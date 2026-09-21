@@ -217,4 +217,224 @@ def _with_model_reasoning_mapping(request_kwargs: dict) -> dict | None:
     return mapped if changed and isinstance(mapped, dict) else None
 
 
-__all__ = ["_with_model_reasoning_mapping"]
+def _without_reasoning_parameters(value: Any) -> Any:
+    """Return the same request with every client reasoning parameter removed.
+
+    A route that cannot translate a client reasoning request does not need one:
+    the model keeps its provider default thinking behavior while the optional
+    ``reasoning``/``reasoning_effort`` fields are the only part of the request
+    the upstream rejected. Return the original object when there is nothing to
+    remove, so callers can treat identity as "no change".
+    """
+
+    if not isinstance(value, dict):
+        return value
+
+    changed = False
+    updated: dict[Any, Any] = {}
+    for key, item in value.items():
+        if key in {"reasoning_effort", "reasoning"}:
+            changed = True
+            continue
+        if key in {"extra_body", "litellm_params"} and isinstance(item, dict):
+            stripped = _without_reasoning_parameters(item)
+            if stripped is not item:
+                changed = True
+                updated[key] = stripped
+                continue
+        updated[key] = item
+    return (updated if changed else value)
+
+
+def _request_has_reasoning_parameters(request_kwargs: Any) -> bool:
+    if not isinstance(request_kwargs, dict):
+        return False
+    return _without_reasoning_parameters(request_kwargs) is not request_kwargs
+
+
+# Google's OpenAI-compatible surface takes the native thinking configuration
+# under an ``extra_body.google`` namespace, and Gemini 3 relays that cannot map
+# an aliased model through their own OpenAI reasoning table still honor it.
+# Only levels those relays translate correctly are sent: xhigh/max are clamped
+# down by the gateway itself, so they are mapped here instead.
+_GOOGLE_THINKING_CONFIG_MODE = "google_thinking_level"
+_REASONING_STRIP_MODE = "strip"
+_GOOGLE_THINKING_LEVEL_BY_EFFORT = {
+    "none": "minimal",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "high",
+    "max": "high",
+}
+
+
+def _request_reasoning_level(request_kwargs: Any) -> str | None:
+    """Return the client's canonical reasoning level from any request shape."""
+
+    if not isinstance(request_kwargs, dict):
+        return None
+    level = _canonical_reasoning_level(request_kwargs.get("reasoning_effort"))
+    if level is not None:
+        return level
+    reasoning = request_kwargs.get("reasoning")
+    if isinstance(reasoning, dict):
+        level = _canonical_reasoning_level(reasoning.get("effort"))
+        if level is not None:
+            return level
+    for container_key in ("extra_body", "litellm_params"):
+        container = request_kwargs.get(container_key)
+        if not isinstance(container, dict):
+            continue
+        level = _canonical_reasoning_level(container.get("reasoning_effort"))
+        if level is not None:
+            return level
+        nested = container.get("reasoning")
+        if isinstance(nested, dict):
+            level = _canonical_reasoning_level(nested.get("effort"))
+            if level is not None:
+                return level
+    return None
+
+
+def _with_google_thinking_level(request_kwargs: dict) -> dict | None:
+    """Translate the client's reasoning level into the native Google shape.
+
+    The rejected OpenAI fields are removed in the same pass.  A client that
+    already chose a native thinking configuration keeps it untouched.
+
+    Relays built on the OpenAI-SDK convention merge a literal ``extra_body``
+    field themselves, while litellm flattens its own ``extra_body`` kwarg into
+    top-level body fields.  Nesting the Google namespace once inside that kwarg
+    is what makes the gateway actually see the thinking configuration; a
+    top-level ``google`` key is ignored there.
+    """
+
+    if not isinstance(request_kwargs, dict):
+        return None
+    level = _request_reasoning_level(request_kwargs)
+    if level is None:
+        return None
+    thinking_level = _GOOGLE_THINKING_LEVEL_BY_EFFORT.get(level)
+    if thinking_level is None:
+        return None
+    stripped = _without_reasoning_parameters(request_kwargs)
+    if not isinstance(stripped, dict):
+        return None
+    updated = dict(stripped)
+    extra_body = updated.get("extra_body")
+    extra_body = dict(extra_body) if isinstance(extra_body, dict) else {}
+    gateway_body = extra_body.get("extra_body")
+    gateway_body = dict(gateway_body) if isinstance(gateway_body, dict) else {}
+    google = gateway_body.get("google")
+    google = dict(google) if isinstance(google, dict) else {}
+    thinking_config = google.get("thinking_config")
+    thinking_config = (
+        dict(thinking_config) if isinstance(thinking_config, dict) else {}
+    )
+    if any(
+        key in thinking_config for key in ("thinking_level", "thinking_budget")
+    ):
+        return None
+    thinking_config["thinking_level"] = thinking_level
+    google["thinking_config"] = thinking_config
+    gateway_body["google"] = google
+    extra_body["extra_body"] = gateway_body
+    updated["extra_body"] = extra_body
+    return updated
+
+
+def _with_model_reasoning_parameter_support(request_kwargs: dict) -> dict | None:
+    """Normalize client reasoning fields for a route learned to refuse them."""
+
+    from . import routing as _routing_module
+
+    if not _request_has_reasoning_parameters(request_kwargs):
+        return None
+    state = _routing_module._reasoning_parameters_compat_cached(request_kwargs)
+    if not isinstance(state, dict):
+        return None
+    mode = state.get("mode")
+    applied: dict | None = None
+    if mode == _GOOGLE_THINKING_CONFIG_MODE:
+        applied = _with_google_thinking_level(request_kwargs)
+    if applied is None:
+        applied = _without_reasoning_parameters(request_kwargs)
+        mode = _REASONING_STRIP_MODE
+    if not isinstance(applied, dict) or applied is request_kwargs:
+        return None
+    _routing_module._trace_reasoning_parameters_compat_applied(
+        applied,
+        mode=mode,
+    )
+    return applied
+
+
+def _mark_reasoning_parameters_compat_retry(retry_kwargs: dict) -> dict:
+    metadata = _request_context_module._request_metadata_dict(
+        retry_kwargs, "litellm_metadata"
+    )
+    retry_metadata = dict(metadata) if metadata else {}
+    retry_metadata[
+        _routing_module_ref()._REASONING_PARAMETERS_COMPAT_RETRY_METADATA_KEY
+    ] = True
+    retry_kwargs["litellm_metadata"] = retry_metadata
+    return retry_kwargs
+
+
+def _routing_module_ref():
+    from . import routing as _routing_module
+
+    return _routing_module
+
+
+def _reasoning_parameters_compat_retry_candidates(
+    exception: Exception,
+    request_kwargs: Any,
+) -> list[tuple[str, dict]]:
+    """Build the compatible replays for a thinking-configuration rejection.
+
+    The native Google thinking shape keeps the client's requested level and is
+    tried first for a Gemini-family upstream; the field-stripping replay keeps
+    every other route working with the provider default thinking behavior.
+    """
+
+    routing = _routing_module_ref()
+    if not isinstance(request_kwargs, dict):
+        return []
+    if routing._request_attempted_reasoning_parameters_compat_retry(request_kwargs):
+        return []
+    if not routing._is_reasoning_configuration_unsupported_error(exception):
+        return []
+    candidates: list[tuple[str, dict]] = []
+    model = request_kwargs.get("model")
+    if isinstance(model, str) and "gemini" in model.casefold():
+        google_kwargs = _with_google_thinking_level(request_kwargs)
+        if google_kwargs is not None:
+            candidates.append(
+                (
+                    _GOOGLE_THINKING_CONFIG_MODE,
+                    _mark_reasoning_parameters_compat_retry(google_kwargs),
+                )
+            )
+    stripped = _without_reasoning_parameters(request_kwargs)
+    if isinstance(stripped, dict) and stripped is not request_kwargs:
+        candidates.append(
+            (
+                _REASONING_STRIP_MODE,
+                _mark_reasoning_parameters_compat_retry(dict(stripped)),
+            )
+        )
+    return candidates
+
+
+__all__ = [
+    "_with_model_reasoning_mapping",
+    "_with_model_reasoning_parameter_support",
+    "_reasoning_parameters_compat_retry_candidates",
+    "_request_has_reasoning_parameters",
+    "_request_reasoning_level",
+    "_without_reasoning_parameters",
+    "_with_google_thinking_level",
+]

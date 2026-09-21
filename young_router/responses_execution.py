@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from . import computer_facade as _computer_facade_module
 from . import image_generation as _image_generation_module
 from . import responses_output as _responses_output_module
 from . import image_inputs as _image_inputs_module
@@ -19,6 +18,7 @@ from .base import (
     Any,
     Optional,
     _GENERIC_HELPER_PATCH_ATTR,
+    _HOSTED_COMPUTER_UNSUPPORTED_MESSAGE,
     _HOSTED_WEB_SEARCH_UNSUPPORTED_BRIDGE_KEY,
     _PROTOCOL_FALLBACK_CACHE_HIT_KEY,
     _PROTOCOL_FALLBACK_CLIENT_SURFACE_KEY,
@@ -489,14 +489,14 @@ async def _execute_responses_chat_bridge_call(
         trace_payload["exception"] = _routing_module._trace_exception(original_exception)
     _trace_module._route_trace(start_event, **trace_payload)
 
-    unsupported_message = _computer_facade_module._hosted_tool_unsupported_message(bridge_metadata)
+    unsupported_message = _responses_web_search_bridge_module._hosted_tool_unsupported_message(bridge_metadata)
     if unsupported_message is not None:
-        response = _computer_facade_module._hosted_tool_unsupported_response(
+        response = _responses_web_search_bridge_module._hosted_tool_unsupported_response(
             bridge_kwargs,
             unsupported_message,
         )
         if bridge_kwargs.get("stream") is True:
-            return _computer_facade_module._hosted_web_search_unsupported_stream(response)
+            return _responses_web_search_bridge_module._hosted_tool_unsupported_stream(response)
         return response
 
     async def execute_once(active_bridge_kwargs: dict) -> Any:
@@ -574,18 +574,18 @@ async def _execute_responses_chat_bridge_call(
             and active_bridge_metadata.get(_WEB_SEARCH_EXTERNAL_BRIDGE_STREAM_KEY) is True
         ):
             if active_bridge_metadata.get(_WEB_SEARCH_EXTERNAL_BRIDGE_KEY) is True:
-                return _computer_facade_module._resolve_web_search_function_calls_stream_rounds(
+                return _responses_web_search_bridge_module._resolve_web_search_function_calls_stream_rounds(
                     response,
                     active_bridge_kwargs,
                     original_function,
                 )
             response_payload = _streaming_module._jsonable(response)
             if not isinstance(response_payload, dict):
-                response_payload = _computer_facade_module._hosted_tool_unsupported_response(
+                response_payload = _responses_web_search_bridge_module._hosted_tool_unsupported_response(
                     active_bridge_kwargs,
                     _responses_output_module._response_text(response),
                 )
-            return _computer_facade_module._external_web_search_bridge_stream(response_payload)
+            return _responses_web_search_bridge_module._external_web_search_bridge_stream(response_payload)
         if (
             should_intercept_external_web_search
             and active_bridge_metadata.get(_WEB_SEARCH_EXTERNAL_BRIDGE_KEY) is True
@@ -709,7 +709,7 @@ async def _postprocess_generic_bridge_response(
                     request_kwargs,
                 )
                 if actions:
-                    async for chunk in _computer_facade_module._resolve_web_search_function_calls_stream_rounds(
+                    async for chunk in _responses_web_search_bridge_module._resolve_web_search_function_calls_stream_rounds(
                         response,
                         request_kwargs,
                         original_function,
@@ -718,11 +718,11 @@ async def _postprocess_generic_bridge_response(
                     return
                 payload = _streaming_module._jsonable(response)
                 if not isinstance(payload, dict):
-                    payload = _computer_facade_module._hosted_tool_unsupported_response(
+                    payload = _responses_web_search_bridge_module._hosted_tool_unsupported_response(
                         request_kwargs,
                         _responses_output_module._response_text(response),
                     )
-                async for chunk in _computer_facade_module._external_web_search_bridge_stream(
+                async for chunk in _responses_web_search_bridge_module._external_web_search_bridge_stream(
                     payload
                 ):
                     yield chunk
@@ -746,18 +746,18 @@ async def _postprocess_generic_bridge_response(
                 )
             return response
         if bridge_metadata.get(_WEB_SEARCH_EXTERNAL_BRIDGE_KEY) is True:
-            return _computer_facade_module._resolve_web_search_function_calls_stream_rounds(
+            return _responses_web_search_bridge_module._resolve_web_search_function_calls_stream_rounds(
                 response,
                 request_kwargs,
                 original_function,
             )
         response_payload = _streaming_module._jsonable(response)
         if not isinstance(response_payload, dict):
-            response_payload = _computer_facade_module._hosted_tool_unsupported_response(
+            response_payload = _responses_web_search_bridge_module._hosted_tool_unsupported_response(
                 request_kwargs,
                 _responses_output_module._response_text(response),
             )
-        return _computer_facade_module._external_web_search_bridge_stream(response_payload)
+        return _responses_web_search_bridge_module._external_web_search_bridge_stream(response_payload)
 
     return await _responses_web_search_bridge_module._resolve_web_search_function_calls(
         response,
@@ -1429,6 +1429,78 @@ async def _execute_responses_function_tool_bridge_call(
             raise
         raise exc
 
+def _hosted_computer_unsupported_retry_response(
+    exception: Exception,
+    request_kwargs: Optional[dict],
+    outer_request_kwargs: Optional[dict],
+) -> Optional[Any]:
+    """Answer a hosted computer-use request when the route refuses that tool.
+
+    Young Router runs no computer-use executor of its own: a hosted ``computer``
+    tool only exists when an upstream serves it natively, and every route here
+    is a relay.  A refusal therefore ends the turn with an explicit unavailable
+    message, because falling back to the chat bridge would drop the hosted tool
+    and answer as if computer use had never been requested.
+    """
+
+    if not isinstance(request_kwargs, dict):
+        return None
+    if not (
+        _responses_request_module._request_is_responses_api(request_kwargs)
+        or _responses_request_module._request_is_responses_api(outer_request_kwargs)
+    ):
+        return None
+    if not _responses_tools_module._native_hosted_computer_unsupported_error(
+        exception,
+        request_kwargs,
+        outer_request_kwargs,
+    ):
+        return None
+    response = _responses_web_search_bridge_module._hosted_tool_unsupported_response(
+        request_kwargs,
+        _HOSTED_COMPUTER_UNSUPPORTED_MESSAGE,
+    )
+    if request_kwargs.get("stream") is True:
+        return _responses_web_search_bridge_module._hosted_tool_unsupported_stream(response)
+    return response
+
+
+def _hosted_computer_unavailable_preemptive_response(
+    request_kwargs: Optional[dict],
+    outer_request_kwargs: Optional[dict] = None,
+) -> Optional[Any]:
+    """Answer a hosted computer-use request before shipping it to a chat route.
+
+    A route whose Responses endpoint does not exist can only be served by the
+    chat bridge, and the bridge drops hosted tools.  When the client brings no
+    computer use of its own, the request would either fail against the chat
+    endpoint or silently lose the capability, so the honest answer is the
+    explicit unavailability message.
+    """
+
+    if not _responses_request_module._request_is_responses_api(request_kwargs):
+        return None
+    if not _responses_surfaces_module._current_route_responses_endpoint_unsupported(
+        request_kwargs,
+        outer_request_kwargs,
+    ):
+        return None
+    if not _responses_tools_module._request_hosted_computer_blocks_chat_bridge(
+        request_kwargs,
+        outer_request_kwargs,
+    ):
+        return None
+    response = _responses_web_search_bridge_module._hosted_tool_unsupported_response(
+        request_kwargs,
+        _HOSTED_COMPUTER_UNSUPPORTED_MESSAGE,
+    )
+    if request_kwargs.get("stream") is True:
+        return _responses_web_search_bridge_module._hosted_tool_unsupported_stream(
+            response
+        )
+    return response
+
+
 def _wrap_generic_function_for_deployment_failover(
     original_function: Any,
     outer_request_kwargs: Optional[dict] = None,
@@ -1599,6 +1671,15 @@ def _wrap_generic_function_for_deployment_failover(
                     start_event="responses_external_web_search_bridge_retry_start",
                     error_event="responses_external_web_search_bridge_retry_error",
                 )
+        hosted_computer_unavailable = _hosted_computer_unavailable_preemptive_response(
+            kwargs,
+            outer_request_kwargs,
+        )
+        if hosted_computer_unavailable is not None:
+            return _image_inputs_module._sanitize_response_echoed_request_images_for_delivery(
+                hosted_computer_unavailable,
+                kwargs,
+            )
         preemptive_bridge_kwargs = _responses_surfaces_module._responses_chat_bridge_preemptive_kwargs(
             kwargs,
             outer_request_kwargs,
@@ -1802,14 +1883,14 @@ def _wrap_generic_function_for_deployment_failover(
                     decision_kwargs,
                 )
                 raise
-            facade_response = await _computer_facade_module._responses_computer_facade_retry_response(
+            hosted_computer_response = _hosted_computer_unsupported_retry_response(
                 exc,
                 kwargs,
                 outer_request_kwargs,
             )
-            if facade_response is not None:
+            if hosted_computer_response is not None:
                 return _image_inputs_module._sanitize_response_echoed_request_images_for_delivery(
-                    facade_response,
+                    hosted_computer_response,
                     kwargs,
                 )
             xhigh_retry_kwargs = _responses_request_module._xhigh_reasoning_compat_retry_kwargs(exc, kwargs)

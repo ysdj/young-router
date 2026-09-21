@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from . import computer_facade as _computer_facade_module
 from . import responses_output as _responses_output_module
 from . import image_inputs as _image_inputs_module
 from . import responses_request as _responses_request_module
@@ -257,7 +256,7 @@ def _responses_chat_bridge_retry_kwargs(
         return None
     plan = _responses_tools_module._responses_hosted_tool_plan(request_kwargs, outer_request_kwargs)
     if (
-        _computer_facade_module._native_hosted_computer_unsupported_error(
+        _responses_tools_module._native_hosted_computer_unsupported_error(
             exception,
             request_kwargs,
             outer_request_kwargs,
@@ -279,7 +278,7 @@ def _responses_chat_bridge_retry_kwargs(
         request_kwargs,
         outer_request_kwargs,
     )
-    if _computer_facade_module._request_hosted_browser_computer_blocks_chat_bridge(request_kwargs, outer_request_kwargs):
+    if _responses_tools_module._request_hosted_computer_blocks_chat_bridge(request_kwargs, outer_request_kwargs):
         return None
     _with_responses_chat_bridge_compatible_tools(retry_kwargs, retry_metadata)
     bridge_input, input_stats = _responses_tools_module._responses_chat_bridge_input(
@@ -1252,7 +1251,7 @@ def _responses_chat_bridge_preemptive_kwargs(
         request_kwargs,
         outer_request_kwargs,
     )
-    if _computer_facade_module._request_hosted_browser_computer_blocks_chat_bridge(
+    if _responses_tools_module._request_hosted_computer_blocks_chat_bridge(
         request_kwargs,
         outer_request_kwargs,
     ):
@@ -1314,7 +1313,7 @@ def _responses_function_tool_bridge_preemptive_reason(
         outer_for_tool_reason,
     ):
         return None
-    if _computer_facade_module._request_hosted_browser_computer_blocks_chat_bridge(
+    if _responses_tools_module._request_hosted_computer_blocks_chat_bridge(
         request_kwargs,
         outer_for_tool_reason,
     ):
@@ -1580,7 +1579,7 @@ def _responses_function_tool_bridge_retry_kwargs(
         outer_request_kwargs,
     ):
         return None
-    if _computer_facade_module._request_hosted_browser_computer_blocks_chat_bridge(
+    if _responses_tools_module._request_hosted_computer_blocks_chat_bridge(
         request_kwargs,
         outer_request_kwargs,
     ):

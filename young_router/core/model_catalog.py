@@ -13,6 +13,11 @@ from .persistence import PersistenceError, atomic_write_json, read_json
 
 
 CATALOG_FILE_NAME = "young-router-model-catalog.json"
+# Releases before the Young Router rebrand managed the same catalog under the
+# retired LiteLLM Menu name.  Codex config files written back then still point
+# at that path, so it stays recognised as a managed catalog target and is
+# migrated (never treated as a foreign, user-owned path).
+LEGACY_CATALOG_FILE_NAME = "litellm-menu-model-catalog.json"
 CATALOG_DESCRIPTION = "Young Router exposed model"
 _REASONING_LEVELS = (
     {"effort": "low", "description": "Fast responses with lighter reasoning"},
@@ -33,6 +38,12 @@ _REASONING_DESCRIPTIONS = {
 
 def managed_catalog_path(codex_home: Path | str) -> Path:
     return Path(codex_home).expanduser() / CATALOG_FILE_NAME
+
+
+def legacy_managed_catalog_path(codex_home: Path | str) -> Path:
+    """Return the pre-rebrand catalog path this app still owns."""
+
+    return Path(codex_home).expanduser() / LEGACY_CATALOG_FILE_NAME
 
 
 def selected_model_names(config: object) -> list[str]:
@@ -353,10 +364,12 @@ def write_catalog(
 
 __all__ = [
     "CATALOG_FILE_NAME",
+    "LEGACY_CATALOG_FILE_NAME",
     "catalog_is_current",
     "catalog_model_names",
     "catalog_names_from_editor",
     "catalog_payload",
+    "legacy_managed_catalog_path",
     "managed_catalog_path",
     "selected_model_names",
     "write_catalog",

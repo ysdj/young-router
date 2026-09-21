@@ -17,6 +17,7 @@ from ..model_catalog import (
     catalog_is_current,
     catalog_model_names,
     catalog_names_from_editor,
+    legacy_managed_catalog_path,
     managed_catalog_path,
     write_catalog,
 )
@@ -95,6 +96,12 @@ class CodexSettingsDomain:
         self._catalog_restart_required = False
         self._catalog_change_reason: str | None = None
         self._catalog_change_event = 0
+        # A managed catalog pointer that names a missing file makes Codex refuse
+        # every configuration load ("No such file or directory"), so the repair
+        # that clears it must never re-enter itself through ``reload()`` and must
+        # report a failure instead of leaving the client broken silently.
+        self._catalog_pointer_repairing = False
+        self._catalog_pointer_error: str | None = None
         # A deferred restart acknowledges the current public-model set. Keep
         # that acknowledgement in memory so a later catalog repair/snapshot
         # cannot manufacture a new prompt for the same model IDs. A genuine
@@ -114,6 +121,11 @@ class CodexSettingsDomain:
         self._raw: dict[str, Any] = {}
         self._draft: dict[str, Any] = {}
         self._baseline: tuple[str, str] = ("", "{}\n")
+        # The app's own proxy endpoint, resolved once per document load rather
+        # than per snapshot: it reads the runtime settings and the (large)
+        # runtime configuration, while snapshots are polled while a window is
+        # open.  `uses_local_api` then only compares strings.
+        self._local_api_base_url: str | None = None
         self.revision = 0
         self.reload()
 
@@ -165,6 +177,38 @@ class CodexSettingsDomain:
             raise DomainError("Codex settings are invalid")
         return copy.deepcopy(dict(payload))
 
+    def codex_home_path(self) -> Path:
+        """Return the home directory that owns Codex's editor documents."""
+
+        configured_home = os.environ.get("CODEX_HOME", "").strip()
+        return self.codex_home or (Path(configured_home).expanduser() if configured_home else Path.home() / ".codex")
+
+    def client_files(self) -> list[dict[str, Any]]:
+        """Describe the Codex documents for the external-settings listing."""
+
+        home = self.codex_home_path()
+        rows: list[dict[str, Any]] = []
+        for document, name, language in (("config", "config.toml", "toml"), ("auth", "auth.json", "json")):
+            path = home / name
+            try:
+                details = path.lstat()
+                exists = stat.S_ISREG(details.st_mode)
+            except OSError:
+                exists = False
+            rows.append(
+                {
+                    "id": f"codex.{document}",
+                    "client": "codex",
+                    "domain": self.name,
+                    "document": document,
+                    "name": name,
+                    "path": str(path),
+                    "language": language,
+                    "exists": exists,
+                }
+            )
+        return rows
+
     def _editor_documents_from_disk(self) -> tuple[str, str, bool, bool]:
         """Read the two editor documents without probing the LiteLLM endpoint.
 
@@ -175,8 +219,7 @@ class CodexSettingsDomain:
         change, rather than to a five-second idle probe.
         """
 
-        configured_home = os.environ.get("CODEX_HOME", "").strip()
-        home = self.codex_home or (Path(configured_home).expanduser() if configured_home else Path.home() / ".codex")
+        home = self.codex_home_path()
 
         def read_document(filename: str, label: str) -> tuple[str, bool]:
             path = home / filename
@@ -197,10 +240,90 @@ class CodexSettingsDomain:
         auth_text, auth_exists = read_document("auth.json", "Codex auth file")
         return config_text, auth_text if auth_exists else "{}\n", config_exists, auth_exists
 
-    def _is_catalog_enabled(self, payload: Mapping[str, Any]) -> bool:
+    def _catalog_pointer(self, payload: Mapping[str, Any]) -> Path | None:
+        """Return the applied ``model_catalog_json`` target when it is a path."""
+
         structured = payload.get("structured", {})
         value = structured.get("model_catalog_json") if isinstance(structured, Mapping) else None
-        return isinstance(value, str) and Path(value).expanduser() == self.model_catalog_path
+        if not isinstance(value, str) or not value.strip():
+            return None
+        return Path(value).expanduser()
+
+    def _managed_catalog_paths(self) -> tuple[Path, ...]:
+        """Return the catalog paths this app owns, current name first."""
+
+        return (self.model_catalog_path, legacy_managed_catalog_path(self.codex_home_path()))
+
+    def _catalog_pointer_is_managed(self, payload: Mapping[str, Any]) -> bool:
+        """Whether the applied pointer names a catalog file this app writes."""
+
+        pointer = self._catalog_pointer(payload)
+        return pointer is not None and pointer in self._managed_catalog_paths()
+
+    def persistence_paths(self) -> tuple[Path, ...]:
+        """Files this domain owns, including the pre-rebrand catalog.
+
+        The legacy catalog is tracked so its deletion is still observed as a
+        disk change (the settings timer then repairs the pointer it dangles
+        from) on installations that predate the rebrand.
+        """
+
+        return (*self._managed_catalog_paths(), self.model_catalog_ack_path)
+
+    def _is_catalog_enabled(self, payload: Mapping[str, Any]) -> bool:
+        # The legacy managed path counts as enabled: a config still pointing at
+        # the pre-rebrand file is this app's catalog, and the next repair or
+        # apply migrates the pointer to the current name.
+        return self._catalog_pointer_is_managed(payload)
+
+    def _repair_catalog_pointer(self, value: str | None) -> bool:
+        """Rewrite only ``model_catalog_json`` on disk, keeping Codex loadable.
+
+        Codex rejects its whole configuration while that key names a missing
+        file, so this repair is intentionally independent of the endpoint
+        probe.  The two documents are read from disk immediately before the
+        write so an external edit made since the last reload is preserved.
+        """
+
+        import codex_config
+
+        if self._catalog_pointer_repairing:
+            return False
+        patch: dict[str, Any] = {"model_catalog_json": value}
+        draft_before = copy.deepcopy(self._draft)
+        try:
+            config_text, auth_text, _, _ = self._editor_documents_from_disk()
+            with _codex_environment(self.runtime_config_path, self.codex_home):
+                repaired = self._sync(config_text, auth_text, patch)
+                codex_config.apply_editor(
+                    {
+                        "config_text": repaired["config_text"],
+                        "auth_text": repaired["auth_text"],
+                    },
+                    self.runtime_config_path,
+                )
+        except Exception:
+            self._catalog_pointer_error = (
+                "Codex catalog pointer could not be repaired; fix model_catalog_json in config.toml"
+            )
+            return False
+        self._catalog_pointer_error = None
+        self._catalog_pointer_repairing = True
+        try:
+            self.reload()
+        finally:
+            self._catalog_pointer_repairing = False
+        # The staged draft is the user's own copy of config.toml.  Move its
+        # pointer with the disk one (as the explicit switch does) so applying a
+        # staged edit cannot put the broken pointer back.
+        draft_config = draft_before.get("config_text", "")
+        draft_auth = draft_before.get("auth_text", "{}\n")
+        if isinstance(draft_config, str) and isinstance(draft_auth, str):
+            try:
+                self._draft = self._sync(draft_config, draft_auth, patch)
+            except DomainError:
+                self._draft = draft_before
+        return True
 
     @staticmethod
     def _catalog_model_names(payload: Mapping[str, Any]) -> list[str]:
@@ -327,12 +450,23 @@ class CodexSettingsDomain:
         force_source_refresh: bool = False,
         require_stable_repair: bool = False,
     ) -> bool:
-        if not self._is_catalog_enabled(self._raw):
+        pointer = self._catalog_pointer(self._raw)
+        if pointer is None or pointer not in self._managed_catalog_paths():
             self._reset_catalog_repair_observation()
             return False
+        dangling = not pointer.exists()
         source_refreshed = self._refresh_live_catalog_source(force=force_source_refresh)
         if not self._catalog_source_is_available(self._raw):
             self._reset_catalog_repair_observation()
+            if dangling and source_refreshed:
+                # Codex cannot load any configuration whose catalog pointer names
+                # a missing file.  A freshly observed endpoint failure means the
+                # catalog cannot be rebuilt right now, so drop the pointer instead
+                # of leaving the client unusable; the next available probe (or an
+                # explicit switch) restores the catalog.
+                if self._repair_catalog_pointer(None):
+                    self._queue_catalog_restart("catalog_missing", names=[], enabled=False, force=True)
+                    self.revision += 1
             return False
         names = self._catalog_model_names(self._raw)
         self._context_registry.refresh_if_due()
@@ -355,9 +489,18 @@ class CodexSettingsDomain:
         else:
             self._reset_catalog_repair_observation()
 
-        if catalog_is_current(self.model_catalog_path, names, registry=self._context_registry):
+        catalog_current = catalog_is_current(
+            self.model_catalog_path, names, registry=self._context_registry
+        )
+        migrated = pointer != self.model_catalog_path
+        if catalog_current and not migrated:
             return False
-        write_catalog(self.model_catalog_path, names, registry=self._context_registry)
+        if not catalog_current:
+            write_catalog(self.model_catalog_path, names, registry=self._context_registry)
+        if migrated:
+            # Write the current file before moving the pointer so a failure in
+            # between leaves Codex with a loadable config, never a dangling one.
+            self._repair_catalog_pointer(str(self.model_catalog_path))
         if notify and model_ids_changed:
             self._queue_catalog_restart("catalog_repaired", names=names, enabled=True)
         self.revision += 1
@@ -379,15 +522,50 @@ class CodexSettingsDomain:
             require_stable_repair=True,
         )
 
+    def refresh_local_api_endpoint(self) -> None:
+        """Resolve this app's proxy endpoint for the "use this API" action."""
+
+        try:
+            from ._shared import local_proxy_endpoint
+
+            self._local_api_base_url = local_proxy_endpoint()[0]
+        except Exception:
+            self._local_api_base_url = None
+
+    def uses_local_api(self) -> bool:
+        """True when the selected Codex provider already points at this proxy."""
+
+        base_url = self._local_api_base_url
+        if not base_url:
+            return False
+        expected = base_url.rstrip("/")
+        structured = self._draft.get("structured")
+        structured = structured if isinstance(structured, Mapping) else {}
+        direct = str(structured.get("model_provider") or "").strip()
+        if not direct:
+            return False
+        candidates: list[str] = []
+        if direct == "openai":
+            candidates.append(str(structured.get("openai_base_url") or ""))
+        providers = structured.get("providers")
+        if isinstance(providers, list):
+            for item in providers:
+                if isinstance(item, Mapping) and str(item.get("id") or "").strip() == direct:
+                    candidates.append(str(item.get("base_url") or ""))
+        return any(candidate.rstrip("/") == expected for candidate in candidates if candidate)
+
     def _safe_snapshot(self, payload: Mapping[str, Any], revision: int) -> dict[str, Any]:
         errors = payload.get("validation_errors", [])
         warnings = payload.get("warnings", [])
+        if self._catalog_pointer_error:
+            warnings = [*(warnings if isinstance(warnings, list) else []), self._catalog_pointer_error]
         public_models = self._catalog_model_names(payload) if self._is_catalog_enabled(payload) else []
         return {
             "domain": "codex",
             "revision": revision,
             "config_exists": bool(payload.get("config_exists")),
             "auth_file_exists": bool(payload.get("auth_exists")),
+            "uses_local_api": self.uses_local_api(),
             "structured": redact(payload.get("structured", {})),
             "models": redact(payload.get("models", [])),
             "validation_errors": redact(errors if isinstance(errors, list) else []),
@@ -487,6 +665,7 @@ class CodexSettingsDomain:
             from ._shared import local_proxy_endpoint
 
             base_url, key = local_proxy_endpoint()
+            self._local_api_base_url = base_url
             structured = self._draft.get("structured")
             structured = structured if isinstance(structured, Mapping) else {}
             direct = str(structured.get("model_provider") or "").strip()
@@ -734,6 +913,7 @@ class CodexSettingsDomain:
         return self.snapshot()
 
     def reload(self) -> dict[str, Any]:
+        self.refresh_local_api_endpoint()
         payload = self._load_editor()
         self._raw = copy.deepcopy(payload)
         self._draft = copy.deepcopy(payload)

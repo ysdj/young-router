@@ -3,7 +3,6 @@ from __future__ import annotations
 import re
 
 from . import codex_fast_tier as _codex_fast_tier_module
-from . import computer_facade as _computer_facade_module
 from . import image_generation as _image_generation_module
 from . import image_inputs as _image_inputs_module
 from . import responses_request as _responses_request_module
@@ -5425,7 +5424,7 @@ async def _non_streaming_response_as_stream(
                 request_data=request_data,
             )
         payload = _completed_response_payload(response, request_data)
-        async for chunk in _computer_facade_module._external_web_search_bridge_stream(payload):
+        async for chunk in _responses_web_search_bridge_module._external_web_search_bridge_stream(payload):
             yield chunk
         return
     yield response
@@ -5748,7 +5747,7 @@ async def _yield_guarded_original_stream(
             stream_event_count=completion_state.event_count,
         )
         original_function = _responses_execution_module._responses_bridge_original_function(request_data)
-        async for resolved_chunk in _computer_facade_module._resolve_web_search_function_calls_stream_rounds(
+        async for resolved_chunk in _responses_web_search_bridge_module._resolve_web_search_function_calls_stream_rounds(
             payload,
             request_data,
             original_function,
@@ -7406,7 +7405,7 @@ async def _yield_start_buffered_stream_with_error_fallback(
                 )
                 await _close_async_iterator_safely(response)
                 original_function = _responses_execution_module._responses_bridge_original_function(request_data)
-                async for resolved_chunk in _computer_facade_module._resolve_web_search_function_calls_stream_rounds(
+                async for resolved_chunk in _responses_web_search_bridge_module._resolve_web_search_function_calls_stream_rounds(
                     payload,
                     request_data,
                     original_function,

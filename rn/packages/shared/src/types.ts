@@ -5,6 +5,7 @@ export type IpcMethod =
   | "disk_state"
   | "logs"
   | "editor"
+  | "files"
   | "dispatch"
   | "subscribe"
   | "validate"
@@ -17,6 +18,7 @@ export type IpcMethod =
 
 export type AppRoute =
   | "home"
+  | "file-editor"
   | "general-settings"
   | "providers-models"
   | "codex-settings"
@@ -40,6 +42,7 @@ export type ConfigDomain =
   | "providers_models"
   | "codex"
   | "claude"
+  | "clients"
   | "runtime"
   | "webdav"
   | "logs"
@@ -47,6 +50,69 @@ export type ConfigDomain =
   | "relay_accounts";
 
 export type LanguagePreference = "system" | "en" | "zh-Hans";
+
+/**
+ * Domains that own a versioned raw editor document. Codex and Claude keep
+ * their own structured settings; ``clients`` owns the remaining external
+ * desktop client configuration files.
+ */
+export type EditorDomain = "codex" | "claude" | "clients";
+
+/** Documents the authenticated raw editor can open, per owning domain. */
+export type EditorDocument =
+  | "config"
+  | "auth"
+  | "settings"
+  | "desktop"
+  | "developer"
+  | "pi_settings"
+  | "pi_models"
+  | "pi_auth"
+  | "dsh_settings"
+  | "dsh_desktop_settings"
+  | "opencode_config"
+  | "opencode_auth";
+
+/** External client a configuration file belongs to, as the pane groups it. */
+export type ClientFileName = "codex" | "claude" | "pi" | "dsh" | "dshDesktop" | "opencode";
+
+export type ClientFileLanguage = "json" | "toml" | "yaml" | "text";
+
+/**
+ * One registered external client configuration file. ``path`` is the only
+ * local path Core returns to the UI, and only through the read-only ``files``
+ * operation that backs the external-settings listing; ``display_path`` is the
+ * same file spelled with the user's home directory as ``~`` for display, while
+ * every action addresses ``path`` itself.
+ */
+export interface ClientFile {
+  id: string;
+  client: "codex" | "claude" | "claudeCode" | "claudeDesktop" | "pi" | "dsh" | "dshDesktop" | "opencode";
+  domain: "codex" | "claude" | "clients";
+  document:
+    | "config"
+    | "auth"
+    | "settings"
+    | "desktop"
+    | "developer"
+    | "pi_settings"
+    | "pi_models"
+    | "pi_auth"
+    | "dsh_settings"
+    | "dsh_desktop_settings"
+    | "opencode_config"
+    | "opencode_auth";
+  name: string;
+  path: string;
+  display_path: string;
+  language: "json" | "toml" | "yaml" | "text";
+  exists: boolean;
+  /**
+   * View state of the editor sheet that owns this file: true while the sheet
+   * is on screen. Core never sends it; the host's editor target does.
+   */
+  present?: boolean;
+}
 
 export interface SecretState {
   present: boolean;
@@ -197,7 +263,48 @@ export interface ProbeSurfaceResult {
 export interface ProbeSummary {
   available_surfaces: string[];
   unavailable_surfaces: string[];
+  /** Surfaces whose request never completed (rejected or timed out). */
+  unreachable_surfaces?: string[];
+  /** Aggregate reason: refused, timeout, mixed, or empty when every surface answered. */
+  transport?: string;
   statuses: Record<string, string>;
+}
+
+export type ProbeDegradationStatus =
+  | "matched"
+  | "mismatch"
+  | "unknown"
+  | "unavailable"
+  | "unreachable"
+  | "skipped"
+  | "error";
+
+export interface ProbeDegradationEngine {
+  name: string;
+  source?: string;
+  revision?: string;
+  staged_at?: string;
+  available?: boolean;
+}
+
+/** TraceOne fingerprint result for the route behind one requested model name. */
+export interface ProbeDegradationResult {
+  status: ProbeDegradationStatus | string;
+  target?: string | null;
+  label?: string | null;
+  /** Raw request status behind an unreachable or failed deep test. */
+  cause?: string;
+  detail?: string;
+  checked_at?: string;
+  numbers?: number;
+  engine?: ProbeDegradationEngine;
+}
+
+/** What the model detail pane's deep test will run for this route. */
+export interface ModelDeepProbePlan {
+  includes_degradation: boolean;
+  target?: string | null;
+  surface?: string;
 }
 
 export interface ProviderModelSummary {
@@ -217,11 +324,13 @@ export interface ProviderModelSummary {
   binding_health?: ModelBindingHealth;
   upstream_protocol_mode?: "fallback" | "fixed";
   upstream_url_surface?: ProbeSurfaceName;
+  deep_probe?: ModelDeepProbePlan;
   probe?: {
     available: boolean;
     recommended_surface?: ProbeSurfaceName | null;
     summary?: ProbeSummary;
     checked_at?: string;
+    degradation?: ProbeDegradationResult;
     surfaces?: Record<string, Omit<ProbeSurfaceResult, "surface">>;
   };
 }
@@ -276,8 +385,27 @@ export interface IpcParams {
   disk_state: { domains: ConfigDomain[] };
   logs: { tab: LogTab; revision?: number };
   editor:
-    | { domain: "codex" | "claude"; document: "config" | "auth" | "settings" | "desktop" | "developer" }
+    | {
+      domain: "codex" | "claude" | "clients";
+      document:
+        | "config"
+        | "auth"
+        | "settings"
+        | "desktop"
+        | "developer"
+        | "pi_settings"
+        | "pi_models"
+        | "pi_auth"
+        | "dsh_settings"
+        | "dsh_desktop_settings"
+        | "opencode_config"
+        | "opencode_auth"
+        | "codex_keybindings"
+        | "codex_agents"
+        | "codex_rules";
+    }
     | { editor_token: string; text: string };
+  files: Record<string, never>;
   dispatch: { action: DispatchAction; revision?: number };
   subscribe: { topics?: string[] };
   validate: { domain: ConfigDomain; revision?: number };
@@ -293,7 +421,30 @@ export interface IpcResults {
   snapshot: { snapshot: CoreSnapshot };
   disk_state: { revision: number; disk: Partial<Record<ConfigDomain, DiskState>> };
   logs: { changed: boolean; revision: number; log: LogView | null };
-  editor: { domain: "codex" | "claude"; document: "config" | "auth" | "settings" | "desktop" | "developer"; editor_token: string; revision: number; text: string; baseline: string };
+  editor: {
+    domain: "codex" | "claude" | "clients";
+    document:
+      | "config"
+      | "auth"
+      | "settings"
+      | "desktop"
+      | "developer"
+      | "pi_settings"
+      | "pi_models"
+      | "pi_auth"
+      | "dsh_settings"
+      | "dsh_desktop_settings"
+      | "opencode_config"
+      | "opencode_auth"
+      | "codex_keybindings"
+      | "codex_agents"
+      | "codex_rules";
+    editor_token: string;
+    revision: number;
+    text: string;
+    baseline: string;
+  };
+  files: { revision: number; files: ClientFile[] };
   dispatch: { revision: number; action_summary?: Record<string, unknown> };
   subscribe: { subscription_id: string };
   validate: { validate: ValidationSummary };
@@ -314,8 +465,10 @@ export interface IpcResults {
     available?: boolean;
     provider_id?: string;
     model_id?: string;
+    unreachable?: boolean;
     recommended_surface?: "openai/responses" | "openai/chat" | "anthropic" | null;
-    summary?: { available_surfaces: string[]; unavailable_surfaces: string[]; statuses: Record<string, string> };
+    summary?: { available_surfaces: string[]; unavailable_surfaces: string[]; unreachable_surfaces?: string[]; transport?: string; statuses: Record<string, string> };
+    degradation?: ProbeDegradationResult;
     surfaces?: { surface: string; available: boolean; status?: string; original_request?: { method: string; url: string; headers: Record<string, string>; body: Record<string, unknown> } }[];
   };
   export: { revision: number; section_count: number; sections?: ConfigDomain[] };
@@ -368,7 +521,8 @@ export interface IpcClient {
   snapshot(): Promise<CoreSnapshot>;
   diskState(domains: ConfigDomain[]): Promise<IpcResults["disk_state"]>;
   logs(tab: LogTab, revision?: number): Promise<IpcResults["logs"]>;
-  editor(domain: "codex" | "claude", document: "config" | "auth" | "settings" | "desktop" | "developer"): Promise<IpcResults["editor"]>;
+  editor(domain: EditorDomain, document: EditorDocument): Promise<IpcResults["editor"]>;
+  files(): Promise<IpcResults["files"]>;
   stageEditor(editorToken: string, text: string): Promise<IpcResults["editor"]>;
   dispatch(action: DispatchAction, revision?: number): Promise<IpcResults["dispatch"]>;
   subscribe(listener: (event: IpcEvent) => void, topics?: string[]): () => void;
@@ -469,6 +623,7 @@ export interface NativeLocalization {
   routeRuntimeSettings: string;
   routeDataManagement: string;
   routeProviderWizard: string;
+  routeFileEditor: string;
   routeLogs: string;
   providerAuthInstruction?: string;
   providerAuthCode?: string;
@@ -517,6 +672,17 @@ export type RelayGroupManagerKey = {
   models: string[];
   enabled: boolean;
 };
+/**
+ * The group manager sheet's own content: what the sheet opens on, and what a
+ * live update replaces it with while the sheet stays open.  `accountLabel` is
+ * the caption under the title, `autoGrouping` the switch's state.
+ */
+export type RelayGroupManagerSnapshot = {
+  accountLabel: string;
+  groups: RelayGroupManagerGroup[];
+  keys: RelayGroupManagerKey[];
+  autoGrouping: boolean;
+};
 /** Localized labels for the native group manager sheet. */
 export type RelayGroupManagerLabels = {
   listLabel: string;
@@ -554,6 +720,8 @@ export type RelayGroupManagerLabels = {
   discardBody: string;
   /** The confirmation's own action label, e.g. 放弃更改. */
   discardConfirm: string;
+  /** The footer line the sheet shows while its rows are still loading. */
+  loadingLabel: string;
 };
 /**
  * What the sheet returns: the auto-grouping switch plus the key edits the user
@@ -599,14 +767,23 @@ export interface NativeLeafAdapter {
   /** Native subordinate sheet: the station's keys with their groups. */
   showGroupManager(options: {
     title: string;
-    accountLabel: string;
     /** The account that owns the keys; names the copy action's secret target. */
     accountId: string;
-    groups: RelayGroupManagerGroup[];
-    keys: RelayGroupManagerKey[];
     labels: RelayGroupManagerLabels;
-    autoGrouping: boolean;
-  }): Promise<RelayGroupManagerResult | undefined>;
+    /**
+     * True while the account's aligned layout is still loading: the sheet shows
+     * the rows it opened on behind its loading line and keeps them read-only
+     * until `updateGroupManager` replaces them.
+     */
+    loading?: boolean;
+  } & RelayGroupManagerSnapshot): Promise<RelayGroupManagerResult | undefined>;
+  /**
+   * Replace the open sheet's content with a later snapshot of the same account
+   * and end its loading state, so the sheet never holds the window closed for a
+   * station round trip.  Resolves false when no sheet is open — a load that
+   * lands after Close changes nothing.
+   */
+  updateGroupManager?(options: RelayGroupManagerSnapshot): Promise<boolean>;
   chooseModelsToAdd(options: {
     models: string[];
     providerName: string;
@@ -669,6 +846,22 @@ export interface NativeLeafAdapter {
   versionInfo?(): Promise<{ app: string; litellm: string; icon?: string }>;
   /** Open an http(s) URL in the user's browser. */
   openExternalURL?(url: string): void;
+  /**
+   * Reveal one registered configuration file in Finder or Explorer. A file
+   * that does not exist yet opens its nearest existing parent directory. The
+   * native host validates the path; this never grants filesystem access.
+   */
+  revealFile?(path: string): void;
+  /**
+   * Present the raw file editor as this platform's own sub-sheet for one
+   * registered client document. macOS attaches it to the settings window,
+   * where it blocks the pane while it is open (mirroring the provider wizard).
+   */
+  openFileEditor?(target: string): void;
+  /** Create the editor sheet's window (and boot its editor) ahead of time. */
+  prepareFileEditor?(): void;
+  /** The document the host currently asks the editor sheet to show, as JSON. */
+  pendingFileEditorTarget?(): string;
   setLocalization(strings: NativeLocalization): void;
   setShortcuts(shortcuts: Record<string, string>): void;
 }

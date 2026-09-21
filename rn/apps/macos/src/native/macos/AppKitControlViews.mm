@@ -167,13 +167,42 @@ NSFont *TableCellFont()
   return [NSFont systemFontOfSize:LiteLLMUIFontSize weight:NSFontWeightRegular];
 }
 
-// The settings sidebar follows the native reference: a 13pt medium label, the
-// same weight the system settings sidebar uses.
-constexpr CGFloat LiteLLMSourceListFontSize = 13.0;
+// The settings sidebar follows the native reference: a 13.5pt medium label, a
+// half step above the 13pt body text.
+constexpr CGFloat LiteLLMSourceListFontSize = 13.5;
 
 NSFont *SourceListFont()
 {
   return [NSFont systemFontOfSize:LiteLLMSourceListFontSize weight:NSFontWeightMedium];
+}
+
+// The sidebar title keeps the sidebar's own vibrancy ink: the primary label
+// color resolved for the vibrant appearance the sidebar material installs.  A
+// raw catalog label color is painted opaque black in this table, which reads
+// darker than the shell's app title, while the resolved sidebar ink is the same
+// tone that title and the system settings sidebar use (about 70% black in the
+// light appearance, 90% white in the dark one).
+NSColor *SourceListTitleColor(NSAppearance *appearance)
+{
+  NSAppearanceName match = [appearance bestMatchFromAppearancesWithNames:@[
+    NSAppearanceNameAqua,
+    NSAppearanceNameDarkAqua,
+  ]];
+  const BOOL dark = [match isEqualToString:NSAppearanceNameDarkAqua];
+  NSAppearance *sidebar = [NSAppearance appearanceNamed:dark ? NSAppearanceNameVibrantDark
+                                                            : NSAppearanceNameVibrantLight];
+  if (@available(macOS 11.0, *)) {
+    __block NSColor *resolved = nil;
+    if (sidebar != nil) {
+      [sidebar performAsCurrentDrawingAppearance:^{
+        resolved = [NSColor.labelColor colorUsingColorSpace:NSColorSpace.sRGBColorSpace];
+      }];
+    }
+    if (resolved != nil) {
+      return resolved;
+    }
+  }
+  return NSColor.labelColor;
 }
 
 NSAttributedString *TableCellTitle(NSString *title, NSColor *color)
@@ -951,17 +980,39 @@ void DiscardStaleScrollerSubviews(NSScrollView *scrollView);
 {
   [super setBackgroundStyle:backgroundStyle];
   // The badge keeps its color; only the title follows the row selection so a
-  // selected source-list row reads white on the accent fill. A monochrome
-  // badge-less icon follows the label color instead.
+  // selected source-list row reads white on the accent fill. An unselected
+  // pane title carries the sidebar's vibrancy ink, the same tone the shell's
+  // app title uses, instead of the opaque black this table paints for a plain
+  // catalog label color. A monochrome badge-less icon keeps the secondary tint
+  // that matches the Windows glyph brush.
   const BOOL emphasized = backgroundStyle == NSBackgroundStyleEmphasized;
-  self.label.textColor = emphasized
-      ? NSColor.alternateSelectedControlTextColor
-      : NSColor.secondaryLabelColor;
+  self.label.textColor = emphasized ? NSColor.alternateSelectedControlTextColor : SourceListTitleColor(self.effectiveAppearance);
   if (!self.badgeTinted) {
     self.icon.contentTintColor = emphasized
         ? NSColor.alternateSelectedControlTextColor
         : NSColor.secondaryLabelColor;
   }
+}
+
+@end
+
+// A source-list row without an icon tile: the settings window's subordinate
+// rails are text lists one level below the sidebar's pane list, so they keep
+// the same source-list type step and the same sidebar ink. That ink resolves
+// against the vibrant appearance to a fixed color, so the emphasized state is
+// swapped here by hand, exactly like the tile cell above.
+@interface LiteLLMSourceListTextCellView : NSTableCellView
+@end
+
+@implementation LiteLLMSourceListTextCellView
+
+- (void)setBackgroundStyle:(NSBackgroundStyle)backgroundStyle
+{
+  [super setBackgroundStyle:backgroundStyle];
+  const BOOL emphasized = backgroundStyle == NSBackgroundStyleEmphasized;
+  self.textField.textColor = emphasized
+      ? NSColor.alternateSelectedControlTextColor
+      : SourceListTitleColor(self.effectiveAppearance);
 }
 
 @end
@@ -1116,6 +1167,7 @@ static void InstallPersistentScrollers(NSScrollView *scrollView, BOOL horizontal
 
 @interface LiteLLMNavigationLinkButton : LiteLLMTabButton
 @property(nonatomic) BOOL linkMode;
+@property(nonatomic) BOOL plainLinkMode;
 @property(nonatomic) BOOL defaultAction;
 @end
 
@@ -1132,6 +1184,12 @@ static void InstallPersistentScrollers(NSScrollView *scrollView, BOOL horizontal
   }
   [self updateLinkAppearance];
   [self.window invalidateCursorRectsForView:self];
+}
+
+- (void)setPlainLinkMode:(BOOL)plainLinkMode
+{
+  _plainLinkMode = plainLinkMode;
+  [self updateLinkAppearance];
 }
 
 - (void)setEnabled:(BOOL)enabled
@@ -1215,27 +1273,57 @@ static void InstallPersistentScrollers(NSScrollView *scrollView, BOOL horizontal
   if (!self.linkMode) {
     return;
   }
-  NSColor *color = self.enabled
-      ? (_hovering ? NSColor.controlAccentColor : NSColor.linkColor)
-      : NSColor.secondaryLabelColor;
+  // A plain link is the quieter value under its own name — a file path that
+  // owns the row — so it reads in the secondary ink at the row's weight
+  // instead of the semibold accent-blue navigation link. Its ink never reacts
+  // to hover: the pointer cursor and the underline it always carries are the
+  // link's whole feedback. A disabled control drops to the tertiary ink.
+  NSColor *color = NSColor.secondaryLabelColor;
+  if (self.plainLinkMode) {
+    color = self.enabled ? NSColor.secondaryLabelColor : NSColor.tertiaryLabelColor;
+  } else if (self.enabled) {
+    color = _hovering ? NSColor.controlAccentColor : NSColor.linkColor;
+  }
+  // A plain link carries the row's own weight; a navigation link is semibold.
+  NSFontWeight linkWeight = self.plainLinkMode ? NSFontWeightRegular : NSFontWeightSemibold;
+  NSFont *linkFont = self.font ?: [NSFont systemFontOfSize:LiteLLMUIFontSize weight:linkWeight];
+  // A link stays underlined whether or not the pointer is over it: the
+  // underline is the affordance, not the hover feedback. A navigation link
+  // keeps its underline for hover only — its inline bezel already marks it as
+  // an action — while the quiet variant carries it at rest.
+  const BOOL underlined = self.enabled &&
+      self.title.length > 0 &&
+      (self.plainLinkMode || _hovering);
   self.attributedTitle = [[NSAttributedString alloc] initWithString:self.title ?: @"" attributes:@{
-    NSFontAttributeName: self.font ?: [NSFont systemFontOfSize:LiteLLMUIFontSize weight:NSFontWeightSemibold],
+    NSFontAttributeName: linkFont,
     NSForegroundColorAttributeName: color,
-    NSUnderlineStyleAttributeName: _hovering && self.enabled && self.title.length > 0
-        ? @(NSUnderlineStyleSingle)
-        : @0,
+    NSUnderlineStyleAttributeName: underlined ? @(NSUnderlineStyleSingle) : @0,
   }];
   self.contentTintColor = color;
 }
 
 @end
 
+// The busy wheel is one drawing for the whole app: `AppKitBusySpinner` in
+// AppKitNativeLeaf.swift owns the frames (visible here through the generated
+// Swift header, the way `LiteLLMPersistentScroller` is), and the 分组管理 sheet
+// turns the same wheel beside 密钥.  A busy button draws it as its own leading
+// image, so AppKit centers the icon together with the title exactly like a
+// symbol-with-title button - one centered group, no view laid over the bezel.
+
 @interface LiteLLMAppKitButtonComponentView () <RCTLiteLLMAppKitButtonViewProtocol>
 @end
-
 @implementation LiteLLMAppKitButtonComponentView {
   NSButton *_button;
   LiteLLMAppKitControlHostView *_host;
+  NSTimer *_busyTimer;
+  NSInteger _busyStep;
+  // The content the button draws from, kept here because the busy state has to
+  // re-apply it (an icon-only button swaps its glyph for the spinner).
+  std::string _title;
+  std::string _symbol;
+  BOOL _symbolWithTitle;
+  BOOL _busy;
 }
 
 + (ComponentDescriptorProvider)componentDescriptorProvider
@@ -1256,6 +1344,10 @@ static void InstallPersistentScrollers(NSScrollView *scrollView, BOOL horizontal
 
     _button = [LiteLLMNavigationLinkButton buttonWithTitle:@"" target:self action:@selector(pressed:)];
     _button.identifier = LiteLLMTabStopIdentifier;
+    // A caller may hand a link a narrower frame than its title needs (an inline
+    // probe finding next to its button); the native control then shows an
+    // ellipsis and the player's tooltip carries the whole sentence.
+    _button.lineBreakMode = NSLineBreakByTruncatingTail;
     _button.bezelStyle = NSBezelStyleRounded;
     _button.controlSize = NSControlSizeRegular;
     _button.buttonType = NSButtonTypeMomentaryPushIn;
@@ -1266,6 +1358,58 @@ static void InstallPersistentScrollers(NSScrollView *scrollView, BOOL horizontal
   return self;
 }
 
+// Draws the button from the cached content. A busy button carries the spinner
+// as its leading image, so the icon and the title stay one centered group. An
+// icon-only button has no room for a second glyph: there the spinner takes the
+// icon's place, centered, and the control keeps its icon size.
+- (void)applyButtonContent
+{
+  NSString *title = StringFromStdString(_title);
+  NSImage *symbolImage = ButtonSymbolImage(_symbol);
+  const BOOL showsTitle = symbolImage == nil || _symbolWithTitle;
+  NSImage *image = _busy ? AppKitBusySpinner.frames[(NSUInteger)_busyStep] : symbolImage;
+  _button.image = image;
+  _button.imagePosition = image == nil
+      ? NSNoImage
+      : (showsTitle ? NSImageLeading : NSImageOnly);
+  _button.title = showsTitle ? title : @"";
+}
+
+// The wheel turns only while its action runs; the frames are drawn once and
+// swapped, so the button never re-lays out while it reports progress.
+- (void)updateBusyAnimation
+{
+  [_busyTimer invalidate];
+  _busyTimer = nil;
+  if (!_busy || self.window == nil) {
+    return;
+  }
+  _busyStep = 0;
+  __weak LiteLLMAppKitButtonComponentView *weakSelf = self;
+  _busyTimer = [NSTimer timerWithTimeInterval:AppKitBusySpinner.stepInterval repeats:YES block:^(NSTimer *timer) {
+    LiteLLMAppKitButtonComponentView *strongSelf = weakSelf;
+    if (strongSelf == nil) {
+      [timer invalidate];
+      return;
+    }
+    [strongSelf advanceBusySpinner];
+  }];
+  // Common modes keep the wheel turning while a menu or a scroll is tracking.
+  [NSRunLoop.mainRunLoop addTimer:_busyTimer forMode:NSRunLoopCommonModes];
+}
+
+- (void)advanceBusySpinner
+{
+  _busyStep = (_busyStep + 1) % AppKitBusySpinner.stepCount;
+  _button.image = AppKitBusySpinner.frames[(NSUInteger)_busyStep];
+}
+
+- (void)viewDidMoveToWindow
+{
+  [super viewDidMoveToWindow];
+  [self updateBusyAnimation];
+}
+
 - (void)updateProps:(const Props::Shared &)props oldProps:(const Props::Shared &)oldProps
 {
   const auto &oldViewProps = *std::static_pointer_cast<const LiteLLMAppKitButtonProps>(_props);
@@ -1274,27 +1418,37 @@ static void InstallPersistentScrollers(NSScrollView *scrollView, BOOL horizontal
   const BOOL symbolChanged = oldViewProps.symbol != newViewProps.symbol;
   const BOOL symbolWithTitleChanged = oldViewProps.symbolWithTitle != newViewProps.symbolWithTitle;
   const BOOL linkChanged = oldViewProps.link != newViewProps.link;
+  const BOOL plainLinkChanged = oldViewProps.plainLink != newViewProps.plainLink;
   const BOOL compactChanged = oldViewProps.compact != newViewProps.compact;
   const BOOL disabledChanged = oldViewProps.disabled != newViewProps.disabled;
+  const BOOL busyChanged = oldViewProps.busy != newViewProps.busy;
   BOOL link = newViewProps.link;
+  // A plain link still behaves like a link, but owns no inline bezel and
+  // left-aligns its title: that is what a long value such as a file path
+  // needs when the caller gives it the whole column width.
+  BOOL plainLink = link && newViewProps.plainLink;
   BOOL useCompactControl = newViewProps.compact && !link;
   BOOL defaultAction = !link && newViewProps.primary && !newViewProps.disabled;
 
-  if (titleChanged || symbolChanged || symbolWithTitleChanged) {
+  if (titleChanged || symbolChanged || symbolWithTitleChanged || busyChanged) {
     NSString *title = StringFromStdString(newViewProps.title);
-    NSImage *symbolImage = ButtonSymbolImage(newViewProps.symbol);
-    const BOOL showsTitle = symbolImage == nil || newViewProps.symbolWithTitle;
-    _button.image = symbolImage;
-    _button.imagePosition = symbolImage == nil
-        ? NSNoImage
-        : (newViewProps.symbolWithTitle ? NSImageLeading : NSImageOnly);
-    _button.title = showsTitle ? title : @"";
+    _title = newViewProps.title;
+    _symbol = newViewProps.symbol;
+    _symbolWithTitle = newViewProps.symbolWithTitle;
+    _busy = newViewProps.busy;
+    [self applyButtonContent];
     if (newViewProps.toolTip.empty()) {
       _button.toolTip = title;
     }
     if (newViewProps.accessibilityLabel.empty()) {
       _button.accessibilityLabel = title;
     }
+  }
+  if (busyChanged) {
+    // A busy button keeps its title, width, and enabled appearance; the
+    // leading spinner is the whole feedback.
+    [self applyButtonContent];
+    [self updateBusyAnimation];
   }
   if (oldViewProps.toolTip != newViewProps.toolTip) {
     _button.toolTip = newViewProps.toolTip.empty() ? StringFromStdString(newViewProps.title) : StringFromStdString(newViewProps.toolTip);
@@ -1306,6 +1460,7 @@ static void InstallPersistentScrollers(NSScrollView *scrollView, BOOL horizontal
     _button.enabled = !newViewProps.disabled;
   }
   if (linkChanged ||
+      plainLinkChanged ||
       oldViewProps.primary != newViewProps.primary ||
       oldViewProps.destructive != newViewProps.destructive ||
       compactChanged ||
@@ -1315,10 +1470,16 @@ static void InstallPersistentScrollers(NSScrollView *scrollView, BOOL horizontal
     ((LiteLLMNavigationLinkButton *)_button).defaultAction = defaultAction;
     _button.hasDestructiveAction = !link && newViewProps.destructive;
     _button.controlSize = useCompactControl ? NSControlSizeSmall : NSControlSizeRegular;
+    // A plain link carries the same weight as the row it belongs to; only a
+    // navigation link is drawn semibold.
+    NSFontWeight linkWeight = plainLink ? NSFontWeightRegular : NSFontWeightSemibold;
     _button.font = link
-        ? [NSFont systemFontOfSize:LiteLLMUIFontSize weight:NSFontWeightSemibold]
+        ? [NSFont systemFontOfSize:LiteLLMUIFontSize weight:linkWeight]
         : [NSFont systemFontOfSize:LiteLLMUIFontSize];
     ((LiteLLMNavigationLinkButton *)_button).linkMode = link;
+    ((LiteLLMNavigationLinkButton *)_button).plainLinkMode = plainLink;
+    _button.bordered = !plainLink;
+    _button.alignment = plainLink ? NSTextAlignmentLeft : NSTextAlignmentCenter;
   }
   if (!link && !newViewProps.primary) {
     _button.bezelColor = nil;
@@ -1327,12 +1488,10 @@ static void InstallPersistentScrollers(NSScrollView *scrollView, BOOL horizontal
   }
   if (!link && linkChanged) {
     _button.contentTintColor = nil;
-    _button.title = ButtonSymbolImage(newViewProps.symbol) == nil || newViewProps.symbolWithTitle
-        ? StringFromStdString(newViewProps.title)
-        : @"";
+    [self applyButtonContent];
   }
 
-  if (titleChanged || symbolChanged || symbolWithTitleChanged || linkChanged || compactChanged) {
+  if (titleChanged || symbolChanged || symbolWithTitleChanged || linkChanged || plainLinkChanged || compactChanged || busyChanged) {
     [_host setNeedsLayout:YES];
   }
   [super updateProps:props oldProps:oldProps];
@@ -1347,6 +1506,7 @@ static void InstallPersistentScrollers(NSScrollView *scrollView, BOOL horizontal
   static const auto defaultProps = std::make_shared<const LiteLLMAppKitButtonProps>();
   _props = defaultProps;
   ((LiteLLMNavigationLinkButton *)_button).linkMode = NO;
+  ((LiteLLMNavigationLinkButton *)_button).plainLinkMode = NO;
   _button.image = nil;
   _button.imagePosition = NSNoImage;
   _button.title = @"";
@@ -1361,7 +1521,19 @@ static void InstallPersistentScrollers(NSScrollView *scrollView, BOOL horizontal
   _button.controlSize = NSControlSizeRegular;
   _button.font = [NSFont systemFontOfSize:LiteLLMUIFontSize];
   _button.contentTintColor = nil;
+  _title.clear();
+  _symbol.clear();
+  _symbolWithTitle = NO;
+  _busy = NO;
+  [_busyTimer invalidate];
+  _busyTimer = nil;
+  _busyStep = 0;
   [_host setNeedsLayout:YES];
+}
+
+- (void)dealloc
+{
+  [_busyTimer invalidate];
 }
 
 - (void)pressed:(__unused id)sender
@@ -2428,9 +2600,12 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
     [self applySourceListChrome:newViewProps.sourceList];
   }
   if (compactChanged || sourceListChanged) {
-    // Sidebar rows use the compact native source-list rhythm while keeping the
-    // bundled icon tile optically centered.
-    _tableView.rowHeight = newViewProps.sourceList ? 26 : (newViewProps.compact ? 22 : 28);
+    // Sidebar rows use the native source-list rhythm; a compact source list is
+    // the pane's own rail one level down, so it takes one density step below the
+    // sidebar's 30 pt without losing the badge tile's optical centering.
+    _tableView.rowHeight = newViewProps.sourceList
+        ? (newViewProps.compact ? 26 : 30)
+        : (newViewProps.compact ? 22 : 28);
     _tableView.intercellSpacing = newViewProps.sourceList ? NSMakeSize(0, 2) : NSZeroSize;
     if (_tableView.headerView != nil) {
       NSRect headerFrame = _tableView.headerView.frame;
@@ -2571,7 +2746,12 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   // selectedKey props, so an empty per-table selection must be representable.
   _tableView.allowsEmptySelection = YES;
   _tableView.backgroundColor = sourceList ? NSColor.clearColor : NSColor.controlBackgroundColor;
-  _scrollView.drawsBackground = !sourceList;
+  // The scroller floats over the clip view, so the scroll view must not paint
+  // its own background in the strip it still reserves for it: that paint landed
+  // on top of the content and covered the row under the knob with a white block
+  // (most visible over a selected row).  The table draws the row background
+  // itself; the source list stays transparent for the window material.
+  _scrollView.drawsBackground = NO;
   // Source-list rows stay transparent: the settings window itself carries one
   // sidebar material behind every pane, so a per-table backdrop would double
   // the vibrancy and leave the surrounding sidebar a different shade.
@@ -2807,6 +2987,16 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   // legitimately sit inside the header strip, and re-parking it here undid the
   // first wheel notch over a table whose overflow is only a few points.
   if (_tableView.headerView != nil) {
+    // The scroller floats over the clip view, so AppKit tiled the header once
+    // for the pre-float width and left an uncovered strip beside it: the scroll
+    // view's white background showed through as a notch above the floating knob.
+    // Keep the header exactly as wide as the content it labels.
+    NSRect headerFrame = _tableView.headerView.frame;
+    const CGFloat headerWidth = NSWidth(visibleBounds);
+    if (fabs(NSWidth(headerFrame) - headerWidth) > 0.5) {
+      headerFrame.size.width = headerWidth;
+      _tableView.headerView.frame = headerFrame;
+    }
     const CGFloat restingOrigin = -NSHeight(_tableView.headerView.frame);
     const CGFloat originY = NSMinY(_clipView.bounds);
     if (fabs(originY) < 0.5) {
@@ -2995,10 +3185,17 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   }
   const size_t cellIndex = static_cast<size_t>(row) * columnCount + static_cast<size_t>(columnIndex);
   NSString *value = cellIndex < viewProps.cells.size() ? StringFromStdString(viewProps.cells[cellIndex]) : @"";
-  NSUserInterfaceItemIdentifier identifier = @"LiteLLMAppKitTableCell";
+  // A source-list row without an icon tile is the settings window's own
+  // subordinate rail — the runtime table of contents, the backup & sync tabs,
+  // and the external client list. It is a navigation list one level below the
+  // sidebar, so it carries the sidebar's own type step and ink instead of
+  // falling through to an ordinary body cell.
+  const bool railRow = viewProps.sourceList;
+  NSUserInterfaceItemIdentifier identifier = railRow ? @"LiteLLMAppKitSourceListTextCell" : @"LiteLLMAppKitTableCell";
   NSTableCellView *cell = [tableView makeViewWithIdentifier:identifier owner:self];
   if (cell == nil) {
-    cell = [[NSTableCellView alloc] initWithFrame:NSZeroRect];
+    Class cellClass = railRow ? [LiteLLMSourceListTextCellView class] : [NSTableCellView class];
+    cell = [[cellClass alloc] initWithFrame:NSZeroRect];
     cell.identifier = identifier;
     NSTextField *label = [NSTextField labelWithString:@""];
     label.translatesAutoresizingMaskIntoConstraints = NO;
@@ -3026,15 +3223,21 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
     else if (constraint.firstAttribute == NSLayoutAttributeTrailing) constraint.constant = -columnPadding;
   }
   NSTextField *label = cell.textField;
-  label.font = TableCellFont();
   const std::string &rowKey = viewProps.rowKeys[static_cast<size_t>(row)];
-  const bool disabled = std::find(viewProps.disabledRowKeys.begin(), viewProps.disabledRowKeys.end(), rowKey) != viewProps.disabledRowKeys.end();
-  const std::string cellKey = rowKey + "\x1f" + std::to_string(columnIndex);
-  const bool secondary = std::find(viewProps.secondaryCellKeys.begin(), viewProps.secondaryCellKeys.end(), cellKey) != viewProps.secondaryCellKeys.end();
-  const bool alert = std::find(viewProps.alertRowKeys.begin(), viewProps.alertRowKeys.end(), rowKey) != viewProps.alertRowKeys.end();
-  NSColor *textColor = alert ? NSColor.systemBrownColor : (disabled || secondary ? NSColor.secondaryLabelColor : NSColor.labelColor);
-  label.textColor = textColor;
-  label.attributedStringValue = TableCellTitle(value, textColor);
+  if (railRow) {
+    label.stringValue = value;
+    label.font = SourceListFont();
+    label.textColor = SourceListTitleColor(self.effectiveAppearance);
+  } else {
+    const bool disabled = std::find(viewProps.disabledRowKeys.begin(), viewProps.disabledRowKeys.end(), rowKey) != viewProps.disabledRowKeys.end();
+    const std::string cellKey = rowKey + "\x1f" + std::to_string(columnIndex);
+    const bool secondary = std::find(viewProps.secondaryCellKeys.begin(), viewProps.secondaryCellKeys.end(), cellKey) != viewProps.secondaryCellKeys.end();
+    const bool alert = std::find(viewProps.alertRowKeys.begin(), viewProps.alertRowKeys.end(), rowKey) != viewProps.alertRowKeys.end();
+    NSColor *textColor = alert ? NSColor.systemBrownColor : (disabled || secondary ? NSColor.secondaryLabelColor : NSColor.labelColor);
+    label.font = TableCellFont();
+    label.textColor = textColor;
+    label.attributedStringValue = TableCellTitle(value, textColor);
+  }
   label.toolTip = value;
   label.accessibilityLabel = value;
   cell.toolTip = value;
@@ -3288,6 +3491,7 @@ WKProcessPool *LiteLLMCodeEditorProcessPool(void)
     <RCTLiteLLMAppKitCodeWebViewViewProtocol, WKNavigationDelegate, WKScriptMessageHandler>
 - (void)loadEditorHTML:(NSString *)html;
 - (void)recoverEditorPageWithError:(NSString *)error;
+- (void)insertPasteboardText:(NSString *)text;
 @end
 
 @implementation LiteLLMAppKitCodeWebViewComponentView {
@@ -3521,6 +3725,10 @@ WKProcessPool *LiteLLMCodeEditorProcessPool(void)
     [self emitEditorError:error];
     return;
   }
+  if ([type isEqualToString:@"paste"]) {
+    [self insertPasteboardText:[[NSPasteboard generalPasteboard] stringForType:NSPasteboardTypeString]];
+    return;
+  }
   if (![type isEqualToString:@"change"]) {
     [self emitEditorError:@"unknown_editor_message"];
     return;
@@ -3547,6 +3755,35 @@ WKProcessPool *LiteLLMCodeEditorProcessPool(void)
       boundedCount(payload[@"changed"]),
       boundedCount(payload[@"deleted"])};
   std::static_pointer_cast<const LiteLLMAppKitCodeWebViewEventEmitter>(_eventEmitter)->onEditorChange(event);
+}
+
+// The page cannot read the system pasteboard from its own script context, so
+// its context menu asks the host for the text and receives it as plain text.
+- (void)insertPasteboardText:(NSString *)text
+{
+  if (text.length == 0) {
+    return;
+  }
+  // Keep the injected payload bounded; the editor document itself is capped
+  // at 2 MiB. Never split a surrogate pair at the truncation point.
+  static const NSUInteger maximumLength = 262144;
+  if (text.length > maximumLength) {
+    NSRange range = NSMakeRange(0, maximumLength);
+    unichar last = [text characterAtIndex:maximumLength - 1];
+    if (last >= 0xD800 && last <= 0xDBFF) {
+      range.length -= 1;
+    }
+    text = [text substringWithRange:range];
+  }
+  NSDictionary<NSString *, id> *payload = @{@"type": @"insertText", @"text": text};
+  NSData *jsonData = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
+  if (jsonData == nil) {
+    return;
+  }
+  NSString *json = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
+  NSString *script = [NSString stringWithFormat:
+      @"window.LiteLLMCodeEditor && window.LiteLLMCodeEditor.receive(%@);", json];
+  [_webView evaluateJavaScript:script completionHandler:nil];
 }
 
 - (void)emitEditorError:(NSString *)message

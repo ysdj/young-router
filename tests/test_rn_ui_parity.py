@@ -127,17 +127,17 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
     def test_assistant_settings_use_one_shared_surface_with_active_domain_actions(self) -> None:
         for marker in (
-            'type AssistantSettingsDomain = "codex" | "claude";',
+            'type AssistantSettingsDomain = "codex" | "claude" | "clients";',
             'const settingsRoute = isAssistantSettingsRoute(route);',
             'const domain = settingsRoute ? undefined : domainForRoute(route);',
             '<AssistantSettingsWorkspace',
-            'assistantSettingsScroll',
-            'assistantQuickGrid',
-            'assistantRawGrid',
+            'externalSettingsWorkspace',
+            '<SettingsRail',
             'await flushPendingFields();',
+            "assistantFileSurfaceStyles.fileRow",
             'const stagedDomainsForRoute = useCallback((currentSnapshot: CoreSnapshot | undefined): ConfigDomain[] => {',
             'if (settingsRoute) {',
-            'return (["codex", "claude"] as const).filter((name) => currentSnapshot?.drafts[name]?.dirty);',
+            'return (["codex", "claude", "clients"] as const).filter((name) => currentSnapshot?.drafts[name]?.dirty);',
             'const dirtyDomains = stagedDomainsForRoute(current);',
             'for (const name of dirtyDomains) {',
             'const needsDiscardConfirmation = routeHasStagedChanges(current);',
@@ -147,6 +147,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn('selected={settingsTab}', self.ui)
         self.assertNotIn('<WindowTabs values={[{ id: "codex", title: "Codex" }, { id: "claude", title: "Claude" }]}', self.ui)
         self.assertNotIn('patch_deployment', self.ui)
+
     def test_apply_serializes_pending_core_field_commits(self) -> None:
         flush = self.ui.split("const flushPendingFields = async (): Promise<void> => {", 1)[1].split(
             "const hasPendingFieldEdits",
@@ -196,9 +197,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('setProviderWizardOpen(true);')
         self.assert_ui_has('return () => setProviderWizardOpen(false);')
         # The raw file editor is the other explicit-action sub-sheet; it also
-        # holds immediate apply while open and saves on its own button.
-        self.assert_ui_has('setAssistantEditorOpen(activeAssistantFile !== undefined);')
-        self.assert_ui_has('title={translate("common.save")}')
+        # holds immediate apply while open and saves (and closes) on its own
+        # button.
+        self.assert_ui_has('setAssistantEditorOpen(requested);')
+        self.assert_ui_has('title={translate("status.saveAndClose")}')
         gate = (ROOT / "rn/packages/shared/src/ui/providerWizardGate.ts").read_text(encoding="utf-8")
         self.assertIn("let providerWizardOpen = false;", gate)
         self.assertIn("export function setProviderWizardOpen(open: boolean): void {", gate)
@@ -296,11 +298,19 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
     def test_provider_probe_applies_a_changed_recommendation_without_locking_the_workspace(self) -> None:
         for marker in (
-            'title={probing ? translate("providers.probing") : translate("providers.probe")}',
+            'title={probeTitle}',
             'function modelProbePresentation(',
-            'translate("providers.probeSummaryAvailable"',
-            'tooltip={probeDetailHint}',
-            'accessibilityHint={probeDetailHint}',
+            '? translate("providers.probeInlineReady")',
+            '? translate("providers.probeInlinePartial")',
+            '? translate("providers.probeInlineRefused")',
+            '? translate("providers.probeInlineTimeout")',
+            'const uniformStatus = surfaceStatuses.size === 1 ? [...surfaceStatuses][0] : "";',
+            '? translate("providers.probeInlineAuthError")',
+            '? translate("providers.probeInlineUnsupported")',
+            'const compactReason = (deepTestIncluded ? degradationLine : "")',
+            'const compact = [availabilityCount, compactReason].filter(Boolean).join("; ");',
+            'translate("providers.probeResultPrefix")',
+            'styles.inspectorProbeFinding}',
             'void native.showReadOnlyText({',
             'language: "text"',
             'translate("providers.probeOriginalRequest"',
@@ -329,9 +339,127 @@ class ReactNativeUiParityTests(unittest.TestCase):
         ):
             self.assert_ui_has(marker)
 
+    def test_host_bridges_keep_a_long_model_probe_alive(self) -> None:
+        """A 30 s loopback timeout used to cut off a slow deep test."""
+
+        macos_bridge = (ROOT / "rn/apps/macos/src/native/macos/CoreIPCBridge.swift").read_text(encoding="utf-8")
+        windows_bridge = (ROOT / "rn/apps/windows/src/native/windows/CoreIPCBridge.cpp").read_text(encoding="utf-8")
+        self.assertIn("private static func responseTimeoutInterval(for method: String) -> TimeInterval {", macos_bridge)
+        self.assertIn("method == \"probe\" ? 900 : 30", macos_bridge)
+        self.assertIn("timeoutInterval: Self.responseTimeoutInterval(for: metadata.method)", macos_bridge)
+        self.assertIn('const int receive_timeout_ms = method == "probe" ? 900000 : 30000;', windows_bridge)
+        self.assertIn('Request(endpoint, L"", L"POST", request_json, session, receive_timeout_ms);', windows_bridge)
+
+    def test_model_detail_deep_test_names_the_degradation_probe_before_it_runs(self) -> None:
+        # The button reports what the deep test will actually run: a Responses
+        # route whose name the staged engine can attribute adds the
+        # degradation fingerprint probe, every other route stays a plain probe.
+        for marker in (
+            'const degradationIncluded = booleanValue(asRecord(model.deep_probe).includes_degradation);',
+            'const probeTitle = degradationIncluded',
+            '? translate("providers.deepTest")',
+            ': translate("providers.probe");',
+            '<ActionButton title={probeTitle} titleWidth="tight" busy={probing} toolTip={(probePresentation.compact ? probePresentation.tooltip : "") || (degradationIncluded ? translate("providers.deepTestHint") : undefined)} disabled={(busy && !probing) || !probeReady} onPress={probe} />',
+            'function probeDegradationLine(degradation: UnknownRecord, translate: Translate, detailed = false): string {',
+            'function probeDegradationDetails(degradation: UnknownRecord, translate: Translate): string {',
+            'const degradation = asRecord(result?.degradation ?? probe.degradation);',
+            'case "matched":',
+            'case "mismatch":',
+            'case "unavailable":',
+            'translate("providers.degradationEngine", { engine: stringValue(engine.name), revision: revision || "?" })',
+            'titleWidth="tight"',
+            'accessibilityRole="link" accessibilityLabel={probePresentation.compactSentence}',
+            'const degradationSentence = probeDegradationLine(degradation, translate, true);',
+            'const tooltip = joinProbeSummary([compactSentence, availabilitySentence, degradationSentence]);',
+            '? translate("providers.probeInlineReady")',
+            '? translate("providers.probeInlinePartial")',
+            '? translate("providers.probeInlineRefused")',
+            '? translate("providers.probeInlineTimeout")',
+            'const uniformStatus = surfaceStatuses.size === 1 ? [...surfaceStatuses][0] : "";',
+            '? translate("providers.probeInlineAuthError")',
+            '? translate("providers.probeInlineUnsupported")',
+            'const compactReason = (deepTestIncluded ? degradationLine : "")',
+            'const compact = [availabilityCount, compactReason].filter(Boolean).join("; ");',
+            'translate("providers.probeResultPrefix")',
+            'styles.inspectorProbeFinding}',
+        ):
+            self.assert_ui_has(marker)
+        # Only the availability finding may ever change stored routing; a
+        # fingerprint mismatch is reported and nothing else.
+        self.assertNotIn('degradation.status === "mismatch") ', self.ui)
+        for marker in (
+            'const unreachableCount = surfaces.filter((surface) => surface.status === "network_error").length;',
+            '? translate("providers.probeSummaryUnreachable")',
+            ': translate("providers.probeSummaryUnavailable")',
+            '.filter((text, index, all) => all.indexOf(text) === index)',
+            'case "unreachable":',
+            'function probeFailureKey(degradation: UnknownRecord): TranslationKey {',
+            'case "auth_error":',
+            'return "providers.probeInlineAuthError";',
+        ):
+            self.assert_ui_has(marker)
+        for marker in (
+            '"providers.probeResultPrefix": "结果:"',
+            '"providers.probeAvailabilityCount": "{available}/{total} 可用"',
+            '"providers.probeSummaryUnavailable": "不可用"',
+            '"providers.probeSummaryUnreachable": "上游未响应"',
+            '"providers.degradationMatched": "未降智"',
+            '"providers.degradationMatchedDetail": "未降智（指纹与 {target} 一致）"',
+            '"providers.degradationMismatch": "疑似降智"',
+            '"providers.degradationMismatchDetail": "降智：指纹更像 {label}（目标 {target}）"',
+            '"providers.degradationUnknown": "指纹存疑"',
+            '"providers.degradationUnreachable": "上游未响应"',
+        ):
+            self.assertIn(marker, self.zh)
+        # The result line carries the finding itself: a "总结:" label would only
+        # eat the width the pane needs for the whole short result.
+        self.assertNotIn("总结", self.zh)
+        self.assertIn('"providers.degradationMatched": "Not degraded"', self.en)
+        self.assertIn('"providers.degradationMismatch": "Looks degraded"', self.en)
+        self.assertIn('"providers.probeSummaryUnreachable": "Upstream did not answer"', self.en)
+        self.assertIn('"providers.probeResultPrefix": "Result:"', self.en)
+        self.assertIn('"providers.probeAvailabilityCount": "{available}/{total} available"', self.en)
+        self.assertIn('"providers.probeInlineRefused": "Refused"', self.en)
+        self.assertIn('"providers.probeInlineAuthError": "Key refused"', self.en)
+        for marker in (
+            'function nativeButtonTightWidth(title: string, plainLink = false): number {',
+            'return Math.max(44, Math.ceil(nativeControlTextWidth(title) + 20));',
+            'titleWidth?: "auto" | "tight" | "flex";',
+            'props.busy === undefined ? reservation : nativeButtonBusyMinimumWidth(props.title, reservation, props.plainLink === true)',
+            'function NativeButtonWithRef({ titleWidth: titleWidthRequest, ...props }, ref)',
+            'const BUSY_SPINNER_SIZE = 12;',
+        ):
+            self.assertIn(marker, self.native_controls)
+        self.assert_ui_has('titleWidth={titleWidth} toolTip={toolTip} onPress={onPress} style={style} />;')
+        for marker in (
+            '"providers.probe": "探测"',
+            '"providers.deepTest": "深测"',
+            '"providers.deepTestHint": "先验可用性，再比对降智指纹（TraceOne）"',
+            '"providers.degradationUnavailable": "深测不可用"',
+            '"providers.degradationError": "深测失败"',
+        ):
+            self.assertIn(marker, self.zh)
+        for marker in (
+            '"providers.probe": "Probe"',
+            '"providers.deepTest": "Deep test"',
+        ):
+            self.assertIn(marker, self.en)
+
     def test_unprobed_models_do_not_render_a_status_placeholder(self) -> None:
-        self.assert_ui_has('return { compact: "", full: "" };')
-        self.assert_ui_has('{probePresentation.compact ? <Pressable')
+        self.assert_ui_has('return { compact: "", compactSentence: "", tooltip: "", full: "" };')
+        self.assertIn('export function nativeControlTextWidth(label: string): number {', self.native_controls)
+        self.assertIn('if (plainLink) return Math.ceil(nativeControlTextWidth(title)) + 2;', self.native_controls)
+        self.assert_ui_has('{probePresentation.compactSentence ? <Pressable style={styles.inspectorProbeFinding}')
+        self.assert_ui_has('onPress={openProbeDetails} accessibilityRole="link" accessibilityLabel={probePresentation.compactSentence}')
+        self.assert_ui_has('inspectorProbeFindingText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textDecorationLine: "underline" }')
+        # A link also owns its cursor: the pointing hand, on both platforms.
+        self.assert_ui_has('inspectorProbeFinding: { flexShrink: 1, minWidth: 0, cursor: "pointer" }')
+        self.assert_ui_has('const compactSentence = `${translate("providers.probeResultPrefix")} ${compact}`;')
+        self.assert_ui_has('ellipsizeMode="tail" tooltip={probePresentation.tooltip}')
+        # The whole finding - label included - is one grey underlined link: the
+        # underline is what says it can be clicked, so nothing is bolded.
+        self.assertNotIn('inspectorProbeResultLabel', self.ui)
+
         self.assertNotIn(
             '<TooltipText numberOfLines={2} tooltip={probeTooltip} accessibilityHint={probePresentation.full} style={styles.probeSummary}>{probePresentation.compact}</TooltipText></View>',
             self.ui,
@@ -351,19 +479,89 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('"providers.protocolModeFallback": "Auto-adapt"', self.en)
         self.assertIn('"providers.fallbackProtocol": "Backup protocol"', self.en)
 
-    def test_provider_probe_button_is_disabled_while_probing(self) -> None:
+    def test_provider_probe_button_reports_progress_without_graying_out(self) -> None:
         self.assert_ui_has(
-            '<ActionButton title={probing ? translate("providers.probing") : translate("providers.probe")} disabled={busy || probing || !probeReady} onPress={probe} />'
+            '<ActionButton title={probeTitle} titleWidth="tight" busy={probing} toolTip={(probePresentation.compact ? probePresentation.tooltip : "") || (degradationIncluded ? translate("providers.deepTestHint") : undefined)} disabled={(busy && !probing) || !probeReady} onPress={probe} />'
         )
+        # The probe keeps its own name while it runs: the button carries the
+        # progress as a leading spinner instead of a swapped title.
+        self.assert_ui_not_has('title={probing ? translate("providers.probing")')
+        self.assert_ui_has(
+            "onPress={probe} />{probePresentation.compactSentence ? <Pressable style={styles.inspectorProbeFinding}",
+        )
+        self.assert_ui_not_has("probeSummaryTrigger")
+        self.assert_ui_not_has('styles.probeSummary}')
         self.assert_ui_has('const probeReady = Boolean(')
         self.assertNotIn('await flushPendingFields();\n      const before = await ipc.snapshot();', self.ui)
+
+    def test_loading_buttons_keep_their_title_width_and_color_with_a_spinner(self) -> None:
+        """A working button reports progress; it never disables, renames, or resizes itself."""
+
+        # The shared contract: a busy button is handed a spinner the native
+        # control draws as the button's leading image, so it centers the icon
+        # with the title as one group and keeps the width its own reservation
+        # already gave it. A caller that hugs its label adds that slot itself.
+        for marker in (
+            "busy?: boolean;",
+            "busy: props.busy === true,",
+            "function nativeButtonBusyMinimumWidth(",
+            "const BUSY_SPINNER_SLOT = 2 * (BUSY_SPINNER_SIZE + BUSY_SPINNER_GAP + BUSY_SPINNER_BEZEL_ROOM);",
+        ):
+            self.assertIn(marker, self.native_controls)
+        for component in ("macos", "windows"):
+            spec = (ROOT / f"rn/packages/shared/src/ui/{component}/NativeButtonNativeComponent.ts").read_text(encoding="utf-8")
+            self.assertIn("busy?: WithDefault<boolean, false>;", spec)
+        # Every loading button reports its own progress and keeps its label;
+        # the disabled state is left for controls that merely wait on a sibling.
+        for marker in (
+            'busy={processing} disabled={wizardBusy && !processing}',
+            'busy={loginBusy} disabled={(wizardBusy && !loginBusy)',
+            'busy={modelFetchState === "loading"}',
+            'busy={fetchModelsBusy} disabled={(busy && !fetchModelsBusy)',
+            'busy={probing}',
+            'busy={saving} disabled={(busy && !saving)',
+            'busy={clientActionBusy}',
+            'busy={serviceBusy} disabled={snapshot === undefined || (busy && !serviceBusy)}',
+            'busy={cooldownClearPending}',
+            'busy={pendingAction === "import"}',
+            'busy={pendingAction === "export"}',
+            'busy={probeBusy} disabled={busy && !probeBusy}',
+            'busy={pendingAction === "sync"}',
+        ):
+            self.assert_ui_has(marker)
+        for marker in (
+            'busy={pendingAction === "cleanup"}',
+            'busy={pendingAction === "add"}',
+            'busy={pendingAction === "login"}',
+            'busy={pendingAction === "remove"}',
+        ):
+            self.assertIn(marker, self.relay)
+        # A busy button stays pressable, so each converted action carries its
+        # own re-entry guard instead of relying on `disabled`.
+        for marker in (
+            "if (loginBusy) return;",
+            "if (processing) return;",
+            "if (modelFetchState === \"loading\") return;",
+            "if (fetchModelsBusy) return;",
+            "if (cooldownClearPending) return;",
+            "if (relayAddBusy) return;",
+            "if (authPending !== undefined) return;",
+        ):
+            self.assert_ui_has(marker)
+        # No loading button renames itself any more.
+        for marker in (
+            'title={processing ? translate("providers.wizard.creating")',
+            'title={serviceBusy ? translate("service.starting")',
+            'title={loginBusy ? translate("relay.stepSignIn")',
+        ):
+            self.assert_ui_not_has(marker)
 
     def test_provider_selection_and_new_models_keep_independent_stable_state(self) -> None:
         self.assert_ui_has('onSelectionChange={(key) => { setSelectedProvider(key); setSelectedModel(undefined); setProviderSourceModel(undefined); }}')
         self.assert_ui_has('const pendingModelIds = useRef<{ providerId: string; ids: Set<string> } | undefined>(undefined);')
         self.assertNotIn('knownModelIdsByProvider', self.ui)
         self.assertNotIn('Promise.all(added.map(', self.ui)
-        self.assert_ui_has('disabled={busy || probing || !probeReady}')
+        self.assert_ui_has('disabled={(busy && !probing) || !probeReady}')
 
     def test_new_models_use_zero_order_without_coercing_zero_to_one(self) -> None:
         # A model added from the pane is committed by the shell right away, so
@@ -410,16 +608,21 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('providerInspector: { width: 290, minWidth: 290, maxWidth: 290')
         self.assertNotIn("<ScrollView contentContainerStyle={styles.providerEditorScroll}><ProviderEditor", self.ui)
         self.assert_ui_has("providerEditorContent: { flex: 1, minHeight: 0 }")
-        self.assert_ui_has("providerEditorScrollContent: { paddingTop: 3, paddingLeft: 0, paddingRight: 16, paddingBottom: 12, gap: 6 }")
+        # The inspector pane's header row is the workspace's first row, so it
+        # must not carry a top inset: 供应商: <name> lines up with the left
+        # column's toolbar row (the 添加向导… button) instead of sitting below it.
+        self.assert_ui_has("providerEditorScrollContent: { paddingLeft: 0, paddingRight: 16, paddingBottom: 12, gap: 6 }")
+        self.assertNotIn("providerEditorScrollContent: { paddingTop", self.ui)
         self.assert_ui_has('persistentScrollIndicator: { position: "absolute", width: 0, height: 0 }')
-        self.assert_ui_has('return <PersistentScrollView style={styles.providerEditorContent} contentContainerStyle={styles.providerEditorScrollContent} showsVerticalScrollIndicator nestedScrollEnabled onViewportHeightChange={setEditorViewportHeight} onContentHeightChange={setEditorContentHeight}>')
+        self.assert_ui_has('return <PersistentScrollView style={styles.providerEditorContent} contentContainerStyle={styles.providerEditorScrollContent} showsVerticalScrollIndicator nestedScrollEnabled>')
         self.assert_ui_has('{kind === "apiKey" || (kind === "relay" && !station) ? <ProviderSourceFields')
         self.assert_ui_has("<NativePersistentScrollIndicator style={styles.persistentScrollIndicator} />")
         self.assert_ui_has('showsHorizontalScrollIndicator={false}\n    onLayout=')
         self.assert_ui_has('<PersistentScrollView style={styles.providerWizardModelScroll} contentContainerStyle={styles.providerWizardModelScrollContent} showsVerticalScrollIndicator keyboardShouldPersistTaps="handled">')
         self.assert_ui_has('providersLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }')
         self.assert_ui_has('providerModelColumns: { flex: 1, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }')
-        self.assert_ui_has('inspectorContent: { paddingTop: 3, paddingLeft: 0, paddingRight: 6')
+        self.assert_ui_has('inspectorContent: { paddingLeft: 0, paddingRight: 6')
+        self.assertNotIn("inspectorContent: { paddingTop", self.ui)
         self.assert_ui_has("providerLeftColumn: { flex: 1, minWidth: 0, minHeight: 0, gap: 6 }")
         self.assert_ui_has("providerListPane: { width: 140, minWidth: 140, maxWidth: 140")
         self.assert_ui_has('columns={[{ label: translate("providers.provider"), width: 132 }]}')
@@ -434,7 +637,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('cellHorizontalPadding={6}')
         self.assert_ui_has('firstColumnHorizontalPadding={0}')
         self.assert_ui_has('label={translate("providers.keyName")}')
-        self.assert_ui_has('NativeSecretField plainText autoCommit label={translate("providers.keyValue")}')
+        self.assert_ui_has('NativeSecretField labelVisible={false} plainText autoCommit label={translate("providers.keyValue")}')
         self.assert_ui_has('label={translate("providers.provider")} labelWidth={60} allowShrink')
         self.assert_ui_has('label={translate("providers.protocolMode")} labelWidth={60} allowShrink')
         self.assert_ui_has('pickerShrink: { minWidth: 0 }')
@@ -793,7 +996,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('const SETTINGS_TITLEBAR_INSET = Platform.OS === "macos" ? 32 : 0;', self.ui)
         self.assertIn('settingsDetail: { minWidth: 0, flex: 1, paddingTop: SETTINGS_TITLEBAR_INSET }', self.ui)
         self.assertIn('settingsDetailBody: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }', self.ui)
-        self.assertIn('settingsSidebarTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }', self.ui)
+        self.assertIn('settingsSidebarTitle: { color: systemColors.label, fontSize: SOURCE_LIST_FONT_SIZE, fontWeight: "600" }', self.ui)
         self.assertIn('settingsSidebarDivider: { height: 1, flexShrink: 0, marginHorizontal: 12, backgroundColor: systemColors.separator }', self.ui)
         self.assertIn('settingsPaneTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600" }', self.ui)
         self.assertIn('settingsSidebarList: { flex: 1, minHeight: 0 }', self.ui)
@@ -851,7 +1054,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("export const UI_FONT_SIZE = 13;", typography)
         self.assertIn("export const UI_TIP_FONT_SIZE = 12;", typography)
         self.assertEqual(
-            {"UI_FONT_SIZE", "UI_TIP_FONT_SIZE", "10", "15"},
+            {"UI_FONT_SIZE", "UI_TIP_FONT_SIZE", "SOURCE_LIST_FONT_SIZE", "10", "15"},
             {value.strip() for value in re.findall(r"fontSize:\s*([^,}\n]+)", self.ui)},
         )
         self.assertEqual(
@@ -867,6 +1070,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("panelFeedback: { color: colors.secondary, fontSize: UI_TIP_FONT_SIZE", relay)
 
         self.assertIn("constexpr CGFloat LiteLLMUIFontSize = 13.0;", macos_controls)
+        # The sidebar source list reads a half step above body text on both
+        # hosts, and the React sidebar header keeps the same size.
+        self.assertIn("export const SOURCE_LIST_FONT_SIZE = 13.5;", typography)
+        self.assertIn("constexpr CGFloat LiteLLMSourceListFontSize = 13.5;", macos_controls)
+        self.assertIn("constexpr double kSourceListFontSize = 13.5;", windows_controls)
         self.assertNotIn("systemFontSizeForControlSize", macos_controls)
         self.assertNotRegex(macos_controls, r"(?:systemFontOfSize|monospacedSystemFontOfSize):\d")
         self.assertIn("column.headerCell.attributedStringValue = TableHeaderTitle(columnTitle);", macos_controls)
@@ -877,7 +1085,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
         for source in (windows_controls, windows_leaf, windows_relay):
             self.assertIn("constexpr double kUIFontSize = 13.0;", source)
-            self.assertNotRegex(source, r"FontSize\((?!kUIFontSize\)|kSourceListFontSize\)|kSourceListGlyphFontSize\))")
+            # Every FontSize() call names one of the type steps: the rail's own
+            # ternary picks the source-list step, never a literal.
+            self.assertNotRegex(
+                source,
+                r"FontSize\((?!rail_row \? kSourceListFontSize : kUIFontSize\)|kUIFontSize\)|kSourceListFontSize\)|kSourceListGlyphFontSize\))",
+            )
 
     def test_logs_default_to_requests_and_show_latest_first(self) -> None:
         self.assertNotIn("logInfoBar", self.ui)
@@ -977,44 +1190,6 @@ class ReactNativeUiParityTests(unittest.TestCase):
         ):
             self.assertIn(value, chinese)
 
-    def test_claude_permission_picker_includes_the_official_delegate_mode(self) -> None:
-        claude = self.ui.split("function ClaudeScreen", 1)[1].split(
-            "function AssistantSettingsWorkspace", 1
-        )[0]
-        self.assertIn('translate("claude.desktopProvider")', claude)
-        self.assertNotIn('translate("claude.permissions")', claude)
-        self.assertNotIn("CLAUDE_PERMISSION_MODES", claude)
-
-    def test_claude_structured_forms_are_named_for_their_single_column_layout(self) -> None:
-        claude = self.ui.split("function ClaudeScreen", 1)[1].split(
-            "function AssistantSettingsWorkspace", 1
-        )[0]
-        self.assertIn("assistantSettingsStyles.domainBody", claude)
-        self.assertIn("assistantSettingsStyles.quickFields", claude)
-        self.assertIn("assistantQuickGrid", self.ui)
-        self.assertNotIn("twoColumnForm", self.ui)
-
-    def test_claude_settings_expose_only_the_compact_safe_capability_controls(self) -> None:
-        claude = self.ui.split("function ClaudeScreen", 1)[1].split(
-            "function AssistantSettingsWorkspace", 1
-        )[0]
-        for marker in (
-            'translate("claude.desktopProvider")',
-            'translate("common.model")',
-            'translate("claude.desktopGateway")',
-            'field="desktop_gateway_api_key"',
-        ):
-            self.assertIn(marker, claude)
-        self.assertNotIn('translate("claude.deployment")', claude)
-        self.assertNotIn('field="deployment_token"', claude)
-        for removed in (
-            'translate("claude.permissions")',
-            'translate("claude.capabilities")',
-            'translate("claude.sandbox")',
-            'translate("claude.memory")',
-        ):
-            self.assertNotIn(removed, claude)
-
     def test_relay_metadata_commits_before_native_credential_cleanup_and_persists_a_retry(self) -> None:
         relay = self.relay
         route = self.ui.split("const commitRelayMetadata", 1)[1].split("const flushPendingFields", 1)[0]
@@ -1068,12 +1243,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("secondaryCellKeys,", self.native_controls)
         self.assertIn("const spanningRowKeys = rows.filter((row) => row.spanning).map((row) => row.key);", self.native_controls)
         self.assertIn("spanningRowKeys,", self.native_controls)
-        # Five data tables plus the settings shell's pane source list, the
-        # runtime table of contents, and the backup & sync rail.
-        self.assertEqual(self.ui.count("<NativeTable"), 8)
+        # Five data tables, the settings shell's pane source list, and the one
+        # subordinate rail every split pane renders from the shared component.
+        self.assertEqual(self.ui.count("<NativeTable"), 7)
         self.assertEqual(self.ui.count("alternatingRows"), 0)
         self.assertNotIn("selectedKey={selectedRoute ?? \"\"} alternatingRows", self.ui)
-        self.assertEqual(self.ui.count("striped={false}"), 3)
+        self.assertEqual(self.ui.count("striped={false}"), 2)
         shell = self.ui.split("function SettingsShell(", 1)[1].split("function RouteSurface(", 1)[0]
         self.assertIn("striped={false}", shell)
         self.assertIn("_tableView.usesAlternatingRowBackgroundColors = NO;", mac_native)
@@ -1082,13 +1257,28 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("_tableView.selectionHighlightStyle = sourceList", mac_native)
         self.assertIn("NSTableViewSelectionHighlightStyleSourceList", mac_native)
         self.assertIn("_tableView.headerView = nil;", mac_native)
-        self.assertIn("_scrollView.drawsBackground = !sourceList;", mac_native)
+        self.assertIn("_scrollView.drawsBackground = NO;", mac_native)
+        self.assertNotIn("_scrollView.drawsBackground = !sourceList;", mac_native)
         # The shell and the runtime TOC coordinate their selection through the
         # JS selectedKey props, so the source-list chrome must keep empty
         # per-table selection representable.
         self.assertNotIn("_tableView.allowsEmptySelection = !sourceList;", mac_native)
         self.assertIn("NSImage *tileImage = imageName.length > 0 ? [NSImage imageNamed:imageName] : nil;", mac_native)
         self.assertIn("cell.badge.layer.backgroundColor = NSColor.clearColor.CGColor;", mac_native)
+        # A sidebar pane title carries the sidebar's vibrancy ink (the primary
+        # label color resolved for the vibrant sidebar appearance) so it reads
+        # the same tone as the shell's app title; a raw catalog label color is
+        # painted opaque black here, and only the selection swaps the ink for
+        # the emphasized title color.
+        source_list_cell = mac_native.split("@implementation LiteLLMSourceListCellView", 1)[1].split("@end", 1)[0]
+        self.assertIn("NSColor *SourceListTitleColor(NSAppearance *appearance)", mac_native)
+        self.assertIn("NSAppearanceNameVibrantLight", mac_native)
+        self.assertIn("resolved = [NSColor.labelColor colorUsingColorSpace:NSColorSpace.sRGBColorSpace];", mac_native)
+        self.assertIn(
+            "self.label.textColor = emphasized ? NSColor.alternateSelectedControlTextColor : SourceListTitleColor(self.effectiveAppearance);",
+            source_list_cell,
+        )
+        self.assertNotIn("label.textColor = NSColor.secondaryLabelColor;", source_list_cell)
         # The sidebar material now lives on the window itself (AppDelegate),
         # so a source-list table must stay transparent instead of stacking a
         # second backdrop that would darken only the table's own area.
@@ -1175,6 +1365,72 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("} else if (disabled || secondary) {", windows_native)
         self.assertIn("alertRowKeys?: ReadonlyArray<string>;", mac_table_spec + windows_table_spec)
 
+    def test_subordinate_rails_share_one_source_list_style(self) -> None:
+        """Backup & sync, runtime settings, and external clients render one rail.
+
+        The three panes that split their body into a list plus a detail used to
+        carry three hand-built variants of the same source list (140 pt versus
+        156 pt wide, 132 pt versus 148 pt columns), and their symbol-less rows
+        fell through to the ordinary body cell: 13 pt regular ink in a row the
+        sidebar one level up had already left behind. One shared rail keeps the
+        second level on the sidebar's own source-list chrome, one density step
+        below it — the way the platform's own in-pane rows sit under its sidebar
+        rows (macOS measures 32 pt for a sidebar row and about 28 pt inside a
+        pane).
+        """
+        mac_native = MACOS_CONTROLS.read_text(encoding="utf-8")
+        windows_native = WINDOWS_CONTROLS.read_text(encoding="utf-8")
+        self.assertIn("const SETTINGS_RAIL_WIDTH = 156;", self.ui)
+        self.assertIn("const SETTINGS_RAIL_COLUMN_WIDTH = 148;", self.ui)
+        self.assertIn(
+            "settingsRail: { width: SETTINGS_RAIL_WIDTH, flexShrink: 0, minHeight: 0, paddingTop: 6, borderRightWidth: 1, borderRightColor: systemColors.separator }",
+            self.ui,
+        )
+        self.assertIn("settingsRailList: { flex: 1, minHeight: 0 },", self.ui)
+        # One rail: the sidebar's own source-list chrome, no header, no
+        # striping, and one column a translated client name still fits in.
+        rail = self.ui.split("function SettingsRail(", 1)[1].split("\nfunction ", 1)[0]
+        for marker in (
+            'columns={[{ label: "", width: SETTINGS_RAIL_COLUMN_WIDTH }]}',
+            "sourceList",
+            "cellHorizontalPadding={8}",
+            "firstColumnHorizontalPadding={8}",
+            "onSelectionChange={onSelectionChange}",
+        ):
+            self.assertIn(marker, rail)
+        # The rail is the *compact* source list, and the shell's own sidebar is
+        # the regular one: that one density step is what separates the two levels
+        # of the same control.
+        self.assertIn("compact", rail)
+        shell = self.ui.split("function SettingsShell(", 1)[1].split("\nfunction ", 1)[0]
+        self.assertIn("compact={false}", shell)
+        self.assertIn("sourceList", shell)
+        self.assertEqual(self.ui.count("<SettingsRail"), 3)
+        # Every split pane renders it; none of them keeps a rail of its own.
+        for pane_start in (
+            "function AssistantSettingsWorkspace(",
+            "function RuntimeWorkspace(",
+            "function DataManagementWorkspace(",
+        ):
+            self.assertIn("<SettingsRail", self.ui.split(pane_start, 1)[1].split("\nfunction ", 1)[0])
+        for removed_rail in ("externalSettingsRail", "dataManagementRail", "runtimeToc:", "runtimeTocList"):
+            self.assertNotIn(removed_rail, self.ui)
+        # A source-list row without an icon tile is that same list one level
+        # down, so each host gives it the sidebar's own type step and ink
+        # instead of the ordinary body cell.
+        rail_row = mac_native.split("const bool railRow = viewProps.sourceList;", 1)[1].split("label.toolTip = value;", 1)[0]
+        self.assertIn('identifier = railRow ? @"LiteLLMAppKitSourceListTextCell" : @"LiteLLMAppKitTableCell";', rail_row)
+        self.assertIn("Class cellClass = railRow ? [LiteLLMSourceListTextCellView class] : [NSTableCellView class];", rail_row)
+        self.assertIn("label.stringValue = value;", rail_row)
+        self.assertIn("label.font = SourceListFont();", rail_row)
+        self.assertIn("label.textColor = SourceListTitleColor(self.effectiveAppearance);", rail_row)
+        rail_cell = mac_native.split("@implementation LiteLLMSourceListTextCellView", 1)[1].split("@end", 1)[0]
+        self.assertIn("self.textField.textColor = emphasized", rail_cell)
+        self.assertIn("? NSColor.alternateSelectedControlTextColor", rail_cell)
+        self.assertIn(": SourceListTitleColor(self.effectiveAppearance);", rail_cell)
+        self.assertIn("cell.FontSize(rail_row ? kSourceListFontSize : kUIFontSize);", windows_native)
+        self.assertIn("if (rail_row) cell.FontWeight(winrt::Windows::UI::Text::FontWeights::Medium());", windows_native)
+
     def test_route_trace_uses_primary_text_except_active_selection(self) -> None:
         for style in (
             "routeTraceRequestTime: { flexShrink: 0, color: systemColors.label",
@@ -1219,8 +1475,18 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.assertIn("compact?: WithDefault<boolean, false>;", spec)
         # Sidebar source lists use the taller settings density; data tables keep
         # the compact/normal log density.
-        self.assertIn("_tableView.rowHeight = newViewProps.sourceList ? 26 : (newViewProps.compact ? 22 : 28);", mac_native)
-        self.assertIn("row.MinHeight(source_list ? 26.0 : (props.compact.value_or(false) ? 22.0 : 28.0));", windows_native)
+        # The sidebar keeps the native source-list rhythm; the pane's own rail is
+        # a compact source list one density step below it (the platform's own
+        # in-pane rows sit under its sidebar rows).
+        self.assertIn(
+            "_tableView.rowHeight = newViewProps.sourceList ? (newViewProps.compact ? 26 : 30) : (newViewProps.compact ? 22 : 28);",
+            re.sub(r"\s+", " ", mac_native),
+        )
+        self.assertIn(
+            "row.MinHeight(source_list ? (compact_rows ? 26.0 : 30.0) : (compact_rows ? 22.0 : 28.0));",
+            re.sub(r"\s+", " ", windows_native),
+        )
+        self.assertIn("const bool compact_rows = props.compact.value_or(false);", windows_native)
         self.assertIn("AlternatingRowBrush()", windows_native)
 
     def test_native_tables_keep_short_log_columns_readable_and_scroll_overflow(self) -> None:
@@ -1330,11 +1596,34 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.native_controls,
         )
         self.assertIn(
-            "{ minWidth: nativeButtonMinimumWidth(props.title, compact) + (props.symbol ? 22 : 0), flexShrink: 0 }",
+            'minWidth: (props.busy === undefined ? reservation : nativeButtonBusyMinimumWidth(props.title, reservation, props.plainLink === true)) + (props.symbol ? 22 : 0),',
+            self.native_controls,
+        )
+        # A busy button keeps its title, width, and enabled color and shows a
+        # leading spinner in the slack the reservation already leaves, so a
+        # caller that hugs its label gets the slot added to its own width.
+        self.assertIn("const BUSY_SPINNER_SIZE = 12;", self.native_controls)
+        self.assertIn("return Math.max(reservation, Math.ceil(nativeControlTextWidth(title)) + BUSY_SPINNER_SLOT);", self.native_controls)
+        self.assertIn("busy: props.busy === true,", self.native_controls)
+        # The bezel-hugging width is opt-in for a caller that owns its own short
+        # label, and the request never reaches the native component props.
+        self.assertIn('titleWidth?: "auto" | "tight" | "flex";', self.native_controls)
+        self.assertIn(
+            "function NativeButtonWithRef({ titleWidth: titleWidthRequest, ...props }, ref)",
             self.native_controls,
         )
         self.assertIn(
             "const style = [props.link ? styles.linkButton : styles.button, props.style, titleWidth];",
+            self.native_controls,
+        )
+        # ``flex`` hands the width to the caller's container: without it a long
+        # title (a file path) reserves its full text width and widens the row.
+        self.assertIn(
+            'titleWidthRequest === "flex"',
+            self.native_controls,
+        )
+        self.assertIn(
+            "{ minWidth: 0, flexShrink: 1 }",
             self.native_controls,
         )
         self.assertIn(
@@ -1356,7 +1645,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
     def test_settings_workspaces_keep_their_legacy_layout_roots(self) -> None:
         expected_components = {
-            "CodexWorkspace": ("codexWorkspace:",),
+            "AssistantSettingsWorkspace": ("codexWorkspaceFrame:", "assistantSettingsScroll:"),
             "RuntimeWorkspace": ("runtimeWorkspace:", "runtimeScrollSurface:"),
             "DataManagementWorkspace": ("dataManagementWorkspace:", "dataManagementTabs:"),
             "WebDavWorkspace": ("webDavForm:", "webdavFormRows:"),
@@ -1379,7 +1668,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         for marker in (
             '<PersistentScrollView style={styles.generalScroll}',
             '<PersistentScrollView ref={scrollRef} style={styles.runtimeScrollSurface}',
-            '<PersistentScrollView style={styles.assistantSettingsScroll}',
+            '<PersistentScrollView style={styles.externalSettingsPane}',
             '<PersistentScrollView style={styles.dataManagementPane}',
             '<PersistentScrollView\n            ref={timelineScrollRef}',
         ):
@@ -1388,113 +1677,160 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
     def test_assistant_settings_have_one_outer_scroll_surface_without_tabs(self) -> None:
         for marker in (
-            '<PersistentScrollView style={styles.assistantSettingsScroll}',
-            "assistantSettingsScrollContent",
-            "assistantQuickSection",
-            "assistantFileSurfaceStyles.filesSection",
-            'translate("settings.files")',
+            '<PersistentScrollView style={styles.externalSettingsPane}',
+            "externalSettingsPaneContent",
+            "externalSettingsDetailHeader",
+            "<SettingsRail",
         ):
             self.assert_ui_has(marker)
         self.assertNotIn("settingsTabBar", self.ui)
         self.assertNotIn("settingsTabs", self.ui)
         self.assertNotIn('<WindowTabs values={[{ id: "codex", title: "Codex" }, { id: "claude", title: "Claude" }]}', self.ui)
 
-    def test_codex_provider_editor_actions_have_a_clear_textual_hierarchy(self) -> None:
-        codex = self.ui.split("function CodexWorkspace", 1)[1].split(
-            "function SettingsWorkspace", 1
-        )[0]
-        for marker in (
-            'translate("codex.provider")',
-            'translate("common.model")',
-            'translate("codex.gateway")',
-            'field="api_key"',
-            "const commitProvider",
-            "const commitGateway",
-            '<TextField label={translate("codex.provider")} value={directProvider}',
-        ):
-            self.assertIn(marker, codex)
-        self.assertNotIn('<PickerField label={translate("codex.provider")}', codex)
-        self.assertNotIn("<View style={styles.listToolRail}>", self.ui)
-
-    def test_codex_provider_url_is_only_edited_in_the_provider_detail(self) -> None:
-        codex = self.ui.split("function CodexWorkspace", 1)[1].split(
-            "function SettingsWorkspace", 1
-        )[0]
-        self.assertIn("const directProvider = stringValue(structured.model_provider);", codex)
-        self.assertIn("const provider = providerRows.find((item) => identifier(item) === directProvider);", codex)
-        self.assertIn('const gateway = directProvider === "openai"', codex)
-        self.assertIn('label={translate("codex.gateway")}', codex)
-        self.assertIn("const commitGateway", codex)
-        self.assertNotIn('label={translate("providers.baseUrl")}', codex)
-        self.assertNotIn('label={translate("common.endpoint")}', codex)
-
-    def test_codex_model_picker_tracks_the_saved_model_without_duplicate_labels(self) -> None:
-        codex = self.ui.split("function CodexWorkspace", 1)[1].split(
-            "function SettingsWorkspace", 1
-        )[0]
-        self.assertIn(
-            "const deploymentModels = [...new Set(deployments.map((item) => stringValue(item.model)).filter(Boolean))];",
-            codex,
-        )
-        self.assertIn(
-            '<PickerField label={translate("common.model")} value={displayedModel} values={deploymentModels}',
-            codex,
-        )
-        self.assertIn(
-            '<TextField label={translate("common.model")} value={displayedModel} disabled={busy} onDraftChange={setModelDraft}',
-            codex,
-        )
-        self.assertIn(
-            'const displayedModel = modelDraft ?? stringValue(structured.model);',
-            codex,
-        )
-        self.assertIn(
-            "const row = deployments.find((item) => stringValue(item.model) === model);",
-            codex,
-        )
-        self.assertIn(
-            "const selection: CodexModelSelection = {",
-            codex,
-        )
-        self.assertIn(
-            "supports_responses_compaction: typeof rawCompactionSupport === \"boolean\" ? rawCompactionSupport : null,",
-            codex,
-        )
-        self.assertIn(
-            "void dispatch(\"select_model\", { selection }, \"codex\");",
-            codex,
-        )
-        self.assertNotIn('translate("codex.activeDeployment")', codex)
-
     def test_assistant_plaintext_credentials_have_no_set_or_clear_buttons(self) -> None:
-        codex = self.ui.split("function CodexWorkspace", 1)[1].split(
-            "function SettingsWorkspace", 1
-        )[0]
-        claude = self.ui.split("function ClaudeScreen", 1)[1].split(
-            "function AssistantSettingsWorkspace", 1
-        )[0]
-        for screen in (codex, claude):
-            self.assertIn("<NativeSecretField plainText autoCommit", screen)
-            self.assertNotIn("setTitle=", screen)
-            self.assertNotIn("clearTitle=", screen)
-            self.assertNotIn("onClear=", screen)
+        # The external settings pane edits files only; the remaining plaintext
+        # credential fields (providers) still render one inline control with no
+        # separate set/clear actions of their own.
+        self.assertIn('<NativeSecretField labelVisible={false} plainText autoCommit', self.ui)
+        for marker in (
+            '<NativeSecretField labelVisible={false} plainText autoCommit label={translate("providers.keyValue")}',
+            '<NativeSecretField\n          labelVisible={false}',
+            '<NativeSecretField autoCommit label={translate("providers.authTypeClaude")}',
+        ):
+            self.assertIn(marker, self.ui)
+        self.assertNotIn("clearTitle=", self.ui)
+        self.assertNotIn("onClear=", self.ui)
 
-    def test_codex_and_claude_share_the_settings_workspace_geometry(self) -> None:
-        codex = self.ui.split("function CodexWorkspace", 1)[1].split(
-            "function SettingsWorkspace", 1
-        )[0]
-        claude = self.ui.split("function ClaudeScreen", 1)[1].split(
-            "function AssistantSettingsWorkspace", 1
-        )[0]
-        for screen in (codex, claude):
-            self.assertIn("assistantSettingsStyles.domainBody", screen)
-            self.assertIn("assistantSettingsStyles.quickFields", screen)
-        self.assertIn("assistantSettingsScroll", self.ui)
-        self.assertIn("assistantQuickGrid", self.ui)
-        self.assertIn("assistantFileSurfaceStyles.fileGroups", self.ui)
+    def test_external_settings_list_only_registered_client_files_with_paths(self) -> None:
+        pane = self.ui.split("function AssistantSettingsWorkspace", 1)[1].split("function GeneralWorkspace", 1)[0]
+        self.assertIn(
+            'const CLIENT_FILE_GROUPS: ReadonlyArray<{ client: ClientFile["client"]; titleKey: string; hintKey: string }> = [',
+            self.ui,
+        )
+        for marker in (
+            'translate(localApiActive ? "settings.useLocalApiActive" : "settings.useLocalApi")',
+            'translate("settings.editFile")',
+            "void ipc.files()",
+            ".then((result) => { if (active) setFiles(result.files); })",
+            "{file.name}",
+            "{file.display_path}",
+            'translate("clients.fileMissing")',
+            "onOpenFile(file)",
+            "disabled={busy || !file.exists}",
+            'toolTip={file.exists ? undefined : translate("clients.fileMissing")}',
+            "assistantFileSurfaceStyles.fileRow",
+            "assistantFileSurfaceStyles.filePathLink",
+        ):
+            self.assertIn(marker, pane)
+        # Codex is the one client with a client-level action: adopt this app's
+        # proxy as that client's backend.
+        # The editor is a route the host presents as its own sub-sheet, not an
+        # in-window React overlay.
+        for marker in (
+            "function FileEditorWorkspace(",
+            "route === \"file-editor\"",
+            "fileIdRequest={fileIdRequest}",
+            "native.openFileEditor(JSON.stringify(editorTargetPayload(file, true)))",
+            "native.prepareFileEditor?.();",
+            "editorTargetFromPayload(native.pendingFileEditorTarget?.())",
+            'native.window.open("codex-settings")',
+            "setAssistantEditorOpen(requested);",
+        ):
+            self.assertIn(marker, self.ui)
+        self.assertNotIn("AssistantFileEditorDialog", self.ui)
+        self.assertNotIn("activeAssistantFile", self.ui)
+        for marker in (
+            'const clientAction = selectedClient === "codex"',
+            'void onUseLocalApi().finally(() => setClientActionBusy(false));',
+            "disabled={(busy && !clientActionBusy) || localApiActive}",
+            "busy={clientActionBusy}",
+            'translate(localApiActive ? "settings.useLocalApiActive" : "settings.useLocalApi")',
+            'translate(localApiActive ? "settings.useLocalApiActiveHint" : "settings.useLocalApiHint")',
+            "{clientAction}",
+            'localApiActive={codexUsesLocalApi}',
+            'onUseLocalApi={() => dispatch("use_local_api", {}, "codex")}',
+            'booleanValue(asRecord(domainState(snapshot, "codex")).uses_local_api)',
+        ):
+            self.assertIn(marker, self.ui if marker not in pane else pane)
+        # The path itself is the reveal control: a native link button whose
+        # long title is bounded by its own column instead of the button's
+        # reserved label width.  It shows the home-shortened spelling of the
+        # file while the action still addresses the real path.
+        for marker in (
+            'titleWidth="flex"',
+            'title={file.display_path}',
+            'onPress={() => native.revealFile?.(file.path)}',
+            'accessibilityLabel={`${revealFileLabel}: ${file.display_path}`}',
+            'const revealFileLabel = translate(Platform.OS === "windows" ? "settings.revealInExplorer" : "settings.revealInFinder");',
+            'filePathLink: { alignSelf: "stretch", minWidth: 0, flexGrow: 0, flexShrink: 1 },',
+        ):
+            self.assertIn(marker, self.ui)
+        # Every level keeps the app's UI font and the standard sizes: the
+        # heading is a section heading on its own band, and the file rows stay
+        # ordinary 13pt list text.
+        self.assertIn(
+            'externalSettingsDetailTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },',
+            self.ui,
+        )
+        self.assertIn(
+            "fileLabel: { color: systemColors.label, fontSize: UI_FONT_SIZE },",
+            self.ui,
+        )
+        # The Core listing is the only path source, and the pane no longer
+        # renders label/input structured editing for any client.
+        for removed in ("TextField", "PickerField", "NativeSecretField", "settings.structured", "assistantQuickGrid"):
+            self.assertNotIn(removed, pane)
+        self.assertIn("externalSettingsWorkspace", self.ui)
+        # The pane aligns its rail exactly like the backup & sync pane: the
+        # route body contributes no horizontal padding of its own.
+        self.assertIn("settingsRoute && styles.assistantSettingsContent", self.ui)
+        self.assertIn("assistantSettingsContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }", self.ui)
+        # The pane's rail is the settings window's shared subordinate rail, so it
+        # needs no caption, width, or striping of its own.
+        self.assertNotIn("externalSettingsRailTitle", self.ui)
+        self.assertIn("externalSettingsDetailHeader", self.ui)
         self.assertIn('horizontal={false}', self.ui)
         self.assertIn('showsHorizontalScrollIndicator={false}', self.ui)
-        self.assertIn('assistantSettingsLayoutStyles.boundedContent', self.ui)
+
+    def test_external_file_editor_route_owns_save_and_close(self) -> None:
+        editor = self.ui.split("function FileEditorWorkspace(", 1)[1].split("function AssistantSettingsWorkspace(", 1)[0]
+        for marker in (
+            "setAssistantEditorOpen(requested);",
+            "return () => setAssistantEditorOpen(false);",
+            'native.window.close("file-editor");',
+            'native.window.open("codex-settings");',
+            "await ipc.applyDomains([...domains], refreshed.revision);",
+            'onStatus(translate("common.saving"));',
+            'onStatus(translate("common.saved"));',
+            'translate("status.close")',
+            'translate("status.saveAndClose")',
+            "assistantFileSurfaceStyles.editorFooterActions",
+            "target?.display_path",
+            # Close warns once, then discards the staged draft before the
+            # sheet goes away; Save writes the file and closes it.
+            "const closeWindow = (): void => {",
+            "current.drafts[target.domain]?.dirty !== true",
+            "native.showConfirmation(",
+            'translate("settings.discardDraftTitle")',
+            'translate("settings.discardDraftBody")',
+            'translate("common.discard")',
+            'type: "cancel"',
+        ):
+            self.assertIn(marker, editor)
+        self.assertNotIn('translate("common.save")', editor)
+        self.assertIn("fileEditorRouteContent:", self.ui)
+        self.assertIn("menuLabels={editorMenuLabels(translate)}", self.ui)
+        self.assertIn(
+            'editorFooterActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 10 },',
+            self.ui,
+        )
+        # The footer is the two actions alone: the old hint text is gone and
+        # the actions keep the trailing edge of the row.
+        self.assertNotIn("editorFooterHint", self.ui)
+        self.assertIn('justifyContent: "flex-end", gap: 12', self.ui)
+        # Copy and Cut work on the current line with no selection, like every
+        # code editor: an unselected Cmd-X must never look dead.
+        self.assertIn('aceEditor.setOption("copyWithEmptySelection", true);', self.code_editor_web)
 
     def test_runtime_uses_core_projection_kinds_and_adaptive_layout(self) -> None:
         for marker in (
@@ -1513,14 +1849,23 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'const resetTo = useCallback((next: string): void => {',
             'useEffect(() => { if (resetToken > 0) field.resetTo(resetValue); }, [resetToken]);',
             # The assistant file editor is a window-level sheet.
-            'onRegisterAssistantDialog={setAssistantDialog}',
-            'onRegisterAssistantDialog(activeAssistantFile ? <AssistantFileEditorDialog {...assistantDialogProps.current} /> : null);',
+
+            'route === "file-editor" ? <FileEditorWorkspace',
             'translate("runtime.fixInvalidBeforeClose")',
             'invalidCloseNotice.current = true;',
             'invalidCloseNotice.current = false;',
             'const jumpToCategory = (name: string): void => {',
-            'scrollRef.current?.scrollTo({ y: Math.max(0, offset - 2), animated: false });',
+            'const target = runtimeTocJumpTarget(offset);',
+            'pendingJump.current = { category: name, target };',
+            'scrollRef.current?.scrollTo({ y: target, animated: false });',
             'const trackScroll = ({ nativeEvent }: NativeSyntheticEvent<NativeScrollEvent>): void => {',
+            # A clamped jump owns the selection where it landed, so the click that
+            # could not align its section at the pane's top edge is not undone by
+            # the position it clamped to.
+            'const pendingJump = useRef<RuntimeTocJump | null>(null);',
+            'const landed = runtimeTocJumpLanded(pending, nativeEvent.contentOffset.y, { contentHeight: nativeEvent.contentSize.height, viewportHeight: nativeEvent.layoutMeasurement.height });',
+            'if (landed) return;',
+            'import { runtimeTocJumpLanded, runtimeTocJumpTarget, type RuntimeTocJump } from "./runtimeTocScroll";',
             'setSectionOffsets((current) => current[name] === nativeEvent.layout.y ? current : { ...current, [name]: nativeEvent.layout.y });',
             'onScroll={trackScroll} scrollEventThrottle={32}',
             'style={styles.runtimeScrollSurface}',
@@ -1560,19 +1905,28 @@ class ReactNativeUiParityTests(unittest.TestCase):
         schema = (ROOT / "young_router/core/runtime_settings_schema.py").read_text(encoding="utf-8")
         localized = (ROOT / "rn/packages/shared/src/i18n/runtimeSettingsI18n.ts").read_text(encoding="utf-8")
         keys = re.findall(r"'key': '([^']+)'", schema)
-        self.assertEqual(70, len(keys))
+        self.assertEqual(64, len(keys))
         self.assertEqual(len(keys), len(set(keys)))
         for key in keys:
             self.assertIn(f"  {key}: {{ label:", localized)
-        # The Relay category disappeared with its only setting; retired dead
-        # controls must not stay translated in the pane.
-        for category in ("Timeouts", "Recovery", "Web Search", "Vision Router", "Model Context", "Fallback", "Computer Facade", "MCP", "Logs", "Network", "Service"):
+        # The Relay and Computer Facade categories disappeared with their only
+        # settings; retired dead controls must not stay translated in the pane.
+        for category in ("Timeouts", "Recovery", "Web Search", "Vision Router", "Model Context", "Fallback", "MCP", "Logs", "Network", "Service"):
             self.assertIn(f'  "{category}":', localized)
         self.assertNotIn('  "Relay":', localized)
+        self.assertNotIn('  "Computer Facade":', localized)
         self.assertNotIn("Vision Bridge", localized)
         self.assertNotIn("YOUNG_ROUTER_VISION_BRIDGE_", schema)
+        self.assertNotIn("YOUNG_ROUTER_COMPUTER_FACADE_", schema)
         for retired in (
             "YOUNG_ROUTER_RELAY_AUTO_GROUP_INTERVAL_MINUTES",
+            "YOUNG_ROUTER_COMPUTER_FACADE_BACKEND",
+            "YOUNG_ROUTER_COMPUTER_FACADE_MODEL",
+            "YOUNG_ROUTER_COMPUTER_FACADE_MAX_STEPS",
+            "YOUNG_ROUTER_COMPUTER_FACADE_TRACE",
+            "YOUNG_ROUTER_COMPUTER_FACADE_TRACE_SCREENSHOTS",
+            "YOUNG_ROUTER_COMPUTER_FACADE_ACTION_DENYLIST",
+            "YOUNG_ROUTER_COMPUTER_FACADE_REQUIRE_OBSERVATION",
             "LITELLM_MAX_REQUESTS_BEFORE_RESTART",
             "LITELLM_STATE_TTL_SECONDS",
             "LITELLM_RUNTIME_VERIFY_WAIT_SECONDS",
@@ -1618,9 +1972,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("const option = options[nativeEvent.index];", self.ui)
         self.assertIn("if (option) onSelect(option.value);", self.ui)
         self.assertIn("assistantSettingOptions(values, translate)", self.ui)
-        self.assertIn('translate("card.codexSettings")', self.ui)
-        self.assertIn('translate("card.claudeSettings")', self.ui)
-        self.assertIn("localizeCodexValidationMessage(message, translate)", self.ui)
+        self.assertIn('titleKey: "clients.codex"', self.ui)
+        self.assertIn('{ client: "claudeCode", titleKey: "claude.codeSection"', self.ui)
+        self.assertIn('{ client: "claudeDesktop", titleKey: "claude.desktopSection"', self.ui)
+        # The external settings pane lists client files instead of structured
+        # Codex/Claude fields, so it localizes display metadata only.
+        self.assertNotIn("localizeCodexValidationMessage(message, translate)", self.ui)
 
     def test_sensitive_settings_use_inline_native_password_controls(self) -> None:
         for marker in (
@@ -1628,7 +1985,6 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "<NativeSecureTextInput domain={domain}",
             'domain="runtime" field="setting"',
             'domain="webdav" field="password"',
-            'domain="codex" field="api_key"',
             'domain="providers_models" field="api_key"',
             'placeholder={hint ?? ""}',
         ):
@@ -1736,13 +2092,18 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("const flushAssistantEditorFields = async (): Promise<void> => {", self.ui)
         self.assertIn("field.flushBeforeAssistantEditor === true && field.isDirty?.() === true", self.ui)
         self.assertIn("flushBeforeAssistantEditor: true", self.ui)
-        self.assertIn("const openAssistantFile = (target: AssistantFileTarget): void => {", self.ui)
+        self.assertIn("const openAssistantFile = (file: ClientFile): void => {", self.ui)
         self.assertIn("void flushAssistantEditorFields()", self.ui)
-        self.assertIn(".then(() => setActiveAssistantFile(target))", self.ui)
+        self.assertIn("native.openFileEditor(JSON.stringify(editorTargetPayload(file, true)))", self.ui)
+        # The sheet is warmed while the pane is open and switches documents
+        # through the host's pending target, so opening never rebuilds it.
+        self.assertIn("native.prepareFileEditor?.();", self.ui)
+        self.assertIn("editorTargetFromPayload(native.pendingFileEditorTarget?.())", self.ui)
+        self.assertIn("if (!target) return undefined;", self.ui)
         self.assertIn("onOpenFile={openAssistantFile}", self.ui)
         self.assertLess(
             self.ui.index("void flushAssistantEditorFields()"),
-            self.ui.index(".then(() => setActiveAssistantFile(target))"),
+            self.ui.index("native.openFileEditor(JSON.stringify(editorTargetPayload(file, true)))"),
         )
         self.assertIn("void stageLatest(false).catch(() => undefined);", raw_editor)
         self.assertIn("}, RAW_EDITOR_SYNC_INTERVAL_MS);", raw_editor)
@@ -1759,11 +2120,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'import "ace-builds/src-noconflict/ace";',
             'import "ace-builds/src-noconflict/mode-json";',
             'import "ace-builds/src-noconflict/mode-toml";',
+            'import "ace-builds/src-noconflict/mode-yaml";',
             'import "ace-builds/src-noconflict/ext-searchbox";',
-            'type EditorLanguage = "json" | "toml" | "text";',
+            'type EditorLanguage = "json" | "toml" | "yaml" | "text";',
             "type ReplaceDocumentCommand = {",
             'type SetBaselineCommand = { type: "setBaseline"; baseline: string };',
-            'type HostCommand = ReplaceDocumentCommand | SetBaselineCommand | { type: "focus" };',
+            'type HostCommand = ReplaceDocumentCommand | SetBaselineCommand | InsertTextCommand | { type: "focus" };',
             "type AceSession = {",
             "type AceEditor = {",
             "type AceApi = { edit: (element: HTMLElement, options?: Record<string, unknown>) => AceEditor };",
@@ -1786,6 +2148,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "function modeForLanguage(language: EditorLanguage): string",
             'if (language === "json") return "ace/mode/json";',
             'if (language === "toml") return "ace/mode/toml";',
+            'if (language === "yaml") return "ace/mode/yaml";',
             "function configureEditor(command: ReplaceDocumentCommand): void",
             "aceEditor.session.setUseWorker(false);",
             "function createEditor(command: ReplaceDocumentCommand): void",
@@ -1798,6 +2161,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'const editorScrollbar = document.getElementById("editor-scrollbar");',
             'scrollTrack.addEventListener("pointerdown", (event) => {',
             "scrollEditorFromPointer(event.clientY, grabOffset);",
+            # Ace's content layer is one line taller than its scroller, so the
+            # scroller's scrollHeight can never decide whether to show a bar.
+            "function aceContentHeight(viewport: HTMLElement): number {",
+            "Ace keeps its content layer one line taller than the scroller",
+            "return Math.max(config?.maxHeight ?? 0, lineHeightTotal);",
         ):
             self.assertIn(marker, self.code_editor_web)
         for marker in (
@@ -1820,6 +2188,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "#editor-scrollbar {",
             "#editor-scrollbar-thumb {",
             '<div id="editor-scrollbar" aria-hidden="true" hidden>',
+            "#editor-menu {",
+            ".editor-menu-item {",
+            ".editor-menu-separator {",
+            '<div id="editor-menu" role="menu" hidden></div>',
+            "window.LiteLLMCodeEditorMenuLabels",
         ):
             self.assertIn(marker, self.code_editor_wrapper)
         self.assertNotIn("#diff-summary", self.code_editor_wrapper)
@@ -1837,6 +2210,32 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("entryPoints: [source]", bundler)
         self.assertIn('format: "iife"', bundler)
 
+    def test_code_editor_cut_copy_and_context_menu_use_deterministic_actions(self) -> None:
+        for marker in (
+            "function writeClipboardText(text: string): boolean {",
+            "copied = document.execCommand(\"copy\");",
+            "function copySelection(editor: AceEditor): boolean {",
+            "if (!copySelection(editor)) return;",
+            "if (key === \"x\") editor.execCommand(\"cut\");",
+            "function requestHostPaste(): void {",
+            'post({ type: "paste" });',
+            "function insertHostText(text: string): void {",
+            'editor.execCommand("paste", text.slice(0, 1024 * 1024));',
+            "function showEditorMenu(clientX: number, clientY: number): void {",
+            "function runMenuAction(action: MenuAction): void {",
+            'if (copySelection(editor)) editor.execCommand("cut");',
+            'frame.addEventListener("contextmenu", (event) => {',
+            "const MENU_ENTRIES: ReadonlyArray<MenuAction | \"separator\"> = [\"undo\", \"redo\", \"separator\", \"cut\", \"copy\", \"paste\", \"separator\", \"selectAll\"];",
+        ):
+            self.assertIn(marker, self.code_editor_web)
+        # The async clipboard API is never the only route: its rejection used
+        # to preventDefault away the browser's own copy/cut handling.
+        self.assertNotIn("navigator.clipboard?.writeText", self.code_editor_web)
+        self.assertNotIn("navigator.clipboard?.readText", self.code_editor_web)
+        # Native hosts read the pasteboard for the context menu's Paste item.
+        self.assertIn('if ([type isEqualToString:@"paste"])', MACOS_CONTROLS.read_text(encoding="utf-8"))
+        self.assertIn('if (type == "paste")', WINDOWS_CONTROLS.read_text(encoding="utf-8"))
+
     def test_assistant_setting_option_labels_cover_user_visible_non_brand_values(self) -> None:
         assistant_i18n = (ROOT / "rn/packages/shared/src/i18n/assistantSettingsI18n.ts").read_text(encoding="utf-8")
         for marker in ('"amazon-bedrock": "Amazon Bedrock"', 'lmstudio: "LM Studio"', 'vscode: "VS Code"', 'terminal: "终端"'):
@@ -1845,27 +2244,27 @@ class ReactNativeUiParityTests(unittest.TestCase):
     def test_logs_show_empty_state_after_a_loaded_but_missing_log_source(self) -> None:
         self.assertIn('active ? translate("logs.empty") : translate("logs.loading")', self.ui)
 
-    def test_claude_settings_keep_desktop_basics_and_raw_code_sources_without_inventing_saved_defaults(self) -> None:
+    def test_external_settings_edit_claude_files_without_inventing_saved_defaults(self) -> None:
+        # Claude documents are now file rows in the shared listing; the pane
+        # never renders a structured Claude form or invents a saved default.
         for marker in (
-            'translate("settings.claudeUnavailable")',
-            "const desktop = asRecord(state.desktop);",
-            'dispatch("desktop_patch", { inferenceProvider: inferenceProvider || null }, "claude")',
-            'dispatch("desktop_patch", { inferenceGatewayBaseUrl }, "claude")',
-            "const desktopModelNames = stringList(desktop.model_names);",
-            'dispatch("desktop_models_patch", { model_names: splitLines(value) }, "claude")',
-            'field="desktop_gateway_api_key"',
-            'translate("claude.desktopSection")',
-            'translate("claude.codeSection")',
-            'document: "desktop"',
-            'document: "developer"',
-            'document: "settings"',
-            "function AssistantFileEditorDialog",
+            '{ client: "claudeCode", titleKey: "claude.codeSection"',
+            '{ client: "claudeDesktop", titleKey: "claude.desktopSection"',
+            'hintKey: "clients.claudeCodeFilesHint"',
+            "function FileEditorWorkspace",
+            'language={target.language === "text" ? "json" : target.language}',
         ):
             self.assert_ui_has(marker)
-        self.assertNotIn('translate("claude.deployment")', self.ui)
-        self.assertNotIn('field="deployment_token"', self.ui)
-        self.assertNotIn('patch_deployment', self.ui)
-        for invented_default in (
+        for removed in (
+            'translate("claude.deployment")',
+            'field="deployment_token"',
+            "const desktop = asRecord(state.desktop);",
+            "const desktopModelNames = stringList(desktop.model_names);",
+            'dispatch("desktop_patch", { inferenceProvider: inferenceProvider || null }, "claude")',
+            'dispatch("desktop_models_patch", { model_names: splitLines(value) }, "claude")',
+            'field="desktop_gateway_api_key"',
+            'translate("settings.claudeUnavailable")',
+            'patch_deployment',
             "booleanValue(settings.autoMemoryEnabled, true)",
             "booleanValue(sandbox.autoAllowBashIfSandboxed, true)",
             "booleanValue(sandbox.allowUnsandboxedCommands, true)",
@@ -1873,24 +2272,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'stringValue(settings.effortLevel, "medium")',
             '!booleanValue(filesystem.disabled)',
         ):
-            self.assertNotIn(invented_default, self.ui)
-
-    def test_claude_settings_keep_the_compact_memory_permission_sandbox_and_capability_groups(self) -> None:
-        claude = self.ui.split("function ClaudeScreen", 1)[1].split(
-            "function AssistantSettingsWorkspace", 1
-        )[0]
-        for removed in (
-            'translate("claude.memory")',
-            'translate("claude.permissions")',
-            'translate("claude.sandbox")',
-            'translate("claude.capabilities")',
-            'hasBooleanSetting',
-        ):
-            self.assertNotIn(removed, claude)
-        self.assertIn('translate("claude.desktopSection")', claude)
-        self.assertIn('translate("claude.codeSection")', claude)
-        self.assertIn('translate("settings.claudeDesktopFilesHint")', self.ui)
-        self.assertIn('translate("settings.claudeCodeFilesHint")', self.ui)
+            self.assertNotIn(removed, self.ui)
 
     def test_runtime_form_rows_keep_labels_and_controls_aligned_when_reflowed(self) -> None:
         for marker in (
@@ -1909,7 +2291,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "runtimeActionSlot:",
             "runtimeHelpSlot:",
             "runtimeWorkspaceBody:",
-            "runtimeToc:",
+            "<SettingsRail rows={tocRows}",
             "runtimeSection:",
             "runtimeFieldList:",
             "runtimeModifiedBar:",
@@ -2116,7 +2498,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'dispatch("provider.select_relay_station", { provider_id: providerID, station_id: station.id })',
             'label={translate("providers.providerName")} labelWidth={88}',
             'label={translate("providers.keyName")}',
-            'NativeSecretField plainText autoCommit label={translate("providers.keyValue")}',
+            'NativeSecretField labelVisible={false} plainText autoCommit label={translate("providers.keyValue")}',
             'title={translate("providers.backToModel", { model: sourceModelLabel })} link',
             'providerEditorHeader:',
             'providerEditorSection:',
@@ -2315,7 +2697,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('await dispatchServiceAction(serviceRestart ? "service.restart" : "service.start");', general)
         self.assertIn('onStatus(translate("service.running"));', general)
         self.assertIn("onStatus(errorMessage(reason, translate));", general)
-        self.assertIn('title={serviceBusy ? translate("service.starting") : serviceRestart ? translate("service.restart") : translate("service.start")}', general)
+        self.assertIn('title={serviceRestart ? translate("service.restart") : translate("service.start")}', general)
+        # The action reports its own progress instead of swapping its title or
+        # graying out while the service restarts.
+        self.assertIn("busy={serviceBusy} disabled={snapshot === undefined || (busy && !serviceBusy)}", general)
         self.assertIn("{serviceActionAvailable ? <NativeButton", general)
         self.assertIn("generalServiceAction: { minWidth: 96 }", self.ui)
         # The control is part of the 服务 row inside the pane, never of the
@@ -2582,10 +2967,17 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('await commit("account.delete", { id: removal.account.id, dependency_policy: removalPolicy });', removal)
         self.assertIn("await native.clearRelayCredentials(removal.account.id);", removal)
         self.assertIn('await commit("credential_cleanup_confirm", { id: removal.account.id, kind: "credentials" });', removal)
-        # Quietly restore sessions once per account when the panel mounts.
+        # Quietly restore sessions once per account when the panel mounts; a
+        # restore that fails leaves the account signed out and never opens the
+        # login page on its own (去登录 / + ask for it).  The quiet resource
+        # refresh still runs: a locally known key is local data, and Core reads
+        # the station through a remembered session when it has one.
         self.assertIn("const attemptedAccounts = useRef(new Set<string>());", relay)
         self.assertIn("attemptedAccounts.current.add(account.id);", relay)
-        self.assertIn("const canAutoLogin = account.rememberPassword && account.passwordSaved && Boolean(account.username.trim());", relay)
+        self.assertNotIn("if (!(await restoreSavedSession(account))) return;", relay)
+        self.assertIn("await restoreSavedSession(account);", relay)
+        self.assertIn("await refreshAccountResources(account, true);", relay)
+        self.assertNotIn("const canAutoLogin =", relay)
         # Station connection details stay editable through staged updates.
         self.assertIn("const stageStationUpdate = async (overrides: StationDraft = {}): Promise<void> => {", relay)
         self.assertIn('await commit("station.update", { id: station.id, name, origin, type });', relay)
@@ -2594,14 +2986,21 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # 登录中 while the sign-in is in flight, otherwise 已登录 / 未登录 (the
         # expired and not-yet-probed cases read as 未登录 and keep the brown
         # alert row). 去登录 only appears while signed out and is never
-        # disabled; 分组管理 needs a live session.
+        # disabled; 分组管理 shows the station's locally known keys, so it is
+        # never gated on the login state that the keys outlive.
         self.assertIn('const relayLoginState = (account: RelayAccount): "signed_in" | "signing_in" | "signed_out" => {', relay)
         self.assertIn('if (loading[account.id]?.session) return "signing_in";', relay)
         self.assertIn('return effectiveLoginStatus(account) === "signed_in" ? "signed_in" : "signed_out";', relay)
         self.assertIn('translate(`relay.status.${relayLoginState(account)}`)', relay)
         self.assertIn('const selectedLoginState = selected ? relayLoginState(selected) : "signed_out";', relay)
-        self.assertIn('{selectedLoginState === "signed_out" ? <NativeButton title={translate("relay.goLogin")} compact onPress={() => { void loginSelected(); }} /> : null}', relay)
-        self.assertIn('disabled={controlsBusy || !native.showGroupManager || selectedLoginState !== "signed_in"}', relay)
+        self.assertIn('{selectedLoginState === "signed_out" ? <NativeButton title={translate("relay.goLogin")} compact busy={pendingAction === "login"} disabled={controlsBusy && pendingAction !== "login"} onPress={() => { void loginSelected(); }} /> : null}', relay)
+        # 去登录 opens the login page at once: the silent session probe must not
+        # delay the sheet the user explicitly asked for.
+        login_selected = relay.split("const loginSelected = async (): Promise<void> => {", 1)[1].split("const removeSelected", 1)[0]
+        self.assertIn("await runPendingAction(\"login\", () => loginAccount(account));", login_selected)
+        self.assertNotIn("restoreSavedSession(selected)", login_selected)
+        self.assertIn('disabled={controlsBusy || !native.showGroupManager}', relay)
+        self.assertNotIn('!native.showGroupManager || selectedLoginState !== "signed_in"', relay)
         self.assertNotIn('disabled={controlsBusy || isAccountLoading(selected.id)}', relay)
         self.assertIn('"relay.status.signing_in": "登录中"', self.zh)
         self.assertIn('"relay.status.signing_in": "Signing in"', self.en)
@@ -2646,8 +3045,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("private final class NativeGroupManagerController: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate", mac_leaf)
         self.assertIn("@objc private func addDraftKey(_ sender: NSButton)", mac_leaf)
         self.assertIn("@objc private func removeSelectedKey(_ sender: NSButton)", mac_leaf)
-        self.assertIn("@objc private func applySheet(_ sender: NSButton)", mac_leaf)
-        self.assertIn("@objc private func closeSheet(_ sender: NSButton)", mac_leaf)
+        self.assertIn("@objc private func applyPanel(_ sender: NSButton)", mac_leaf)
+        self.assertIn("@objc private func closePanel(_ sender: NSButton)", mac_leaf)
         self.assertIn("@objc private func toggleSelectedEnabled(_ sender: NSButton)", mac_leaf)
         self.assertIn("func resultOnEnd() -> NativeGroupManagerResult?", mac_leaf)
         self.assertIn("let autoGrouping: Bool\n    let creates: [Create]\n    let updates: [Update]\n    let deletes: [String]", mac_leaf)
@@ -2746,7 +3145,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("private var revealedKeys: [String: String] = [:]", mac_leaf)
         self.assertIn('valueField?.stringValue = row.hint.isEmpty ? label("emptyLabel") : label("savedLabel")', mac_leaf)
         self.assertIn("self.valueField?.stringValue = value", mac_leaf)
-        self.assertIn("private func fitSheetToContent() {", mac_leaf)
+        self.assertIn("private func fitPanelToContent() {", mac_leaf)
         # The sheet explains itself through its rows: the staged-changes tip
         # is gone, so the copy result is the detail column's last line.
         self.assertNotIn("hint: translate(\"relay.groupManagerHint\")", relay)
@@ -2757,11 +3156,64 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('discardConfirm: translate("common.discard"),', relay)
         self.assertIn('"relay.groupManagerDiscardTitle": "放弃未保存的更改？"', self.zh)
         self.assertIn('"relay.groupManagerDiscardBody": "关闭分组管理会丢弃尚未应用的密钥更改。"', self.zh)
-        self.assertIn("private func confirmDiscardIfNeeded() -> Bool {", mac_leaf)
+        self.assertIn("func confirmDiscardIfNeeded() -> Bool {", mac_leaf)
         self.assertIn("AppKitNativeLeaf.shared.confirm(", mac_leaf)
+        # The title-bar close button asks the same question the footer Close
+        # does, so the window never drops staged edits silently.
+        self.assertIn("return groupManagerController?.confirmDiscardIfNeeded() ?? true", mac_leaf)
         self.assertIn("if (has_staged_changes() && !Confirm(labels.discard_title, labels.discard_body, labels.discard_confirm)) return;", windows_leaf)
         self.assertIn('labels.discard_title = read("discardTitle");', windows_module)
         self.assertNotIn("hint.Text(winrt::hstring(labels.hint));", windows_leaf)
+        # The sheet opens on the account facts the provider window already
+        # holds and loads the rest in place: it appears at once behind its
+        # loading line, and the aligned draft arrives through the native update
+        # instead of holding the window closed for the station round trip.  A
+        # host without that update keeps the pre-load ordering.
+        self.assertIn("updateGroupManager?(options: RelayGroupManagerSnapshot): Promise<boolean>;", types)
+        self.assertIn("export type RelayGroupManagerSnapshot = {", types)
+        self.assertIn("updateGroupManager?(options: RelayGroupManagerSnapshot): Promise<boolean>;", native_bridge)
+        self.assertIn("updateGroupManager?: (options: RelayGroupManagerSnapshot) => Promise<boolean>;", platform_entry)
+        self.assertIn("updateGroupManager: leaf.updateGroupManager", platform_entry)
+        self.assertIn("loadingLabel: translate(\"relay.groupManagerLoading\"),", relay)
+        self.assertIn('"relay.groupManagerLoading": "正在读取中转站…"', self.zh)
+        self.assertIn('"relay.groupManagerLoading": "Reading the station…"', self.en)
+        self.assertIn("const pending = update && groupManagerNeedsAlignment(account) ? loadGroupManagerAccount(account) : undefined;", relay)
+        self.assertIn("const result = await native.showGroupManager({ ...groupManagerRequest(current), loading: Boolean(pending) });", relay)
+        self.assertIn("if (!update) current = await loadGroupManagerAccount(account);", relay)
+        # The update carries the sheet's content alone, which is exactly the
+        # field set the native side accepts for it.
+        self.assertIn("void push(groupManagerSnapshot(aligned)).catch(() => {", relay)
+        self.assertIn("const groupManagerSnapshot = (current: RelayAccount) => {", relay)
+        self.assertIn('guard Set(options.keys).isSubset(of: ["accountLabel", "groups", "keys", "autoGrouping"]),', mac_module)
+        self.assertIn("guard let controller = groupManagerController, groupManagerPanel != nil else { return false }", mac_leaf)
+        self.assertIn("@objc(updateGroupManager:resolver:rejecter:)", mac_module)
+        self.assertIn("RCT_EXTERN_METHOD(updateGroupManager:(NSDictionary *)options", mac_bridge)
+        self.assertIn("func updateGroupManager(accountLabel: String, groups: [[String: String]], keys: [[String: String]], autoGrouping: Bool) -> Bool {", mac_leaf)
+        self.assertIn("controller.applyData(", mac_leaf)
+        self.assertIn("func applyData(accountLabel: String, groups: [GroupOption], rows: [KeyRow], autoGrouping: Bool) {", mac_leaf)
+        self.assertIn("private func updateLoadingChrome() {", mac_leaf)
+        self.assertIn("applyButton?.isEnabled = !loading && hasStagedChanges", mac_leaf)
+        self.assertIn("!loading && toggle?.state == .off", mac_leaf)
+        # The list header carries the load: the wheel turns beside 密钥 on the
+        # key list the station answer is about to replace, and the words for
+        # that wait ride the wheel as its tooltip.  It is the button's own wheel
+        # - the shared pre-rendered frames, swapped in place - never a
+        # progress-indicator view.
+        self.assertIn("let loadingSpinner = NSImageView()", mac_leaf)
+        self.assertIn('loadingSpinner.toolTip = label("loadingLabel")', mac_leaf)
+        self.assertIn('loadingSpinner.setAccessibilityLabel(label("loadingLabel"))', mac_leaf)
+        self.assertIn("loadingSpinner.leadingAnchor.constraint(equalTo: listTitle.trailingAnchor, constant: 6),", mac_leaf)
+        self.assertIn("loadingSpinner?.image = AppKitBusySpinner.frames[loadingStep]", mac_leaf)
+        self.assertIn("private func startLoadingWheel() {", mac_leaf)
+        self.assertIn("private func stopLoadingWheel() {", mac_leaf)
+        self.assertIn("RunLoop.main.add(timer, forMode: .common)", mac_leaf)
+        # The footer keeps only the switch and the buttons.
+        self.assertNotIn('let loadingLabel = NSTextField(labelWithString: label("loadingLabel"))', mac_leaf)
+        self.assertNotIn("NSProgressIndicator", mac_leaf)
+        # The list follows its key across the load while that key survives it.
+        self.assertIn("let index = previousID.flatMap { id in rows.firstIndex { $0.id == id } } ?? (rows.isEmpty ? -1 : 0)", mac_leaf)
+        self.assertIn("private static func groupNames(_ groups: [GroupOption]) -> [String: String] {", mac_leaf)
+        self.assertIn("private static func modelGridRows(_ rows: [KeyRow]) -> Int {", mac_leaf)
         # The copy action keeps its own width, so the key wraps beside it.
         self.assertIn("copyButton.setContentCompressionResistancePriority(.required, for: .horizontal)", mac_leaf)
         # 模型列表 closes the sheet as an aligned, complete grid: it spans both
@@ -2771,8 +3223,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("let modelsTitle = NSTextField(labelWithString: label(\"modelsLabel\"))", mac_leaf)
         self.assertIn("let modelsList = NativeModelsListView(font: detailFont, emptyText: label(\"emptyLabel\"))", mac_leaf)
         self.assertIn("modelsList?.setModels(row.modelNames)", mac_leaf)
-        self.assertIn("let modelRows = max(3, min(12, rows.map { $0.modelNames.count }.max() ?? 0))", mac_leaf)
-        self.assertIn("modelsList.heightAnchor.constraint(equalToConstant: CGFloat(modelRows) * 17),", mac_leaf)
+        self.assertIn("let modelsHeight = modelsList.heightAnchor.constraint(equalToConstant: CGFloat(NativeGroupManagerController.modelGridRows(rows)) * 17)", mac_leaf)
+        self.assertIn("modelsListHeight?.constant = CGFloat(NativeGroupManagerController.modelGridRows(rows)) * 17", mac_leaf)
         self.assertIn("listFrame.bottomAnchor.constraint(equalTo: toggle.topAnchor, constant: -14),", mac_leaf)
         self.assertIn("usePersistentScrollers(horizontal: false, vertical: true)", mac_leaf)
         self.assertIn("std::wstring EllipsizeMiddle(std::wstring const& value) {", windows_leaf)
@@ -2810,8 +3262,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("auto show_copy_status = [copy_status, status_timer]", windows_leaf)
         # 自动分组 owns one key per group: the sheet refreshes the station facts
         # and stages Core's alignment first, then lists only the keys still in a
-        # group, so a checked switch never shows an ungrouped row or item.
-        self.assertIn("await apiKeyActions.alignAutoGrouping(account.id);", relay)
+        # group, so a checked switch never shows an ungrouped row or item.  That
+        # load lands in the sheet that is already open, never in front of it.
+        self.assertIn("await alignAutoGroupingAction(current.id);", relay)
         self.assertIn("pendingDelete: entry.pending_delete === true,", relay)
         self.assertIn("current.resources.filter((resource) => !resource.pendingDelete && resourceGroup(resource, current.groups) !== undefined)", relay)
         self.assertIn('if (current.type === "newapi" && !current.autoGrouping) {', relay)
@@ -2847,8 +3300,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("private func currentGroupText(for row: KeyRow) -> String {", mac_leaf)
         self.assertIn("private func multiplierText(for row: KeyRow) -> String {", mac_leaf)
         self.assertIn('guard !row.groupID.isEmpty, currentGroupNames[row.groupID] != nil else { return "" }', mac_leaf)
-        self.assertIn("private lazy var currentGroupNames: [String: String] = {", mac_leaf)
+        # The names follow the sheet's data: the load in place replaces them
+        # together with the rows that read them.
+        self.assertIn("private var currentGroupNames: [String: String]", mac_leaf)
         self.assertIn("for group in groups where !group.id.isEmpty { names[group.id] = group.name }", mac_leaf)
+        self.assertIn("self.currentGroupNames = NativeGroupManagerController.groupNames(groups)", mac_leaf)
         self.assertIn("auto current_group_text = ", windows_leaf)
         self.assertIn("auto multiplier_text = ", windows_leaf)
         self.assertIn("if (entry.id == row.group_id) return entry.name;", windows_leaf)
@@ -2885,7 +3341,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         ):
             self.assertNotIn(marker, ui)
         # Adding an account goes straight to the native sign-in.
-        self.assertIn("await startPendingLogin();", relay)
+        self.assertIn("await runPendingAction(\"add\", startPendingLogin);", relay)
         # The wizard's relay family is auto-detected inside the login flow:
         # no type picker, no station-details button, no type row style.
         for marker in (
@@ -2920,11 +3376,17 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '// them so custom-only vendors see a plain key table.',
             'if (showHeaders) rows.push({ key: "group:custom", cells: [`${translate("providers.keysCustom")} · ${customKeys.length}`], spanning: true });',
             'rows.push({ key: `custom:${key.id}`, cells: [showHeaders ? `\\t${key.name}` : key.name] });',
-            '// it shrinks until the whole inspector fits, so the pane keeps no scrollbar',
-            'const keysTableInlineRowHeights = tableRows.map((row) => (row.spanning ? 28 : 22));',
-            'const keysTableInlineAvailableHeight = keysTableInlineSiblingHeight === undefined ? undefined : paneViewportHeight - keysTableInlineSiblingHeight - 1;',
-            'keysTableInlineHeight = Math.min(keysTableInlineContentHeight, Math.max(fitted, Math.min(keysTableInlineMinHeight, keysTableInlineContentHeight)));',
-            'React.useLayoutEffect(() => { keysTableInlineRenderedHeight.current = keysTableInlineHeight; }, [keysTableInlineHeight]);',
+            '// The inline keys panel shows one list of a fixed height beside its editor',
+            'const KEYS_INLINE_EDITOR_WIDTH = 124;',
+            'const KEYS_INLINE_LIST_HEIGHT = 26 + 6 * 22;',
+            'keysInlineBody: { minWidth: 0, height: KEYS_INLINE_LIST_HEIGHT, flexDirection: "row", alignItems: "flex-start", gap: 6 }',
+            'keysTableInline: { flex: 1, minWidth: 0, height: KEYS_INLINE_LIST_HEIGHT, minHeight: KEYS_INLINE_LIST_HEIGHT }',
+            'style={variant === "inline" ? styles.keysTableInline : styles.keysTable}',
+            'keysEditorInline: { width: KEYS_INLINE_EDITOR_WIDTH, minWidth: 0, flexGrow: 0, flexShrink: 0, gap: 5 }',
+            'keysEditorField: { minWidth: 0, gap: 2 }',
+            '// Each inline editor row stacks its label above the control',
+            'labelVisible={false}',
+            'keysEditorFieldHeader: { height: 22, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 4 }',
             "rows.push({ key: `account:${account.id}`, cells: [accountDisplayName(account, translate)], spanning: true });",
             "cells: [`\\t${providedNameDrafts[row.key] ?? row.label}`],",
             "providedRows",
@@ -3085,7 +3547,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # like a value the user could edit.
         self.assertNotIn('translate("providers.keyListHint")', self.ui)
         self.assertNotIn('translate("providers.providedKeysNeedAccount")', self.ui)
-        self.assertIn('} style={styles.panelActionButton} />\n        </View>\n      </> : null}\n    </View>;', self.ui)
+        self.assertIn('} style={styles.panelActionButton} />)}\n      </> : null}\n    </View>;', self.ui)
         # The relay account section's + shares the key panel's right edge.
         self.assertIn(
             '<View style={styles.panelHeader}>\n        <Text style={styles.panelTitle}>{translate("providers.accounts")}</Text>\n        <View style={styles.panelActions}>',
@@ -3124,7 +3586,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         ):
             self.assertIn(marker, relay, marker)
         for marker in (
-            'keysEditorRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6, flexWrap: "wrap" }',
+            'keysEditorFieldHeader: { height: 22, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 4 }',
             'keysGroupPicker: { flex: 1, minWidth: 120, height: 26 }',
             'panelActionButton: { width: 22, minWidth: 22, height: 22 }',
             'providerAccountsHeader: { minWidth: 0, paddingTop: 6, borderTopWidth: 1, borderTopColor: systemColors.separator },',
@@ -3192,7 +3654,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('modelPane: { flex: 1, minWidth: 0, minHeight: 130, paddingTop: 2, borderTopWidth: 1, borderTopColor: systemColors.separator }')
         self.assert_ui_has('keysPane: { flex: 1, minWidth: 0, minHeight: 0 }')
         self.assert_ui_has('keysInline: { minWidth: 0, gap: 6, paddingTop: 6, borderTopWidth: 1, borderTopColor: systemColors.separator }')
-        self.assert_ui_has('keysEditorRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6, flexWrap: "wrap" }')
+        self.assert_ui_has('keysInlineBody: { minWidth: 0, height: KEYS_INLINE_LIST_HEIGHT, flexDirection: "row", alignItems: "flex-start", gap: 6 }')
+        self.assert_ui_has('keysEditorFieldLabel: { flexShrink: 1, color: systemColors.label, fontSize: UI_FONT_SIZE }')
         self.assert_ui_has('keysHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15, flexShrink: 1 }')
         self.assert_ui_has('<ProviderKeysPanel')
         self.assertNotIn('providerKeyGrid:', self.ui)
@@ -3224,7 +3687,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has("formRow: { minHeight: 24, gap: 2 }")
         self.assert_ui_has("formRowControl: { gap: 1 }")
         self.assertIn("const compactStyles = StyleSheet.create({", relay)
-        self.assertIn('keysEditorRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6, flexWrap: "wrap" }', self.ui)
+        self.assertIn('keysEditorField: { minWidth: 0, gap: 2 }', self.ui)
 
     def test_relay_tables_use_compact_native_zebra_rows_and_shared_alignment(self) -> None:
         relay = RELAY_MANAGER.read_text(encoding="utf-8")
@@ -3255,7 +3718,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         for marker in (
             "function WebDavWorkspace(",
             '{tab === "webdav" ? <View style={[styles.dataManagementWebDavPane, styles.dataManagementWebDavContent, dataManagementPolishStyles.webDavContent]}>',
-            '<WebDavWorkspace snapshot={snapshot} busy={busy || webDavOperationBusy} status={statuses.webdav} translate={translate} dispatch={dispatch} onSecretState={onSecretState} onProbe={onProbeWebDav}>',
+            '<WebDavWorkspace snapshot={snapshot} busy={busy || webDavOperationBusy} probeBusy={pendingAction === "probe"} status={statuses.webdav} translate={translate} dispatch={dispatch} onSecretState={onSecretState} onProbe={() => runPendingAction("probe", onProbeWebDav)}>',
             '<NativeCheckbox label={translate("webdav.enabled")} value={booleanValue(state.enabled)} disabled={busy} onValueChange={(enabled) => dispatch("patch", { enabled })} style={styles.webdavEnabledControl} />',
             "webdavStateRow:",
             "webdavEnabledControl: { flexGrow: 0, flexShrink: 0, alignSelf: \"flex-start\" }",
@@ -3312,9 +3775,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'const runWebDavOperation = async (operation: () => Promise<unknown>, message: string): Promise<void> => {',
             'if (webDavOperationInFlight.current) return;',
             'webDavOperationBusy={webDavOperationBusy}',
-            'disabled={busy || webDavOperationBusy || snapshot?.webdav.enabled !== true}',
+            'disabled={webDavBusy("sync") || snapshot?.webdav.enabled !== true}',
             'type: action, payload: { sections: [...WEBDAV_SYNC_DOMAINS] }',
-            'onPress={() => { void onSyncWebDav(syncAction); }}',
+            'onPress={() => { void runPendingAction("sync", () => onSyncWebDav(syncAction)); }}',
         ):
             self.assert_ui_has(marker)
 
@@ -3336,7 +3799,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "}, null, true);",
             "function WebDavPasswordField(",
             'isDirty: () => dirtyRef.current',
-            "<NativeSecretField plainText autoCommit label={translate(\"common.apiKey\")}",
+            '<NativeSecretField labelVisible={false} plainText autoCommit label={translate("providers.keyValue")}',
+
+    
             'input: { width: "100%", minHeight: 26',
             'formRow: { width: "100%", minHeight: 26',
             'form: { gap: 6 }',
@@ -3362,11 +3827,6 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("modelUpstreamDisplay", self.ui)
         self.assertIn("providerKeyDisplayName", self.ui)
         self.assertIn('value={drafts?.providerKeyDisplayName(providerId, selectedCustom.id, selectedCustom.name) ?? selectedCustom.name}', self.ui)
-        self.assertIn("const providerRows = asRecords(structured.providers).map(editableRecord);", self.ui)
-        self.assertIn("const commitGateway = (base_url: string): Promise<void>", self.ui)
-        self.assertIn("providers: providerRows.map((item) => identifier(item) === directProvider ? { ...item, base_url } : item)", self.ui)
-        self.assertIn("onDraftChange={setModelDraft}", self.ui)
-        self.assertIn('value={displayedModel}', self.ui)
         self.assertNotIn("const INPUT_SYNC_INTERVAL_MS", self.ui)
         self.assertNotIn("const INPUT_COMMIT_DEBOUNCE_MS", self.ui)
         self.assertNotIn("void commit(false).catch(() => undefined);", self.ui)
@@ -3391,19 +3851,27 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn('"providers.responses": "响应接口"', chinese)
         self.assertNotIn('"providers.chat": "聊天接口"', chinese)
 
+    def test_external_editor_is_a_native_sheet_not_an_overlay(self) -> None:
+        # The editor is presented by the host (macOS sheet, Windows route), so
+        # the shared UI keeps no dimmed overlay or in-window dialog for it.
+        for removed in ("editorLayer", "editorDialog", "nativeSheetCornerRadius"):
+            self.assertNotIn(removed, self.ui)
+        self.assertIn("fileEditorRouteContent:", self.ui)
+        self.assertIn("assistantFileSurfaceStyles.editorRoute", self.ui)
+
     def test_codex_raw_editors_share_height_and_follow_disk_generation(self) -> None:
         for marker in (
-            "showLabel={false} showDiff codexPane syncRevision={syncRevision} style={assistantFileSurfaceStyles.editorRaw}",
-            "assistantFileSurfaceStyles.fileGroups",
-            "assistantFileSurfaceStyles.editorDialog",
-            "function AssistantFileEditorDialog",
+            "showLabel={false} showDiff codexPane syncRevision={syncRevision} style={assistantFileSurfaceStyles.editorRouteRaw}",
+            "assistantFileSurfaceStyles.fileRow",
+            "assistantFileSurfaceStyles.editorRoute",
+            "function FileEditorWorkspace",
             "const [settingsRawReloadToken, setSettingsRawReloadToken] = useState(0);",
             "const [settingsRawBaselineToken, setSettingsRawBaselineToken] = useState(0);",
             'if (reloadDomain === "codex" || reloadDomain === "claude") setSettingsRawBaselineToken((current) => current + 1);',
             'if ((currentDisk[diskDomain]?.generation ?? 0) > priorGeneration && !currentDisk[diskDomain]?.changed && (diskDomain === "codex" || diskDomain === "claude"))',
             "await flushPendingFields();",
-            "reloadToken={rawReloadToken}",
-            "baselineToken={rawBaselineToken}",
+            "reloadToken={reloadToken}",
+            "baselineToken={baselineToken}",
             "baselineToken, document, domain, ipc, registry, reloadNonce, reloadToken, reset, translate",
         ):
             self.assert_ui_has(marker)
@@ -3513,8 +3981,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '{canDeleteKey ? <IconButton label="−" title={translate("common.delete")} disabled={controlsBusy} onPress={deleteSelected} /> : null}',
             self.ui,
         )
-        # No keys means no key table: the empty bordered box is not drawn.
-        self.assertEqual(2, self.ui.count("{tableRows.length > 0 ? keysTable : null}"))
+        # No keys means no key table: the empty bordered box is not drawn, and
+        # the inline panel keeps the one table beside its editor.
+        self.assertEqual(1, self.ui.count("{tableRows.length > 0 ? keysTable : null}"))
+        self.assertIn('{tableRows.length > 0 ? <View style={styles.keysInlineBody}>', self.ui)
+        # The keys panel no longer measures the pane: its list height is fixed.
+        self.assertNotIn("paneViewportHeight", self.ui)
+        self.assertNotIn("paneContentHeight", self.ui)
         self.assertIn('const vendorBaseURL = (drafts?.providerBaseURL(provider) ?? stringValue(provider.endpoint, stringValue(provider.api_base))).trim();', self.ui)
         self.assertIn(
             '{vendorBaseURL ? <NativeButton title="" symbol="plus" compact toolTip={translate("providers.addRelayAccount")}',
@@ -3690,12 +4163,15 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("saveFilePicker", types)
         self.assertIn("saveFilePicker", self.platform_entry)
 
-    def test_codex_and_unified_webdav_actions_keep_visible_labels(self) -> None:
-        self.assert_ui_has('>{translate("settings.structured")}</Text>')
+    def test_external_settings_and_webdav_actions_keep_visible_labels(self) -> None:
         self.assert_ui_has('title={translate("dataManagement.testConnection")}')
-        self.assert_ui_has('dispatch("use_local_api", {}, "codex")')
-        self.assert_ui_has('dispatch("use_local_api", {}, "claude")')
+        self.assert_ui_has('title={translate("dataManagement.testConnection")}')
         self.assert_ui_has('title={translate("dataManagement.syncNow")}')
+        # The pane edits files directly; the old structured heading is gone,
+        # and the one remaining client-level shortcut lives in Codex's header.
+        self.assertNotIn('translate("settings.structured")', self.ui)
+        self.assertIn('dispatch("use_local_api", {}, "codex")', self.ui)
+        self.assertNotIn('dispatch("use_local_api", {}, "claude")', self.ui)
         self.assertNotIn('translate("webdav.subtitle")', self.ui)
 
     def test_settings_surfaces_omit_static_draft_tips_but_keep_actionable_disk_conflicts(self) -> None:

@@ -19,7 +19,7 @@ private func withoutAnimations(_ changes: () -> Void) {
     }
 }
 
-// Kept at module scope so every native route, sheet, alert, and file panel
+// Kept at module scope so every native route, child window, alert, and file panel
 // shares the same zero-animation presentation policy.
 func configureImmediatePresentation(_ window: NSWindow) {
     window.animationBehavior = .none
@@ -109,7 +109,17 @@ private enum NativeRelayOriginPolicy {
     }
     private let statusItem: NSStatusItem
     private weak var hostWindow: NSWindow?
-    private var routeWindowFactory: ((String, String?, NSWindow?) -> NSWindow?)?
+    private var routeWindowFactory: ((String, String?, String?, NSWindow?) -> NSWindow?)?
+    /// The raw file editor is presented as a child window over the workspace,
+    /// exactly like the provider wizard. Its window is created once — as soon
+    /// as the pane that opens it appears — so the embedded editor boots while
+    /// the user is still reading the file list; opening then only presents the
+    /// already loaded window. The pending document travels as a small JSON
+    /// payload the window reads through ``pendingFileEditorTarget()``.
+    private var pendingFileEditorTargetValue: String?
+    /// Every child panel on screen with the window it locks, outermost first:
+    /// ending one ends the children opened from it, and the lock over a parent
+    /// is only released with its last child. See ``presentChildPanel(_:in:prepare:)``.
     private var reactHostStarter: (() -> Void)?
     private var routeWindows: [String: NSWindow] = [:]
     /// The service menu is shown on right-click only; a left click opens the
@@ -119,7 +129,8 @@ private enum NativeRelayOriginPolicy {
     private var approvedCloseRoutes: Set<String> = []
     private var codexRestartConfirmationPanel: NSPanel?
     private var codexRestartConfirmationCompletion: ((String) -> Void)?
-    private var groupManagerSheet: NSPanel?
+    private var childPanels: [ChildPanel] = []
+    private var groupManagerPanel: NSPanel?
     private var groupManagerCompletionBlock: ((NativeGroupManagerResult?) -> Void)?
     private var groupManagerController: NativeGroupManagerController?
     private var activeReadOnlyCodeController: NativeReadOnlyCodeController?
@@ -156,8 +167,8 @@ private enum NativeRelayOriginPolicy {
         "routeProviderWizard": "Add Provider",
         "providerAuthInstruction": "Complete sign-in on the official provider page. The code below is shown only for this device-code flow.",
         "providerAuthCode": "Device code", "providerAuthCopy": "Copy", "providerAuthBlocked": "This navigation was blocked because it is outside the official provider authentication flow.",
-        "routeCodexSettings": "Codex / Claude Settings", "routeClaudeSettings": "Claude Settings",
-        "routeRuntimeSettings": "Runtime Settings",
+        "routeCodexSettings": "External Apps", "routeClaudeSettings": "Claude Settings",
+        "routeRuntimeSettings": "Runtime",
         "routeDataManagement": "Data Management", "routeLogs": "Logs",
         "modelChooserTitle": "Choose Models to Add", "modelChooserHeading": "Choose models to add",
         "modelChooserProvider": "Provider", "modelChooserKey": "Key", "modelChooserSearch": "Search models",
@@ -182,7 +193,7 @@ private enum NativeRelayOriginPolicy {
         statusMenu = makeMenu()
     }
 
-    public func setRouteWindowFactory(_ factory: @escaping (String, String?, NSWindow?) -> NSWindow?) {
+    public func setRouteWindowFactory(_ factory: @escaping (String, String?, String?, NSWindow?) -> NSWindow?) {
         routeWindowFactory = factory
     }
 
@@ -252,13 +263,13 @@ private enum NativeRelayOriginPolicy {
         installLanguageMenuIfAvailable()
     }
 
-    func open(route: String, title: String, initialLogTab: String? = nil) {
+    func open(route: String, title: String, initialLogTab: String? = nil, warmOnly: Bool = false) {
         // The legacy app was menu-bar first. "home" exists only as a routing
         // target for RN, not as a dashboard window.
         guard route != "home" else {
             hideHostWindow()
             // "home" leaves the settings shell for the menu bar. Close the
-            // wizard sheet first, then the shared settings window, so no
+            // wizard window first, then the shared settings window, so no
             // empty shell window stays onscreen after the route switch.
             if routeWindows["provider-wizard"] != nil {
                 close(route: "provider-wizard")
@@ -273,11 +284,18 @@ private enum NativeRelayOriginPolicy {
         // stay shared with Windows. Fabric component views below that surface
         // supply AppKit controls, focus behavior, and system appearance.
         let windowRoute = canonicalRoute(route)
+        if windowRoute == "file-editor", pendingFileEditorTargetValue == nil {
+            // One window edits one registered document. A bare deep link, a
+            // restored window, or a stale request has no document to edit, so
+            // it must not present an empty editor.
+            return
+        }
         ensureReactHostStarted()
         if windowRoute == "provider-wizard", settingsWindowKey() == nil,
            let parentTitle = routeWindowTitle("providers-models") {
-            // The provider wizard is a child of the provider workspace. A
-            // native sheet keeps that workspace visible while AppKit locks it.
+            // The provider wizard is a child of the provider workspace: its own
+            // movable window in front of that workspace, which is locked until
+            // the wizard closes.
             open(route: "providers-models", title: parentTitle)
         }
         if Self.settingsPaneRoutes.contains(windowRoute),
@@ -299,7 +317,7 @@ private enum NativeRelayOriginPolicy {
         let window: NSWindow
         if let existing = routeWindows[windowRoute] {
             if let initialLogTab,
-               let refreshed = routeWindowFactory?(route, initialLogTab, existing) {
+               let refreshed = routeWindowFactory?(route, initialLogTab, pendingFileEditorTargetValue, existing) {
                 window = refreshed
                 routeWindows[windowRoute] = window
                 window.delegate = self
@@ -307,7 +325,7 @@ private enum NativeRelayOriginPolicy {
                 window = existing
             }
             window.title = title
-        } else if let created = routeWindowFactory?(route, initialLogTab, nil) {
+        } else if let created = routeWindowFactory?(route, initialLogTab, pendingFileEditorTargetValue, nil) {
             window = created
             routeWindows[windowRoute] = window
             window.delegate = self
@@ -317,25 +335,75 @@ private enum NativeRelayOriginPolicy {
             return
         }
         updateActivationPolicy()
-        configureImmediatePresentation(window)
-        withoutAnimations {
-            if windowRoute == "provider-wizard", let parent = settingsWindow() {
-                if window.sheetParent == nil {
-                    // AppKit disables the parent until endSheet is called.
-                    parent.beginSheet(window)
-                } else {
-                    window.makeKeyAndOrderFront(nil)
-                }
+        if warmOnly {
+            // A warm window boots its React root behind the scenes and reaches
+            // the screen only when the user opens the document it edits.
+            configureImmediatePresentation(window)
+            withoutAnimations { window.orderOut(nil) }
+        } else if windowRoute == "provider-wizard" || windowRoute == "file-editor" {
+            // The wizard and the file editor are children of the workspace they
+            // open from: each is its own movable window with the rest of the
+            // app locked until it closes, exactly like the model chooser. A
+            // window that is already up is only brought forward, never given a
+            // second modal session.
+            if isChildPanel(window) {
+                NSApp.activate(ignoringOtherApps: true)
+                configureImmediatePresentation(window)
+                withoutAnimations { window.makeKeyAndOrderFront(nil) }
             } else {
-                window.makeKeyAndOrderFront(nil)
+                presentChildPanel(window, in: settingsWindow())
             }
+        } else {
+            configureImmediatePresentation(window)
+            withoutAnimations { window.makeKeyAndOrderFront(nil) }
+            NSApp.activate(ignoringOtherApps: true)
         }
-        NSApp.activate(ignoringOtherApps: true)
     }
 
     func open(route: String) {
         guard let title = routeWindowTitle(route) else { return }
         open(route: route, title: title)
+    }
+
+    /// The document the editor window is currently asked to show, as the JSON
+    /// payload the shared UI sent. The window reads it through the synchronous
+    /// accessor below; the host never parses its contents.
+    func pendingFileEditorTarget() -> String {
+        pendingFileEditorTargetValue ?? ""
+    }
+
+    /// Create the editor window without presenting it, so its embedded editor
+    /// boots before the user asks for it. Safe to call repeatedly.
+    func prepareFileEditor() {
+        guard routeWindows["file-editor"] == nil else { return }
+        guard let title = routeWindowTitle("file-editor") else { return }
+        let keep = pendingFileEditorTargetValue
+        // The window factory only forwards a requested document; a prepared
+        // window starts with none and receives the first one on open.
+        pendingFileEditorTargetValue = nil
+        open(route: "file-editor", title: title, warmOnly: true)
+        pendingFileEditorTargetValue = keep
+        updateActivationPolicy()
+    }
+
+    /// Present the raw file editor for one Core-listed client document in its
+    /// own movable window over the workspace. ``payload`` is the shared UI's
+    /// JSON description of that document; a warm window reads it directly.
+    func openFileEditor(_ payload: String) {
+        let trimmed = payload.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.utf8.count <= 8192,
+              trimmed.unicodeScalars.allSatisfy({ $0.value >= 0x20 && $0.value != 0x7f }) else { return }
+        pendingFileEditorTargetValue = trimmed
+        defer { pendingFileEditorTargetValue = nil }
+        guard let title = routeWindowTitle("file-editor") else { return }
+        if routeWindows["file-editor"] != nil {
+            // A warm window already booted its editor: present it and let the
+            // mounted root pick up the new document.
+            open(route: "file-editor", title: title)
+            emitAction("edit-file")
+            return
+        }
+        open(route: "file-editor", title: title)
     }
 
     func close(route: String? = nil) {
@@ -347,8 +415,10 @@ private enum NativeRelayOriginPolicy {
         let restoreProviderModels = selectedRoute == "provider-wizard"
             ? settingsWindow() : nil
         withoutAnimations {
-            if let parent = window.sheetParent {
-                parent.endSheet(window)
+            if isChildPanel(window) {
+                // End the child window's own modal session before it closes, so
+                // the workspace it was opened from is interactive again.
+                endChildPanel(window)
             }
             window.orderOut(nil)
             window.close()
@@ -396,6 +466,11 @@ private enum NativeRelayOriginPolicy {
             requestClose(route: route, hiding: sender)
             return false
         }
+        // 分组管理 discards its draft on Close, so the title-bar close button
+        // asks the same question the footer's Close does before it goes away.
+        if let panel = groupManagerPanel, sender === panel {
+            return groupManagerController?.confirmDiscardIfNeeded() ?? true
+        }
         return true
     }
 
@@ -408,10 +483,136 @@ private enum NativeRelayOriginPolicy {
             completion?("later")
             return
         }
+        // The group manager's own title-bar close button is one dismissal path
+        // beside its footer Close/Apply pair; every one of them settles the
+        // pending result, so a closed window never leaves the pane waiting.
+        if let panel = groupManagerPanel, window === panel {
+            finishGroupManager()
+            return
+        }
+        // A child window AppKit closed itself — its parent going away, or a
+        // close that did not come through ``close(route:)`` — releases the lock
+        // it held over that parent.
+        if isChildPanel(window) {
+            endChildPanel(window)
+        }
         if let route = routeForWindow(window) {
             routeWindows.removeValue(forKey: route)
             updateActivationPolicy()
         }
+    }
+
+    // MARK: - Child panels
+
+    /// One open child surface: the surface, the window it locks, and the lock
+    /// view that keeps that window's content from answering clicks and keys.
+    private struct ChildPanel {
+        let window: NSWindow
+        let parent: NSWindow?
+    }
+
+    /// Present a child surface — the provider wizard, the file editor, 分组管理,
+    /// the relay sign-in browser, the relay usage log, the read-only document
+    /// viewer, the official provider sign-in, or the model chooser — the way
+    /// the app presents every child: its own movable titled window in front of
+    /// the app, attached above the window it was opened from, with that
+    /// window's content locked until the child closes.
+    ///
+    /// The lock is ``NativeChildPanelShield`` rather than a modal session. This
+    /// app cannot use `NSApp.runModal`: that runs the main run loop in its modal
+    /// mode alone, and the React host's frame, timer, event, and promise work
+    /// all stall there — a window opened that way paints nothing and every
+    /// React surface in the process stops committing and stops answering, while
+    /// a native timer heartbeat does not restore it. A sheet keeps the loop
+    /// alive but cannot be dragged and shows no title bar. The shield does both
+    /// jobs: the child keeps a real movable window, the parent stays locked, and
+    /// the app keeps running.
+    ///
+    /// ``prepare`` runs once the panel is key, so a surface can install its
+    /// first responder or load its document.
+    func presentChildPanel(_ panel: NSWindow, in parent: NSWindow?, prepare: (() -> Void)? = nil) {
+        panel.isReleasedWhenClosed = false
+        lockParentWindow(parent, for: panel)
+        childPanels.append(ChildPanel(window: panel, parent: parent))
+        if let parent {
+            // A child window follows the window it was opened from and always
+            // stays above it, which is the part of AppKit's own sheet behavior
+            // worth keeping here.
+            parent.addChildWindow(panel, ordered: .above)
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        configureImmediatePresentation(panel)
+        withoutAnimations { panel.makeKeyAndOrderFront(nil) }
+        prepare?()
+    }
+
+    /// End a child surface: the children it opened end with it, the lock over
+    /// its parent is released, and the window comes off screen. Every dismissal
+    /// path — the title-bar close button, an in-surface Close or Apply, and a
+    /// resolved completion — comes through here.
+    func endChildPanel(_ panel: NSWindow) {
+        for descendant in childPanels.filter({ $0.parent === panel }).map({ $0.window }) {
+            endChildPanel(descendant)
+        }
+        guard let entry = childPanels.first(where: { $0.window === panel }) else {
+            withoutAnimations { panel.orderOut(nil) }
+            return
+        }
+        childPanels.removeAll { $0.window === panel }
+        if let parent = entry.parent {
+            parent.removeChildWindow(panel)
+            unlockParentWindow(parent)
+        }
+        withoutAnimations { panel.orderOut(nil) }
+    }
+
+    /// Cover the content of ``parent`` while ``panel`` is up: the shield takes
+    /// every mouse event, holds the first responder, and keeps the child key, so
+    /// no control of the locked window answers a click or a key. Its window
+    /// buttons are disabled for the same reason, so the parent cannot be closed
+    /// or minimized out from under the child.
+    private func lockParentWindow(_ parent: NSWindow?, for panel: NSWindow) {
+        guard let parent, let content = parent.contentView else { return }
+        if let shield = content.subviews.first(where: { $0 is NativeChildPanelShield }) as? NativeChildPanelShield {
+            shield.setAccessibilityLabel(panel.title)
+            return
+        }
+        let shield = NativeChildPanelShield(frame: content.bounds)
+        shield.autoresizingMask = [.width, .height]
+        shield.setAccessibilityLabel(panel.title)
+        shield.onInteraction = { [weak panel] in
+            // The click belongs to the child: keep it key, so pressing the
+            // locked parent selects nothing in it and blurs nothing in the
+            // child.
+            panel?.makeKeyAndOrderFront(nil)
+        }
+        content.addSubview(shield, positioned: .above, relativeTo: nil)
+        parent.makeFirstResponder(shield)
+        for type in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+            parent.standardWindowButton(type)?.isEnabled = false
+        }
+    }
+
+    /// Release the lock over ``parent`` once its last child has closed.
+    private func unlockParentWindow(_ parent: NSWindow) {
+        guard !childPanels.contains(where: { $0.parent === parent }) else { return }
+        parent.contentView?.subviews.first(where: { $0 is NativeChildPanelShield })?.removeFromSuperview()
+        for type in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+            parent.standardWindowButton(type)?.isEnabled = true
+        }
+    }
+
+    /// True while ``window`` is one of the child panels on screen.
+    private func isChildPanel(_ window: NSWindow) -> Bool {
+        childPanels.contains { $0.window === window }
+    }
+
+    /// A locked window's content keeps its own first responder: a key press
+    /// must never reach a control of the window a child surface locks.
+    public func windowDidBecomeKey(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow,
+              let shield = window.contentView?.subviews.first(where: { $0 is NativeChildPanelShield }) else { return }
+        window.makeFirstResponder(shield)
     }
 
     func chooseImportFile(
@@ -567,9 +768,10 @@ private enum NativeRelayOriginPolicy {
         finishCodexRestartConfirmation(choice: "restart")
     }
 
-    /// Native subordinate sheet of the provider window: the station's API
-    /// keys beside the group each one belongs to.  The sheet drafts its edits
-    /// locally and returns them as staged actions, so every Core write still
+    /// Native child window of the provider workspace: the station's API keys
+    /// beside the group each one belongs to.  It opens in its own movable
+    /// window with the workspace locked until it closes, drafts its edits
+    /// locally, and returns them as staged actions, so every Core write still
     /// happens in the shared provider window.
     func showGroupManager(
         title: String,
@@ -579,6 +781,7 @@ private enum NativeRelayOriginPolicy {
         keys: [[String: String]],
         labels: [String: String],
         autoGrouping: Bool,
+        loading: Bool,
         completion: @escaping (NativeGroupManagerResult?) -> Void
     ) {
         guard Thread.isMainThread else {
@@ -591,38 +794,15 @@ private enum NativeRelayOriginPolicy {
                     keys: keys,
                     labels: labels,
                     autoGrouping: autoGrouping,
+                    loading: loading,
                     completion: completion
                 )
             }
             return
         }
-        let options = groups.compactMap { entry -> NativeGroupManagerController.GroupOption? in
-            guard let id = entry["id"], let label = entry["label"], !label.isEmpty else { return nil }
-            let name = entry["name"].flatMap { $0.isEmpty ? nil : $0 } ?? label
-            let rate = entry["rate"] ?? ""
-            return NativeGroupManagerController.GroupOption(id: id, label: label, name: name, rate: rate)
-        }
-        let rows = keys.compactMap { entry -> NativeGroupManagerController.KeyRow? in
-            guard let id = entry["id"], let name = entry["name"] else { return nil }
-            let groupID = entry["groupID"] ?? ""
-            let enabled = (entry["enabled"] ?? "1") != "0"
-            return NativeGroupManagerController.KeyRow(
-                id: id,
-                name: name,
-                groupID: groupID,
-                groupLabel: entry["groupLabel"] ?? groupID,
-                multiplier: entry["multiplier"] ?? "",
-                hint: entry["hint"] ?? "",
-                modelNames: (entry["models"] ?? "").split(separator: "\n").map(String.init),
-                originalName: name,
-                originalGroupID: groupID,
-                originalEnabled: enabled,
-                enabled: enabled,
-                deleted: false,
-                isDraft: false
-            )
-        }
-        guard let sheetParent = settingsWindow(), rows.count <= 512, options.count <= 512 else {
+        let options = NativeGroupManagerController.groupOptions(from: groups)
+        let rows = NativeGroupManagerController.keyRows(from: keys)
+        guard rows.count <= 512, options.count <= 512 else {
             completion(nil)
             return
         }
@@ -633,31 +813,62 @@ private enum NativeRelayOriginPolicy {
             groups: options,
             rows: rows,
             labels: labels,
-            autoGrouping: autoGrouping
+            autoGrouping: autoGrouping,
+            loading: loading
         )
         groupManagerController = controller
         groupManagerCompletionBlock = completion
-        guard let panel = controller.makeSheet() else {
+        guard let panel = controller.makePanel() else {
             groupManagerController = nil
             groupManagerCompletionBlock = nil
             completion(nil)
             return
         }
-        groupManagerSheet = panel
-        NSApp.activate(ignoringOtherApps: true)
-        withoutAnimations {
-            sheetParent.beginSheet(panel) { [weak self] _ in
-                guard let self else { return }
-                // Any dismissal path — the sheet's own Close button or the
-                // provider window going away — resolves the pending promise.
-                let result = self.groupManagerController?.resultOnEnd()
-                let completion = self.groupManagerCompletionBlock
-                self.groupManagerCompletionBlock = nil
-                self.groupManagerSheet = nil
-                self.groupManagerController = nil
-                completion?(result)
-            }
-        }
+        groupManagerPanel = panel
+        panel.delegate = self
+        // A child surface of the workspace: its own movable window over the
+        // workspace, whose content stays locked until 关闭 or 应用并关闭 ends
+        // it.  Every dismissal path settles the pending promise through
+        // ``finishGroupManager()``.
+        presentChildPanel(panel, in: settingsWindow())
+    }
+
+    /// Settle the group manager's pending result once, whichever way its window
+    /// went away: the footer's Close or Apply, the title-bar close button, or
+    /// the workspace window going away underneath it.
+    private func finishGroupManager() {
+        guard let panel = groupManagerPanel else { return }
+        groupManagerPanel = nil
+        panel.delegate = nil
+        let result = groupManagerController?.resultOnEnd()
+        groupManagerController = nil
+        let completion = groupManagerCompletionBlock
+        groupManagerCompletionBlock = nil
+        endChildPanel(panel)
+        completion?(result)
+    }
+
+    /// Applies a later snapshot of the same account to the window that is open
+    /// for it, and ends its loading state.  The provider window opens the child
+    /// window on the account facts it already holds, so 自动分组's aligned
+    /// draft — which costs a station round trip — lands here instead of holding
+    /// the window closed.  False when no live window took it: a load that
+    /// finishes after Close, or during the window's dismissal, changes nothing.
+    ///
+    /// The push arrives while the child window's modal session is running, so
+    /// it reaches the rows through the main queue exactly like the model
+    /// chooser's own callbacks do.
+    @discardableResult
+    func updateGroupManager(accountLabel: String, groups: [[String: String]], keys: [[String: String]], autoGrouping: Bool) -> Bool {
+        guard Thread.isMainThread else { return false }
+        guard let controller = groupManagerController, groupManagerPanel != nil else { return false }
+        controller.applyData(
+            accountLabel: accountLabel,
+            groups: NativeGroupManagerController.groupOptions(from: groups),
+            rows: NativeGroupManagerController.keyRows(from: keys),
+            autoGrouping: autoGrouping
+        )
+        return true
     }
 
     private func finishCodexRestartConfirmation(choice: String) {
@@ -682,17 +893,13 @@ private enum NativeRelayOriginPolicy {
         completion: @escaping () -> Void
     ) {
         activeReadOnlyCodeController?.close()
-        let owner = activeWindow()
         let controller = NativeReadOnlyCodeController(
             title: title,
             text: text,
             closeTitle: closeTitle,
             language: language,
             html: html,
-            onClose: { [weak self, weak owner] closedController in
-                if let owner, closedController.panel.parent === owner {
-                    owner.removeChildWindow(closedController.panel)
-                }
+            onClose: { [weak self] closedController in
                 if self?.activeReadOnlyCodeController === closedController {
                     self?.activeReadOnlyCodeController = nil
                 }
@@ -700,11 +907,10 @@ private enum NativeRelayOriginPolicy {
             }
         )
         activeReadOnlyCodeController = controller
-        let panel = controller.panel
-        if let owner {
-            owner.addChildWindow(panel, ordered: .above)
-        }
-        controller.present()
+        // One child surface presentation for every surface: the viewer gets its
+        // own movable window over the app, with the window behind it locked
+        // until this document closes.
+        presentChildPanel(controller.panel, in: activeWindow(), prepare: { controller.loadContent() })
     }
 
     /// Present an official provider login. Claude OAuth uses the system
@@ -763,7 +969,8 @@ private enum NativeRelayOriginPolicy {
             authFingerprint = "\(provider)|\(url.absoluteString)|\(callbackURL ?? "")"
         }
         // Re-presentation for the same account replaces its stale challenge;
-        // other account fingerprints remain visible and independent.
+        // other account fingerprints keep their own window and stay usable once
+        // the newest one closes.
         activeProviderAuthControllers[authFingerprint]?.close()
         let controller = NativeProviderAuthController(
             provider: provider,
@@ -783,7 +990,10 @@ private enum NativeRelayOriginPolicy {
             completion()
         }
         activeProviderAuthControllers[authFingerprint] = controller
-        controller.present()
+        // Its own movable window with its parent locked behind it, like every
+        // other child surface. A second account's window stacks on top of this
+        // one and takes over the locked window until it closes.
+        presentChildPanel(controller.panel, in: activeWindow(), prepare: { controller.loadContent() })
     }
 
     func showActionMenu(title: String, items: [String], anchor: [String: NSNumber]) -> Int? {
@@ -882,13 +1092,13 @@ private enum NativeRelayOriginPolicy {
             completion(nil)
             return
         }
-        // A login opened from the providers workspace attaches to that window
-        // as a sheet: it is a subordinate surface, and the parent stays
-        // unclickable until the flow finishes.
-        let sheetParent = embeddedWindow == nil ? settingsWindow() : nil
+        // The sign-in browser is a child surface of the workspace it is opened
+        // from: its own movable window with the rest of the app locked until
+        // the flow finishes.
         let embeddedClose: (() -> Void)? = embedded ? { [weak self] in
             self?.close(route: "provider-wizard")
         } : nil
+        let presentationParent = embeddedWindow == nil ? settingsWindow() : nil
         let controller = NativeRelayLoginController(
             accountID: accountID,
             type: type,
@@ -898,7 +1108,7 @@ private enum NativeRelayOriginPolicy {
             username: username,
             embeddedWindow: embeddedWindow,
             embeddedClose: embeddedClose,
-            sheetParent: sheetParent,
+            presentationParent: presentationParent,
             pendingAccount: pendingAccount,
             stationID: stationID,
             stationName: stationName,
@@ -970,6 +1180,7 @@ private enum NativeRelayOriginPolicy {
             originURL: canonicalOrigin,
             language: language,
             username: nil,
+            presentationParent: settingsWindow(),
             mode: .logs
         )
         activeRelayLoginController = controller
@@ -1070,11 +1281,14 @@ private enum NativeRelayOriginPolicy {
         return true
     }
 
-    func chooseModelsToAdd(models: [String], providerName: String, keyName: String) -> [String]? {
+    func chooseModelsToAdd(models: [String], providerName: String, keyName: String, completion: @escaping ([String]?) -> Void) {
         let candidates = models
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
-        guard !candidates.isEmpty else { return [] }
+        guard !candidates.isEmpty else {
+            completion([])
+            return
+        }
 
         let contentWidth: CGFloat = 620
         let rowHeight: CGFloat = 28
@@ -1096,16 +1310,16 @@ private enum NativeRelayOriginPolicy {
             listHeight: listHeight,
             controller: controller
         )
-        defer { withoutAnimations { panel.close() } }
-
-        NSApp.activate(ignoringOtherApps: true)
-        withoutAnimations { panel.makeKeyAndOrderFront(nil) }
-        // `initialFirstResponder` is not guaranteed to win when a panel is
-        // entered through a nested modal run loop. Establish the editor after
-        // the panel is key so the insertion caret is present on first paint.
-        controller.focusSearchField()
-        guard NSApp.runModal(for: panel) == .OK else { return nil }
-        return controller.selectedModels
+        // The model chooser is the reference child surface: its own movable
+        // window in front of the app, with the window behind it locked until it
+        // ends. `initialFirstResponder` is not guaranteed to win when a panel is
+        // presented, so its editor is established once the panel is key.
+        controller.onFinish = { [weak self] selection in
+            self?.endChildPanel(panel)
+            withoutAnimations { panel.close() }
+            completion(selection)
+        }
+        presentChildPanel(panel, in: activeWindow(), prepare: { controller.focusSearchField() })
     }
 
     private func makeModelChooserPanel(
@@ -1404,6 +1618,31 @@ private enum NativeRelayOriginPolicy {
         NSWorkspace.shared.open(parsed)
     }
 
+    /// Reveal one Core-listed configuration file in Finder.
+    ///
+    /// The settings pane shows files the user may not have created yet, so a
+    /// missing target opens its nearest existing parent directory instead of
+    /// doing nothing. Only an absolute path is accepted; the path itself comes
+    /// from Core's registered client file listing.
+    func revealFile(_ path: String) {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("/"),
+              trimmed.utf8.count <= 4096,
+              !trimmed.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7f }) else { return }
+        let target = URL(fileURLWithPath: trimmed)
+        if FileManager.default.fileExists(atPath: target.path) {
+            NSWorkspace.shared.activateFileViewerSelecting([target])
+            return
+        }
+        var directory = target.deletingLastPathComponent()
+        while directory.path != "/" && !FileManager.default.fileExists(atPath: directory.path) {
+            let parent = directory.deletingLastPathComponent()
+            if parent.path == directory.path { break }
+            directory = parent
+        }
+        NSWorkspace.shared.open(directory)
+    }
+
     private func registerSelection(
         _ url: URL?,
         purpose: String,
@@ -1537,8 +1776,8 @@ private enum NativeRelayOriginPolicy {
         case "toggle-autostart": return localized("autoStart", fallback: "Auto Start at Login")
         case "toggle-codex-model-catalog": return "Use LiteLLM models in Codex"
         case "open-providers-models": return localized("routeProvidersModels", fallback: "Providers & Models")
-        case "open-runtime-settings": return localized("routeRuntimeSettings", fallback: "Runtime Settings")
-        case "open-codex-settings": return localized("routeCodexSettings", fallback: "Codex / Claude Settings")
+        case "open-runtime-settings": return localized("routeRuntimeSettings", fallback: "Runtime")
+        case "open-codex-settings": return localized("routeCodexSettings", fallback: "External Apps")
         case "open-data-management": return localized("routeDataManagement", fallback: "Data Management")
         case "open-logs", "open-logs?tab=recovery": return localized("routeLogs", fallback: "Logs")
         case "show-version": return localized("version", fallback: "Version")
@@ -1684,10 +1923,11 @@ private enum NativeRelayOriginPolicy {
         guard let route else { return }
         let windowRoute = canonicalRoute(route)
         if let window = requestedWindow ?? routeWindows[windowRoute] {
-            // Keep a native sheet visible while React decides whether a dirty
-            // draft may be discarded. Ordering it out here would leave the
-            // parent sheet-locked with no visible child to dismiss.
-            if window.sheetParent == nil {
+            // Keep a child window visible while React decides whether a dirty
+            // draft may be discarded: its modal session is still running, and
+            // ordering it out here would leave the app locked behind a window
+            // that is no longer on screen to dismiss.
+            if !isChildPanel(window) {
                 withoutAnimations {
                     window.orderOut(nil)
                 }
@@ -1719,7 +1959,7 @@ private enum NativeRelayOriginPolicy {
         settingsWindowKey().flatMap { routeWindows[$0] }
     }
 
-    private func activeWindow() -> NSWindow? {
+    func activeWindow() -> NSWindow? {
         if let keyWindow = NSApp.keyWindow, routeForWindow(keyWindow) != nil {
             return keyWindow
         }
@@ -1738,6 +1978,9 @@ private enum NativeRelayOriginPolicy {
     private func configure(_ window: NSWindow, for route: String, title: String) {
         let layout = routeWindowLayout(for: route)
         window.title = title
+        // A document editor cannot be resumed without the document it was
+        // opened for, so it is never restored by AppKit.
+        window.isRestorable = route != "file-editor"
         window.minSize = layout.minSize
         window.maxSize = layout.maxSize ?? Self.unconstrainedWindowSize
         window.setContentSize(layout.contentSize)
@@ -1773,6 +2016,15 @@ private enum NativeRelayOriginPolicy {
                 minSize: NSSize(width: 540, height: 420),
                 maxSize: nil
             )
+        case "file-editor":
+            // The editor opens over the workspace it belongs to, so its default
+            // size fits inside the settings window and leaves it readable
+            // around the edges.
+            return RouteWindowLayout(
+                contentSize: NSSize(width: 900, height: 560),
+                minSize: NSSize(width: 720, height: 420),
+                maxSize: nil
+            )
         default:
             return RouteWindowLayout(
                 contentSize: NSSize(width: 1052, height: 600),
@@ -1801,8 +2053,9 @@ private enum NativeRelayOriginPolicy {
         case "home": return localized("routeHome", fallback: "Young Router")
         case "providers-models": return localized("routeProvidersModels", fallback: "Providers & Models")
         case "provider-wizard": return localized("routeProviderWizard", fallback: "Add Provider")
-        case "codex-settings", "claude-settings": return localized("routeCodexSettings", fallback: "Codex / Claude Settings")
-        case "runtime-settings": return localized("routeRuntimeSettings", fallback: "Runtime Settings")
+        case "file-editor": return localized("routeFileEditor", fallback: "Edit File")
+        case "codex-settings", "claude-settings": return localized("routeCodexSettings", fallback: "External Apps")
+        case "runtime-settings": return localized("routeRuntimeSettings", fallback: "Runtime")
         case "data-management": return localized("routeDataManagement", fallback: "Data Management")
         case "logs": return localized("routeLogs", fallback: "Logs")
         default: return nil
@@ -1820,6 +2073,7 @@ private enum NativeRelayOriginPolicy {
         switch route {
         case "home": return localized("routeHome", fallback: "Young Router")
         case "provider-wizard": return "LiteLLM " + localized("routeProviderWizard", fallback: "Add Provider")
+        case "file-editor": return localized("routeFileEditor", fallback: "Edit File")
         default: return nil
         }
     }
@@ -1882,6 +2136,53 @@ private enum NativeRelayOriginPolicy {
     @objc private func quit() { requestQuit() }
 }
 
+/// The one browser identity every request of ours presents.  The literal is
+/// mirrored by `young_router/browser_identity.py` and asserted by
+/// `tests/test_browser_identity.py`: the app never exposes a User-Agent of its
+/// own, and a relay that binds a browser session to its IP and User-Agent
+/// fingerprint keeps one account on one fingerprint.
+enum RelayBrowserIdentity {
+    static let userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Safari/605.1.15"
+    static let acceptLanguage = "zh-CN,zh;q=0.9,en;q=0.8"
+}
+
+/// The lock a child surface puts over the window it was opened from.
+///
+/// The app cannot lock a parent with `NSApp.runModal`: that runs the main run
+/// loop in its modal mode alone, and the React host's frame, timer, event, and
+/// promise work all stall there, so a modal session freezes every React surface
+/// in the process. This view does the locking instead. It covers the parent's
+/// content, takes every mouse event, and holds the first responder, so no
+/// control of the locked window answers a click or a key while the child
+/// surface is up; the child keeps its own movable window, and the app keeps
+/// rendering and answering everywhere else.
+private final class NativeChildPanelShield: NSView {
+    /// Called for every mouse press: the child takes the keyboard back, so a
+    /// press on the locked window selects nothing in it.
+    var onInteraction: (() -> Void)?
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard let superview else { return nil }
+        return bounds.contains(convert(point, from: superview)) ? self : nil
+    }
+
+    override var acceptsFirstResponder: Bool { true }
+    override func mouseDown(with event: NSEvent) { onInteraction?() }
+    override func mouseUp(with event: NSEvent) { onInteraction?() }
+    override func rightMouseDown(with event: NSEvent) { onInteraction?() }
+    override func rightMouseUp(with event: NSEvent) { onInteraction?() }
+    override func otherMouseDown(with event: NSEvent) { onInteraction?() }
+    override func otherMouseUp(with event: NSEvent) { onInteraction?() }
+    override func mouseDragged(with event: NSEvent) { onInteraction?() }
+    override func scrollWheel(with event: NSEvent) { onInteraction?() }
+    override func keyDown(with event: NSEvent) {}
+    override func keyUp(with event: NSEvent) {}
+    override func flagsChanged(with event: NSEvent) {}
+
+    override func isAccessibilityElement() -> Bool { true }
+    override func accessibilityRole() -> NSAccessibility.Role? { .group }
+}
+
 /// A push button that keeps the Return-key default-button role without the
 /// accent-colored default fill. Assigning ``keyEquivalent`` ``"\\r"`` makes
 /// AppKit paint the button with the control accent color; temporarily
@@ -1900,7 +2201,7 @@ private final class NeutralDefaultButton: NSButton {
 }
 
 
-/// Thin separator frame around a native list inside a sheet, matching the
+/// Thin separator frame around a native list inside a window, matching the
 /// shared table's frame instead of a heavier bezel box.
 private final class NativeListFrameView: NSView {
     override init(frame frameRect: NSRect) {
@@ -1923,7 +2224,7 @@ private final class NativeListFrameView: NSView {
 }
 
 /// The 模型列表 view: the selected key's models, one aligned line each, in the
-/// detail column.  The sheet sizes it for the longest list it shows, and the
+/// detail column.  The window sizes it for the longest list it shows, and the
 /// persistent scroller takes over when the list is taller than that.
 private final class NativeModelsListView: NSScrollView {
     private let textView = NSTextView(frame: .zero)
@@ -1995,7 +2296,7 @@ private final class NativeModelsListView: NSScrollView {
     }
 }
 
-/// Result of the native group manager sheet: the auto-grouping switch plus the
+/// Result of the native group manager window: the auto-grouping switch plus the
 /// key edits the user staged in the master-detail editor.
 struct NativeGroupManagerResult {
     struct Create {
@@ -2016,8 +2317,8 @@ struct NativeGroupManagerResult {
     let deletes: [String]
 }
 
-/// Column headers inside the group manager sheet reuse the shared table's
-/// header title style so the sheet list reads like every other native table.
+/// Column headers inside the group manager window reuse the shared table's
+/// header title style so the window list reads like every other native table.
 private func groupManagerHeaderTitle(_ title: String) -> NSAttributedString {
     let paragraph = NSMutableParagraphStyle()
     paragraph.lineBreakMode = .byTruncatingTail
@@ -2031,7 +2332,7 @@ private func groupManagerHeaderTitle(_ title: String) -> NSAttributedString {
     ])
 }
 
-/// The group manager sheet: the pre-refactor master-detail editor.  The left
+/// The group manager window: the pre-refactor master-detail editor.  The left
 /// list carries the keys with their group and rate plus the ＋/－ toolbar, the
 /// right pane edits the selected key, and the bottom bar applies or discards
 /// the staged edits.  Manual edits follow the auto-grouping switch because
@@ -2065,28 +2366,72 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         let isDraft: Bool
     }
 
+    /// The picker's group options, built from the native payload: the name
+    /// heads the picker with its rate appended, and 倍率 reports the rate alone.
+    static func groupOptions(from entries: [[String: String]]) -> [GroupOption] {
+        entries.compactMap { entry -> GroupOption? in
+            guard let id = entry["id"], let label = entry["label"], !label.isEmpty else { return nil }
+            let name = entry["name"].flatMap { $0.isEmpty ? nil : $0 } ?? label
+            let rate = entry["rate"] ?? ""
+            return GroupOption(id: id, label: label, name: name, rate: rate)
+        }
+    }
+
+    /// The list's key rows, each drafted against the group the station reports.
+    static func keyRows(from entries: [[String: String]]) -> [KeyRow] {
+        entries.compactMap { entry -> KeyRow? in
+            guard let id = entry["id"], let name = entry["name"] else { return nil }
+            let groupID = entry["groupID"] ?? ""
+            let enabled = (entry["enabled"] ?? "1") != "0"
+            return KeyRow(
+                id: id,
+                name: name,
+                groupID: groupID,
+                groupLabel: entry["groupLabel"] ?? groupID,
+                multiplier: entry["multiplier"] ?? "",
+                hint: entry["hint"] ?? "",
+                modelNames: (entry["models"] ?? "").split(separator: "\n").map(String.init),
+                originalName: name,
+                originalGroupID: groupID,
+                originalEnabled: enabled,
+                enabled: enabled,
+                deleted: false,
+                isDraft: false
+            )
+        }
+    }
+
     private let title: String
-    private let accountLabel: String
+    private var accountLabel: String
     /// The account that owns the keys; the copy action names it as the secret target.
     private let accountID: String
-    private let groups: [GroupOption]
+    private var groups: [GroupOption]
     private var rows: [KeyRow]
     private let labels: [String: String]
-    private let initialAutoGrouping: Bool
+    /// The switch's value when the window's rows last arrived, so the footer's
+    /// staged-change test compares the live switch against the loaded account.
+    private var initialAutoGrouping: Bool
+    /// The window's rows are still loading: 自动分组's aligned draft costs a
+    /// station round trip, and the window opens before that answer arrives.  The
+    /// rows it opened on stay read-only behind the wheel beside 密钥 until the
+    /// update lands, so an edit can never be staged against data the load is
+    /// about to replace.
+    private var loading: Bool
     private var syncingSelection = false
     private var applied = false
     private var copyStatusToken = 0
     ///
-    /// Plaintext keys the sheet already revealed while it is open, keyed by
+    /// Plaintext keys the window already revealed while it is open, keyed by
     /// key id.  Core's lease is read-once, so a re-selection reuses what the
-    /// sheet already read instead of asking for another one, and the values
-    /// are dropped with the controller when the sheet ends.
+    /// window already read instead of asking for another one, and the values
+    /// are dropped with the controller when the window ends.
     private var revealedKeys: [String: String] = [:]
     /// Distinguishes the newest reveal from a reply for an earlier selection.
     private var revealToken = 0
 
     private weak var panel: NSPanel?
     private weak var table: NSTableView?
+    private weak var accountField: NSTextField?
     private weak var addButton: NSButton?
     private weak var removeButton: NSButton?
     private weak var enabledCheckbox: NSButton?
@@ -2098,6 +2443,16 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
     private weak var copyButton: NSButton?
     private weak var copyStatusField: NSTextField?
     private weak var toggle: NSButton?
+    /// The list header's busy wheel: the shared frames a working button draws,
+    /// turning beside 密钥 while the station round trip is in flight.  The wheel
+    /// keeps its box whether it turns or not, so the header never shifts.
+    private weak var loadingSpinner: NSImageView?
+    /// The wheel's timer and step: the frames are drawn once, so turning the
+    /// wheel only swaps images and never re-lays the header out.
+    private var loadingTimer: Timer?
+    private var loadingStep = 0
+    /// The 模型列表 grid's height, which a later snapshot can grow.
+    private var modelsListHeight: NSLayoutConstraint?
 
     /// Save and Close stays disabled until the draft would change the account:
     /// the auto-grouping switch, a staged create, update, or delete.
@@ -2121,11 +2476,7 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
 
     /// Group names the account still offers, keyed by group id, so the list's
     /// group column names the group while its 倍率 column carries the rate.
-    private lazy var currentGroupNames: [String: String] = {
-        var names: [String: String] = [:]
-        for group in groups where !group.id.isEmpty { names[group.id] = group.name }
-        return names
-    }()
+    private var currentGroupNames: [String: String]
 
     /// The 倍率 column reports the rate the row costs right now, on the same
     /// terms whether or not 自动分组 owns the layout; 倍率 carries a rate and
@@ -2155,7 +2506,7 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         return row.multiplier
     }
 
-    init(title: String, accountLabel: String, accountID: String, groups: [GroupOption], rows: [KeyRow], labels: [String: String], autoGrouping: Bool) {
+    init(title: String, accountLabel: String, accountID: String, groups: [GroupOption], rows: [KeyRow], labels: [String: String], autoGrouping: Bool, loading: Bool) {
         self.title = title
         self.accountLabel = accountLabel
         self.accountID = accountID
@@ -2163,6 +2514,22 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         self.rows = rows
         self.labels = labels
         self.initialAutoGrouping = autoGrouping
+        self.loading = loading
+        self.currentGroupNames = NativeGroupManagerController.groupNames(groups)
+    }
+
+    /// Group names keyed by group id, for the column that names a row's group.
+    private static func groupNames(_ groups: [GroupOption]) -> [String: String] {
+        var names: [String: String] = [:]
+        for group in groups where !group.id.isEmpty { names[group.id] = group.name }
+        return names
+    }
+
+    /// The 模型列表 grid's row count: room for the longest key's list, at least
+    /// the three rows a short list reads in, at most the twelve it shows a
+    /// scroll for.
+    private static func modelGridRows(_ rows: [KeyRow]) -> Int {
+        max(3, min(12, rows.map { $0.modelNames.count }.max() ?? 0))
     }
 
     private func label(_ key: String, _ fallback: String = "") -> String {
@@ -2187,16 +2554,19 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
     }
 
     private var editingEnabled: Bool {
-        toggle?.state == .off
+        !loading && toggle?.state == .off
     }
 
-    func makeSheet() -> NSPanel? {
+    func makePanel() -> NSPanel? {
         let rowHeight: CGFloat = 22
         let headerHeight: CGFloat = 24
         let listHeight = min(360, max(120, CGFloat(rows.count + 1) * rowHeight + 2 + headerHeight))
+        // The same child-surface chrome the model chooser uses: a titled window
+        // of its own with the platform close button, over the workspace it
+        // belongs to.
         let panel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: 780, height: 172 + listHeight),
-            styleMask: [.titled],
+            styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
         )
@@ -2210,6 +2580,7 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         let titleLabel = NSTextField(labelWithString: title)
         titleLabel.font = NSFont.systemFont(ofSize: nativeUIFontSize, weight: .semibold)
         let accountField = NSTextField(labelWithString: accountLabel)
+        self.accountField = accountField
         accountField.font = NSFont.systemFont(ofSize: nativeUIFontSize)
         accountField.textColor = .secondaryLabelColor
         accountField.lineBreakMode = .byTruncatingMiddle
@@ -2218,6 +2589,19 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         // Left column: the key list with the ＋ / － toolbar.
         let listTitle = NSTextField(labelWithString: label("listLabel"))
         listTitle.font = NSFont.systemFont(ofSize: nativeUIFontSize, weight: .semibold)
+        // 密钥's own header declares the load: the key list is what the station
+        // round trip is about to replace, so the wheel turns beside the title
+        // those rows belong to, and the footer keeps only the switch and the
+        // buttons.  It is the button's own busy wheel - the same shared frames,
+        // swapped in place - never a progress-indicator view, and the words for
+        // the wait ride it as its tooltip.
+        let loadingSpinner = NSImageView()
+        loadingSpinner.imageScaling = .scaleNone
+        loadingSpinner.contentTintColor = .secondaryLabelColor
+        loadingSpinner.toolTip = label("loadingLabel")
+        loadingSpinner.setAccessibilityLabel(label("loadingLabel"))
+        loadingSpinner.isHidden = true
+        self.loadingSpinner = loadingSpinner
         // ± ride the list header as the app's compact icon buttons do: one
         // square small control each, four points apart.
         let removeButton = NSButton(title: "", target: self, action: #selector(removeSelectedKey(_:)))
@@ -2273,7 +2657,7 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         multiplierColumn.headerCell.isBezeled = false
         let table = NSTableView()
         table.style = .plain
-        // The sheet list labels its columns like every other native table so
+        // The window list labels its columns like every other native table so
         // 名称 / 分组 / 倍率 stay readable while 自动分组 disables the detail pane.
         table.headerView = NSTableHeaderView(frame: NSRect(x: 0, y: 0, width: 0, height: headerHeight))
         table.addTableColumn(nameColumn)
@@ -2369,12 +2753,13 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         }
         // 模型列表 sits in the detail column under the key's own facts: one
         // aligned line per model, sized for the longest list any key carries so
-        // switching groups never resizes the sheet.
-        let modelRows = max(3, min(12, rows.map { $0.modelNames.count }.max() ?? 0))
+        // switching groups never resizes the window.
         let modelsTitle = NSTextField(labelWithString: label("modelsLabel"))
         modelsTitle.font = NSFont.systemFont(ofSize: nativeUIFontSize, weight: .semibold)
         let modelsList = NativeModelsListView(font: detailFont, emptyText: label("emptyLabel"))
         self.modelsList = modelsList
+        let modelsHeight = modelsList.heightAnchor.constraint(equalToConstant: CGFloat(NativeGroupManagerController.modelGridRows(rows)) * 17)
+        self.modelsListHeight = modelsHeight
         let copyStatus = NSTextField(labelWithString: "")
         copyStatus.font = NSFont.systemFont(ofSize: nativeUIFontSize)
         copyStatus.textColor = .secondaryLabelColor
@@ -2386,10 +2771,10 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         toggle.font = NSFont.systemFont(ofSize: nativeUIFontSize)
         toggle.state = initialAutoGrouping ? .on : .off
         self.toggle = toggle
-        let closeButton = NSButton(title: label("closeLabel"), target: self, action: #selector(closeSheet(_:)))
+        let closeButton = NSButton(title: label("closeLabel"), target: self, action: #selector(closePanel(_:)))
         closeButton.bezelStyle = .rounded
         closeButton.font = NSFont.systemFont(ofSize: nativeUIFontSize)
-        let applyButton = NSButton(title: label("applyLabel"), target: self, action: #selector(applySheet(_:)))
+        let applyButton = NSButton(title: label("applyLabel"), target: self, action: #selector(applyPanel(_:)))
         applyButton.bezelStyle = .rounded
         applyButton.font = NSFont.systemFont(ofSize: nativeUIFontSize)
         applyButton.keyEquivalent = "\r"
@@ -2397,12 +2782,12 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         applyButton.isEnabled = false
         self.applyButton = applyButton
 
-        [titleLabel, accountField, listTitle, addButton, removeButton, listFrame, enabledCheckbox, nameLabel, nameField, groupFieldLabel, groupPopUp, multiplierLabel, multiplierField, valueLabel, valueField, copyButton, copyStatus, modelsTitle, modelsList, toggle, closeButton, applyButton].forEach {
+        [titleLabel, accountField, listTitle, loadingSpinner, addButton, removeButton, listFrame, enabledCheckbox, nameLabel, nameField, groupFieldLabel, groupPopUp, multiplierLabel, multiplierField, valueLabel, valueField, copyButton, copyStatus, modelsTitle, modelsList, toggle, closeButton, applyButton].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
             content.addSubview($0)
         }
         NSLayoutConstraint.activate([
-            // The sheet keeps its own width: a long key or model list wraps in
+            // The window keeps its own width: a long key or model list wraps in
             // its row instead of stretching the window to fit the text.
             content.widthAnchor.constraint(equalToConstant: 780),
             titleLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
@@ -2414,7 +2799,7 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
             listTitle.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
             listTitle.topAnchor.constraint(equalTo: accountField.bottomAnchor, constant: 12),
             // 密钥's ＋ / － actions belong to the key list, so they end at the
-            // list's own edge instead of the sheet's.
+            // list's own edge instead of the window's.
             removeButton.trailingAnchor.constraint(equalTo: listFrame.trailingAnchor),
             removeButton.centerYAnchor.constraint(equalTo: listTitle.centerYAnchor),
             removeButton.widthAnchor.constraint(equalToConstant: 22),
@@ -2461,19 +2846,19 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
             copyButton.centerYAnchor.constraint(equalTo: valueField.centerYAnchor),
             // 模型列表 takes the detail column's width under the key's facts;
             // the list scrolls when the station reports more models than the
-            // sheet shows at once.
+            // window shows at once.
             modelsTitle.leadingAnchor.constraint(equalTo: enabledCheckbox.leadingAnchor),
             modelsTitle.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
             modelsTitle.topAnchor.constraint(equalTo: valueField.bottomAnchor, constant: 10),
             modelsList.leadingAnchor.constraint(equalTo: enabledCheckbox.leadingAnchor),
             modelsList.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
             modelsList.topAnchor.constraint(equalTo: modelsTitle.bottomAnchor, constant: 6),
-            modelsList.heightAnchor.constraint(equalToConstant: CGFloat(modelRows) * 17),
+            modelsHeight,
             copyStatus.leadingAnchor.constraint(equalTo: enabledCheckbox.leadingAnchor),
             copyStatus.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
             copyStatus.topAnchor.constraint(equalTo: modelsList.bottomAnchor, constant: 12),
             // The detail column's last line is the copy result; it ends above
-            // the footer, and the sheet grows to fit the rows it carries (the
+            // the footer, and the window grows to fit the rows it carries (the
             // key list stretches with it).
             copyStatus.bottomAnchor.constraint(equalTo: toggle.topAnchor, constant: -14),
             toggle.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
@@ -2482,25 +2867,112 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
             applyButton.centerYAnchor.constraint(equalTo: toggle.centerYAnchor),
             closeButton.trailingAnchor.constraint(equalTo: applyButton.leadingAnchor, constant: -8),
             closeButton.centerYAnchor.constraint(equalTo: toggle.centerYAnchor),
+            // The wheel rides 密钥's own line, at the list column's left edge:
+            // the load it reports is about that key list.
+            loadingSpinner.leadingAnchor.constraint(equalTo: listTitle.trailingAnchor, constant: 6),
+            loadingSpinner.centerYAnchor.constraint(equalTo: listTitle.centerYAnchor),
+            loadingSpinner.widthAnchor.constraint(equalToConstant: AppKitBusySpinner.size),
+            loadingSpinner.heightAnchor.constraint(equalToConstant: AppKitBusySpinner.size),
         ])
-        // The sheet fits the longer of the key list and the detail column, so
+        // The window fits the longer of the key list and the detail column, so
         // a three-key account still shows every detail row.  The fit is
         // reapplied once a selection loads its wrapped rows.
-        fitSheetToContent()
-        // The selection drives the detail column, so the sheet opens on the
+        fitPanelToContent()
+        // The selection drives the detail column, so the window opens on the
         // first key instead of a blank form.
         if !rows.isEmpty {
             table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
         }
-        loadDetail()
-        refreshApplyButton()
+        updateLoadingChrome()
         return panel
     }
 
-    /// The sheet fits the longer of the key list and the detail column, so a
+    /// Applies a later snapshot of the same account to the open window: the
+    /// window opens on the account facts the provider window already holds and
+    /// then shows the station's refreshed layout.  The rows are replaced
+    /// wholesale because the window is read-only until the load lands, so no
+    /// staged edit can be lost to it.
+    func applyData(accountLabel: String, groups: [GroupOption], rows: [KeyRow], autoGrouping: Bool) {
+        let previousID = selectedRowID
+        self.accountLabel = accountLabel
+        self.groups = groups
+        self.rows = rows
+        self.currentGroupNames = NativeGroupManagerController.groupNames(groups)
+        self.initialAutoGrouping = autoGrouping
+        accountField?.stringValue = accountLabel
+        toggle?.state = autoGrouping ? .on : .off
+        stagedDeleteCount = 0
+        // A plaintext value the window read belongs to the key id it came from;
+        // a key the refresh replaced is read again on its next selection.
+        let ids = Set(rows.map { $0.id })
+        revealedKeys = revealedKeys.filter { ids.contains($0.key) }
+        modelsListHeight?.constant = CGFloat(NativeGroupManagerController.modelGridRows(rows)) * 17
+        groupPopUp?.removeAllItems()
+        groupPopUp?.addItems(withTitles: groups.map { $0.label })
+        loading = false
+        // The selection follows its key across the load while that key is still
+        // there; otherwise the window opens on the first row of the new list.
+        let index = previousID.flatMap { id in rows.firstIndex { $0.id == id } } ?? (rows.isEmpty ? -1 : 0)
+        table?.reloadData()
+        if index >= 0 && index < rows.count {
+            table?.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+        } else {
+            table?.deselectAll(nil)
+        }
+        updateLoadingChrome()
+    }
+
+    /// The list header states a load in flight and what it withholds: the wheel
+    /// turns beside 密钥, while the switch and every edit control the update is
+    /// about to replace are disabled.  Close stays available: a load the user
+    /// does not want to wait for can still be discarded.
+    private func updateLoadingChrome() {
+        loadingSpinner?.isHidden = !loading
+        if loading {
+            startLoadingWheel()
+        } else {
+            stopLoadingWheel()
+        }
+        toggle?.isEnabled = !loading
+        loadDetail()
+        refreshApplyButton()
+    }
+
+    /// Turns the shared wheel one step per tick, in common modes so it keeps
+    /// turning while a menu or a scroll is tracking.  The timer holds the
+    /// controller weakly: a window that ends while the load is still in flight
+    /// takes its wheel with it instead of leaving one turning off screen.
+    private func startLoadingWheel() {
+        guard loadingTimer == nil else { return }
+        loadingSpinner?.image = AppKitBusySpinner.frames[loadingStep]
+        let timer = Timer(timeInterval: AppKitBusySpinner.stepInterval, repeats: true) { [weak self] timer in
+            guard let self else {
+                timer.invalidate()
+                return
+            }
+            self.advanceLoadingWheel()
+        }
+        loadingTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func stopLoadingWheel() {
+        loadingTimer?.invalidate()
+        loadingTimer = nil
+    }
+
+    /// The wheel turns by swapping pre-rendered frames, so nothing about the
+    /// window's layout changes while it reports progress.
+    private func advanceLoadingWheel() {
+        guard !AppKitBusySpinner.frames.isEmpty else { return }
+        loadingStep = (loadingStep + 1) % AppKitBusySpinner.frames.count
+        loadingSpinner?.image = AppKitBusySpinner.frames[loadingStep]
+    }
+
+    /// The window fits the longer of the key list and the detail column, so a
     /// short key list still shows every detail row.  A loaded selection adds
     /// the 模型列表 grid, so the fit is reapplied whenever the rows load.
-    private func fitSheetToContent() {
+    private func fitPanelToContent() {
         guard let panel, let content = panel.contentView else { return }
         let minimumHeight = min(content.fittingSize.height, 900)
         if minimumHeight > content.frame.height {
@@ -2557,7 +3029,7 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
             groupPopUp?.selectItem(at: -1)
         }
         syncingSelection = false
-        fitSheetToContent()
+        fitPanelToContent()
     }
 
     private func reloadAndSelect(_ index: Int) {
@@ -2572,7 +3044,7 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
     }
 
     private func refreshApplyButton() {
-        applyButton?.isEnabled = hasStagedChanges
+        applyButton?.isEnabled = !loading && hasStagedChanges
     }
 
     private func commitNameField() {
@@ -2662,7 +3134,7 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
     }
 
     /// Show the selected key in plaintext.  The value is read through Core's
-    /// native capability and stays in this sheet: React never receives it.  A
+    /// native capability and stays in this window: React never receives it.  A
     /// draft key has no key on the station yet, and a key whose read fails
     /// keeps stating the state the presence sentinel reports.
     private func revealSelectedKey(_ row: KeyRow) {
@@ -2693,8 +3165,8 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
                 guard self.revealToken == token, self.selectedRowID == keyID else { return }
                 self.valueField?.stringValue = value
                 // A wrapped key makes the detail column taller than the panel
-                // was sized for, so the sheet takes the height it now needs.
-                self.fitSheetToContent()
+                // was sized for, so the window takes the height it now needs.
+                self.fitPanelToContent()
             }
         }
     }
@@ -2710,7 +3182,7 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         guard let table, let index = table.selectedRow as Int?, index >= 0, index < rows.count else { return }
         let row = rows[index]
         guard canCopy(row) else { return }
-        // A key the sheet already revealed copies from what it holds, so the
+        // A key the window already revealed copies from what it holds, so the
         // read-once lease is not spent twice on the same key.
         if let revealed = revealedKeys[row.id] {
             let pasteboard = NSPasteboard.general
@@ -2769,19 +3241,20 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         refreshApplyButton()
     }
 
-    /// Close discards the draft, so a sheet that would lose edits asks first; a
-    /// sheet the user never touched closes straight away.
-    @objc private func closeSheet(_ sender: NSButton) {
+    /// Close discards the draft, so a window that would lose edits asks first;
+    /// a window the user never touched closes straight away.
+    @objc private func closePanel(_ sender: NSButton) {
         guard confirmDiscardIfNeeded() else { return }
         applied = false
-        if let panel, let parent = panel.sheetParent {
-            parent.endSheet(panel)
+        if let panel {
+            AppKitNativeLeaf.shared.endChildPanel(panel)
         }
     }
 
     /// Confirm a Close that would drop staged edits.  The native alert owns the
-    /// copy so the decision is visible regardless of the shared UI's state.
-    private func confirmDiscardIfNeeded() -> Bool {
+    /// copy so the decision is visible regardless of the shared UI's state, and
+    /// the window's own title-bar close button asks the same question.
+    func confirmDiscardIfNeeded() -> Bool {
         guard hasStagedChanges else { return true }
         let title = label("discardTitle")
         let message = label("discardBody")
@@ -2792,12 +3265,12 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         )
     }
 
-    @objc private func applySheet(_ sender: NSButton) {
+    @objc private func applyPanel(_ sender: NSButton) {
         guard hasStagedChanges else { return }
         commitNameField()
         applied = true
-        if let panel, let parent = panel.sheetParent {
-            parent.endSheet(panel)
+        if let panel {
+            AppKitNativeLeaf.shared.endChildPanel(panel)
         }
     }
 
@@ -2890,6 +3363,98 @@ final class NativeSplitView: NSSplitView {
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
+    }
+}
+
+/// The app's busy wheel: the frames a working control swaps in place to report
+/// progress.  One drawing serves both callers - the Fabric busy button in
+/// `AppKitControlViews.mm`, which reads this class through the generated Swift
+/// header the way it reads `LiteLLMPersistentScroller`, and the 分组管理 window's
+/// key list header beside 密钥 - so a wait in flight is one wheel, never a second
+/// one drawn beside it.
+///
+/// The wheel is drawn as the control's own leading image, so AppKit centers the
+/// icon together with the title exactly like a symbol-with-title button: one
+/// centered group, no view laid over the bezel.  A native progress indicator
+/// only renders correctly at its own intrinsic sizes, so the wheel is the small
+/// graded spoke early iOS used, pre-rendered as rotated template frames that
+/// AppKit tints with whatever the caller draws its text in.
+///
+/// The ObjC control views read this class through the generated Swift header, so
+/// it must be public to appear in `YoungRouter-Swift.h`.
+@objc(AppKitBusySpinner)
+public final class AppKitBusySpinner: NSObject {
+    /// The wheel's own size in points: every frame is drawn at this box, so a
+    /// caller that reserves it never re-lays out while the wheel turns.
+    @objc public static let size: CGFloat = 12
+    /// Steps per full turn.
+    @objc public static let stepCount = 12
+    /// How long one step lasts, so one turn takes about a second.
+    @objc public static var stepInterval: TimeInterval {
+        1 / TimeInterval(stepCount)
+    }
+    /// The frames, one per step, in step order: a caller only ever swaps them.
+    @objc public static let frames: [NSImage] = (0 ..< stepCount).map { step in
+        frame(rotation: -360 / CGFloat(stepCount) * CGFloat(step))
+    }
+
+    /// One frame: the wheel drawn into a 2x bitmap and rotated into place, so the
+    /// caller only swaps images and never redraws, resizes, or re-lays out.
+    private static func frame(rotation: CGFloat) -> NSImage {
+        // Two device pixels per point keeps the spokes crisp on a Retina display.
+        let scale = 2
+        let pixels = Int((size * CGFloat(scale)).rounded())
+        let image = NSImage(size: NSSize(width: size, height: size))
+        guard let representation = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: pixels,
+            pixelsHigh: pixels,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ), let context = NSGraphicsContext(bitmapImageRep: representation) else { return image }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = context
+        let transform = NSAffineTransform()
+        transform.scale(by: CGFloat(scale))
+        transform.translateX(by: size / 2, yBy: size / 2)
+        transform.rotate(byDegrees: rotation)
+        transform.translateX(by: -size / 2, yBy: -size / 2)
+        transform.concat()
+        drawWheel()
+        NSGraphicsContext.restoreGraphicsState()
+        image.addRepresentation(representation)
+        // A template image is tinted by AppKit like the text it sits beside, so
+        // the wheel needs no color of its own.
+        image.isTemplate = true
+        return image
+    }
+
+    /// One graded spoke per position: a template image is masked by its alpha,
+    /// so the black spokes differ only by opacity - the fading trail that makes
+    /// the wheel read as motion.
+    private static func drawWheel() {
+        let outer = size / 2 - 0.75
+        let inner = outer * 0.42
+        let center = size / 2
+        let path = NSBezierPath()
+        path.lineCapStyle = .round
+        path.lineWidth = max(1.1, outer * 0.3)
+        for step in 0 ..< stepCount {
+            let alpha = 0.16 + 0.84 * (CGFloat(step) / CGFloat(stepCount - 1))
+            let angle = CGFloat(step) * (2 * .pi / CGFloat(stepCount))
+            let dx = sin(angle)
+            let dy = -cos(angle)
+            path.removeAllPoints()
+            path.move(to: NSPoint(x: center + dx * inner, y: center + dy * inner))
+            path.line(to: NSPoint(x: center + dx * outer, y: center + dy * outer))
+            NSColor.black.withAlphaComponent(alpha).setStroke()
+            path.stroke()
+        }
     }
 }
 
@@ -3294,6 +3859,7 @@ private final class NativeModelChooserListView: NSView {
 
 private final class NativeModelChooserController: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
     private var didStopModal = false
+    var onFinish: (([String]?) -> Void)?
     weak var modalWindow: NSWindow?
     weak var searchField: NativeInstantFocusSearchField?
     weak var scrollView: NSScrollView?
@@ -3370,14 +3936,19 @@ private final class NativeModelChooserController: NSObject, NSWindowDelegate, NS
     }
     @objc func selectAllAction(_ sender: Any?) { listView.selectAll() }
     @objc func invertSelectionAction(_ sender: Any?) { listView.invertSelection() }
-    @objc func addSelectedAction(_ sender: Any?) { stopModal(with: .OK) }
-    @objc func cancelAction(_ sender: Any?) { stopModal(with: .cancel) }
-    func windowWillClose(_ notification: Notification) { stopModal(with: .cancel) }
-    private func stopModal(with response: NSApplication.ModalResponse) {
+    @objc func addSelectedAction(_ sender: Any?) { finish([String](listView.selectedModels)) }
+    @objc func cancelAction(_ sender: Any?) { finish(nil) }
+    func windowWillClose(_ notification: Notification) { finish(nil) }
+
+    /// Settle the pending chooser exactly once, whichever way its window went
+    /// away: the Add button carries the selection, Cancel and the title-bar
+    /// close button carry nothing.
+    private func finish(_ selection: [String]?) {
         guard !didStopModal else { return }
         didStopModal = true
-        NSApp.stopModal(withCode: response)
-        modalWindow?.orderOut(nil)
+        let completion = onFinish
+        onFinish = nil
+        completion?(selection)
     }
     var selectedModels: [String] { listView.selectedModels }
 }
@@ -3482,13 +4053,12 @@ private final class NativeReadOnlyCodeController: NSObject, NSWindowDelegate {
         webView.setAccessibilityLabel(title)
     }
 
-    func present() {
+    /// Lay the viewer out and hand the document to its embedded editor.  The
+    /// host owns the window's presentation — one child window with the app
+    /// locked until it closes — so this only prepares the content.
+    func loadContent() {
         guard !stopped else { return }
-        NSApp.activate(ignoringOtherApps: true)
-        withoutAnimations {
-            panel.makeKeyAndOrderFront(nil)
-            panel.contentView?.layoutSubtreeIfNeeded()
-        }
+        panel.contentView?.layoutSubtreeIfNeeded()
         webView.loadHTMLString(documentHTML, baseURL: nil)
         documentHTML = ""
     }
@@ -3512,7 +4082,7 @@ private final class NativeReadOnlyCodeController: NSObject, NSWindowDelegate {
         panel.delegate = nil
         webView.stopLoading()
         webView.loadHTMLString("", baseURL: nil)
-        withoutAnimations { panel.orderOut(nil) }
+        AppKitNativeLeaf.shared.endChildPanel(panel)
         let completion = onClose
         onClose = nil
         completion?(self)
@@ -3639,7 +4209,7 @@ private final class NativeProviderAuthController: NSObject, NSWindowDelegate, WK
         // inside this isolated WebView instead of silently dropping it.
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = true
         webView = WKWebView(frame: .zero, configuration: configuration)
-        webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Safari/605.1.15"
+        webView.customUserAgent = RelayBrowserIdentity.userAgent
 
         panel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: 860, height: 700),
@@ -3762,13 +4332,12 @@ private final class NativeProviderAuthController: NSObject, NSWindowDelegate, WK
         panel.initialFirstResponder = webView
     }
 
-    func present() {
+    /// Lay the panel out and start the provider page.  The host owns the
+    /// window's presentation — one child window with the app locked until it
+    /// closes — so this only prepares the content.
+    func loadContent() {
         guard !stopped else { return }
-        NSApp.activate(ignoringOtherApps: true)
-        withoutAnimations {
-            panel.makeKeyAndOrderFront(nil)
-            panel.contentView?.layoutSubtreeIfNeeded()
-        }
+        panel.contentView?.layoutSubtreeIfNeeded()
         webView.load(URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData))
     }
 
@@ -3841,7 +4410,7 @@ private final class NativeProviderAuthController: NSObject, NSWindowDelegate, WK
         webView.navigationDelegate = nil
         webView.stopLoading()
         webView.loadHTMLString("", baseURL: nil)
-        withoutAnimations { panel.orderOut(nil) }
+        AppKitNativeLeaf.shared.endChildPanel(panel)
         let completion = onClose
         onClose = nil
         completion?(self)
@@ -3928,20 +4497,25 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     private static let embeddedInitialHeight: CGFloat = 620
     private static let embeddedMinimumWebHeight: CGFloat = 420
     private static let embeddedMaximumWebHeight: CGFloat = 980
+    private static let panelActionBarHeight: CGFloat = 44
 
     /// The login page is supplied by the relay station, so its form and
-    /// agreement layout cannot be represented by one fixed sheet height. The
+    /// agreement layout cannot be represented by one fixed window height. The
     /// probe finds the username input through the agreement row and returns
     /// only that interval's height. Page headers, footers, and unrelated
-    /// content must not inflate the embedded login sheet.
+    /// content must not inflate the embedded login window.
     private static let embeddedContentHeightScript = """
     (() => {
+      // The station's own announcement dialog covers the form; hide it before
+      // measuring so the geometry is the real sign-in layout.
+      try { window.__youngRouterLoginSurface?.prepare?.(); } catch {}
       const visible = (node) => {
         if (!(node instanceof Element)) return false;
         const rect = node.getBoundingClientRect();
         const style = getComputedStyle(node);
         return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
       };
+      const containsSignInForm = (node) => Boolean(node.querySelector?.('input[type=password],input[autocomplete=current-password]'));
       const attributes = (node) => [
         node.getAttribute?.('name'),
         node.getAttribute?.('id'),
@@ -3980,18 +4554,184 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         ...all('input[type="checkbox"],[role="checkbox"]'),
         ...all('a,p,span'),
       ].find((node) => agreementPattern.test(anchorText(node)));
-      const topAnchor = bounds(username || password || login || agreement);
-      const bottomAnchor = bounds(agreement || login || password || username);
-      const bodyHeight = Math.max(document.body?.scrollHeight || 0, document.documentElement?.scrollHeight || 0);
-      const interval = topAnchor && bottomAnchor && bottomAnchor.bottom > topAnchor.top
-        ? bottomAnchor.bottom - Math.max(0, topAnchor.top - 24) + 24
+      const topAnchor = bounds(username || password);
+      const submitAnchor = bounds(login);
+      const agreementAnchor = bounds(agreement);
+      // The window must show the whole sign-in form: from the first field down
+      // to the submit button, extended to the agreement row that stations print
+      // directly under it (登录即代表同意…). Page headers, footers, and nested
+      // content outside that interval must not inflate the login window.
+      let lastAnchor = submitAnchor || agreementAnchor;
+      if (submitAnchor && agreementAnchor && agreementAnchor.bottom > submitAnchor.bottom && agreementAnchor.top - submitAnchor.bottom <= 160) {
+        lastAnchor = agreementAnchor;
+      }
+      const fixedHeaders = Array.from(document.querySelectorAll('header,nav,[class*="header"],[class*="Header"],[class*="navbar"],[class*="Navbar"]'))
+        .filter((node) => visible(node) && !containsSignInForm(node) && ['fixed', 'sticky'].includes(getComputedStyle(node).position));
+      // A fixed site header overlays the scrolled form, so the first field is
+      // kept clear of the tallest one instead of butting against the top edge.
+      const fixedHeaderHeight = fixedHeaders.reduce((height, node) => {
+        const rect = node.getBoundingClientRect();
+        if (rect.top > 4 || rect.height > 240) return height;
+        return Math.max(height, rect.height);
+      }, 0);
+      const interval = topAnchor && lastAnchor && lastAnchor.bottom > topAnchor.top
+        ? lastAnchor.bottom - topAnchor.top + 40
         : 640;
-      if (topAnchor && bottomAnchor && bottomAnchor.bottom > topAnchor.top) {
+      if (topAnchor && lastAnchor && lastAnchor.bottom > topAnchor.top) {
+        const bodyHeight = Math.max(document.body?.scrollHeight || 0, document.documentElement?.scrollHeight || 0);
         const maxScroll = Math.max(0, bodyHeight - Math.max(window.innerHeight, 1));
-        const targetScroll = Math.min(maxScroll, Math.max(0, topAnchor.top - 24));
+        const targetScroll = Math.min(maxScroll, Math.max(0, topAnchor.top - fixedHeaderHeight - 12));
         window.scrollTo({ top: targetScroll, left: 0, behavior: 'auto' });
       }
-      return Math.max(420, Math.min(980, Math.ceil(interval)));
+      // A sign-in form is a floor, not a target: the window keeps the first
+      // field through the button visible without any scrolling.
+      const minimum = topAnchor ? 520 : 420;
+      return Math.max(minimum, Math.min(980, Math.ceil(interval)));
+    })();
+    """
+
+    /// Station sign-in pages are single-page apps: their own announcements
+    /// (系统公告 and similar blockers) cover the form, and a successful sign-in
+    /// routes client-side without ever reloading the document. This script
+    /// hides those blocking overlays, publishes the very same helper to the
+    /// height probe, and reports client-side navigation so the controller can
+    /// re-run its readiness and sign-in checks.
+    private static let relayLoginSurfaceScript = """
+    (() => {
+      const state = { lastDismissal: 0 };
+      const visible = (node) => {
+        if (!(node instanceof Element)) return false;
+        const rect = node.getBoundingClientRect();
+        const style = getComputedStyle(node);
+        return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+      };
+      const coveredArea = (node) => {
+        const rect = node.getBoundingClientRect();
+        return rect.width * rect.height;
+      };
+      // Swift interprets backslash escapes inside its own string literals, so
+      // this JS source keeps every regex free of them.
+      const whitespacePattern = new RegExp('[' + String.fromCharCode(9, 10, 11, 12, 13, 32) + ']+', 'g');
+      const elementText = (node) => `${node.innerText || node.textContent || ''} ${node.getAttribute?.('aria-label') || ''} ${node.getAttribute?.('title') || ''}`.replace(whitespacePattern, ' ').trim();
+      // A station announcement often offers both a persistent "close for today"
+      // action and a plain close: prefer the persistent one, then the explicit
+      // dismissal, and fall back to a bare close affordance last.
+      const persistentDismissPattern = /^(?:今日关闭|不再提示|今天不再提示|don't show again|dont show again)$/iu;
+      const dismissPattern = /^(?:关闭公告|关闭|我知道了|知道了|明白|确定|好的|暂不|稍后再说|close|dismiss|got it|ok|no thanks)$/iu;
+      const signInActionPattern = /登录|登陆|注册|继续|提交|进入|sign in|sign up|log in|login|submit|continue|register/iu;
+      const closeAffordancePattern = /(close|dismiss|icon-close)/i;
+      const containsSignInForm = (node) => Boolean(node.querySelector?.('input[type=password],input[autocomplete=current-password]'));
+      const dismissalControl = (root) => {
+        let best = null;
+        for (const node of root.querySelectorAll('button,[role="button"],a,[class*="close"],[class*="Close"]')) {
+          if (!visible(node) || node.disabled) continue;
+          if (String(node.getAttribute?.('type') || '').toLowerCase() === 'submit') continue;
+          const text = elementText(node);
+          if (text.length > 24) continue;
+          // Never press the station's own sign-in, registration, or consent
+          // action: only an explicit dismissal affordance is safe here.
+          if (text && signInActionPattern.test(text)) continue;
+          let rank = 0;
+          if (persistentDismissPattern.test(text)) rank = 3;
+          else if (dismissPattern.test(text)) rank = 2;
+          else {
+            const signature = `${node.className || ''} ${node.getAttribute?.('aria-label') || ''} ${node.getAttribute?.('title') || ''}`;
+            if (closeAffordancePattern.test(signature)) rank = 1;
+          }
+          if (rank && (!best || rank > best.rank)) best = { node, rank };
+        }
+        return best?.node ?? null;
+      };
+      const revealed = new WeakMap();
+      const dismissBlockingOverlays = (force) => {
+        const now = Date.now();
+        if (!force && now - state.lastDismissal < 250) return false;
+        state.lastDismissal = now;
+        const viewportArea = Math.max(1, window.innerWidth * window.innerHeight);
+        const selectors = '[role="dialog"],[aria-modal="true"],[class*="backdrop"],[class*="Backdrop"],[class*="mask"],[class*="Mask"],[class*="modal"],[class*="Modal"],[class*="dialog"],[class*="Dialog"],[class*="overlay"],[class*="Overlay"],[class*="popup"],[class*="Popup"],[class*="notice"],[class*="Notice"]';
+        let changed = false;
+        for (const node of document.querySelectorAll(selectors)) {
+          if (!visible(node) || containsSignInForm(node)) continue;
+          const position = getComputedStyle(node).position;
+          if (position !== 'fixed' && position !== 'absolute') continue;
+          const covered = coveredArea(node);
+          if (covered < viewportArea * 0.12) continue;
+          const seen = (revealed.get(node) ?? 0) + 1;
+          revealed.set(node, seen);
+          const control = dismissalControl(node);
+          if (control && seen <= 2) {
+            try { control.click(); } catch {}
+            changed = true;
+            continue;
+          }
+          // A station can reopen an announcement right after it is dismissed
+          // (its own close action does not always persist), so a layer that
+          // survives the dismissal attempts is hidden outright.
+          if (covered >= viewportArea * 0.3) {
+            try { node.style.setProperty('display', 'none', 'important'); } catch {}
+            changed = true;
+          }
+        }
+        return changed;
+      };
+      try {
+        window.__youngRouterLoginSurface = {
+          dismiss: () => dismissBlockingOverlays(false),
+          prepare: () => dismissBlockingOverlays(true),
+        };
+      } catch {}
+      const notify = () => {
+        try { window.webkit.messageHandlers.litellmRelayPage.postMessage({ kind: 'navigation' }); } catch {}
+      };
+      const wrap = (name) => {
+        const original = window.history?.[name];
+        if (typeof original !== 'function') return;
+        window.history[name] = function (...args) {
+          const result = original.apply(this, args);
+          notify();
+          return result;
+        };
+      };
+      wrap('pushState');
+      wrap('replaceState');
+      window.addEventListener('popstate', notify);
+      window.addEventListener('hashchange', notify);
+      const prepare = () => dismissBlockingOverlays(true);
+      prepare();
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', prepare, { once: true });
+      }
+      new MutationObserver(() => dismissBlockingOverlays(false)).observe(document.documentElement, { childList: true, subtree: true });
+      window.setInterval(() => dismissBlockingOverlays(false), 1000);
+    })();
+    """
+
+    /// The station keeps its session in local storage, and a single-page sign-in
+    /// never reloads the document, so no navigation callback announces it. The
+    /// watcher polls that storage and returns only a compact signature: a new
+    /// credential fingerprint starts one server-side verification.
+    private static let loginStateScript = """
+    (() => {
+      const read = (key) => {
+        try {
+          const value = window.localStorage.getItem(key);
+          return typeof value === 'string' ? value : '';
+        } catch { return ''; }
+      };
+      let token = read('auth_token') || read('access_token') || '';
+      if (!token) {
+        try {
+          const user = JSON.parse(read('user') || 'null');
+          const candidate = user && typeof user === 'object' ? (user.token || user.access_token) : '';
+          if (typeof candidate === 'string') token = candidate;
+        } catch {}
+      }
+      const loginField = document.querySelector('input[type=password],input[autocomplete=current-password]');
+      return {
+        token: token ? `${token.length}:${token.slice(-8)}` : '',
+        path: String(window.location.pathname || '') + String(window.location.search || ''),
+        form: Boolean(loginField && loginField.getBoundingClientRect().height > 0),
+      };
     })();
     """
 
@@ -4080,8 +4820,10 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     private lazy var session = URLSession(configuration: .ephemeral, delegate: self, delegateQueue: nil)
     private let panel: NSPanel?
     private weak var embeddedWindow: NSWindow?
+    /// The window this sign-in browser locks while it is up; nil for the
+    /// embedded step, which lives inside the wizard's own window.
+    private weak var presentationParent: NSWindow?
     private let embeddedClose: (() -> Void)?
-    private weak var sheetParent: NSWindow?
     private let pendingAccount: Bool
     private let stationID: String?
     private let stationName: String?
@@ -4101,6 +4843,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     private var result: CoreIPCBridge.RelayLoginResult?
     private var capturedAccessToken: String?
     private var capturedRefreshToken: String?
+    private var capturedUserID: String?
     private var capturedPassword: String?
     private var restoredSession: NativeRelaySession?
     private var didRestoreSession = false
@@ -4116,6 +4859,10 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     private var embeddedResizeAttempts = 0
     private var lastEmbeddedContentHeight: CGFloat?
     private var automaticCheckProbe: DispatchWorkItem?
+    private var loginWatchProbe: DispatchWorkItem?
+    private var observedLoginSignature: String?
+    private var observedLoginForm: Bool?
+    private var checkStartedAt: Date?
     private var panelClosedDuringCommit = false
     private var activeCheck: NativeRelayLoginAttempt?
     private var completion: ((CoreIPCBridge.RelayLoginResult?) -> Void)?
@@ -4129,7 +4876,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         username: String?,
         embeddedWindow: NSWindow? = nil,
         embeddedClose: (() -> Void)? = nil,
-        sheetParent: NSWindow? = nil,
+        presentationParent: NSWindow? = nil,
         pendingAccount: Bool = false,
         stationID: String? = nil,
         stationName: String? = nil,
@@ -4146,7 +4893,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         self.mode = mode
         self.embeddedWindow = embeddedWindow
         self.embeddedClose = embeddedClose
-        self.sheetParent = sheetParent
+        self.presentationParent = presentationParent
         self.pendingAccount = pendingAccount
         self.stationID = stationID
         self.stationName = stationName
@@ -4192,6 +4939,13 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
                     forMainFrameOnly: true
                 )
             )
+            configuration.userContentController.addUserScript(
+                WKUserScript(
+                    source: Self.relayLoginSurfaceScript,
+                    injectionTime: .atDocumentStart,
+                    forMainFrameOnly: true
+                )
+            )
         }
         webView = WKWebView(frame: .zero, configuration: configuration)
         panel = embeddedWindow == nil ? NSPanel(
@@ -4203,6 +4957,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         super.init()
         if mode == .login {
             configuration.userContentController.add(self, name: "litellmRelayPassword")
+            configuration.userContentController.add(self, name: "litellmRelayPage")
         }
         buildPanel()
     }
@@ -4210,14 +4965,11 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     func start(completion: @escaping (CoreIPCBridge.RelayLoginResult?) -> Void) {
         self.completion = completion
         beginBrowserFlow()
-        if let panel, let sheetParent {
-            // Sheet presentation: subordinate to the provider window, whose
-            // controls stay blocked until the sheet ends.
-            NSApp.activate(ignoringOtherApps: true)
-            configureImmediatePresentation(panel)
-            withoutAnimations { sheetParent.beginSheet(panel, completionHandler: nil) }
-        } else if let panel {
-            NSApp.activate(ignoringOtherApps: true)
+        if let panel {
+            // Child window presentation: its own movable window over the app,
+            // which stays locked until the sign-in flow ends. The page loads
+            // first and the modal session runs last, so the station's form is
+            // already on its way while the window settles.
             panel.center()
             configureImmediatePresentation(panel)
             withoutAnimations { panel.makeKeyAndOrderFront(nil) }
@@ -4237,6 +4989,9 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         }
         restoreSessionAndLoad()
         scheduleEmbeddedBrowserResize()
+        if let panel {
+            AppKitNativeLeaf.shared.presentChildPanel(panel, in: presentationParent ?? AppKitNativeLeaf.shared.activeWindow())
+        }
     }
 
     /// Each controller represents one browser login flow. Clear temporary
@@ -4244,6 +4999,13 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     private func beginBrowserFlow() {
         _ = activeCheck?.requestCancellation()
         activeCheck = nil
+        loginWatchProbe?.cancel()
+        loginWatchProbe = nil
+        observedLoginSignature = nil
+        observedLoginForm = nil
+        checkStartedAt = nil
+        automaticCheckProbe?.cancel()
+        automaticCheckProbe = nil
         embeddedResizeProbe?.cancel()
         embeddedResizeProbe = nil
         embeddedResizeAttempts = 0
@@ -4279,14 +5041,20 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
 
     private var isEmbeddedPresentation: Bool { embeddedWindow != nil }
 
+    /// The sign-in browser is a region the app sizes around the station's own
+    /// page: the embedded step page and the child window laid out over the
+    /// workspace. Each measures that page's geometry so the first field through
+    /// the submit button stays visible.
+    private var measuresPageGeometry: Bool { panel != nil || isEmbeddedPresentation }
+
     private func scheduleEmbeddedBrowserResize(delay: TimeInterval = 0.15) {
-        guard isEmbeddedPresentation, isBrowserFlowLive, embeddedResizeAttempts < 16 else { return }
+        guard measuresPageGeometry, isBrowserFlowLive, embeddedResizeAttempts < 16 else { return }
         embeddedResizeProbe?.cancel()
         embeddedResizeAttempts += 1
         let work = DispatchWorkItem { [weak self] in
-            guard let self, self.isBrowserFlowLive, self.isEmbeddedPresentation else { return }
+            guard let self, self.isBrowserFlowLive, self.measuresPageGeometry else { return }
             self.webView.evaluateJavaScript(Self.embeddedContentHeightScript) { [weak self] value, _ in
-                guard let self, self.isBrowserFlowLive, self.isEmbeddedPresentation else { return }
+                guard let self, self.isBrowserFlowLive, self.measuresPageGeometry else { return }
                 if let number = value as? NSNumber, number.doubleValue.isFinite {
                     self.resizeEmbeddedBrowser(contentHeight: CGFloat(number.doubleValue))
                 }
@@ -4300,15 +5068,35 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     }
 
     private func resizeEmbeddedBrowser(contentHeight: CGFloat) {
-        guard let embeddedWindow,
-              contentHeight.isFinite else { return }
+        guard contentHeight.isFinite else { return }
         let webViewHeight = min(Self.embeddedMaximumWebHeight, max(Self.embeddedMinimumWebHeight, ceil(contentHeight)))
-        let height = webViewHeight + Self.embeddedStepTopInset + Self.embeddedStepBottomInset
-        if let lastEmbeddedContentHeight, abs(lastEmbeddedContentHeight - height) < 8 {
+        if isEmbeddedPresentation {
+            guard let embeddedWindow else { return }
+            let height = webViewHeight + Self.embeddedStepTopInset + Self.embeddedStepBottomInset
+            guard acceptsMeasuredHeight(height) else { return }
+            embeddedWindow.setContentSize(NSSize(width: 900, height: height))
             return
         }
+        // The panel keeps its generous default height and only grows when the
+        // station's own form needs more room than the window already shows, so
+        // opening one never jumps in size.
+        guard let panel else { return }
+        let chrome = Self.embeddedHeaderHeight + Self.panelActionBarHeight
+        let height = min(maximumPanelHeight(), webViewHeight + chrome)
+        guard height > panel.contentLayoutRect.height + 8 else { return }
+        guard acceptsMeasuredHeight(height) else { return }
+        panel.setContentSize(NSSize(width: 900, height: height))
+    }
+
+    private func acceptsMeasuredHeight(_ height: CGFloat) -> Bool {
+        if let lastEmbeddedContentHeight, abs(lastEmbeddedContentHeight - height) < 8 { return false }
         lastEmbeddedContentHeight = height
-        embeddedWindow.setContentSize(NSSize(width: 900, height: height))
+        return true
+    }
+
+    private func maximumPanelHeight() -> CGFloat {
+        let visibleHeight = (panel?.screen ?? NSScreen.main)?.visibleFrame.height ?? 700
+        return max(560, visibleHeight - 140)
     }
 
     private func buildPanel() {
@@ -4322,10 +5110,12 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         // The React step owns the progress header and close action. The
         // embedded browser must not add a second native panel header.
         let showsEmbeddedClose = false
-        // A sheet has no traffic-light close button, so it carries an
-        // explicit Close action; the parent window stays blocked anyway.
-        let showsSheetClose = sheetParent != nil && mode == .login && !isEmbeddedPresentation
-        let showsPanelActions = showsReloadAction || showsEmbeddedClose || showsSheetClose
+        // The window carries the title-bar close button every child surface
+        // has; the explicit Close action stays beside it as the login flow's
+        // own way out (and its Esc shortcut), exactly like the model chooser's
+        // Cancel.
+        let showsPanelClose = panel != nil && mode == .login && !isEmbeddedPresentation
+        let showsPanelActions = showsReloadAction || showsEmbeddedClose || showsPanelClose
         titleLabel.font = NSFont.systemFont(ofSize: nativeUIFontSize, weight: .semibold)
         titleLabel.lineBreakMode = .byTruncatingTail
         let host = originURL.host ?? ""
@@ -4363,23 +5153,23 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
             $0.translatesAutoresizingMaskIntoConstraints = false
             header.addSubview($0)
         }
-        // A sheet has no traffic-light close button, so its Close action
-        // lives in a fixed bottom-right action bar, matching the route-window
-        // convention; only the logs header keeps inline header buttons.
-        let sheetActionBar = showsSheetClose ? NSView() : nil
-        let sheetActionSeparator = showsSheetClose ? NSBox() : nil
-        sheetActionSeparator?.boxType = .separator
+        // The explicit Close action lives in a fixed bottom-right action bar,
+        // matching the route-window convention; only the logs header keeps
+        // inline header buttons.
+        let panelActionBar = showsPanelClose ? NSView() : nil
+        let panelActionSeparator = showsPanelClose ? NSBox() : nil
+        panelActionSeparator?.boxType = .separator
         if showsReloadAction {
             ([signInButton, cancelButton] as [NSButton?]).compactMap { $0 }.forEach {
                 $0.translatesAutoresizingMaskIntoConstraints = false
                 header.addSubview($0)
             }
-        } else if let actionBar = sheetActionBar {
+        } else if let actionBar = panelActionBar {
             actionBar.translatesAutoresizingMaskIntoConstraints = false
             content.addSubview(actionBar)
             cancelButton.translatesAutoresizingMaskIntoConstraints = false
             actionBar.addSubview(cancelButton)
-            if let separator = sheetActionSeparator {
+            if let separator = panelActionSeparator {
                 separator.translatesAutoresizingMaskIntoConstraints = false
                 actionBar.addSubview(separator)
             }
@@ -4435,19 +5225,19 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
             loadingLabel.centerXAnchor.constraint(equalTo: loadingOverlay.centerXAnchor),
             loadingLabel.centerYAnchor.constraint(equalTo: loadingOverlay.centerYAnchor),
         ]
-        if let actionBar = sheetActionBar {
+        if let actionBar = panelActionBar {
             constraints += [
                 webView.bottomAnchor.constraint(equalTo: actionBar.topAnchor),
                 actionBar.leadingAnchor.constraint(equalTo: content.leadingAnchor),
                 actionBar.trailingAnchor.constraint(equalTo: content.trailingAnchor),
                 actionBar.bottomAnchor.constraint(equalTo: content.bottomAnchor),
-                actionBar.heightAnchor.constraint(equalToConstant: 44),
+                actionBar.heightAnchor.constraint(equalToConstant: Self.panelActionBarHeight),
                 cancelButton.leadingAnchor.constraint(greaterThanOrEqualTo: actionBar.leadingAnchor, constant: 18),
                 cancelButton.trailingAnchor.constraint(equalTo: actionBar.trailingAnchor, constant: -18),
                 cancelButton.centerYAnchor.constraint(equalTo: actionBar.centerYAnchor),
                 cancelButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 76),
             ]
-            if let separator = sheetActionSeparator {
+            if let separator = panelActionSeparator {
                 constraints += [
                     separator.leadingAnchor.constraint(equalTo: actionBar.leadingAnchor),
                     separator.trailingAnchor.constraint(equalTo: actionBar.trailingAnchor),
@@ -4643,6 +5433,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         let attempt = NativeRelayLoginAttempt()
         activeCheck = attempt
         checking = true
+        checkStartedAt = Date()
         panelClosedDuringCommit = false
         automaticCheckProbe?.cancel()
         automaticCheckProbe = nil
@@ -4675,11 +5466,22 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     }
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard mode == .login, message.frameInfo.isMainFrame else { return }
+        if message.name == "litellmRelayPage" {
+            // The page routed itself: the sign-in step may just have been
+            // replaced by the station console, and the form geometry changed
+            // with it.
+            embeddedResizeAttempts = 0
+            scheduleEmbeddedBrowserResize(delay: 0.05)
+            schedulePageReadinessProbe()
+            scheduleAgreementReveal()
+            scheduleLoginFormReveal()
+            scheduleLoginWatch(delay: 0.6)
+            return
+        }
         // The capture always runs so the post-login prompt can offer to keep
         // the typed password; whether it is persisted is decided later.
-        guard mode == .login,
-              mode == .login,
-              message.name == "litellmRelayPassword",
+        guard message.name == "litellmRelayPassword",
               message.frameInfo.isMainFrame,
               message.frameInfo.securityOrigin.host.lowercased() == originURL.host?.lowercased(),
               let password = message.body as? String,
@@ -4707,6 +5509,13 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
             } catch { return ''; }
           })(),
           refreshToken: localStorage.getItem('refresh_token') || '',
+          userID: (() => {
+            try {
+              const user = JSON.parse(localStorage.getItem('user') || 'null');
+              const value = user && typeof user === 'object' ? user.id : null;
+              return typeof value === 'number' || typeof value === 'string' ? String(value).slice(0, 32) : '';
+            } catch { return ''; }
+          })(),
           password: \(passwordExpression)
         }))();
         """
@@ -4716,6 +5525,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
                 if let fields = value as? [String: Any] {
                     self.capturedAccessToken = (fields["accessToken"] as? String).flatMap { $0.isEmpty ? nil : $0 }
                     self.capturedRefreshToken = (fields["refreshToken"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                    self.capturedUserID = (fields["userID"] as? String).flatMap { $0.isEmpty ? nil : $0 }
                     self.capturedPassword = (fields["password"] as? String).flatMap { $0.isEmpty ? nil : $0 }
                 }
                 completion()
@@ -4801,6 +5611,8 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         request.httpMethod = probe.path.hasSuffix("auth/refresh") ? "POST" : "GET"
         request.timeoutInterval = 12
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue(RelayBrowserIdentity.acceptLanguage, forHTTPHeaderField: "Accept-Language")
+        request.setValue(RelayBrowserIdentity.userAgent, forHTTPHeaderField: "User-Agent")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(originHeader, forHTTPHeaderField: "Origin")
         request.setValue(originHeader, forHTTPHeaderField: "Referer")
@@ -4808,6 +5620,12 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         let probeAccessToken = capturedAccessToken ?? restoredSession?.accessToken
         if let probeAccessToken, !probeAccessToken.isEmpty {
             request.setValue("Bearer \(probeAccessToken)", forHTTPHeaderField: "Authorization")
+        }
+        // New API forks that require the account header reject the request
+        // without it; the id comes from the page's own session record, so it
+        // always matches the account the token belongs to.
+        if type == "newapi", let capturedUserID, !capturedUserID.isEmpty {
+            request.setValue(capturedUserID, forHTTPHeaderField: "New-Api-User")
         }
         session.dataTask(with: request) { [weak self, weak attempt] data, response, _ in
             guard let self, let attempt, attempt.isActive() else { return }
@@ -5046,6 +5864,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         restoredSession = session
         result = value
         checking = false
+        checkStartedAt = nil
         finished = true
         embeddedResizeProbe?.cancel()
         embeddedResizeProbe = nil
@@ -5103,6 +5922,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         attempt.finish()
         activeCheck = nil
         checking = false
+        checkStartedAt = nil
         if panelClosedDuringCommit {
             finished = true
             clearCapturedCredentials()
@@ -5133,15 +5953,75 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
     }
 
+    /// A station sign-in completes inside the page, so no navigation callback
+    /// announces it. The watcher polls the page's own credential storage while
+    /// the sign-in surface is open and starts one verification per new
+    /// credential fingerprint; the quiet automatic check keeps retrying behind
+    /// it, so a slow or temporarily failing station still settles.
+    private func scheduleLoginWatch(delay: TimeInterval = 1) {
+        guard mode == .login, isBrowserFlowLive else { return }
+        loginWatchProbe?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.pollLoginState() }
+        loginWatchProbe = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    private func pollLoginState() {
+        guard mode == .login, isBrowserFlowLive else { return }
+        webView.evaluateJavaScript(Self.loginStateScript) { [weak self] value, _ in
+            guard let self, self.isBrowserFlowLive else { return }
+            let fields = value as? [String: Any]
+            let token = (fields?["token"] as? String) ?? ""
+            let path = (fields?["path"] as? String) ?? ""
+            let formPresent = (fields?["form"] as? Bool) ?? false
+            if token.isEmpty {
+                self.observedLoginSignature = nil
+                // A sign-in form that disappeared means the station accepted
+                // the credentials, and a cookie-only station stores no token.
+                if self.observedLoginForm == true, !formPresent {
+                    self.recoverStalledCheck()
+                    self.startSignInCheck(automatically: true)
+                }
+            } else {
+                let signature = "\(token)@\(path)"
+                if signature != self.observedLoginSignature {
+                    self.observedLoginSignature = signature
+                    self.recoverStalledCheck()
+                    self.startSignInCheck(automatically: true)
+                }
+            }
+            self.observedLoginForm = formPresent
+            self.scheduleLoginWatch(delay: token.isEmpty ? 1 : 1.5)
+        }
+    }
+
+    /// A verification that never resolves would silently stop the automatic
+    /// loop. A check that has neither committed nor finished for a long time is
+    /// dropped so the next poll can retry; a commit in flight is left alone.
+    private func recoverStalledCheck() {
+        guard checking, let activeCheck, !activeCheck.isCommitting() else { return }
+        guard let checkStartedAt, Date().timeIntervalSince(checkStartedAt) > 30 else { return }
+        activeCheck.finish()
+        self.activeCheck = nil
+        self.checkStartedAt = nil
+        checking = false
+    }
+
     private func clearCapturedCredentials() {
         capturedAccessToken = nil
         capturedRefreshToken = nil
+        capturedUserID = nil
         capturedPassword = nil
     }
 
     private func dismissPresentation() {
         automaticCheckProbe?.cancel()
         automaticCheckProbe = nil
+        loginWatchProbe?.cancel()
+        loginWatchProbe = nil
+        observedLoginSignature = nil
+        observedLoginForm = nil
+        checkStartedAt = nil
         pageReadinessProbe?.cancel()
         pageReadinessProbe = nil
         loginFormRevealProbe?.cancel()
@@ -5149,6 +6029,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         agreementRevealProbe?.cancel()
         agreementRevealProbe = nil
         webView.configuration.userContentController.removeScriptMessageHandler(forName: "litellmRelayPassword")
+        webView.configuration.userContentController.removeScriptMessageHandler(forName: "litellmRelayPage")
         if let observer = embeddedCloseObserver {
             NotificationCenter.default.removeObserver(observer)
             embeddedCloseObserver = nil
@@ -5156,11 +6037,11 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         embeddedContent?.removeFromSuperview()
         embeddedContent = nil
         if let panel {
-            // The project forbids window animations: end/close the sheet or
-            // panel inside a zero-duration transaction so dismissal is instant.
+            // The project forbids window animations: end the child window's
+            // modal session and close it inside a zero-duration transaction so
+            // dismissal is instant and the workspace behind it is live again.
             withoutAnimations {
-                panel.sheetParent?.endSheet(panel)
-                panel.orderOut(nil)
+                AppKitNativeLeaf.shared.endChildPanel(panel)
                 panel.close()
             }
         }
@@ -5182,6 +6063,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         scheduleEmbeddedBrowserResize()
         schedulePageReadinessProbe()
         scheduleAgreementReveal()
+        scheduleLoginWatch(delay: 1)
         if mode == .logs {
             if !didRestoreSession {
                 restoreLocalStorageWhenReady()
@@ -5242,6 +6124,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
                             self.restoreLocalStorageWhenReady()
                         }
                         self.scheduleAutomaticSignInCheck()
+                        self.scheduleLoginWatch(delay: 1)
                     }
                 } else {
                     self.schedulePageReadinessProbe()
@@ -5448,6 +6331,8 @@ private enum NativeRelaySessionProbe {
             request.httpMethod = probe.method
             request.timeoutInterval = 12
             request.setValue("application/json", forHTTPHeaderField: "Accept")
+            request.setValue(RelayBrowserIdentity.acceptLanguage, forHTTPHeaderField: "Accept-Language")
+            request.setValue(RelayBrowserIdentity.userAgent, forHTTPHeaderField: "User-Agent")
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             let origin = originHeader(originURL)
             request.setValue(origin, forHTTPHeaderField: "Origin")

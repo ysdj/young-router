@@ -14,6 +14,7 @@ import type {
   RelayGroupManagerKey,
   RelayGroupManagerLabels,
   RelayGroupManagerResult,
+  RelayGroupManagerSnapshot,
   ServiceStatus,
 } from "../types";
 
@@ -49,14 +50,17 @@ export interface NativeLeafBridge {
   chooseModelsToAdd(models: string[], providerName: string, keyName: string): Promise<string[] | undefined>;
   showGroupManager(options: {
     title: string;
-    accountLabel: string;
     /** The account that owns the keys; names the copy action's secret target. */
     accountId: string;
-    groups: RelayGroupManagerGroup[];
-    keys: RelayGroupManagerKey[];
     labels: RelayGroupManagerLabels;
-    autoGrouping: boolean;
-  }): Promise<RelayGroupManagerResult | undefined>;
+    /** True while the account's aligned layout is still loading. */
+    loading?: boolean;
+  } & RelayGroupManagerSnapshot): Promise<RelayGroupManagerResult | undefined>;
+  /**
+   * Replace the open group manager sheet's content with a later snapshot of the
+   * same account and end its loading state; false when no sheet is open.
+   */
+  updateGroupManager?(options: RelayGroupManagerSnapshot): Promise<boolean>;
   editSecret(
     domain: "providers_models" | "codex" | "claude" | "runtime" | "webdav",
     field: string,
@@ -107,6 +111,10 @@ export interface NativeLeafBridge {
   showVersion?(): void;
   versionInfo?(): Promise<{ app: string; litellm: string; icon?: string }>;
   openExternalURL?(url: string): void;
+  revealFile?(path: string): void;
+  openFileEditor?(target: string): void;
+  prepareFileEditor?(): void;
+  pendingFileEditorTarget?(): string;
   setLocalization(strings: NativeLocalization): void;
   setShortcuts(shortcuts: Record<string, string>): void;
 }
@@ -159,6 +167,9 @@ export function createNativeLeafBridgeAdapter(bridge: NativeLeafBridge): NativeL
     showCodexRestartConfirmation: ({ title, message, restartLabel, laterLabel }) => bridge.showCodexRestartConfirmation(title, message, restartLabel, laterLabel),
     chooseModelsToAdd: ({ models, providerName, keyName }) => bridge.chooseModelsToAdd(models, providerName, keyName),
     showGroupManager: (options) => bridge.showGroupManager(options),
+    updateGroupManager: bridge.updateGroupManager
+      ? (options) => bridge.updateGroupManager!(options)
+      : undefined,
     editSecret: ({ domain, field, target, title, allowClear }) => bridge.editSecret(domain, field, target, title, allowClear),
     clearSecret: ({ domain, field, target }) => bridge.clearSecret(domain, field, target),
     copySecret: ({ domain, field, target }) => bridge.copySecret(domain, field, target),
@@ -173,6 +184,10 @@ export function createNativeLeafBridgeAdapter(bridge: NativeLeafBridge): NativeL
     showVersion: () => bridge.showVersion?.(),
     versionInfo: bridge.versionInfo ? () => bridge.versionInfo!() : undefined,
     openExternalURL: bridge.openExternalURL ? (url) => bridge.openExternalURL!(url) : undefined,
+    revealFile: bridge.revealFile ? (path) => bridge.revealFile!(path) : undefined,
+    openFileEditor: bridge.openFileEditor ? (target) => bridge.openFileEditor!(target) : undefined,
+    prepareFileEditor: bridge.prepareFileEditor ? () => bridge.prepareFileEditor!() : undefined,
+    pendingFileEditorTarget: bridge.pendingFileEditorTarget ? () => bridge.pendingFileEditorTarget!() : undefined,
     setLocalization: (strings) => bridge.setLocalization(strings),
     setShortcuts: (shortcuts) => bridge.setShortcuts(shortcuts),
   };

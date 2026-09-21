@@ -12,13 +12,14 @@ Young Router is a native macOS and Windows app that runs a local AI gateway (bui
 - **Vision bridge.** When a route explicitly rejects image input, Young Router describes the image (local OCR, Ollama / LM Studio, your HTTP vision providers, or a free fallback) and retries the same route with text context. Routes that support vision always get the original image untouched.
 - **Search bridge.** Native hosted web search where supported; otherwise the bundled [pi-web-access](https://github.com/nicobailon/pi-web-access) worker does real searches and page fetches. OpenRouter routes use their native search tool. Transient failures are never remembered as "unsupported".
 - **Relay-station management.** Add a New API / Sub2API station by URL — the app detects its type, you sign in inside the app, and it loads your API keys, groups, models, and balance. Key changes stay staged until you press **Apply**; deleting a key first shows which models depend on it; keys auto-bind to providers with the same Base URL. Official OpenAI / Claude accounts live in the same window.
+- **Degradation deep test.** The model detail pane's probe names what it will run: on a Responses route whose name matches a known Codex route it also runs the bundled [TraceOne](https://github.com/wangchao0708/TraceOne) fingerprint check and reports whether the answer came from the requested route or from a different one. A fingerprint mismatch is only reported — the model keeps its enable checkbox and its routing stays yours to change.
 - **Image generation bridge.** Image-generation requests are routed to the deployments that support them, with a forced retry when a capable route returns nothing.
 - **Codex & Claude in one click.** Codex Settings writes the local endpoint and key without touching your other settings, and adds model catalog, fast tier, compaction, reasoning-effort compatibility, and usage normalization. Claude Settings offers **Use local API**, plus models, permissions, and sandbox.
 - **Private by default.** Prompts, message bodies, authorization headers, and API keys never enter the request log.
 - **Staged, safe configuration.** Edits are validated and staged; nothing is written or restarted until **Apply**, and credentials stay in private storage.
 - **Native and self-contained.** Menu bar / tray app with English and Chinese UI; release builds bundle Python, Node.js, and a pinned LiteLLM, so nothing else needs installing.
 
-Also included: a computer-use facade for routes without native support, route-trace HTML reports, online usage, and optional WebDAV config sync.
+Also included: route-trace HTML reports, online usage, and optional WebDAV config sync.
 
 ## Quick start
 
@@ -30,7 +31,7 @@ Also included: a computer-use facade for routes without native support, route-tr
 5. Connect your tools:
    - **Codex** → **Codex Settings…** → choose a LiteLLM deployment → **Apply**
    - **Claude** → **Claude Settings…** → **Use local API** → **Apply**
-   - **Anything OpenAI-compatible** → Base URL `http://127.0.0.1:12389/v1` (actual port in **General**), with your local gateway key
+   - **Anything OpenAI-compatible** → Base URL `http://127.0.0.1:12390/v1` (actual port in **General**), with your local gateway key
 
 ## Installation
 
@@ -61,7 +62,7 @@ Source builds also need Xcode, CocoaPods, Node.js 22+, pnpm 11, and [uv](https:/
 
 ## Configuration
 
-Editable config: `~/.young-router/config.yaml` (sanitized example: [`config.example.yaml`](./config.example.yaml)). Everything is validated and staged — the service only changes after **Apply**. Runtime knobs (timeouts, cool-downs, port, vision / search / computer settings) live in **Runtime Settings**; per-deployment capability flags (`upstream_protocol_mode`, `upstream_url_surface`, `supports_responses_web_search`, `supports_responses_image_generation_tool`, `supports_responses_compaction`) are documented in the example file.
+Editable config: `~/.young-router/config.yaml` (sanitized example: [`config.example.yaml`](./config.example.yaml)). Everything is validated and staged — the service only changes after **Apply**. Runtime knobs (timeouts, cool-downs, port, vision / search / computer settings) live in **Runtime**; per-deployment capability flags (`upstream_protocol_mode`, `upstream_url_surface`, `supports_responses_web_search`, `supports_responses_image_generation_tool`, `supports_responses_compaction`) are documented in the example file.
 
 <details>
 <summary>Import / export, sync, deep links, development</summary>
@@ -93,13 +94,14 @@ MIT License. See [LICENSE](./LICENSE).
 - **识图桥接。** 线路明确拒绝图片输入时，自动生成图片描述（本机 OCR、Ollama / LM Studio、你配置的 HTTP 视觉供应商或免费回退），转成文本后重试原线路；真正支持视觉的线路始终收到未被改动的原图。
 - **搜索桥接。** 支持原生联网搜索时优先用原生；不支持时由内置的 [pi-web-access](https://github.com/nicobailon/pi-web-access) worker 执行真实搜索与网页抓取；OpenRouter 线路使用其原生搜索工具。瞬时失败不会被误记为“不支持”。
 - **中转站智能管理。** 填一个 URL 即可添加 New API / Sub2API 中转站：自动识别类型、在应用内登录、自动加载 API 密钥、分组、模型和余额。密钥改动先暂存，点击**应用**才生效；删除前会提示哪些模型正在使用；Base URL 相同的供应商会自动绑定这些密钥。OpenAI / Claude 官方账号也在同一个窗口管理。
+- **降智深测。** 模型详情页的按钮会说明它将要执行什么：当线路走 responses 协议且模型名对应已知 Codex 线路时，同时运行内置的 [TraceOne](https://github.com/wangchao0708/TraceOne) 指纹探测，给出“指纹与所请求线路一致”还是“指纹更像另一条线路”。指纹不一致只作为结果展示——不会取消模型的启用勾选，路由怎么改仍由你决定。
 - **图像生成桥接。** 图像生成请求会被路由到真正支持该能力的线路；能力线路返回空响应时会强制重试，避免请求白跑。
 - **Codex 与 Claude 一键接入。** Codex 设置会写入本地端点与密钥且不碰你的其他配置，并提供模型目录、Fast 层级、压缩方式、推理强度兼容和用量归一化；Claude 设置提供**使用本机 API**，以及模型、权限和沙箱选项。
 - **默认保护隐私。** 提示词正文、消息内容、授权头和 API 密钥不会进入请求日志。
 - **配置安全可控。** 修改先校验、暂存，点击**应用**前不会写文件或重启服务；原始凭据保存在私有存储中。
 - **原生、零额外依赖。** 菜单栏 / 托盘应用，中英文界面；发布包内置 Python、Node.js 和锁定版本的 LiteLLM，无需安装其他依赖。
 
-另外还包含：为不支持电脑操作的线路提供的 computer-use facade、路由追踪 HTML 报告、在线用量，以及可选的 WebDAV 配置同步。
+另外还包含：路由追踪 HTML 报告、在线用量，以及可选的 WebDAV 配置同步。
 
 ## 快速开始
 
@@ -111,7 +113,7 @@ MIT License. See [LICENSE](./LICENSE).
 5. 接入工具：
    - **Codex** → **Codex 设置…** → 选择一个 LiteLLM 部署 → **应用**
    - **Claude** → **Claude 设置…** → **使用本机 API** → **应用**
-   - **其他 OpenAI 兼容工具** → Base URL `http://127.0.0.1:12389/v1`（实际端口见**常规**），密钥使用本地网关密钥
+   - **其他 OpenAI 兼容工具** → Base URL `http://127.0.0.1:12390/v1`（实际端口见**常规**），密钥使用本地网关密钥
 
 ## 安装
 
@@ -142,7 +144,7 @@ Windows（Developer PowerShell，需要 Windows App SDK 与 VS C++ 桌面工作�
 
 ## 配置
 
-可编辑配置：`~/.young-router/config.yaml`（脱敏示例：[`config.example.yaml`](./config.example.yaml)）。所有修改先校验、暂存，点击**应用**后服务才会变化。超时、冷却、端口、识图 / 搜索 / 电脑操作等运行时项都在**运行时设置**中调整；每个部署的能力标志（`upstream_protocol_mode`、`upstream_url_surface`、`supports_responses_web_search`、`supports_responses_image_generation_tool`、`supports_responses_compaction`）在示例文件中有说明。
+可编辑配置：`~/.young-router/config.yaml`（脱敏示例：[`config.example.yaml`](./config.example.yaml)）。所有修改先校验、暂存，点击**应用**后服务才会变化。超时、冷却、端口、识图 / 搜索 / 电脑操作等运行时项都在**运行时**中调整；每个部署的能力标志（`upstream_protocol_mode`、`upstream_url_surface`、`supports_responses_web_search`、`supports_responses_image_generation_tool`、`supports_responses_compaction`）在示例文件中有说明。
 
 <details>
 <summary>导入导出、同步、深链、开发</summary>

@@ -14,6 +14,14 @@ from typing import Any, Callable, Optional
 
 
 
+# The Core resolves model metadata through LiteLLM too (catalog context
+# windows, reasoning policies).  Keep those lookups on the bundled cost map:
+# otherwise the first lookup in a process tries a remote refresh and its
+# timeout is added to whatever request happened to run first - a settings
+# save or a snapshot.  The managed proxy already sets this for its workers.
+os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "true")
+
+
 def _bounded_writer(stream: Any, text: str) -> int:
     from young_router.log_rotation import write_bounded_stream
 

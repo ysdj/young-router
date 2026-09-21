@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import unittest
 from pathlib import Path
 
@@ -170,7 +171,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertNotIn('case "configuration-package":', leaf)
         self.assertNotIn("maxSize: NSSize(width: 680, height: 386)", leaf)
 
-    def test_macos_provider_wizard_is_a_cascaded_sheet_that_locks_the_parent(self) -> None:
+    def test_macos_child_surfaces_are_movable_locked_windows(self) -> None:
         leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
         open_route = leaf.split("func open(route: String, title: String", 1)[1].split(
             "func open(route: String)", 1
@@ -181,18 +182,57 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         request_close = leaf.split("private func requestClose", 1)[1].split(
             "private func canonicalRoute", 1
         )[0]
+        presentation = leaf.split("func presentChildPanel(", 1)[1].split("func chooseImportFile(", 1)[0]
+        shield = leaf.split("private final class NativeChildPanelShield", 1)[1].split(
+            "/// A push button that keeps the Return-key", 1
+        )[0]
 
         # The wizard is a child of the unified provider workspace; legacy
         # relay routes are canonicalized into it.
         self.assertIn('if route == "relay-add" { return "provider-wizard" }', leaf)
         self.assertIn('if windowRoute == "provider-wizard", settingsWindowKey() == nil', open_route)
-        self.assertIn("parent.beginSheet(window)", open_route)
-        self.assertIn("window.sheetParent == nil", open_route)
-        self.assertIn("parent.endSheet(window)", close_route)
+        # One presentation for every child surface: its own movable window in
+        # front of the app, attached above the window it was opened from, with
+        # that window's content locked until it closes. An attached sheet
+        # (immovable, no title bar) and a plain floating window (parent stays
+        # clickable) are both refused.
+        self.assertIn("withoutAnimations { panel.makeKeyAndOrderFront(nil) }", presentation)
+        self.assertIn("parent.addChildWindow(panel, ordered: .above)", presentation)
+        self.assertIn("lockParentWindow(parent, for: panel)", presentation)
+        self.assertNotIn("beginSheet(", leaf)
+        # The lock is a shield over the parent's content, never an app-modal
+        # session: `NSApp.runModal` runs the main run loop in its modal mode
+        # alone and freezes the React host's timers, events, and promises, which
+        # left a child window painting nothing while the surface behind it
+        # stopped answering.
+        # (the doc comments name it only to explain why it is not used)
+        self.assertNotIn("NSApp.runModal(for:", leaf)
+
+        self.assertIn("override func hitTest(_ point: NSPoint) -> NSView? {", shield)
+        self.assertIn("override func hitTest(_ point: NSPoint) -> NSView? {", shield)
+        self.assertIn("return bounds.contains(convert(point, from: superview)) ? self : nil", shield)
+        self.assertIn("override func mouseDown(with event: NSEvent) { onInteraction?() }", shield)
+        self.assertIn("override func keyDown(with event: NSEvent) {}", shield)
+        self.assertIn("content.addSubview(shield, positioned: .above, relativeTo: nil)", presentation)
+        self.assertIn("parent.makeFirstResponder(shield)", presentation)
+        # The locked window cannot be closed or minimized out from under its
+        # child, and its content keeps the first responder.
+        self.assertIn("parent.standardWindowButton(type)?.isEnabled = false", presentation)
+        self.assertIn("parent.standardWindowButton(type)?.isEnabled = true", presentation)
+        self.assertIn("window.makeFirstResponder(shield)", leaf)
+        # Ending a child releases the lock, takes the window off screen, and
+        # takes the children it opened with it.
+        self.assertIn("for descendant in childPanels.filter({ $0.parent === panel }).map({ $0.window }) {", presentation)
+        self.assertIn("parent.removeChildWindow(panel)", presentation)
+        self.assertIn("unlockParentWindow(parent)", presentation)
+        self.assertIn('if windowRoute == "provider-wizard" || windowRoute == "file-editor" {', open_route)
+        self.assertIn("presentChildPanel(window, in: settingsWindow())", open_route)
+        self.assertIn("endChildPanel(window)", close_route)
         self.assertIn('let restoreProviderModels = selectedRoute == "provider-wizard"', close_route)
         self.assertIn("restoreProviderModels.makeKeyAndOrderFront(nil)", close_route)
-        self.assertIn("if window.sheetParent == nil", request_close)
-        self.assertIn("parent sheet-locked", request_close)
+        # A dirty draft keeps its child window on screen while React decides:
+        # ordering it out would leave a lock over a window that is gone.
+        self.assertIn("if !isChildPanel(window) {", request_close)
         self.assertNotIn("restoreRelayAccounts", close_route)
 
     def test_windows_tray_left_click_does_not_reinterpret_menu_index_zero(self) -> None:
@@ -689,7 +729,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # an explicit route whitelist; a whitelist silently dropped General
         # onto a plain titled window while the shared shell still reserved its
         # title-bar inset.
-        self.assertIn('NSSet<NSString *> *standaloneRoutes = [NSSet setWithArray:@[@"home", @"provider-wizard"]];', app_delegate)
+        self.assertIn('NSSet<NSString *> *standaloneRoutes = [NSSet setWithArray:@[@"home", @"provider-wizard", @"file-editor"]];', app_delegate)
         self.assertIn("const BOOL settingsShell = ![standaloneRoutes containsObject:route];", app_delegate)
         # The material belongs to the window; a per-table backdrop would stack
         # a second vibrancy layer over only the table's own rows.
@@ -845,6 +885,47 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("@objc func openExternalURL(_ url: String)", mac_module)
         self.assertIn("RCT_EXTERN_METHOD(versionInfo:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)", mac_bridge)
         self.assertIn("RCT_EXTERN_METHOD(openExternalURL:(NSString *)url)", mac_bridge)
+        # The external-settings pane reveals a listed file in the platform file
+        # manager; the host validates the path and never grants file access.
+        self.assertIn("func revealFile(_ path: String)", mac_leaf)
+        self.assertIn("NSWorkspace.shared.activateFileViewerSelecting([target])", mac_leaf)
+        self.assertIn("func revealFile(_ path: String)", mac_module)
+        self.assertIn("@objc func revealFile(_ path: String)", mac_module)
+        self.assertIn("RCT_EXTERN_METHOD(revealFile:(NSString *)path)", mac_bridge)
+        # The raw file editor is a native child window over the workspace, so it
+        # is opened by the host and rendered outside the settings shell.
+        self.assertIn("func openFileEditor(_ payload: String)", mac_leaf)
+        self.assertIn("func pendingFileEditorTarget() -> String", mac_leaf)
+        self.assertIn("func prepareFileEditor()", mac_leaf)
+        self.assertIn("open(route: \"file-editor\", title: title, warmOnly: true)", mac_leaf)
+        # A warm editor window boots its React root off screen; the shared
+        # child-surface presentation is what puts it in front of the app.
+        self.assertIn("if warmOnly {", mac_leaf)
+        self.assertIn('if windowRoute == "provider-wizard" || windowRoute == "file-editor" {', mac_leaf)
+        self.assertIn("presentChildPanel(window, in: settingsWindow())", mac_leaf)
+        # The editor sheet exists for exactly one document: a bare deep link or
+        # an AppKit-restored window must not present an empty editor.
+        self.assertIn('if windowRoute == "file-editor", pendingFileEditorTargetValue == nil {', mac_leaf)
+        self.assertIn('window.isRestorable = route != "file-editor"', mac_leaf)
+        self.assertIn('case "file-editor": return localized("routeFileEditor", fallback: "Edit File")', mac_leaf)
+        self.assertIn("@objc func openFileEditor(_ payload: String)", mac_module)
+        self.assertIn("@objc func prepareFileEditor()", mac_module)
+        self.assertIn("@objc func pendingFileEditorTarget() -> String", mac_module)
+        self.assertIn("RCT_EXTERN_METHOD(openFileEditor:(NSString *)payload)", mac_bridge)
+        self.assertIn("RCT_EXTERN_METHOD(prepareFileEditor)", mac_bridge)
+        self.assertIn("RCT_EXTERN__BLOCKING_SYNCHRONOUS_METHOD(pendingFileEditorTarget)", mac_bridge)
+        app_delegate = (MAC_PROJECT / "YoungRouter-macOS/AppDelegate.mm").read_text(encoding="utf-8")
+        self.assertIn('standaloneRoutes = [NSSet setWithArray:@[@"home", @"provider-wizard", @"file-editor"]];', app_delegate)
+        self.assertIn('props[@"initialFileTarget"] = fileId;', app_delegate)
+        self.assertIn("NSString *fileId, NSWindow *existingWindow", app_delegate)
+        self.assertIn('if (route == L"file-editor") return {900, 560};', win_leaf)
+        self.assertIn('if (route == L"file-editor") return Localized("routeFileEditor", L"Edit File");', win_leaf)
+        self.assertIn("void RevealFile(std::wstring_view path);", win_header)
+        self.assertIn("void WinUI3NativeLeaf::RevealFile(std::wstring_view path)", win_leaf)
+        self.assertIn('L"/select,\\"" + target + L"\\""', win_leaf)
+        self.assertIn('ShellExecuteW(nullptr, L"open", L"explorer.exe", arguments.c_str(), nullptr, SW_SHOWNORMAL);', win_leaf)
+        self.assertIn('REACT_METHOD(RevealFile, L"revealFile");', win_module_header)
+        self.assertIn("void WinUI3NativeLeafModule::RevealFile(std::wstring const& path) noexcept", win_module)
         self.assertIn("struct VersionInfoResult {", win_header)
         self.assertIn("VersionInfoResult VersionInfo() const;", win_header)
         self.assertIn("void OpenExternalURL(std::wstring_view url);", win_header)
@@ -939,7 +1020,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
 
         self.assertIn("private var routeWindows: [String: NSWindow] = [:]", leaf)
         self.assertIn("setRouteWindowFactory", leaf)
-        self.assertIn("routeWindowFactory?(route, initialLogTab, existing)", leaf)
+        self.assertIn("routeWindowFactory?(route, initialLogTab, pendingFileEditorTargetValue, existing)", leaf)
         # Every settings pane reuses one registry key; only the provider wizard
         # is still an independent child window created by the same factory.
         self.assertIn("private static let settingsPaneRoutes: Set<String> = [", leaf)
@@ -1031,20 +1112,23 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         )
         self.assertIn("await leaf.showReadOnlyText(title, text, closeLabel, language, html);", platform)
 
-        self.assertIn('import { CODE_EDITOR_HTML, CodeEditorWebView', ui)
+        self.assertIn('import { CodeEditorWebView, editorMenuLabels, readOnlyCodeEditorHtml } from "./code-editor/CodeEditorWebView";', ui)
         self.assertGreaterEqual(ui.count("void native.showReadOnlyText({"), 3)
         self.assertIn('text: selected.rows.map((row) => row.original).join("\\n\\n")', ui)
         self.assertIn("text: row.original", ui)
         self.assertIn('language: "json"', ui)
-        self.assertIn("html: CODE_EDITOR_HTML", ui)
+        self.assertIn("html: readOnlyCodeEditorHtml(editorMenuLabels(translate))", ui)
         for obsolete in ("const [originalRecord", "setOriginalRecord(", "if (originalRecord)", "log-original:"):
             self.assertNotIn(obsolete, ui)
 
         mac_viewer = mac.split("func showReadOnlyText(", 1)[1].split("func showActionMenu(", 1)[0]
         self.assertIn("let controller = NativeReadOnlyCodeController(", mac_viewer)
         self.assertIn("activeReadOnlyCodeController = controller", mac_viewer)
-        self.assertIn("controller.present()", mac_viewer)
-        self.assertNotIn("NSApp.runModal(for: panel)", mac_viewer)
+        # The viewer is a child surface like every other one: its own movable
+        # window that locks the app until the document closes, never a child
+        # window the window behind it stays clickable behind.
+        self.assertIn("presentChildPanel(controller.panel, in: activeWindow(), prepare: { controller.loadContent() })", mac_viewer)
+        self.assertNotIn("owner.addChildWindow(panel, ordered: .above)", mac_viewer)
         self.assertIn("private func readOnlyCodeEditorHTML(html: String, text: String, language: String) -> String", mac)
         self.assertIn('"readOnly": true', mac)
         self.assertIn('"showDiff": false', mac)
@@ -1201,7 +1285,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("language,", relay_ui)
         self.assertIn("native.relayLogin({", relay_ui)
         self.assertIn("pendingAccount: true,", relay_ui)
-        self.assertIn("await startPendingLogin();", relay_ui)
+        self.assertIn("await runPendingAction(\"add\", startPendingLogin);", relay_ui)
         self.assertIn("native.cancelRelayLogin();", wizard_ui)
         # Pending logins flow through both hosts: the module allowlists the
         # pending/station fields and the accept payload forwards them to Core,
@@ -1225,11 +1309,13 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn('payload["pending_account"] = true', mac_core)
         self.assertIn('payload.SetNamedValue(L"pending_account"', windows_core)
         self.assertIn('"pending_account"', core_ipc)
-        # The providers-window login attaches as a subordinate sheet, so the
-        # parent stays blocked until the flow ends.
-        self.assertIn('let sheetParent = embeddedWindow == nil ? settingsWindow() : nil', mac_leaf)
-        self.assertIn('sheetParent.beginSheet(panel, completionHandler: nil)', mac_leaf)
-        self.assertIn('panel.sheetParent?.endSheet(panel)', mac_leaf)
+        # The providers-window login opens as a child window like every other
+        # child surface, so the app stays locked behind it until the flow ends
+        # and the window keeps its own title-bar close button.
+        self.assertIn('embeddedWindow: embeddedWindow,', mac_leaf)
+        self.assertNotIn("sheetParent", mac_leaf)
+        self.assertIn('let presentationParent = embeddedWindow == nil ? settingsWindow() : nil', mac_leaf)
+        self.assertIn("presentChildPanel(panel, in: presentationParent", mac_leaf)
         self.assertIn("embedded: true,", wizard_ui)
         self.assertIn("suggestedRelayStationName(candidate)", wizard_ui)
         # The relay family is auto-detected; no manual type state survives.
@@ -1316,8 +1402,28 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("private static let embeddedStepBottomInset: CGFloat = 54", mac_leaf)
         self.assertIn("getBoundingClientRect", mac_leaf)
         self.assertIn("agreementPattern", mac_leaf)
-        self.assertIn("bottomAnchor.bottom - Math.max(0, topAnchor.top - 24) + 24", mac_leaf)
+        self.assertIn("lastAnchor.bottom - topAnchor.top + 40", mac_leaf)
         self.assertIn("window.scrollTo({ top: targetScroll", mac_leaf)
+        # A single-page station sign-in is announced by its own storage, never
+        # by a navigation, and its announcement dialog covers the form.
+        self.assertIn("private static let relayLoginSurfaceScript", mac_leaf)
+        # Swift string literals process backslash escapes, so the JS those
+        # literals carry must not contain any (a stray escape silently broke
+        # the announcement dismissal script once).
+        js_scripts = {}
+        for name in ("relayLoginSurfaceScript", "loginStateScript", "embeddedContentHeightScript", "immediateWebPresentationScript"):
+            match = re.search(rf'private static let {name} = """\n(.*?)\n    """', mac_leaf, re.S)
+            self.assertIsNotNone(match, name)
+            js_scripts[name] = match.group(1)
+            self.assertNotIn("\\", match.group(1), f"{name} must not carry JS backslash escapes")
+        self.assertIn("String.fromCharCode(9, 10, 11, 12, 13, 32)", js_scripts["relayLoginSurfaceScript"])
+        self.assertIn("private static let loginStateScript", mac_leaf)
+        self.assertIn("window.__youngRouterLoginSurface", mac_leaf)
+        self.assertIn("litellmRelayPage", mac_leaf)
+        self.assertIn("private func scheduleLoginWatch(delay: TimeInterval = 1)", mac_leaf)
+        self.assertIn("private func pollLoginState()", mac_leaf)
+        self.assertIn("private func recoverStalledCheck()", mac_leaf)
+        self.assertIn("window.history[name] = function (...args)", mac_leaf)
         self.assertIn("private func scheduleEmbeddedBrowserResize", mac_leaf)
         self.assertIn("private func resizeEmbeddedBrowser(contentHeight:", mac_leaf)
         self.assertIn("embeddedWindow.setContentSize(NSSize(width: 900, height: height))", mac_leaf)
@@ -1336,8 +1442,9 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # JS `native.cancelRelayLogin()` optional chain silently no-ops and the
         # embedded login browser can never be dismissed by the wizard's Back.
         self.assertIn("RCT_EXTERN_METHOD(cancelRelayLogin)", mac_bridge)
-        self.assertIn("parent.beginSheet(window)", mac_leaf)
-        self.assertIn("parent.endSheet(window)", mac_leaf)
+        # The wizard is a child window of the workspace, so the embedded
+        # sign-in step rides the wizard's own close action instead of a sheet.
+        self.assertIn("presentChildPanel(window, in: settingsWindow())", mac_leaf)
         self.assertIn("@objc private func closeEmbeddedWindow", mac_leaf)
         self.assertIn('self?.close(route: "provider-wizard")', mac_leaf)
         self.assertIn('routeWindows["provider-wizard"].flatMap', mac_leaf)
@@ -1547,7 +1654,12 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
 
         self.assertIn("func chooseModelsToAdd(models: [String]", mac_leaf)
         self.assertIn("NSPanel(", mac_leaf)
-        self.assertIn("NSApp.runModal(for: panel)", mac_leaf)
+        # The chooser is the reference child surface: its own movable window,
+        # the window behind it locked by the shield, and a completion that
+        # carries the selection once that window closes.
+        self.assertIn("completion: @escaping ([String]?) -> Void) {", mac_leaf)
+        self.assertIn("presentChildPanel(panel, in: activeWindow(), prepare: { controller.focusSearchField() })", mac_leaf)
+        self.assertIn("completion(selection)", mac_leaf)
         self.assertIn("let searchField = NativeInstantFocusSearchField()", mac_leaf)
         self.assertIn("searchField.focusRingType = .none", mac_leaf)
         self.assertIn("showsInstantFocusBorder = true", mac_leaf)
@@ -1704,8 +1816,8 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         mac_spec = (SHARED / "ui/macos/NativeSecureTextInputNativeComponent.ts").read_text(encoding="utf-8")
         windows_spec = (SHARED / "ui/windows/NativeSecureTextInputNativeComponent.ts").read_text(encoding="utf-8")
 
-        workspace = ui.split("function ProviderKeysPanel", 1)[1].split("function CodexWorkspace", 1)[0]
-        self.assertIn("<NativeSecretField plainText autoCommit", workspace)
+        workspace = ui.split("function ProviderKeysPanel", 1)[1].split("function TablePane", 1)[0]
+        self.assertIn("<NativeSecretField labelVisible={false} plainText autoCommit", workspace)
         self.assertNotIn('setTitle={translate("common.set")}', workspace)
         self.assertNotIn('clearTitle={translate("common.clear")}', workspace)
         self.assertNotIn("onClear={() => clearSecret", workspace)
@@ -1788,8 +1900,29 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         windows = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
 
         self.assertIn("link?: boolean;", adapter)
+        self.assertIn("plainLink?: boolean;", adapter)
         for spec in (mac_spec, windows_spec):
             self.assertIn("link?: WithDefault<boolean, false>;", spec)
+            self.assertIn("plainLink?: WithDefault<boolean, false>;", spec)
+        # A plain link keeps link behavior but drops the inline bezel and
+        # left-aligns its title, for a long value that owns its whole column.
+        self.assertIn("BOOL plainLink = link && newViewProps.plainLink;", mac)
+        self.assertIn("_button.bordered = !plainLink;", mac)
+        self.assertIn("_button.alignment = plainLink ? NSTextAlignmentLeft : NSTextAlignmentCenter;", mac)
+        self.assertIn("plainLink", windows)
+        # ...and it is the quiet variant: secondary ink at the row's weight,
+        # never the accent-colored navigation link, underlined at rest because
+        # the underline is the affordance, and never restating its color for
+        # hover — only the navigation link takes the accent from the pointer.
+        self.assertIn("((LiteLLMNavigationLinkButton *)_button).plainLinkMode = plainLink;", mac)
+        self.assertIn("NSFontWeight linkWeight = plainLink ? NSFontWeightRegular : NSFontWeightSemibold;", mac)
+        self.assertIn("color = self.enabled ? NSColor.secondaryLabelColor : NSColor.tertiaryLabelColor;", mac)
+        self.assertIn("(self.plainLinkMode || _hovering);", mac)
+        self.assertIn("NSUnderlineStyleAttributeName: underlined ? @(NSUnderlineStyleSingle) : @0,", mac)
+        self.assertIn("color = _hovering ? NSColor.controlAccentColor : NSColor.linkColor;", mac)
+        self.assertNotIn("NSColor.labelColor : NSColor.secondaryLabelColor", mac)
+        self.assertIn("linkLabel.Foreground(SecondaryTextBrush());", windows)
+        self.assertIn("linkLabel.TextDecorations(winrt::Windows::UI::Text::TextDecorations::Underline);", windows)
         self.assertIn("NSBezelStyleInline", mac)
         self.assertIn("LiteLLMNavigationLinkButton", mac)
         self.assertIn("NSCursor.pointingHandCursor", mac)
@@ -1968,6 +2101,10 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertNotIn("_dataSignature", controls)
         self.assertNotIn("nextDataSignature", controls)
         self.assertIn("- (void)updateScrollerVisibility", controls)
+        # The floating scroller strip must not expose the scroll view's
+        # background beside the header (the white notch above the knob).
+        self.assertIn("const CGFloat headerWidth = NSWidth(visibleBounds);", controls)
+        self.assertIn("headerFrame.size.width = headerWidth;", controls)
         self.assertIn("const CGFloat headerHeight = _tableView.headerView == nil ? 0 : NSHeight(_tableView.headerView.frame);", controls)
         self.assertIn("const CGFloat dataViewportHeight = MAX(0, NSHeight(_scrollView.contentView.bounds) - headerHeight);", controls)
         self.assertIn("const NSInteger rowCount = _tableView.numberOfRows;", controls)
@@ -2121,14 +2258,14 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("if (labelsChanged || compactChanged) {\n    [_host setNeedsLayout:YES];\n  }", segmented)
         self.assertNotIn("_control.selectedSegment = SegmentIndex(viewProps.labels", segmented)
         self.assertIn("const BOOL titleChanged = oldViewProps.title != newViewProps.title;", button)
-        self.assertIn("if (titleChanged || symbolChanged || symbolWithTitleChanged || linkChanged || compactChanged) {\n    [_host setNeedsLayout:YES];\n  }", button)
+        self.assertIn("if (titleChanged || symbolChanged || symbolWithTitleChanged || linkChanged || plainLinkChanged || compactChanged || busyChanged) {\n    [_host setNeedsLayout:YES];\n  }", button)
         self.assertIn('symbolName = @"pause.fill";', controls)
         self.assertIn('symbolName = @"play.fill";', controls)
         self.assertIn('symbolName = @"minus";', controls)
         self.assertIn('symbolName = @"trash";', controls)
         self.assertIn('symbolName = @"tray.and.arrow.down";', controls)
         self.assertIn('symbolName = @"arrow.clockwise";', controls)
-        self.assertIn("_button.imagePosition = symbolImage == nil\n        ? NSNoImage\n        : (newViewProps.symbolWithTitle ? NSImageLeading : NSImageOnly);", button)
+        self.assertIn("_button.imagePosition = image == nil\n      ? NSNoImage\n      : (showsTitle ? NSImageLeading : NSImageOnly);", button)
         self.assertIn('symbolName = @"info.circle";', controls)
 
         windows = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
@@ -2142,6 +2279,59 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn('else if (symbol == "refresh") icon.Glyph(L"\\xE72C");', windows)
         self.assertIn('else if (symbol == "chevron-up") icon.Glyph(L"\\xE70E");', windows)
         self.assertIn('else if (symbol == "chevron-down") icon.Glyph(L"\\xE70D");', windows)
+
+    def test_macos_busy_buttons_center_a_spinner_with_the_title_and_stay_live(self) -> None:
+        controls = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
+        button = controls.split("@implementation LiteLLMAppKitButtonComponentView", 1)[1].split(
+            "Class<RCTComponentViewProtocol> LiteLLMAppKitButtonCls", 1
+        )[0]
+
+        # The busy prop only drives the leading image: the enabled appearance,
+        # the title, and the control's width are untouched, so a working button
+        # never turns into a greyed-out placeholder.
+        self.assertIn("const BOOL busyChanged = oldViewProps.busy != newViewProps.busy;", button)
+        self.assertIn("_busy = newViewProps.busy;", button)
+        self.assertIn("[self updateBusyAnimation];", button)
+        self.assertNotIn("newViewProps.busy", button.split("_button.enabled", 1)[1].split("\n", 1)[0])
+        self.assertIn("_busyStep = 0;", button.split("- (void)prepareForRecycle", 1)[1])
+        self.assertIn("[_busyTimer invalidate];", button.split("- (void)prepareForRecycle", 1)[1])
+        # The spinner is the button's own leading image, exactly like a
+        # symbol-with-title button, so AppKit centers the icon together with
+        # the title as one group. An icon-only button keeps its icon size and
+        # shows the wheel in the icon's place.
+        self.assertIn("NSImage *image = _busy ? AppKitBusySpinner.frames[(NSUInteger)_busyStep] : symbolImage;", button)
+        self.assertIn(": (showsTitle ? NSImageLeading : NSImageOnly);", button)
+        self.assertIn('_button.title = showsTitle ? title : @"";', button)
+        # The wheel turns by swapping pre-rendered frames, so nothing about the
+        # button's layout changes while it reports progress.
+        self.assertIn("_busyStep = (_busyStep + 1) % AppKitBusySpinner.stepCount;", button)
+        self.assertIn("_button.image = AppKitBusySpinner.frames[(NSUInteger)_busyStep];", button)
+        self.assertIn("NSRunLoopCommonModes", button)
+        # The wheel is one drawing for the whole app: the Swift leaf owns the
+        # frames and the 分组管理 sheet turns the same ones beside 密钥, so this
+        # control view only swaps them.  A template image is tinted by AppKit
+        # like the title it sits beside (white on an accent-filled default
+        # button), so the wheel needs no color of its own.
+        mac_leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
+        self.assertNotIn("BusySpinnerFrames", controls)
+        for marker in (
+            "public static let stepCount = 12",
+            "NSColor.black.withAlphaComponent(alpha).setStroke()",
+            "image.isTemplate = true",
+            "@objc(AppKitBusySpinner)",
+        ):
+            self.assertIn(marker, mac_leaf)
+        self.assertIn("AppKitBusySpinner.stepInterval", button)
+        # The shared sheet turns that wheel beside 密钥 instead of a second one.
+        self.assertIn("loadingSpinner?.image = AppKitBusySpinner.frames[loadingStep]", mac_leaf)
+        # The spinner is never a view laid over the bezel.
+        self.assertNotIn("leadingAccessory", controls)
+
+        windows = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
+        self.assertIn("bool const busy = props.busy.value_or(false);", windows)
+        self.assertIn("auto ring = ProgressRing{};", windows)
+        self.assertIn("button_.IsEnabled(Enabled(props.disabled));", windows)
+        self.assertIn("row.Children().Append(busySpinner());", windows)
 
     def test_macos_buttons_clear_default_action_state_before_fabric_reuse(self) -> None:
         controls = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")

@@ -23,11 +23,13 @@ from typing import Any
 import urllib.error
 import urllib.request
 
+from young_router.browser_identity import browser_request_headers
+
 import yaml
 
 
-DEFAULT_PORT = "12389"
-DEFAULT_KEY = "sk-local-litellm"
+DEFAULT_PORT = "12390"
+DEFAULT_KEY = "sk-young-router"
 LOCAL_MODEL_LIST_TIMEOUT_SECONDS = 1.0
 LOCAL_MODEL_LIST_MAX_BYTES = 512 * 1024
 LITELLM_CODEX_PROVIDER_ID = "young-router"
@@ -253,9 +255,8 @@ def _local_exposed_models(api_key: str) -> tuple[list[str], bool]:
     request = urllib.request.Request(
         f"{local_base_url().rstrip('/')}/models",
         headers={
-            "Accept": "application/json",
+            **browser_request_headers(),
             "Authorization": f"Bearer {api_key}",
-            "User-Agent": "Young-Router-Codex-Settings/1",
         },
         method="GET",
     )

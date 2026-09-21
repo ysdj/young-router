@@ -360,6 +360,8 @@ test -x "$STAGED_APP/Contents/Resources/Core/runtime/bin/litellm"
 test -x "$STAGED_APP/Contents/Resources/Core/runtime/bin/node"
 test -x "$STAGED_APP/Contents/Resources/Core/bin/vision_ocr"
 test -f "$STAGED_APP/Contents/Resources/Core/young_router/pi-web-access/index.ts"
+test -f "$STAGED_APP/Contents/Resources/Core/young_router/traceone/traceone.js"
+test -f "$STAGED_APP/Contents/Resources/Core/young_router/traceone/prompt.txt"
 plutil -lint "$STAGED_APP/Contents/Info.plist" >/dev/null
 codesign --verify --deep --strict --verbose=2 "$STAGED_APP"
 printf '%s\n' "Young Router: staged bundle verified"

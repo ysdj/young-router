@@ -12,7 +12,7 @@ from .base import (
     Optional,
     _BROWSER_COMPUTER_CLIENT_FUNCTION_NAMES,
     _BROWSER_COMPUTER_CLIENT_NAMESPACE_NAMES,
-    _HOSTED_BROWSER_COMPUTER_TOOL_TYPES,
+    _HOSTED_COMPUTER_TOOL_TYPES,
     _RESPONSES_CHAT_BRIDGE_METADATA_KEY,
     _RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY,
     _PI_WEB_ACCESS_TOOL_NAMES,
@@ -236,26 +236,6 @@ def _request_should_consume_web_search_function_call(
     )
 
 
-def _hosted_browser_computer_tool_types(tools: Any) -> list[str]:
-    if not isinstance(tools, list):
-        return []
-    types: list[str] = []
-    for tool in tools:
-        if not isinstance(tool, dict):
-            continue
-        tool_type = tool.get("type")
-        if tool_type in _HOSTED_BROWSER_COMPUTER_TOOL_TYPES and tool_type not in types:
-            types.append(tool_type)
-    return types
-
-
-def _request_hosted_browser_computer_tool_types(
-    request_kwargs: Optional[dict],
-) -> list[str]:
-    request_kwargs = request_kwargs or {}
-    return _hosted_browser_computer_tool_types(request_kwargs.get("tools"))
-
-
 def _tools_include_browser_computer_client_tool(tools: Any) -> bool:
     if not isinstance(tools, list):
         return False
@@ -284,8 +264,22 @@ def _tools_include_browser_computer_client_tool(tools: Any) -> bool:
 
 
 def _request_has_browser_computer_client_tool(request_kwargs: Optional[dict]) -> bool:
+    """True when this request carries the client's own computer/browser tools.
+
+    Codex Desktop declares its computer use inside leading ``additional_tools``
+    input items (the ``mcp__cua_repl``/``mcp__node_repl`` repl namespaces), so
+    the input items count exactly like top-level tools here: they are the
+    client's executor and must keep working across a bridged request.
+    """
+
     request_kwargs = request_kwargs or {}
     if _tools_include_browser_computer_client_tool(request_kwargs.get("tools")):
+        return True
+    if _tools_include_browser_computer_client_tool(
+        _responses_tools_module._responses_input_additional_tools(
+            request_kwargs.get("input")
+        )
+    ):
         return True
     for discovered_tool in _responses_tools_module._responses_input_tool_search_output_tools(
         request_kwargs.get("input")

@@ -2903,7 +2903,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
         assert modified is not None
         self.assertEqual(modified["extra_headers"]["User-Agent"], "codex-local/1.2.3")
 
-    async def test_pre_call_deployment_hook_forwards_litellm_params_proxy_user_agent(self) -> None:
+    async def test_pre_call_deployment_hook_replaces_our_own_proxy_user_agent(self) -> None:
         hooks, _ = load_hook_module()
         hook = hooks.YoungRouterHook()
         original = {
@@ -2925,7 +2925,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
         self.assertEqual(modified["extra_headers"]["X-Trace"], "keep-me")
         self.assertEqual(
             modified["extra_headers"]["User-Agent"],
-            "Young%20Router/1 CFNetwork/3860.600.21 Darwin/25.5.0",
+            hooks._FALLBACK_BROWSER_USER_AGENT,
         )
         self.assertNotIn("Accept", modified["extra_headers"])
         self.assertEqual(original["extra_headers"], {"X-Trace": "keep-me"})
@@ -3541,7 +3541,12 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
         modified = await hook.async_pre_call_deployment_hook(original, call_type=None)
 
-        self.assertIsNone(modified)
+        # An unrelated host keeps its request untouched apart from the one
+        # User-Agent guarantee: nothing of ours identifies the router upstream.
+        self.assertEqual(
+            {"api_base": "https://example.com/v1", "extra_headers": {"User-Agent": hooks._FALLBACK_BROWSER_USER_AGENT}},
+            modified,
+        )
 
     async def test_pre_call_deployment_hook_uses_browser_header_retry_marker(self) -> None:
         hooks, _ = load_hook_module()

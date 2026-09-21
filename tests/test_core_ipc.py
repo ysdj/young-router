@@ -125,7 +125,7 @@ class CoreProtocolTests(unittest.TestCase):
         schema = load_protocol_schema()
         self.assertEqual(1, schema["protocol_version"])
         self.assertEqual(
-            ["snapshot", "disk_state", "logs", "editor", "dispatch", "subscribe", "validate", "apply", "reload", "probe", "export", "import_preview", "import"],
+            ["snapshot", "disk_state", "logs", "editor", "files", "dispatch", "subscribe", "validate", "apply", "reload", "probe", "export", "import_preview", "import"],
             schema["methods"],
         )
         typescript = (
@@ -172,6 +172,7 @@ class CoreProtocolTests(unittest.TestCase):
             "disk_state": {"domains": ["codex", "claude"]},
             "logs": {"tab": "requests"},
             "editor": {"domain": "codex", "document": "config"},
+            "files": {},
             "dispatch": {"action": {"type": "set", "domain": "language", "payload": {}}},
             "subscribe": {"topics": ["snapshot"]},
             "validate": {"domain": "language", "revision": 0},
@@ -187,6 +188,7 @@ class CoreProtocolTests(unittest.TestCase):
             "disk_state": {"domains": []},
             "logs": {"tab": "unknown"},
             "editor": {"domain": "runtime", "document": "config"},
+            "files": {"stale": True},
             "dispatch": {"action": {"type": "", "unexpected": True}},
             "subscribe": {"topics": ["topic"] * 33},
             "validate": {"domain": "unknown"},
@@ -239,6 +241,22 @@ class CoreProtocolTests(unittest.TestCase):
             "disk_state": {"revision": 0, "disk": {}},
             "logs": {"changed": True, "revision": 1, "log": {"tab": "requests", "available": False, "paused": False, "line_count": 0, "records": [], "filter": "", "limit": 10000}},
             "editor": {"domain": "codex", "document": "config", "editor_token": "token", "revision": 0, "text": "model = \"example\"\n", "baseline": "model = \"example\"\n"},
+            "files": {
+                "revision": 0,
+                "files": [
+                    {
+                        "id": "pi_settings",
+                        "client": "pi",
+                        "domain": "clients",
+                        "document": "pi_settings",
+                        "name": "settings.json",
+                        "path": "/Users/example/.pi/agent/settings.json",
+                        "display_path": "/Users/example/.pi/agent/settings.json",
+                        "language": "json",
+                        "exists": False,
+                    }
+                ],
+            },
             "dispatch": {"revision": 0, "action_summary": {"operation": "fetch_models"}},
             "subscribe": {"subscription_id": "subscription"},
             "validate": {"validate": {}},
@@ -262,6 +280,7 @@ class CoreProtocolTests(unittest.TestCase):
             "disk_state": {"revision": -1, "disk": {}},
             "logs": {"changed": "yes", "revision": 1, "log": None},
             "editor": {"domain": "codex", "document": "config", "editor_token": "token", "revision": 0},
+            "files": {"revision": 0, "files": [{"id": "pi_settings"}]},
             "dispatch": {"revision": -1, "action_summary": "fetch_models"},
             "subscribe": {"subscription_id": 1},
             "validate": {"validate": []},

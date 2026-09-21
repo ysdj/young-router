@@ -222,11 +222,15 @@ void CoreIPCBridge::RemoveEventHandler(int token) {
 
 std::string CoreIPCBridge::Send(std::string const& request_json) {
   if (stopping_) throw std::runtime_error("core unavailable");
-  const bool is_subscription = RequestMethod(request_json) == "subscribe";
+  const std::string method = RequestMethod(request_json);
+  const bool is_subscription = method == "subscribe";
+  // A model probe waits for the deployment's own first-event budget and then
+  // for a complete fingerprint answer, so it outlives the 30 s default.
+  const int receive_timeout_ms = method == "probe" ? 900000 : 30000;
   for (int attempt = 0; attempt < 2; ++attempt) {
     auto [endpoint, session, generation] = EnsureSession();
     try {
-      auto result = Request(endpoint, L"", L"POST", request_json, session);
+      auto result = Request(endpoint, L"", L"POST", request_json, session, receive_timeout_ms);
       if (IsSessionFailure(result.status)) {
         InvalidateCoreIfGeneration(generation, true);
         continue;

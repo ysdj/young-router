@@ -118,7 +118,7 @@ class HookPatchTests(HookTestCase):
             def get_custom_headers(**_kwargs):
                 return {
                     "x-litellm-call-id": "synthetic-call",
-                    "x-litellm-model-name": "synthetic-route-\u6b21",
+                    "x-litellm-model-name": "synthetic-route-次",
                     "x-latin1-value": "caf\u00e9",
                 }
 
@@ -1742,6 +1742,183 @@ class HookPatchTests(HookTestCase):
         self.assertEqual(error.failed_deployment_id, "image-order2")
         self.assertEqual(error.failed_deployment_order, 2)
         self.assertEqual(error.num_retries, 0)
+
+    async def test_make_call_replays_with_a_native_reasoning_shape(self) -> None:
+        hooks, _ = load_hook_module()
+        with tempfile.TemporaryDirectory() as directory:
+            self.set_env(
+                hooks._DEPLOYMENT_COOLDOWN_FILE_ENV,
+                str(Path(directory) / "routing.json"),
+            )
+            router_module = types.ModuleType("litellm.router")
+
+            deployment = {
+                "litellm_params": {
+                    "model": "openai/[次]gemini-3.8-flash",
+                    "order": 0,
+                },
+                "model_info": {"id": "baa28073"},
+            }
+
+            class Router:
+                def _update_kwargs_with_deployment(self, deployment, kwargs, function_name=None):
+                    kwargs["model_info"] = deployment["model_info"].copy()
+
+                async def make_call(self, original_function, *args, **kwargs):
+                    response = original_function(*args, **kwargs)
+                    if hasattr(response, "__await__"):
+                        return await response
+                    return response
+
+            router_module.Router = Router
+            sys.modules["litellm.router"] = router_module
+            hooks._install_selected_deployment_marker_patch()
+
+            calls = []
+
+            class ProviderBadRequest(Exception):
+                status_code = 400
+
+            def rejection() -> Exception:
+                return ProviderBadRequest(
+                    'OpenAIException - model "[次]gemini-3.8-flash" does not '
+                    "have a known gemini thinking configuration"
+                )
+
+            async def original_function(**kwargs):
+                calls.append(dict(kwargs))
+                if "reasoning_effort" in kwargs:
+                    raise rejection()
+                return {"ok": True}
+
+            router = Router()
+            response = await router.make_call(
+                original_function,
+                model="gemini-3.8-flash",
+                model_info={"id": "baa28073"},
+                reasoning_effort="high",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+
+            self.assertEqual({"ok": True}, response)
+            self.assertEqual(2, len(calls))
+            self.assertEqual("high", calls[0]["reasoning_effort"])
+            self.assertNotIn("reasoning_effort", calls[1])
+            self.assertEqual(
+                "high",
+                calls[1]["extra_body"]["extra_body"]["google"]["thinking_config"][
+                    "thinking_level"
+                ],
+            )
+            state = hooks._reasoning_parameters_compat_cached(
+                {"model_info": {"id": "baa28073"}}
+            )
+            self.assertIsNotNone(state)
+            assert state is not None
+            self.assertEqual("google_thinking_level", state["mode"])
+
+            # A non-Gemini route cannot use the native shape and keeps the
+            # field-stripping replay.
+            calls.clear()
+
+            async def plain_original_function(**kwargs):
+                calls.append(dict(kwargs))
+                if "reasoning_effort" in kwargs:
+                    raise ProviderBadRequest(
+                        "invalid_request_error: model plain-model does not have a "
+                        "known thinking configuration"
+                    )
+                return {"ok": True}
+
+            response = await router.make_call(
+                plain_original_function,
+                model="plain-model",
+                model_info={"id": "plain-route"},
+                reasoning_effort="high",
+            )
+
+            self.assertEqual({"ok": True}, response)
+            self.assertEqual(2, len(calls))
+            self.assertNotIn("reasoning_effort", calls[1])
+            self.assertNotIn("extra_body", calls[1])
+            state = hooks._reasoning_parameters_compat_cached(
+                {"model_info": {"id": "plain-route"}}
+            )
+            self.assertIsNotNone(state)
+            assert state is not None
+            self.assertEqual("strip", state["mode"])
+
+            # A gateway that also refuses the native shape falls back to the
+            # strip replay, which is what the route then remembers.
+            calls.clear()
+
+            async def refusing_original_function(**kwargs):
+                calls.append(dict(kwargs))
+                if "reasoning_effort" in kwargs:
+                    raise rejection()
+                if "extra_body" in kwargs:
+                    raise ProviderBadRequest(
+                        'unsupported reasoning effort: "high"'
+                    )
+                return {"ok": True}
+
+            response = await router.make_call(
+                refusing_original_function,
+                model="gemini-3.9-flash",
+                model_info={"id": "fallback-route"},
+                reasoning_effort="high",
+            )
+
+            self.assertEqual({"ok": True}, response)
+            self.assertEqual(3, len(calls))
+            self.assertNotIn("extra_body", calls[2])
+            state = hooks._reasoning_parameters_compat_cached(
+                {"model_info": {"id": "fallback-route"}}
+            )
+            self.assertIsNotNone(state)
+            assert state is not None
+            self.assertEqual("strip", state["mode"])
+
+            # Every replay failing surfaces the last error without looping.
+            calls.clear()
+
+            class Unrelated(Exception):
+                status_code = 500
+
+            async def failing_original_function(**kwargs):
+                calls.append(dict(kwargs))
+                if "reasoning_effort" in kwargs:
+                    raise rejection()
+                raise Unrelated("upstream exploded")
+
+            with self.assertRaises(Unrelated):
+                await router.make_call(
+                    failing_original_function,
+                    model="gemini-3.8-flash",
+                    model_info={"id": "baa28073"},
+                    reasoning_effort="high",
+                )
+            self.assertEqual(3, len(calls))
+
+            # An ordinary request/format 400 on the same route is not a
+            # reasoning-parameter problem and keeps the standard error path.
+            calls.clear()
+
+            class PlainBadRequest(Exception):
+                status_code = 400
+
+            async def rejecting_original_function(**kwargs):
+                calls.append(dict(kwargs))
+                raise PlainBadRequest("invalid_request_error: messages must not be empty")
+
+            with self.assertRaises(PlainBadRequest):
+                await router.make_call(
+                    rejecting_original_function,
+                    model="gemini-3.8-flash",
+                    model_info={"id": "baa28073"},
+                    reasoning_effort="high",
+                )
+            self.assertEqual(1, len(calls))
 
     async def test_public_image_generation_reuses_common_fallback_path(self) -> None:
         hooks, _ = load_hook_module()

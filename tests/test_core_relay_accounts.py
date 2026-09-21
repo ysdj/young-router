@@ -1225,6 +1225,99 @@ class RelayAccountsDomainTests(unittest.TestCase):
             self.assertFalse(relay.secret_present("session", account["id"]))
             self.assertFalse(snapshot["drafts"]["providers_models"]["dirty"])
 
+    def test_core_keeps_cached_relay_keys_when_a_session_check_fails(self) -> None:
+        """A signed-out session must not hide the station's cached API keys."""
+
+        responses = {
+            "/api/user/models": {"success": True, "data": ["chat-a"]},
+            "/api/token/?p=1&size=100": {
+                "success": True,
+                "data": {"items": [{"id": 7, "status": 1, "key": "masked"}]},
+            },
+        }
+        fake = FakeRelayHTTPClient(responses)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            domain = RelayAccountsDomain(root, http_client=fake)
+            account_id = domain.dispatch(
+                "add",
+                {"type": "newapi", "label": "Relay", "origin": "https://relay.example.test"},
+            )["accounts"][0]["id"]
+            domain.accept_login_result(account_id, username="sample-user", cookie="session=replace-cookie")
+            resources = domain.refresh_resources(account_id)["resources"]
+            self.assertTrue(resources)
+
+            providers = ProvidersModelsDomain(root / "config.yaml")
+            core = CoreStore(
+                metadata_path=root / ".litellm-runtime" / "core-state.json",
+                domains=[domain, providers],
+            )
+
+            result = core.restore_relay_session(
+                account_id=account_id,
+                account_type="newapi",
+                label="Relay",
+                origin="https://relay.example.test",
+                login_status="signed_out",
+            )
+
+            self.assertEqual("signed_out", result["login_status"])
+            account = core.snapshot()["domains"]["relay_accounts"]["accounts"][0]
+            self.assertEqual(
+                [resource["id"] for resource in resources],
+                [item["id"] for item in account["resources"]],
+            )
+            # The login observation is recorded on its own: it never downgrades
+            # or hides the verified key list, so local keys keep loading.
+            self.assertEqual("ready", account["resource_status"])
+            self.assertEqual("none", account["resource_error"])
+
+    def test_local_relay_keys_stay_loadable_and_refreshable_while_signed_out(self) -> None:
+        """A remembered session is a local credential, not a login gate.
+
+        The account reads signed out after a failed session check, yet its
+        cached keys stay listed and readable, and the station can still be
+        refreshed without a fresh browser sign-in.
+        """
+
+        responses = {
+            "/api/user/models": {"success": True, "data": ["chat-a"]},
+            "/api/token/?p=1&size=100": {
+                "success": True,
+                "data": {"items": [{"id": 7, "status": 1, "key": "masked"}]},
+            },
+            "/api/token/7/key": {"success": True, "data": {"key": "replace-relay-key"}},
+        }
+        fake = FakeRelayHTTPClient(responses)
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RelayAccountsDomain(Path(directory), http_client=fake)
+            account_id = domain.dispatch(
+                "add",
+                {"type": "newapi", "label": "Relay", "origin": "https://relay.example.test"},
+            )["accounts"][0]["id"]
+            domain.accept_login_result(
+                account_id,
+                username="sample-user",
+                cookie="session=replace-cookie",
+                remember_password=True,
+            )
+            resources = domain.refresh_resources(account_id)["resources"]
+            self.assertTrue(resources)
+            resource_id = resources[0]["id"]
+
+            domain.set_login_status(account_id, "signed_out")
+            account = domain.snapshot()["accounts"][0]
+            self.assertEqual("signed_out", account["login_status"])
+            self.assertEqual([resource_id], [item["id"] for item in account["resources"]])
+            self.assertEqual("ready", account["resource_status"])
+            # The native plaintext lease reads the locally known key without a
+            # fresh sign-in, and a refresh may still read the station.
+            self.assertEqual(
+                "sk-replace-relay-key",
+                domain.trusted_secret_value("api_key", f"{account_id}:{resource_id}"),
+            )
+            self.assertEqual("ready", domain.refresh_resources(account_id)["resource_status"])
+
     def test_ordinary_dispatch_rejects_credentials_and_core_has_no_password_surface(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             domain = RelayAccountsDomain(directory)

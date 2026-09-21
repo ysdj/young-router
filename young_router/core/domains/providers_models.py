@@ -6,10 +6,13 @@ import copy
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
 import re
+import socket
+import ssl
 import tempfile
 import time
 import urllib.error
@@ -34,6 +37,8 @@ from config_editor_core.schema import (
     infer_upstream_fallback_surface,
 )
 
+from ... import traceone
+from ...browser_identity import browser_request_headers
 from ...api_base import isolated_http_opener, service_root
 from ..persistence import atomic_write_text
 from ..security import REDACT_TEXT, redact, safe_error_message
@@ -42,6 +47,7 @@ from ._shared import (
     _action_name,
     _copy_mapping,
     _default_provider_config_path,
+    _default_runtime_settings_path,
     _direction_destination,
     _index,
     _mapping,
@@ -86,8 +92,35 @@ class ProvidersModelsDomain:
     _MODEL_LIST_TIMEOUT_SECONDS = 5.0
     _MAX_MODEL_LIST_BYTES = 2 * 1024 * 1024
     _MAX_MODEL_CANDIDATES = 256
-    _MODEL_PROBE_TIMEOUT_SECONDS = 6.0
+    # "Unreachable" must mean the same thing the router means by it: the probe
+    # waits for a first event exactly as long as this deployment lets the proxy
+    # wait for one, so the pane's verdict follows Runtime Settings (Timeouts →
+    # First-event timeout) instead of a private ceiling. 120s is that setting's
+    # schema default; an explicit env override still wins.
+    _MODEL_PROBE_TIMEOUT_SECONDS = 120.0
+    _MODEL_PROBE_TIMEOUT_SETTING_KEY = "YOUNG_ROUTER_STREAM_START_TIMEOUT_SECONDS"
+    # Measured on a live edge: roughly half of the TLS connections from this
+    # host are dropped with ``SSL: UNEXPECTED_EOF_WHILE_READING`` within ~5s -
+    # httpx and urllib alike, so it is the edge, not this transport. Three
+    # attempts on a dropped connection keep a working route from reading as
+    # unavailable. Only the transport is retried: an HTTP status and a read
+    # timeout are verdicts.
+    _MODEL_PROBE_ATTEMPTS = 3
+    _MODEL_PROBE_RETRY_DELAY_SECONDS = 0.4
+    # A relay that answers its first byte slowly still answers; deployments can
+    # raise this without a rebuild when their edge is consistently slower.
+    _MODEL_PROBE_TIMEOUT_ENV = "YOUNG_ROUTER_MODEL_PROBE_TIMEOUT_SECONDS"
     _MAX_MODEL_PROBE_BYTES = 256 * 1024
+    # The degradation deep test asks one model for a full 315-integer answer,
+    # so it needs its own budget: a reasoning model legitimately takes longer
+    # than the six-second availability probe, and a truncated answer would be
+    # reported as an inconclusive fingerprint instead of a slow model.
+    # The deep test asks one reasoning model for 315 integers: measured 86s and
+    # 147s on a healthy relay, so the ceiling leaves room for a loaded edge.
+    _DEGRADATION_PROBE_TIMEOUT_SECONDS = 300.0
+    _DEGRADATION_PROBE_TIMEOUT_ENV = "YOUNG_ROUTER_DEGRADATION_PROBE_TIMEOUT_SECONDS"
+    _MAX_DEGRADATION_PROBE_BYTES = 512 * 1024
+    _DEGRADATION_SURFACE = "openai/responses"
     _API_KEY_TARGET_SEPARATOR = "\x1f"
     _WEB_SEARCH_CAPABILITY_ALIASES = {
         "supports_responses_web_search": "supports_responses_web_search",
@@ -498,6 +531,7 @@ class ProvidersModelsDomain:
                         "supports_responses_image_generation_tool_present": bool(model.get("supports_responses_image_generation_tool_present")),
                         "litellm_extra": safe_litellm_extra,
                         "api_key_configured": model_key,
+                        "deep_probe": self._deep_probe_plan(model),
                         "probe": redact(live_probe) if live_probe else None,
                     }
                 )
@@ -954,7 +988,7 @@ class ProvidersModelsDomain:
                 "model_count": 0,
             }
 
-        headers = {"Accept": "application/json", "User-Agent": "Young-Router-Core/1"}
+        headers = browser_request_headers()
         if credential:
             headers["Authorization"] = f"Bearer {credential}"
         request = urllib.request.Request(endpoint, headers=headers, method="GET")
@@ -1114,11 +1148,8 @@ class ProvidersModelsDomain:
         model_name: str,
     ) -> dict[str, Any]:
         root = service_root(api_base)
-        headers = {
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "User-Agent": "Young-Router-Core/1",
-        }
+        headers = browser_request_headers()
+        headers["Content-Type"] = "application/json"
         if surface == "anthropic":
             endpoint = f"{root}/v1/messages" if isinstance(root, str) and root else ""
             headers["x-api-key"] = credential
@@ -1175,30 +1206,24 @@ class ProvidersModelsDomain:
             headers=headers,
             method="POST",
         )
-        try:
-            with isolated_http_opener().open(
-                request,
-                timeout=cls._MODEL_PROBE_TIMEOUT_SECONDS,
-            ) as response:
-                status = getattr(response, "status", None)
-                if status is None:
-                    status = response.getcode()
-                body = response.read(cls._MAX_MODEL_PROBE_BYTES + 1)
-        except urllib.error.HTTPError as exc:
-            code = exc.code
-            probe_status = (
-                "unsupported"
-                if code in {404, 405}
-                else "auth_error"
-                if code in {401, 403}
-                else "rate_limited"
-                if code == 429
-                else "http_error"
-            )
-            return result(False, probe_status)
-        except Exception:
-            return result(False, "network_error")
-
+        for attempt in range(cls._MODEL_PROBE_ATTEMPTS):
+            try:
+                with isolated_http_opener().open(
+                    request,
+                    timeout=cls._model_probe_timeout_seconds(),
+                ) as response:
+                    status = getattr(response, "status", None)
+                    if status is None:
+                        status = response.getcode()
+                    body = response.read(cls._MAX_MODEL_PROBE_BYTES + 1)
+                break
+            except urllib.error.HTTPError as exc:
+                return result(False, cls._probe_status_for_http_code(exc.code))
+            except Exception as exc:
+                failure = cls._probe_failure_status(exc)
+                if attempt + 1 >= cls._MODEL_PROBE_ATTEMPTS or not cls._probe_transport_retryable(exc):
+                    return result(False, failure)
+                time.sleep(cls._MODEL_PROBE_RETRY_DELAY_SECONDS)
         if not isinstance(status, int) or not 200 <= status < 300 or len(body) > cls._MAX_MODEL_PROBE_BYTES:
             return result(False, "http_error")
         try:
@@ -1214,6 +1239,307 @@ class ProvidersModelsDomain:
         else:
             usable = any(key in decoded for key in ("id", "output", "output_text"))
         return result(usable, "ok" if usable else "invalid_response")
+
+    @classmethod
+    def _model_probe_timeout_seconds(cls) -> float:
+        """The first-event budget this deployment gives a real request."""
+
+        raw = os.environ.get(cls._MODEL_PROBE_TIMEOUT_ENV, "").strip()
+        if raw:
+            try:
+                return max(1.0, float(raw))
+            except ValueError:
+                pass
+        try:
+            from runtime_settings_io import load_specs, read_settings_file
+
+            values = read_settings_file(_default_runtime_settings_path(), load_specs())
+            configured = str(values.get(cls._MODEL_PROBE_TIMEOUT_SETTING_KEY, "")).strip()
+            if configured:
+                return max(1.0, float(configured))
+        except Exception:
+            pass
+        return cls._MODEL_PROBE_TIMEOUT_SECONDS
+
+    @staticmethod
+    def _probe_failure_status(error: BaseException) -> str:
+        """Name a failed probe request for what it was.
+
+        A closed, reset or refused connection means the peer rejected the
+        request - the pane must say "rejected", never "no response". Only a
+        request that was accepted and then stayed silent is a timeout. Anything
+        unclassifiable keeps the umbrella status.
+        """
+
+        def timed_out(value: object) -> bool:
+            return isinstance(value, (TimeoutError, socket.timeout))
+
+        def rejected(value: object) -> bool:
+            return isinstance(
+                value,
+                (
+                    ConnectionError,
+                    http.client.RemoteDisconnected,
+                    ssl.SSLError,
+                    ssl.SSLEOFError,
+                    socket.gaierror,
+                ),
+            )
+
+        if timed_out(error):
+            return "timeout"
+        if isinstance(error, urllib.error.URLError):
+            reason = getattr(error, "reason", None)
+            if timed_out(reason):
+                return "timeout"
+            return "refused" if rejected(reason) else "network_error"
+        return "refused" if rejected(error) else "network_error"
+
+    @classmethod
+    def _probe_transport_retryable(cls, error: BaseException) -> bool:
+        """A rejected connection is transient; a silent one is the answer.
+
+        Relay edges reset a fresh diagnostic client's first connection, and the
+        next attempt answers immediately - that is worth one retry. A request
+        that was accepted and then went silent is a slow or stalled route, and
+        retrying it only doubles the wait before the same verdict.
+        """
+
+        return cls._probe_failure_status(error) == "refused"
+
+    @staticmethod
+    def _probe_status_for_http_code(code: int) -> str:
+        return (
+            "unsupported"
+            if code in {404, 405}
+            else "auth_error"
+            if code in {401, 403}
+            else "rate_limited"
+            if code == 429
+            else "http_error"
+        )
+
+    @classmethod
+    def _degradation_timeout_seconds(cls) -> float:
+        raw = os.environ.get(cls._DEGRADATION_PROBE_TIMEOUT_ENV, "").strip()
+        if raw:
+            try:
+                return max(1.0, float(raw))
+            except ValueError:
+                pass
+        return cls._DEGRADATION_PROBE_TIMEOUT_SECONDS
+
+    def _responses_surface_for(self, model: Mapping[str, Any]) -> str:
+        """The surface this route answers with when it speaks Responses at all.
+
+        Mirrors the probe's preference order: a fixed route uses its configured
+        surface, a fallback route prefers the surface inferred from the model
+        name and only then the configured one.
+        """
+
+        configured = str(model.get("upstream_url_surface", "")).strip()
+        mode = str(model.get("upstream_protocol_mode", "fallback")).strip().lower()
+        inferred = infer_upstream_fallback_surface(self._wire_model_name(model))
+        candidates = (configured,) if mode == "fixed" else (inferred, configured)
+        return self._DEGRADATION_SURFACE if self._DEGRADATION_SURFACE in candidates else ""
+
+    def _deep_probe_plan(self, model: Mapping[str, Any]) -> dict[str, Any]:
+        """Describe what the model detail pane's deep test will actually run.
+
+        A degradation fingerprint only means something for the routes the
+        staged TraceOne engine can attribute, and only the Responses surface of
+        such a route carries the Codex-shaped answer the fingerprints were
+        measured on.  Every other model keeps the plain availability probe, so
+        the pane's button can name the action before it runs.
+        """
+
+        wire_name = self._wire_model_name(model)
+        public_name = str(model.get("model_name", "")).strip()
+        target = traceone.route_target(wire_name, public_name)
+        surface = self._responses_surface_for(model)
+        includes = bool(target) and surface == self._DEGRADATION_SURFACE
+        return {
+            "includes_degradation": includes,
+            "target": target if includes else None,
+            "surface": surface if includes else "",
+        }
+
+    @staticmethod
+    def _probe_answer_text(payload: Mapping[str, Any] | None) -> str:
+        """Extract the model's answer from a Responses or chat completion body."""
+
+        if not isinstance(payload, Mapping):
+            return ""
+        text = payload.get("output_text")
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+        chunks: list[str] = []
+        output = payload.get("output")
+        if isinstance(output, Sequence) and not isinstance(output, (str, bytes, bytearray)):
+            for item in output:
+                if not isinstance(item, Mapping):
+                    continue
+                content = item.get("content")
+                if not isinstance(content, Sequence) or isinstance(content, (str, bytes, bytearray)):
+                    continue
+                for part in content:
+                    if isinstance(part, Mapping) and isinstance(part.get("text"), str):
+                        chunks.append(part["text"])
+        if chunks:
+            return "\n".join(chunks).strip()
+        choices = payload.get("choices")
+        if isinstance(choices, Sequence) and not isinstance(choices, (str, bytes, bytearray)):
+            for choice in choices:
+                if not isinstance(choice, Mapping):
+                    continue
+                message = choice.get("message")
+                if isinstance(message, Mapping) and isinstance(message.get("content"), str):
+                    chunks.append(message["content"])
+        return "\n".join(chunks).strip()
+
+    def _degradation_request(
+        self,
+        *,
+        api_base: str,
+        credential: str,
+        model_name: str,
+        prompt: str,
+    ) -> tuple[str, str]:
+        """Send the frozen identity prompt and return (answer, status)."""
+
+        root = service_root(api_base)
+        endpoint = f"{root}/v1/responses" if isinstance(root, str) and root else ""
+        if not endpoint or not credential or not model_name:
+            return "", "invalid_config"
+        payload = {
+            "model": model_name,
+            "input": prompt,
+            "stream": False,
+            "store": False,
+        }
+        request = urllib.request.Request(
+            endpoint,
+            data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+            headers={
+                **browser_request_headers(),
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {credential}",
+            },
+            method="POST",
+        )
+        for attempt in range(self._MODEL_PROBE_ATTEMPTS):
+            try:
+                with isolated_http_opener().open(
+                    request, timeout=self._degradation_timeout_seconds()
+                ) as response:
+                    status = getattr(response, "status", None)
+                    if status is None:
+                        status = response.getcode()
+                    body = response.read(self._MAX_DEGRADATION_PROBE_BYTES + 1)
+                break
+            except urllib.error.HTTPError as exc:
+                return "", self._probe_status_for_http_code(exc.code)
+            except Exception as exc:
+                # The long fingerprint request pays the same first-connection
+                # edge reset as the availability probe and follows the same
+                # retry rule.
+                failure = self._probe_failure_status(exc)
+                if attempt + 1 >= self._MODEL_PROBE_ATTEMPTS or not self._probe_transport_retryable(exc):
+                    return "", failure
+                time.sleep(self._MODEL_PROBE_RETRY_DELAY_SECONDS)
+        if not isinstance(status, int) or not 200 <= status < 300 or len(body) > self._MAX_DEGRADATION_PROBE_BYTES:
+            return "", "http_error"
+        try:
+            decoded = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return "", "invalid_response"
+        if isinstance(decoded, Mapping) and isinstance(decoded.get("error"), Mapping) and not decoded.get("output"):
+            return "", "http_error"
+        text = self._probe_answer_text(decoded if isinstance(decoded, Mapping) else None)
+        if not text:
+            return "", "invalid_response"
+        return text, "ok"
+
+    def _degradation_probe(
+        self,
+        *,
+        plan: Mapping[str, Any],
+        api_base: str,
+        credential: str,
+        model_name: str,
+        surface_status: str,
+    ) -> dict[str, Any]:
+        """Run TraceOne once against this route and report the attribution."""
+
+        checked_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        planned_target = plan.get("target")
+        target = planned_target if isinstance(planned_target, str) and planned_target else None
+        engine = traceone.engine()
+        result: dict[str, Any] = {
+            "status": "skipped",
+            "target": target,
+            "label": None,
+            "cause": "",
+            "detail": "This model is not a route the degradation engine can attribute",
+            "checked_at": checked_at,
+            "engine": engine,
+            "numbers": 0,
+        }
+        if not plan.get("includes_degradation"):
+            return result
+        if surface_status != "ok":
+            # The route already failed its tiny Responses probe, so a longer
+            # fingerprint request cannot tell the user anything new. The failure
+            # keeps its own name: rejected, silent, or a definitive rejection.
+            result["status"] = (
+                "unreachable" if surface_status in {"refused", "timeout", "network_error"} else "error"
+            )
+            result["cause"] = surface_status
+            result["detail"] = (
+                f"The {self._DEGRADATION_SURFACE} surface did not answer the availability probe ({surface_status})"
+            )
+            return result
+        result["detail"] = "The degradation engine is not staged in this build"
+        result["status"] = "unavailable"
+        if not engine.get("available"):
+            return result
+        try:
+            prompt = traceone.prompt_text()
+        except traceone.TraceOneUnavailable as exc:
+            result["detail"] = safe_exception_message(exc)
+            return result
+        answer, status = self._degradation_request(
+            api_base=api_base,
+            credential=credential,
+            model_name=model_name,
+            prompt=prompt,
+        )
+        if not answer:
+            result["detail"] = f"The {self._DEGRADATION_SURFACE} deep-test request failed ({status})"
+            result["status"] = "unreachable" if status in {"refused", "timeout", "network_error"} else "error"
+            result["cause"] = status
+            return result
+        try:
+            decision = traceone.identify(answer)
+        except (traceone.TraceOneUnavailable, RuntimeError, ValueError) as exc:
+            result["detail"] = safe_exception_message(exc)
+            result["status"] = "error"
+            return result
+        label = traceone.normalize_route_name(decision.get("label")) or ""
+        numbers = int(decision.get("numbers") or 0)
+        result["label"] = label or None
+        result["numbers"] = numbers
+        if decision.get("status") != "identified" or not label:
+            result["status"] = "unknown"
+            result["detail"] = "The answer could not be attributed to any known route"
+            return result
+        if label == target:
+            result["status"] = "matched"
+            result["detail"] = f"Fingerprint matches the requested route {target}"
+        else:
+            result["status"] = "mismatch"
+            result["detail"] = f"Fingerprint matches {label} instead of the requested route {target}"
+        return result
 
     def _probe_model(
         self,
@@ -1267,22 +1593,63 @@ class ProvidersModelsDomain:
             for surface in priority
             if surface_results.get(surface, {}).get("available") is True
         ]
-        recommended = available_surfaces[0] if available_surfaces else None
+        statuses = {
+            surface: str(surface_results.get(surface, {}).get("status", "unavailable"))
+            for surface in priority
+        }
+        # A transport failure on the route's own preferred surface is not a
+        # verdict about that surface: relay edges reset diagnostic connections
+        # while the route keeps serving traffic. Recommending another protocol
+        # then would silently re-point a working route, so the recommendation
+        # waits until the preferred surface answered.
+        preferred_surface = priority[0] if priority else ""
+        recommendation_blocked = statuses.get(preferred_surface) == "network_error"
+        recommended = None if recommendation_blocked else (available_surfaces[0] if available_surfaces else None)
         unavailable_surfaces = [surface for surface in priority if surface not in available_surfaces]
+        # A transport failure is not a verdict about the route. Relay edges drop
+        # or stall diagnostic connections while the same route serves ordinary
+        # traffic, so the pane must say "could not reach" instead of claiming the
+        # model is unavailable.
+        transport_statuses = {
+            statuses[surface]
+            for surface in priority
+            if statuses.get(surface) in {"refused", "timeout", "network_error"}
+        }
+        unreachable_surfaces = [surface for surface in priority if surface in {
+            candidate for candidate in priority
+            if statuses.get(candidate) in {"refused", "timeout", "network_error"}
+        }]
+        transport = (
+            "refused"
+            if transport_statuses == {"refused"}
+            else "timeout"
+            if transport_statuses == {"timeout"}
+            else "mixed"
+            if transport_statuses
+            else ""
+        )
         summary = {
             "available_surfaces": available_surfaces,
             "unavailable_surfaces": unavailable_surfaces,
-            "statuses": {
-                surface: str(surface_results.get(surface, {}).get("status", "unavailable"))
-                for surface in priority
-            },
+            "unreachable_surfaces": unreachable_surfaces,
+            "transport": transport,
+            "statuses": statuses,
         }
         checked_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        degradation = self._degradation_probe(
+            plan=self._deep_probe_plan(model),
+            api_base=api_base,
+            credential=credential,
+            model_name=model_name,
+            surface_status=str(surface_results.get(self._DEGRADATION_SURFACE, {}).get("status", "unavailable")),
+        )
         probe_overlay = {
             "available": recommended is not None,
+            "unreachable": bool(unreachable_surfaces) and len(unreachable_surfaces) == len(priority),
             "recommended_surface": recommended,
             "summary": summary,
             "checked_at": checked_at,
+            "degradation": copy.deepcopy(degradation),
             "surfaces": {
                 surface: {
                     "available": result.get("available") is True,
@@ -1295,6 +1662,9 @@ class ProvidersModelsDomain:
         return {
             "ok": recommended is not None,
             "available": recommended is not None,
+            # Every surface failed at the transport layer: the probe has no
+            # verdict, which the UI reports separately from "unavailable".
+            "unreachable": bool(unreachable_surfaces) and len(unreachable_surfaces) == len(priority),
             "protocols": [
                 surface
                 for surface in surfaces
@@ -1302,7 +1672,14 @@ class ProvidersModelsDomain:
             ],
             "recommended_surface": recommended,
             "summary": summary,
-            "detail": "Model probe completed" if recommended is not None else "No usable model API surface was found",
+            "degradation": copy.deepcopy(degradation),
+            "detail": "Model probe completed"
+            if recommended is not None
+            else "The configured surface could not be reached; no protocol change is recommended"
+            if recommendation_blocked
+            else "The model endpoint could not be reached"
+            if unreachable_surfaces and len(unreachable_surfaces) == len(priority)
+            else "No usable model API surface was found",
             "provider_id": provider_id,
             "model_id": model_id,
             "surfaces": [

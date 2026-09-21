@@ -54,7 +54,19 @@ NODE_ARCHIVE_BASE_URL = os.environ.get(
     "https://nodejs.org/dist",
 )
 DEFAULT_TIMEOUT_SECONDS = 120
+# Build-tool metadata lookup identity: this script runs on a maintainer's
+# machine, not in the shipped app.
 USER_AGENT = "Young-Router/pi-web-access-build"
+# The shipped app never presents a User-Agent of its own, so the staged
+# package's self-naming UA literals are rewritten to the same browser identity
+# Core uses (`young_router/browser_identity.py`).
+SELF_USER_AGENT_VALUE_RE = re.compile(
+    r'''(?i)(["']user-agent["']\s*:\s*)(["'])([^"']*(?:pi-web-access|young[ _-]?router)[^"']*)\2'''
+)
+SELF_USER_AGENT_ASSIGNMENT_RE = re.compile(
+    r'''(?i)(\bUSER_AGENT\s*=\s*)(["'])([^"']*(?:pi-web-access|young[ _-]?router)[^"']*)\2'''
+)
+STAGED_USER_AGENT_SUFFIXES = (".js", ".mjs", ".cjs", ".ts")
 PACKAGE_VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
 NODE_VERSION_PATTERN = re.compile(r"^v22\.[0-9]+\.[0-9]+$")
 FALLBACK_PI_PEERS = (
@@ -193,6 +205,55 @@ def _copy_tree(source: Path, destination: Path) -> None:
     shutil.copytree(source, destination, symlinks=True)
 
 
+def _browser_user_agent() -> str:
+    """Return the shared browser identity of the host this package is built for."""
+
+    root = Path(__file__).resolve().parent.parent
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    from young_router.browser_identity import browser_user_agent
+
+    return browser_user_agent()
+
+
+def _normalize_staged_user_agents(package_root: Path) -> int:
+    """Rewrite the package's self-naming User-Agent literals.
+
+    The shipped app must never expose a User-Agent of its own: its web search
+    and fetch paths present the shared browser identity instead.  The staged
+    package is patched here, in the one place that owns its adaptation, and the
+    rewrite is verified — an upstream release that renames or drops these
+    literals fails the build instead of silently shipping a self-identifying
+    client.
+    """
+
+    user_agent = _browser_user_agent()
+    rewritten = 0
+    for path in sorted(package_root.rglob("*")):
+        if path.suffix not in STAGED_USER_AGENT_SUFFIXES or not path.is_file():
+            continue
+        if "node_modules" in path.parts:
+            continue
+        text = path.read_text(encoding="utf-8")
+        updated, value_hits = SELF_USER_AGENT_VALUE_RE.subn(
+            lambda match: f"{match.group(1)}{match.group(2)}{user_agent}{match.group(2)}",
+            text,
+        )
+        updated, assignment_hits = SELF_USER_AGENT_ASSIGNMENT_RE.subn(
+            lambda match: f"{match.group(1)}{match.group(2)}{user_agent}{match.group(2)}",
+            updated,
+        )
+        if value_hits or assignment_hits:
+            path.write_text(updated, encoding="utf-8")
+            rewritten += value_hits + assignment_hits
+    if rewritten < 3:
+        raise UpdateError(
+            "pi-web-access no longer exposes the expected self-naming User-Agent literals; "
+            "re-check the package's request headers and update the staging adaptation"
+        )
+    return rewritten
+
+
 def _flatten_package(npm_root: Path, destination: Path) -> str:
     package_root = npm_root / "node_modules" / PACKAGE_NAME
     dependencies_root = npm_root / "node_modules"
@@ -223,6 +284,8 @@ def _flatten_package(npm_root: Path, destination: Path) -> str:
     version = version_data.get("version") if isinstance(version_data, dict) else None
     if not isinstance(version, str) or not PACKAGE_VERSION_PATTERN.fullmatch(version):
         raise UpdateError("Installed pi-web-access package has an invalid version")
+
+    _normalize_staged_user_agents(package_payload)
 
     if destination.exists():
         if not destination.is_dir():

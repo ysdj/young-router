@@ -29,6 +29,7 @@ import urllib.request
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from ..browser_identity import browser_request_headers
 from .persistence import (
     PersistenceError,
     atomic_write_bytes,
@@ -46,7 +47,7 @@ MAX_USAGE_ROWS = 100
 SERVICE_STATES = frozenset({"starting", "running", "unhealthy", "stopped", "unknown"})
 OWNER_RECORD_VERSION = 2
 # Local proxy port used when no valid preference is configured.
-DEFAULT_LOCAL_PORT = 12389
+DEFAULT_LOCAL_PORT = 12390
 OWNER_TOKEN_ENV = "YOUNG_ROUTER_SERVICE_OWNER_TOKEN"
 CORE_PID_ENV = "YOUNG_ROUTER_CORE_PID"
 OWNER_TOKEN_BYTES = 32
@@ -699,7 +700,7 @@ class CoreServiceController:
         target_port = self._effective_port() if port is None else port
         request = urllib.request.Request(
             f"http://127.0.0.1:{target_port}/health/liveliness",
-            headers={"Accept": "application/json", "User-Agent": "Young-Router-Core/1"},
+            headers=browser_request_headers(),
             method="GET",
         )
         try:
@@ -725,7 +726,7 @@ class CoreServiceController:
         target_port = self._effective_port() if port is None else port
         request = urllib.request.Request(
             f"http://127.0.0.1:{target_port}/health/liveliness",
-            headers={"Accept": "application/json", "User-Agent": "Young-Router-Core/1"},
+            headers=browser_request_headers(),
             method="GET",
         )
         try:

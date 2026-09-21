@@ -50,7 +50,7 @@ export function isSettingsPaneRoute(route: AppRoute | undefined): boolean {
 
 /** Every non-home, non-sheet route renders inside the settings shell. */
 export function isSettingsShellRoute(route: AppRoute | undefined): boolean {
-  return route !== undefined && route !== "home" && route !== "provider-wizard";
+  return route !== undefined && route !== "home" && route !== "provider-wizard" && route !== "file-editor";
 }
 
 export function routeMenuActions(

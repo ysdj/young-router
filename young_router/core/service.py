@@ -339,6 +339,24 @@ def _safe_issue_path(value: object) -> str:
     return text if re.fullmatch(r"[A-Za-z0-9_.\[\]-]+", text) else "configuration"
 
 
+def _display_path(path: str) -> str:
+    """Spell one user file path with the home directory written as ``~``.
+
+    The external-settings pane shows where each registered client file lives;
+    the account's own home directory is noise there and should not be spelled
+    out.  Only the spelling is shortened: the row keeps its real ``path`` for
+    the operations that must address the file itself.
+    """
+
+    home = str(Path.home())
+    if path == home:
+        return "~"
+    prefix = home + os.sep
+    if not home or not path.startswith(prefix):
+        return path
+    return "~/" + path[len(prefix):].replace(os.sep, "/")
+
+
 def _secret_presence(value: object) -> bool:
     if value in (None, "", False, [], {}, REDACTED):
         return False if value != REDACTED else True
@@ -747,6 +765,7 @@ class CoreStore:
 
         from .domains._shared import _default_runtime_settings_path
         from .domains.claude import ClaudeSettingsDomain
+        from .domains.clients import ClientSettingsDomain
         from .domains.codex import CodexSettingsDomain
         from .domains.language import LanguageSettingsDomain
         from .domains.logs import LogsDomain
@@ -800,6 +819,11 @@ class CoreStore:
             adapters.append(claude_factory())
         except Exception:
             adapters.append(RecoverableDomain("claude", claude_factory))
+        clients_factory: Callable[[], DomainAdapter] = lambda: ClientSettingsDomain()
+        try:
+            adapters.append(clients_factory())
+        except Exception:
+            adapters.append(RecoverableDomain("clients", clients_factory))
         adapters.append(
             LogsDomain(
                 runtime_root,
@@ -1211,19 +1235,63 @@ class CoreStore:
         return identity
 
     def _editor_adapter(self, domain: str, document: str) -> tuple[str, DomainAdapter]:
+        if not isinstance(document, str) or not document:
+            raise CoreError("invalid_editor", "The requested editor is unavailable")
         name = _canonical_domain(domain)
-        if name not in {"codex", "claude"}:
-            raise CoreError("invalid_editor", "The requested editor is unavailable")
-        if document not in {"config", "auth", "settings", "desktop", "developer"}:
-            raise CoreError("invalid_editor", "The requested editor is unavailable")
-        if (name == "codex" and document not in {"config", "auth"}) or (
-            name == "claude" and document not in {"settings", "desktop", "developer"}
-        ):
-            raise CoreError("invalid_editor", "The requested editor is unavailable")
         adapter = self._domains.get(name)
+        if name == "codex":
+            if document not in {"config", "auth"}:
+                raise CoreError("invalid_editor", "The requested editor is unavailable")
+        elif name == "claude":
+            if document not in {"settings", "desktop", "developer"}:
+                raise CoreError("invalid_editor", "The requested editor is unavailable")
+        elif name == "clients":
+            # Every external-client file is a registered document; the UI can
+            # never name a path, only one of these Core-owned ids.
+            documents = getattr(adapter, "documents", ())
+            if document not in documents:
+                raise CoreError("invalid_editor", "The requested editor is unavailable")
+        else:
+            raise CoreError("invalid_editor", "The requested editor is unavailable")
         if adapter is None:
             raise DomainNotFound(name)
         return name, adapter
+
+    def client_files(self) -> dict[str, Any]:
+        """List the external client configuration files the UI may edit.
+
+        This read-only operation is the single Core surface that returns a
+        local path, and it only ever names the registered files owned by the
+        Codex, Claude, and external-client adapters.  File contents never
+        travel here; they stay behind the authenticated editor lease.  Every
+        row carries the file's real ``path`` for the pane's own actions next to
+        the home-shortened ``display_path`` it shows.
+        """
+
+        with self._lock:
+            files: list[dict[str, Any]] = []
+            for name in ("codex", "claude", "clients"):
+                adapter = self._domains.get(name)
+                provider = getattr(adapter, "client_files", None)
+                if not callable(provider):
+                    continue
+                try:
+                    rows = provider()
+                except Exception:
+                    # One unavailable client must not hide the files of the
+                    # others; the pane simply lists what Core can manage.
+                    continue
+                if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes, bytearray)):
+                    continue
+                for row in rows:
+                    if not isinstance(row, Mapping):
+                        continue
+                    entry = dict(row)
+                    path = entry.get("path")
+                    if isinstance(path, str) and path:
+                        entry["display_path"] = _display_path(path)
+                    files.append(entry)
+            return {"revision": self._revision, "files": files}
 
     def editor_document(self, domain: str, document: str) -> dict[str, Any]:
         """Read one versioned editor document as a single Core operation.
@@ -1258,6 +1326,9 @@ class CoreStore:
                 raw = exporter(include_sensitive=True)
                 key = "config_text" if document == "config" else "auth_text"
                 text = raw.get(key) if isinstance(raw, Mapping) else None
+            elif name == "clients":
+                reader = getattr(adapter, "raw_text", None)
+                text = reader(document) if callable(reader) else None
             else:
                 raw_text = getattr(adapter, "raw_text", None)
                 text = raw_text(include_sensitive=True, document=document) if callable(raw_text) else None
@@ -1286,6 +1357,9 @@ class CoreStore:
                     raise ValueError
                 key = "config_text" if document == "config" else "auth_text"
                 text = state.get(key)
+            elif name == "clients":
+                reader = getattr(_adapter, "baseline_text", None)
+                text = reader(document) if callable(reader) else None
             else:
                 if not isinstance(state, Mapping):
                     raise ValueError
@@ -1349,7 +1423,7 @@ class CoreStore:
                 revision = self._revision
             self._check_revision(revision)
             payload: dict[str, Any]
-            if name == "codex":
+            if name == "codex" or name == "clients":
                 payload = {"document": document, "text": text}
             else:
                 payload = {"document": document, "raw_json": text}

@@ -35,6 +35,7 @@ from . import image_inputs as _image_inputs_module
 from . import request_context as _request_context_module
 from . import responses_request as _responses_request_module
 from . import trace as _trace_module
+from .browser_identity import browser_request_headers
 
 _DSH_VISION_ROUTER_CONFIG_ENV = "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON"
 _DSH_VISION_ROUTER_ENABLED_ENV = "YOUNG_ROUTER_DSH_VISION_ROUTER_ENABLED"
@@ -636,7 +637,7 @@ def _chat_completion_payload(reference: str, provider: Optional[dict[str, Any]] 
 
 
 def _request_bytes(url: str, *, timeout: float) -> bytes:
-    request = urllib.request.Request(url, headers={"User-Agent": "Young-Router-dsh-vision-router/1.7.6"})
+    request = urllib.request.Request(url, headers=browser_request_headers())
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return response.read()
 
@@ -742,7 +743,8 @@ def _post_chat_completion(payload: dict[str, Any]) -> str:
     provider = _ACTIVE_PROVIDER.get() or {}
     url = f"{str(provider.get('base_url') or _DEFAULT_HTTP_BASE_URL).rstrip('/')}/chat/completions"
     body = json.dumps(payload).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
+    headers = browser_request_headers()
+    headers["Content-Type"] = "application/json"
     api_key = _provider_api_key(provider)
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -885,10 +887,9 @@ def _post_anthropic_completion(payload: dict[str, Any]) -> str:
     if payload.get("top_p") is not None:
         request_body["top_p"] = payload["top_p"]
     body = json.dumps(request_body).encode("utf-8")
-    headers = {
-        "Content-Type": "application/json",
-        "anthropic-version": "2023-06-01",
-    }
+    headers = browser_request_headers()
+    headers["Content-Type"] = "application/json"
+    headers["anthropic-version"] = "2023-06-01"
     api_key = _provider_api_key(provider)
     if api_key:
         headers["x-api-key"] = api_key

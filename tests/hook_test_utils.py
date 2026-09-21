@@ -36,7 +36,6 @@ HOOK_MODULE_NAMES = (
     "responses_execution",
     "patches",
     "tools",
-    "computer_facade",
     "image_generation",
     "dsh_vision_router",
     "streaming",

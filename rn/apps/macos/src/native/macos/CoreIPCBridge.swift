@@ -107,7 +107,12 @@ import Foundation
                 guard !self.isStopping() else { throw BridgeError.unavailable }
                 guard let data = request.data(using: .utf8),
                       let metadata = self.requestMetadata(data) else { throw BridgeError.invalidResponse }
-                let (body, _, requestGeneration, restarted) = try self.performCoreRequest(route: "", method: "POST", body: data)
+                let (body, _, requestGeneration, restarted) = try self.performCoreRequest(
+                    route: "",
+                    method: "POST",
+                    body: data,
+                    timeoutInterval: Self.responseTimeoutInterval(for: metadata.method)
+                )
                 guard self.isValidResponseEnvelope(body, requestID: metadata.requestID),
                       let text = String(data: body, encoding: .utf8) else {
                     _ = self.resetCore(expectedGeneration: requestGeneration)
@@ -906,6 +911,13 @@ import Foundation
                 Thread.sleep(forTimeInterval: 1)
             }
         }
+    }
+
+    /// A model probe waits for the deployment's own first-event budget and then
+    /// for a complete fingerprint answer, so it outlives the transport default.
+    /// Every other method keeps the short bound that keeps the UI responsive.
+    private static func responseTimeoutInterval(for method: String) -> TimeInterval {
+        method == "probe" ? 900 : 30
     }
 
     private func requestMetadata(_ data: Data) -> (requestID: String, method: String)? {

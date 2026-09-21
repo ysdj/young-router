@@ -166,6 +166,7 @@ class WinUI3NativeLeaf : public std::enable_shared_from_this<WinUI3NativeLeaf> {
   };
   VersionInfoResult VersionInfo() const;
   void OpenExternalURL(std::wstring_view url);
+  void RevealFile(std::wstring_view path);
   void Quit();
 
  private:

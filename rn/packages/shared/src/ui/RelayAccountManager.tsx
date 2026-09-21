@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Platform, PlatformColor, StyleSheet, Text, View, type StyleProp, type ViewStyle } from "react-native";
 import type { CoreSnapshot, NativeLeafAdapter } from "../types";
 import { NativeButton, NativeCheckbox, NativePicker, NativeSecureTextInput, NativeTable, NativeTextField } from "./NativeControls";
+import { usePendingAction } from "./pendingAction";
 import { normalizeRelayOrigin } from "./relayOrigin";
 import { UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
 
@@ -92,8 +93,8 @@ export type StationDraft = Partial<Pick<RelayStation, "name" | "origin" | "type"
 type PolicyOption<T extends string> = { value: T; label: string; hint: string };
 const INLINE_MODEL_LIMIT = 5;
 /**
- * How many model names the 分组管理 sheet lays out for one key, and how much
- * text those names may take.  The sheet shows the whole list, so these are
+ * How many model names the 分组管理 window lays out for one key, and how much
+ * text those names may take.  The window shows the whole list, so these are
  * sanity bounds for a station that reports hundreds of models rather than a
  * display truncation; a list that hits one states the rest with an ellipsis.
  */
@@ -139,7 +140,7 @@ function groupRateLabel(group: RelayGroup | undefined): string {
 
 /**
  * The 模型列表: every model the station reports for one key, in the station's
- * own order.  The sheet lays the names out itself, so the list travels as names
+ * own order.  The window lays the names out itself, so the list travels as names
  * rather than a pre-joined sentence.
  */
 function resourceModelList(resource: RelayResource): string[] {
@@ -481,13 +482,15 @@ export function ApiKeyCreateDialog({ visible, groups, disabled, onClose, onCreat
   </RelayDialogLayer>;
 }
 
-export function DependencyPolicyDialog<T extends string>({ visible, title, message, options, value, disabled, confirmLabel, onValueChange, onClose, onConfirm, translate }: {
+export function DependencyPolicyDialog<T extends string>({ visible, title, message, options, value, disabled, busy = false, confirmLabel, onValueChange, onClose, onConfirm, translate }: {
   visible: boolean;
   title: string;
   message: string;
   options: Array<PolicyOption<T>>;
   value: T;
   disabled: boolean;
+  /** The confirm action is running: it reports progress in place instead of graying out. */
+  busy?: boolean;
   confirmLabel: string;
   onValueChange: (value: T) => void;
   onClose: () => void;
@@ -504,7 +507,7 @@ export function DependencyPolicyDialog<T extends string>({ visible, title, messa
           <View style={styles.decisionField}><Text style={styles.decisionLabel}>{translate("relay.dependencyPolicy")}</Text><NativePicker labels={options.map((option) => option.label)} selectedValue={selectedOption.label} disabled={disabled} onChange={({ nativeEvent }) => { const option = options[nativeEvent.index]; if (option) onValueChange(option.value); }} style={styles.decisionControl} /></View>
           <Text style={styles.decisionHint}>{selectedOption.hint}</Text>
         </View>
-        <View style={styles.dialogFooter}><View style={styles.decisionSpacer} /><View style={styles.dialogActions}><NativeButton title={translate("status.cancel")} compact disabled={disabled} onPress={onClose} /><NativeButton title={confirmLabel} primary destructive={confirmLabel === translate("common.delete")} disabled={disabled} onPress={onConfirm} /></View></View>
+        <View style={styles.dialogFooter}><View style={styles.decisionSpacer} /><View style={styles.dialogActions}><NativeButton title={translate("status.cancel")} compact disabled={disabled} onPress={onClose} /><NativeButton title={confirmLabel} primary destructive={confirmLabel === translate("common.delete")} busy={busy} disabled={disabled && !busy} onPress={onConfirm} /></View></View>
       </View>
     </View>
   </RelayDialogLayer>;
@@ -566,12 +569,16 @@ export function StationAccountsPanel({
   const [localSignedIn, setLocalSignedIn] = useState<Set<string>>(() => new Set());
   const [loginFailure, setLoginFailure] = useState<Set<string>>(() => new Set());
   const [formBusy, setFormBusy] = useState(false);
+  // Which account action is running: the button that started one keeps its own
+  // inline spinner instead of graying out.
+  const [pendingAction, runPendingAction] = usePendingAction<"cleanup" | "add" | "login" | "remove">();
   const [removal, setRemoval] = useState<{ account: RelayAccount }>();
   const [removalPolicy, setRemovalPolicy] = useState<LocalDependencyPolicy>("detach");
   // What a sign-in may save is asked by the native login flow after the
   // webview login succeeds; adding an account goes straight to sign-in.
   const beginAddLogin = async (): Promise<void> => {
-    await startPendingLogin();
+    if (pendingAction === "add") return;
+    await runPendingAction("add", startPendingLogin);
   };
   const [internalStationDraft, setInternalStationDraft] = useState<StationDraft>({});
   const stationDraft = stationDraftProp ?? internalStationDraft;
@@ -746,7 +753,9 @@ export function StationAccountsPanel({
   };
   // Restore saved sessions quietly once per account per panel mount. This
   // mirrors the old workspace behaviour: selecting a provider must surface
-  // fresh login state and resources without a manual refresh click.
+  // fresh login state and resources without a manual refresh click.  A restore
+  // that fails never opens the login page on its own: the account reads 未登录
+  // and keeps its cached keys until the user presses 去登录 (or +).
   const attemptedAccounts = useRef(new Set<string>());
   useEffect(() => {
     if (busy) return;
@@ -754,19 +763,17 @@ export function StationAccountsPanel({
       if (attemptedAccounts.current.has(account.id) || isAccountLoading(account.id)) continue;
       attemptedAccounts.current.add(account.id);
       void (async () => {
-        if (await restoreSavedSession(account)) {
-          // Opening the station is the probe: refresh resources so the
-          // provided keys reflect the live account state.
-          await refreshAccountResources(account, true);
-          return;
-        }
-        const canAutoLogin = account.rememberPassword && account.passwordSaved && Boolean(account.username.trim());
-        if (canAutoLogin) await loginAccount(account);
+        // Opening the station is the probe: restore the login, then refresh the
+        // key list.  The refresh runs even when the session check failed — a
+        // locally known key is local data, and Core still reads the station
+        // through an explicitly remembered session when it has one.
+        await restoreSavedSession(account);
+        await refreshAccountResources(account, true);
       })();
     }
   }, [busy, stationAccounts]);
   // The add flow never reserves an account slot. The webview login runs
-  // first (modal sheet on the provider window); Core creates the account
+  // first (its own modal window over the workspace); Core creates the account
   // shell only when sign-in actually succeeds (pending_account), so a
   // cancelled login leaves nothing behind. Whether the password is kept is
   // decided by the post-login prompt inside the native flow. The relay
@@ -803,35 +810,41 @@ export function StationAccountsPanel({
       setFormBusy(false);
     }
   };
+  // 去登录 opens the login page at once: the silent session/password check
+  // already ran when the account appeared (and its network timeout is exactly
+  // the wait the user must not sit through), while the native login window
+  // restores the remembered browser session itself and closes again when that
+  // session still works.
   const loginSelected = async (): Promise<void> => {
     if (!selected) return;
     if (effectiveLoginStatus(selected) === "signed_in") return;
-    if (await restoreSavedSession(selected)) {
-      await refreshAccountResources(selected);
-      return;
-    }
-    await loginAccount(selected);
+    if (pendingAction === "login") return;
+    const account = selected;
+    await runPendingAction("login", () => loginAccount(account));
   };
   const removeSelected = async (): Promise<void> => {
     if (!removal) return;
-    setFormBusy(true);
-    setFeedback(undefined);
-    try {
-      await commit("account.delete", { id: removal.account.id, dependency_policy: removalPolicy });
-      setSelectedID(undefined);
+    if (pendingAction === "remove") return;
+    await runPendingAction("remove", async () => {
+      setFormBusy(true);
+      setFeedback(undefined);
       try {
-        await native.clearRelayCredentials(removal.account.id);
-        await commit("credential_cleanup_confirm", { id: removal.account.id, kind: "credentials" });
+        await commit("account.delete", { id: removal.account.id, dependency_policy: removalPolicy });
+        setSelectedID(undefined);
+        try {
+          await native.clearRelayCredentials(removal.account.id);
+          await commit("credential_cleanup_confirm", { id: removal.account.id, kind: "credentials" });
+        } catch {
+          // Core retains a secret-free cleanup tombstone for retry.
+        }
+        await refreshAccounts();
+        setRemoval(undefined);
       } catch {
-        // Core retains a secret-free cleanup tombstone for retry.
+        publish(translate("relay.operationFailed"));
+      } finally {
+        setFormBusy(false);
       }
-      await refreshAccounts();
-      setRemoval(undefined);
-    } catch {
-      publish(translate("relay.operationFailed"));
-    } finally {
-      setFormBusy(false);
-    }
+    });
   };
   const stageStationUpdate = async (overrides: StationDraft = {}): Promise<void> => {
     const draft = stationDraftRef.current;
@@ -855,34 +868,40 @@ export function StationAccountsPanel({
       setStationBusy(false);
     }
   };
-  // 分组管理 is the provider window's native subordinate sheet: the
+  // 分组管理 is a native subordinate window of the workspace: the
   // pre-refactor master-detail editor with the key list (＋ / －), the selected
   // key's detail, and Close / Apply at the bottom.  Apply returns the staged
   // edits; Close discards them.  Core rejects manual key writes while
   // automatic grouping owns the layout, so the switch is staged around them.
-  const openGroupManager = async (): Promise<void> => {
-    const account = selected;
-    if (!account || !native.showGroupManager) return;
-    // 自动分组 owns the key layout, so the sheet opens on the aligned draft:
-    // refresh the station facts, let Core stage its one-key-per-group layout,
-    // then read the account back so the list never shows keys the switch is
-    // already replacing.  Without a group list there is no 1:1 layout to build,
-    // so the keys stay as the station last reported them.
-    let current = account;
-    if (account.autoGrouping && account.groups.length > 0 && apiKeyActions?.alignAutoGrouping) {
-      setFormBusy(true);
-      try {
-        if (await refreshResources(account.id) === "ready") {
-          await apiKeyActions.alignAutoGrouping(account.id);
-          const snapshot = await refreshAccounts();
-          current = (snapshot ? accountsFromSnapshot(snapshot) : []).find((entry) => entry.id === account.id) ?? account;
-        }
-      } catch {
-        // A station that cannot be refreshed keeps the keys it last reported.
-      } finally {
-        setFormBusy(false);
-      }
+  //
+  // 自动分组 owns the key layout, so the list the window shows comes from the
+  // aligned draft: refresh the station facts, let Core stage its one-key-per-
+  // group layout, then read the account back so the list never shows keys the
+  // switch is already replacing.  Without a group list there is no 1:1 layout
+  // to build, so the keys stay as the station last reported them.
+  const alignAutoGroupingAction = apiKeyActions?.alignAutoGrouping;
+  const groupManagerNeedsAlignment = (current: RelayAccount): boolean =>
+    Boolean(alignAutoGroupingAction) && current.autoGrouping && current.groups.length > 0;
+  // The account facts the window's rows are built from: the aligned draft while
+  // 自动分组 owns the layout, otherwise the account as this pane already holds
+  // it.  A station that cannot be refreshed keeps the keys it last reported.
+  const loadGroupManagerAccount = async (current: RelayAccount): Promise<RelayAccount> => {
+    if (!alignAutoGroupingAction || !groupManagerNeedsAlignment(current)) return current;
+    try {
+      if (await refreshResources(current.id) !== "ready") return current;
+      await alignAutoGroupingAction(current.id);
+      const snapshot = await refreshAccounts();
+      return (snapshot ? accountsFromSnapshot(snapshot) : []).find((entry) => entry.id === current.id) ?? current;
+    } catch {
+      // A station that cannot be refreshed keeps the keys it last reported.
+      return current;
     }
+  };
+  // The window's content for one account: the rows, the groups they can be
+  // assigned to, and the caption the window shows above them.  The same content
+  // serves the opening request and the later update, so a load can never change
+  // the shape of what the window holds.
+  const groupManagerSnapshot = (current: RelayAccount) => {
     // The picker keeps the rate so a group is identifiable while it is chosen;
     // the list column shows the name alone because 倍率 has its own column.
     const groups = current.groups
@@ -907,10 +926,8 @@ export function StationAccountsPanel({
     const keyResources = current.autoGrouping && current.groups.length > 0
       ? current.resources.filter((resource) => !resource.pendingDelete && resourceGroup(resource, current.groups) !== undefined)
       : current.resources;
-    const result = await native.showGroupManager({
-      title: translate("relay.groupManager"),
+    return {
       accountLabel: accountDisplayName(current, translate),
-      accountId: current.id,
       groups,
       keys: keyResources.map((resource) => ({
         id: resource.id,
@@ -918,40 +935,84 @@ export function StationAccountsPanel({
         groupID: resource.groupID,
         groupLabel: resourceGroupName(resource, current.groups, translate),
         multiplier: groupRateLabel(resourceGroup(resource, current.groups)),
-        // Core reports only whether a credential exists; the sheet reads the
+        // Core reports only whether a credential exists; the window reads the
         // real value through the native capability and shows it in place.
         hint: resource.keyHint,
         models: resourceModelList(resource),
         enabled: resource.enabled,
       })),
-      labels: {
-        listLabel: translate("providers.keys"),
-        addLabel: translate("common.add"),
-        removeLabel: translate("common.delete"),
-        nameLabel: translate("providers.keyName"),
-        groupLabel: translate("relay.apiKeyGroup"),
-        multiplierLabel: translate("relay.apiKeyMultiplier"),
-        valueLabel: translate("providers.keyValue"),
-        copyActionLabel: translate("common.copy"),
-        copyLabel: translate("relay.apiKeyCopy"),
-        copiedLabel: translate("relay.apiKeyCopied"),
-        failedLabel: translate("relay.operationFailed"),
-        modelsLabel: translate("relay.apiKeyModelList"),
-        emptyLabel: translate("common.none"),
-        savedLabel: translate("relay.resourceKeyConfigured"),
-        enabledLabel: translate("common.enable"),
-        newKeyName: translate("relay.apiKeyNewName"),
-        autoGroupingLabel: translate("relay.apiKeyAutoGrouping"),
-        ungroupedLabel: translate("relay.apiKeyUngrouped"),
-        closeLabel: translate("status.close"),
-        applyLabel: translate("status.saveAndClose"),
-        discardTitle: translate("relay.groupManagerDiscardTitle"),
-        discardBody: translate("relay.groupManagerDiscardBody"),
-        discardConfirm: translate("common.discard"),
-      },
       autoGrouping: current.autoGrouping,
-    });
+    };
+  };
+  // Every label the window's native controls read, resolved once per request.
+  const groupManagerLabels = () => ({
+    listLabel: translate("providers.keys"),
+    addLabel: translate("common.add"),
+    removeLabel: translate("common.delete"),
+    nameLabel: translate("providers.keyName"),
+    groupLabel: translate("relay.apiKeyGroup"),
+    multiplierLabel: translate("relay.apiKeyMultiplier"),
+    valueLabel: translate("providers.keyValue"),
+    copyActionLabel: translate("common.copy"),
+    copyLabel: translate("relay.apiKeyCopy"),
+    copiedLabel: translate("relay.apiKeyCopied"),
+    failedLabel: translate("relay.operationFailed"),
+    modelsLabel: translate("relay.apiKeyModelList"),
+    emptyLabel: translate("common.none"),
+    savedLabel: translate("relay.resourceKeyConfigured"),
+    enabledLabel: translate("common.enable"),
+    newKeyName: translate("relay.apiKeyNewName"),
+    autoGroupingLabel: translate("relay.apiKeyAutoGrouping"),
+    ungroupedLabel: translate("relay.apiKeyUngrouped"),
+    closeLabel: translate("status.close"),
+    applyLabel: translate("status.saveAndClose"),
+    discardTitle: translate("relay.groupManagerDiscardTitle"),
+    discardBody: translate("relay.groupManagerDiscardBody"),
+    discardConfirm: translate("common.discard"),
+    // The window's key list header carries the load: the wheel beside 密钥 turns
+    // while the station round trip is in flight, and these words ride it as its
+    // tooltip, so the wait is stated on the rows it is about to replace.
+    loadingLabel: translate("relay.groupManagerLoading"),
+  });
+  // The window's opening request: the content above plus the chrome only a
+  // request carries — the title, the account that owns the keys, and every
+  // label the native controls read.
+  const groupManagerRequest = (current: RelayAccount) => ({
+    title: translate("relay.groupManager"),
+    accountId: current.id,
+    labels: groupManagerLabels(),
+    ...groupManagerSnapshot(current),
+  });
+  const openGroupManager = async (): Promise<void> => {
+    const account = selected;
+    if (!account || !native.showGroupManager) return;
+    // The window appears first and loads second: 自动分组's aligned draft costs a
+    // station round trip, and the window must never stay closed for it.  The
+    // window opens on the account facts this pane already holds, keeps its rows
+    // read-only while the load is in flight, and takes the aligned draft
+    // through the native update when it lands.  A host without that update
+    // opens the window on the loaded facts instead, as it always has — the
+    // window there can only ever show data that is already loaded.
+    const update = native.updateGroupManager;
+    const pending = update && groupManagerNeedsAlignment(account) ? loadGroupManagerAccount(account) : undefined;
+    let current = account;
+    if (!update) current = await loadGroupManagerAccount(account);
+    if (pending) {
+      void pending.then((aligned) => {
+        const push = native.updateGroupManager;
+        if (!push) return;
+        void push(groupManagerSnapshot(aligned)).catch(() => {
+          // A payload the host refuses would leave the window on its loading
+          // line forever, so the facts it opened on clear it instead.
+          void push(groupManagerSnapshot(account)).catch(() => undefined);
+        });
+      });
+    }
+    const result = await native.showGroupManager({ ...groupManagerRequest(current), loading: Boolean(pending) });
     if (!result) return;
+    // The staged edits are reconciled against the loaded account, which is the
+    // one the window's rows came from.
+    if (pending) current = await pending;
     setFormBusy(true);
     setFeedback(undefined);
     try {
@@ -996,27 +1057,30 @@ export function StationAccountsPanel({
   const removalKeys = removal?.account.resources.length ?? 0;
   const selectedRemovalModels = removal?.account.linkedModelCount ?? 0;
   const retryCleanup = async (cleanup: PendingCredentialCleanup): Promise<void> => {
-    setFormBusy(true);
-    try {
-      await native.clearRelayCredentials(cleanup.accountID);
-      await commit("credential_cleanup_confirm", { id: cleanup.accountID, kind: cleanup.kind });
-      await refreshAccounts();
-    } catch {
-      // Core keeps the tombstone for a later retry.
-    } finally {
-      setFormBusy(false);
-    }
+    if (pendingAction === "cleanup") return;
+    await runPendingAction("cleanup", async () => {
+      setFormBusy(true);
+      try {
+        await native.clearRelayCredentials(cleanup.accountID);
+        await commit("credential_cleanup_confirm", { id: cleanup.accountID, kind: cleanup.kind });
+        await refreshAccounts();
+      } catch {
+        // Core keeps the tombstone for a later retry.
+      } finally {
+        setFormBusy(false);
+      }
+    });
   };
   const stationCleanups = (cleanups ?? []).filter((cleanup) => station.accountIDs.includes(cleanup.accountID));
   return <View style={styles.accountsPanel}>
     {stationCleanups.map((cleanup) => <View key={`cleanup:${cleanup.accountID}`} style={styles.cleanupRow}>
       <Text numberOfLines={2} style={styles.cleanupText}>{translate("relay.credentialsCleanupPending", { label: cleanup.label })}</Text>
-      <NativeButton title={translate("relay.retryCleanup")} compact disabled={controlsBusy} onPress={() => { void retryCleanup(cleanup); }} style={styles.panelActionButton} />
+      <NativeButton title={translate("relay.retryCleanup")} compact busy={pendingAction === "cleanup"} disabled={controlsBusy && pendingAction !== "cleanup"} onPress={() => { void retryCleanup(cleanup); }} style={styles.panelActionButton} />
     </View>)}
     <View style={styles.panelHeader}>
       <Text style={styles.panelTitle}>{translate("providers.accounts")}</Text>
       <View style={styles.panelActions}>
-        {stationAccounts.length < 8 ? <NativeButton title="" symbol="plus" compact toolTip={translate("relay.addAccount")} accessibilityLabel={translate("relay.addAccount")} disabled={controlsBusy} onPress={() => { void beginAddLogin(); }} style={styles.panelActionButton} /> : null}
+        {stationAccounts.length < 8 ? <NativeButton title="" symbol="plus" compact toolTip={translate("relay.addAccount")} accessibilityLabel={translate("relay.addAccount")} busy={pendingAction === "add"} disabled={controlsBusy && pendingAction !== "add"} onPress={() => { void beginAddLogin(); }} style={styles.panelActionButton} /> : null}
         {selected ? <NativeButton title="" symbol="minus" compact destructive toolTip={translate("relay.removeLocal")} accessibilityLabel={translate("relay.removeLocal")} disabled={controlsBusy} onPress={() => { setRemovalPolicy("detach"); setRemoval({ account: selected }); }} style={styles.panelActionButton} /> : null}
       </View>
     </View>
@@ -1035,10 +1099,10 @@ export function StationAccountsPanel({
       <View style={styles.fieldRow}>
         <Text style={[styles.fieldLabel, { width: 44 }]}>{translate("relay.accountField")}</Text>
         <Text numberOfLines={1} style={styles.accountNameValue}>{accountDisplayName(selected, translate)}</Text>
-        {selectedLoginState === "signed_out" ? <NativeButton title={translate("relay.goLogin")} compact onPress={() => { void loginSelected(); }} /> : null}
+        {selectedLoginState === "signed_out" ? <NativeButton title={translate("relay.goLogin")} compact busy={pendingAction === "login"} disabled={controlsBusy && pendingAction !== "login"} onPress={() => { void loginSelected(); }} /> : null}
       </View>
       <View style={styles.accountActionsRow}>
-        <NativeButton title={translate("relay.groupManager")} compact disabled={controlsBusy || !native.showGroupManager || selectedLoginState !== "signed_in"} onPress={() => { void openGroupManager(); }} />
+        <NativeButton title={translate("relay.groupManager")} compact disabled={controlsBusy || !native.showGroupManager} onPress={() => { void openGroupManager(); }} />
       </View>
     </View> : null}
     <DependencyPolicyDialog
@@ -1050,7 +1114,8 @@ export function StationAccountsPanel({
         { value: "delete_models", label: translate("relay.policyDeleteModels"), hint: translate("relay.policyDeleteModelsHint") },
       ]}
       value={removalPolicy}
-      disabled={controlsBusy}
+      disabled={controlsBusy && pendingAction !== "remove"}
+      busy={pendingAction === "remove"}
       confirmLabel={translate("relay.removeLocal")}
       onValueChange={setRemovalPolicy}
       onClose={() => setRemoval(undefined)}
@@ -1066,7 +1131,8 @@ export function StationAccountsPanel({
         { value: "delete_models", label: translate("relay.policyDeleteModels"), hint: translate("relay.policyDeleteModelsHint") },
       ]}
       value={removalPolicy}
-      disabled={controlsBusy}
+      disabled={controlsBusy && pendingAction !== "remove"}
+      busy={pendingAction === "remove"}
       confirmLabel={translate("relay.removeLocal")}
       onValueChange={setRemovalPolicy}
       onClose={() => setRemoval(undefined)}

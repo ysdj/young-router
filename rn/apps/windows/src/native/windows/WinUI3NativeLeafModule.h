@@ -37,6 +37,7 @@ struct WinUI3NativeLeafModule {
   REACT_METHOD(ShowVersion, L"showVersion");
   REACT_METHOD(VersionInfo, L"versionInfo");
   REACT_METHOD(OpenExternalURL, L"openExternalURL");
+  REACT_METHOD(RevealFile, L"revealFile");
   REACT_METHOD(Quit, L"quit");
   REACT_METHOD(SetShortcuts, L"setShortcuts");
   REACT_EVENT(MenuAction, L"menuAction");

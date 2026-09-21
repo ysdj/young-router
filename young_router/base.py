@@ -19,6 +19,8 @@ import re
 import threading
 import time
 from urllib.parse import urlparse
+
+from . import browser_identity as _browser_identity
 from typing import Any, AsyncIterator, Dict, List, Optional, Union
 import litellm
 from litellm.integrations.custom_logger import CustomLogger
@@ -185,6 +187,15 @@ _WEB_SEARCH_TOOL_UNSUPPORTED_CACHE_HIT_KEY = (
 )
 _WEB_SEARCH_TOOL_UNSUPPORTED_LOCK = threading.Lock()
 _WEB_SEARCH_TOOL_UNSUPPORTED: dict[str, dict[str, Any]] = {}
+_REASONING_PARAMETERS_COMPAT_TTL_SECONDS_ENV = (
+    "YOUNG_ROUTER_REASONING_COMPAT_TTL_SECONDS"
+)
+_REASONING_PARAMETERS_COMPAT_DEFAULT_TTL_SECONDS = 1800.0
+_REASONING_PARAMETERS_COMPAT_RETRY_METADATA_KEY = (
+    "young_router_reasoning_parameters_compat_retry"
+)
+_REASONING_PARAMETERS_COMPAT_LOCK = threading.Lock()
+_REASONING_PARAMETERS_COMPAT: dict[str, dict[str, Any]] = {}
 _STREAM_ROUTE_EXHAUSTION_DEFAULT_RETRIES = 0
 _STREAM_ROUTE_EXHAUSTION_RETRY_AFTER_MAX_SECONDS = 60.0
 _SAME_DEPLOYMENT_RETRIES_ENV = "YOUNG_ROUTER_SAME_DEPLOYMENT_RETRIES"
@@ -284,11 +295,10 @@ _RESPONSES_CHAT_BRIDGE_PREEMPTIVE_METADATA_KEY = (
 _RESPONSES_FUNCTION_TOOL_SCHEMA_RETRY_METADATA_KEY = (
     "responses_function_tool_schema_compat_retry"
 )
-_FALLBACK_BROWSER_USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/125.0 Safari/537.36"
-)
+# Every request the app makes on its own behalf, and every upstream call that
+# has no client User-Agent to forward, presents the shared browser identity
+# instead of an implementation fingerprint of its own.
+_FALLBACK_BROWSER_USER_AGENT = _browser_identity.browser_user_agent()
 _BROWSER_COMPATIBLE_HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
@@ -408,46 +418,12 @@ _HOSTED_TOOL_UNSUPPORTED_MESSAGE_KEY = "hosted_tool_unsupported_message"
 _HOSTED_WEB_SEARCH_UNSUPPORTED_MESSAGE = (
     "web_search is unavailable for this route."
 )
-_COMPUTER_FACADE_BACKEND_ENV = "YOUNG_ROUTER_COMPUTER_FACADE_BACKEND"
-_COMPUTER_FACADE_MODEL_ENV = "YOUNG_ROUTER_COMPUTER_FACADE_MODEL"
-_COMPUTER_FACADE_MAX_STEPS_ENV = "YOUNG_ROUTER_COMPUTER_FACADE_MAX_STEPS"
-_COMPUTER_FACADE_TRACE_ENV = "YOUNG_ROUTER_COMPUTER_FACADE_TRACE"
-_COMPUTER_FACADE_TRACE_SCREENSHOTS_ENV = (
-    "YOUNG_ROUTER_COMPUTER_FACADE_TRACE_SCREENSHOTS"
-)
-_COMPUTER_FACADE_ACTION_DENYLIST_ENV = (
-    "YOUNG_ROUTER_COMPUTER_FACADE_ACTION_DENYLIST"
-)
-_COMPUTER_FACADE_REQUIRE_OBSERVATION_ENV = (
-    "YOUNG_ROUTER_COMPUTER_FACADE_REQUIRE_OBSERVATION"
-)
-_COMPUTER_FACADE_PLANNER_METADATA_KEY = (
-    "computer_facade_planner"
-)
-_COMPUTER_FACADE_EXECUTOR_METADATA_KEY = (
-    "computer_facade_executor"
-)
-_COMPUTER_FACADE_AUTO_BACKEND = "auto"
-_COMPUTER_FACADE_MCP_BACKEND = "mcp"
-_COMPUTER_FACADE_BROWSER_BACKEND = "browser"
-_COMPUTER_FACADE_CHROME_BACKEND = "chrome"
-_COMPUTER_FACADE_PLAYWRIGHT_BACKEND = "playwright"
-_COMPUTER_FACADE_CUA_BACKEND = "cua"
-_COMPUTER_FACADE_MOCK_BACKEND = "mock"
-_COMPUTER_FACADE_BACKENDS = {
-    _COMPUTER_FACADE_AUTO_BACKEND,
-    _COMPUTER_FACADE_MCP_BACKEND,
-    _COMPUTER_FACADE_BROWSER_BACKEND,
-    _COMPUTER_FACADE_CHROME_BACKEND,
-    _COMPUTER_FACADE_PLAYWRIGHT_BACKEND,
-    _COMPUTER_FACADE_MOCK_BACKEND,
-}
-_COMPUTER_FACADE_DEFAULT_MAX_STEPS = 20
-_COMPUTER_FACADE_SAFE_FAILURE_MESSAGE = (
-    "computer-use backend is unavailable for this route."
-)
-_COMPUTER_FACADE_MOCK_DONE_MESSAGE = (
-    "computer facade mock completed after screenshot observation."
+# The router runs no computer-use executor of its own.  A hosted ``computer``
+# tool is only ever served by an upstream that supports it natively, so the
+# client is told the truth instead of silently receiving an answer without
+# computer use.
+_HOSTED_COMPUTER_UNSUPPORTED_MESSAGE = (
+    "hosted computer use is unavailable for this route."
 )
 _ROUTE_TRACE_PREVIEW_CHARS_ENV = "YOUNG_ROUTER_ROUTE_TRACE_PREVIEW_CHARS"
 _ROUTE_TRACE_PREVIEW_DEFAULT_CHARS = 2000
@@ -721,16 +697,23 @@ _UPSTREAM_TEMPORARY_ERROR_CLASS_NAMES = {
     "TimeoutError",
 }
 _CHAT_TOOL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-_HOSTED_BROWSER_COMPUTER_TOOL_TYPES = {"computer"}
+_HOSTED_COMPUTER_TOOL_TYPES = {"computer"}
 _BROWSER_COMPUTER_CLIENT_NAMESPACE_NAMES = {
     "browser",
     "browser_use",
     "chrome",
     "chrome_browser",
+    "cua_repl",
     "mcp__browser",
     "mcp__browser_use",
     "mcp__chrome",
     "mcp__computer_use",
+    # Codex Desktop's computer/browser use arrives as the unified-computer-use
+    # plugin's repl namespaces; they are the client's own executor, so a request
+    # that declares them must keep them across the chat bridge.
+    "mcp__cua_repl",
+    "mcp__node_repl",
+    "node_repl",
 }
 _BROWSER_COMPUTER_CLIENT_FUNCTION_NAMES = {
     "click",
@@ -742,6 +725,7 @@ _BROWSER_COMPUTER_CLIENT_FUNCTION_NAMES = {
     "scroll",
     "select_text",
     "set_value",
+    "turn_ended",
     "type_text",
 }
 _RESPONSES_STREAM_COMPLETED_TYPES = {"response.completed"}
@@ -765,47 +749,17 @@ _HOSTED_WEB_SEARCH_TOOL_TYPES = {
     "web_search_preview",
 }
 _WEB_SEARCH_NATIVE_EVENT_SEEN_METADATA_KEY = "native_web_search_event_seen"
-_HOSTED_GA_COMPUTER_TOOL_TYPES = {"computer"}
 
 
 @dataclass(frozen=True)
 class HostedToolPlan:
     hosted_web_search: bool = False
     hosted_web_search_preview: bool = False
+    # A hosted ``computer`` tool asks the upstream to drive the user's machine.
+    # No route this proxy fronts can do that, but the request must still be
+    # recognised so it is never silently bridged into a chat request that drops
+    # the tool.
     hosted_computer: bool = False
     client_namespaces: list[str] = field(default_factory=list)
     client_functions: list[str] = field(default_factory=list)
     passthrough_tools: list[dict] = field(default_factory=list)
-    facade_required: bool = False
-    unsupported_reason: Optional[str] = None
-    hosted_computer_tools: list[dict] = field(default_factory=list)
-    computer_environment: Optional[dict] = None
-    available_executor_hints: list[str] = field(default_factory=list)
-
-
-@dataclass
-class ComputerObservation:
-    type: str
-    image_url: Optional[str] = None
-    text: Optional[str] = None
-    detail: Optional[str] = None
-    width: Optional[int] = None
-    height: Optional[int] = None
-    backend: str = ""
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class ComputerAction:
-    type: str
-    x: Optional[int] = None
-    y: Optional[int] = None
-    button: Optional[str] = None
-    text: Optional[str] = None
-    keys: Optional[list[str]] = None
-    dx: Optional[int] = None
-    dy: Optional[int] = None
-    scroll_x: Optional[int] = None
-    scroll_y: Optional[int] = None
-    duration_ms: Optional[int] = None
-    message: Optional[str] = None
