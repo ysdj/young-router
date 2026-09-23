@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { Platform, PlatformColor, StyleSheet, Text, View, type StyleProp, type ViewStyle } from "react-native";
+import { Platform, PlatformColor, StyleSheet, Text, View } from "react-native";
 import type { CoreSnapshot, NativeLeafAdapter } from "../types";
-import { NativeButton, NativeCheckbox, NativePicker, NativeSecureTextInput, NativeTable, NativeTextField } from "./NativeControls";
+import { NativeButton, NativeCheckbox, NativePicker, NativeTable, NativeTextField } from "./NativeControls";
 import { usePendingAction } from "./pendingAction";
 import { normalizeRelayOrigin } from "./relayOrigin";
 import { UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
@@ -87,11 +87,9 @@ export type RelayApiKeyActions = {
 /** Staged relay metadata commits go through this opaque host callback. */
 export type RelayCommit = (type: string, payload?: UnknownRecord) => Promise<void>;
 
-type AccountLoadingState = { session: boolean; resources: boolean };
 type ResourceRefreshTarget = { id: string; resources?: RelayResource[] };
 export type StationDraft = Partial<Pick<RelayStation, "name" | "origin" | "type">>;
 type PolicyOption<T extends string> = { value: T; label: string; hint: string };
-const INLINE_MODEL_LIMIT = 5;
 /**
  * How many model names the 分组管理 window lays out for one key, and how much
  * text those names may take.  The window shows the whole list, so these are
@@ -112,10 +110,6 @@ function count(value: unknown): number {
 }
 function groupMultiplier(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-
-function groupMultiplierLabel(multiplier: number | null, translate: Translate): string {
-  return multiplier === null ? translate("relay.apiKeyUngrouped") : `×${multiplier}`;
 }
 
 /** The 分组 field: the group's name alone; 倍率 has its own row and column. */
@@ -299,18 +293,6 @@ function translateStationName(account?: RelayAccount): string {
 }
 
 
-export function relayTypeLabel(type: RelayType, translate: Translate): string {
-  return translate(type === "newapi" ? "relay.type.newapi" : "relay.type.sub2api");
-}
-
-function resourceHint(account: RelayAccount, translate: Translate): string {
-  if (account.resourceStatus === "unavailable" || account.resourceError === "login_expired") return translate("relay.resourcesLoginExpired");
-  if (account.resourceError === "no_api_keys") return translate("relay.resourcesNoApiKeys");
-  if (account.resourceError === "no_models") return translate("relay.resourcesNoModels");
-  if (account.resourceStatus === "idle") return translate("relay.resourcesNotLoaded");
-  return translate("relay.resourcesUnavailable");
-}
-
 function stationName(account: RelayAccount): string {
   return account.stationName || account.label || account.origin;
 }
@@ -330,10 +312,6 @@ export function stationDisplayName(station: RelayStation, translate: Translate):
   return originHostLabel(station.origin) || name;
 }
 
-function stationPickerLabel(station: RelayStation, translate: Translate): string {
-  return `${stationDisplayName(station, translate)} (${relayTypeLabel(station.type ?? "newapi", translate)})`;
-}
-
 function usernameShortName(account: RelayAccount): string {
   return account.username.trim();
 }
@@ -344,10 +322,6 @@ export function accountDisplayName(account: RelayAccount, translate: Translate):
   const label = account.label.trim();
   if (label && !/^https?:\/\//iu.test(label)) return label;
   return originHostLabel(account.origin) || translate("relay.unsignedAccount");
-}
-
-function accountDetailTitle(account: RelayAccount, translate: Translate): string {
-  return usernameShortName(account) || accountDisplayName(account, translate);
 }
 
 function balanceLabel(account: RelayAccount, translate: Translate): string {
@@ -389,10 +363,6 @@ export function NativeWizardProgress({ steps, activeIndex }: { steps: string[]; 
       <Text style={[styles.setupProgressLabel, index === activeIndex && styles.setupProgressLabelCurrent]}>{label}</Text>
     </View>)}
   </View>;
-}
-
-function FormRow({ label, children }: { label: string; children: React.ReactNode }): React.JSX.Element {
-  return <NativeFormRow label={label}>{children}</NativeFormRow>;
 }
 
 function RelayDialogLayer({ visible, onRequestClose, children }: {
@@ -953,13 +923,13 @@ export function StationAccountsPanel({
     groupLabel: translate("relay.apiKeyGroup"),
     multiplierLabel: translate("relay.apiKeyMultiplier"),
     valueLabel: translate("providers.keyValue"),
-    copyActionLabel: translate("common.copy"),
+    // The copy is an icon button beside the value; these words ride it as its
+    // tooltip and its accessibility label.
     copyLabel: translate("relay.apiKeyCopy"),
     copiedLabel: translate("relay.apiKeyCopied"),
     failedLabel: translate("relay.operationFailed"),
     modelsLabel: translate("relay.apiKeyModelList"),
     emptyLabel: translate("common.none"),
-    savedLabel: translate("relay.resourceKeyConfigured"),
     enabledLabel: translate("common.enable"),
     newKeyName: translate("relay.apiKeyNewName"),
     autoGroupingLabel: translate("relay.apiKeyAutoGrouping"),
@@ -1210,16 +1180,13 @@ const compactStyles = StyleSheet.create({
 });
 
 const styles = StyleSheet.create({
-  hidden: { display: "none" },
   accountsPanel: { minWidth: 0, gap: 6, paddingTop: 6, borderTopWidth: 1, borderTopColor: colors.separator },
-  accountsPanelGap: { minWidth: 0, gap: 4 },
   cleanupRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6, flexWrap: "wrap" },
   cleanupText: { flex: 1, minWidth: 0, color: colors.secondary, fontSize: UI_FONT_SIZE, lineHeight: 16 },
   panelHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 },
   panelTitle: { flex: 1, color: colors.text, fontSize: UI_FONT_SIZE, fontWeight: "600" },
   panelActions: { marginLeft: "auto", flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 4 },
   panelActionButton: { width: 22, minWidth: 22, height: 22 },
-  panelFeedback: { color: colors.secondary, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
   accountsTable: { flex: 0, height: 84, minHeight: 84, flexShrink: 0 },
   accountsEmpty: { minHeight: 40, alignItems: "center", justifyContent: "center", paddingHorizontal: 10, paddingVertical: 8, borderWidth: 1, borderColor: colors.separator, backgroundColor: colors.panel },
   accountsEmptyText: { color: colors.secondary, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15, textAlign: "center" },
@@ -1228,8 +1195,6 @@ const styles = StyleSheet.create({
   accountActionsRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6, flexWrap: "wrap" },
   fieldRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 },
   fieldLabel: { width: 64, flexShrink: 0, color: colors.secondary, fontSize: UI_FONT_SIZE },
-  fieldControl: { flex: 1, minWidth: 0, height: 26 },
-  autoGroupingCheckbox: { flexShrink: 0 },
   setupProgress: { width: "100%", flexDirection: "row", alignItems: "center", minHeight: 22, gap: 18 },
   setupProgressStep: { flexDirection: "row", alignItems: "center", gap: 7, flexShrink: 0 },
   setupProgressBadge: { width: 20, height: 20, borderRadius: 10, borderWidth: 1, borderColor: colors.separator, alignItems: "center", justifyContent: "center", backgroundColor: colors.window },

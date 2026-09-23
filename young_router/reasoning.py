@@ -9,6 +9,7 @@ from .core.model_contexts import (
     ModelContextRegistry,
     ReasoningCapability,
     default_context_cache_path,
+    legacy_context_cache_paths,
 )
 from . import request_context as _request_context_module
 
@@ -34,10 +35,13 @@ def _runtime_settings_path() -> Path:
     return Path(configured).expanduser() if configured else _runtime_root() / "runtime-settings.env"
 
 
-def _reasoning_cache_path() -> Path:
+def _codex_home() -> Path:
     configured_home = os.environ.get("CODEX_HOME", "").strip()
-    codex_home = Path(configured_home).expanduser() if configured_home else Path.home() / ".codex"
-    return default_context_cache_path(codex_home)
+    return Path(configured_home).expanduser() if configured_home else Path.home() / ".codex"
+
+
+def _reasoning_cache_path() -> Path:
+    return default_context_cache_path(_runtime_root())
 
 
 def _cache_mtime_ns(path: Path) -> int | None:
@@ -65,6 +69,7 @@ def _reasoning_registry() -> ModelContextRegistry:
         runtime_config_path=runtime_config,
         runtime_settings_path=runtime_settings,
         cache_path=cache,
+        legacy_cache_paths=legacy_context_cache_paths(_codex_home()),
         refresh_enabled=False,
     )
     _registry_state = (key, registry)

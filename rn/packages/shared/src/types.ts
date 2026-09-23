@@ -71,12 +71,8 @@ export type EditorDocument =
   | "dsh_settings"
   | "dsh_desktop_settings"
   | "opencode_config"
-  | "opencode_auth";
-
-/** External client a configuration file belongs to, as the pane groups it. */
-export type ClientFileName = "codex" | "claude" | "pi" | "dsh" | "dshDesktop" | "opencode";
-
-export type ClientFileLanguage = "json" | "toml" | "yaml" | "text";
+  | "opencode_auth"
+  | "codex_model_catalog";
 
 /**
  * One registered external client configuration file. ``path`` is the only
@@ -210,18 +206,6 @@ export interface ApplyIssue {
   provider_id?: string;
   model_id?: string;
   retryable?: boolean;
-}
-
-export type RelayPendingOperationStatus = "staged" | "remote_applied" | "local_pending" | "completed";
-
-export interface RelayPendingOperationSummary {
-  id: string;
-  action: string;
-  status: RelayPendingOperationStatus;
-  station_id?: string;
-  account_id?: string;
-  resource_id?: string;
-  linked_model_count?: number;
 }
 
 export type ProviderAuthKind = "api_key" | "openai_login" | "claude_login";
@@ -400,9 +384,8 @@ export interface IpcParams {
         | "dsh_desktop_settings"
         | "opencode_config"
         | "opencode_auth"
-        | "codex_keybindings"
         | "codex_agents"
-        | "codex_rules";
+        | "codex_model_catalog";
     }
     | { editor_token: string; text: string };
   files: Record<string, never>;
@@ -436,9 +419,8 @@ export interface IpcResults {
       | "dsh_desktop_settings"
       | "opencode_config"
       | "opencode_auth"
-      | "codex_keybindings"
       | "codex_agents"
-      | "codex_rules";
+      | "codex_model_catalog";
     editor_token: string;
     revision: number;
     text: string;
@@ -574,10 +556,6 @@ export interface NativeSegmentedControl {
   setSelectedIndex(index: number): void;
 }
 
-export type NativeWindowAdapter = NativeWindow;
-export type NativeMenuBarAdapter = NativeMenuBar;
-export type NativeTrayAdapter = NativeTray;
-
 export interface NativeLocalization {
   appTitle: string;
   /** Application-menu About item. */
@@ -696,9 +674,7 @@ export type RelayGroupManagerLabels = {
    * capability; the value never crosses this boundary.
    */
   valueLabel: string;
-  /** The copy button's own title (`common.copy`), e.g. 复制 / Copy. */
-  copyActionLabel: string;
-  /** The copy action's tooltip and accessibility name. */
+  /** The copy icon button's tooltip and accessibility name. */
   copyLabel: string;
   copiedLabel: string;
   failedLabel: string;
@@ -706,8 +682,6 @@ export type RelayGroupManagerLabels = {
   modelsLabel: string;
   /** `common.none`: the placeholder for an empty detail value. */
   emptyLabel: string;
-  /** `relay.resourceKeyConfigured`: the key value row when the key exists. */
-  savedLabel: string;
   enabledLabel: string;
   newKeyName: string;
   autoGroupingLabel: string;
@@ -741,6 +715,11 @@ export interface NativeLeafAdapter {
   openFilePicker(options: { purpose: "import" }): Promise<string | undefined>;
   saveFilePicker(options: { suggestedName: string }): Promise<string | undefined>;
   showActionMenu(options: { title: string; items: string[]; anchor: NativeMenuAnchor }): Promise<number | undefined>;
+  /**
+   * The same menu with one submenu per group, so a long model list stays
+   * navigable under its provider.  Resolves the chosen group/item pair.
+   */
+  showGroupedActionMenu?(options: { title: string; groups: Array<{ title: string; items: string[] }>; anchor: NativeMenuAnchor }): Promise<{ group: number; item: number } | undefined>;
   showConfirmation(options: { title: string; message: string; confirmLabel: string }): Promise<boolean>;
   showReadOnlyText(options: { title: string; text: string; closeLabel: string; language: "json" | "toml" | "text"; html: string }): Promise<void>;
   /**
@@ -802,7 +781,10 @@ export interface NativeLeafAdapter {
     target?: string;
   }): Promise<{ revision: number; present: boolean } | undefined>;
   copySecret(options: {
-    domain: "relay_accounts";
+    // A key the workspace can copy without ever receiving it: the relay
+    // station's key and the provider's own stored key, both read through
+    // Core's one-shot plaintext capability.
+    domain: "providers_models" | "relay_accounts";
     field: "api_key";
     target: string;
   }): Promise<boolean>;
@@ -883,9 +865,3 @@ export interface NativeMenuAnchor {
  * selection carries the compaction capability; the Core apply still resolves
  * the authoritative value from the runtime configuration row.
  */
-export interface CodexModelSelection {
-  model: string;
-  provider: string;
-  deployment_id: string;
-  supports_responses_compaction?: boolean | null;
-}

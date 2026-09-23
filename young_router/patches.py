@@ -17,6 +17,7 @@ from . import routing as _routing_module
 from . import streaming as _streaming_module
 from . import trace as _trace_module
 from . import dsh_vision_router as _dsh_vision_router_module
+from . import proxy_idle as _proxy_idle_module
 
 
 from .base import (
@@ -1865,3 +1866,6 @@ def install_all() -> None:
     _install_managed_responses_websocket_keepalive_patch()
     _install_responses_completion_stream_patch()
     _install_responses_tool_search_bridge_patch()
+    # The managed proxy's idle loops are not part of request handling, but every
+    # worker and the supervisor run them, so they are installed with the rest.
+    _proxy_idle_module.install_proxy_idle_patches()

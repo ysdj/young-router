@@ -6,6 +6,11 @@ export interface NativeButtonProps extends ViewProps {
   title: string;
   symbol?: string;
   symbolWithTitle?: WithDefault<boolean, false>;
+  /**
+   * Draw the symbol after the title instead of before it, so a menu button
+   * reads "Title ▾" while an ordinary button keeps its leading icon.
+   */
+  symbolTrailing?: WithDefault<boolean, false>;
   disabled?: WithDefault<boolean, false>;
   /**
    * The button's own action is running. The control keeps its title, width,

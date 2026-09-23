@@ -30,8 +30,13 @@ def _positive_pid(value: str) -> int:
     return pid
 
 
-def _watch_parent(parent_pid: int, stop: threading.Event, *, poll_interval: float = 0.25) -> None:
-    """Stop Core when its original native host is no longer its parent."""
+def _watch_parent(parent_pid: int, stop: threading.Event, *, poll_interval: float = 1.0) -> None:
+    """Stop Core when its original native host is no longer its parent.
+
+    One check per second keeps a killed host's Core from lingering while
+    leaving the idle machine in its deep idle states; the host's own quit path
+    signals this process directly, so the interval only bounds the fallback.
+    """
 
     if os.name == "nt":
         _watch_windows_parent(parent_pid, stop, poll_interval=poll_interval)

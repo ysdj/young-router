@@ -367,11 +367,6 @@ function codeEditorHtml(command?: InitialEditorCommand, labels?: CodeEditorMenuL
 </html>`;
 }
 
-// Kept as the source document for read-only native viewers. Editable panes
-// get their first document before the bundle executes, which removes the
-// blank-WebView/second-replace startup phase.
-export const CODE_EDITOR_HTML = codeEditorHtml();
-
 // Building the shell embeds the whole editor bundle, so the localized
 // read-only variant is cached per label set instead of per open.
 let readOnlyHtmlCache: { key: string; html: string } | undefined;

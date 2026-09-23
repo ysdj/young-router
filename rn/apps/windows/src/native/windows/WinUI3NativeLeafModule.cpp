@@ -367,6 +367,92 @@ void WinUI3NativeLeafModule::ShowActionMenu(
   }
 }
 
+void WinUI3NativeLeafModule::ShowGroupedActionMenu(
+    std::wstring const& title,
+    winrt::Microsoft::ReactNative::JSValueArray const& groups,
+    winrt::Microsoft::ReactNative::JSValueObject const& anchor,
+    winrt::Microsoft::ReactNative::ReactPromise<std::optional<winrt::Microsoft::ReactNative::JSValueObject>> const& promise) noexcept {
+  auto number = [&anchor](char const* key) -> std::optional<double> {
+    auto found = anchor.find(key);
+    if (found == anchor.end()) return std::nullopt;
+    if (auto value = found->second.TryGetDouble()) return *value;
+    if (auto value = found->second.TryGetInt64()) return static_cast<double>(*value);
+    return std::nullopt;
+  };
+  auto x = number("x");
+  auto y = number("y");
+  auto width = number("width");
+  auto height = number("height");
+  if (!x || !y || !width || !height || !std::isfinite(*x) || !std::isfinite(*y) ||
+      !std::isfinite(*width) || !std::isfinite(*height) || *x < 0 || *y < 0 ||
+      *width <= 0 || *height <= 0 || *width > 8192 || *height > 8192 ||
+      groups.empty() || groups.size() > 32) {
+    promise.Resolve(std::nullopt);
+    return;
+  }
+  std::vector<NativeMenuGroup> native_groups;
+  native_groups.reserve(groups.size());
+  for (auto const& entry : groups) {
+    auto const* group = entry.TryGetObject();
+    if (group == nullptr) {
+      promise.Resolve(std::nullopt);
+      return;
+    }
+    auto title_found = group->find("title");
+    auto items_found = group->find("items");
+    if (title_found == group->end() || items_found == group->end()) {
+      promise.Resolve(std::nullopt);
+      return;
+    }
+    auto group_title = title_found->second.TryGetString();
+    if (!group_title || group_title->empty() || group_title->size() > 240) {
+      promise.Resolve(std::nullopt);
+      return;
+    }
+    auto items_array = items_found->second.TryGetArray();
+    if (items_array == nullptr || items_array->empty() || items_array->size() > 64) {
+      promise.Resolve(std::nullopt);
+      return;
+    }
+    NativeMenuGroup native_group;
+    native_group.title = winrt::hstring(*group_title).c_str();
+    native_group.items.reserve(items_array->size());
+    for (auto const& item : *items_array) {
+      auto item_text = item.TryGetString();
+      if (!item_text || item_text->empty() || item_text->size() > 240) {
+        promise.Resolve(std::nullopt);
+        return;
+      }
+      native_group.items.push_back(winrt::hstring(*item_text).c_str());
+    }
+    native_groups.push_back(std::move(native_group));
+  }
+  try {
+    auto leaf = leaf_;
+    auto js_dispatcher = context_.JSDispatcher();
+    YoungRouter::NativeMenuAnchor menu_anchor{*x, *y, *width, *height};
+    context_.UIDispatcher().Post([leaf, title, groups = std::move(native_groups), menu_anchor, promise, js_dispatcher]() mutable {
+      std::optional<std::pair<size_t, size_t>> selected;
+      try {
+        selected = leaf->ShowGroupedActionMenu(title, groups, menu_anchor);
+      } catch (...) {
+      }
+      js_dispatcher.Post([promise, selected] {
+        if (!selected) {
+          promise.Resolve(std::nullopt);
+          return;
+        }
+        winrt::Microsoft::ReactNative::JSValueObject result;
+        result["group"] = static_cast<double>(selected->first);
+        result["item"] = static_cast<double>(selected->second);
+        promise.Resolve(result);
+      });
+    });
+  } catch (...) {
+    promise.Resolve(std::nullopt);
+  }
+}
+
 void WinUI3NativeLeafModule::ChooseModelsToAdd(
     std::vector<std::string> const& models,
     std::wstring const& provider_name,
@@ -652,13 +738,11 @@ void WinUI3NativeLeafModule::ShowGroupManager(
       labels.group_label = read("groupLabel");
       labels.multiplier_label = read("multiplierLabel");
       labels.value_label = read("valueLabel");
-      labels.copy_action_label = read("copyActionLabel");
       labels.copy_label = read("copyLabel");
       labels.copied_label = read("copiedLabel");
       labels.failed_label = read("failedLabel");
       labels.models_label = read("modelsLabel");
       labels.empty_label = read("emptyLabel");
-      labels.saved_label = read("savedLabel");
       labels.enabled_label = read("enabledLabel");
       labels.new_key_name = read("newKeyName");
       labels.auto_grouping_label = read("autoGroupingLabel");

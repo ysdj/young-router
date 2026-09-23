@@ -7,10 +7,12 @@ import unittest
 from unittest import mock
 
 from young_router.core.model_catalog import (
+    catalog_carries_native_profile,
     catalog_is_current,
     catalog_model_names,
     catalog_names_from_editor,
     catalog_payload,
+    select_inherited_profile,
     selected_model_names,
     write_catalog,
 )
@@ -172,6 +174,102 @@ class ModelCatalogTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "catalog.json"
             self.assertIsNone(catalog_model_names(path))
+
+    def test_inherited_profile_follows_the_clients_declared_hierarchy(self) -> None:
+        """The base for alias models ignores catalog order and hidden profiles."""
+
+        def profile(slug: str, *, priority: object, visibility: object, prompt: str) -> dict[str, object]:
+            model: dict[str, object] = {
+                "slug": slug,
+                "base_instructions": prompt,
+                "model_messages": {"instructions_template": prompt},
+            }
+            if priority is not None:
+                model["priority"] = priority
+            if visibility is not None:
+                model["visibility"] = visibility
+            return model
+
+        hidden_flagship = profile("cyber-flagship", priority=0, visibility="hide", prompt="Hidden")
+        listed_mid = profile("gpt-mid", priority=10, visibility="list", prompt="Mid")
+        listed_flagship = profile("gpt-flagship", priority=1, visibility="list", prompt="Flagship")
+
+        selected = select_inherited_profile([hidden_flagship, listed_mid, listed_flagship])
+        self.assertIsNotNone(selected)
+        assert selected is not None
+        self.assertEqual("gpt-flagship", selected["slug"])
+
+        # A catalog without any listed profile still yields instructions.
+        selected = select_inherited_profile([hidden_flagship])
+        self.assertIsNotNone(selected)
+        assert selected is not None
+        self.assertEqual("cyber-flagship", selected["slug"])
+        self.assertIsNone(select_inherited_profile([]))
+
+    def test_pinned_base_profile_survives_a_newer_generation(self) -> None:
+        """A new client flagship must not re-map every alias automatically."""
+
+        astra = {
+            "slug": "gpt-6-astra",
+            "priority": 1,
+            "visibility": "list",
+            "base_instructions": "Astra instructions",
+            "model_messages": {"instructions_template": "Astra instructions"},
+        }
+        next_generation = {
+            "slug": "gpt-7-orbit",
+            "priority": 0,
+            "visibility": "list",
+            "base_instructions": "GPT-7 instructions",
+            "model_messages": {"instructions_template": "GPT-7 instructions"},
+        }
+        native = [next_generation, astra]
+
+        pinned = catalog_payload(["gemini-9-pro"], native_models=native, base_slug="gpt-6-astra")["models"][0]
+        self.assertEqual("Astra instructions", pinned["base_instructions"])
+        # Without the pin the client's declared flagship wins the mapping.
+        unpinned = catalog_payload(["gemini-9-pro"], native_models=native)["models"][0]
+        self.assertEqual("GPT-7 instructions", unpinned["base_instructions"])
+
+    def test_unreadable_client_catalog_never_downgrades_native_instructions(self) -> None:
+        """A Codex update must not replace the client's prompts with ours."""
+
+        native_profile = {
+            "slug": "gpt-6-astra",
+            "base_instructions": "Native GPT-6 process words",
+            "model_messages": {"instructions_template": "Native GPT-6 process words"},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "model-catalog.json"
+            with mock.patch(
+                "young_router.core.model_catalog.load_native_catalog",
+                return_value=[native_profile],
+            ):
+                write_catalog(path, ["gpt-6-astra"])
+            self.assertTrue(catalog_carries_native_profile(path))
+
+            with mock.patch(
+                "young_router.core.model_catalog.load_native_catalog",
+                return_value=[],
+            ):
+                # The client is installed but its bundled catalog cannot be
+                # read right now: the file keeps the client's own prompts.
+                self.assertTrue(catalog_is_current(path, ["gpt-6-astra"]))
+
+            # A fallback-only file (no client was installed when it was
+            # written) still refreshes as soon as a client is readable again.
+            fallback = Path(directory) / "fallback.json"
+            with mock.patch(
+                "young_router.core.model_catalog.load_native_catalog",
+                return_value=[],
+            ):
+                write_catalog(fallback, ["gpt-6-astra"])
+            self.assertFalse(catalog_carries_native_profile(fallback))
+            with mock.patch(
+                "young_router.core.model_catalog.load_native_catalog",
+                return_value=[native_profile],
+            ):
+                self.assertFalse(catalog_is_current(fallback, ["gpt-6-astra"]))
 
     def test_sol_catalog_uses_codex_native_reasoning_levels(self) -> None:
         native_profile = {

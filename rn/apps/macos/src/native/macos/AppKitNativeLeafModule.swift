@@ -326,6 +326,13 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
         }
     }
 
+    @objc(showGroupedActionMenu:groups:anchor:resolver:rejecter:)
+    func showGroupedActionMenu(_ title: String, groups: [NSDictionary], anchor: [String: NSNumber], resolver resolve: @escaping RCTPromiseResolveBlock, rejecter reject: RCTPromiseRejectBlock) {
+        DispatchQueue.main.async {
+            resolve(self.leaf.showGroupedActionMenu(title: title, groups: groups as? [[String: Any]] ?? [], anchor: anchor))
+        }
+    }
+
     @objc func chooseModelsToAdd(_ models: [String], providerName: String, keyName: String, resolver resolve: @escaping RCTPromiseResolveBlock, rejecter reject: @escaping RCTPromiseRejectBlock) {
         guard models.count <= 10_000,
               models.allSatisfy({ !$0.isEmpty && $0.utf8.count <= 256 && !$0.unicodeScalars.contains(where: { $0.value < 32 }) }),

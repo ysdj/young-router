@@ -430,7 +430,7 @@ class CodexRestartPromptTests(unittest.TestCase):
             self.assertEqual(before_event + 1, second["change_event"])
             self.assertEqual(["public-a", "public-b"], catalog_model_names(catalog_path))
 
-    def test_acknowledged_catalog_signature_survives_core_recreation(self) -> None:
+    def test_recreated_core_does_not_reprompt_without_a_model_change(self) -> None:
         endpoint = {"models": ["public-a"]}
 
         def exposed_models(_api_key: str):
@@ -447,10 +447,13 @@ class CodexRestartPromptTests(unittest.TestCase):
             first = self._domain(root)
             enabled = first.set_model_catalog_enabled_immediately(True)
             first.dispatch("acknowledge_model_catalog_restart", {})
-            self.assertTrue(first.model_catalog_ack_path.exists())
+            # The acknowledgement is process state now: no app state file is
+            # written for it, and a recreated Core re-arms a prompt only when
+            # the model set (or enabled state) actually changes.
+            self.assertFalse((root / "model-catalog-state.json").exists())
 
-            # A subscription recovery creates a fresh Codex domain, so this
-            # verifies the acknowledgement is not only process-local memory.
+            # A subscription recovery creates a fresh Codex domain; with the
+            # same model set it must not manufacture a prompt by itself.
             second = CodexSettingsDomain(root / "config.yaml", codex_home=root / "codex")
             self._force_catalog_observation(second)
             unchanged = second.snapshot()["model_catalog"]

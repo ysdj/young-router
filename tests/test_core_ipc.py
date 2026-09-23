@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import os
 from pathlib import Path
@@ -57,6 +58,13 @@ class CoreProtocolTests(unittest.TestCase):
             core_main._watch_parent(4321, stop, poll_interval=0)
 
         self.assertTrue(stop.is_set())
+
+    def test_core_parent_watchdog_checks_once_a_second(self) -> None:
+        """An idle Core sleeps between parent checks instead of spinning on them."""
+
+        default = inspect.signature(core_main._watch_parent).parameters["poll_interval"].default
+
+        self.assertEqual(default, 1.0)
 
     def test_core_parent_watchdog_uses_a_process_handle_on_windows(self) -> None:
         stop = threading.Event()

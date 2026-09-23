@@ -50,9 +50,8 @@ class ClientFilesDomainTests(unittest.TestCase):
                     "dsh_desktop_settings",
                     "opencode_config",
                     "opencode_auth",
-                    "codex_keybindings",
                     "codex_agents",
-                    "codex_rules",
+                    "codex_model_catalog",
                 },
                 set(files),
             )
@@ -67,6 +66,13 @@ class ClientFilesDomainTests(unittest.TestCase):
                 files["dsh_desktop_settings"]["path"],
             )
             self.assertEqual("opencode.json", files["opencode_config"]["name"])
+            # The model catalog the Codex pane's switch installs is listed with
+            # the file name Core itself writes, under the same Codex home.
+            self.assertEqual("model-catalog.json", files["codex_model_catalog"]["name"])
+            self.assertEqual(
+                str(Path(directory) / "codex" / "model-catalog.json"),
+                files["codex_model_catalog"]["path"],
+            )
             self.assertFalse(files["pi_settings"]["exists"])
             self.assertTrue(all(row["domain"] == "clients" for row in files.values()))
             # The listing is display-only: it never carries file text.
@@ -164,9 +170,8 @@ class ClientFilesDomainTests(unittest.TestCase):
                     "dsh_desktop_settings",
                     "opencode_config",
                     "opencode_auth",
-                    "codex_keybindings",
                     "codex_agents",
-                    "codex_rules",
+                    "codex_model_catalog",
                 ],
                 [row["document"] for row in result["files"]],
             )
@@ -176,12 +181,12 @@ class ClientFilesDomainTests(unittest.TestCase):
                     "claudeCode", "claudeDesktop", "claudeDesktop",
                     "pi", "pi", "pi",
                     "dsh", "dshDesktop", "opencode", "opencode",
-                    "codex", "codex", "codex",
+                    "codex", "codex",
                 ],
                 [row["client"] for row in result["files"]],
             )
             self.assertEqual(
-                {"codex": 2, "claude": 3, "clients": 10},
+                {"codex": 2, "claude": 3, "clients": 9},
                 {
                     name: sum(1 for row in result["files"] if row["domain"] == name)
                     for name in ("codex", "claude", "clients")

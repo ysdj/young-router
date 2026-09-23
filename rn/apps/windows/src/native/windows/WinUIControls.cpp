@@ -160,6 +160,30 @@ winrt::Windows::UI::Color SourceListBadgeColor(std::vector<std::string> const& c
       static_cast<uint8_t>(value & 0xFF)};
 }
 
+// Every button symbol resolves here once, so an icon-only button, a glyph
+// with a title, and a quiet link that carries only the glyph cannot drift.
+wchar_t const* ButtonSymbolGlyph(std::string const& symbol) {
+  if (symbol == "check") return L"\xE73E";
+  if (symbol == "close") return L"\xE711";
+  if (symbol == "copy") return L"\xE8C8";
+  if (symbol == "edit") return L"\xE70F";
+  if (symbol == "help") return L"\xE897";
+  if (symbol == "import") return L"\xE8B5";
+  if (symbol == "info") return L"\xE946";
+  if (symbol == "minus") return L"\xE738";
+  if (symbol == "pause") return L"\xE769";
+  if (symbol == "play") return L"\xE768";
+  if (symbol == "plus") return L"\xE710";
+  if (symbol == "power-off" || symbol == "power-on") return L"\xE7E8";
+  if (symbol == "refresh") return L"\xE72C";
+  if (symbol == "chevron-down") return L"\xE70D";
+  if (symbol == "chevron-up") return L"\xE70E";
+  // Windows has no combined up/down glyph in Segoe MDL2 Assets, so the
+  // pull-down pair uses the platform's own down chevron.
+  if (symbol == "chevron-up-down") return L"\xE70D";
+  return L"\xE74D";
+}
+
 wchar_t const* SourceListGlyph(std::string const& symbol) {
   if (symbol == "square.stack.3d.up") return L"\xE7B8";
   if (symbol == "gearshape.2") return L"\xE713";
@@ -321,28 +345,21 @@ struct ButtonComponentView final
       auto icon = FontIcon{};
       icon.FontFamily(FontFamily(L"Segoe MDL2 Assets"));
       icon.FontSize(kUIFontSize);
-      if (symbol == "check") icon.Glyph(L"\xE73E");
-      else if (symbol == "close") icon.Glyph(L"\xE711");
-      else if (symbol == "copy") icon.Glyph(L"\xE8C8");
-      else if (symbol == "edit") icon.Glyph(L"\xE70F");
-      else if (symbol == "import") icon.Glyph(L"\xE8B5");
-      else if (symbol == "info") icon.Glyph(L"\xE946");
-      else if (symbol == "power-on" || symbol == "power-off") icon.Glyph(L"\xE7E8");
-      else if (symbol == "minus") icon.Glyph(L"\xE738");
-      else if (symbol == "pause") icon.Glyph(L"\xE769");
-      else if (symbol == "play") icon.Glyph(L"\xE768");
-      else if (symbol == "plus") icon.Glyph(L"\xE710");
-      else if (symbol == "refresh") icon.Glyph(L"\xE72C");
-      else if (symbol == "chevron-up") icon.Glyph(L"\xE70E");
-      else if (symbol == "chevron-down") icon.Glyph(L"\xE70D");
-      else icon.Glyph(L"\xE74D");
+      icon.Glyph(ButtonSymbolGlyph(symbol));
       icon.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Center);
       auto label = TextBlock{};
       label.FontSize(kUIFontSize);
       label.Text(ToHString(props.title));
       label.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Center);
-      row.Children().Append(icon);
-      row.Children().Append(label);
+      // A menu button carries its glyph after the title so it reads like a
+      // pop-up; an ordinary symbol-with-title button keeps it leading.
+      if (props.symbolTrailing.value_or(false)) {
+        row.Children().Append(label);
+        row.Children().Append(icon);
+      } else {
+        row.Children().Append(icon);
+        row.Children().Append(label);
+      }
       if (busy) {
         // The spinner leads the glyph and the title as one centered group.
         row.Children().InsertAt(0, busySpinner());
@@ -352,21 +369,7 @@ struct ButtonComponentView final
       auto icon = FontIcon{};
       icon.FontFamily(FontFamily(L"Segoe MDL2 Assets"));
       icon.FontSize(kUIFontSize);
-      if (symbol == "check") icon.Glyph(L"\xE73E");
-      else if (symbol == "close") icon.Glyph(L"\xE711");
-      else if (symbol == "copy") icon.Glyph(L"\xE8C8");
-      else if (symbol == "edit") icon.Glyph(L"\xE70F");
-      else if (symbol == "import") icon.Glyph(L"\xE8B5");
-      else if (symbol == "info") icon.Glyph(L"\xE946");
-      else if (symbol == "power-on" || symbol == "power-off") icon.Glyph(L"\xE7E8");
-      else if (symbol == "minus") icon.Glyph(L"\xE738");
-      else if (symbol == "pause") icon.Glyph(L"\xE769");
-      else if (symbol == "play") icon.Glyph(L"\xE768");
-      else if (symbol == "plus") icon.Glyph(L"\xE710");
-      else if (symbol == "refresh") icon.Glyph(L"\xE72C");
-      else if (symbol == "chevron-up") icon.Glyph(L"\xE70E");
-      else if (symbol == "chevron-down") icon.Glyph(L"\xE70D");
-      else icon.Glyph(L"\xE74D");
+      icon.Glyph(ButtonSymbolGlyph(symbol));
       // An icon-only button has no room for a second glyph: while its action
       // runs the spinner takes the icon's place instead of sitting beside it.
       if (busy) {
@@ -390,6 +393,19 @@ struct ButtonComponentView final
       linkLabel.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Center);
       row.Children().Append(linkLabel);
       hyperlink_.Content(row);
+    } else if (link && props.plainLink.value_or(false) && !symbol.empty()) {
+      // A quiet link may carry an icon instead of words: the platform glyph in
+      // the same quiet ink a plain label uses, with no label underline to
+      // decorate and no hyperlink padding to pad an icon-only control.
+      auto icon = FontIcon{};
+      icon.FontFamily(FontFamily(L"Segoe MDL2 Assets"));
+      icon.FontSize(kUIFontSize);
+      icon.Glyph(ButtonSymbolGlyph(symbol));
+      icon.Foreground(SecondaryTextBrush());
+      hyperlink_.Padding(winrt::Microsoft::UI::Xaml::Thickness{0, 0, 0, 0});
+      hyperlink_.MinWidth(0);
+      hyperlink_.MinHeight(0);
+      hyperlink_.Content(icon);
     } else if (link && props.plainLink.value_or(false)) {
       // The quiet link owns both its ink and its resting underline on the text
       // itself, so the hyperlink's pointer-over state cannot repaint either:
@@ -634,6 +650,20 @@ struct CheckboxComponentView final
       winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUICheckboxProps> const& old_props) noexcept override {
     winrt::YoungRouter::Codegen::BaseLiteLLMWinUICheckbox<CheckboxComponentView>::UpdateProps(view, props, old_props);
     ApplyProps(old_props);
+  }
+
+  // Fabric may retain an unmounted component in its recycle pool: reset the
+  // controlled box with the view, or a reused view would paint the previous
+  // row's check while the new props carry the default (unchecked) value — and
+  // the value comparison in ApplyProps would then skip the repaint that was
+  // supposed to clear it.
+  void PrepareForRecycle(
+      winrt::Microsoft::ReactNative::ComponentView const&) noexcept {
+    if (!checkbox_) return;
+    syncing_ = true;
+    checkbox_.IsChecked(false);
+    checkbox_.IsEnabled(true);
+    syncing_ = false;
   }
 
  private:
@@ -2283,6 +2313,18 @@ struct SwitchComponentView final
     ApplyProps(old_props);
   }
 
+  // Same recycling contract as the checkbox: a reused switch must not keep
+  // another row's on state while React mounts it with the default value.
+  void PrepareForRecycle(
+      winrt::Microsoft::ReactNative::ComponentView const&) noexcept {
+    if (!toggle_) return;
+    syncing_ = true;
+    value_ = false;
+    UpdateGlyph();
+    syncing_ = false;
+    toggle_.IsEnabled(true);
+  }
+
  private:
   void ApplyProps(
       winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUISwitchProps> const& old_props) noexcept {
@@ -2402,6 +2444,46 @@ void RegisterCodeWebView(
       });
 }
 
+void RegisterCheckbox(
+    winrt::Microsoft::ReactNative::IReactPackageBuilder const& package_builder) noexcept {
+  winrt::YoungRouter::Codegen::RegisterLiteLLMWinUICheckboxNativeComponent<CheckboxComponentView>(
+      package_builder,
+      [](winrt::Microsoft::ReactNative::Composition::IReactCompositionViewComponentBuilder const& builder) {
+        builder.SetContentIslandComponentViewInitializer(
+            [](ContentIslandComponentView const& island_view) noexcept {
+              YoungRouter::ConfigureImmediateXamlPresentation();
+              auto user_data = winrt::make_self<CheckboxComponentView>();
+              user_data->InitializeContentIsland(island_view);
+              auto weak = user_data->get_weak();
+              island_view.Destroying(
+                  [weak](auto const&, winrt::Microsoft::ReactNative::ComponentView const& view) noexcept {
+                    if (auto current = weak.get()) current->PrepareForRecycle(view);
+                  });
+              island_view.UserData(*user_data);
+            });
+      });
+}
+
+void RegisterSwitch(
+    winrt::Microsoft::ReactNative::IReactPackageBuilder const& package_builder) noexcept {
+  winrt::YoungRouter::Codegen::RegisterLiteLLMWinUISwitchNativeComponent<SwitchComponentView>(
+      package_builder,
+      [](winrt::Microsoft::ReactNative::Composition::IReactCompositionViewComponentBuilder const& builder) {
+        builder.SetContentIslandComponentViewInitializer(
+            [](ContentIslandComponentView const& island_view) noexcept {
+              YoungRouter::ConfigureImmediateXamlPresentation();
+              auto user_data = winrt::make_self<SwitchComponentView>();
+              user_data->InitializeContentIsland(island_view);
+              auto weak = user_data->get_weak();
+              island_view.Destroying(
+                  [weak](auto const&, winrt::Microsoft::ReactNative::ComponentView const& view) noexcept {
+                    if (auto current = weak.get()) current->PrepareForRecycle(view);
+                  });
+              island_view.UserData(*user_data);
+            });
+      });
+}
+
 void RegisterTable(
     winrt::Microsoft::ReactNative::IReactPackageBuilder const& package_builder) noexcept {
   winrt::YoungRouter::Codegen::RegisterLiteLLMWinUITableNativeComponent<TableComponentView>(
@@ -2453,9 +2535,8 @@ void RegisterWinUIControls(
   RegisterComponent<PickerComponentView>(
       package_builder,
       winrt::YoungRouter::Codegen::RegisterLiteLLMWinUIPickerNativeComponent<PickerComponentView>);
-  RegisterComponent<CheckboxComponentView>(
-      package_builder,
-      winrt::YoungRouter::Codegen::RegisterLiteLLMWinUICheckboxNativeComponent<CheckboxComponentView>);
+  RegisterCheckbox(package_builder);
+  RegisterSwitch(package_builder);
   RegisterTable(package_builder);
   RegisterComponent<TextEditorComponentView>(
       package_builder,
@@ -2473,9 +2554,6 @@ void RegisterWinUIControls(
   RegisterComponent<TextInputComponentView>(
       package_builder,
       winrt::YoungRouter::Codegen::RegisterLiteLLMWinUITextInputNativeComponent<TextInputComponentView>);
-  RegisterComponent<SwitchComponentView>(
-      package_builder,
-      winrt::YoungRouter::Codegen::RegisterLiteLLMWinUISwitchNativeComponent<SwitchComponentView>);
   RegisterComponent<SelectableRowComponentView>(
       package_builder,
       winrt::YoungRouter::Codegen::RegisterLiteLLMWinUISelectableRowNativeComponent<SelectableRowComponentView>);

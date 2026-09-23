@@ -26,7 +26,14 @@ from .persistence import PersistenceError, atomic_write_json, read_json
 UNKNOWN_MODEL_CONTEXT_WINDOW = 272_000
 DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT = 95
 DEFAULT_MODEL_CONTEXT_REFRESH_HOURS = 6
-MODEL_CONTEXT_CACHE_FILE_NAME = "young-router-model-contexts.json"
+MODEL_CONTEXT_CACHE_FILE_NAME = "model-contexts.json"
+# Cache spellings retired inside the Codex home.  The cache is this app's
+# private metadata, so current releases keep it under the runtime root (never
+# in a client directory) and migrate these copies once, newest spelling first.
+PREVIOUS_MODEL_CONTEXT_CACHE_FILE_NAMES = (
+    "young-router-model-contexts.json",
+    "litellm-menu-model-contexts.json",
+)
 MODEL_CONTEXT_SOURCES = (
     "https://pi.dev/api/models",
     "https://raw.githubusercontent.com/openai/codex/main/codex-rs/models-manager/models.json",
@@ -516,6 +523,7 @@ class ModelContextRegistry:
         runtime_config_path: Path | str | None = None,
         runtime_settings_path: Path | str | None = None,
         cache_path: Path | str | None = None,
+        legacy_cache_paths: Sequence[Path | str] | None = None,
         refresh_enabled: bool | None = None,
         fetcher: Callable[[str], object] | None = None,
         clock: Callable[[], float] | None = None,
@@ -523,6 +531,9 @@ class ModelContextRegistry:
         self.runtime_config_path = Path(runtime_config_path).expanduser() if runtime_config_path else None
         self.runtime_settings_path = Path(runtime_settings_path).expanduser() if runtime_settings_path else None
         self.cache_path = Path(cache_path).expanduser() if cache_path else None
+        self.legacy_cache_paths = tuple(
+            Path(path).expanduser() for path in (legacy_cache_paths or ())
+        )
         self.refresh_enabled = bool(runtime_settings_path) if refresh_enabled is None else bool(refresh_enabled)
         self._fetcher = fetcher or self._fetch_json
         self._clock = clock or time.time
@@ -551,6 +562,51 @@ class ModelContextRegistry:
 
         return json.loads(payload.decode("utf-8"))
 
+    def _remove_legacy_caches(self) -> None:
+        """Drop retired in-Codex-home copies once the private cache is current."""
+
+        for legacy in self.legacy_cache_paths:
+            if self.cache_path is not None and legacy == self.cache_path:
+                continue
+            try:
+                legacy.unlink()
+            except OSError:
+                pass
+
+    def _migrate_legacy_cache(self, payload: Mapping[str, Any]) -> None:
+        """Copy a retired in-Codex-home cache to the runtime root once."""
+
+        if self.cache_path is None:
+            return
+        try:
+            atomic_write_json(self.cache_path, dict(payload))
+        except PersistenceError:
+            return
+        self._remove_legacy_caches()
+
+    def _read_cache(self) -> Mapping[str, Any]:
+        """Read the private cache, importing a retired Codex-home copy once."""
+
+        if self.cache_path is not None:
+            try:
+                payload = read_json(self.cache_path, default={})
+            except PersistenceError:
+                payload = {}
+            if isinstance(payload, Mapping) and payload.get("records"):
+                self._remove_legacy_caches()
+                return payload
+        for legacy in self.legacy_cache_paths:
+            if self.cache_path is not None and legacy == self.cache_path:
+                continue
+            try:
+                payload = read_json(legacy, default={})
+            except PersistenceError:
+                continue
+            if isinstance(payload, Mapping) and payload.get("records"):
+                self._migrate_legacy_cache(payload)
+                return payload
+        return {}
+
     def _load_cache(self) -> None:
         if self._cache_loaded:
             return
@@ -558,10 +614,7 @@ class ModelContextRegistry:
         self._records = {key: dict(value) for key, value in _BUNDLED_RECORDS.items()}
         if self.cache_path is None:
             return
-        try:
-            payload = read_json(self.cache_path, default={})
-        except PersistenceError:
-            return
+        payload = self._read_cache()
         fetched_at = payload.get("fetched_at")
         if isinstance(fetched_at, (int, float)) and not isinstance(fetched_at, bool):
             self._cache_fetched_at = float(fetched_at)
@@ -750,6 +803,7 @@ class ModelContextRegistry:
                     self.cache_path,
                     {"fetched_at": now, "records": self._records},
                 )
+                self._remove_legacy_caches()
             except PersistenceError:
                 pass
         return True
@@ -842,8 +896,17 @@ class ModelContextRegistry:
         )
 
 
-def default_context_cache_path(codex_home: Path | str) -> Path:
-    return Path(codex_home).expanduser() / MODEL_CONTEXT_CACHE_FILE_NAME
+def default_context_cache_path(runtime_root: Path | str) -> Path:
+    """Return the private cache path under the app's own runtime root."""
+
+    return Path(runtime_root).expanduser() / MODEL_CONTEXT_CACHE_FILE_NAME
+
+
+def legacy_context_cache_paths(codex_home: Path | str) -> tuple[Path, ...]:
+    """Return retired in-Codex-home cache copies, newest spelling first."""
+
+    home = Path(codex_home).expanduser()
+    return tuple(home / name for name in PREVIOUS_MODEL_CONTEXT_CACHE_FILE_NAMES)
 
 
 __all__ = [
@@ -852,9 +915,11 @@ __all__ = [
     "DEFAULT_MODEL_CONTEXT_REFRESH_HOURS",
     "MODEL_CONTEXT_CACHE_FILE_NAME",
     "MODEL_CONTEXT_SOURCES",
+    "PREVIOUS_MODEL_CONTEXT_CACHE_FILE_NAMES",
     "ModelContextRegistry",
     "ReasoningCapability",
     "UNKNOWN_MODEL_CONTEXT_WINDOW",
     "default_context_cache_path",
     "gpt_family_model_name",
+    "legacy_context_cache_paths",
 ]

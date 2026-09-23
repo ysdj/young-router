@@ -82,14 +82,14 @@ def _current_bytes(path: pathlib.Path) -> bytes | None:
     try:
         details = path.lstat()
         if stat.S_ISLNK(details.st_mode) or not stat.S_ISREG(details.st_mode):
-            raise ClaudeDesktopConfigError("Claude Desktop configuration changed on disk; reload before applying")
+            raise ClaudeDesktopConfigError("Claude Desktop configuration changed on disk; reload and try again")
         return path.read_bytes()
     except FileNotFoundError:
         return None
     except ClaudeDesktopConfigError:
         raise
     except OSError:
-        raise ClaudeDesktopConfigError("Claude Desktop configuration changed on disk; reload before applying") from None
+        raise ClaudeDesktopConfigError("Claude Desktop configuration changed on disk; reload and try again") from None
 
 
 def _atomic_write(path: pathlib.Path, text: str) -> None:
@@ -450,9 +450,9 @@ class ClaudeDesktopConfig:
         if not self.is_dirty():
             return
         if _current_bytes(self.desktop_meta_path) != self._baseline_meta_bytes:
-            raise ClaudeDesktopConfigError("Claude Desktop configuration changed on disk; reload before applying")
+            raise ClaudeDesktopConfigError("Claude Desktop configuration changed on disk; reload and try again")
         if self.desktop_config_path is not None and _current_bytes(self.desktop_config_path) != self._baseline_config_bytes:
-            raise ClaudeDesktopConfigError("Claude Desktop configuration changed on disk; reload before applying")
+            raise ClaudeDesktopConfigError("Claude Desktop configuration changed on disk; reload and try again")
         errors = validate_config(self._draft)
         if errors:
             raise ClaudeDesktopConfigError(errors[0])
@@ -570,7 +570,7 @@ class ClaudeDeveloperSettings:
         if not self.is_dirty():
             return
         if _current_bytes(self.path) != self._baseline_bytes:
-            raise ClaudeDesktopConfigError("Claude Desktop developer settings changed on disk; reload before applying")
+            raise ClaudeDesktopConfigError("Claude Desktop developer settings changed on disk; reload and try again")
         errors = self._validate(self._draft)
         if errors:
             raise ClaudeDesktopConfigError(errors[0])

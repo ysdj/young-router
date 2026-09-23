@@ -22,6 +22,7 @@ struct WinUI3NativeLeafModule {
   REACT_METHOD(ShowConfirmation, L"showConfirmation");
   REACT_METHOD(ShowReadOnlyText, L"showReadOnlyText");
   REACT_METHOD(ShowActionMenu, L"showActionMenu");
+  REACT_METHOD(ShowGroupedActionMenu, L"showGroupedActionMenu");
   REACT_METHOD(ChooseModelsToAdd, L"chooseModelsToAdd");
   REACT_METHOD(SetLocalization, L"setLocalization");
   REACT_METHOD(EditSecret, L"editSecret");
@@ -74,6 +75,11 @@ struct WinUI3NativeLeafModule {
       std::vector<std::wstring> const& items,
       winrt::Microsoft::ReactNative::JSValueObject const& anchor,
       winrt::Microsoft::ReactNative::ReactPromise<std::optional<double>> const& promise) noexcept;
+  void ShowGroupedActionMenu(
+      std::wstring const& title,
+      winrt::Microsoft::ReactNative::JSValueArray const& groups,
+      winrt::Microsoft::ReactNative::JSValueObject const& anchor,
+      winrt::Microsoft::ReactNative::ReactPromise<std::optional<winrt::Microsoft::ReactNative::JSValueObject>> const& promise) noexcept;
   void ChooseModelsToAdd(
       std::vector<std::string> const& models,
       std::wstring const& provider_name,

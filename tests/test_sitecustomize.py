@@ -28,6 +28,16 @@ class SiteCustomizeTests(unittest.TestCase):
         if result.returncode != 0:
             self.skipTest("litellm is not installed for this Python")
 
+    def require_uvicorn(self) -> None:
+        result = subprocess.run(
+            [self.python(), "-c", "import uvicorn.supervisors.multiprocess"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            self.skipTest("uvicorn is not installed for this Python")
+
     def run_probe(
         self,
         *,
@@ -308,6 +318,86 @@ class SiteCustomizeTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.strip(), "False")
+
+    def test_proxy_sitecustomize_patches_the_idle_serve_loop(self) -> None:
+        self.require_uvicorn()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = Path(temp_dir) / "runtime"
+            runtime.mkdir()
+
+            result = self.run_probe(
+                runtime=runtime,
+                template=ROOT,
+                pythonpath_extra=[],
+                code=textwrap.dedent(
+                    """
+                    import uvicorn.server
+                    from uvicorn.supervisors import multiprocess
+
+                    print(
+                        getattr(uvicorn.server.Server.main_loop, "_young_router_idle_tick_patch", False),
+                        getattr(uvicorn.server.Server.handle_exit, "_young_router_idle_tick_patch", False),
+                        getattr(multiprocess.Process.is_alive, "_young_router_idle_tick_patch", False),
+                    )
+                    """
+                ),
+                extra_env={"YOUNG_ROUTER_PROXY_PROCESS": "1"},
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "True True True")
+
+    def test_proxy_sitecustomize_defers_the_uvicorn_import(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = Path(temp_dir) / "runtime"
+            runtime.mkdir()
+
+            result = self.run_probe(
+                runtime=runtime,
+                template=ROOT,
+                pythonpath_extra=[],
+                code=textwrap.dedent(
+                    """
+                    import sys
+
+                    print(any(name == "uvicorn" or name.startswith("uvicorn.") for name in sys.modules))
+                    """
+                ),
+                extra_env={"YOUNG_ROUTER_PROXY_PROCESS": "1"},
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "False")
+
+    def test_non_proxy_python_keeps_upstream_serve_loops(self) -> None:
+        self.require_uvicorn()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = Path(temp_dir) / "runtime"
+            runtime.mkdir()
+
+            result = self.run_probe(
+                runtime=runtime,
+                template=ROOT,
+                pythonpath_extra=[],
+                code=textwrap.dedent(
+                    """
+                    import uvicorn.server
+
+                    print(getattr(uvicorn.server.Server.main_loop, "_young_router_idle_tick_patch", False))
+                    """
+                ),
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "False")
+
+    def test_proxy_master_parent_watch_checks_once_a_second(self) -> None:
+        source = (ROOT / "sitecustomize.py").read_text(encoding="utf-8")
+        watchdog = source.split("def _install_core_parent_watchdog", 1)[1]
+
+        self.assertIn("_PROXY_PARENT_WATCH_INTERVAL_SECONDS = 1.0", source)
+        self.assertIn("time.sleep(_PROXY_PARENT_WATCH_INTERVAL_SECONDS)", watchdog)
+        self.assertNotIn("time.sleep(0.1)", watchdog)
 
     def test_disable_system_proxy_lookup_uses_environment_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

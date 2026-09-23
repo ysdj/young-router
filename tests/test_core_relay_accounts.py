@@ -250,6 +250,66 @@ class RelayAccountsDomainTests(unittest.TestCase):
 
             self.assertEqual(8.75, refreshed["balance"])
 
+    def test_relay_key_read_keeps_the_rest_of_the_station_key_list(self) -> None:
+        """One station answer caches every key, so the next key is a cache hit.
+
+        The group manager reveals one key at a time through Core's plaintext
+        lease and a sub2api key list arrives whole.  A Core that just started
+        holds the account's resources but none of their keys, so the first read
+        fetches the list and every other key of that account is served from
+        what it kept.
+        """
+
+        key_path = "/api/v1/keys?page=1&page_size=100"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake = FakeRelayHTTPClient(
+                {
+                    "/api/v1/user/profile": {"data": {"balance": 8.75}},
+                    key_path: {
+                        "data": {
+                            "items": [
+                                {"id": "11", "name": "alpha", "status": "active", "key": "sk-replace-alpha"},
+                                {"id": "12", "name": "beta", "status": "active", "key": "sk-replace-beta"},
+                            ]
+                        }
+                    },
+                    "/api/v1/channels/available": {
+                        "data": [{"platforms": [{"supported_models": ["model-test"]}]}]
+                    },
+                }
+            )
+            domain = RelayAccountsDomain(root, http_client=fake)
+            account_id = domain.dispatch(
+                "account.add",
+                {"type": "sub2api", "label": "Sub2API", "origin": "https://relay.example.test"},
+            )["accounts"][0]["id"]
+            domain.accept_login_result(
+                account_id,
+                username="person@example.test",
+                access_token="replace-token",
+                remember_password=True,
+            )
+            resources = domain.refresh_resources(account_id)["resources"]
+            domain.apply()
+            self.assertEqual(["sub2api-11", "sub2api-12"], [resource["id"] for resource in resources])
+
+            # A reloaded Core has the resources but not their keys: the first
+            # read fetches the list once, the second key is answered from it.
+            reloaded = RelayAccountsDomain(root, http_client=fake)
+            list_reads = lambda: [path for _, path, _ in fake.requests if path == key_path]
+            before = len(list_reads())
+            self.assertEqual(
+                "sk-replace-alpha",
+                reloaded.trusted_secret_value("api_key", f"{account_id}:sub2api-11"),
+            )
+            self.assertEqual(before + 1, len(list_reads()))
+            self.assertEqual(
+                "sk-replace-beta",
+                reloaded.trusted_secret_value("api_key", f"{account_id}:sub2api-12"),
+            )
+            self.assertEqual(before + 1, len(list_reads()))
+
     def test_type_detection_classifies_public_station_signatures_without_staging(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fake = FakeRelayHTTPClient(
