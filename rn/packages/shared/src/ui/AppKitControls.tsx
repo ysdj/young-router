@@ -23,6 +23,8 @@ export type NativeButtonProps = {
   title: string;
   symbol?: string;
   symbolWithTitle?: boolean;
+  /** Draw the symbol after the title (menu buttons read "Title ▾"). */
+  symbolTrailing?: boolean;
   toolTip?: string;
   accessibilityLabel?: string;
   disabled?: boolean;

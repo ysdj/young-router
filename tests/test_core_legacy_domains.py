@@ -1920,7 +1920,7 @@ class ProvidersModelsDomainTests(unittest.TestCase):
 
 
 class CodexSettingsDomainTests(unittest.TestCase):
-    def test_use_local_api_points_the_selected_provider_at_the_young_router_proxy(self) -> None:
+    def test_use_local_api_rewrites_the_selected_provider_in_place(self) -> None:
         """The pane's Codex action adopts this app's own proxy as the backend."""
 
         with tempfile.TemporaryDirectory() as directory:
@@ -1932,11 +1932,11 @@ class CodexSettingsDomainTests(unittest.TestCase):
             home = root / "codex"
             home.mkdir()
             (home / "config.toml").write_text(
-                'model = "default-chat"\n'
-                'model_provider = "custom"\n'
+                'model = "relay-model"\n'
+                'model_provider = "relay"\n'
                 '\n'
-                '[model_providers.custom]\n'
-                'name = "custom"\n'
+                '[model_providers.relay]\n'
+                'name = "relay"\n'
                 'base_url = "https://relay.example.test/v1"\n'
                 'wire_api = "responses"\n'
                 'requires_openai_auth = true\n',
@@ -1946,23 +1946,203 @@ class CodexSettingsDomainTests(unittest.TestCase):
             domain = CodexSettingsDomain(runtime, codex_home=home)
             self.assertFalse(domain.snapshot()["uses_local_api"])
 
-            domain.dispatch("use_local_api", {})
+            # The pane names the route the client leaves behind: the proxy
+            # serves public model names, so the direct route id would not
+            # resolve there.
+            domain.dispatch("use_local_api", {"model": "default-chat"})
+            domain.apply()
 
             base_url, key = local_proxy_endpoint()
             self.assertRegex(base_url, r"^http://127\.0\.0\.1:\d+/v1$")
             structured = domain.snapshot()["structured"]
-            provider = next(item for item in structured["providers"] if item["id"] == "custom")
-            self.assertEqual(base_url, provider["base_url"])
+            # The client keeps the provider ``model_provider`` names; only that
+            # row's endpoint changes, so no provider identity is invented and
+            # the client keeps its own backend name.
+            self.assertEqual("relay", structured["model_provider"])
+            relay = next(item for item in structured["providers"] if item["id"] == "relay")
+            self.assertEqual(base_url, relay["base_url"])
+            self.assertEqual("default-chat", structured["model"])
             documents = domain.export(include_sensitive=True)
             self.assertIn(base_url, documents["config_text"])
             self.assertNotIn("relay.example.test", documents["config_text"])
+            self.assertNotIn("[model_providers.custom]", documents["config_text"])
             # The proxy's master key replaces the relay credential.
             self.assertIn(key, documents["config_text"] + documents["auth_text"])
-            # The pane's button reports this state instead of offering a no-op.
+            # The pane's switch reports this state instead of offering a no-op.
             self.assertTrue(domain.snapshot()["uses_local_api"])
-            domain.dispatch("use_local_api", {})
+            domain.dispatch("use_local_api", {"model": "default-chat"})
             self.assertEqual(documents, domain.export(include_sensitive=True))
             self.assertTrue(domain.snapshot()["uses_local_api"])
+
+    def test_use_local_api_follows_a_built_in_openai_selection(self) -> None:
+        """A built-in OpenAI selection takes Codex's own base-url override."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            from young_router.core.domains._shared import local_proxy_endpoint
+
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            home = root / "codex"
+            home.mkdir()
+            (home / "config.toml").write_text(
+                'model = "gpt-5.6-sol"\n'
+                'model_provider = "openai"\n',
+                encoding="utf-8",
+            )
+            (home / "auth.json").write_text('{"OPENAI_API_KEY": "replace-me-secret"}\n', encoding="utf-8")
+            domain = CodexSettingsDomain(runtime, codex_home=home)
+
+            domain.dispatch("use_local_api", {"model": "default-chat"})
+            domain.apply()
+
+            base_url, key = local_proxy_endpoint()
+            structured = domain.snapshot()["structured"]
+            self.assertEqual("openai", structured["model_provider"])
+            self.assertEqual(base_url, structured["openai_base_url"])
+            documents = domain.export(include_sensitive=True)
+            self.assertIn(f'openai_base_url = "{base_url}"', documents["config_text"])
+            self.assertNotIn("[model_providers", documents["config_text"])
+            self.assertIn(key, documents["auth_text"])
+            self.assertTrue(domain.snapshot()["uses_local_api"])
+
+    def test_use_local_api_follows_the_runtime_port_and_master_key(self) -> None:
+        """A client on the proxy follows the endpoint the runtime settings own."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            from young_router.core.domains import _shared
+
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            home = root / "codex"
+            home.mkdir()
+            (home / "config.toml").write_text(
+                'model = "default-chat"\n'
+                'model_provider = "relay"\n'
+                '\n'
+                '[model_providers.relay]\n'
+                'name = "relay"\n'
+                'base_url = "https://relay.example.test/v1"\n'
+                'wire_api = "responses"\n'
+                'requires_openai_auth = true\n',
+                encoding="utf-8",
+            )
+            (home / "auth.json").write_text('{"OPENAI_API_KEY": "retired-key"}\n', encoding="utf-8")
+            with mock.patch.object(
+                _shared, "local_proxy_endpoint", return_value=("http://127.0.0.1:19999/v1", "sk-first")
+            ):
+                domain = CodexSettingsDomain(runtime, codex_home=home)
+                # A client on one of its own backends is never rewritten: the
+                # row names the user's provider, not this app's proxy.
+                self.assertFalse(domain.follow_local_api_endpoint())
+                domain.dispatch("use_local_api", {"model": "default-chat"})
+                domain.apply()
+            self.assertIn("http://127.0.0.1:19999/v1", domain.export(include_sensitive=True)["config_text"])
+
+            # The runtime pane moved the proxy to another port and issued a new
+            # master key; the client has to follow both, and only the row
+            # ``model_provider`` names plus the client's key may change.
+            with mock.patch.object(
+                _shared, "local_proxy_endpoint", return_value=("http://127.0.0.1:20001/v1", "sk-second")
+            ):
+                self.assertTrue(domain.follow_local_api_endpoint())
+                self.assertFalse(domain.follow_local_api_endpoint())
+            documents = domain.export(include_sensitive=True)
+            self.assertIn("http://127.0.0.1:20001/v1", documents["config_text"])
+            self.assertNotIn("19999", documents["config_text"])
+            self.assertEqual(1, documents["config_text"].count("[model_providers.relay]"))
+            self.assertIn('model_provider = "relay"', documents["config_text"])
+            self.assertNotIn("[model_providers.custom]", documents["config_text"])
+            self.assertNotIn("sk-first", documents["auth_text"])
+            self.assertIn("sk-second", documents["auth_text"])
+            # The model the client runs is not part of the endpoint.
+            self.assertEqual("default-chat", domain.snapshot()["structured"]["model"])
+            self.assertTrue(domain.snapshot()["uses_local_api"])
+
+    def test_use_local_api_leaves_a_hand_written_provider_alone(self) -> None:
+        """A provider row that is not this app's proxy is never rewritten."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            from young_router.core.domains import _shared
+
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            home = root / "codex"
+            home.mkdir()
+            (home / "config.toml").write_text(
+                'model = "default-chat"\n'
+                'model_provider = "local-llama"\n'
+                '\n'
+                '[model_providers.local-llama]\n'
+                'name = "local-llama"\n'
+                'base_url = "http://127.0.0.1:11434/v1"\n'
+                'wire_api = "chat"\n'
+                'requires_openai_auth = true\n',
+                encoding="utf-8",
+            )
+            (home / "auth.json").write_text('{"OPENAI_API_KEY": "local-key"}\n', encoding="utf-8")
+            with mock.patch.object(
+                _shared, "local_proxy_endpoint", return_value=("http://127.0.0.1:20002/v1", "sk-second")
+            ):
+                domain = CodexSettingsDomain(runtime, codex_home=home)
+                self.assertFalse(domain.follow_local_api_endpoint())
+                documents = domain.export(include_sensitive=True)
+                self.assertIn("http://127.0.0.1:11434/v1", documents["config_text"])
+                self.assertNotIn("sk-second", documents["auth_text"])
+
+    def test_use_saved_model_restores_the_provider_endpoint_key_and_default_model(self) -> None:
+        """The designate action points the client straight at one saved route."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            home = root / "codex"
+            home.mkdir()
+            # The client currently runs a public model name through the local
+            # proxy, so every part of the designated route has to be written —
+            # the default model, that route's endpoint, and its key — while the
+            # provider ``model_provider`` names keeps its identity.
+            (home / "config.toml").write_text(
+                'model = "stale-model"\n'
+                'model_provider = "newapi"\n'
+                '\n'
+                '[model_providers.newapi]\n'
+                'name = "newapi"\n'
+                'base_url = "http://127.0.0.1:12390/v1"\n'
+                'wire_api = "responses"\n'
+                'requires_openai_auth = true\n',
+                encoding="utf-8",
+            )
+            (home / "auth.json").write_text('{"OPENAI_API_KEY": "sk-young-router"}\n', encoding="utf-8")
+            domain = CodexSettingsDomain(runtime, codex_home=home)
+
+            domain.dispatch(
+                "use_saved_model",
+                {"model": "default-chat", "provider": "primary", "deployment_id": "00000071"},
+            )
+            domain.apply()
+
+            documents = domain.export(include_sensitive=True)
+            self.assertIn('model = "default-chat"', documents["config_text"])
+            self.assertNotIn('model = "stale-model"', documents["config_text"])
+            # The designation rewrites the provider the client already names —
+            # its URL, API surface, and key — instead of inventing a provider
+            # named after the route.
+            self.assertIn('model_provider = "newapi"', documents["config_text"])
+            self.assertNotIn('model_provider = "primary"', documents["config_text"])
+            self.assertNotIn("[model_providers.primary]", documents["config_text"])
+            newapi = next(
+                item for item in domain.snapshot()["structured"]["providers"] if item["id"] == "newapi"
+            )
+            self.assertEqual("https://example.test/v1", newapi["base_url"])
+            self.assertEqual("responses", newapi["wire_api"])
+            self.assertIn('base_url = "https://example.test/v1"', documents["config_text"])
+            # The route's own key replaces the router's master key.
+            self.assertIn("replace-me-secret", documents["auth_text"])
+            self.assertNotIn("sk-young-router", documents["auth_text"])
 
     def test_staged_edits_preserve_existing_codex_file_presence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1995,7 +2175,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
             runtime.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
             home = root / "codex"
             home.mkdir()
-            catalog_path = home / "young-router-model-catalog.json"
+            catalog_path = home / "model-catalog.json"
             (home / "config.toml").write_text(
                 f'model = "default-chat"\nmodel_catalog_json = "{catalog_path}"\n',
                 encoding="utf-8",
@@ -2064,7 +2244,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
             self.assertTrue(snapshot["domains"]["codex"]["model_catalog"]["enabled"])
             self.assertTrue(snapshot["domains"]["codex"]["model_catalog"]["restart_required"])
             self.assertEqual("enabled", snapshot["domains"]["codex"]["model_catalog"]["change_reason"])
-            catalog = json.loads((home / "young-router-model-catalog.json").read_text(encoding="utf-8"))
+            catalog = json.loads((home / "model-catalog.json").read_text(encoding="utf-8"))
             self.assertEqual(["default-chat"], [model["slug"] for model in catalog["models"]])
 
             acknowledged = core.dispatch(
@@ -2135,7 +2315,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
                 ["default-chat", "second-chat", "third-chat"],
                 enabled["result"]["model_catalog"]["public_models"],
             )
-            catalog = json.loads((home / "young-router-model-catalog.json").read_text(encoding="utf-8"))
+            catalog = json.loads((home / "model-catalog.json").read_text(encoding="utf-8"))
             self.assertEqual(
                 ["default-chat", "second-chat", "third-chat"],
                 [model["slug"] for model in catalog["models"]],
@@ -2177,7 +2357,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
             self.assertEqual(["default-chat"], snapshot["public_models"])
             self.assertFalse(snapshot["restart_required"])
             self.assertIsNone(snapshot["change_reason"])
-            catalog = json.loads((home / "young-router-model-catalog.json").read_text(encoding="utf-8"))
+            catalog = json.loads((home / "model-catalog.json").read_text(encoding="utf-8"))
             self.assertEqual(["default-chat"], [model["slug"] for model in catalog["models"]])
 
     def test_enabled_catalog_updates_when_litellm_reports_an_empty_model_list(self) -> None:
@@ -2221,7 +2401,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
             self.assertEqual([], snapshot["public_models"])
             self.assertTrue(snapshot["restart_required"])
             self.assertEqual("catalog_repaired", snapshot["change_reason"])
-            catalog = json.loads((home / "young-router-model-catalog.json").read_text(encoding="utf-8"))
+            catalog = json.loads((home / "model-catalog.json").read_text(encoding="utf-8"))
             self.assertEqual([], catalog["models"])
 
     @mock.patch("codex_config._local_exposed_models", return_value=(["default-chat"], True))
@@ -2245,7 +2425,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
                 {"domain": "codex", "type": "acknowledge_model_catalog_restart", "payload": {}},
                 expected_revision=enabled["revision"],
             )
-            catalog_path = home / "young-router-model-catalog.json"
+            catalog_path = home / "model-catalog.json"
             catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
             catalog["models"][0]["description"] = "stale metadata"
             catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
@@ -2278,7 +2458,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
                 {"domain": "codex", "type": "acknowledge_model_catalog_restart", "payload": {}},
                 expected_revision=enabled["revision"],
             )
-            catalog_path = home / "young-router-model-catalog.json"
+            catalog_path = home / "model-catalog.json"
             catalog_path.unlink()
 
             snapshot = core.snapshot()["domains"]["codex"]["model_catalog"]
@@ -2345,7 +2525,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
             core.apply("codex", revision=staged["revision"])
 
             snapshot = core.snapshot()["domains"]["codex"]["model_catalog"]
-            catalog = json.loads((home / "young-router-model-catalog.json").read_text(encoding="utf-8"))
+            catalog = json.loads((home / "model-catalog.json").read_text(encoding="utf-8"))
 
             self.assertEqual(["model-b", "model-a"], snapshot["public_models"])
             self.assertEqual(["model-b", "model-a"], [model["slug"] for model in catalog["models"]])
@@ -2420,7 +2600,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
             codex._catalog_source_checked_at = 0.0
             first = core.snapshot()["domains"]["codex"]["model_catalog"]
             self.assertFalse(first["restart_required"])
-            catalog = json.loads((home / "young-router-model-catalog.json").read_text(encoding="utf-8"))
+            catalog = json.loads((home / "model-catalog.json").read_text(encoding="utf-8"))
             self.assertEqual(["default-chat"], [model["slug"] for model in catalog["models"]])
 
             # A second fresh observation completes the repair and queues the
@@ -2429,7 +2609,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
             repaired = core.snapshot()["domains"]["codex"]["model_catalog"]
             self.assertTrue(repaired["restart_required"])
             self.assertEqual("catalog_repaired", repaired["change_reason"])
-            catalog = json.loads((home / "young-router-model-catalog.json").read_text(encoding="utf-8"))
+            catalog = json.loads((home / "model-catalog.json").read_text(encoding="utf-8"))
             self.assertEqual(["deepseek-v4-flash"], [model["slug"] for model in catalog["models"]])
 
             core.dispatch(
@@ -2452,7 +2632,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
             # /v1/models surface does not expose.
             self.assertFalse(catalog_state["restart_required"])
             self.assertIsNone(catalog_state["change_reason"])
-            catalog = json.loads((home / "young-router-model-catalog.json").read_text(encoding="utf-8"))
+            catalog = json.loads((home / "model-catalog.json").read_text(encoding="utf-8"))
             self.assertEqual(["deepseek-v4-flash"], [model["slug"] for model in catalog["models"]])
 
     def test_sync_and_apply_preserve_unknown_toml_and_auth_fields(self) -> None:

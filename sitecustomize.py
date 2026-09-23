@@ -36,6 +36,7 @@ _CONFIG_CALLBACK_ORIGINAL_ATTR = "_young_router_config_callback_import_original"
 _OPTIONAL_DATABASE_ERROR_PATCH_ATTR = "_young_router_optional_database_error_patch"
 _TIMESTAMPED_OUTPUT_ATTR = "_young_router_timestamped_output"
 _CORE_PARENT_WATCHDOG_ATTR = "_young_router_core_parent_watchdog"
+_PROXY_PARENT_WATCH_INTERVAL_SECONDS = 1.0
 
 
 class _TimestampedOutputState:
@@ -111,9 +112,12 @@ def _install_core_parent_watchdog() -> None:
     def watch_parent() -> None:
         # Core can be killed in the short fork-to-Python-start interval. In
         # that case the master already has PPID 1: terminate immediately
-        # rather than leaving the configured port orphaned.
+        # rather than leaving the configured port orphaned.  One check per
+        # second is enough for that and costs the idle machine one wakeup
+        # instead of ten; the group is torn down on the next check rather than
+        # within a tenth of a second.
         while os.getppid() == core_pid:
-            time.sleep(0.1)
+            time.sleep(_PROXY_PARENT_WATCH_INTERVAL_SECONDS)
         try:
             os.killpg(process_group, signal.SIGTERM)
         except OSError:
@@ -390,6 +394,25 @@ def _install_uvicorn_websocket_frame_limit_patch() -> None:
     _patch_after_import("uvicorn", _patch)
 
 
+def _install_proxy_idle_patches() -> None:
+    """Stop the proxy's idle loops from waking the machine ten times a second.
+
+    The supervisor and all sixteen workers run uvicorn's ten-hertz serve loop
+    while the router is idle, and the supervisor health-checks every worker
+    twice a second.  The installer lives in ``young_router.proxy_idle`` so this
+    early hook (interpreter startup, covering the ``macos_proxy`` launch path)
+    and the callback-time ``young_router.patches.install_all`` share one
+    implementation.
+    """
+
+    def _patch(_uvicorn_module: Any) -> None:
+        from young_router.proxy_idle import install_proxy_idle_patches
+
+        install_proxy_idle_patches()
+
+    _patch_after_import("uvicorn", _patch)
+
+
 def _install_system_proxy_lookup_patch() -> None:
     raw_snapshot = os.environ.pop(_SYSTEM_PROXY_SNAPSHOT_ENV, "")
     if not raw_snapshot and os.environ.get("YOUNG_ROUTER_DISABLE_SYSTEM_PROXY_LOOKUP") != "1":
@@ -457,3 +480,4 @@ if os.environ.get("YOUNG_ROUTER_PROXY_PROCESS") == "1":
     _install_litellm_optional_database_error_patch()
     _install_litellm_openai_image_edit_usage_patch()
     _install_uvicorn_websocket_frame_limit_patch()
+    _install_proxy_idle_patches()

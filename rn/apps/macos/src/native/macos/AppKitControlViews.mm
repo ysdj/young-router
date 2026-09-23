@@ -106,6 +106,49 @@ NSInteger SegmentIndex(const std::vector<std::string> &labels, const std::string
   return selected == labels.end() ? -1 : static_cast<NSInteger>(std::distance(labels.begin(), selected));
 }
 
+// Plaintext values this process already read through Core's native lease,
+// keyed by domain/field/target.  A lease read is a two-request Core round
+// trip, and a pane re-selects the same key after every window or snapshot
+// change, so a value the app already read is shown at once instead of leaving
+// the field on its loading hint.  The memo is bounded, and a value the user
+// stages or clears replaces it.
+static const NSUInteger LiteLLMPlainTextMemoLimit = 256;
+
+static NSMutableDictionary<NSString *, NSString *> *LiteLLMPlainTextSecretMemo(void)
+{
+  static NSMutableDictionary<NSString *, NSString *> *memo = nil;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{ memo = [NSMutableDictionary dictionary]; });
+  return memo;
+}
+
+static NSString *LiteLLMPlainTextMemoKey(NSString *domain, NSString *field, NSString *target)
+{
+  return [NSString stringWithFormat:@"%@\u001f%@\u001f%@", domain ?: @"", field ?: @"", target ?: @""];
+}
+
+static void LiteLLMRememberPlainText(NSString *domain, NSString *field, NSString *target, NSString *value)
+{
+  if (domain.length == 0 || field.length == 0) return;
+  NSMutableDictionary<NSString *, NSString *> *memo = LiteLLMPlainTextSecretMemo();
+  NSString *key = LiteLLMPlainTextMemoKey(domain, field, target);
+  if (value.length == 0) {
+    [memo removeObjectForKey:key];
+    return;
+  }
+  [memo setObject:value forKey:key];
+  while (memo.count > LiteLLMPlainTextMemoLimit) {
+    NSString *oldest = memo.allKeys.firstObject;
+    if (oldest == nil) break;
+    [memo removeObjectForKey:oldest];
+  }
+}
+
+static void LiteLLMForgetPlainText(NSString *domain, NSString *field, NSString *target)
+{
+  LiteLLMRememberPlainText(domain, field, target, @"");
+}
+
 NSAttributedString *TableHeaderTitle(NSString *title)
 {
   NSMutableParagraphStyle *paragraph = [NSMutableParagraphStyle new];
@@ -134,6 +177,8 @@ NSImage *ButtonSymbolImage(const std::string &symbol)
     symbolName = @"pencil";
   } else if (symbol == "import") {
     symbolName = @"tray.and.arrow.down";
+  } else if (symbol == "help") {
+    symbolName = @"questionmark.circle";
   } else if (symbol == "info") {
     symbolName = @"info.circle";
   } else if (symbol == "power-off") {
@@ -156,6 +201,9 @@ NSImage *ButtonSymbolImage(const std::string &symbol)
     symbolName = @"chevron.up";
   } else if (symbol == "chevron-down") {
     symbolName = @"chevron.down";
+  } else if (symbol == "chevron-up-down") {
+    // The indicator a native pull-down button carries.
+    symbolName = @"chevron.up.chevron.down";
   }
   return symbolName == nil
       ? nil
@@ -1323,6 +1371,7 @@ static void InstallPersistentScrollers(NSScrollView *scrollView, BOOL horizontal
   std::string _title;
   std::string _symbol;
   BOOL _symbolWithTitle;
+  BOOL _symbolTrailing;
   BOOL _busy;
 }
 
@@ -1366,12 +1415,22 @@ static void InstallPersistentScrollers(NSScrollView *scrollView, BOOL horizontal
 {
   NSString *title = StringFromStdString(_title);
   NSImage *symbolImage = ButtonSymbolImage(_symbol);
+  if (symbolImage != nil && _symbolTrailing) {
+    // A menu indicator is drawn a step smaller than the label it follows,
+    // exactly the way AppKit draws a pull-down button's own indicator.
+    NSImageSymbolConfiguration *configuration =
+        [NSImageSymbolConfiguration configurationWithPointSize:LiteLLMUIFontSize - 3.5 weight:NSFontWeightMedium];
+    symbolImage = [symbolImage imageWithSymbolConfiguration:configuration];
+  }
   const BOOL showsTitle = symbolImage == nil || _symbolWithTitle;
   NSImage *image = _busy ? AppKitBusySpinner.frames[(NSUInteger)_busyStep] : symbolImage;
   _button.image = image;
+  // A busy button draws the spinner as its leading content; an idle menu
+  // button draws its symbol after the title so it reads like a pop-up.
+  const BOOL trailingSymbol = _symbolTrailing && !_busy;
   _button.imagePosition = image == nil
       ? NSNoImage
-      : (showsTitle ? NSImageLeading : NSImageOnly);
+      : (showsTitle ? (trailingSymbol ? NSImageTrailing : NSImageLeading) : NSImageOnly);
   _button.title = showsTitle ? title : @"";
 }
 
@@ -1417,6 +1476,7 @@ static void InstallPersistentScrollers(NSScrollView *scrollView, BOOL horizontal
   const BOOL titleChanged = oldViewProps.title != newViewProps.title;
   const BOOL symbolChanged = oldViewProps.symbol != newViewProps.symbol;
   const BOOL symbolWithTitleChanged = oldViewProps.symbolWithTitle != newViewProps.symbolWithTitle;
+  const BOOL symbolTrailingChanged = oldViewProps.symbolTrailing != newViewProps.symbolTrailing;
   const BOOL linkChanged = oldViewProps.link != newViewProps.link;
   const BOOL plainLinkChanged = oldViewProps.plainLink != newViewProps.plainLink;
   const BOOL compactChanged = oldViewProps.compact != newViewProps.compact;
@@ -1430,11 +1490,12 @@ static void InstallPersistentScrollers(NSScrollView *scrollView, BOOL horizontal
   BOOL useCompactControl = newViewProps.compact && !link;
   BOOL defaultAction = !link && newViewProps.primary && !newViewProps.disabled;
 
-  if (titleChanged || symbolChanged || symbolWithTitleChanged || busyChanged) {
+  if (titleChanged || symbolChanged || symbolWithTitleChanged || symbolTrailingChanged || busyChanged) {
     NSString *title = StringFromStdString(newViewProps.title);
     _title = newViewProps.title;
     _symbol = newViewProps.symbol;
     _symbolWithTitle = newViewProps.symbolWithTitle;
+    _symbolTrailing = newViewProps.symbolTrailing;
     _busy = newViewProps.busy;
     [self applyButtonContent];
     if (newViewProps.toolTip.empty()) {
@@ -1491,7 +1552,7 @@ static void InstallPersistentScrollers(NSScrollView *scrollView, BOOL horizontal
     [self applyButtonContent];
   }
 
-  if (titleChanged || symbolChanged || symbolWithTitleChanged || linkChanged || plainLinkChanged || compactChanged || busyChanged) {
+  if (titleChanged || symbolChanged || symbolWithTitleChanged || symbolTrailingChanged || linkChanged || plainLinkChanged || compactChanged || busyChanged) {
     [_host setNeedsLayout:YES];
   }
   [super updateProps:props oldProps:oldProps];
@@ -1524,6 +1585,7 @@ static void InstallPersistentScrollers(NSScrollView *scrollView, BOOL horizontal
   _title.clear();
   _symbol.clear();
   _symbolWithTitle = NO;
+  _symbolTrailing = NO;
   _busy = NO;
   [_busyTimer invalidate];
   _busyTimer = nil;
@@ -1562,6 +1624,10 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitButtonCls(void)
   NSButton *_checkbox;
   LiteLLMAppKitControlHostView *_host;
   BOOL _synchronizing;
+  // Whether the drawn control already carries props.  A mount has to paint the
+  // props it is given even when they equal the component's defaults: comparing
+  // only old and new props leaves a box that is configured on drawn off.
+  BOOL _propsApplied;
 }
 
 + (ComponentDescriptorProvider)componentDescriptorProvider
@@ -1598,19 +1664,21 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitButtonCls(void)
 {
   const auto &oldViewProps = *std::static_pointer_cast<const LiteLLMAppKitCheckboxProps>(_props);
   const auto &newViewProps = *std::static_pointer_cast<const LiteLLMAppKitCheckboxProps>(props);
-  const BOOL labelChanged = oldViewProps.label != newViewProps.label;
-  const BOOL labelVisibilityChanged = oldViewProps.labelVisible != newViewProps.labelVisible;
-  const BOOL compactChanged = oldViewProps.compact != newViewProps.compact;
+  const BOOL firstPass = !_propsApplied;
+  _propsApplied = YES;
+  const BOOL labelChanged = firstPass || oldViewProps.label != newViewProps.label;
+  const BOOL labelVisibilityChanged = firstPass || oldViewProps.labelVisible != newViewProps.labelVisible;
+  const BOOL compactChanged = firstPass || oldViewProps.compact != newViewProps.compact;
   if (labelChanged || labelVisibilityChanged) {
     NSString *label = StringFromStdString(newViewProps.label);
     _checkbox.title = newViewProps.labelVisible ? label : @"";
     _checkbox.accessibilityLabel = label;
   }
   _synchronizing = YES;
-  if (oldViewProps.value != newViewProps.value) {
+  if (firstPass || oldViewProps.value != newViewProps.value) {
     _checkbox.state = newViewProps.value ? NSControlStateValueOn : NSControlStateValueOff;
   }
-  if (oldViewProps.disabled != newViewProps.disabled) {
+  if (firstPass || oldViewProps.disabled != newViewProps.disabled) {
     _checkbox.enabled = !newViewProps.disabled;
   }
   if (compactChanged) {
@@ -1625,6 +1693,24 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitButtonCls(void)
     [_host setNeedsLayout:YES];
   }
   [super updateProps:props oldProps:oldProps];
+}
+
+- (void)prepareForRecycle
+{
+  [super prepareForRecycle];
+  static const auto defaultProps = std::make_shared<const LiteLLMAppKitCheckboxProps>();
+  _props = defaultProps;
+  // The drawn box is part of what a reused view carries, so it is reset with
+  // the props: otherwise Fabric hands a recycled view to a switch whose props
+  // are the defaults (unchecked), the value guard above sees no change, and
+  // the stale check stays painted over a configuration that says otherwise.
+  _propsApplied = NO;
+  _synchronizing = YES;
+  _checkbox.state = NSControlStateValueOff;
+  _checkbox.enabled = YES;
+  _checkbox.title = @"";
+  _checkbox.accessibilityLabel = nil;
+  _synchronizing = NO;
 }
 
 - (void)changed:(__unused id)sender
@@ -2332,6 +2418,10 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitTextFieldCls(void)
   NSSwitch *_switch;
   LiteLLMAppKitControlHostView *_host;
   BOOL _synchronizing;
+  // Same contract as the checkbox: the first props pass after a mount or a
+  // recycle paints the configured value even when it equals the default, so a
+  // switch that is configured on never mounts drawn off.
+  BOOL _propsApplied;
 }
 
 + (ComponentDescriptorProvider)componentDescriptorProvider
@@ -2371,15 +2461,31 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitTextFieldCls(void)
 {
   const auto &oldViewProps = *std::static_pointer_cast<const LiteLLMAppKitSwitchProps>(_props);
   const auto &newViewProps = *std::static_pointer_cast<const LiteLLMAppKitSwitchProps>(props);
+  const BOOL firstPass = !_propsApplied;
+  _propsApplied = YES;
   _synchronizing = YES;
-  if (oldViewProps.value != newViewProps.value) {
+  if (firstPass || oldViewProps.value != newViewProps.value) {
     _switch.state = newViewProps.value ? NSControlStateValueOn : NSControlStateValueOff;
   }
-  if (oldViewProps.disabled != newViewProps.disabled) {
+  if (firstPass || oldViewProps.disabled != newViewProps.disabled) {
     _switch.enabled = !newViewProps.disabled;
   }
   _synchronizing = NO;
   [super updateProps:props oldProps:oldProps];
+}
+
+- (void)prepareForRecycle
+{
+  [super prepareForRecycle];
+  static const auto defaultProps = std::make_shared<const LiteLLMAppKitSwitchProps>();
+  _props = defaultProps;
+  // Same recycling contract as the checkbox: a reused switch must not keep
+  // another row's on state while React mounts it with the default value.
+  _propsApplied = NO;
+  _synchronizing = YES;
+  _switch.state = NSControlStateValueOff;
+  _switch.enabled = YES;
+  _synchronizing = NO;
 }
 
 - (void)changed:(__unused id)sender
@@ -4121,6 +4227,9 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
   if (newViewProps.resetRequest != oldViewProps.resetRequest &&
       newViewProps.resetRequest != _lastResetRequest) {
     _lastResetRequest = newViewProps.resetRequest;
+    // The pane uses a reset to re-read a value that changed underneath it, so
+    // the remembered copy goes with it.
+    LiteLLMForgetPlainText(_domain, _secretField, _target);
     _synchronizingField = YES;
     _field.stringValue = @"";
     _plainField.stringValue = @"";
@@ -4217,7 +4326,12 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
       [strongSelf emitRevision:strongSelf->_lastRevision present:strongSelf->_lastPresent status:@"error" error:@"stage_failed" commitRequest:strongSelf->_lastCommitRequest];
       return;
     }
-    if (preservePlainText) strongSelf->_lastSyncedPlainText = [secret copy];
+    if (preservePlainText) {
+      strongSelf->_lastSyncedPlainText = [secret copy];
+      // What the user staged is what this field now holds, so the next read
+      // shows it instead of the value it replaced.
+      LiteLLMRememberPlainText(domain, field, target, secret);
+    }
     [strongSelf emitRevision:revision.integerValue present:present.boolValue status:@"saved" error:@"" commitRequest:strongSelf->_lastCommitRequest];
   }];
 }
@@ -4227,6 +4341,18 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
   NSString *domain = [_domain copy];
   NSString *field = [_secretField copy];
   NSString *target = [_target copy];
+  // A value this process already read is shown at once: the field never
+  // returns to its loading hint for a key the app already knows.
+  NSString *memoized = LiteLLMPlainTextSecretMemo()[LiteLLMPlainTextMemoKey(domain, field, target)];
+  if (memoized.length > 0) {
+    _synchronizingField = YES;
+    [self setActiveText:memoized];
+    _lastSyncedPlainText = [memoized copy];
+    _synchronizingField = NO;
+    _secretDirty = NO;
+    [self emitRevision:_lastRevision present:_lastPresent status:@"ready" error:@"" commitRequest:_lastCommitRequest];
+    return;
+  }
   __weak LiteLLMAppKitSecureTextInputComponentView *weakSelf = self;
   [CoreIPCBridge.shared readPlainTextSecretForDomain:domain
                                                field:field
@@ -4239,6 +4365,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
       [strongSelf emitRevision:strongSelf->_lastRevision present:strongSelf->_lastPresent status:@"error" error:@"read_failed" commitRequest:strongSelf->_lastCommitRequest];
       return;
     }
+    LiteLLMRememberPlainText(domain, field, target, value);
     strongSelf->_synchronizingField = YES;
     [strongSelf setActiveText:value];
     strongSelf->_lastSyncedPlainText = [value copy];

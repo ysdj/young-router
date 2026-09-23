@@ -10,8 +10,6 @@ import type {
   NativeMenuAction,
   NativeMenuAnchor,
   LanguagePreference,
-  RelayGroupManagerGroup,
-  RelayGroupManagerKey,
   RelayGroupManagerLabels,
   RelayGroupManagerResult,
   RelayGroupManagerSnapshot,
@@ -35,6 +33,7 @@ export interface NativeLeafBridge {
   openFilePicker(purpose: "import"): Promise<string | undefined>;
   saveFilePicker(suggestedName: string): Promise<string | undefined>;
   showActionMenu(title: string, items: string[], anchor: NativeMenuAnchor): Promise<number | undefined>;
+  showGroupedActionMenu?(title: string, groups: Array<{ title: string; items: string[] }>, anchor: NativeMenuAnchor): Promise<{ group: number; item: number } | undefined>;
   showConfirmation(title: string, message: string, confirmLabel: string): Promise<boolean>;
   showReadOnlyText(title: string, text: string, closeLabel: string, language: "json" | "toml" | "text", html: string): Promise<void>;
   showProviderAuth?(options: {
@@ -73,7 +72,7 @@ export interface NativeLeafBridge {
     field: string,
     target: string | undefined,
   ): Promise<{ revision: number; present: boolean } | undefined>;
-  copySecret(domain: "relay_accounts", field: "api_key", target: string): Promise<boolean>;
+  copySecret(domain: "providers_models" | "relay_accounts", field: "api_key", target: string): Promise<boolean>;
   relayLogin(options: {
     accountId: string;
     type: "newapi" | "sub2api";
@@ -159,6 +158,9 @@ export function createNativeLeafBridgeAdapter(bridge: NativeLeafBridge): NativeL
     openFilePicker: ({ purpose }) => bridge.openFilePicker(purpose),
     saveFilePicker: ({ suggestedName }) => bridge.saveFilePicker(suggestedName),
     showActionMenu: ({ title, items, anchor }) => bridge.showActionMenu(title, items, anchor),
+    showGroupedActionMenu: bridge.showGroupedActionMenu
+      ? ({ title, groups, anchor }) => bridge.showGroupedActionMenu!(title, groups, anchor)
+      : undefined,
     showConfirmation: ({ title, message, confirmLabel }) => bridge.showConfirmation(title, message, confirmLabel),
     showReadOnlyText: ({ title, text, closeLabel, language, html }) => bridge.showReadOnlyText(title, text, closeLabel, language, html),
     showProviderAuth: bridge.showProviderAuth

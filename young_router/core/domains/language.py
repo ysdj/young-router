@@ -40,7 +40,7 @@ MESSAGES: dict[str, dict[str, str]] = {
     "en": {
         "app.title": "Young Router",
         "status.providers": "Providers & Models",
-        "status.codex": "External Apps",
+        "status.codex": "External",
         "status.general": "General",
         "status.claude": "Claude Settings",
         "status.runtime": "Runtime",
@@ -51,7 +51,6 @@ MESSAGES: dict[str, dict[str, str]] = {
         "status.reload": "Reload",
         "status.settings": "Settings…",
         "status.close": "Close",
-        "status.apply": "Apply",
         "status.cancel": "Cancel",
         "status.autoStart": "Auto Start at Login",
         "status.quit": "Quit Young Router",
@@ -104,7 +103,7 @@ MESSAGES: dict[str, dict[str, str]] = {
     "zh-Hans": {
         "app.title": "漾路由",
         "status.providers": "供应商与模型",
-        "status.codex": "外部应用",
+        "status.codex": "外部",
         "status.general": "常规",
         "status.claude": "Claude 设置",
         "status.runtime": "运行时",
@@ -115,7 +114,6 @@ MESSAGES: dict[str, dict[str, str]] = {
         "status.reload": "重新加载",
         "status.settings": "设置…",
         "status.close": "关闭",
-        "status.apply": "应用",
         "status.cancel": "取消",
         "status.autoStart": "登录时自动启动",
         "status.quit": "退出漾路由",
@@ -294,7 +292,7 @@ class LanguageSettingsDomain:
         try:
             details = self.preference_path.lstat()
             if stat.S_ISLNK(details.st_mode) or not stat.S_ISREG(details.st_mode):
-                raise LanguageSettingsError("Language preference changed on disk; reload before applying")
+                raise LanguageSettingsError("Language preference changed on disk; reload and try again")
             current = self.preference_path.read_bytes()
         except FileNotFoundError:
             current = None
@@ -303,7 +301,7 @@ class LanguageSettingsDomain:
         except OSError:
             raise LanguageSettingsError("Language preference could not be saved") from None
         if current != self._baseline_bytes:
-            raise LanguageSettingsError("Language preference changed on disk; reload before applying")
+            raise LanguageSettingsError("Language preference changed on disk; reload and try again")
         text = json.dumps({"language": self.choice}, ensure_ascii=False) + "\n"
         _atomic_write(self.preference_path, text)
         self._baseline_bytes = text.encode("utf-8")

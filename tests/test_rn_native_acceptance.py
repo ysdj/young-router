@@ -809,7 +809,10 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertNotIn('("L" as NSString).draw(', leaf)
         self.assertIn("NSStatusItem.squareLength", leaf)
         self.assertIn("statusItem.button?.image = Self.statusBarIcon", leaf)
-        self.assertNotIn("systemSymbolName:", leaf)
+        # The status item draws the bundled monochrome asset, never a system
+        # symbol; the sheet's own icon buttons are free to use SF Symbols.
+        status_icon = leaf.split("private static let statusBarIcon: NSImage = {", 1)[1].split("}()", 1)[0]
+        self.assertNotIn("systemSymbolName:", status_icon)
         self.assertIn('"filename" : "status_icon.png"', icon_contents)
         self.assertIn('"filename" : "status_icon@2x.png"', icon_contents)
         self.assertNotIn("template-rendering-intent", icon_contents)
@@ -1061,6 +1064,8 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         windows_header = (WIN_NATIVE / "WinUI3NativeLeaf.h").read_text(encoding="utf-8")
         windows_module = (WIN_NATIVE / "WinUI3NativeLeafModule.cpp").read_text(encoding="utf-8")
         windows_module_header = (WIN_NATIVE / "WinUI3NativeLeafModule.h").read_text(encoding="utf-8")
+        mac_controls = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
+        windows_controls = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
 
         self.assertIn("interface NativeMenuAnchor", types)
         self.assertIn("anchor: NativeMenuAnchor", types)
@@ -1076,6 +1081,36 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("anchor:(NSDictionary *)anchor", mac_bridge)
         self.assertIn("showActionMenu:items:anchor:resolver:rejecter:", mac_module)
         self.assertIn("NativeMenuAnchor anchor", windows_header)
+        # The grouped menu adds one submenu per provider; the pointer decides
+        # where it opens so it stays under the button that asked for it.
+        self.assertIn("showGroupedActionMenu?(title: string, groups:", bridge)
+        self.assertIn("showGroupedActionMenu: async (title, groups, anchor)", platform)
+        # The grouped menu answers the same `{group, item}` object on both
+        # hosts. A bare macOS array reaches React as `[0, 1]`, whose `.group`
+        # and `.item` are both undefined, so the chosen model was silently
+        # never applied on that host.
+        self.assertIn("func showGroupedActionMenu(title: String, groups: [[String: Any]], anchor: [String: NSNumber]) -> [String: NSNumber]?", mac)
+        self.assertIn('return ["group": NSNumber(value: tag / 1_000), "item": NSNumber(value: tag % 1_000)]', mac)
+        self.assertIn('result["group"] = static_cast<double>(selected->first);', windows_module)
+        self.assertIn('result["item"] = static_cast<double>(selected->second);', windows_module)
+        self.assertIn("designateSavedModel(savedModelGroups[choice.group]?.selections[choice.item]);", ui)
+        self.assertIn("Promise<{ group: number; item: number } | undefined>", types)
+        # One menu deep: the provider is a section caption and its models sit
+        # underneath, never a submenu opening to the right.
+        self.assertIn(".sectionHeader(title: entry.0)", mac)
+        self.assertIn("header.isEnabled = false", mac)
+        self.assertIn("let top = min(pointer.y + anchorHeight, max(bounds.maxY - 1, 0))", mac)
+        self.assertIn('symbolName = @"chevron.up.chevron.down";', mac_controls)
+        self.assertIn("configurationWithPointSize:LiteLLMUIFontSize - 3.5", mac_controls)
+        self.assertIn('if (symbol == "chevron-up-down") return L"\\xE70D";', windows_controls)
+        self.assertIn("showGroupedActionMenu:groups:anchor:resolver:rejecter:", mac_module)
+        self.assertIn("MF_STRING | MF_DISABLED", windows)
+        # The grouped menu itself stays one level deep.
+        grouped_menu = windows.split("WinUI3NativeLeaf::ShowGroupedActionMenu(", 1)[1].split(
+            "WinUI3NativeLeaf::ShowActionMenu(", 1
+        )[0]
+        self.assertNotIn("MF_POPUP", grouped_menu)
+        self.assertIn("ShowGroupedActionMenu(", windows_module)
         self.assertIn("GetClientRect(window_handle_", windows)
         self.assertIn("ClientToScreen(window_handle_", windows)
         self.assertNotIn("GetCursorPos(&point)", windows)
@@ -1575,9 +1610,12 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # The attribute order differs in the new panel; assert both parts.
         self.assertIn('domain="relay_accounts"', provided_panel)
         self.assertIn('field="api_key"', provided_panel)
+        # The custom key's 密钥值 field carries the same copy icon at its own
+        # trailing edge, and it copies the provider's stored key.
+        self.assertIn('domain: "providers_models", field: "api_key"', provided_panel)
         self.assertIn('copySecret(options:', types)
-        self.assertIn('copySecret(domain: "relay_accounts", field: "api_key", target: string)', bridge)
-        self.assertIn('copySecret?: (domain: "relay_accounts", field: "api_key", target: string)', platform)
+        self.assertIn('copySecret(domain: "providers_models" | "relay_accounts", field: "api_key", target: string)', bridge)
+        self.assertIn('copySecret?: (domain: "providers_models" | "relay_accounts", field: "api_key", target: string)', platform)
         self.assertIn('@objc(copySecret:field:target:resolver:rejecter:)', mac_module)
         self.assertIn('copySecret:(NSString *)domain field:(NSString *)field target:(NSString *)target', mac_bridge)
         self.assertIn('REACT_METHOD(CopySecret, L"copySecret")', windows_header)
@@ -1660,6 +1698,31 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("completion: @escaping ([String]?) -> Void) {", mac_leaf)
         self.assertIn("presentChildPanel(panel, in: activeWindow(), prepare: { controller.focusSearchField() })", mac_leaf)
         self.assertIn("completion(selection)", mac_leaf)
+        # The host owns the chooser while its window is up. AppKit holds a
+        # window's delegate and a control's target weakly, so a chooser that
+        # only exists as a local in `chooseModelsToAdd` is collected the moment
+        # that method returns: the panel then draws and lists its models while
+        # 取消, 全选, 反选 and + each deliver their action to nobody, the
+        # title-bar close button never reaches `windowWillClose`, and no path
+        # answers the pending promise. One completion settles the chooser and
+        # ends the child surface together, so the window it locked behind it is
+        # unlocked by the same call that answers the promise.
+        self.assertIn("private var openModelChooser: ModelChooser?", mac_leaf)
+        self.assertIn("let completion: ([String]?) -> Void", mac_leaf)
+        self.assertIn(
+            "openModelChooser = ModelChooser(panel: panel, controller: controller, completion: completion)",
+            mac_leaf,
+        )
+        self.assertIn("controller.onFinish = { [weak self] selection in", mac_leaf)
+        self.assertIn("self?.finishModelChooser(panel, selection: selection)", mac_leaf)
+        self.assertIn("private func finishModelChooser(_ panel: NSPanel, selection: [String]?) {", mac_leaf)
+        self.assertIn("panel.delegate = nil", mac_leaf)
+        self.assertIn("chooser.completion(selection)", mac_leaf)
+        # A request that lands on an open chooser settles it instead of stacking
+        # a second identical window over the one the user is answering, and the
+        # lock only brings forward a child that is still open.
+        self.assertIn("if let open = openModelChooser {", mac_leaf)
+        self.assertIn("guard let panel, self?.isChildPanel(panel) == true else { return }", mac_leaf)
         self.assertIn("let searchField = NativeInstantFocusSearchField()", mac_leaf)
         self.assertIn("searchField.focusRingType = .none", mac_leaf)
         self.assertIn("showsInstantFocusBorder = true", mac_leaf)
@@ -2188,6 +2251,62 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("_tableView.usesAlternatingRowBackgroundColors = NO;", table)
         self.assertNotIn("_frameView.framed = YES;", table)
 
+    def test_boolean_controls_reset_their_drawn_state_when_recycled(self) -> None:
+        """A reused checkbox or switch must not paint another row's on state.
+
+        The drawn state lives in the AppKit control, not in the props, and the
+        props-update guard only repaints on a *changed* value.  A recycled
+        view handed to a row whose props equal the defaults therefore kept the
+        previous row's check painted over a configuration that said otherwise.
+        """
+
+        controls = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
+        windows = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
+        for implementation, exported, control, drawn in (
+            (
+                "@implementation LiteLLMAppKitCheckboxComponentView",
+                "LiteLLMAppKitCheckboxCls",
+                "_checkbox",
+                "_checkbox.state = NSControlStateValueOff;",
+            ),
+            (
+                "@implementation LiteLLMAppKitSwitchComponentView",
+                "LiteLLMAppKitSwitchCls",
+                "_switch",
+                "_switch.state = NSControlStateValueOff;",
+            ),
+        ):
+            start = controls.index(implementation)
+            end = controls.index(f"Class<RCTComponentViewProtocol> {exported}", start)
+            view = controls[start:end]
+            self.assertIn("- (void)prepareForRecycle", view)
+            self.assertIn("_props = defaultProps;", view)
+            self.assertIn(drawn, view)
+            self.assertIn(f"{control}.enabled = YES;", view)
+            # A mount must paint the props it is given, not only a change:
+            # a switch configured on has to mount on, and the first pass after
+            # a mount or a recycle is what guarantees that.
+            self.assertIn("BOOL _propsApplied;", view)
+            self.assertIn("const BOOL firstPass = !_propsApplied;", view)
+            self.assertIn("_propsApplied = YES;", view)
+            self.assertIn("_propsApplied = NO;", view)
+            self.assertIn("if (firstPass || oldViewProps.value != newViewProps.value) {", view)
+            self.assertIn("if (firstPass || oldViewProps.disabled != newViewProps.disabled) {", view)
+        # The Windows mirror resets the same controlled state from the island's
+        # Destroying hook, exactly like the table and the code web view.
+        self.assertIn(
+            "void PrepareForRecycle(\n      winrt::Microsoft::ReactNative::ComponentView const&) noexcept {",
+            windows,
+        )
+        self.assertIn("checkbox_.IsChecked(false);", windows)
+        # The Windows mirror applies every prop when it has no previous props,
+        # which is the same first-pass contract.
+        self.assertIn("const bool value_changed = !old_props || old_props->value != props.value;", windows)
+        self.assertIn("const bool disabled_changed = !old_props || old_props->disabled != props.disabled;", windows)
+        self.assertIn("value_ = false;", windows)
+        self.assertIn("  RegisterCheckbox(package_builder);", windows)
+        self.assertIn("  RegisterSwitch(package_builder);", windows)
+
     def test_macos_menu_autostart_fallback_uses_localization(self) -> None:
         leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
         self.assertIn('"autoStart": "Auto Start at Login"', leaf)
@@ -2218,11 +2337,11 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             "Class<RCTComponentViewProtocol> LiteLLMAppKitSwitchCls", 1
         )[0]
 
-        self.assertIn("const BOOL labelChanged = oldViewProps.label != newViewProps.label;", checkbox)
-        self.assertIn("const BOOL labelVisibilityChanged = oldViewProps.labelVisible != newViewProps.labelVisible;", checkbox)
+        self.assertIn("const BOOL labelChanged = firstPass || oldViewProps.label != newViewProps.label;", checkbox)
+        self.assertIn("const BOOL labelVisibilityChanged = firstPass || oldViewProps.labelVisible != newViewProps.labelVisible;", checkbox)
         self.assertIn('_checkbox.title = newViewProps.labelVisible ? label : @"";', checkbox)
         self.assertIn("_checkbox.accessibilityLabel = label;", checkbox)
-        self.assertIn("const BOOL compactChanged = oldViewProps.compact != newViewProps.compact;", checkbox)
+        self.assertIn("const BOOL compactChanged = firstPass || oldViewProps.compact != newViewProps.compact;", checkbox)
         self.assertIn("if (labelChanged || labelVisibilityChanged || compactChanged) {\n    [_host setNeedsLayout:YES];\n  }", checkbox)
         self.assertNotIn("[_host setNeedsLayout:YES];", switch)
 
@@ -2258,27 +2377,38 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("if (labelsChanged || compactChanged) {\n    [_host setNeedsLayout:YES];\n  }", segmented)
         self.assertNotIn("_control.selectedSegment = SegmentIndex(viewProps.labels", segmented)
         self.assertIn("const BOOL titleChanged = oldViewProps.title != newViewProps.title;", button)
-        self.assertIn("if (titleChanged || symbolChanged || symbolWithTitleChanged || linkChanged || plainLinkChanged || compactChanged || busyChanged) {\n    [_host setNeedsLayout:YES];\n  }", button)
+        self.assertIn("if (titleChanged || symbolChanged || symbolWithTitleChanged || symbolTrailingChanged || linkChanged || plainLinkChanged || compactChanged || busyChanged) {\n    [_host setNeedsLayout:YES];\n  }", button)
         self.assertIn('symbolName = @"pause.fill";', controls)
         self.assertIn('symbolName = @"play.fill";', controls)
         self.assertIn('symbolName = @"minus";', controls)
         self.assertIn('symbolName = @"trash";', controls)
         self.assertIn('symbolName = @"tray.and.arrow.down";', controls)
         self.assertIn('symbolName = @"arrow.clockwise";', controls)
-        self.assertIn("_button.imagePosition = image == nil\n      ? NSNoImage\n      : (showsTitle ? NSImageLeading : NSImageOnly);", button)
+        self.assertIn("_button.imagePosition = image == nil\n      ? NSNoImage\n      : (showsTitle ? (trailingSymbol ? NSImageTrailing : NSImageLeading) : NSImageOnly);", button)
         self.assertIn('symbolName = @"info.circle";', controls)
+        self.assertIn('symbolName = @"questionmark.circle";', controls)
 
         windows = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
         self.assertIn('const auto symbol = props.symbol.value_or("");', windows)
         self.assertIn('icon.FontFamily(FontFamily(L"Segoe MDL2 Assets"));', windows)
-        self.assertIn('if (symbol == "check")', windows)
-        self.assertIn('else if (symbol == "power-on" || symbol == "power-off")', windows)
-        self.assertIn('else if (symbol == "copy")', windows)
-        self.assertIn('else if (symbol == "edit")', windows)
-        self.assertIn('else if (symbol == "import") icon.Glyph(L"\\xE8B5");', windows)
-        self.assertIn('else if (symbol == "refresh") icon.Glyph(L"\\xE72C");', windows)
-        self.assertIn('else if (symbol == "chevron-up") icon.Glyph(L"\\xE70E");', windows)
-        self.assertIn('else if (symbol == "chevron-down") icon.Glyph(L"\\xE70D");', windows)
+        self.assertIn('if (symbol == "check") return L"\\xE73E";', windows)
+        self.assertIn('if (symbol == "copy") return L"\\xE8C8";', windows)
+        self.assertIn('if (symbol == "edit") return L"\\xE70F";', windows)
+        self.assertIn('if (symbol == "power-off" || symbol == "power-on") return L"\\xE7E8";', windows)
+        self.assertIn('icon.Glyph(ButtonSymbolGlyph(symbol));', windows)
+        self.assertIn('if (symbol == "check") return L"\\xE73E";', windows)
+        self.assertIn('if (symbol == "help") return L"\\xE897";', windows)
+        self.assertIn('if (symbol == "import") return L"\\xE8B5";', windows)
+        self.assertIn('if (symbol == "refresh") return L"\\xE72C";', windows)
+        self.assertIn('if (symbol == "chevron-down") return L"\\xE70D";', windows)
+        self.assertIn('if (symbol == "chevron-up") return L"\\xE70E";', windows)
+        # One map serves the icon-only button, the glyph-with-title button, and
+        # the quiet link that carries only a glyph.
+        self.assertEqual(3, windows.count('icon.Glyph(ButtonSymbolGlyph(symbol));'))
+        self.assertIn(
+            '} else if (link && props.plainLink.value_or(false) && !symbol.empty()) {',
+            windows,
+        )
 
     def test_macos_busy_buttons_center_a_spinner_with_the_title_and_stay_live(self) -> None:
         controls = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
@@ -2300,7 +2430,11 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # the title as one group. An icon-only button keeps its icon size and
         # shows the wheel in the icon's place.
         self.assertIn("NSImage *image = _busy ? AppKitBusySpinner.frames[(NSUInteger)_busyStep] : symbolImage;", button)
-        self.assertIn(": (showsTitle ? NSImageLeading : NSImageOnly);", button)
+        self.assertIn(": (showsTitle ? (trailingSymbol ? NSImageTrailing : NSImageLeading) : NSImageOnly);", button)
+        # A menu button keeps its chevron on the title's trailing edge; while
+        # its action runs the spinner stays the leading content.
+        self.assertIn("const BOOL trailingSymbol = _symbolTrailing && !_busy;", button)
+        self.assertIn("_symbolTrailing = newViewProps.symbolTrailing;", button)
         self.assertIn('_button.title = showsTitle ? title : @"";', button)
         # The wheel turns by swapping pre-rendered frames, so nothing about the
         # button's layout changes while it reports progress.
