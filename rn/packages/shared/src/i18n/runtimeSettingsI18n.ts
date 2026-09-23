@@ -25,7 +25,6 @@ const units: Record<string, string> = {
   queries: "条查询",
   actions: "次操作",
   failures: "次失败",
-  steps: "步",
   MB: "MB",
   workers: "个工作进程",
   rows: "行",
@@ -76,6 +75,7 @@ const zh: Record<string, RuntimeCopy> = {
   YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON: { label: "dsh-vision-router 配置", help: "可直接粘贴 JSON 的多行配置框，设置 backend（auto/local/api/off）、localOllama、localLmStudio、按顺序排列的 httpProviders（支持 apiKeyEnv），或 providers 中的 {provider,model,fallbacks}（vision-http/ovh 会映射到内置 HTTP 链；未知适配器会跳过），以及 freeFallback、prompt、timeoutSeconds 和 maxTokens。上方快捷控件与对应 JSON 字段会相互更新。仅当所选模型拒绝图像输入时运行；明确支持 vision 的模型仍直接收到原图。" },
   YOUNG_ROUTER_UNKNOWN_MODEL_CONTEXT_WINDOW: { label: "未知模型原始上下文", help: "当内置配置、实际路由、LiteLLM 与上游元数据都无法识别模型时，供 Codex 使用的原始上下文窗口。默认 272000，按 Codex 95% 的有效窗口策略会显示约 258k。" },
   YOUNG_ROUTER_MODEL_CONTEXT_REFRESH_HOURS: { label: "模型上下文刷新间隔", help: "托管 Codex 模型目录刷新公开上下文元数据的间隔。设为 0 后仅使用内置配置与已有缓存，不访问上游。" },
+  YOUNG_ROUTER_CATALOG_BASE_PROFILE: { label: "模型目录基础配置", help: "内部记录：第三方 Codex 模型别名继承的原生配置。由 Core 写入，仅当已安装客户端不再提供该配置时才会更新；请勿手动修改。" },
   YOUNG_ROUTER_DEPLOYMENT_COOLDOWN_FAILURES: { label: "冷却失败阈值", help: "同一部署 / 协议对连续失败多少次后临时跳过。该部署的其他已配置协议仍可使用。设为 0 可关闭冷却。" },
   YOUNG_ROUTER_DEPLOYMENT_COOLDOWN_SECONDS: { label: "冷却时长", help: "失败部署 / 协议对达到阈值后被跳过的时长。仅当所有已配置协议都在冷却时，才会排除该部署。设为 0 可关闭冷却。" },
   YOUNG_ROUTER_SESSION_DEPLOYMENT_AFFINITY: { label: "会话部署亲和", help: "让同一会话继续使用首次成功服务的部署，使提示缓存复用与路由黏性在多轮之间保持稳定。关闭后每轮完全按路由策略选择。" },
@@ -104,7 +104,7 @@ const zh: Record<string, RuntimeCopy> = {
 };
 
 const options: Record<string, Record<string, string>> = {
-  "*": { on: "开启", auto: "自动", local: "本地", api: "API", off: "关闭", error: "直接报错", recovery: "恢复", recovery_cooldown: "恢复并冷却", compact: "紧凑", detailed: "详细", mcp: "MCP", browser: "内置浏览器", chrome: "Chrome", playwright: "Playwright", mock: "模拟" },
+  "*": { on: "开启", auto: "自动", local: "本地", api: "API", off: "关闭", error: "直接报错", recovery: "恢复", recovery_cooldown: "恢复并冷却" },
   YOUNG_ROUTER_PREFIX_IMAGE_MODE: { preview: "全部预览", "path-recent": "近期预览+远期路径", off: "关闭" },
 };
 const englishOptions: Record<string, string> = {
@@ -113,6 +113,9 @@ const englishOptions: Record<string, string> = {
   auto: "Auto",
   local: "Local",
   api: "API",
+  error: "Error",
+  recovery: "Recover",
+  recovery_cooldown: "Recover + cooldown",
   preview: "Preview",
   "path-recent": "Recent previews + older paths",
 };
@@ -140,5 +143,3 @@ export function runtimeUnitLabel(value: string, translate: Translator): string {
 export function runtimeOptionLabel(key: string, value: string, translate: Translator): string {
   return isChinese(translate) ? options[key]?.[value] ?? options["*"][value] ?? value : englishOptions[value] ?? value;
 }
-
-export const runtimeLocalizedKeys = Object.freeze(Object.keys(zh));

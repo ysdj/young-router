@@ -34,6 +34,12 @@ struct NativeMenuAnchor {
   double height = 0;
 };
 
+/// One submenu of a grouped action menu: a title and the items under it.
+struct NativeMenuGroup {
+  std::wstring title;
+  std::vector<std::wstring> items;
+};
+
 // Convert a content size expressed in 96-DPI DIPs to the physical outer-frame
 // size required by AppWindow::Resize for a particular native window.
 POINT FrameTrackSizeForContentDips(HWND window, LONG width, LONG height);
@@ -75,13 +81,11 @@ struct GroupManagerLabels {
   std::wstring group_label;
   std::wstring multiplier_label;
   std::wstring value_label;
-  std::wstring copy_action_label;
   std::wstring copy_label;
   std::wstring copied_label;
   std::wstring failed_label;
   std::wstring models_label;
   std::wstring empty_label;
-  std::wstring saved_label;
   std::wstring enabled_label;
   std::wstring new_key_name;
   std::wstring auto_grouping_label;
@@ -142,6 +146,12 @@ class WinUI3NativeLeaf : public std::enable_shared_from_this<WinUI3NativeLeaf> {
       std::wstring_view language,
       std::wstring_view html);
   std::optional<size_t> ShowActionMenu(std::wstring_view title, std::vector<std::wstring> const& items, NativeMenuAnchor anchor);
+  /// Two-level menu: every group is a submenu.  Returns the chosen
+  /// ``{group, item}`` pair.
+  std::optional<std::pair<size_t, size_t>> ShowGroupedActionMenu(
+      std::wstring_view title,
+      std::vector<NativeMenuGroup> const& groups,
+      NativeMenuAnchor anchor);
   std::optional<std::vector<std::wstring>> ChooseModelsToAdd(
       std::vector<std::wstring> models,
       std::wstring provider_name,

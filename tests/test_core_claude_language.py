@@ -922,7 +922,7 @@ class LanguageSettingsDomainTests(unittest.TestCase):
                 domain.dispatch("set", {"language": "fr"})
         translator = create_translator("zh-Hans")
         self.assertEqual("Claude 设置", translator("status.claude"))
-        self.assertEqual("外部应用", translator("status.codex"))
+        self.assertEqual("外部", translator("status.codex"))
         self.assertEqual("运行时", translator("status.runtime"))
         self.assertEqual("常规", translator("status.general"))
         self.assertEqual("日志 (路由恢复 1, 冷却 2)", translator("status.logsSummary", {"recovering": 1, "cooldown": 2}))

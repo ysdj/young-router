@@ -130,6 +130,14 @@ private enum NativeRelayOriginPolicy {
     private var codexRestartConfirmationPanel: NSPanel?
     private var codexRestartConfirmationCompletion: ((String) -> Void)?
     private var childPanels: [ChildPanel] = []
+    /// The model chooser on screen: its window, the controller that answers its
+    /// controls, and the completion the pending JS promise waits on. AppKit
+    /// keeps a window's delegate and a control's target weak, so the host is
+    /// what keeps a chooser alive; without this entry the panel draws and lists
+    /// its models, but 全选, 反选, + and 取消 each deliver their action to
+    /// nobody — and the window can then only be closed with its title-bar
+    /// button, which leaves the parent locked.
+    private var openModelChooser: ModelChooser?
     private var groupManagerPanel: NSPanel?
     private var groupManagerCompletionBlock: ((NativeGroupManagerResult?) -> Void)?
     private var groupManagerController: NativeGroupManagerController?
@@ -167,7 +175,7 @@ private enum NativeRelayOriginPolicy {
         "routeProviderWizard": "Add Provider",
         "providerAuthInstruction": "Complete sign-in on the official provider page. The code below is shown only for this device-code flow.",
         "providerAuthCode": "Device code", "providerAuthCopy": "Copy", "providerAuthBlocked": "This navigation was blocked because it is outside the official provider authentication flow.",
-        "routeCodexSettings": "External Apps", "routeClaudeSettings": "Claude Settings",
+        "routeCodexSettings": "External", "routeClaudeSettings": "Claude Settings",
         "routeRuntimeSettings": "Runtime",
         "routeDataManagement": "Data Management", "routeLogs": "Logs",
         "modelChooserTitle": "Choose Models to Add", "modelChooserHeading": "Choose models to add",
@@ -511,6 +519,17 @@ private enum NativeRelayOriginPolicy {
         let parent: NSWindow?
     }
 
+    /// One open model chooser, owned by the host for as long as its window is
+    /// up so the controls, the window delegate, and the pending completion all
+    /// stay answerable. One chooser at a time: a request that lands while a
+    /// chooser is up settles that one as cancelled instead of stacking a second
+    /// identical window over it.
+    private struct ModelChooser {
+        let panel: NSPanel
+        let controller: NativeModelChooserController
+        let completion: ([String]?) -> Void
+    }
+
     /// Present a child surface — the provider wizard, the file editor, 分组管理,
     /// the relay sign-in browser, the relay usage log, the read-only document
     /// viewer, the official provider sign-in, or the model chooser — the way
@@ -580,11 +599,15 @@ private enum NativeRelayOriginPolicy {
         let shield = NativeChildPanelShield(frame: content.bounds)
         shield.autoresizingMask = [.width, .height]
         shield.setAccessibilityLabel(panel.title)
-        shield.onInteraction = { [weak panel] in
+        shield.onInteraction = { [weak self, weak panel] in
             // The click belongs to the child: keep it key, so pressing the
             // locked parent selects nothing in it and blurs nothing in the
-            // child.
-            panel?.makeKeyAndOrderFront(nil)
+            // child. Only a child that is still open comes forward: a window
+            // that already went away must not be brought back by a click on
+            // the lock it left behind, and that lock is released as soon as
+            // the child ends.
+            guard let panel, self?.isChildPanel(panel) == true else { return }
+            panel.makeKeyAndOrderFront(nil)
         }
         content.addSubview(shield, positioned: .above, relativeTo: nil)
         parent.makeFirstResponder(shield)
@@ -1029,6 +1052,74 @@ private enum NativeRelayOriginPolicy {
         return target.selectedIndex
     }
 
+    /// The point a menu opens at.  X comes from the caller's button rectangle
+    /// (its left edge), Y from the pointer: the menu hangs *below the button*
+    /// in the content view's own direction, so it never depends on which
+    /// vertical space a caller's measurement used and never opens to the
+    /// side.  Without a pointer inside the window the rectangle alone decides.
+    private func menuAnchorPoint(contentView: NSView, anchor: [String: NSNumber]) -> NSPoint {
+        let bounds = contentView.bounds
+        let anchorX = min(max(anchor["x"]?.doubleValue ?? 0, 0), max(bounds.maxX - 1, 0))
+        let anchorHeight = max(anchor["height"]?.doubleValue ?? 0, 0)
+        if let mouse = contentView.window?.mouseLocationOutsideOfEventStream {
+            let pointer = contentView.convert(mouse, from: nil)
+            if bounds.contains(pointer) {
+                // The pointer sits on the button that asked for the menu; one
+                // button height below it clears the button's own bounds.
+                let top = min(pointer.y + anchorHeight, max(bounds.maxY - 1, 0))
+                return NSPoint(x: anchorX, y: top)
+            }
+        }
+        let anchorY = anchor["y"]?.doubleValue ?? 0
+        let topDownY = contentView.isFlipped ? anchorY + anchorHeight : anchorY
+        return NSPoint(
+            x: anchorX,
+            y: min(max(topDownY, 0), max(bounds.maxY - 1, 0))
+        )
+    }
+
+    /// A grouped action menu: groups are section headers and their items are
+    /// listed underneath, so a long list of saved models stays navigable in
+    /// one menu (never a submenu on the right).  Resolves the chosen item as
+    /// the same `{group, item}` object the Windows leaf resolves — a bare
+    /// array would reach React as `[0, 1]`, whose `group`/`item` are both
+    /// undefined and leave the caller's selection silently unapplied — or nil
+    /// when the menu was dismissed.
+    func showGroupedActionMenu(title: String, groups: [[String: Any]], anchor: [String: NSNumber]) -> [String: NSNumber]? {
+        guard !title.isEmpty, title.utf8.count <= 160,
+              !groups.isEmpty, groups.count <= 32,
+              let window = activeWindow(), let contentView = window.contentView else { return nil }
+        var entries: [(String, [String])] = []
+        for group in groups {
+            guard let groupTitle = group["title"] as? String, !groupTitle.isEmpty, groupTitle.utf8.count <= 240,
+                  let items = group["items"] as? [String], !items.isEmpty, items.count <= 64,
+                  items.allSatisfy({ !$0.isEmpty && $0.utf8.count <= 240 }) else { return nil }
+            entries.append((groupTitle, items))
+        }
+        let menu = NSMenu(title: title)
+        let target = NativeActionMenuTarget()
+        for (groupIndex, entry) in entries.enumerated() {
+            if #available(macOS 14.0, *) {
+                menu.addItem(.sectionHeader(title: entry.0))
+            } else {
+                // Older systems have no section-header item: a disabled row
+                // still reads as the group's own caption.
+                let header = NSMenuItem(title: entry.0, action: nil, keyEquivalent: "")
+                header.isEnabled = false
+                menu.addItem(header)
+            }
+            for (itemIndex, itemTitle) in entry.1.enumerated() {
+                let item = NSMenuItem(title: itemTitle, action: #selector(NativeActionMenuTarget.select(_:)), keyEquivalent: "")
+                item.target = target
+                item.tag = groupIndex * 1_000 + itemIndex
+                menu.addItem(item)
+            }
+        }
+        _ = menu.popUp(positioning: nil, at: menuAnchorPoint(contentView: contentView, anchor: anchor), in: contentView)
+        guard let tag = target.selectedIndex, tag >= 0 else { return nil }
+        return ["group": NSNumber(value: tag / 1_000), "item": NSNumber(value: tag % 1_000)]
+    }
+
     func relayLogin(
         accountID: String,
         type: String,
@@ -1293,6 +1384,12 @@ private enum NativeRelayOriginPolicy {
         let contentWidth: CGFloat = 620
         let rowHeight: CGFloat = 28
         let listHeight = min(480, max(220, CGFloat(candidates.count) * rowHeight + 2))
+        // One chooser at a time: a second request settles the open one as
+        // cancelled, so its promise never hangs and no identical window stacks
+        // over the one the user is answering.
+        if let open = openModelChooser {
+            finishModelChooser(open.panel, selection: nil)
+        }
         let controller = NativeModelChooserController(
             models: candidates,
             width: contentWidth - 36,
@@ -1314,12 +1411,32 @@ private enum NativeRelayOriginPolicy {
         // window in front of the app, with the window behind it locked until it
         // ends. `initialFirstResponder` is not guaranteed to win when a panel is
         // presented, so its editor is established once the panel is key.
+        //
+        // The host owns the chooser for as long as its window is up: the
+        // panel's delegate and every control's target are weak AppKit
+        // references, so a chooser that the host only builds and presents is
+        // collected the moment this method returns, and its 取消, 全选, 反选
+        // and + buttons then answer nobody.
         controller.onFinish = { [weak self] selection in
-            self?.endChildPanel(panel)
-            withoutAnimations { panel.close() }
-            completion(selection)
+            self?.finishModelChooser(panel, selection: selection)
         }
+        openModelChooser = ModelChooser(panel: panel, controller: controller, completion: completion)
         presentChildPanel(panel, in: activeWindow(), prepare: { controller.focusSearchField() })
+    }
+
+    /// Settle the open chooser exactly once, whichever way its window went
+    /// away: the footer's + carries the selection, while 取消, Esc and the
+    /// title-bar close button carry nothing. Ending the child surface here is
+    /// what releases the lock over the window the chooser was opened from.
+    private func finishModelChooser(_ panel: NSPanel, selection: [String]?) {
+        guard let chooser = openModelChooser, chooser.panel === panel else { return }
+        openModelChooser = nil
+        // This close must not answer as a second dismissal: the window is
+        // closed by the host from here on, not by the user.
+        panel.delegate = nil
+        endChildPanel(panel)
+        withoutAnimations { panel.close() }
+        chooser.completion(selection)
     }
 
     private func makeModelChooserPanel(
@@ -1342,7 +1459,7 @@ private enum NativeRelayOriginPolicy {
         panel.minSize = NSSize(width: 520, height: 340)
         panel.isReleasedWhenClosed = false
         panel.delegate = controller
-        controller.modalWindow = panel
+        controller.chooserWindow = panel
 
         let content = NSView()
         panel.contentView = content
@@ -1777,7 +1894,7 @@ private enum NativeRelayOriginPolicy {
         case "toggle-codex-model-catalog": return "Use LiteLLM models in Codex"
         case "open-providers-models": return localized("routeProvidersModels", fallback: "Providers & Models")
         case "open-runtime-settings": return localized("routeRuntimeSettings", fallback: "Runtime")
-        case "open-codex-settings": return localized("routeCodexSettings", fallback: "External Apps")
+        case "open-codex-settings": return localized("routeCodexSettings", fallback: "External")
         case "open-data-management": return localized("routeDataManagement", fallback: "Data Management")
         case "open-logs", "open-logs?tab=recovery": return localized("routeLogs", fallback: "Logs")
         case "show-version": return localized("version", fallback: "Version")
@@ -2054,7 +2171,7 @@ private enum NativeRelayOriginPolicy {
         case "providers-models": return localized("routeProvidersModels", fallback: "Providers & Models")
         case "provider-wizard": return localized("routeProviderWizard", fallback: "Add Provider")
         case "file-editor": return localized("routeFileEditor", fallback: "Edit File")
-        case "codex-settings", "claude-settings": return localized("routeCodexSettings", fallback: "External Apps")
+        case "codex-settings", "claude-settings": return localized("routeCodexSettings", fallback: "External")
         case "runtime-settings": return localized("routeRuntimeSettings", fallback: "Runtime")
         case "data-management": return localized("routeDataManagement", fallback: "Data Management")
         case "logs": return localized("routeLogs", fallback: "Logs")
@@ -2332,6 +2449,49 @@ private func groupManagerHeaderTitle(_ title: String) -> NSAttributedString {
     ])
 }
 
+/// The plaintext keys this app already read, keyed by ``account:resource``.
+/// The group manager window is rebuilt every time it opens and Core's lease is
+/// read-once and process-local, so the host remembers what a window read: the
+/// next window shows those keys at once instead of an empty value while its
+/// own read runs.  Bounded, and dropped for an account whose keys the station
+/// reports differently.
+private final class NativeRelayKeyMemo {
+    static let shared = NativeRelayKeyMemo()
+
+    private let lock = NSLock()
+    private var values: [String: String] = [:]
+    private let limit = 1024
+
+    private static func key(_ accountID: String, _ resourceID: String) -> String {
+        "\(accountID)\u{1f}\(resourceID)"
+    }
+
+    func value(accountID: String, resourceID: String) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return values[Self.key(accountID, resourceID)]
+    }
+
+    func remember(accountID: String, resourceID: String, value: String) {
+        guard !value.isEmpty else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        values[Self.key(accountID, resourceID)] = value
+        while values.count > limit, let oldest = values.keys.first {
+            values.removeValue(forKey: oldest)
+        }
+    }
+
+    /// Drop what the host remembered for one account, so a key the station
+    /// reports differently is read again instead of being shown from memory.
+    func forget(accountID: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        let prefix = "\(accountID)\u{1f}"
+        values = values.filter { !$0.key.hasPrefix(prefix) }
+    }
+}
+
 /// The group manager window: the pre-refactor master-detail editor.  The left
 /// list carries the keys with their group and rate plus the ＋/－ toolbar, the
 /// right pane edits the selected key, and the bottom bar applies or discards
@@ -2426,8 +2586,12 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
     /// window already read instead of asking for another one, and the values
     /// are dropped with the controller when the window ends.
     private var revealedKeys: [String: String] = [:]
-    /// Distinguishes the newest reveal from a reply for an earlier selection.
-    private var revealToken = 0
+    /// The rows still waiting for their key, in the order the sheet reads them.
+    private var revealQueue: [String] = []
+    /// The queued rows a read is already running for, so a pass never asks for
+    /// the same key twice.
+    private var revealInFlight: Set<String> = []
+    private var revealPassRunning = false
 
     private weak var panel: NSPanel?
     private weak var table: NSTableView?
@@ -2516,6 +2680,14 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         self.initialAutoGrouping = autoGrouping
         self.loading = loading
         self.currentGroupNames = NativeGroupManagerController.groupNames(groups)
+        // A key this app already read is on screen when the window opens: the
+        // remembered value is what the row shows until the sheet reads the
+        // current one, so the value row is never empty for a known key.
+        for row in rows where !row.isDraft && !row.hint.isEmpty {
+            if let value = NativeRelayKeyMemo.shared.value(accountID: accountID, resourceID: row.id) {
+                revealedKeys[row.id] = value
+            }
+        }
     }
 
     /// Group names keyed by group id, for the column that names a row's group.
@@ -2561,11 +2733,19 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         let rowHeight: CGFloat = 22
         let headerHeight: CGFloat = 24
         let listHeight = min(360, max(120, CGFloat(rows.count + 1) * rowHeight + 2 + headerHeight))
+        // The window's two columns: the key list keeps its width and the detail
+        // column states the key's facts at half of it, so the sheet carries no
+        // empty right half and the key list and its detail read at one size.
+        let listWidth: CGFloat = 344
+        let detailWidth: CGFloat = 189
+        // The margins and the gap between the columns, so the window fits its
+        // two columns exactly.
+        let contentWidth = 20 + listWidth + 18 + detailWidth + 20
         // The same child-surface chrome the model chooser uses: a titled window
         // of its own with the platform close button, over the workspace it
         // belongs to.
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 780, height: 172 + listHeight),
+            contentRect: NSRect(x: 0, y: 0, width: contentWidth, height: 172 + listHeight),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -2573,6 +2753,10 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         configureImmediatePresentation(panel)
         panel.title = title
         panel.isReleasedWhenClosed = false
+        // The sheet states its columns and then sits in the middle of the
+        // screen like every other child surface; a panel left at its creation
+        // origin opens against the bottom-left corner of the display.
+        panel.center()
         self.panel = panel
 
         let content = NSView()
@@ -2730,21 +2914,28 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         // 密钥值 stays one line: a station key is one long token, so it shows
         // its head, an ellipsis, and its tail instead of reflowing the rows
         // below it.  The field still holds the whole value, so selecting it or
-        // pressing 复制 hands over the key itself.
+        // pressing the copy button beside it hands over the key itself.
         valueField.lineBreakMode = .byTruncatingMiddle
         valueField.maximumNumberOfLines = 1
         valueField.isSelectable = true
         valueField.setAccessibilityLabel(label("valueLabel"))
         self.valueField = valueField
-        let copyButton = NSButton(title: label("copyActionLabel"), target: self, action: #selector(copySelectedKey(_:)))
+        // The copy is an icon button beside the value, the way every icon
+        // action in the app reads: the words ride it as its tooltip and its
+        // accessibility label instead of taking a text button's width from
+        // the key and the models beside it.
+        let copyButton = NSButton(title: "", target: self, action: #selector(copySelectedKey(_:)))
         copyButton.bezelStyle = .rounded
         copyButton.font = detailFont
         copyButton.controlSize = .small
+        copyButton.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: label("copyLabel"))
+        copyButton.imagePosition = .imageOnly
         copyButton.toolTip = label("copyLabel")
         copyButton.setAccessibilityLabel(label("copyLabel"))
         self.copyButton = copyButton
-        // The copy action owns a fixed slice of its row, so the key (and the
-        // models) always wrap beside it instead of squeezing it to nothing.
+        // The copy action keeps its own icon-sized slice of the row, so the
+        // key (and the models) always wrap beside it instead of squeezing it
+        // to nothing.
         copyButton.setContentCompressionResistancePriority(.required, for: .horizontal)
         copyButton.setContentHuggingPriority(.required, for: .horizontal)
         for field in [valueField] {
@@ -2786,10 +2977,20 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
             $0.translatesAutoresizingMaskIntoConstraints = false
             content.addSubview($0)
         }
+        // The detail column's own trailing edge: every row in it ends here so
+        // the column reads as one block rather than a set of fields written
+        // one by one against the window's edge.
+        let detailGuide = NSLayoutGuide()
+        content.addLayoutGuide(detailGuide)
         NSLayoutConstraint.activate([
             // The window keeps its own width: a long key or model list wraps in
-            // its row instead of stretching the window to fit the text.
-            content.widthAnchor.constraint(equalToConstant: 780),
+            // its row instead of stretching the window to fit the text.  The
+            // detail column's own guide is what ends its rows, so the halved
+            // column is one fact about the layout rather than a constant
+            // repeated by every field in it.
+            content.widthAnchor.constraint(equalToConstant: contentWidth),
+            detailGuide.leadingAnchor.constraint(equalTo: listFrame.trailingAnchor, constant: 18),
+            detailGuide.widthAnchor.constraint(equalToConstant: detailWidth),
             titleLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
             titleLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
             titleLabel.topAnchor.constraint(equalTo: content.topAnchor, constant: 16),
@@ -2808,31 +3009,31 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
             addButton.widthAnchor.constraint(equalToConstant: 22),
             listFrame.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
             listFrame.topAnchor.constraint(equalTo: listTitle.bottomAnchor, constant: 6),
-            listFrame.widthAnchor.constraint(equalToConstant: 344),
+            listFrame.widthAnchor.constraint(equalToConstant: listWidth),
             listFrame.bottomAnchor.constraint(equalTo: toggle.topAnchor, constant: -14),
             scrollView.leadingAnchor.constraint(equalTo: listFrame.leadingAnchor, constant: 1),
             scrollView.trailingAnchor.constraint(equalTo: listFrame.trailingAnchor, constant: -1),
             scrollView.topAnchor.constraint(equalTo: listFrame.topAnchor, constant: 1),
             scrollView.bottomAnchor.constraint(equalTo: listFrame.bottomAnchor, constant: -1),
-            enabledCheckbox.leadingAnchor.constraint(equalTo: listFrame.trailingAnchor, constant: 18),
+            enabledCheckbox.leadingAnchor.constraint(equalTo: detailGuide.leadingAnchor),
             enabledCheckbox.topAnchor.constraint(equalTo: listFrame.topAnchor),
             nameLabel.leadingAnchor.constraint(equalTo: enabledCheckbox.leadingAnchor),
             nameLabel.topAnchor.constraint(equalTo: enabledCheckbox.bottomAnchor, constant: 12),
             nameLabel.widthAnchor.constraint(equalToConstant: detailCaptionWidth),
             nameField.leadingAnchor.constraint(equalTo: nameLabel.trailingAnchor, constant: 8),
-            nameField.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            nameField.trailingAnchor.constraint(equalTo: detailGuide.trailingAnchor),
             nameField.centerYAnchor.constraint(equalTo: nameLabel.centerYAnchor),
             groupFieldLabel.leadingAnchor.constraint(equalTo: enabledCheckbox.leadingAnchor),
             groupFieldLabel.topAnchor.constraint(equalTo: nameLabel.bottomAnchor, constant: 10),
             groupFieldLabel.widthAnchor.constraint(equalToConstant: detailCaptionWidth),
             groupPopUp.leadingAnchor.constraint(equalTo: groupFieldLabel.trailingAnchor, constant: 8),
-            groupPopUp.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            groupPopUp.trailingAnchor.constraint(equalTo: detailGuide.trailingAnchor),
             groupPopUp.centerYAnchor.constraint(equalTo: groupFieldLabel.centerYAnchor),
             multiplierLabel.leadingAnchor.constraint(equalTo: enabledCheckbox.leadingAnchor),
             multiplierLabel.topAnchor.constraint(equalTo: groupFieldLabel.bottomAnchor, constant: 10),
             multiplierLabel.widthAnchor.constraint(equalToConstant: detailCaptionWidth),
             multiplierField.leadingAnchor.constraint(equalTo: multiplierLabel.trailingAnchor, constant: 8),
-            multiplierField.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            multiplierField.trailingAnchor.constraint(equalTo: detailGuide.trailingAnchor),
             multiplierField.centerYAnchor.constraint(equalTo: multiplierLabel.centerYAnchor),
             valueLabel.leadingAnchor.constraint(equalTo: enabledCheckbox.leadingAnchor),
             valueLabel.topAnchor.constraint(equalTo: multiplierLabel.bottomAnchor, constant: 10),
@@ -2841,21 +3042,24 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
             // Both detail lists wrap from their caption's top line, so each row
             // grows down and the rows below it stay clear of the text.
             valueField.topAnchor.constraint(equalTo: valueLabel.topAnchor, constant: 1),
+            // The copy icon sits at the detail column's trailing edge; the key
+            // wraps beside it instead of running under it.
             copyButton.leadingAnchor.constraint(equalTo: valueField.trailingAnchor, constant: 6),
-            copyButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            copyButton.trailingAnchor.constraint(equalTo: detailGuide.trailingAnchor),
+            copyButton.widthAnchor.constraint(equalToConstant: 22),
             copyButton.centerYAnchor.constraint(equalTo: valueField.centerYAnchor),
             // 模型列表 takes the detail column's width under the key's facts;
             // the list scrolls when the station reports more models than the
             // window shows at once.
             modelsTitle.leadingAnchor.constraint(equalTo: enabledCheckbox.leadingAnchor),
-            modelsTitle.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            modelsTitle.trailingAnchor.constraint(equalTo: detailGuide.trailingAnchor),
             modelsTitle.topAnchor.constraint(equalTo: valueField.bottomAnchor, constant: 10),
             modelsList.leadingAnchor.constraint(equalTo: enabledCheckbox.leadingAnchor),
-            modelsList.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            modelsList.trailingAnchor.constraint(equalTo: detailGuide.trailingAnchor),
             modelsList.topAnchor.constraint(equalTo: modelsTitle.bottomAnchor, constant: 6),
             modelsHeight,
             copyStatus.leadingAnchor.constraint(equalTo: enabledCheckbox.leadingAnchor),
-            copyStatus.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            copyStatus.trailingAnchor.constraint(equalTo: detailGuide.trailingAnchor),
             copyStatus.topAnchor.constraint(equalTo: modelsList.bottomAnchor, constant: 12),
             // The detail column's last line is the copy result; it ends above
             // the footer, and the window grows to fit the rows it carries (the
@@ -2906,6 +3110,12 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         // a key the refresh replaced is read again on its next selection.
         let ids = Set(rows.map { $0.id })
         revealedKeys = revealedKeys.filter { ids.contains($0.key) }
+        revealQueue = revealQueue.filter { ids.contains($0) }
+        // The station is the authority on which keys exist: a key it no longer
+        // reports is forgotten rather than shown from what the host remembered.
+        for row in rows where !row.isDraft && row.hint.isEmpty {
+            NativeRelayKeyMemo.shared.remember(accountID: accountID, resourceID: row.id, value: "")
+        }
         modelsListHeight?.constant = CGFloat(NativeGroupManagerController.modelGridRows(rows)) * 17
         groupPopUp?.removeAllItems()
         groupPopUp?.addItems(withTitles: groups.map { $0.label })
@@ -3002,8 +3212,7 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
             enabledCheckbox?.state = .off
             nameField?.stringValue = ""
             multiplierField?.stringValue = empty
-            // A reply for the previous selection must not land on an empty row.
-            revealToken += 1
+            // Nothing is selected, so no read may write into the value row.
             valueField?.stringValue = empty
             valueField?.toolTip = nil
             modelsList?.setModels([])
@@ -3135,40 +3344,96 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
 
     /// Show the selected key in plaintext.  The value is read through Core's
     /// native capability and stays in this window: React never receives it.  A
-    /// draft key has no key on the station yet, and a key whose read fails
-    /// keeps stating the state the presence sentinel reports.
+    /// draft key has no key on the station yet, and a row with no credential
+    /// states that instead of a stand-in label that reads like the value.
     private func revealSelectedKey(_ row: KeyRow) {
         valueField?.toolTip = nil
         guard canCopy(row) else {
-            valueField?.stringValue = row.hint.isEmpty ? label("emptyLabel") : label("savedLabel")
+            // 密钥值 carries the key itself: a row whose station has no key
+            // says 未提供, and a row the sheet cannot read states nothing.
+            valueField?.stringValue = row.hint.isEmpty ? label("emptyLabel") : ""
             return
         }
         if let revealed = revealedKeys[row.id] {
             valueField?.stringValue = revealed
             return
         }
-        // The row states the key's presence until Core answers with the value.
-        valueField?.stringValue = label("savedLabel")
-        revealToken += 1
-        let token = revealToken
-        let keyID = row.id
+        // The key is read by the pass below, which starts with this row: the
+        // sheet shows what it can read rather than a stand-in label, and the
+        // rows behind this one are filled while the user looks at this one.
+        valueField?.stringValue = ""
+        fillRowKeys()
+    }
+
+    /// Read the keys this sheet shows: the selected row first, then every other
+    /// row that still needs one.  Core answers a key it already holds at once,
+    /// and a cold account costs one station read for the whole pass, so a row
+    /// carries its key when it is selected instead of staying empty while its
+    /// own read runs.
+    private func fillRowKeys() {
+        let selected = selectedRowID
+        var ids = rows
+            .filter { canCopy($0) && revealedKeys[$0.id] == nil && !revealInFlight.contains($0.id) && !revealQueue.contains($0.id) }
+            .map { $0.id }
+        guard !ids.isEmpty else { return }
+        if let selected, let index = ids.firstIndex(of: selected), index > 0 {
+            ids.remove(at: index)
+            ids.insert(selected, at: 0)
+        }
+        revealQueue.append(contentsOf: ids)
+        drainRevealQueue()
+    }
+
+    /// One read at a time: this is background work for rows the user may not
+    /// look at, and the station answers one key list for the whole account.
+    private func drainRevealQueue() {
+        guard !revealPassRunning, !revealQueue.isEmpty else { return }
+        let keyID = revealQueue.removeFirst()
+        revealInFlight.insert(keyID)
+        revealPassRunning = true
         let target = "\(accountID):\(keyID)"
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let value = try? CoreIPCBridge.shared.readPlainTextSecret(
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let value = Self.readRevealedKey(target: target)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.revealInFlight.remove(keyID)
+                self.revealPassRunning = false
+                if let value {
+                    self.revealedKeys[keyID] = value
+                    NativeRelayKeyMemo.shared.remember(accountID: self.accountID, resourceID: keyID, value: value)
+                    // The row being looked at shows what this pass read; a
+                    // wrapped key makes the detail column taller than the
+                    // panel was sized for, so the window takes the height it
+                    // now needs.
+                    if self.selectedRowID == keyID {
+                        self.valueField?.stringValue = value
+                        self.fitPanelToContent()
+                    }
+                } else if self.selectedRowID == keyID {
+                    self.showCopyStatus(self.label("failedLabel"))
+                }
+                self.drainRevealQueue()
+            }
+        }
+    }
+
+    /// The key behind one relay resource, read through Core's one-time
+    /// plaintext lease.  A Core revision that moves between the lease and the
+    /// read fails that pair rather than the key, so a lost race is retried
+    /// against a fresh lease instead of leaving the row without its value.
+    private static func readRevealedKey(target: String) -> String? {
+        let attempts = 3
+        for attempt in 1...attempts {
+            if let value = try? CoreIPCBridge.shared.readPlainTextSecret(
                 domain: "relay_accounts",
                 field: "api_key",
                 target: target
-            )
-            DispatchQueue.main.async {
-                guard let self, let value, !value.isEmpty else { return }
-                self.revealedKeys[keyID] = value
-                guard self.revealToken == token, self.selectedRowID == keyID else { return }
-                self.valueField?.stringValue = value
-                // A wrapped key makes the detail column taller than the panel
-                // was sized for, so the window takes the height it now needs.
-                self.fitPanelToContent()
+            ), !value.isEmpty {
+                return value
             }
+            if attempt < attempts { Thread.sleep(forTimeInterval: 0.25) }
         }
+        return nil
     }
 
     /// A key can only be revealed or copied while the station still holds it.
@@ -3196,16 +3461,13 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         copyButton?.isEnabled = false
         showCopyStatus("")
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let value = try? CoreIPCBridge.shared.readPlainTextSecret(
-                domain: "relay_accounts",
-                field: "api_key",
-                target: target
-            )
+            let value = Self.readRevealedKey(target: target)
             DispatchQueue.main.async {
                 guard let self else { return }
                 var copied = false
-                if let value, !value.isEmpty {
+                if let value {
                     self.revealedKeys[row.id] = value
+                    NativeRelayKeyMemo.shared.remember(accountID: self.accountID, resourceID: row.id, value: value)
                     let pasteboard = NSPasteboard.general
                     pasteboard.clearContents()
                     copied = pasteboard.setString(value, forType: .string)
@@ -3858,9 +4120,12 @@ private final class NativeModelChooserListView: NSView {
 }
 
 private final class NativeModelChooserController: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
-    private var didStopModal = false
+    private var didFinish = false
     var onFinish: (([String]?) -> Void)?
-    weak var modalWindow: NSWindow?
+    /// The chooser's window, so its search field is focused once the window is
+    /// key. The host retains both the window and this controller while the
+    /// chooser is up.
+    weak var chooserWindow: NSWindow?
     weak var searchField: NativeInstantFocusSearchField?
     weak var scrollView: NSScrollView?
     weak var resultCountLabel: NSTextField?
@@ -3894,12 +4159,12 @@ private final class NativeModelChooserController: NSObject, NSWindowDelegate, NS
     }
 
     func focusSearchField() {
-        guard let window = modalWindow, let field = searchField else { return }
+        guard let window = chooserWindow, let field = searchField else { return }
         window.makeFirstResponder(field)
     }
 
     func windowDidBecomeKey(_ notification: Notification) {
-        guard let window = notification.object as? NSWindow, window === modalWindow else { return }
+        guard let window = notification.object as? NSWindow, window === chooserWindow else { return }
         DispatchQueue.main.async { [weak self] in self?.focusSearchField() }
     }
 
@@ -3913,7 +4178,7 @@ private final class NativeModelChooserController: NSObject, NSWindowDelegate, NS
         // Filtering uses cached folded model names and only updates the rows
         // inside the viewport, so it is safe to run in AppKit's text callback.
         // Keeping this synchronous also preserves NSSearchField's editing
-        // transaction and its insertion caret inside the modal run loop.
+        // transaction and its insertion caret while the chooser window is key.
         listView.setSearchQuery(field.stringValue)
         if let scrollView = self.scrollView {
             scrollView.contentView.scroll(to: .zero)
@@ -3942,10 +4207,11 @@ private final class NativeModelChooserController: NSObject, NSWindowDelegate, NS
 
     /// Settle the pending chooser exactly once, whichever way its window went
     /// away: the Add button carries the selection, Cancel and the title-bar
-    /// close button carry nothing.
+    /// close button carry nothing. The host ends the child surface from this
+    /// one completion.
     private func finish(_ selection: [String]?) {
-        guard !didStopModal else { return }
-        didStopModal = true
+        guard !didFinish else { return }
+        didFinish = true
         let completion = onFinish
         onFinish = nil
         completion?(selection)

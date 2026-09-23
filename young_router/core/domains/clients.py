@@ -20,6 +20,7 @@ from pathlib import Path
 from collections.abc import Mapping
 from typing import Any
 
+from ..model_catalog import CATALOG_FILE_NAME, managed_catalog_path
 from ..persistence import PersistenceError, atomic_write_text, read_bytes
 from ._shared import DomainError, _action_name, _mapping
 
@@ -34,12 +35,15 @@ _DOCUMENT_SPECS: tuple[dict[str, Any], ...] = (
     {"id": "dsh_desktop_settings", "client": "dshDesktop", "name": "settings.yaml", "language": "yaml", "strict_json": False},
     {"id": "opencode_config", "client": "opencode", "name": "opencode.json", "language": "json", "strict_json": False},
     {"id": "opencode_auth", "client": "opencode", "name": "auth.json", "language": "json", "strict_json": True},
-    # Codex keeps more than config.toml and auth.json: its TUI keybindings, the
-    # global instruction file, and the command-execpolicy rules are separate
-    # user files in the same home, so the pane lists and edits them as raw text.
-    {"id": "codex_keybindings", "client": "codex", "name": "keybindings.json", "language": "json", "strict_json": True},
+    # Codex keeps more than config.toml and auth.json: the global instruction
+    # file is a separate user file in the same home, so the pane lists and
+    # edits it as raw text.
     {"id": "codex_agents", "client": "codex", "name": "AGENTS.md", "language": "text", "strict_json": False},
-    {"id": "codex_rules", "client": "codex", "name": "default.rules", "language": "text", "strict_json": False},
+    # The managed model catalog the Codex pane's switch installs.  This app
+    # regenerates it from its public model list, so the pane warns before
+    # handing it to the editor; the row keeps the file and its path visible
+    # whether or not the switch currently points Codex at it.
+    {"id": "codex_model_catalog", "client": "codex", "name": CATALOG_FILE_NAME, "language": "json", "strict_json": True},
 )
 
 
@@ -149,9 +153,8 @@ def _client_paths() -> dict[str, Path]:
         "dsh_desktop_settings": desktop_dir / "harness" / "settings.yaml",
         "opencode_config": _first_existing((opencode_config / "opencode.json", opencode_config / "opencode.jsonc")),
         "opencode_auth": opencode_data / "auth.json",
-        "codex_keybindings": codex_dir / "keybindings.json",
         "codex_agents": codex_dir / "AGENTS.md",
-        "codex_rules": codex_dir / "rules" / "default.rules",
+        "codex_model_catalog": managed_catalog_path(codex_dir),
     }
 
 
@@ -359,7 +362,7 @@ class ClientSettingsDomain:
             if self._file_bytes(document) != self._baseline_bytes.get(document)
         ]
         if changed:
-            raise DomainError("The client configuration changed on disk; reload before applying")
+            raise DomainError("The client configuration changed on disk; reload and try again")
         for document in sorted(self.documents):
             text = self._draft.get(document, "")
             if text == self._baseline.get(document, ""):

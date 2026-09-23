@@ -84,6 +84,18 @@ def _relay_site_key(value: object) -> tuple[str, str, int | None] | None:
         return None
 
 
+def _provider_issue_label(provider: Mapping[str, Any]) -> str:
+    """Slug a provider's label for a stable, path-free issue location.
+
+    The pane points at a provider row by label, never by an index into a
+    document the user cannot see; a label that carries punctuation is reduced
+    to a token so the same location never reads as a filesystem path.
+    """
+
+    label = str(provider.get("display_name") or provider.get("name") or "").strip()
+    return re.sub(r"[^A-Za-z0-9_-]+", "-", label).strip("-") or "provider"
+
+
 class ProvidersModelsDomain:
     """Staged providers/models editing through ``config_editor_core``."""
 
@@ -1880,7 +1892,7 @@ class ProvidersModelsDomain:
         except Exception:
             active = ""
         if active and active != enabled[0][1]:
-            return "Enable the active OpenAI login provider before applying"
+            return "Enable the provider that owns the active OpenAI login"
         return ""
 
     @staticmethod
@@ -4634,6 +4646,7 @@ class ProvidersModelsDomain:
         document = self._draft.get("document")
         providers = self._draft.get("providers")
         if isinstance(providers, list):
+            key_issues: list[dict[str, Any]] = []
             for provider in providers:
                 if not isinstance(provider, Mapping):
                     continue
@@ -4641,21 +4654,33 @@ class ProvidersModelsDomain:
                     keys = self._provider_api_keys(provider)
                 except DomainError:
                     return {"valid": False, "errors": ["Provider API keys are invalid"]}
-                if any(
-                    isinstance(key.get("name"), str)
-                    and bool(key["name"].strip())
-                    and not (
-                        isinstance(key.get("value"), str)
-                        and bool(key["value"].strip())
-                    )
-                    and not (
+                # One coded issue per nameless-value key instead of a single
+                # anonymous error: the pane can only point at the provider row
+                # it has to open when the location travels with the issue.
+                for index, key in enumerate(keys):
+                    name = key.get("name")
+                    if not isinstance(name, str) or not name.strip():
+                        continue
+                    if isinstance(key.get("value"), str) and key["value"].strip():
+                        continue
+                    if (
                         allow_unmaterialized_relay_keys
                         and isinstance(key.get("source"), Mapping)
                         and key["source"].get("kind") == "relay"
+                    ):
+                        continue
+                    key_issues.append(
+                        {
+                            "path": "providers_models.{}.api_keys[{}]".format(
+                                _provider_issue_label(provider), index + 1
+                            ),
+                            "code": "api_key_value_required",
+                            "message": "Every API key needs a value",
+                            "severity": "error",
+                        }
                     )
-                    for key in keys
-                ):
-                    return {"valid": False, "errors": ["Every API key needs a value"]}
+            if key_issues:
+                return {"valid": False, "issues": key_issues}
         candidate_providers = copy.deepcopy(providers)
         runtime_slot_error = self._openai_runtime_slot_error(candidate_providers)
         if runtime_slot_error:
@@ -4748,9 +4773,6 @@ class ProvidersModelsDomain:
             models = provider.get("models")
             if not isinstance(models, list):
                 continue
-            provider_label = str(
-                provider.get("display_name") or provider.get("name") or ""
-            ).strip()
             provider_enabled = bool(provider.get("enabled", True))
             for index, model in enumerate(models):
                 if not isinstance(model, Mapping):
@@ -4761,7 +4783,7 @@ class ProvidersModelsDomain:
                 if not (provider_enabled and model_enabled):
                     continue
                 location = "providers_models.{}.models[{}]".format(
-                    re.sub(r"[^A-Za-z0-9_-]+", "-", provider_label).strip("-") or "provider",
+                    _provider_issue_label(provider),
                     index + 1,
                 )
                 if not str(model.get("model_name") or model.get("name") or "").strip():
@@ -4846,7 +4868,7 @@ class ProvidersModelsDomain:
         except Exception as exc:
             message = str(exc)
             if "changed on disk" in message:
-                raise DomainError("Provider/model configuration changed on disk; reload before applying") from None
+                raise DomainError("Provider/model configuration changed on disk; reload and try again") from None
             raise _safe_problem(exc, "Provider/model configuration could not be saved") from None
         self.reload()
         return {"applied": True, **self.snapshot()}

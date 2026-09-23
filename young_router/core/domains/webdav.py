@@ -255,7 +255,7 @@ class WebDAVSettingsDomain:
         if not validation["valid"]:
             raise DomainError("WebDAV settings are invalid")
         if not _same_file(self.settings_path, self._baseline_settings) or self._enabled() != self._baseline_enabled:
-            raise DomainError("WebDAV settings changed on disk; reload before applying")
+            raise DomainError("WebDAV settings changed on disk; reload and try again")
         settings = self._settings()
         try:
             # Save through the owning module so URL normalization and the

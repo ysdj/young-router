@@ -12,7 +12,10 @@
 #include <cwctype>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <map>
+#include <mutex>
+#include <set>
 #include <thread>
 #include <winreg.h>
 #include <winver.h>
@@ -32,6 +35,45 @@ constexpr UINT kTrayMessage = WM_APP + 31;
 constexpr UINT kQuitMessage = WM_APP + 32;
 constexpr UINT kTrayMenuFirstCommand = 41000;
 constexpr double kUIFontSize = 13.0;
+
+// Plaintext relay keys this app already read, keyed by "account:resource".
+// The sheet is rebuilt every time it opens and Core's lease is read-once and
+// process-local, so the host remembers what a sheet read: the next sheet shows
+// those keys at once instead of an empty value while its own read runs.  The
+// memo is bounded and a key whose read is empty is forgotten.
+std::mutex &RelayKeyMemoLock() {
+  static std::mutex lock;
+  return lock;
+}
+
+std::map<std::wstring, std::wstring> &RelayKeyMemo() {
+  static std::map<std::wstring, std::wstring> memo;
+  return memo;
+}
+
+std::wstring RelayKeyMemoEntry(std::wstring const& account_id, std::wstring const& resource_id) {
+  return account_id + L"\x1f" + resource_id;
+}
+
+void RememberRelayKey(std::wstring const& account_id, std::wstring const& resource_id, std::wstring const& value) {
+  if (account_id.empty() || resource_id.empty()) return;
+  std::lock_guard<std::mutex> guard(RelayKeyMemoLock());
+  auto& memo = RelayKeyMemo();
+  const std::wstring entry = RelayKeyMemoEntry(account_id, resource_id);
+  if (value.empty()) {
+    memo.erase(entry);
+    return;
+  }
+  memo[entry] = value;
+  while (memo.size() > 1024) memo.erase(memo.begin());
+}
+
+std::wstring RememberedRelayKey(std::wstring const& account_id, std::wstring const& resource_id) {
+  std::lock_guard<std::mutex> guard(RelayKeyMemoLock());
+  auto const& memo = RelayKeyMemo();
+  auto found = memo.find(RelayKeyMemoEntry(account_id, resource_id));
+  return found == memo.end() ? std::wstring{} : found->second;
+}
 
 namespace web = winrt::Microsoft::Web::WebView2::Core;
 
@@ -647,6 +689,53 @@ void WinUI3NativeLeaf::ShowReadOnlyText(
   (void)completed;
 }
 
+std::optional<std::pair<size_t, size_t>> WinUI3NativeLeaf::ShowGroupedActionMenu(
+    std::wstring_view title,
+    std::vector<NativeMenuGroup> const& groups,
+    NativeMenuAnchor anchor) {
+  if (!window_handle_ || title.empty() || groups.empty() || groups.size() > 32) return std::nullopt;
+  if (!std::isfinite(anchor.x) || !std::isfinite(anchor.y) || !std::isfinite(anchor.width) || !std::isfinite(anchor.height) ||
+      anchor.x < 0 || anchor.y < 0 || anchor.width <= 0 || anchor.height <= 0 ||
+      anchor.width > 8192 || anchor.height > 8192) return std::nullopt;
+  RECT client{};
+  if (!GetClientRect(window_handle_, &client) || anchor.x + anchor.width > client.right + 1 ||
+      anchor.y + anchor.height > client.bottom + 1) return std::nullopt;
+  HMENU menu = CreatePopupMenu();
+  if (!menu) return std::nullopt;
+  for (size_t group_index = 0; group_index < groups.size(); ++group_index) {
+    auto const& group = groups[group_index];
+    if (group.title.empty() || group.title.size() > 240 || group.items.empty() || group.items.size() > 64) {
+      DestroyMenu(menu);
+      return std::nullopt;
+    }
+    // The provider is the group's own caption: a disabled row keeps the list
+    // one menu deep, with its models directly underneath.
+    AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, group.title.c_str());
+    for (size_t item_index = 0; item_index < group.items.size(); ++item_index) {
+      auto const& item = group.items[item_index];
+      if (item.empty() || item.size() > 240) {
+        DestroyMenu(menu);
+        return std::nullopt;
+      }
+      AppendMenuW(menu, MF_STRING, static_cast<UINT_PTR>(group_index * 1'000 + item_index + 1), item.c_str());
+    }
+  }
+  // React Native reports window-local DIPs from the top-left. Convert to
+  // physical client pixels and anchor below the button, independent of the
+  // current mouse position.
+  const UINT dpi = std::max<UINT>(GetDpiForWindow(window_handle_), USER_DEFAULT_SCREEN_DPI);
+  POINT point{
+      MulDiv(static_cast<int>(std::lround(anchor.x)), static_cast<int>(dpi), USER_DEFAULT_SCREEN_DPI),
+      MulDiv(static_cast<int>(std::lround(anchor.y + anchor.height)), static_cast<int>(dpi), USER_DEFAULT_SCREEN_DPI),
+  };
+  ClientToScreen(window_handle_, &point);
+  const UINT selected = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, 0, window_handle_, nullptr);
+  DestroyMenu(menu);
+  if (selected == 0) return std::nullopt;
+  const size_t tag = static_cast<size_t>(selected - 1);
+  return std::make_pair(tag / 1'000, tag % 1'000);
+}
+
 std::optional<size_t> WinUI3NativeLeaf::ShowActionMenu(
     std::wstring_view title,
     std::vector<std::wstring> const& items,
@@ -1027,8 +1116,7 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
     row.original_name = key.name;
     row.original_group_id = key.group_id;
     rows->push_back(std::move(row));
-  }
-  auto syncing = std::make_shared<bool>(false);
+  }  auto syncing = std::make_shared<bool>(false);
   auto applied = std::make_shared<bool>(false);
 
   auto theme_brush = [](wchar_t const* resource, winrt::Windows::UI::Color fallback) {
@@ -1065,6 +1153,9 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
   controls::ColumnDefinition left_column;
   left_column.Width(xaml::GridLengthHelper::FromPixels(360));
   controls::ColumnDefinition right_column;
+  // The detail column states the key's facts at half the key list's width, so
+  // the sheet carries no empty right half.
+  right_column.Width(xaml::GridLengthHelper::FromPixels(190));
   layout.ColumnDefinitions().Append(left_column);
   layout.ColumnDefinitions().Append(right_column);
   controls::RowDefinition body_row;
@@ -1281,8 +1372,17 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
   controls::Grid::SetColumn(value_text, 0);
   controls::Button copy_button;
   copy_button.FontSize(kUIFontSize);
+  copy_button.MinWidth(22);
+  copy_button.Width(22);
   copy_button.Margin(xaml::Thickness{6, 0, 0, 0});
-  copy_button.Content(winrt::box_value(winrt::hstring(labels.copy_action_label)));
+  // The copy is an icon button beside the value, the way every icon action in
+  // the app reads: the words ride it as its tooltip and its automation name
+  // instead of taking a text button's width.
+  auto copy_glyph = controls::FontIcon{};
+  copy_glyph.FontFamily(winrt::Microsoft::UI::Xaml::Media::FontFamily(L"Segoe MDL2 Assets"));
+  copy_glyph.FontSize(kUIFontSize);
+  copy_glyph.Glyph(L"\xE8C8");
+  copy_button.Content(copy_glyph);
   controls::ToolTipService::SetToolTip(copy_button, winrt::box_value(winrt::hstring(labels.copy_label)));
   winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(copy_button, winrt::hstring(labels.copy_label));
   controls::Grid::SetColumn(copy_button, 1);
@@ -1393,8 +1493,14 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
   // already read instead of asking for another one, and the values are dropped
   // with the window.
   auto revealed_values = std::make_shared<std::map<std::wstring, std::wstring>>();
-  // Distinguishes the newest reveal from a reply for an earlier selection.
-  auto reveal_token = std::make_shared<uint64_t>(0);
+  // A key this app already read is on screen when the sheet opens: the
+  // remembered value is what the row shows until the sheet reads the current
+  // one, so the value row is never empty for a known key.
+  for (auto const& row : *rows) {
+    if (row.draft || row.hint.empty()) continue;
+    const std::wstring remembered = RememberedRelayKey(account_id, row.id);
+    if (!remembered.empty()) (*revealed_values)[row.id] = remembered;
+  }
   // One transient status line: every message restarts the same timer, and only
   // the newest one clears it.  The XAML objects are captured by value so a
   // reply that arrives after the sheet closes cannot touch freed stack state.
@@ -1441,11 +1547,17 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
     }
     // Core owns the plaintext; read it off the UI thread through the same
     // capability the provider workspace uses, then copy it back on the UI
-    // thread because WinUI's clipboard requires it.
-    std::thread([target, row, dispatcher, copy_button, show_copy_status, can_copy, copied_label, failed_label] {
-      auto value = CoreIPCBridge::Shared().ReadPlainTextSecret("relay_accounts", "api_key", winrt::to_string(*target));
+    // thread because WinUI's clipboard requires it.  The read retries a lease
+    // that lost a revision race, exactly like the value row's own read.
+    std::thread([target, row, dispatcher, copy_button, show_copy_status, can_copy, copied_label, failed_label, account_id] {
+      std::optional<std::wstring> value;
+      for (int attempt = 0; attempt < 3 && !value; ++attempt) {
+        value = CoreIPCBridge::Shared().ReadPlainTextSecret("relay_accounts", "api_key", winrt::to_string(*target));
+        if (value && value->empty()) value.reset();
+        if (!value && attempt < 2) std::this_thread::sleep_for(std::chrono::milliseconds(250));
+      }
       bool copied = false;
-      if (value && !value->empty()) {
+      if (value) {
         try {
           using namespace winrt::Windows::ApplicationModel::DataTransfer;
           DataPackage package;
@@ -1455,6 +1567,7 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
           copied = true;
         } catch (...) {
         }
+        if (copied) RememberRelayKey(account_id, row->id, *value);
         value->clear();
       }
       dispatcher.TryEnqueue([row, copy_button, show_copy_status, can_copy,
@@ -1467,13 +1580,101 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
 
   // Show the selected key in plaintext: the value is read through Core's native
   // capability and stays in this window.  A draft key has no key on the station
-  // yet, and a key whose read fails keeps stating the presence the descriptor
-  // reports.
-  auto reveal_value = [rows, list, value_text, account_id, revealed_values, reveal_token, can_copy,
-                       empty_label = labels.empty_label, saved_label = labels.saved_label](SheetRow const& row) {
+  // yet, and a row with no credential states that instead of a stand-in label
+  // that reads like the value.
+  //
+  // The sheet reads every row's key, the selected row first: Core answers a key
+  // it already holds at once, and a cold account costs one station read for the
+  // whole pass, so a row carries its key when it is selected instead of staying
+  // empty while its own read runs.
+  auto reveal_queue = std::make_shared<std::vector<std::wstring>>();
+  auto reveal_in_flight = std::make_shared<std::set<std::wstring>>();
+  auto reveal_pass_running = std::make_shared<bool>(false);
+  auto drain_reveal_queue = std::make_shared<std::function<void()>>();
+  *drain_reveal_queue = [reveal_queue, reveal_in_flight, reveal_pass_running, drain_reveal_queue,
+                         account_id, rows, list, value_text, revealed_values,
+                         failed_label = labels.failed_label, show_copy_status]() {
+    if (*reveal_pass_running || reveal_queue->empty()) return;
+    const std::wstring key_id = reveal_queue->front();
+    reveal_queue->erase(reveal_queue->begin());
+    reveal_in_flight->insert(key_id);
+    *reveal_pass_running = true;
+    auto dispatcher = winrt::Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread();
+    if (!dispatcher) {
+      *reveal_pass_running = false;
+      return;
+    }
+    auto target = std::make_shared<std::wstring>(account_id + L":" + key_id);
+    // The key behind one relay resource, through Core's one-time plaintext
+    // lease. A Core revision that moves between the lease and the read fails
+    // that pair rather than the key, so a lost race is retried on a fresh lease
+    // instead of leaving the row without its value.  One read runs at a time:
+    // this is background work for rows the user may not look at.
+    std::thread([target, key_id, dispatcher, value_text, revealed_values, reveal_queue, reveal_in_flight,
+                 reveal_pass_running, drain_reveal_queue, rows, list, account_id,
+                 failed_label, show_copy_status] {
+      std::optional<std::wstring> value;
+      for (int attempt = 0; attempt < 3 && !value; ++attempt) {
+        value = CoreIPCBridge::Shared().ReadPlainTextSecret("relay_accounts", "api_key", winrt::to_string(*target));
+        if (value && value->empty()) value.reset();
+        if (!value && attempt < 2) std::this_thread::sleep_for(std::chrono::milliseconds(250));
+      }
+      auto revealed_value = value ? std::make_shared<std::wstring>(*value) : std::shared_ptr<std::wstring>();
+      if (value) value->clear();
+      dispatcher.TryEnqueue([key_id, revealed_value, value_text, revealed_values, reveal_queue, reveal_in_flight,
+                             reveal_pass_running, drain_reveal_queue, rows, list, account_id,
+                             failed_label, show_copy_status] {
+        reveal_in_flight->erase(key_id);
+        *reveal_pass_running = false;
+        const int32_t selected = list.SelectedIndex();
+        const bool is_selected = selected >= 0 && static_cast<size_t>(selected) < rows->size() &&
+            (*rows)[static_cast<size_t>(selected)].id == key_id;
+        if (revealed_value) {
+          (*revealed_values)[key_id] = *revealed_value;
+          RememberRelayKey(account_id, key_id, *revealed_value);
+          // The row being looked at shows what this pass read.
+          if (is_selected) value_text.Text(winrt::hstring(EllipsizeMiddle(*revealed_value)));
+        } else if (is_selected) {
+          show_copy_status(failed_label);
+        }
+        (*drain_reveal_queue)();
+      });
+    }).detach();
+  };
+  auto fill_row_keys = [rows, revealed_values, reveal_queue, reveal_in_flight, drain_reveal_queue,
+                        can_copy, selected_index]() {
+    const int32_t selected = selected_index();
+    std::wstring selected_id;
+    if (selected >= 0 && static_cast<size_t>(selected) < rows->size()) {
+      selected_id = (*rows)[static_cast<size_t>(selected)].id;
+    }
+    std::vector<std::wstring> pending;
+    for (auto const& row : *rows) {
+      if (!can_copy(row)) continue;
+      if (revealed_values->count(row.id) > 0) continue;
+      if (reveal_in_flight->count(row.id) > 0) continue;
+      if (std::find(reveal_queue->begin(), reveal_queue->end(), row.id) != reveal_queue->end()) continue;
+      pending.push_back(row.id);
+    }
+    if (pending.empty()) return;
+    if (!selected_id.empty()) {
+      auto found = std::find(pending.begin(), pending.end(), selected_id);
+      if (found != pending.end()) {
+        const std::wstring first = *found;
+        pending.erase(found);
+        pending.insert(pending.begin(), first);
+      }
+    }
+    reveal_queue->insert(reveal_queue->end(), pending.begin(), pending.end());
+    (*drain_reveal_queue)();
+  };
+  auto reveal_value = [value_text, revealed_values, can_copy, empty_label = labels.empty_label,
+                       fill_row_keys](SheetRow const& row) {
     const std::wstring key_id = row.id;
     if (!can_copy(row)) {
-      value_text.Text(winrt::hstring(row.hint.empty() ? empty_label : saved_label));
+      // 密钥值 carries the key itself: a row whose station has no key says
+      // 未提供, and a row the sheet cannot read states nothing.
+      value_text.Text(winrt::hstring(row.hint.empty() ? empty_label : std::wstring{}));
       return;
     }
     auto revealed = revealed_values->find(key_id);
@@ -1481,26 +1682,10 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
       value_text.Text(winrt::hstring(EllipsizeMiddle(revealed->second)));
       return;
     }
-    // The row states the key's presence until Core answers with the value.
-    value_text.Text(winrt::hstring(saved_label));
-    const uint64_t token = ++(*reveal_token);
-    auto target = std::make_shared<std::wstring>(account_id + L":" + key_id);
-    auto dispatcher = winrt::Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread();
-    if (!dispatcher) return;
-    std::thread([target, key_id, dispatcher, value_text, revealed_values, reveal_token, token, rows, list] {
-      auto value = CoreIPCBridge::Shared().ReadPlainTextSecret("relay_accounts", "api_key", winrt::to_string(*target));
-      if (!value || value->empty()) return;
-      auto revealed_value = std::make_shared<std::wstring>(*value);
-      value->clear();
-      dispatcher.TryEnqueue([value_text, revealed_values, reveal_token, token, key_id, revealed_value, rows, list] {
-        (*revealed_values)[key_id] = *revealed_value;
-        if (*reveal_token != token) return;
-        const int32_t selected = list.SelectedIndex();
-        if (selected < 0 || static_cast<size_t>(selected) >= rows->size()) return;
-        if ((*rows)[static_cast<size_t>(selected)].id != key_id) return;
-        value_text.Text(winrt::hstring(EllipsizeMiddle(*revealed_value)));
-      });
-    }).detach();
+    // The key is read by the pass, which starts with this row: the sheet shows
+    // what it can read rather than a stand-in label.
+    value_text.Text(L"");
+    fill_row_keys();
   };
 
   auto load_detail = [&]() {
@@ -1523,8 +1708,7 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
       name_box.Text(L"");
       group_picker.SelectedIndex(-1);
       multiplier_value.Text(winrt::hstring(labels.empty_label));
-      // A reply for the previous selection must not land on an empty row.
-      ++(*reveal_token);
+      // Nothing is selected, so no read may write into the value row.
       value_text.Text(winrt::hstring(labels.empty_label));
       rebuild_models({});
       copy_button.IsEnabled(false);
@@ -1776,7 +1960,7 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
   models_scroll.Height(models_height);
   const double detail_height = 256.0 + models_height;
   const double window_height = 560 + std::max(0.0, detail_height - 300.0);
-  if (!RunOwnedModalWindow(dialog, window_handle_, {780, window_height}, finished)) return std::nullopt;
+  if (!RunOwnedModalWindow(dialog, window_handle_, {590, window_height}, finished)) return std::nullopt;
   return outcome;
 }
 

@@ -2179,7 +2179,7 @@ class RelayAccountsDomain:
     ) -> dict[str, str]:
         """Create a stable no-secret issue suitable for IPC projection."""
 
-        result = {"code": code, "message": "Relay Apply requires attention"}
+        result = {"code": code, "message": "Relay synchronization requires attention"}
         if account_id:
             result["account_id"] = account_id
         if resource_id:
@@ -2690,7 +2690,7 @@ class RelayAccountsDomain:
 
         del payload
         if self._read_storage_bytes() != self._baseline_bytes:
-            raise RelayAccountsError("Relay accounts changed on disk; reload before applying")
+            raise RelayAccountsError("Relay accounts changed on disk; reload and try again")
         self._persist(force=True)
         self._auto_grouping_draft_baselines.clear()
         self._import_staged = False
@@ -2721,7 +2721,7 @@ class RelayAccountsDomain:
             retained.append(operation)
         if has_completed:
             if self._read_storage_bytes() != self._baseline_bytes:
-                raise RelayAccountsError("Relay accounts changed on disk; reload before applying")
+                raise RelayAccountsError("Relay accounts changed on disk; reload and try again")
             self._persist(force=True)
         self._pending_operations = retained
         self._persist_journal()
@@ -4114,6 +4114,10 @@ class RelayAccountsDomain:
             if not isinstance(keys, Sequence) or isinstance(keys, (str, bytes, bytearray)):
                 raise RelayAccountsError("Relay API key list is invalid")
             candidates = [item for item in keys if isinstance(item, Mapping)]
+            # The list arrives whole, so the whole account is kept: the next
+            # key the sheet reveals is a cache hit instead of a second round
+            # trip to the station.
+            self._cache_station_keys(account["id"], candidates)
             # Resource IDs are derived from the upstream key ID. Prefer that
             # stable identifier over a display name: duplicate key names are
             # legal and must not reveal or import the wrong credential.
@@ -4143,6 +4147,22 @@ class RelayAccountsDomain:
         value = value if value.startswith("sk-") else f"sk-{value}"
         self._resource_secret_cache[cache_key] = value
         return value
+
+    def _cache_station_keys(self, account_id: object, candidates: Sequence[Mapping[str, Any]]) -> None:
+        """Keep every key one station answer carried, not only the requested one.
+
+        A sub2api key list arrives whole while the group manager reveals one
+        key at a time, so the rest of the answer is cached under the same
+        resource ids the resource refresh derives.  One round trip therefore
+        covers the account instead of one per key the user looks at.
+        """
+
+        for index, item in enumerate(candidates):
+            value = item.get("key")
+            if not isinstance(value, str) or not value.strip():
+                continue
+            resource_id, _ = self._resource_label(item, index, prefix="sub2api")
+            self._resource_secret_cache[self._resource_cache_key(account_id, resource_id)] = value.strip()
 
     @staticmethod
     def _resource_multiplier(account: Mapping[str, Any], resource: Mapping[str, Any]) -> float | None:

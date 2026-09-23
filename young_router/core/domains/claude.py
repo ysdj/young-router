@@ -574,7 +574,7 @@ def _current_bytes(path: pathlib.Path) -> bytes | None:
     try:
         details = path.lstat()
         if stat.S_ISLNK(details.st_mode) or not stat.S_ISREG(details.st_mode):
-            raise ClaudeSettingsError("Claude Settings changed on disk; reload before applying")
+            raise ClaudeSettingsError("Claude Settings changed on disk; reload and try again")
         return path.read_bytes()
     except FileNotFoundError:
         return None
@@ -1655,12 +1655,12 @@ class ClaudeSettingsDomain:
         if missing:
             raise ConfirmationRequired(missing)
         if _current_bytes(self.settings_path) != self._baseline_bytes:
-            raise ClaudeSettingsError("Claude Settings changed on disk; reload before applying")
+            raise ClaudeSettingsError("Claude Settings changed on disk; reload and try again")
         if self._desktop is not None:
             try:
                 if self._desktop.external_disk_state()["changed"]:
                     raise ClaudeDesktopConfigError(
-                        "Claude Desktop configuration changed on disk; reload before applying"
+                        "Claude Desktop configuration changed on disk; reload and try again"
                     )
             except ClaudeDesktopConfigError as exc:
                 raise ClaudeSettingsError(str(exc)) from None
@@ -1668,7 +1668,7 @@ class ClaudeSettingsDomain:
             try:
                 if self._developer.external_disk_state()["changed"]:
                     raise ClaudeDesktopConfigError(
-                        "Claude Desktop developer settings changed on disk; reload before applying"
+                        "Claude Desktop developer settings changed on disk; reload and try again"
                     )
             except ClaudeDesktopConfigError as exc:
                 raise ClaudeSettingsError(str(exc)) from None

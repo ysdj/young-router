@@ -7,16 +7,38 @@ from hook_test_utils import HookTestCase, load_hook_module
 
 
 class HookReasoningMappingTests(HookTestCase):
-    def _configure_pi_cache(self, root: Path, records: dict) -> None:
+    def _write_contexts_cache(self, root: Path, records: dict, *, legacy: bool = False) -> Path:
+        payload = json.dumps({"records": records})
         codex_home = root / "codex"
-        codex_home.mkdir()
-        (codex_home / "young-router-model-contexts.json").write_text(
-            json.dumps({"records": records}),
-            encoding="utf-8",
-        )
+        codex_home.mkdir(exist_ok=True)
+        if legacy:
+            path = codex_home / "young-router-model-contexts.json"
+        else:
+            path = root / "model-contexts.json"
+        path.write_text(payload, encoding="utf-8")
         self.set_env("CODEX_HOME", str(codex_home))
         self.set_env("LITELLM_RUNTIME_ROOT", str(root))
         self.set_env("LITELLM_CONFIG_FILE", str(root / "config.yaml"))
+        return path
+
+    def _configure_pi_cache(self, root: Path, records: dict) -> None:
+        self._write_contexts_cache(root, records)
+
+    def test_legacy_codex_home_cache_is_migrated_into_the_runtime_root(self) -> None:
+        hooks, _ = load_hook_module()
+        root = Path(self.create_temp_dir())
+        legacy = self._write_contexts_cache(
+            root,
+            {"custom/agent": self._record({"high": "high"})},
+            legacy=True,
+        )
+
+        registry = hooks._reasoning_registry()
+        record = registry.record_for("custom/agent")
+
+        self.assertEqual(1000, record.context_window)
+        self.assertTrue((root / "model-contexts.json").exists())
+        self.assertFalse(legacy.exists())
 
     @staticmethod
     def _record(thinking_level_map: dict[str, str | None], *, reasoning: bool = True) -> dict:

@@ -20,6 +20,7 @@ type NativeModule = {
   openFilePicker?: (purpose: "import") => Promise<string | undefined>;
   saveFilePicker?: (suggestedName: string) => Promise<string | undefined>;
   showActionMenu?: (title: string, items: string[], anchor: NativeMenuAnchor) => Promise<number | undefined>;
+  showGroupedActionMenu?: (title: string, groups: Array<{ title: string; items: string[] }>, anchor: NativeMenuAnchor) => Promise<{ group: number; item: number } | undefined>;
   showConfirmation?: (title: string, message: string, confirmLabel: string) => Promise<boolean>;
   showReadOnlyText?: (title: string, text: string, closeLabel: string, language: "json" | "toml" | "text", html: string) => Promise<void>;
   showProviderAuth?: (options: {
@@ -56,7 +57,7 @@ type NativeModule = {
     field: string,
     target: string | undefined,
   ) => Promise<{ revision: number; present: boolean } | undefined>;
-  copySecret?: (domain: "relay_accounts", field: "api_key", target: string) => Promise<boolean>;
+  copySecret?: (domain: "providers_models" | "relay_accounts", field: "api_key", target: string) => Promise<boolean>;
   relayLogin?: (options: {
     accountId: string;
     type: "newapi" | "sub2api";
@@ -148,6 +149,7 @@ const nativeBridge: NativeLeafBridge = {
   openFilePicker: async (purpose) => leaf.openFilePicker?.(purpose),
   saveFilePicker: async (suggestedName) => leaf.saveFilePicker?.(suggestedName),
   showActionMenu: async (title, items, anchor) => leaf.showActionMenu?.(title, items, anchor),
+  showGroupedActionMenu: async (title, groups, anchor) => leaf.showGroupedActionMenu?.(title, groups, anchor),
   showConfirmation: async (title, message, confirmLabel) => leaf.showConfirmation?.(title, message, confirmLabel) ?? false,
   showReadOnlyText: async (title, text, closeLabel, language, html) => {
     if (!leaf.showReadOnlyText) throw new Error("The native code viewer is unavailable.");

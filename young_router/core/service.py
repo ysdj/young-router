@@ -139,7 +139,7 @@ class RevisionConflict(CoreError):
     def __init__(self, expected: int, actual: int):
         self.expected = expected
         self.actual = actual
-        super().__init__("revision_conflict", "The Core state changed; reload before applying")
+        super().__init__("revision_conflict", "The Core state changed; reload and try again")
 
 
 class DomainNotFound(CoreError):
@@ -763,7 +763,7 @@ class CoreStore:
         host can still open the remaining settings windows.
         """
 
-        from .domains._shared import _default_runtime_settings_path
+        from .domains._shared import _default_runtime_root, _default_runtime_settings_path
         from .domains.claude import ClaudeSettingsDomain
         from .domains.clients import ClientSettingsDomain
         from .domains.codex import CodexSettingsDomain
@@ -786,6 +786,9 @@ class CoreStore:
             if runtime_settings_path is not None
             else _default_runtime_settings_path()
         )
+        resolved_runtime_root = (
+            Path(runtime_root).expanduser() if runtime_root is not None else _default_runtime_root()
+        )
         adapters: list[DomainAdapter] = []
         settings_factories: tuple[tuple[str, Callable[[], DomainAdapter]], ...] = (
             ("providers_models", lambda: ProvidersModelsDomain(config_path, auth_manager=provider_auth)),
@@ -795,6 +798,7 @@ class CoreStore:
                     config_path,
                     codex_home=codex_home,
                     runtime_settings_path=resolved_runtime_settings_path,
+                    runtime_root=resolved_runtime_root,
                 ),
             ),
             ("runtime", lambda: RuntimeSettingsDomain(resolved_runtime_settings_path)),
@@ -2214,7 +2218,7 @@ class CoreStore:
             if webdav is None or providers is None or relay is None:
                 raise CoreError("webdav_sync_failed", "WebDAV sync sources are unavailable")
             if any(self._drafts.get(name, {}).get("dirty") for name in ("webdav", *sections)):
-                raise CoreError("webdav_sync_conflict", "Apply or discard selected local drafts before WebDAV sync")
+                raise CoreError("webdav_sync_conflict", "Save or discard pending changes before WebDAV sync")
             if any(self._disk.get(name, {}).get("changed") for name in ("webdav", *sections)):
                 raise CoreError("webdav_sync_conflict", "Reload changed local files before WebDAV sync")
 
@@ -2752,6 +2756,10 @@ class CoreStore:
                 raise CoreError("service_error", safe_exception_message(exc)) from None
             if isinstance(result, Mapping):
                 self._set_service_from_result(result, increment=False)
+                if str(result.get("state")) == "running" and operation in {"start", "start_async", "restart", "reload"}:
+                    # The proxy's port or key may have just changed; a Codex
+                    # client that already uses the proxy has to follow it.
+                    self._follow_codex_local_api()
             else:
                 raise CoreError("service_error", "LiteLLM service returned invalid status")
         else:
@@ -2887,12 +2895,56 @@ class CoreStore:
                         refresh_catalog()
                     except Exception:
                         pass
+                self._follow_codex_local_api(codex)
             stopping = self._service_reload_stopping
             self._emit()
         if stopping:
             # The host quit while this restart was in flight; shutdown() may
             # have stopped the previous proxy before this one started.
             self._stop_service_after_reload_shutdown()
+
+    def _follow_codex_local_api(self, codex: object | None = None) -> None:
+        """Keep a Codex client that uses this app's proxy on its current endpoint.
+
+        A restart is where the proxy's port and master key can change, so a
+        client that already points at the proxy is rewritten there instead of
+        being left on a closed port or a retired key.  The caller holds
+        ``self._lock``; the write happens before the revision is published so
+        every open window sees the new file and the new state together.
+        """
+
+        adapter = codex if codex is not None else self._domains.get("codex")
+        follow = getattr(adapter, "follow_local_api_endpoint", None)
+        if not callable(follow):
+            return
+        try:
+            changed = bool(follow())
+        except Exception:
+            # A client file this app cannot rewrite (locked, unreadable, hand
+            # edited) must not fail the proxy restart that just succeeded.
+            return
+        if not changed or adapter is None:
+            return
+        name = "codex"
+        # The applied state is the adapter's draft projection, which is what a
+        # normal apply records as the baseline for this domain; recording the
+        # written documents here clears the dirty flag the reconcile is not
+        # responsible for.
+        self._baselines[name] = copy.deepcopy(self._adapter_draft_state(name))
+        self._disk[name] = {
+            "changed": False,
+            "generation": int(self._disk.get(name, {}).get("generation", 0)),
+            "keep_draft": False,
+        }
+        self._disk_identities[name] = self._external_disk_identity(adapter)
+        self._revision += 1
+        self._mark_domain(
+            name,
+            dirty=False,
+            validation={"valid": True, "issues": []},
+            base_revision=self._revision,
+        )
+        self._persist_metadata()
 
     def _project_service_reload_failure(self) -> None:
         """Project the controller's real state after a failed background restart."""
@@ -3119,13 +3171,13 @@ class CoreStore:
                     # material is injected and before any local write.
                     preflight = getattr(adapters[name], "validate_relay_preflight", None)
                     if not callable(preflight) or preflight().get("valid") is not True:
-                        raise CoreError("validation_failed", "Fix provider/model issues before applying")
+                        raise CoreError("validation_failed", "Fix the provider/model issues")
                     continue
                 if not self.validate(name)["valid"]:
-                    raise CoreError("validation_failed", "Fix validation errors before applying")
+                    raise CoreError("validation_failed", "Fix the validation errors")
             prepared = prepare()
             if not isinstance(prepared, Mapping) or prepared.get("ready") is not True:
-                raise CoreError("validation_failed", "Fix relay connection or binding issues before applying")
+                raise CoreError("validation_failed", "Fix the relay connection or binding issues")
             operations = prepared.get("operations", ())
             if isinstance(operations, Sequence) and not isinstance(operations, (str, bytes, bytearray)):
                 operation_total = len(operations)
@@ -3180,7 +3232,7 @@ class CoreStore:
                     if self._relay_public_issue_count(materialized):
                         raise RuntimeError("relay_binding_materialization_failed")
                 if not self.validate("providers_models")["valid"]:
-                    raise CoreError("validation_failed", "Fix linked model issues before applying")
+                    raise CoreError("validation_failed", "Fix the linked model issues")
                 providers.apply()
                 provider_locally_applied = True
                 self._mark_relay_coordinated_applied("providers_models")
@@ -3436,7 +3488,7 @@ class CoreStore:
                 # earlier one.
                 for name in names:
                     if not self.validate(name)["valid"]:
-                        raise CoreError("validation_failed", "Fix validation errors before applying")
+                        raise CoreError("validation_failed", "Fix the validation errors")
                 for name in names:
                     adapter = adapters[name]
                     domain_confirmations = list(confirm_codes)

@@ -41,9 +41,11 @@ import { UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
 
 type ButtonProps = {
   title: string;
-  symbol?: "check" | "close" | "copy" | "edit" | "import" | "info" | "minus" | "pause" | "play" | "plus" | "power-off" | "power-on" | "refresh" | "trash" | "chevron-up" | "chevron-down";
+  symbol?: "check" | "close" | "copy" | "edit" | "help" | "import" | "info" | "minus" | "pause" | "play" | "plus" | "power-off" | "power-on" | "refresh" | "trash" | "chevron-up" | "chevron-down" | "chevron-up-down";
   /** Keep the title visible next to a leading symbol instead of icon-only. */
   symbolWithTitle?: boolean;
+  /** Draw that symbol after the title (menu buttons read "Title ▾"). */
+  symbolTrailing?: boolean;
   toolTip?: string;
   accessibilityLabel?: string;
   disabled?: boolean;
@@ -282,6 +284,7 @@ const NativeButtonWithRef = React.forwardRef<any, ButtonProps>(function NativeBu
     link: props.link === true,
     plainLink: props.plainLink === true,
     symbolWithTitle: props.symbolWithTitle === true,
+    symbolTrailing: props.symbolTrailing === true,
   };
   // A caller may enlarge a button, but must never reduce a translated title to
   // an ellipsis. Symbol-only and compact glyph buttons intentionally use their

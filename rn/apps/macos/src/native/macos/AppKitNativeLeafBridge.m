@@ -20,6 +20,7 @@ RCT_EXTERN_METHOD(showCodexRestartConfirmation:(NSString *)title message:(NSStri
 RCT_EXTERN_METHOD(showReadOnlyText:(NSString *)title text:(NSString *)text closeLabel:(NSString *)closeLabel language:(NSString *)language html:(NSString *)html resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)
 RCT_EXTERN_METHOD(showProviderAuth:(NSDictionary *)options resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)
 RCT_EXTERN_METHOD(showActionMenu:(NSString *)title items:(NSArray *)items anchor:(NSDictionary *)anchor resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)
+RCT_EXTERN_METHOD(showGroupedActionMenu:(NSString *)title groups:(NSArray *)groups anchor:(NSDictionary *)anchor resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)
 RCT_EXTERN_METHOD(chooseModelsToAdd:(NSArray *)models providerName:(NSString *)providerName keyName:(NSString *)keyName resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)
 RCT_EXTERN_METHOD(setShortcuts:(NSDictionary *)shortcuts)
 RCT_EXTERN_METHOD(setLocalization:(NSDictionary *)strings)

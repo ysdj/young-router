@@ -232,7 +232,7 @@ class CoreServiceReloadTests(unittest.TestCase):
                 catalog_state = core.snapshot()["domains"]["codex"]["model_catalog"]
 
             catalog = json.loads(
-                (codex_home / "young-router-model-catalog.json").read_text(encoding="utf-8")
+                (codex_home / "model-catalog.json").read_text(encoding="utf-8")
             )
             self.assertTrue(result["applied"])
             self.assertEqual(["public-b"], [model["slug"] for model in catalog["models"]])
@@ -240,6 +240,103 @@ class CoreServiceReloadTests(unittest.TestCase):
             self.assertTrue(catalog_state["restart_required"])
             self.assertEqual("catalog_repaired", catalog_state["change_reason"])
 
+
+    def test_proxy_restart_moves_a_codex_client_that_uses_this_apps_proxy(self) -> None:
+        """A client on the proxy follows the endpoint the restart adopts."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            from young_router.core.domains import _shared
+
+            root = Path(directory)
+            config_path = root / "config.yaml"
+            config_path.write_text(
+                "providers:\n"
+                "  primary:\n"
+                "    api_base: https://example.test/v1\n"
+                "    api_keys:\n"
+                "      - name: default\n"
+                "        value: replace-me\n"
+                "model_list:\n"
+                "  - model_name: public-chat\n"
+                "    litellm_params:\n"
+                "      model: openai/old-chat\n"
+                "      api_base: https://example.test/v1\n"
+                "      api_key: replace-me\n"
+                "    model_info:\n"
+                "      id: deadbeef\n"
+                "      provider: primary\n"
+                "      upstream_url_surface: openai/responses\n"
+                "litellm_settings:\n"
+                "  public_model_groups: [public-chat]\n",
+                encoding="utf-8",
+            )
+            codex_home = root / "codex"
+            codex_home.mkdir()
+            (codex_home / "config.toml").write_text(
+                'model = "public-chat"\n'
+                'model_provider = "relay"\n'
+                '\n'
+                '[model_providers.relay]\n'
+                'name = "relay"\n'
+                'base_url = "http://127.0.0.1:19999/v1"\n'
+                'wire_api = "responses"\n'
+                'requires_openai_auth = true\n',
+                encoding="utf-8",
+            )
+            (codex_home / "auth.json").write_text('{"OPENAI_API_KEY": "retired-key"}\n', encoding="utf-8")
+
+            def reload_service(_operation: str) -> dict[str, str]:
+                return {"state": "running"}
+
+            def status_service(_operation: str) -> dict[str, str]:
+                return {"state": "running"}
+
+            # The app is running on the endpoint the client already uses; the
+            # restart below moves the proxy to another one.
+            with mock.patch.object(
+                _shared, "local_proxy_endpoint", return_value=("http://127.0.0.1:19999/v1", "retired-key")
+            ):
+                providers = ProvidersModelsDomain(config_path)
+                codex = CodexSettingsDomain(config_path, codex_home=codex_home)
+            with mock.patch.object(
+                _shared, "local_proxy_endpoint", return_value=("http://127.0.0.1:20001/v1", "sk-second")
+            ):
+                core = CoreStore(
+                    domains=[providers, codex],
+                    service_handlers={"status": status_service, "reload": reload_service},
+                )
+                core.snapshot()
+                staged = core.dispatch(
+                    {
+                        "domain": "providers_models",
+                        "type": "model.patch",
+                        "payload": {
+                            "provider_id": "primary",
+                            "model_id": "deadbeef",
+                            "changes": {"upstream_model": "openai/new-chat"},
+                        },
+                    },
+                    expected_revision=core.revision,
+                )
+
+                result = core.apply("providers_models", revision=staged["revision"])
+                self.assertTrue(core.wait_for_service_reload(5.0))
+                snapshot = core.snapshot()
+
+            config_text = (codex_home / "config.toml").read_text(encoding="utf-8")
+            auth_text = (codex_home / "auth.json").read_text(encoding="utf-8")
+            self.assertTrue(result["applied"])
+            self.assertIn("http://127.0.0.1:20001/v1", config_text)
+            self.assertNotIn("19999", config_text)
+            # The rewrite stays under the provider the client already named.
+            self.assertIn('model_provider = "relay"', config_text)
+            self.assertNotIn("[model_providers.custom]", config_text)
+            self.assertIn("sk-second", auth_text)
+            self.assertNotIn("retired-key", auth_text)
+            # The write is part of the applied state: the pane must not show a
+            # pending change for a file the user never edited.
+            self.assertFalse(snapshot["drafts"]["codex"]["dirty"])
+            self.assertTrue(snapshot["domains"]["codex"]["uses_local_api"])
 
     def test_provider_apply_returns_before_the_background_restart_finishes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
