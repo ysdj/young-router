@@ -1416,6 +1416,85 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             self.assertFalse(core.snapshot()["drafts"]["providers_models"]["dirty"])
             self.assertEqual(saved_before_probe, path.read_text(encoding="utf-8"))
 
+    def test_a_changed_probe_input_drops_the_stored_finding(self) -> None:
+        """A finding is a claim about one address, model, protocol, and key."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            domain = ProvidersModelsDomain(path)
+
+            def surface_probe(*, surface: str, **_kwargs: object) -> dict[str, object]:
+                return {"surface": surface, "available": True, "status": "ok"}
+
+            def probe() -> None:
+                with mock.patch.object(ProvidersModelsDomain, "_surface_probe", side_effect=surface_probe):
+                    domain.probe({"provider_id": "primary", "model_id": "00000071"})
+
+            def stored_probe() -> object:
+                return domain.snapshot()["providers"][0]["models"][0]["probe"]
+
+            probe()
+            self.assertIsNotNone(stored_probe())
+            # An edit that is not a probe input keeps the finding: the route it
+            # describes is still the route on screen.
+            domain.dispatch(
+                "model.patch",
+                {"provider_id": "primary", "model_id": "00000071", "changes": {"manual_order": 7}},
+            )
+            self.assertIsNotNone(stored_probe())
+            for changes in (
+                {"upstream_model": "other-chat"},
+                {"upstream_protocol_mode": "fixed"},
+                {"upstream_url_surface": "anthropic"},
+                {"provider_key_id": ""},
+            ):
+                probe()
+                self.assertIsNotNone(stored_probe())
+                domain.dispatch(
+                    "model.patch",
+                    {"provider_id": "primary", "model_id": "00000071", "changes": changes},
+                )
+                self.assertIsNone(stored_probe(), changes)
+
+    def test_a_moved_address_or_rekeyed_slot_drops_the_stored_finding(self) -> None:
+        """The address and the credential are probe inputs too."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            domain = ProvidersModelsDomain(path)
+
+            def surface_probe(*, surface: str, **_kwargs: object) -> dict[str, object]:
+                return {"surface": surface, "available": True, "status": "ok"}
+
+            def probe() -> None:
+                with mock.patch.object(ProvidersModelsDomain, "_surface_probe", side_effect=surface_probe):
+                    domain.probe({"provider_id": "primary", "model_id": "00000071"})
+
+            def stored_probe() -> object:
+                return domain.snapshot()["providers"][0]["models"][0]["probe"]
+
+            probe()
+            self.assertIsNotNone(stored_probe())
+            # A provider that moved is a different route at the same name.
+            domain.dispatch(
+                "provider.patch",
+                {"provider_id": "primary", "changes": {"api_base": "https://moved.example.test/v1"}},
+            )
+            self.assertIsNone(stored_probe())
+
+            probe()
+            self.assertIsNotNone(stored_probe())
+            # The credential the probed route answered with is replaced.
+            domain.stage_secret("api_key", "primary\x1fdefault", "replace-me-rotated-secret")
+            self.assertIsNone(stored_probe())
+
+            probe()
+            self.assertIsNotNone(stored_probe())
+            domain.dispatch("provider.clear_key", {"provider_id": "primary"})
+            self.assertIsNone(stored_probe())
+
     def test_model_deep_test_sends_the_frozen_prompt_to_a_responses_route(self) -> None:
         deep_requests: list[dict[str, object]] = []
 
