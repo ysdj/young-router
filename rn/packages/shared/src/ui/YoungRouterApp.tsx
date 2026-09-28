@@ -3916,7 +3916,9 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   const [fetchModelsBusy, setFetchModelsBusy] = useState(false);
   const probingModelKeys = useRef(new Set<string>());
   const [, setProbeActivityRevision] = useState(0);
-  const [probeResults, setProbeResults] = useState<Record<string, IpcResults["probe"]>>({});
+  // A result is kept with the inputs it was measured on: a route the user has
+  // since edited never shows a verdict about the route it replaced.
+  const [probeResults, setProbeResults] = useState<Record<string, { inputs: string; result: IpcResults["probe"] }>>({});
   const shownChallenge = useRef<Record<string, string>>({});
   const fetchKeyChoices = useMemo(
     () => provider && providerKindSelected !== "openai" && providerKindSelected !== "claude" ? providerKeyChoices(provider, relaySources, providerBaseURL(provider)) : [],
@@ -3939,30 +3941,35 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       .catch(() => undefined);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedService]);
-  async function probeModel(targetProviderId: string, targetModelId: string, options?: { confirmRecommendation?: boolean }): Promise<void> {
+  async function probeModel(targetProviderId: string, targetModelId: string, inputs: string, options?: { confirmRecommendation?: boolean }): Promise<void> {
     const key = modelProbeKey(targetProviderId, targetModelId);
     if (probingModelKeys.current.has(key)) return;
     probingModelKeys.current.add(key);
     setProbeActivityRevision((value) => value + 1);
     try {
       const result = await ipc.probe(targetProviderId, targetModelId, "providers_models");
-      setProbeResults((current) => ({ ...current, [key]: result }));
+      setProbeResults((current) => ({ ...current, [key]: { inputs, result } }));
       onSnapshot(await ipc.snapshot());
       const nextSurface = stringValue(result.recommended_surface);
       if (result.ok && isProbeSurface(nextSurface)) await applyProbedSurface(targetProviderId, targetModelId, nextSurface, options);
     } catch (reason: unknown) {
       setProbeResults((current) => ({
         ...current,
-        [key]: { ok: false, protocols: [], detail: errorMessage(reason, translate), provider_id: targetProviderId, model_id: targetModelId },
+        [key]: { inputs, result: { ok: false, protocols: [], detail: errorMessage(reason, translate), provider_id: targetProviderId, model_id: targetModelId } },
       }));
     } finally {
       probingModelKeys.current.delete(key);
       setProbeActivityRevision((value) => value + 1);
     }
   }
-  const modelProbeProps = (targetProviderId: string, targetModelId: string): { probing: boolean; probeResult?: IpcResults["probe"] } => {
+  const modelProbeProps = (targetProviderId: string, targetModelId: string, inputs: string): { probing: boolean; probeResult?: IpcResults["probe"]; probe: () => void } => {
     const key = modelProbeKey(targetProviderId, targetModelId);
-    return { probing: probingModelKeys.current.has(key), probeResult: probeResults[key] };
+    const record = probeResults[key];
+    return {
+      probing: probingModelKeys.current.has(key),
+      probeResult: record !== undefined && record.inputs === inputs ? record.result : undefined,
+      probe: () => probeModel(targetProviderId, targetModelId, inputs),
+    };
   };
   // Poll official-account authorizations so a login that starts here (or in
   // the wizard window) still completes its device-code challenge.
@@ -4528,7 +4535,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
         </View>
       </View>}
     </View>
-    <View style={styles.providerInspector}>{viewMode === "routes" ? (activePublicGroup ? <PublicModelInspector key={`public:${activePublicGroup.name}`} group={activePublicGroup} modelContexts={modelContexts} backLabel={publicModelReturn?.label} onBackToModel={returnToPublicModelOrigin} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} onRenamed={(next) => { setSelectedPublicModel(next); setSelectedRoute(""); }} /> : activeRoute ? (providerSourceModel ? <ProviderEditor key={`provider:${editorIdentifier(activeRoute.provider)}`} provider={activeRoute.provider} relaySources={relaySources} relayStations={relayStations} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onNameDraftChange={(value) => setProviderNameDraft(editorIdentifier(activeRoute.provider), value)} sourceModel={activeRoute.model} onReturnToModel={() => { setProviderSourceModel(undefined); setSelectedModel(editorIdentifier(activeRoute.model)); }} station={stationForProvider(activeRoute.provider)} stationAccounts={stationAccountsFor(activeRoute.provider)} relay={relay} addOfficialAccount={addOfficialAccount} onActivateAndRestart={onActivateAndRestart} onStatus={onStatus} language={snapshot?.language ?? "system"} bindingIssues={bindingIssues} snapshotForCleanups={snapshot} /> : <ModelInspector key={`model:${editorIdentifier(activeRoute.provider)}:${editorIdentifier(activeRoute.model)}`} providers={providers} providerLabels={providers.map(providerDisplayName)} provider={activeRoute.provider} providerId={editorIdentifier(activeRoute.provider)} model={activeRoute.model} modelName={modelDisplayName(editorIdentifier(activeRoute.provider), activeRoute.model)} relaySources={relaySources} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} modelContexts={modelContexts} bindingIssue={bindingIssueFor(activeRoute.model)} probe={() => probeModel(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model))} {...modelProbeProps(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model))} onNameDraftChange={(value) => setModelNameDraft(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model), value)} onProviderClick={() => setProviderSourceModel(editorIdentifier(activeRoute.model))} onOpenPublicModel={() => { const publicModel = stringValue(activeRoute.model.model_name, stringValue(activeRoute.model.name)).trim(); if (!publicModel) return; selectRouteTableRow(routePublicModelRowKey(publicModel)); setPublicModelReturn({ routeKey: activeRoute.key, label: modelUpstreamDisplay(editorIdentifier(activeRoute.provider), activeRoute.model) || publicModel }); }} onProviderChange={(destinationProviderId) => dispatch("model.move_provider", { provider_id: editorIdentifier(activeRoute.provider), model_id: editorIdentifier(activeRoute.model), destination_provider_id: destinationProviderId }).then(() => { setSelectedProvider(destinationProviderId); setSelectedModel(editorIdentifier(activeRoute.model)); setSelectedRoute(`${destinationProviderId}:${activeRoute.deploymentID}`); setProviderSourceModel(undefined); })} />) : <EmptyState translate={translate} />) : provider && model ? <ModelInspector key={`model:${providerId}:${editorIdentifier(model)}`} providers={providers} providerLabels={providers.map(providerDisplayName)} provider={provider} providerId={providerId} model={model} modelName={modelDisplayName(providerId, model)} relaySources={relaySources} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} modelContexts={modelContexts} bindingIssue={bindingIssueFor(model)} probe={() => probeModel(providerId, editorIdentifier(model))} {...modelProbeProps(providerId, editorIdentifier(model))} onNameDraftChange={(value) => setModelNameDraft(providerId, editorIdentifier(model), value)} onProviderClick={() => { setProviderSourceModel(editorIdentifier(model)); setSelectedModel(undefined); }} onOpenPublicModel={() => { const publicModel = stringValue(model.model_name, stringValue(model.name)).trim(); if (!publicModel) return; const originRouteKey = `${providerId}:${stringValue(model.editor_id, stringValue(model.deployment_id, identifier(model))).trim()}`; setViewMode("routes"); selectRouteTableRow(routePublicModelRowKey(publicModel)); setPublicModelReturn({ routeKey: originRouteKey, label: modelUpstreamDisplay(providerId, model) || publicModel }); }} onProviderChange={(destinationProviderId) => dispatch("model.move_provider", { provider_id: providerId, model_id: editorIdentifier(model), destination_provider_id: destinationProviderId }).then(() => { setSelectedProvider(destinationProviderId); setSelectedModel(editorIdentifier(model)); setProviderSourceModel(undefined); })} /> : provider ? <ProviderEditor key={`provider:${providerId}`} provider={provider} relaySources={relaySources} relayStations={relayStations} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onNameDraftChange={(value) => setProviderNameDraft(providerId, value)} sourceModel={models.find((item) => editorIdentifier(item) === providerSourceModel)} onReturnToModel={() => { if (providerSourceModel) setSelectedModel(providerSourceModel); setProviderSourceModel(undefined); }} station={selectedStation} stationAccounts={selectedStationAccounts} relay={relay} addOfficialAccount={addOfficialAccount} onActivateAndRestart={onActivateAndRestart} onStatus={onStatus} language={snapshot?.language ?? "system"} bindingIssues={bindingIssues} snapshotForCleanups={snapshot} /> : <EmptyState translate={translate} />}</View>
+    <View style={styles.providerInspector}>{viewMode === "routes" ? (activePublicGroup ? <PublicModelInspector key={`public:${activePublicGroup.name}`} group={activePublicGroup} modelContexts={modelContexts} backLabel={publicModelReturn?.label} onBackToModel={returnToPublicModelOrigin} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} onRenamed={(next) => { setSelectedPublicModel(next); setSelectedRoute(""); }} /> : activeRoute ? (providerSourceModel ? <ProviderEditor key={`provider:${editorIdentifier(activeRoute.provider)}`} provider={activeRoute.provider} relaySources={relaySources} relayStations={relayStations} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onNameDraftChange={(value) => setProviderNameDraft(editorIdentifier(activeRoute.provider), value)} sourceModel={activeRoute.model} onReturnToModel={() => { setProviderSourceModel(undefined); setSelectedModel(editorIdentifier(activeRoute.model)); }} station={stationForProvider(activeRoute.provider)} stationAccounts={stationAccountsFor(activeRoute.provider)} relay={relay} addOfficialAccount={addOfficialAccount} onActivateAndRestart={onActivateAndRestart} onStatus={onStatus} language={snapshot?.language ?? "system"} bindingIssues={bindingIssues} snapshotForCleanups={snapshot} /> : <ModelInspector key={`model:${editorIdentifier(activeRoute.provider)}:${editorIdentifier(activeRoute.model)}`} providers={providers} providerLabels={providers.map(providerDisplayName)} provider={activeRoute.provider} providerId={editorIdentifier(activeRoute.provider)} model={activeRoute.model} modelName={modelDisplayName(editorIdentifier(activeRoute.provider), activeRoute.model)} relaySources={relaySources} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} modelContexts={modelContexts} bindingIssue={bindingIssueFor(activeRoute.model)} {...modelProbeProps(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model), probeInputFingerprint(providerBaseURL(activeRoute.provider), modelUpstreamDisplay(editorIdentifier(activeRoute.provider), activeRoute.model), activeRoute.model))} onNameDraftChange={(value) => setModelNameDraft(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model), value)} onProviderClick={() => setProviderSourceModel(editorIdentifier(activeRoute.model))} onOpenPublicModel={() => { const publicModel = stringValue(activeRoute.model.model_name, stringValue(activeRoute.model.name)).trim(); if (!publicModel) return; selectRouteTableRow(routePublicModelRowKey(publicModel)); setPublicModelReturn({ routeKey: activeRoute.key, label: modelUpstreamDisplay(editorIdentifier(activeRoute.provider), activeRoute.model) || publicModel }); }} onProviderChange={(destinationProviderId) => dispatch("model.move_provider", { provider_id: editorIdentifier(activeRoute.provider), model_id: editorIdentifier(activeRoute.model), destination_provider_id: destinationProviderId }).then(() => { setSelectedProvider(destinationProviderId); setSelectedModel(editorIdentifier(activeRoute.model)); setSelectedRoute(`${destinationProviderId}:${activeRoute.deploymentID}`); setProviderSourceModel(undefined); })} />) : <EmptyState translate={translate} />) : provider && model ? <ModelInspector key={`model:${providerId}:${editorIdentifier(model)}`} providers={providers} providerLabels={providers.map(providerDisplayName)} provider={provider} providerId={providerId} model={model} modelName={modelDisplayName(providerId, model)} relaySources={relaySources} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} modelContexts={modelContexts} bindingIssue={bindingIssueFor(model)} {...modelProbeProps(providerId, editorIdentifier(model), probeInputFingerprint(providerBaseURL(provider), modelUpstreamDisplay(providerId, model), model))} onNameDraftChange={(value) => setModelNameDraft(providerId, editorIdentifier(model), value)} onProviderClick={() => { setProviderSourceModel(editorIdentifier(model)); setSelectedModel(undefined); }} onOpenPublicModel={() => { const publicModel = stringValue(model.model_name, stringValue(model.name)).trim(); if (!publicModel) return; const originRouteKey = `${providerId}:${stringValue(model.editor_id, stringValue(model.deployment_id, identifier(model))).trim()}`; setViewMode("routes"); selectRouteTableRow(routePublicModelRowKey(publicModel)); setPublicModelReturn({ routeKey: originRouteKey, label: modelUpstreamDisplay(providerId, model) || publicModel }); }} onProviderChange={(destinationProviderId) => dispatch("model.move_provider", { provider_id: providerId, model_id: editorIdentifier(model), destination_provider_id: destinationProviderId }).then(() => { setSelectedProvider(destinationProviderId); setSelectedModel(editorIdentifier(model)); setProviderSourceModel(undefined); })} /> : provider ? <ProviderEditor key={`provider:${providerId}`} provider={provider} relaySources={relaySources} relayStations={relayStations} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onNameDraftChange={(value) => setProviderNameDraft(providerId, value)} sourceModel={models.find((item) => editorIdentifier(item) === providerSourceModel)} onReturnToModel={() => { if (providerSourceModel) setSelectedModel(providerSourceModel); setProviderSourceModel(undefined); }} station={selectedStation} stationAccounts={selectedStationAccounts} relay={relay} addOfficialAccount={addOfficialAccount} onActivateAndRestart={onActivateAndRestart} onStatus={onStatus} language={snapshot?.language ?? "system"} bindingIssues={bindingIssues} snapshotForCleanups={snapshot} /> : <EmptyState translate={translate} />}</View>
   </View></ProviderWorkspaceDraftContext.Provider>;
 }
 
@@ -5024,10 +5031,18 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
   const probeTitle = degradationIncluded
     ? translate("providers.deepTest")
     : translate("providers.probe");
-  const authenticationReady = providerAuthKind(provider) === "api_key"
-    ? booleanValue(model.api_key_configured)
-    : providerAuthStatus(provider) === "signed_in";
-  const probeReady = Boolean(providerBaseUrl.trim() && upstreamName.trim() && authenticationReady);
+  // Probing a route is how its credential gets verified, so the pane does not
+  // refuse the press on its own belief about that credential: the probe answers
+  // with the truth (`providers.probeInlineInvalidConfig` when there is nothing
+  // to try), and a route whose key Core just materialized can be checked at
+  // once instead of staying grayed out on a belief the user cannot change from
+  // here.  Only an account-backed provider that has not signed in has no route
+  // to probe at all, and that state belongs to the provider, not to one model.
+  const probeReady = Boolean(
+    providerBaseUrl.trim()
+    && upstreamName.trim()
+    && (providerAuthKind(provider) === "api_key" || providerAuthStatus(provider) === "signed_in"),
+  );
   // A linked key the relay could not resolve says so here, on the route that
   // failed, naming the key in the same `账号/分组` form the picker uses.
   const bindingIssueText = bindingIssue
@@ -5231,6 +5246,25 @@ function isProbeSurface(value: string): value is "openai/responses" | "openai/ch
 
 function modelProbeKey(providerId: string, modelId: string): string {
   return `${providerId}\x1f${modelId}`;
+}
+
+/** The inputs one probe result is evidence for: the address it called, the
+ * model name it asked for, the protocol it tried, and the credential slot that
+ * answered.  A result measured on other inputs describes a route that no longer
+ * exists, so the pane drops it instead of showing it beside the new one.  The
+ * address and the model name are the pane's own values, a pending edit
+ * included: the finding goes as soon as the field it belongs to is edited. */
+function probeInputFingerprint(providerBaseUrl: string, upstreamModel: string, model: UnknownRecord): string {
+  return [
+    providerBaseUrl,
+    upstreamModel,
+    stringValue(model.litellm_model),
+    stringValue(model.api_base),
+    stringValue(model.provider_key_id, stringValue(model.api_key_name)),
+    stringValue(model.upstream_protocol_mode, "fallback"),
+    stringValue(model.upstream_url_surface),
+    booleanValue(model.api_key_configured) ? "1" : "0",
+  ].join("\x1f");
 }
 
 function providerModelsByEditorId(snapshot: CoreSnapshot, providerId: string): UnknownRecord[] {

@@ -151,6 +151,22 @@ class ProvidersModelsDomain:
     # raise this without a rebuild when their edge is consistently slower.
     _MODEL_PROBE_TIMEOUT_ENV = "YOUNG_ROUTER_MODEL_PROBE_TIMEOUT_SECONDS"
     _MAX_MODEL_PROBE_BYTES = 256 * 1024
+    # The inputs a stored probe result is a claim about: which address was
+    # called, which model name was asked for, which protocol was tried, and
+    # which credential answered.  Editing one of them leaves the finding
+    # describing a route that no longer exists, so it is dropped rather than
+    # shown beside the route the user now has.
+    _PROBE_INPUT_KEYS = frozenset(
+        {
+            "litellm_model",
+            "api_base",
+            "api_key",
+            "api_key_name",
+            "provider_key_id",
+            "upstream_url_surface",
+            "upstream_protocol_mode",
+        }
+    )
     # The degradation deep test asks one model for a full 315-integer answer,
     # so it needs its own budget: a reasoning model legitimately takes longer
     # than the six-second availability probe, and a truncated answer would be
@@ -407,6 +423,40 @@ class ProvidersModelsDomain:
         """Return the editor identity so one model's result never aliases another's."""
 
         return self._editor_id(model, model=True)
+
+    def _forget_probe_result(self, provider: Mapping[str, Any], model: Mapping[str, Any]) -> None:
+        """Drop one stored probe result; the route it described has changed."""
+
+        provider_name = str(provider.get("name", "")).strip()
+        self._probe_overlay.get(provider_name, {}).pop(self._probe_model_key(model), None)
+
+    def _forget_provider_probe_results(self, provider: Mapping[str, Any]) -> None:
+        """Drop every stored result of one provider: its address or key material moved."""
+
+        self._probe_overlay.pop(str(provider.get("name", "")).strip(), None)
+
+    def _forget_key_probe_results(self, provider: Mapping[str, Any], key: Mapping[str, Any]) -> None:
+        """Drop the results of the routes that answer with one provider key.
+
+        The key a route answers with is the key the probe measured its
+        credential on, so the model is resolved the same way the credential is
+        (a route that names no key follows the provider's own default).
+        """
+
+        overlay = self._probe_overlay.get(str(provider.get("name", "")).strip())
+        if not overlay:
+            return
+        key_id = str(key.get("id", "")).strip()
+        models = provider.get("models")
+        if not isinstance(models, Sequence) or isinstance(models, (str, bytes, bytearray)):
+            return
+        for model in models:
+            if not isinstance(model, Mapping):
+                continue
+            selected = self._model_provider_key(provider, model)
+            if selected is None or str(selected.get("id", "")).strip() != key_id:
+                continue
+            self._forget_probe_result(provider, model)
 
     @staticmethod
     def _upstream_model_prefix(
@@ -2729,6 +2779,7 @@ class ProvidersModelsDomain:
         if self._provider_key_source(keys[key_index].get("source"))["kind"] == "relay":
             raise DomainError("Relay provider key is managed by its source")
         keys[key_index]["value"] = value
+        self._forget_key_probe_results(provider, keys[key_index])
         self._sync_primary_api_key(provider, keys)
         providers[provider_index] = provider
 
@@ -3241,6 +3292,11 @@ class ProvidersModelsDomain:
                     keys = []
                 provider["api_keys"] = keys
                 provider["api_key"] = api_key
+                if keys and isinstance(keys[0], Mapping):
+                    # The credential the probed routes answered with is gone.
+                    self._forget_key_probe_results(provider, keys[0])
+                else:
+                    self._forget_provider_probe_results(provider)
             if "name" in changes and self._provider_name_exists(
                 providers, changes["name"], exclude_index=index
             ):
@@ -3274,6 +3330,10 @@ class ProvidersModelsDomain:
             if current_name != previous_name:
                 if previous_name in self._probe_overlay:
                     self._probe_overlay[current_name] = self._probe_overlay.pop(previous_name)
+            if "api_base" in changes:
+                # Every route of this provider was probed against the old
+                # address; a moved URL is a different route.
+                self._forget_provider_probe_results(provider)
             if "api_keys" in changes:
                 normalized_keys = self._provider_api_keys(provider)
                 self._sync_primary_api_key(provider, normalized_keys)
@@ -3294,6 +3354,7 @@ class ProvidersModelsDomain:
             if self._provider_auth_state(provider)["kind"] != "api_key":
                 raise DomainError("Provider keys are unavailable for account login")
             self._sync_primary_api_key(provider, [])
+            self._forget_provider_probe_results(provider)
             providers[index] = provider
             return
         if action in {"provider_delete", "delete_provider"}:
@@ -5076,6 +5137,10 @@ class ProvidersModelsDomain:
                 model["litellm_model"] = self._canonical_upstream_model(
                     model.get("litellm_model"), model, provider
                 )
+            if self._PROBE_INPUT_KEYS.intersection(changes):
+                # A result measured on the old address, model, protocol, or key
+                # is not evidence for the route the user just made.
+                self._forget_probe_result(provider, model)
             self._normalize_model_binding(provider, model)
             models[index] = model
         elif action in {"model_delete", "delete_model"}:

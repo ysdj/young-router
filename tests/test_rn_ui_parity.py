@@ -761,7 +761,34 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_not_has("probeSummaryTrigger")
         self.assert_ui_not_has('styles.probeSummary}')
         self.assert_ui_has('const probeReady = Boolean(')
+        # The credential is what a probe exists to test, so the pane's own
+        # belief about it never holds the press: a route whose key Core just
+        # materialized can be probed at once, and a route with nothing to try
+        # answers with `providers.probeInlineInvalidConfig` instead of a button
+        # the user cannot enable from here.
+        self.assert_ui_has('&& (providerAuthKind(provider) === "api_key" || providerAuthStatus(provider) === "signed_in"),')
+        self.assert_ui_not_has("authenticationReady")
         self.assertNotIn('await flushPendingFields();\n      const before = await ipc.snapshot();', self.ui)
+
+    def test_a_changed_probe_input_clears_the_probe_result(self) -> None:
+        """A finding is shown only while it describes the route on screen."""
+
+        # The interface's own result is stored with the inputs it was measured
+        # on, so an edited route never shows the verdict of the route it
+        # replaced.
+        self.assert_ui_has('const [probeResults, setProbeResults] = useState<Record<string, { inputs: string; result: IpcResults["probe"] }>>({});')
+        self.assert_ui_has('stringValue(model.provider_key_id, stringValue(model.api_key_name)),')
+        self.assert_ui_has('stringValue(model.upstream_protocol_mode, "fallback"),')
+        self.assert_ui_has('setProbeResults((current) => ({ ...current, [key]: { inputs, result } }));')
+        self.assert_ui_has('probeResult: record !== undefined && record.inputs === inputs ? record.result : undefined,')
+        self.assert_ui_has('probe: () => probeModel(targetProviderId, targetModelId, inputs),')
+        # One expression decides both what the button probes and which result it
+        # shows, so the two can never disagree about the route; the address and
+        # the model name are the pane's own values, a pending edit included.
+        self.assert_ui_has('function probeInputFingerprint(providerBaseUrl: string, upstreamModel: string, model: UnknownRecord): string {')
+        self.assert_ui_has('{...modelProbeProps(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model), probeInputFingerprint(providerBaseURL(activeRoute.provider), modelUpstreamDisplay(editorIdentifier(activeRoute.provider), activeRoute.model), activeRoute.model))}')
+        self.assert_ui_has('{...modelProbeProps(providerId, editorIdentifier(model), probeInputFingerprint(providerBaseURL(provider), modelUpstreamDisplay(providerId, model), model))}')
+        self.assert_ui_not_has('{...modelProbeProps(providerId, editorIdentifier(model))}')
 
     def test_loading_buttons_keep_their_title_width_and_color_with_a_spinner(self) -> None:
         """A working button reports progress; it never disables, renames, or resizes itself."""
