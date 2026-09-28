@@ -3339,6 +3339,8 @@ class CoreStore:
         adapters: Mapping[str, DomainAdapter],
         confirm_codes: Sequence[str],
         overwrite_codes: set[str],
+        *,
+        relay_dependency_only: bool = False,
     ) -> dict[str, Any]:
         """Apply relay and linked model changes around irreversible remote work.
 
@@ -3435,9 +3437,14 @@ class CoreStore:
                     if not callable(preflight) or preflight().get("valid") is not True:
                         raise CoreError("provider_model_invalid", "Fix the provider/model issues")
                     continue
+                if relay_dependency_only and name == "relay_accounts":
+                    # This Apply uses a linked key; it is not the user's relay
+                    # work, so the station's session state and its outstanding
+                    # operations are not this edit's validation.
+                    continue
                 if not self.validate(name)["valid"]:
                     raise CoreError("relay_preflight_failed", "Fix the validation errors")
-            prepared = prepare()
+            prepared = {"ready": True, "operations": ()} if relay_dependency_only else prepare()
             if not isinstance(prepared, Mapping) or prepared.get("ready") is not True:
                 # The relay is what is not ready here: pending operations, a
                 # session that needs a sign-in, or a target that moved.  Say so
@@ -3452,7 +3459,7 @@ class CoreStore:
             # The journal itself is the phase source of truth. It is kept
             # deliberately small and secret-free, so Core can classify work
             # without inspecting an API request body.
-            non_destructive = [
+            non_destructive = [] if relay_dependency_only else [
                 operation
                 for operation in operations
                 if isinstance(operation, Mapping)
@@ -3467,14 +3474,15 @@ class CoreStore:
                 remote_boundary_crossed = True
                 non_destructive_result = execute(prepared, phase="non_destructive")
 
-            reconciled = reconcile(prepared, phase="non_destructive")
-            # Transport failures are provisional until the immediate factual
-            # refresh. A lost response may still have applied remotely; only
-            # unresolved reconciliation issues stop the coordinated Apply — and
-            # that is the relay's own outstanding work, which the relay message
-            # names, never the edit the user just made.
-            if self._relay_public_issue_count(reconciled):
-                raise CoreError("relay_not_ready", "Fix the relay connection or binding issues")
+            if not relay_dependency_only:
+                reconciled = reconcile(prepared, phase="non_destructive")
+                # Transport failures are provisional until the immediate factual
+                # refresh. A lost response may still have applied remotely; only
+                # unresolved reconciliation issues stop the coordinated Apply —
+                # and that is the relay's own outstanding work, which the relay
+                # message names, never the edit the user just made.
+                if self._relay_public_issue_count(reconciled):
+                    raise CoreError("relay_not_ready", "Fix the relay connection or binding issues")
 
             providers = adapters.get("providers_models")
             if providers is not None:
@@ -3495,6 +3503,13 @@ class CoreStore:
                     # before a model selects it.  Resolve every selected key
                     # here so a provider-side key import is fully usable
                     # after Apply; private material remains inside Core.
+                    # Resolving a linked key may still read the station — a
+                    # key that has never been materialized has to come from
+                    # somewhere — but this Apply's *readiness* never depends on
+                    # it: the resolution falls back to the credential already
+                    # persisted on the slot and to the catalog the last
+                    # successful read recorded, so signing in is not a
+                    # precondition for managing a model.
                     materials = binding_materials({"resources": sources}, refresh=True)
                     materialized = materialize(materials)
                     # Whatever this resolution said becomes the pane's own map
@@ -3550,15 +3565,22 @@ class CoreStore:
             # The relay's durable draft includes operation-journal state. It
             # is committed only after model materialization has reached disk,
             # so a remote create cannot be lost if the app exits now.
-            commit()
-            relay_locally_applied = True
-            self._mark_relay_coordinated_applied("relay_accounts")
-            applied.append("relay_accounts")
+            if relay_dependency_only:
+                # The relay domain took part — it resolved the keys this edit
+                # binds — but it committed no journal work, so its own pending
+                # operations stay exactly as they were, retryable from the
+                # relay's own surfaces.
+                applied.append("relay_accounts")
+            else:
+                commit()
+                relay_locally_applied = True
+                self._mark_relay_coordinated_applied("relay_accounts")
+                applied.append("relay_accounts")
 
             if provider_locally_applied:
                 self._schedule_service_reload_after_apply()
 
-            destructive = [
+            destructive = [] if relay_dependency_only else [
                 operation
                 for operation in operations
                 if isinstance(operation, Mapping)
@@ -3571,13 +3593,21 @@ class CoreStore:
                 # for removal; a failed deletion remains journaled for retry.
                 remote_boundary_crossed = True
                 destructive_result = execute(prepared, phase="destructive")
-            reconciled_after_delete = reconcile(prepared, phase="destructive")
-            finalize_result = finalize()
-            issue_count = (
-                self._relay_public_issue_count(reconciled_after_delete)
-                + self._relay_public_issue_count(finalize_result)
-            )
-            pending = self._relay_operation_count(relay)
+            if relay_dependency_only:
+                # This edit carries no relay work of its own, so the journal's
+                # remaining phases are not part of its result: every pending
+                # operation stays exactly as the user left it, retryable from
+                # the relay's own surfaces.
+                issue_count = 0
+                pending = 0
+            else:
+                reconciled_after_delete = reconcile(prepared, phase="destructive")
+                finalize_result = finalize()
+                issue_count = (
+                    self._relay_public_issue_count(reconciled_after_delete)
+                    + self._relay_public_issue_count(finalize_result)
+                )
+                pending = self._relay_operation_count(relay)
             if issue_count or pending:
                 # The local relay document is authoritative for completed
                 # work, while outstanding journal entries keep this domain
@@ -3597,7 +3627,8 @@ class CoreStore:
                     "issues": self._relay_apply_issues(issue_count),
                 }
 
-            self._mark_relay_coordinated_applied("relay_accounts")
+            if not relay_dependency_only:
+                self._mark_relay_coordinated_applied("relay_accounts")
             self._revision += 1
             self._persist_metadata()
         except Exception as exc:
@@ -3690,6 +3721,7 @@ class CoreStore:
             relay_candidate = self._domains.get("relay_accounts")
             provider_candidate = self._domains.get("providers_models")
             relay_coordinator_available = callable(getattr(relay_candidate, "prepare_apply", None))
+            relay_dependency_only = False
             dependency_summary = getattr(provider_candidate, "dependency_summary", None)
             linked_provider_key_count = 0
             if callable(dependency_summary):
@@ -3715,6 +3747,14 @@ class CoreStore:
                         self._adapter_draft_state("providers_models")
                     ) != _relay_binding_projection(baseline):
                         names.append("relay_accounts")
+                        # The relay is a *dependency* of this edit, not the
+                        # user's own relay work: the edit needs the key it
+                        # binds resolved and nothing more.  The station's
+                        # session and its unfinished operations belong to the
+                        # relay domain's own Apply, so this one never validates
+                        # them, never runs the journal, and never reports the
+                        # backlog against an edit that did not ask about it.
+                        relay_dependency_only = True
                     else:
                         relay_coordinator_available = False
                 elif "relay_accounts" in names and "providers_models" not in names:
@@ -3744,7 +3784,13 @@ class CoreStore:
                 raise ConfirmationNeeded(missing_overwrite)
 
             if "relay_accounts" in adapters and relay_coordinator_available:
-                return self._apply_relay_coordinated(names, adapters, confirm_codes, overwrite_codes)
+                return self._apply_relay_coordinated(
+                    names,
+                    adapters,
+                    confirm_codes,
+                    overwrite_codes,
+                    relay_dependency_only=relay_dependency_only,
+                )
 
             transaction_adapters = dict(adapters)
             adapter_checkpoints = {

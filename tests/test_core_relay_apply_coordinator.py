@@ -867,6 +867,73 @@ class RelayApplyCoordinatorIntegrationTests(unittest.TestCase):
             self.assertEqual(1, http.calls.count(("PUT", "/api/token/")))
 
 
+    def test_a_linked_key_edit_is_not_gated_by_the_relays_own_backlog(self) -> None:
+        """Using a linked key is not the same as doing the relay's work.
+
+        A model edit that binds relay material pulls the relay domain in as a
+        *dependency*: the edit needs its key resolved and nothing more.  A
+        station whose own unfinished operations keep the relay domain unready
+        (a pending key create, a session that needs a sign-in) must therefore
+        not refuse that edit — the user's model has nothing to do with the
+        backlog, and adding one must not read as 中转站还有待处理的操作.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            core, relay, providers, _http, account_id, resource_id = self._linked_core(root)
+            provider_id = providers.snapshot()["providers"][0]["id"]
+            # `model-a` is what the fixture's own key catalog serves.
+            core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "model.add",
+                    "payload": {
+                        "provider_id": provider_id,
+                        "model": {"model_name": "model-a", "litellm_model": "openai/model-a"},
+                    },
+                },
+                expected_revision=core.revision,
+            )
+            model = next(
+                item
+                for item in providers.snapshot()["providers"][0]["models"]
+                if item["model_name"] == "model-a"
+            )
+            core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "model.select_relay_resource",
+                    "payload": {
+                        "provider_id": provider_id,
+                        "model_id": model["id"],
+                        "station_id": relay.snapshot()["accounts"][0]["station_id"],
+                        "account_id": account_id,
+                        "resource_id": resource_id,
+                    },
+                },
+                expected_revision=core.revision,
+            )
+
+            # The relay cannot finish its own work; that backlog is not this
+            # edit's business, and the edit still binds relay material.
+            with patch.object(
+                RelayAccountsDomain, "prepare_apply", return_value={"ready": False, "issues": []}
+            ):
+                result = core.apply(domain="providers_models", revision=core.revision)
+
+            self.assertTrue(result["applied"])
+            self.assertEqual("applied", result["status"])
+            self.assertEqual(0, result["pending_operations"])
+            # The relay domain took part — it resolved the key this edit binds —
+            # but it committed no journal work of its own.
+            self.assertIn("relay_accounts", result["domains"])
+            written = (root / "config.yaml").read_text(encoding="utf-8")
+            self.assertIn("model-a", written)
+            # The linked key carries its materialized credential, so the edit
+            # really landed instead of being refused.
+            self.assertIn("replace-materialized-key", written)
+
+
 class LocalEditBesideARelayBacklogTests(unittest.TestCase):
     """A local provider/model edit must not inherit the relay's backlog.
 
