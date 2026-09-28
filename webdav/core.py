@@ -30,6 +30,11 @@ except Exception:  # pragma: no cover - surfaced by validate_config()
 APP_NAME = "young-router"
 ARCHIVE_VERSION = 1
 DEFAULT_REMOTE_NAME = "young-router-config.json"
+#: Names earlier versions gave the remote bundle.  A stored setting that still
+#: carries one is read as the current default, and the sync moves the file it
+#: pointed at, so the collection keeps one live bundle under this app's name
+#: instead of a copy named after the proxy underneath it.
+LEGACY_REMOTE_NAMES = ("litellm-config.json",)
 CONFIG_BUNDLE_FORMAT = "json"
 CONFIG_BUNDLE_MAX_BYTES = 16 * 1024 * 1024
 MANIFEST_MAX_BYTES = 64 * 1024
@@ -48,12 +53,28 @@ SENSITIVE_QUERY_KEYS = {"x-vercel-protection-bypass"}
 SYNC_STATE_VERSION = 1
 DEFAULT_SYNC_INTERVAL_MINUTES = 30
 DEFAULT_TIMEOUT_SECONDS = 30.0
+SYNC_DIRECTIONS = ("smart", "push", "pull")
+DEFAULT_SYNC_DIRECTION = "smart"
 WEBDAV_REQUEST_RETRY_ATTEMPTS = 3
 WEBDAV_REQUEST_RETRY_DELAY_SECONDS = 1.0
 
 
+#: The remote file was written by a different app identity, archive version, or
+#: bundle format.  It travels to Core's error envelope so a pane can name the
+#: cause (and the way out) instead of repeating a generic failure.
+INCOMPATIBLE_BUNDLE_CODE = "webdav_sync_incompatible"
+
+
 class SyncError(RuntimeError):
-    pass
+    #: A cause a pane can name.  ``WebDAVHTTPError`` subclasses this and keeps
+    #: its own ``code`` (the HTTP status), so the class default is only used
+    #: when a raise asks for something more specific.
+    code = "webdav_sync_failed"
+
+    def __init__(self, message: str, code: str | None = None) -> None:
+        super().__init__(message)
+        if code is not None:
+            self.code = code
 
 
 class WebDAVHTTPError(SyncError):
@@ -185,6 +206,7 @@ class Settings:
     remote_name: str = DEFAULT_REMOTE_NAME
     sync_interval_minutes: int = DEFAULT_SYNC_INTERVAL_MINUTES
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
+    sync_direction: str = DEFAULT_SYNC_DIRECTION
 
     @property
     def configured(self) -> bool:
@@ -197,6 +219,7 @@ class Settings:
             "remote_name": self.remote_name,
             "sync_interval_minutes": self.sync_interval_minutes,
             "timeout_seconds": self.timeout_seconds,
+            "sync_direction": self.sync_direction,
             "has_password": bool(self.password),
         }
 
@@ -252,6 +275,24 @@ def _timestamp() -> str:
 
 def _utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def timestamp_epoch(value: Any) -> float | None:
+    """Read one of this module's UTC stamps as epoch seconds.
+
+    Callers that schedule work off ``updated_at``/``checked_at`` need a clock,
+    not a string; an unreadable stamp is "no record" rather than an error, so a
+    hand-edited state file degrades to a fresh sync instead of a crash.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.timestamp()
 
 
 def _sha256_bytes(data: bytes) -> str:
@@ -351,6 +392,18 @@ def _normalize_sync_interval_minutes(value: Any) -> int:
     return min(minutes, 24 * 60)
 
 
+def _normalize_sync_direction(value: Any) -> str:
+    if value is None or value == "":
+        return DEFAULT_SYNC_DIRECTION
+    text = str(value).strip().lower()
+    if text in {"sync", "auto", "automatic"}:
+        # The pane and the IPC action call the comparing mode "sync".
+        return DEFAULT_SYNC_DIRECTION
+    if text not in SYNC_DIRECTIONS:
+        return DEFAULT_SYNC_DIRECTION
+    return text
+
+
 def _normalize_timeout_seconds(value: Any) -> float:
     if value is None or value == "":
         return DEFAULT_TIMEOUT_SECONDS
@@ -368,11 +421,16 @@ def _settings_from_raw(raw: dict[str, Any]) -> Settings:
     username = str(raw.get("username", "") or "").strip()
     password = str(raw.get("password", "") or "")
     remote_name = str(raw.get("remote_name", "") or DEFAULT_REMOTE_NAME).strip() or DEFAULT_REMOTE_NAME
+    if remote_name in LEGACY_REMOTE_NAMES:
+        remote_name = DEFAULT_REMOTE_NAME
     sync_interval_minutes = _normalize_sync_interval_minutes(
         raw.get("sync_interval_minutes", DEFAULT_SYNC_INTERVAL_MINUTES)
     )
     timeout_seconds = _normalize_timeout_seconds(
         raw.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS)
+    )
+    sync_direction = _normalize_sync_direction(
+        raw.get("sync_direction", raw.get("direction", DEFAULT_SYNC_DIRECTION))
     )
     if "/" in remote_name or remote_name in {".", ".."}:
         raise SyncError("remote_name must be a file name, not a path")
@@ -388,6 +446,7 @@ def _settings_from_raw(raw: dict[str, Any]) -> Settings:
         remote_name=remote_name,
         sync_interval_minutes=sync_interval_minutes,
         timeout_seconds=timeout_seconds,
+        sync_direction=sync_direction,
     )
 
 
@@ -425,6 +484,7 @@ def save_settings(path: pathlib.Path, settings: Settings) -> None:
             "remote_name": settings.remote_name,
             "sync_interval_minutes": settings.sync_interval_minutes,
             "timeout_seconds": settings.timeout_seconds,
+            "sync_direction": settings.sync_direction,
         },
         ensure_ascii=False,
         indent=2,
@@ -622,6 +682,20 @@ def save_sync_status(path: pathlib.Path, action: str, ok: bool) -> None:
     _atomic_write(path, json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8"))
 
 
+def read_status_file(path: pathlib.Path) -> dict[str, Any]:
+    """Read the last run's outcome, treating an unreadable file as "no record".
+
+    Both the settings pane and the interval loop read this file, so a file that
+    is missing, empty, or half-written by a killed process must not raise: the
+    caller wants to know whether a run is recorded, not to fail.
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def baseline_manifest(path: pathlib.Path) -> dict[str, Any] | None:
     state = load_sync_state(path)
     manifest = state.get("manifest")
@@ -663,13 +737,13 @@ def _expected_bundle_files() -> dict[str, tuple[bool, str]]:
 def _validate_bundle_header(manifest: dict[str, Any]) -> None:
     expected_fields = {"app", "version", "format", "created_at", "summary", "files"}
     if set(manifest) != expected_fields:
-        raise SyncError("WebDAV sync bundle has unexpected top-level fields")
+        raise SyncError("WebDAV sync bundle has unexpected top-level fields", INCOMPATIBLE_BUNDLE_CODE)
     if manifest.get("app") != APP_NAME or manifest.get("version") != ARCHIVE_VERSION:
-        raise SyncError("WebDAV sync bundle was not created by this Young Router version")
+        raise SyncError("WebDAV sync bundle was not created by this Young Router version", INCOMPATIBLE_BUNDLE_CODE)
     if manifest.get("format") != CONFIG_BUNDLE_FORMAT:
-        raise SyncError("WebDAV sync bundle must use the current JSON format")
+        raise SyncError("WebDAV sync bundle must use the current JSON format", INCOMPATIBLE_BUNDLE_CODE)
     if not isinstance(manifest.get("created_at"), str) or not manifest["created_at"].strip():
-        raise SyncError("WebDAV sync bundle is missing created_at")
+        raise SyncError("WebDAV sync bundle is missing created_at", INCOMPATIBLE_BUNDLE_CODE)
 
 
 def _read_bundle_manifest_entry(
@@ -902,15 +976,37 @@ def bundle_url(settings: Settings) -> str:
     return _remote_child_url(base, settings.remote_name)
 
 
+def manifest_name(remote_name: str) -> str:
+    """The sidecar manifest's name for a bundle name."""
+    return f"{remote_name[:-5]}.manifest.json" if remote_name.endswith(".json") else f"{remote_name}.manifest.json"
+
+
 def manifest_url(settings: Settings) -> str:
     url = bundle_url(settings)
     parsed = urllib.parse.urlsplit(url)
-    path = parsed.path
-    if path.endswith(".json"):
-        path = f"{path[:-5]}.manifest.json"
-    else:
-        path = f"{path}.manifest.json"
-    return _remote_with_path(url, path)
+    return _remote_with_path(url, f"{parsed.path.rsplit('/', 1)[0]}/{urllib.parse.quote(manifest_name(settings.remote_name))}")
+
+
+def archived_bundle_name(remote_name: str, stamp: str | None = None) -> str:
+    """The name a kept-aside remote bundle takes.
+
+    It mirrors the local convention (``config.yaml.bak-20260924-195812``): the
+    remote copy keeps its stem and extension and carries the moment it was set
+    aside, so several replacements never collide and the name still says what
+    the file is.
+    """
+    name = pathlib.PurePosixPath(remote_name.strip() or "config.json").name
+    suffixes = "".join(pathlib.PurePosixPath(name).suffixes)
+    stem = name[: len(name) - len(suffixes)] if suffixes else name
+    return f"{stem}.bak-{stamp or _timestamp()}{suffixes}"
+
+
+def remote_sibling_url(settings: Settings, name: str) -> str:
+    """A URL for another file in the bundle's own collection."""
+    url = bundle_url(settings)
+    parsed = urllib.parse.urlsplit(url)
+    directory = parsed.path.rsplit("/", 1)[0]
+    return _remote_with_path(url, f"{directory}/{urllib.parse.quote(name)}")
 
 
 def collection_url(settings: Settings) -> str:

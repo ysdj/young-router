@@ -12,6 +12,7 @@ $PiWork = Join-Path ([System.IO.Path]::GetTempPath()) ("young-router-pi-web-acce
 $PiPackage = Join-Path $PiWork "package"
 $PiNode = Join-Path $PiWork "node"
 $TraceOneWork = Join-Path ([System.IO.Path]::GetTempPath()) ("young-router-traceone-" + [guid]::NewGuid().ToString("N"))
+$WorkBuddyConnectWork = Join-Path ([System.IO.Path]::GetTempPath()) ("young-router-workbuddy-connect-" + [guid]::NewGuid().ToString("N"))
 
 function Copy-CoreSource {
   param([string]$Source, [string]$Destination)
@@ -40,6 +41,11 @@ try {
   $TraceOneUpdater = Join-Path $ProjectRoot "scripts\update_traceone.py"
   & uv run --no-project --python 3.12 $TraceOneUpdater --output $TraceOneWork
   if ($LASTEXITCODE -ne 0) { throw "Could not update the bundled TraceOne degradation engine." }
+  # WorkBuddy access is driven through the published third-party package, so
+  # every artifact build re-resolves its latest release.
+  $WorkBuddyConnectUpdater = Join-Path $ProjectRoot "scripts\update_workbuddy_connect.py"
+  & uv run --no-project --python 3.12 $WorkBuddyConnectUpdater --output $WorkBuddyConnectWork
+  if ($LASTEXITCODE -ne 0) { throw "Could not update the bundled dsh-workbuddy-connect package." }
   if (-not (Test-Path (Join-Path $AppRoot "windows"))) {
     throw "React Native Windows host project is missing at rn/apps/windows/windows."
   }
@@ -62,6 +68,7 @@ try {
   }
   Copy-CoreSource $PiPackage (Join-Path $Core "young_router\pi-web-access")
   Copy-CoreSource $TraceOneWork (Join-Path $Core "young_router\traceone")
+  Copy-CoreSource $WorkBuddyConnectWork (Join-Path $Core "young_router\workbuddy-connect")
   Get-ChildItem -LiteralPath $Core -Recurse -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force
   Get-ChildItem -LiteralPath $Core -Recurse -File -Include "*.pyc", "*.pyo" | Remove-Item -Force
 
@@ -103,6 +110,9 @@ set "RUNTIME_ROOT=%~dp0"
   }
   if (-not (Test-Path (Join-Path $Core "young_router\traceone\prompt.txt"))) {
     throw "The bundled TraceOne identity prompt is missing."
+  }
+  if (-not (Test-Path (Join-Path $Core "young_router\workbuddy-connect\lib\index.js"))) {
+    throw "The bundled dsh-workbuddy-connect package is missing."
   }
   if (-not (Test-Path (Join-Path $RuntimeBin "node.exe"))) {
     throw "The bundled Node.js runtime is missing."

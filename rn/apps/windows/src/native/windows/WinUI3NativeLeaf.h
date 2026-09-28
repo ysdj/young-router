@@ -1,6 +1,7 @@
 #pragma once
 
 #include <shellapi.h>
+#include <algorithm>
 #include <functional>
 #include <map>
 #include <memory>
@@ -82,7 +83,6 @@ struct GroupManagerLabels {
   std::wstring multiplier_label;
   std::wstring value_label;
   std::wstring copy_label;
-  std::wstring copied_label;
   std::wstring failed_label;
   std::wstring models_label;
   std::wstring empty_label;
@@ -135,10 +135,42 @@ class WinUI3NativeLeaf : public std::enable_shared_from_this<WinUI3NativeLeaf> {
   // in 96-DPI content DIPs and convert them at the native window boundary.
   POINT MinimumTrackSizeForActiveRoute() const;
   bool SetWindowContentSize(std::wstring_view route, double width, double height);
+  // One answer on the app's decision window: its label, the id the caller hears
+  // back, whether Return carries it, whether Escape and the title-bar close
+  // button carry it, and whether it destroys what it names.  Mirrors the macOS
+  // `NativeDecisionAnswer`.
+  struct DecisionAnswer {
+    std::wstring id;
+    std::wstring label;
+    bool primary = false;
+    bool cancel = false;
+    bool destructive = false;
+  };
+  // One decision window for every question the app asks — a confirmation, the
+  // version acknowledgement — shaped like the macOS decision panel: the question
+  // as the window title, the detail in the body, and the answers along the
+  // trailing edge with the caller's last answer (the primary) outermost.  Empty
+  // when the window went away without an answer; the caller reads that as
+  // cancelled.
+  std::optional<std::wstring> ShowDecisionWindow(
+      std::wstring_view title,
+      std::wstring_view message,
+      std::vector<DecisionAnswer> const& answers) const;
   bool Confirm(
       std::wstring_view title,
       std::wstring_view message,
-      std::wstring_view confirm_label);
+      std::wstring_view confirm_label,
+      bool destructive);
+  // A two-answer question on the app's own decision window, for a surface that
+  // hosts its own UI (the relay sign-in browser): `primary_label` is the Return
+  // answer and `secondary_label` the cancel one.  True when the primary answer
+  // was chosen; a window that went away without an answer answers the secondary
+  // one.
+  bool DecideChoice(
+      std::wstring_view title,
+      std::wstring_view message,
+      std::wstring_view primary_label,
+      std::wstring_view secondary_label) const;
   void ShowReadOnlyText(
       std::wstring_view title,
       std::wstring_view text,

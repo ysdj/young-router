@@ -108,9 +108,30 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
         }
     }
 
-    @objc func showConfirmation(_ title: String, message: String, confirmLabel: String, resolver resolve: @escaping RCTPromiseResolveBlock, rejecter reject: RCTPromiseRejectBlock) {
+    @objc func showConfirmation(_ title: String, message: String, confirmLabel: String, destructive: Bool, resolver resolve: @escaping RCTPromiseResolveBlock, rejecter reject: RCTPromiseRejectBlock) {
         DispatchQueue.main.async {
-            resolve(self.leaf.confirm(title: title, message: message, confirmTitle: confirmLabel))
+            // The app's own decision panel, never an alert's modal session: the
+            // React host keeps running while the question is on screen, and the
+            // answer that cannot be undone draws destructive.
+            self.leaf.presentDecisionPanel(
+                title,
+                message: message,
+                answers: [
+                    NativeDecisionAnswer(
+                        id: "cancel",
+                        title: self.leaf.localizedText("cancel", fallback: "Cancel"),
+                        isCancel: true
+                    ),
+                    NativeDecisionAnswer(
+                        id: "confirm",
+                        title: confirmLabel,
+                        isDefault: true,
+                        isDestructive: destructive
+                    ),
+                ]
+            ) { answer in
+                resolve(answer == "confirm")
+            }
         }
     }
 
@@ -234,6 +255,49 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
             keys: keys,
             autoGrouping: autoGrouping
         ))
+    }
+
+    /// The next 保存并关闭 request from the open sheet: the sheet stays up while
+    /// the shared UI writes and applies the edits it handed over, and states the
+    /// outcome in its own status strip.
+    @objc(awaitGroupManagerApply:rejecter:)
+    func awaitGroupManagerApply(
+        _ resolve: @escaping RCTPromiseResolveBlock,
+        rejecter reject: @escaping RCTPromiseRejectBlock
+    ) {
+        self.leaf.awaitGroupManagerApply { result in
+            guard let result else {
+                resolve(nil)
+                return
+            }
+            resolve([
+                "autoGrouping": result.autoGrouping,
+                "creates": result.creates.map { ["name": $0.name, "groupID": $0.groupID] },
+                "updates": result.updates.map {
+                    ["keyID": $0.keyID, "name": $0.name, "groupID": $0.groupID, "enabled": $0.enabled]
+                },
+                "deletes": result.deletes,
+            ])
+        }
+    }
+
+    /// Answer a handed-over save: the sheet states the result in its own status
+    /// strip and closes, or keeps its rows for another try.
+    @objc(finishGroupManagerApply:resolver:rejecter:)
+    func finishGroupManagerApply(
+        _ options: [String: Any],
+        resolver resolve: @escaping RCTPromiseResolveBlock,
+        rejecter reject: @escaping RCTPromiseRejectBlock
+    ) {
+        guard Set(options.keys).isSubset(of: ["status", "close"]),
+              let status = options["status"] as? String,
+              status.count <= 256,
+              let close = options["close"] as? Bool else {
+            reject("E_NATIVE_GROUP_INPUT", "The group manager answer is invalid.", nil)
+            return
+        }
+        self.leaf.finishGroupManagerApply(status: status, close: close)
+        resolve(nil)
     }
 
     @objc(showCodexRestartConfirmation:message:restartLabel:laterLabel:resolver:rejecter:)
@@ -383,46 +447,35 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
                 return
             }
             DispatchQueue.main.async {
-                let alert = NSAlert()
-                alert.alertStyle = .informational
-                alert.messageText = title
-                alert.addButton(withTitle: self.leaf.localizedText("set", fallback: "Set"))
-                if allowClear && capability.present {
-                    alert.addButton(withTitle: self.leaf.localizedText("clear", fallback: "Clear"))
-                }
-                alert.addButton(withTitle: self.leaf.localizedText("cancel", fallback: "Cancel"))
-                let input = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
-                input.maximumNumberOfLines = 1
-                alert.accessoryView = input
-                alert.window.initialFirstResponder = input
-                configureImmediatePresentation(alert.window)
-                let response = alert.runModal()
-                let shouldSet = response == .alertFirstButtonReturn
-                let shouldClear = allowClear && capability.present && response == .alertSecondButtonReturn
-                guard shouldSet || shouldClear else {
-                    input.stringValue = ""
-                    resolve(nil)
-                    return
-                }
-                let value = shouldSet ? input.stringValue : nil
-                input.stringValue = ""
-                if shouldSet && (value?.isEmpty ?? true) {
-                    resolve(nil)
-                    return
-                }
-                DispatchQueue.global(qos: .userInitiated).async {
-                    do {
-                        let staged = try CoreIPCBridge.shared.stageSecret(
-                            capability.token,
-                            value: value,
-                            clear: shouldClear
-                        )
-                        DispatchQueue.main.async {
-                            resolve(["revision": staged.revision, "present": staged.present])
-                        }
-                    } catch {
-                        DispatchQueue.main.async {
-                            reject("E_NATIVE_SECRET_STAGE", "The local Core could not stage this secret.", nil)
+                // The app's own decision surface, not an alert: the field is a
+                // child window over the pane that asked for it, and the React
+                // host keeps running while it is up.
+                self.leaf.presentSecretPrompt(
+                    title: title,
+                    clearLabel: allowClear && capability.present
+                        ? self.leaf.localizedText("clear", fallback: "Clear")
+                        : nil
+                ) { answer, value in
+                    let shouldSet = answer == "set"
+                    let shouldClear = answer == "clear"
+                    guard shouldSet || shouldClear, !(shouldSet && value.isEmpty) else {
+                        resolve(nil)
+                        return
+                    }
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        do {
+                            let staged = try CoreIPCBridge.shared.stageSecret(
+                                capability.token,
+                                value: shouldSet ? value : nil,
+                                clear: shouldClear
+                            )
+                            DispatchQueue.main.async {
+                                resolve(["revision": staged.revision, "present": staged.present])
+                            }
+                        } catch {
+                            DispatchQueue.main.async {
+                                reject("E_NATIVE_SECRET_STAGE", "The local Core could not stage this secret.", nil)
+                            }
                         }
                     }
                 }

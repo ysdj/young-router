@@ -424,6 +424,140 @@ class RelayModelBindingTests(unittest.TestCase):
             self.assertEqual([], rematerialized["issues"])
             self.assertNotIn("replace-rematerialized-credential", json.dumps(rematerialized))
 
+    def test_a_key_the_relay_could_not_resolve_is_projected_onto_its_routes(self) -> None:
+        """A refused binding names the row it belongs to, not only the outcome.
+
+        The pane marks rows by ids: Core projects the materialization's
+        secret-free issues onto the provider key and the routes that point at
+        it, so a key the relay could not refresh (here the whole account could
+        not be read) marks its own rows instead of leaving the user with a
+        sentence about an unknown one.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            domain = ProvidersModelsDomain(Path(directory) / "config.yaml")
+            source = relay_source()
+            domain.stage_relay_import([source])
+            provider = domain.snapshot()["providers"][0]
+            key = next(item for item in provider["key_states"] if item["source"]["kind"] == "relay")
+            linked = provider["models"][0]
+
+            result = domain.materialize_relay_bindings(
+                {
+                    "resources": [],
+                    "issues": [
+                        {"code": "refresh_failed", "account_id": source["account_id"], "resource_id": source["resource_id"]},
+                    ],
+                }
+            )
+            domain.record_binding_issues(result["issues"])
+
+            rows = domain.snapshot()["binding_issues"]
+            self.assertEqual({"refresh_failed", "resource_missing"}, {row["code"] for row in rows})
+            self.assertEqual({key["id"]}, {row["provider_key_id"] for row in rows})
+            self.assertEqual({linked["editor_id"]}, {row["model_id"] for row in rows})
+            self.assertEqual({provider["editor_id"]}, {row["provider"] for row in rows})
+            # Nothing user-authored or secret travels with them.
+            self.assertNotIn("replace-materialized-credential", json.dumps(rows))
+
+            # A station the whole account read failed on names no resource: the
+            # keys of that account are what the rows resolve to.
+            domain.record_binding_issues([{"code": "refresh_failed", "account_id": source["account_id"]}])
+            account_rows = domain.snapshot()["binding_issues"]
+            self.assertEqual({key["id"]}, {row["provider_key_id"] for row in account_rows})
+            self.assertEqual({linked["editor_id"]}, {row["model_id"] for row in account_rows})
+            # Another account's failure marks nothing here.
+            domain.record_binding_issues([{"code": "refresh_failed", "account_id": "account-other"}])
+            self.assertEqual([], domain.snapshot()["binding_issues"])
+
+    def test_a_key_with_its_own_persisted_value_materializes_without_the_station(self) -> None:
+        """Model management stays decoupled from relay sign-in.
+
+        The relay is consulted to learn a key, a catalog, or a multiplier it has
+        not reported yet — never as a precondition.  A linked slot that already
+        carries the value this document materialized keeps working while the
+        station cannot be read at all (no dashboard session, an expired one, or
+        a station that is down), because the only thing a binding needs from the
+        relay is the key value, and that value is already here.  Reporting the
+        station's refusal beside such a route would mark a row that is fine.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            domain = ProvidersModelsDomain(Path(directory) / "config.yaml")
+            source = relay_source(models=["upstream-chat"])
+            domain.stage_relay_import([source])
+            # The first resolution is what persists the credential.
+            domain.materialize_relay_bindings(
+                {"resources": [{**source, "api_key": "replace-materialized-credential"}]}
+            )
+            domain.apply()
+            provider = domain.snapshot()["providers"][0]
+            key = next(item for item in provider["key_states"] if item["source"]["kind"] == "relay")
+            self.assertTrue(key["configured"])
+
+            # Now the station is unreadable: no resource resolved for this
+            # source, and the refresh says so at the account level too.
+            result = domain.materialize_relay_bindings(
+                {
+                    "resources": [],
+                    "issues": [
+                        {"code": "refresh_failed", "account_id": source["account_id"]},
+                        {"code": "resource_key_unavailable", "account_id": source["account_id"], "resource_id": source["resource_id"]},
+                    ],
+                }
+            )
+
+            self.assertEqual([], result["issues"])
+            self.assertEqual(1, result["materialized_provider_keys"])
+            self.assertEqual(1, result["materialized"])
+            written = domain.export(include_sensitive=True)["providers"][0]
+            self.assertEqual(
+                "replace-materialized-credential",
+                next(item for item in written["api_keys"] if item["name"] == key["name"])["value"],
+            )
+            # Nothing leaked into the pane's own issue projection either.
+            domain.record_binding_issues(result["issues"])
+            self.assertEqual([], domain.snapshot()["binding_issues"])
+            self.assertNotIn("replace-materialized-credential", json.dumps(domain.snapshot()))
+
+    def test_a_station_that_cannot_be_read_still_marks_a_key_with_no_value(self) -> None:
+        """A slot with no materialized value is a genuinely unresolved binding.
+
+        The decoupling stops at the value the document does not have: with
+        nothing to fall back on, the station's refusal is the row's real cause
+        and stays reported.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            domain = ProvidersModelsDomain(Path(directory) / "config.yaml")
+            source = relay_source(models=["upstream-chat"])
+            domain.stage_relay_import([source])
+            provider = domain.snapshot()["providers"][0]
+            key = next(item for item in provider["key_states"] if item["source"]["kind"] == "relay")
+            self.assertFalse(key["configured"])
+
+            result = domain.materialize_relay_bindings(
+                {
+                    "resources": [],
+                    "issues": [{"code": "refresh_failed", "account_id": source["account_id"]}],
+                }
+            )
+
+            self.assertEqual(
+                {"resource_missing", "refresh_failed"},
+                {item["code"] for item in result["issues"]},
+            )
+            domain.record_binding_issues(result["issues"])
+            rows = domain.snapshot()["binding_issues"]
+            self.assertEqual({key["id"]}, {row["provider_key_id"] for row in rows})
+            self.assertFalse(
+                next(
+                    item
+                    for item in domain.snapshot()["providers"][0]["key_states"]
+                    if item["id"] == key["id"]
+                )["configured"]
+            )
+
     def test_materialization_reports_catalog_and_multiplier_problems_without_secret(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             domain = ProvidersModelsDomain(Path(directory) / "config.yaml")

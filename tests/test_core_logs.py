@@ -808,6 +808,10 @@ model_list:
                         "[2026-08-01T04:10:11Z] #----------------------#",
                         "[2026-08-01T04:10:11Z] # Give Feedback / Get Help: https://github.com/BerriAI/litellm/issues/new #",
                         "[2026-08-01T04:10:11Z] openai/example-model",
+                        "[2026-08-01T04:10:11Z]    ██╗     ██╗████████╗███████╗",
+                        "[2026-08-01T04:10:11Z]    ╚══════╝╚═╝   ╚═╝   ╚══════╝",
+                        "[2026-08-01T04:10:11Z] LiteLLM: Proxy initialized with Config, Set models:",
+                        "[2026-08-01T04:10:11Z] gemini-3.1-pro",
                         "[2026-08-01T04:10:12Z] INFO: Started server process [123]",
                     ]
                 )
@@ -818,6 +822,124 @@ model_list:
             records = LogsDomain(root).view("service")["log"]["records"]
 
             self.assertEqual(["[2026-08-01T04:10:12Z] INFO: Started server process [123]"], records)
+
+    def test_service_log_folds_one_worker_burst_into_one_row(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "server.log").write_text(
+                "\n".join(
+                    [
+                        "[2026-08-01T04:10:11Z] INFO: Started server process [101]",
+                        "[2026-08-01T04:10:11Z] INFO: Waiting for application startup.",
+                        "[2026-08-01T04:10:11Z] INFO: Started server process [102]",
+                        "[2026-08-01T04:10:11Z] INFO: Waiting for application startup.",
+                        "[2026-08-01T04:10:12Z] INFO: Application startup complete.",
+                        "[2026-08-01T04:10:12Z] INFO: Application startup complete.",
+                        "[2026-08-01T04:10:12Z] INFO: 127.0.0.1:50001 - \"GET /v1/models HTTP/1.1\" 200 OK",
+                        "[2026-08-01T04:10:12Z] INFO: 127.0.0.1:50002 - \"GET /v1/models HTTP/1.1\" 200 OK",
+                        "[2026-08-01T04:10:12Z] INFO: 127.0.0.1:50003 - \"GET /v1/models HTTP/1.1\" 404 Not Found",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            records = LogsDomain(root).view("service")["log"]["records"]
+
+            self.assertEqual(
+                [
+                    "[2026-08-01T04:10:11Z] INFO: Started server process [101] (×2)",
+                    "[2026-08-01T04:10:11Z] INFO: Waiting for application startup. (×2)",
+                    "[2026-08-01T04:10:12Z] INFO: Application startup complete. (×2)",
+                ]
+                + [
+                    "[2026-08-01T04:10:12Z] INFO: 127.0.0.1:50001 - \"GET <private-path> HTTP/1.1\" 200 OK (×2)",
+                    "[2026-08-01T04:10:12Z] INFO: 127.0.0.1:50003 - \"GET <private-path> HTTP/1.1\" 404 Not Found",
+                ],
+                records,
+            )
+
+    def test_service_log_keeps_a_late_repeat_as_its_own_row(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "server.log").write_text(
+                "\n".join(
+                    [
+                        "[2026-08-01T04:10:11Z] INFO: Application startup complete.",
+                        "[2026-08-01T04:15:30Z] INFO: Application startup complete.",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            records = LogsDomain(root).view("service")["log"]["records"]
+
+            self.assertEqual(
+                [
+                    "[2026-08-01T04:10:11Z] INFO: Application startup complete.",
+                    "[2026-08-01T04:15:30Z] INFO: Application startup complete.",
+                ],
+                records,
+            )
+
+    def test_service_log_splits_records_two_workers_wrote_into_one_line(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "server.log").write_text(
+                "\n".join(
+                    [
+                        "[2026-08-01T04:10:11Z]    gemini-3.1-pro[2026-08-01T04:10:11Z] INFO: Started server process [101]",
+                        "[2026-08-01T04:10:11Z] INFO: Started server process [101][2026-08-01T04:10:11Z] INFO: Started server process [102]",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            records = LogsDomain(root).view("service")["log"]["records"]
+
+            self.assertEqual(
+                ["[2026-08-01T04:10:11Z] INFO: Started server process [101] (×3)"],
+                records,
+            )
+
+    def test_a_route_trace_record_is_never_split_by_a_quoted_timestamp(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "server.log").write_text(
+                "[2026-08-01T04:10:11Z] litellm_route_trace "
+                '{"event": "probe", "preview": "[2026-08-01T04:10:11Z] text", '
+                '"timestamp": "2026-08-01T04:10:11Z"}\n'
+                "[2026-08-01T04:10:12Z] INFO: Started server process [7]\n",
+                encoding="utf-8",
+            )
+
+            domain = LogsDomain(root)
+
+            self.assertEqual(
+                ["[2026-08-01T04:10:12Z] INFO: Started server process [7]"],
+                domain.view("service")["log"]["records"],
+            )
+            self.assertEqual(1, len(domain.view("route-trace")["log"]["records"]))
+
+    def test_a_long_service_row_keeps_its_repeat_count_inside_the_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            message = "x" * 900
+            (root / "server.log").write_text(
+                "\n".join(
+                    f"[2026-08-01T04:10:1{index}Z] INFO: {message}" for index in range(2)
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            records = LogsDomain(root).view("service")["log"]["records"]
+
+            self.assertEqual(1, len(records))
+            self.assertTrue(records[0].endswith(" (×2)"))
+            self.assertLessEqual(len(records[0]), 512)
 
     def test_service_traceback_lines_are_one_selectable_record(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

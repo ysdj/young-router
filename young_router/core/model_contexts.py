@@ -547,6 +547,8 @@ class ModelContextRegistry:
         self._route_index_cache: dict[str, list[dict[str, Any]]] = {}
         self._cache_fetched_at: float | None = None
         self._last_refresh_attempt: float | None = None
+        self._runtime_values_key: tuple[int, int] | None = None
+        self._runtime_values_cache: tuple[int, int] | None = None
 
     @staticmethod
     def _fetch_json(url: str) -> object:
@@ -645,17 +647,33 @@ class ModelContextRegistry:
         refresh_hours = DEFAULT_MODEL_CONTEXT_REFRESH_HOURS
         if self.runtime_settings_path is None:
             return unknown, refresh_hours
+        # Every catalog entry and pane snapshot asks for these two values, so
+        # re-parse the settings file only when it actually changed; a live
+        # edit still lands on the next lookup.
+        try:
+            details = self.runtime_settings_path.stat()
+            key: tuple[int, int] | None = (details.st_mtime_ns, details.st_size)
+        except OSError:
+            key = None
+        if key is not None and key == self._runtime_values_key and self._runtime_values_cache is not None:
+            return self._runtime_values_cache
+        resolved: tuple[int, int] | None = None
         try:
             from runtime_settings_io import load_specs, read_settings_file
 
             values = read_settings_file(self.runtime_settings_path, load_specs())
             unknown = int(values.get("YOUNG_ROUTER_UNKNOWN_MODEL_CONTEXT_WINDOW", unknown))
             refresh_hours = int(values.get("YOUNG_ROUTER_MODEL_CONTEXT_REFRESH_HOURS", refresh_hours))
+            resolved = (max(1, unknown), max(0, refresh_hours))
         except Exception:
             # A malformed settings file is reported by the Runtime Settings
             # domain; catalog generation still has its bundled policy.
             pass
-        return max(1, unknown), max(0, refresh_hours)
+        if resolved is None:
+            return max(1, unknown), max(0, refresh_hours)
+        self._runtime_values_key = key
+        self._runtime_values_cache = resolved
+        return resolved
 
     def _route_index(self) -> dict[str, list[dict[str, Any]]]:
         """Return the parsed ``model_list`` of the provider config, by name.
@@ -808,12 +826,28 @@ class ModelContextRegistry:
                 pass
         return True
 
-    def record_for(self, public_name: str) -> ContextRecord:
-        self._load_cache()
-        route_ids = self._load_route_model_ids(public_name)
-        unknown, _ = self._runtime_values()
+    @staticmethod
+    def _deployment_context(deployment: Mapping[str, Any]) -> int | None:
+        """Read the user's public-model context window from one deployment."""
+
+        model_info = deployment.get("model_info")
+        if not isinstance(model_info, Mapping):
+            return None
+        return _positive_int(model_info.get("max_input_tokens"))
+
+    def _custom_contexts(self, public_name: str) -> list[int]:
+        """Collect the explicitly configured windows of every route in a group."""
+
+        contexts: list[int] = []
+        for deployment in self._load_route_deployments(public_name):
+            context = self._deployment_context(deployment)
+            if context is not None:
+                contexts.append(context)
+        return contexts
+
+    def _resolved_route_records(self, public_name: str) -> list[dict[str, Any]]:
         records: list[dict[str, Any]] = []
-        for model_id in route_ids:
+        for model_id in self._load_route_model_ids(public_name):
             record = self._resolve_context_record(model_id)
             if record is not None:
                 records.append(record)
@@ -821,15 +855,61 @@ class ModelContextRegistry:
             record = self._resolve_context_record(public_name)
             if record is not None:
                 records.append(record)
-        if records:
+        return records
+
+    @staticmethod
+    def _context_record_from_records(
+        records: Sequence[Mapping[str, Any]],
+        *,
+        unknown: int,
+    ) -> ContextRecord:
+        if not records:
             return ContextRecord(
-                context_window=min(int(record["context_window"]) for record in records),
-                max_context_window=min(int(record["max_context_window"]) for record in records),
-                effective_context_window_percent=min(int(record.get("effective_context_window_percent", DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT)) for record in records),
+                context_window=unknown,
+                max_context_window=unknown,
+                effective_context_window_percent=DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT,
             )
         return ContextRecord(
-            context_window=unknown,
-            max_context_window=unknown,
+            context_window=min(int(record["context_window"]) for record in records),
+            max_context_window=min(int(record["max_context_window"]) for record in records),
+            effective_context_window_percent=min(int(record.get("effective_context_window_percent", DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT)) for record in records),
+        )
+
+    def default_record_for(self, public_name: str) -> ContextRecord:
+        """Resolve registry metadata while ignoring the user's own limits.
+
+        The model inspector shows this window as the value a public model
+        falls back to when the user has not customized it; ``record_for`` is
+        the effective policy the managed catalog writes.
+        """
+
+        self._load_cache()
+        unknown, _ = self._runtime_values()
+        return self._context_record_from_records(
+            self._resolved_route_records(public_name),
+            unknown=unknown,
+        )
+
+    def record_for(self, public_name: str) -> ContextRecord:
+        """Resolve one public model's context policy.
+
+        An explicitly configured window wins over registry metadata: the user
+        knows the relay in front of the route, so a public model whose routes
+        declare ``model_info.max_input_tokens`` keeps that value even when a
+        better-known upstream profile resolves a different window.  The group
+        reports the smallest declared value, the same safe direction every
+        inferred lookup already takes.
+        """
+
+        self._load_cache()
+        resolved = self.default_record_for(public_name)
+        contexts = self._custom_contexts(public_name)
+        if not contexts:
+            return resolved
+        context = min(contexts)
+        return ContextRecord(
+            context_window=context,
+            max_context_window=context,
             effective_context_window_percent=DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT,
         )
 

@@ -1141,6 +1141,7 @@ def _install_generic_deployment_failover_patch() -> None:
             _codex_fast_tier_module._with_codex_fast_default_service_tier,
             _responses_request_module._with_codex_tool_registry_instruction,
             _responses_request_module._with_codex_descendant_cleanup_instruction,
+            _responses_request_module._with_codex_commentary_discipline_instruction,
             _responses_request_module._with_empty_tool_controls_removed,
             _responses_request_module._with_codex_compaction_controls,
             _responses_request_module._with_responses_native_extra_body,

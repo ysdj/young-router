@@ -130,6 +130,9 @@ def run(argv: list[str] | None = None) -> int:
         reset_transient_routing_state=True,
     )
     server = CoreIPCServer(core, address=args.address, port=args.port)
+    # The interval loop lives beside the IPC server: it reads the saved switch
+    # and interval, so a machine nobody is looking at still syncs.
+    webdav_scheduler = core.webdav_scheduler()
 
     def request_stop(_signum: int, _frame: Any) -> None:
         stop.set()
@@ -140,6 +143,7 @@ def run(argv: list[str] | None = None) -> int:
         if stop.is_set():
             return 0
         server.start()
+        webdav_scheduler.start()
         if args.endpoint_file is not None:
             _write_endpoint(args.endpoint_file, server)
         if args.print_endpoint:
@@ -157,6 +161,10 @@ def run(argv: list[str] | None = None) -> int:
         stop.set()
         if parent_watchdog is not None and parent_watchdog is not threading.current_thread():
             parent_watchdog.join(timeout=1.0)
+        try:
+            webdav_scheduler.stop()
+        except Exception:
+            pass
         try:
             core.shutdown()
         except Exception:

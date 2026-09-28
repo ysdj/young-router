@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cwctype>
 #include <filesystem>
+#include <iterator>
 #include <fstream>
 #include <functional>
 #include <map>
@@ -550,50 +551,160 @@ bool WinUI3NativeLeaf::SetWindowContentSize(std::wstring_view route, double widt
       SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER) != FALSE;
 }
 
-bool WinUI3NativeLeaf::Confirm(
+std::optional<std::wstring> WinUI3NativeLeaf::ShowDecisionWindow(
     std::wstring_view title,
     std::wstring_view message,
-    std::wstring_view confirm_label) {
+    std::vector<DecisionAnswer> const& answers) const {
   namespace xaml = winrt::Microsoft::UI::Xaml;
   namespace controls = winrt::Microsoft::UI::Xaml::Controls;
+  if (title.empty() || answers.empty() || answers.size() > 3) return std::nullopt;
+  auto cancel_answer = std::find_if(answers.begin(), answers.end(), [](auto const& answer) { return answer.cancel; });
+  if (cancel_answer == answers.end()) return std::nullopt;
+  auto primary_answer = std::find_if(answers.begin(), answers.end(), [](auto const& answer) { return answer.primary; });
+  if (primary_answer == answers.end()) primary_answer = std::prev(answers.end());
+
+  // The question's own width decides the window, the way a macOS alert does: as
+  // narrow as its text allows, never wider than the maximum, so a two-word
+  // confirmation is a small dialog and not a 440 pt box.
+  constexpr double kDialogMinWidth = 300;
+  constexpr double kDialogMaxWidth = 420;
+  constexpr double kDialogMargin = 20;
   xaml::Window dialog;
   dialog.Title(winrt::hstring(title));
 
   controls::StackPanel root;
   root.Spacing(16);
-  root.Margin(xaml::Thickness{20, 20, 20, 20});
+  root.Margin(xaml::Thickness{kDialogMargin, kDialogMargin, kDialogMargin, kDialogMargin});
 
-  controls::TextBlock body;
-  body.FontSize(kUIFontSize);
-  body.Text(winrt::hstring(message));
-  body.TextWrapping(xaml::TextWrapping::Wrap);
-  root.Children().Append(body);
+  // The dialog opens on its whole message: the body wraps at the dialog's own
+  // width and the window grows to the text it carries instead of clipping a
+  // key's model list in a fixed box.
+  double message_height = 0;
+  double text_width = kDialogMinWidth - kDialogMargin * 2;
+  const bool has_message = !message.empty();
+  if (has_message) {
+    controls::TextBlock body;
+    body.FontSize(kUIFontSize);
+    body.Text(winrt::hstring(message));
+    body.TextWrapping(xaml::TextWrapping::Wrap);
+    root.Children().Append(body);
+    try {
+      // The unwrapped width first, so a short message keeps a narrow dialog.
+      body.Measure(winrt::Windows::Foundation::Size{1.0e7f, 1.0e7f});
+      text_width = std::clamp(
+          static_cast<double>(body.DesiredSize().Width),
+          kDialogMinWidth - kDialogMargin * 2,
+          kDialogMaxWidth - kDialogMargin * 2);
+      body.Measure(winrt::Windows::Foundation::Size{static_cast<float>(text_width), 1.0e7f});
+      message_height = static_cast<double>(body.DesiredSize().Height);
+    } catch (...) {
+    }
+    if (!(message_height > 0)) message_height = 60;
+  }
+  const double dialog_width = text_width + kDialogMargin * 2;
+  const double dialog_height = std::min(460.0, kDialogMargin * 2 + message_height + (has_message ? 16 : 0) + 34);
 
   controls::StackPanel actions;
   actions.Orientation(controls::Orientation::Horizontal);
   actions.HorizontalAlignment(xaml::HorizontalAlignment::Right);
   actions.Spacing(8);
-  controls::Button cancel;
-  cancel.FontSize(kUIFontSize);
-  cancel.Content(winrt::box_value(winrt::hstring(Localized("cancel", L"Cancel"))));
-  controls::Button confirm;
-  confirm.FontSize(kUIFontSize);
-  confirm.Content(winrt::box_value(winrt::hstring(
-      confirm_label.empty() ? Localized("ok", L"OK") : std::wstring(confirm_label))));
-  actions.Children().Append(cancel);
-  actions.Children().Append(confirm);
+  // The answer runs along the trailing edge with the caller's last answer (the
+  // primary one) outermost, which is where the macOS panel draws it.
+  std::wstring answer;
+  controls::Button primary_button{nullptr};
+  for (auto const& entry : answers) {
+    controls::Button button;
+    button.FontSize(kUIFontSize);
+    button.Content(winrt::box_value(winrt::hstring(entry.label.empty() ? Localized("ok", L"OK") : entry.label)));
+    if (entry.destructive) {
+      // A destructive answer draws with the system's own critical ink, the way
+      // the macOS panel draws it red.
+      winrt::Windows::UI::Color critical{255, 196, 43, 28};
+      try {
+        auto resources = xaml::Application::Current().Resources();
+        auto brush = resources.Lookup(winrt::box_value(winrt::hstring(L"SystemFillColorCriticalBrush")))
+                         .try_as<xaml::Media::SolidColorBrush>();
+        button.Foreground(brush ? brush : xaml::Media::SolidColorBrush(critical));
+      } catch (...) {
+        button.Foreground(xaml::Media::SolidColorBrush(critical));
+      }
+    }
+    const std::wstring id = entry.id;
+    button.Click([&dialog, &answer, id](auto const&, auto const&) {
+      answer = id;
+      dialog.Close();
+    });
+    if (entry.primary) primary_button = button;
+    actions.Children().Append(button);
+  }
   root.Children().Append(actions);
   dialog.Content(root);
 
   bool finished = false;
-  bool accepted = false;
-  cancel.Click([dialog](auto const&, auto const&) { dialog.Close(); });
-  confirm.Click([dialog, &accepted](auto const&, auto const&) {
-    accepted = true;
-    dialog.Close();
-  });
   dialog.Closed([&finished](auto const&, auto const&) { finished = true; });
-  return RunOwnedModalWindow(dialog, window_handle_, {440, 220}, finished) && accepted;
+  // Return answers the primary and Escape is the question's own way out, exactly
+  // as the macOS panel answers: without them the only keyboard answer was
+  // whichever control happened to hold focus.
+  const std::wstring primary_id = primary_answer->id;
+  const std::wstring cancel_id = cancel_answer->id;
+  root.KeyDown([&dialog, &answer, primary_id, cancel_id](
+                   auto const&, winrt::Microsoft::UI::Xaml::Input::KeyRoutedEventArgs const& args) {
+    const auto key = args.Key();
+    if (key == winrt::Windows::System::VirtualKey::Escape) {
+      args.Handled(true);
+      answer = cancel_id;
+      dialog.Close();
+      return;
+    }
+    if (key == winrt::Windows::System::VirtualKey::Enter) {
+      args.Handled(true);
+      answer = primary_id;
+      dialog.Close();
+    }
+  });
+  if (primary_button) primary_button.Focus(xaml::FocusState::Programmatic);
+  if (!RunOwnedModalWindow(dialog, window_handle_, {dialog_width, dialog_height}, finished)) return std::nullopt;
+  // A window closed by its own button (or its title bar) answers nothing: the
+  // caller reads that as cancelled.
+  if (answer.empty()) return std::nullopt;
+  return answer;
+}
+
+bool WinUI3NativeLeaf::DecideChoice(
+    std::wstring_view title,
+    std::wstring_view message,
+    std::wstring_view primary_label,
+    std::wstring_view secondary_label) const {
+  DecisionAnswer secondary;
+  secondary.id = L"secondary";
+  secondary.label = std::wstring(secondary_label);
+  secondary.cancel = true;
+  DecisionAnswer primary;
+  primary.id = L"primary";
+  primary.label = std::wstring(primary_label);
+  primary.primary = true;
+  auto answer = ShowDecisionWindow(title, message, {secondary, primary});
+  // A window that went away without an answer is the cancel answer, exactly as
+  // Escape is.
+  return answer.has_value() && *answer == L"primary";
+}
+
+bool WinUI3NativeLeaf::Confirm(
+    std::wstring_view title,
+    std::wstring_view message,
+    std::wstring_view confirm_label,
+    bool destructive) {
+  DecisionAnswer cancel_answer;
+  cancel_answer.id = L"cancel";
+  cancel_answer.label = Localized("cancel", L"Cancel");
+  cancel_answer.cancel = true;
+  DecisionAnswer confirm_answer;
+  confirm_answer.id = L"confirm";
+  confirm_answer.label = confirm_label.empty() ? Localized("ok", L"OK") : std::wstring(confirm_label);
+  confirm_answer.primary = true;
+  confirm_answer.destructive = destructive;
+  auto answer = ShowDecisionWindow(title, message, {cancel_answer, confirm_answer});
+  return answer.has_value() && *answer == L"confirm";
 }
 
 void WinUI3NativeLeaf::ShowReadOnlyText(
@@ -813,6 +924,9 @@ std::optional<std::vector<std::wstring>> WinUI3NativeLeaf::ChooseModelsToAdd(
   controls::TextBlock title;
   title.Text(Localized("modelChooserHeading", L"Choose models to add"));
   title.FontSize(kUIFontSize);
+  // The heading step matches the macOS panel's (`nativeHeadingFont`): one
+  // semibold step inside a native window, whichever host draws it.
+  title.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
   root.Children().Append(title);
 
   controls::TextBlock subtitle;
@@ -1391,20 +1505,16 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
   value_row.Children().Append(value_field);
   detail.Children().Append(models_title);
   detail.Children().Append(models_scroll);
-  controls::TextBlock copy_status;
-  copy_status.FontSize(kUIFontSize);
-  copy_status.TextTrimming(winrt::Microsoft::UI::Xaml::TextTrimming::CharacterEllipsis);
-  copy_status.Foreground(theme_brush(
-      L"TextFillColorSecondaryBrush", winrt::Windows::UI::Color{255, 110, 110, 115}));
-  detail.Children().Append(copy_status);
   controls::Grid::SetColumn(detail, 1);
   layout.Children().Append(detail);
 
   controls::Grid footer;
   controls::ColumnDefinition footer_toggle;
+  controls::ColumnDefinition footer_status_column;
   controls::ColumnDefinition footer_actions;
   footer_actions.Width(xaml::GridLengthHelper::Auto());
   footer.ColumnDefinitions().Append(footer_toggle);
+  footer.ColumnDefinitions().Append(footer_status_column);
   footer.ColumnDefinitions().Append(footer_actions);
   controls::CheckBox toggle;
   toggle.FontSize(kUIFontSize);
@@ -1417,6 +1527,16 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
   };
   controls::Grid::SetColumn(toggle, 0);
   footer.Children().Append(toggle);
+  // The window's one status line: its save result, or a failed copy.  It takes
+  // the free space, so a message never moves the buttons.
+  controls::TextBlock footer_status;
+  footer_status.FontSize(kUIFontSize);
+  footer_status.TextTrimming(winrt::Microsoft::UI::Xaml::TextTrimming::CharacterEllipsis);
+  footer_status.Foreground(theme_brush(
+      L"TextFillColorSecondaryBrush", winrt::Windows::UI::Color{255, 110, 110, 115}));
+  footer_status.VerticalAlignment(xaml::VerticalAlignment::Center);
+  controls::Grid::SetColumn(footer_status, 1);
+  footer.Children().Append(footer_status);
   controls::StackPanel actions;
   actions.Orientation(controls::Orientation::Horizontal);
   actions.HorizontalAlignment(xaml::HorizontalAlignment::Right);
@@ -1430,7 +1550,7 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
   apply.IsEnabled(false);
   actions.Children().Append(close);
   actions.Children().Append(apply);
-  controls::Grid::SetColumn(actions, 1);
+  controls::Grid::SetColumn(actions, 2);
   footer.Children().Append(actions);
   controls::Grid::SetRow(footer, 1);
   controls::Grid::SetColumnSpan(footer, 2);
@@ -1506,17 +1626,17 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
   // reply that arrives after the sheet closes cannot touch freed stack state.
   auto status_timer = std::make_shared<xaml::DispatcherTimer>();
   status_timer->Interval(std::chrono::milliseconds(4000));
-  status_timer->Tick([status_timer, copy_status](auto const&, auto const&) {
+  status_timer->Tick([status_timer, footer_status](auto const&, auto const&) {
     status_timer->Stop();
-    copy_status.Text(L"");
+    footer_status.Text(L"");
   });
-  auto show_copy_status = [copy_status, status_timer](std::wstring const& message) {
-    copy_status.Text(winrt::hstring(message));
+  auto show_copy_status = [footer_status, status_timer](std::wstring const& message) {
+    footer_status.Text(winrt::hstring(message));
     status_timer->Stop();
     if (!message.empty()) status_timer->Start();
   };
   copy_button.Click([rows, list, account_id, copy_button, show_copy_status, can_copy, revealed_values,
-                     copied_label = labels.copied_label, failed_label = labels.failed_label](auto const&, auto const&) {
+                     failed_label = labels.failed_label](auto const&, auto const&) {
     const int32_t selected = list.SelectedIndex();
     if (selected < 0 || static_cast<size_t>(selected) >= rows->size()) return;
     auto row = std::make_shared<SheetRow>((*rows)[static_cast<size_t>(selected)]);
@@ -1531,7 +1651,7 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
         package.SetText(winrt::hstring(revealed->second));
         Clipboard::SetContent(package);
         Clipboard::Flush();
-        show_copy_status(copied_label);
+        // A copy that worked says nothing.
       } catch (...) {
         show_copy_status(failed_label);
       }
@@ -1549,7 +1669,7 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
     // capability the provider workspace uses, then copy it back on the UI
     // thread because WinUI's clipboard requires it.  The read retries a lease
     // that lost a revision race, exactly like the value row's own read.
-    std::thread([target, row, dispatcher, copy_button, show_copy_status, can_copy, copied_label, failed_label, account_id] {
+    std::thread([target, row, dispatcher, copy_button, show_copy_status, can_copy, failed_label, account_id] {
       std::optional<std::wstring> value;
       for (int attempt = 0; attempt < 3 && !value; ++attempt) {
         value = CoreIPCBridge::Shared().ReadPlainTextSecret("relay_accounts", "api_key", winrt::to_string(*target));
@@ -1571,8 +1691,9 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
         value->clear();
       }
       dispatcher.TryEnqueue([row, copy_button, show_copy_status, can_copy,
-                             message = copied ? copied_label : failed_label] {
+                             message = copied ? std::wstring{} : failed_label] {
         copy_button.IsEnabled(can_copy(*row));
+        // A copy that worked says nothing: only a failure takes the line.
         show_copy_status(message);
       });
     }).detach();
@@ -1910,7 +2031,7 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
   });
   close.Click([&](auto const&, auto const&) {
     // Close drops the staged draft, so a sheet that would lose edits asks first.
-    if (has_staged_changes() && !Confirm(labels.discard_title, labels.discard_body, labels.discard_confirm)) return;
+    if (has_staged_changes() && !Confirm(labels.discard_title, labels.discard_body, labels.discard_confirm, /*destructive=*/true)) return;
     *applied = false;
     dialog.Close();
   });
@@ -1988,8 +2109,15 @@ bool WinUI3NativeLeaf::SetLaunchAtLogin(bool enabled) {
 }
 
 void WinUI3NativeLeaf::ShowVersion() const {
-  std::wstring text = VersionText();
-  MessageBoxW(window_handle_, text.c_str(), Localized("appTitle", L"Young Router").c_str(), MB_OK | MB_ICONINFORMATION);
+  // The version acknowledgement is the app's own decision window with one
+  // answer, exactly as macOS draws it: a MessageBox would be a second dialog
+  // family for the same acknowledgement.
+  DecisionAnswer ok;
+  ok.id = L"ok";
+  ok.label = Localized("ok", L"OK");
+  ok.primary = true;
+  ok.cancel = true;
+  ShowDecisionWindow(Localized("appTitle", L"Young Router"), VersionText(), {ok});
 }
 
 WinUI3NativeLeaf::VersionInfoResult WinUI3NativeLeaf::VersionInfo() const {

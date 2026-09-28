@@ -1,6 +1,7 @@
 #pragma once
 
 #include <windows.h>
+#include <functional>
 #include <optional>
 #include <string>
 
@@ -20,6 +21,12 @@ struct WindowsRelayLoginOptions {
   std::optional<std::string> station_name;
   std::optional<std::string> station_type;
   std::optional<std::string> station_origin;
+  // The host's own decision surface: the sign-in surface asks its post-login
+  // question (keep the typed password?) through the one decision window the app
+  // uses for every question, instead of a ContentDialog of its own.  Empty when
+  // the host has none, and then the question answers "session only".
+  std::function<bool(std::wstring const& title, std::wstring const& message,
+                     std::wstring const& primary_label, std::wstring const& secondary_label)> decide;
 };
 
 struct WindowsRelayLoginResult {

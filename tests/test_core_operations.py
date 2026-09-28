@@ -13,13 +13,18 @@ import textwrap
 import unittest
 from unittest import mock
 
+import yaml
+
 from young_router.core import CoreStore
+from young_router.core.service import CoreError
 from young_router.core.domains.providers_models import ProvidersModelsDomain
 from young_router.core.domains.relay_accounts import RelayAccountsDomain
 from young_router.core.domains.runtime import RuntimeSettingsDomain
 from young_router.core.domains.webdav import WebDAVSettingsDomain
 from young_router.core.domains._shared import DomainError
 from young_router.core.operations import CoreServiceController
+
+from webdav import core as webdav_core  # noqa: E402
 from young_router.core.persistence import PersistenceError
 
 
@@ -759,6 +764,71 @@ class CoreOperationsTests(unittest.TestCase):
 
             self.assertEqual("44001", controller._runtime_env()["LITELLM_PORT"])
 
+    def test_staged_runtime_config_moves_retry_counts_into_the_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            controller = CoreServiceController(root)
+            (root / "config.yaml").write_text(
+                textwrap.dedent(
+                    """
+                    model_list: []
+                    router_settings:
+                      num_retries: 2
+                      retry_policy:
+                        TimeoutErrorRetries: 2
+                      RateLimitErrorRetries: 8
+                      InternalServerErrorRetries: 2
+                      fallbacks:
+                        - first-model:
+                            - second-model
+                    """
+                ).lstrip(),
+                encoding="utf-8",
+            )
+
+            controller._stage_runtime_config()
+
+            staged = yaml.safe_load(
+                (root / ".litellm-runtime" / "config.yaml").read_text(encoding="utf-8")
+            )
+            self.assertEqual(2, staged["router_settings"]["num_retries"])
+            self.assertEqual(
+                {
+                    "TimeoutErrorRetries": 2,
+                    "RateLimitErrorRetries": 8,
+                    "InternalServerErrorRetries": 2,
+                },
+                staged["router_settings"]["retry_policy"],
+            )
+            self.assertEqual(
+                [{"first-model": ["second-model"]}],
+                staged["router_settings"]["fallbacks"],
+            )
+
+    def test_staged_runtime_config_is_a_byte_copy_without_misplaced_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            controller = CoreServiceController(root)
+            source = root / "config.yaml"
+            source.write_text(
+                textwrap.dedent(
+                    """
+                    model_list: []
+                    router_settings:
+                      retry_policy:
+                        RateLimitErrorRetries: 8
+                    """
+                ).lstrip(),
+                encoding="utf-8",
+            )
+
+            controller._stage_runtime_config()
+
+            self.assertEqual(
+                source.read_bytes(),
+                (root / ".litellm-runtime" / "config.yaml").read_bytes(),
+            )
+
     def test_service_start_appends_proxy_output_to_service_log(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             controller = CoreServiceController(directory)
@@ -1178,6 +1248,204 @@ class CoreOperationsTests(unittest.TestCase):
             summary = core.snapshot()["action_summaries"]["webdav"]
             self.assertEqual(["providers_models", "relay_accounts"], summary["sections"])
             self.assertNotIn("replace-webdav-password", json.dumps(core.snapshot()))
+
+    def test_the_interval_loop_reads_the_saved_switch_and_interval(self) -> None:
+        """The loop's view is committed state, never a half-typed draft."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.yaml"
+            config.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            webdav = self._configured_webdav_domain(root, config)
+            core = CoreStore(domains=[webdav])
+
+            webdav.dispatch("patch", {"enabled": True, "sync_interval_minutes": 15, "sync_direction": "push"})
+            webdav.apply()
+            self.assertEqual(
+                {
+                    "enabled": True,
+                    "configured": True,
+                    "sync_interval_minutes": 15,
+                    "sync_direction": "push",
+                    "last_sync_at": None,
+                },
+                core.webdav_auto_sync_state(),
+            )
+
+            # Editing fields in an open window leaves the loop's view alone: a
+            # half-typed interval must not change what runs in the background.
+            webdav.dispatch("patch", {"enabled": False, "sync_interval_minutes": 0})
+            state = core.webdav_auto_sync_state()
+            self.assertTrue(state["enabled"])
+            self.assertEqual(15, state["sync_interval_minutes"])
+
+    def test_an_automatic_run_uses_the_saved_direction(self) -> None:
+        """智能同步 means the comparing action; the other two mean themselves."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.yaml"
+            config.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            webdav = self._configured_webdav_domain(root, config)
+            core = CoreStore(domains=[webdav])
+            webdav.dispatch("patch", {"enabled": True, "sync_direction": "push"})
+            webdav.apply()
+
+            recorded: list[tuple[tuple[object, ...], dict[str, object]]] = []
+            with mock.patch.object(
+                core,
+                "_dispatch_webdav_sync",
+                side_effect=lambda *args, **kwargs: recorded.append((args, kwargs)),
+            ):
+                core.run_automatic_webdav_sync()
+            (operation, payload, _revision), flags = recorded[-1]
+            self.assertEqual("push", operation)
+            self.assertEqual({"sections": ["providers_models", "relay_accounts"]}, payload)
+            # Only the Core's own loop may ask for the unattended behaviour.
+            self.assertEqual({"automatic": True}, flags)
+
+            webdav.dispatch("patch", {"sync_direction": "smart"})
+            webdav.apply()
+            with mock.patch.object(
+                core,
+                "_dispatch_webdav_sync",
+                side_effect=lambda *args, **kwargs: recorded.append((args, kwargs)),
+            ):
+                core.run_automatic_webdav_sync()
+            self.assertEqual("sync", recorded[-1][0][0])
+
+    def test_an_automatic_sync_is_not_stopped_by_an_open_draft(self) -> None:
+        """A background sync reads the files; a pane's draft is the pane's.
+
+        A reader's own sync must still refuse to race their unsaved edits, so
+        the guard stays for the button and the loop goes around it.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.yaml"
+            config.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            providers = ProvidersModelsDomain(config)
+            relay = RelayAccountsDomain(storage_path=root / ".litellm-runtime" / "relay-accounts.json")
+            webdav = self._configured_webdav_domain(root, config)
+            core = CoreStore(domains=[providers, relay, webdav])
+
+            # A window's unsaved draft, as Core tracks it for the guard.  The
+            # WebDAV pane stages edits of its own too (its draft_state proves
+            # the window has something unapplied).
+            core._drafts.setdefault("webdav", {})["dirty"] = True
+            core._drafts.setdefault("providers_models", {})["dirty"] = True
+            webdav.dispatch("patch", {"sync_interval_minutes": 45})
+            self.assertEqual(45, webdav.draft_state()["settings"]["sync_interval_minutes"])
+
+            pushed: list[object] = []
+            with mock.patch("webdav.core.WebDAVClient", return_value=object()), mock.patch(
+                "webdav.operations.read_remote_manifest",
+                return_value=None,
+            ), mock.patch("webdav.operations.push_bundle", side_effect=lambda *args, **kwargs: pushed.append(args)):
+                core.run_automatic_webdav_sync()
+
+            self.assertEqual(1, len(pushed))
+            with self.assertRaises(CoreError) as raised:
+                core.dispatch(
+                    {"domain": "webdav", "type": "sync", "payload": {"sections": ["providers_models", "relay_accounts"]}},
+                    expected_revision=core.revision,
+                )
+            self.assertEqual("webdav_sync_conflict", raised.exception.code)
+
+    def test_changing_webdav_settings_wakes_the_interval_loop(self) -> None:
+        """A saved setting takes effect at once, not at the next wake."""
+
+        from young_router.core.webdav_scheduler import WebDAVSyncScheduler
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.yaml"
+            config.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            webdav = self._configured_webdav_domain(root, config)
+            providers = ProvidersModelsDomain(config)
+            core = CoreStore(domains=[providers, webdav])
+            core.webdav_scheduler()
+
+            with mock.patch.object(WebDAVSyncScheduler, "kick") as kick:
+                core.dispatch({"domain": "webdav", "action": "patch", "payload": {"sync_interval_minutes": 5}})
+            kick.assert_called_once()
+
+            # Any other domain's action leaves the loop's sleep alone.
+            with mock.patch.object(WebDAVSyncScheduler, "kick") as kick:
+                core.dispatch({"domain": "providers_models", "action": "reload", "payload": {}})
+            kick.assert_not_called()
+
+    def test_the_pane_sees_the_last_recorded_run(self) -> None:
+        """A window opened after a failed automatic sync can say why."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.yaml"
+            config.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            webdav = self._configured_webdav_domain(root, config)
+            self.assertIsNone(webdav.snapshot()["last_result"])
+
+            webdav.status_path.write_text(
+                json.dumps({"action": "sync", "checked_at": "2026-09-25T02:00:00Z", "ok": False}),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                {"action": "sync", "ok": False, "at": "2026-09-25T02:00:00Z"},
+                webdav.snapshot()["last_result"],
+            )
+
+    def test_smart_sync_keeps_an_unreadable_remote_file_and_pushes_over_it(self) -> None:
+        """Smart sync resolves a remote file from another version by itself.
+
+        A probe beside the sync button only proves the connection, and the
+        guard refuses to *read* a bundle from another app identity or archive
+        version.  Asking the reader to switch 同步方向 by hand is not what
+        "smart" means, so the sync keeps that file under a dated sibling name
+        and pushes this Mac's state over it -- and says so in its own summary.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.yaml"
+            config.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            providers = ProvidersModelsDomain(config)
+            relay = RelayAccountsDomain(storage_path=root / ".litellm-runtime" / "relay-accounts.json")
+            webdav = self._configured_webdav_domain(root, config)
+            core = CoreStore(domains=[providers, relay, webdav])
+
+            archived: list[str] = []
+
+            def archive(client: object, settings: object) -> str:
+                archived.append("menu-config.bak-20260924-200000.json")
+                return archived[-1]
+
+            pushed: list[str] = []
+
+            with mock.patch("webdav.core.WebDAVClient", return_value=object()), mock.patch(
+                "webdav.operations.read_remote_manifest",
+                side_effect=webdav_core.SyncError(
+                    "WebDAV sync bundle was not created by this Young Router version",
+                    webdav_core.INCOMPATIBLE_BUNDLE_CODE,
+                ),
+            ), mock.patch("webdav.operations.archive_remote_bundle", side_effect=archive), mock.patch(
+                "webdav.operations.push_bundle",
+                side_effect=lambda *args, **kwargs: pushed.append(str(args[4] if len(args) > 4 else "push")),
+            ):
+                result = core.dispatch(
+                    {
+                        "domain": "webdav",
+                        "type": "sync",
+                        "payload": {"sections": ["providers_models", "relay_accounts"]},
+                    },
+                    expected_revision=core.revision,
+                )
+
+            self.assertEqual(["menu-config.bak-20260924-200000.json"], archived)
+            self.assertEqual(["sync-push"], pushed)
+            self.assertEqual(
+                {"outcome": "push", "archived_remote": "menu-config.bak-20260924-200000.json"},
+                {key: result["action_summary"][key] for key in ("outcome", "archived_remote")},
+            )
 
     def test_manual_webdav_sync_rejects_partial_sections_and_dirty_sources(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

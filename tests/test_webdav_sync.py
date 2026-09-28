@@ -20,7 +20,222 @@ from webdav import core as webdav_core  # noqa: E402
 from webdav import operations as webdav_operations  # noqa: E402
 
 
+class WebDAVRemoteRenameTests(unittest.TestCase):
+    def _settings(self, directory: Path, remote_name: str = webdav_core.DEFAULT_REMOTE_NAME):
+        path = directory / "webdav.json"
+        path.write_text(
+            json.dumps({"url": "https://webdav.example.test/config/", "username": "person", "password": "secret", "remote_name": remote_name}),
+            encoding="utf-8",
+        )
+        return webdav_core.load_settings(path)
+
+    def test_a_renamed_setting_moves_the_file_it_pointed_at(self) -> None:
+        """The bundle and its manifest move; nothing is deleted first."""
+        calls: list[tuple[str, str]] = []
+
+        class Client:
+            files = {
+                "https://webdav.example.test/config/litellm-config.json": b'{"app": "young-router"}',
+                "https://webdav.example.test/config/litellm-config.manifest.json": b'{"app": "young-router"}',
+            }
+
+            def head(self, url: str) -> tuple[int, dict[str, str]]:
+                calls.append(("head", url))
+                if url in self.files:
+                    return 200, {}
+                raise webdav_core.WebDAVHTTPError("HEAD", url, 404, "Not Found", b"")
+
+            def get(self, url: str, *, max_bytes: int = 0) -> bytes:
+                calls.append(("get", url))
+                return self.files[url]
+
+            def put(self, url: str, data: bytes, content_type: str) -> None:
+                calls.append(("put", url))
+                self.files[url] = data
+
+            def delete(self, url: str) -> None:
+                calls.append(("delete", url))
+                self.files.pop(url, None)
+
+        with tempfile.TemporaryDirectory() as directory:
+            settings = self._settings(Path(directory))
+            client = Client()
+            moved = webdav_operations.adopt_renamed_remote_bundle(client, settings, webdav_core.LEGACY_REMOTE_NAMES)
+
+        self.assertEqual({"name": "litellm-config.json", "removed": True}, moved)
+        writes = [url for kind, url in calls if kind == "put"]
+        deletes = [url for kind, url in calls if kind == "delete"]
+        self.assertEqual(
+            [
+                "https://webdav.example.test/config/young-router-config.json",
+                "https://webdav.example.test/config/young-router-config.manifest.json",
+            ],
+            writes,
+        )
+        # The copy lands before the old files go, and in that order.
+        self.assertLess(calls.index(("put", writes[0])), calls.index(("delete", "https://webdav.example.test/config/litellm-config.manifest.json")))
+        self.assertEqual(
+            [
+                "https://webdav.example.test/config/litellm-config.manifest.json",
+                "https://webdav.example.test/config/litellm-config.json",
+            ],
+            deletes,
+        )
+
+    def test_a_server_that_refuses_delete_keeps_the_copy_and_says_so(self) -> None:
+        """PUT only: the copy lands, the old file stays, the reader is told."""
+        class Client:
+            files = {"https://webdav.example.test/config/litellm-config.json": b'{"app": "young-router"}'}
+
+            def head(self, url: str) -> tuple[int, dict[str, str]]:
+                if url in self.files:
+                    return 200, {}
+                raise webdav_core.WebDAVHTTPError("HEAD", url, 404, "Not Found", b"")
+
+            def get(self, url: str, *, max_bytes: int = 0) -> bytes:
+                return self.files[url]
+
+            def put(self, url: str, data: bytes, content_type: str) -> None:
+                self.files[url] = data
+
+            def delete(self, url: str) -> None:
+                raise webdav_core.WebDAVHTTPError("DELETE", url, 403, "Forbidden", b"")
+
+        with tempfile.TemporaryDirectory() as directory:
+            settings = self._settings(Path(directory))
+            client = Client()
+            moved = webdav_operations.adopt_renamed_remote_bundle(client, settings, webdav_core.LEGACY_REMOTE_NAMES)
+            copied = client.files["https://webdav.example.test/config/young-router-config.json"]
+
+        self.assertEqual({"name": "litellm-config.json", "removed": False}, moved)
+        self.assertEqual(b'{"app": "young-router"}', copied)
+
+    def test_a_settings_name_that_is_not_the_old_default_stays_put(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = self._settings(Path(directory), "my-own-config.json")
+        self.assertEqual("my-own-config.json", settings.remote_name)
+
+
+class WebDAVSyncDirectionTests(unittest.TestCase):
+    """The direction is a saved setting, so the interval loop obeys it too."""
+
+    def _path(self, directory: Path) -> Path:
+        return directory / "webdav.json"
+
+    def test_the_direction_round_trips_and_defaults_to_smart(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._path(Path(directory))
+            settings = webdav_core.load_settings(path)
+            self.assertEqual("smart", settings.sync_direction)
+            self.assertEqual("smart", settings.sanitized()["sync_direction"])
+
+            saved = webdav_core.Settings(url="https://webdav.example.test/config/", sync_direction="pull")
+            webdav_core.save_settings(path, saved)
+            self.assertEqual("pull", webdav_core.load_settings(path).sync_direction)
+            self.assertEqual("pull", json.loads(path.read_text(encoding="utf-8"))["sync_direction"])
+
+    def test_the_ipc_spelling_and_legacy_keys_still_read_as_smart(self) -> None:
+        cases = {"sync": "smart", "auto": "smart", "SMART": "smart", "": "smart", "sideways": "smart", "push": "push"}
+        for stored, expected in cases.items():
+            with self.subTest(stored):
+                with tempfile.TemporaryDirectory() as directory:
+                    path = self._path(Path(directory))
+                    path.write_text(
+                        json.dumps({"url": "https://webdav.example.test/config/", "sync_direction": stored}),
+                        encoding="utf-8",
+                    )
+                    self.assertEqual(expected, webdav_core.load_settings(path).sync_direction)
+
+    def test_a_direction_alias_from_an_older_file_is_honored(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._path(Path(directory))
+            path.write_text(
+                json.dumps({"url": "https://webdav.example.test/config/", "direction": "push"}),
+                encoding="utf-8",
+            )
+            self.assertEqual("push", webdav_core.load_settings(path).sync_direction)
+
+    def test_the_commands_layer_writes_the_direction_through(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._path(Path(directory))
+            existing = webdav_core.load_settings(path)
+            updated = webdav_commands._settings_from_payload({"sync_direction": "pull"}, existing)
+            self.assertEqual("pull", updated.sync_direction)
+            # A payload that says nothing about the direction keeps the one the
+            # settings file already has.
+            self.assertEqual("pull", webdav_commands._settings_from_payload({}, updated).sync_direction)
+            self.assertEqual("smart", webdav_commands._settings_from_payload({}, existing).sync_direction)
+
+
+class WebDAVArchiveTests(unittest.TestCase):
+    def test_a_kept_aside_bundle_carries_when_it_was_set_aside(self) -> None:
+        """The copy keeps its extension and gains the local backup's stamp."""
+        self.assertEqual(
+            "menu-config.bak-20260924-195812.json",
+            webdav_core.archived_bundle_name("menu-config.json", "20260924-195812"),
+        )
+        self.assertEqual(
+            "config.bak-20260924-195812.tar.gz",
+            webdav_core.archived_bundle_name("config.tar.gz", "20260924-195812"),
+        )
+        self.assertEqual(
+            "config.bak-20260924-195812.json",
+            webdav_core.archived_bundle_name("", "20260924-195812"),
+        )
+
+    def test_archiving_copies_the_remote_file_to_a_sibling(self) -> None:
+        """The unreadable file is read and written back under its new name."""
+        calls: list[tuple[str, str, bytes]] = []
+
+        class Client:
+            def get(self, url: str, max_bytes: int = 0) -> bytes:
+                calls.append(("get", url, b""))
+                return b'{"app": "litellm-menu"}'
+
+            def put(self, url: str, data: bytes, content_type: str) -> None:
+                calls.append(("put", url, data))
+
+        with tempfile.TemporaryDirectory() as directory:
+            settings_path = Path(directory) / "webdav.json"
+            settings_path.write_text(
+                json.dumps({"url": "https://webdav.example.test/config/", "username": "person", "password": "secret", "remote_name": "menu-config.json"}),
+                encoding="utf-8",
+            )
+            settings = webdav_core.load_settings(settings_path)
+            name = webdav_operations.archive_remote_bundle(Client(), settings)
+        self.assertTrue(name.startswith("menu-config.bak-"))
+        self.assertTrue(name.endswith(".json"))
+        self.assertEqual("get", calls[0][0])
+        self.assertEqual("https://webdav.example.test/config/menu-config.json", calls[0][1])
+        self.assertEqual("put", calls[1][0])
+        self.assertEqual(f"https://webdav.example.test/config/{name}", calls[1][1])
+        self.assertEqual(b'{"app": "litellm-menu"}', calls[1][2])
+
+
 class WebDAVSyncBundleTests(unittest.TestCase):
+    def test_an_incompatible_remote_bundle_names_its_cause(self) -> None:
+        """A bundle from another app identity or archive version states why.
+
+        The probe beside the sync button only proves the connection works, so
+        the sync itself has to say what it refused and how to get past it: the
+        error carries ``webdav_sync_incompatible``, which the pane turns into
+        "the remote file came from an older version; push to overwrite it".
+        """
+        legacy = {
+            "app": "litellm-menu",
+            "version": webdav_core.ARCHIVE_VERSION,
+            "format": webdav_core.CONFIG_BUNDLE_FORMAT,
+            "created_at": "2026-07-30T21:05:26Z",
+            "summary": {},
+            "files": [],
+        }
+        with self.assertRaises(webdav_core.SyncError) as raised:
+            webdav_core._validate_bundle_header(legacy)
+        self.assertEqual("webdav_sync_incompatible", raised.exception.code)
+        self.assertIn("not created by this Young Router version", str(raised.exception))
+        # Anything else keeps the generic cause, so a pane cannot mistake it.
+        self.assertEqual("webdav_sync_failed", webdav_core.SyncError("WebDAV sync failed").code)
+
     def write_config(self, directory: Path) -> Path:
         path = directory / "config.yaml"
         path.write_text(
@@ -265,14 +480,17 @@ class WebDAVSyncBundleTests(unittest.TestCase):
         settings = webdav_core._settings_from_raw(
             {
                 "url": "https://example.com/dav/resource?x-vercel-protection-bypass:secret-value",
+                # A stored earlier default is read as the current one: the
+                # remote file is named after this app, not the proxy under it.
                 "remote_name": "litellm-config.json",
             }
         )
 
         self.assertEqual(
             webdav_core.bundle_url(settings),
-            "https://example.com/dav/resource/litellm-config.json?x-vercel-protection-bypass=secret-value",
+            "https://example.com/dav/resource/young-router-config.json?x-vercel-protection-bypass=secret-value",
         )
+        self.assertEqual(webdav_core.DEFAULT_REMOTE_NAME, settings.remote_name)
 
     def test_timeout_seconds_is_saved_with_webdav_settings(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

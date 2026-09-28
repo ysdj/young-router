@@ -21,7 +21,15 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
-MAX_MESSAGE_BYTES = 4 * 1024 * 1024
+MAX_MESSAGE_BYTES = 16 * 1024 * 1024
+# One raw-editor document: the text a read returns, the baseline beside it,
+# and the text a stage accepts all share this cap.  A read therefore carries
+# the document twice, and the editor page's own bootstrap embeds both copies,
+# so the transport budget above has to cover two documents plus their
+# envelope.  The managed Codex catalog this app writes for its own model list
+# is already ~2.1 MB (26 models carrying the installed client's instructions),
+# which is why the cap cannot sit below the files the app generates itself.
+MAX_EDITOR_DOCUMENT_BYTES = 6 * 1024 * 1024
 MAX_REQUEST_ID_BYTES = 256
 MAX_METHOD_BYTES = 64
 MAX_JSON_DEPTH = 32
@@ -580,6 +588,7 @@ def load_protocol_schema() -> dict[str, Any]:
 
 __all__ = [
     "METHODS",
+    "MAX_EDITOR_DOCUMENT_BYTES",
     "MAX_MESSAGE_BYTES",
     "PROTOCOL_VERSION",
     "ProtocolError",

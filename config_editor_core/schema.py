@@ -44,11 +44,22 @@ MENU_RELAY_CATALOG_MODE_KEY = "x-young-router-relay-catalog-mode"
 MENU_RELAY_SOURCE_MODEL_KEY = "x-young-router-relay-source-model"
 MENU_ORDER_MODE_KEY = "x-young-router-order-mode"
 MENU_MANUAL_ORDER_KEY = "x-young-router-manual-order"
+# A public model's custom context window lives in the deployment's model_info
+# under the name the managed Codex catalog and the proxy's model metadata
+# already read: ``max_input_tokens``.
+PUBLIC_MODEL_CONTEXT_KEY = "max_input_tokens"
+PUBLIC_MODEL_LIMIT_KEYS = (PUBLIC_MODEL_CONTEXT_KEY,)
 MENU_PROVIDER_SOURCE_KEY = "x-young-router-provider-source"
 MENU_PROVIDER_AUTH_KEY = "x-young-router-provider-auth"
 PROVIDER_KEY_SOURCE_KINDS = {"independent", "relay"}
 PROVIDER_SOURCE_KINDS = {"custom", "relay"}
-PROVIDER_AUTH_KINDS = {"api_key", "openai_login", "claude_login"}
+PROVIDER_AUTH_KINDS = {
+    "api_key",
+    "openai_login",
+    "claude_login",
+    "workbuddy_login",
+    "workbuddy_ai_login",
+}
 MODEL_CATALOG_MODES = {"independent", "relay_linked"}
 MODEL_ORDER_MODES = {"manual", "relay_multiplier"}
 RANDOM_DEPLOYMENT_ID_RE = re.compile(r"^[0-9a-f]{8}$")
@@ -564,7 +575,6 @@ def _validate_current_schema(data: dict[str, Any], path: pathlib.Path) -> None:
                 "supports_responses_endpoint",
                 "supports_image_generation",
                 "supports_vision",
-                "max_input_tokens",
                 "context_metadata_source",
                 "context_metadata_model_id",
             ):
@@ -585,6 +595,14 @@ def _validate_current_schema(data: dict[str, Any], path: pathlib.Path) -> None:
                     raise ValueError(
                         f"{path.name} {section_name}[{index}] uses unsupported {unsupported_key}; "
                         f"use {replacement}"
+                    )
+            for limit_key in PUBLIC_MODEL_LIMIT_KEYS:
+                limit = model_info.get(limit_key)
+                if limit is None:
+                    continue
+                if _positive_int(limit) is None:
+                    raise ValueError(
+                        f"{path.name} {section_name}[{index}] {limit_key} must be a positive integer"
                     )
             deployment_id = _string_value(model_info.get("id")).strip()
             if deployment_id and not RANDOM_DEPLOYMENT_ID_RE.fullmatch(deployment_id):

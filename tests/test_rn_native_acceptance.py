@@ -618,10 +618,15 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("application.forceTerminate()", restart)
         self.assertNotIn("application.terminate()", restart)
         confirmation = leaf.split("func showCodexRestartConfirmation(", 1)[1].split(
-            "@objc private func selectCodexRestartLater", 1
+            "func showGroupManager(", 1
         )[0]
-        self.assertIn("NSPanel(", confirmation)
-        self.assertIn("panel.isFloatingPanel = true", confirmation)
+        # The catalog restart question is the app's own decision panel, presented
+        # as a floating window rather than one that locks the window the user is
+        # working in, and it is never a modal session.
+        self.assertIn("codexRestartPanel = presentDecisionPanel(", confirmation)
+        self.assertIn('NativeDecisionAnswer(id: "later", title: laterLabel, isCancel: true)', confirmation)
+        self.assertIn('NativeDecisionAnswer(id: "restart", title: restartLabel, isDefault: true)', confirmation)
+        self.assertIn("locksParent: false", confirmation)
         self.assertNotIn("runModal", confirmation)
         self.assertIn("func showCodexRestartConfirmation", module)
         self.assertIn("@objc func restartCodex", module)
@@ -629,6 +634,171 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("RCT_EXTERN_METHOD(restartCodex:", bridge)
         self.assertIn("showCodexRestartConfirmation?:", platform)
         self.assertIn("restartCodex?: () => Promise<boolean>", platform)
+
+    def test_native_localization_never_falls_back_to_english(self) -> None:
+        """Every string a native leaf shows is one the shared UI localized.
+
+        A leaf's own default dictionary is English, so a key the shared UI never
+        sends — the blocked-navigation message inside the official provider
+        sign-in, the read-only viewer's record label — reaches a Chinese app in
+        English.
+        """
+        ui = (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
+        sent_block = ui.split("native.setLocalization({", 1)[1].split("\n    });", 1)[0]
+        sent = set(re.findall(r"([A-Za-z0-9_]+):\s*translate\(", sent_block))
+        self.assertGreater(len(sent), 25)
+
+        read: dict[str, set[str]] = {
+            "macOS leaf": set(re.findall(r'localized(?:Text)?\("([^"]+)"', (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8"))),
+            "macOS module": set(re.findall(r'localized(?:Text)?\("([^"]+)"', (MAC_NATIVE / "AppKitNativeLeafModule.swift").read_text(encoding="utf-8"))),
+        }
+        for path in sorted(WIN_NATIVE.glob("*.cpp")):
+            read[path.name] = set(re.findall(r'Localized\("([^"]+)"', path.read_text(encoding="utf-8")))
+
+        missing = {name: sorted(keys - sent) for name, keys in read.items() if keys - sent}
+        self.assertEqual({}, missing, f"native strings the shared UI never sends: {missing}")
+
+    def test_one_non_modal_decision_surface_draws_every_confirmation(self) -> None:
+        """Every confirmation is the app's own panel, never a modal alert."""
+        leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
+        module = (MAC_NATIVE / "AppKitNativeLeafModule.swift").read_text(encoding="utf-8")
+        bridge = (MAC_NATIVE / "AppKitNativeLeafBridge.m").read_text(encoding="utf-8")
+        platform = (SHARED / "platformEntry.ts").read_text(encoding="utf-8")
+        bridge_types = (SHARED / "platform/nativeBridge.ts").read_text(encoding="utf-8")
+        types = (SHARED / "types.ts").read_text(encoding="utf-8")
+        windows_leaf = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
+        windows_module = (WIN_NATIVE / "WinUI3NativeLeafModule.cpp").read_text(encoding="utf-8")
+
+        # One builder draws every question the way a macOS alert is drawn: a
+        # borderless rounded panel, no title bar, the question in bold over its
+        # detail, and the answers as one row of equal width across the bottom.
+        decision = leaf.split("private func makeDecisionPanel(", 1)[1].split(
+            "/// Presents a built decision panel", 1
+        )[0]
+        self.assertIn("let panel = NativeDecisionPanel(", decision)
+        self.assertIn("styleMask: [.borderless],", decision)
+        self.assertIn("panel.isMovableByWindowBackground = true", decision)
+        self.assertIn("content.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor", decision)
+        self.assertIn("content.layer?.cornerRadius = nativeDecisionCornerRadius", decision)
+        # The question stays the window's title for the window that asked (its
+        # lock announces the question) and for a screen reader, and it is drawn in
+        # the body because a borderless panel never draws a title.
+        self.assertIn("panel.title = title", decision)
+        self.assertIn("let questionLabel = NSTextField(wrappingLabelWithString: title)", decision)
+        # A destructive answer draws with the system's red ink on the ordinary
+        # bezel, and never with the default button's accent fill.
+        self.assertIn("button.attributedTitle = NSAttributedString(", decision)
+        self.assertIn(".foregroundColor: NSColor.systemRed", decision)
+        self.assertIn("button.drawsNeutralWhileDefault = answer.isDefault", decision)
+        self.assertIn("override func draw(_ dirtyRect: NSRect) {", leaf)
+        self.assertIn('button.keyEquivalent = "\\u{1b}"', decision)
+        # The answers are one row of equal width across the bottom: the first
+        # starts at the text column's leading edge, the last ends at its trailing
+        # edge, and every answer takes the same share between them.
+        self.assertIn("constraints.append(button.widthAnchor.constraint(equalTo: first.widthAnchor))", decision)
+        self.assertIn("constraints.append(first.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: inset))", decision)
+        self.assertIn("constraints.append(last.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -inset))", decision)
+        self.assertIn("private static func decisionLineWidth(", leaf)
+        self.assertIn("private static func decisionTextHeight(", leaf)
+        # The question is put where a question belongs: centred on the window that
+        # asked it (or on the screen when a background event asks) instead of
+        # wherever `NSWindow.center()` lands for a borderless child.
+        presentation = leaf.split("private func presentBuiltDecisionPanel(", 1)[1].split(
+            "/// Puts a decision panel where a question belongs", 1
+        )[0]
+        self.assertIn("let anchor = locksParent ? (parent ?? activeWindow()) : nil", presentation)
+        self.assertIn("Self.positionDecisionPanel(panel, over: anchor)", presentation)
+        self.assertIn("presentChildPanel(panel, in: anchor, prepare: prepare)", presentation)
+        self.assertIn("private static func positionDecisionPanel(_ panel: NSWindow, over anchor: NSWindow?)", leaf)
+        # A question is a child surface, never an alert: neither file builds an
+        # alert any more, so nothing runs the modal loop that freezes the React
+        # host (see the child-surface modal freeze incident).  The alert is only
+        # ever named in a comment, never constructed, and no modal loop is run.
+        for source in (leaf, module):
+            self.assertNotIn("NSAlert()", source)
+            self.assertNotIn("runModal(", source)
+            self.assertNotIn("beginSheetModal(for: promptParent", source)
+        self.assertNotIn("NSApp.runModal(for:", leaf)
+        self.assertIn("override func cancelOperation(_ sender: Any?) {", leaf)
+        # A borderless panel only becomes key when it says so, or every
+        # confirmation would answer no key at all.
+        self.assertIn("override var canBecomeKey: Bool { true }", leaf)
+        # Escape, the window that asked going away, and an answer all settle the
+        # same entry exactly once, and the lock over the parent is released.
+        self.assertIn("func finishDecisionPanel(_ panel: NSWindow, answer: String) {", leaf)
+        self.assertIn("if codexRestartPanel === panel { codexRestartPanel = nil }", leaf)
+        self.assertIn("endChildPanel(panel)\n        state.completion(answer)", leaf)
+        self.assertIn("if let state = decisionPanels[ObjectIdentifier(window)] {", leaf)
+        self.assertIn("if let state = decisionPanels[ObjectIdentifier(panel)] {", leaf)
+        self.assertIn('completion(answers.first(where: { $0.isCancel })?.id ?? "")', leaf)
+        # The one prompt that carries its own control is the same panel: a secure
+        # field under the question, 设置 disabled until it has something to stage,
+        # the caret in the field, and the typed value read once and cleared in the
+        # same turn instead of travelling with the answer.
+        secret = leaf.split("func presentSecretPrompt(", 1)[1].split(
+            "/// The height a decision panel's own text needs", 1
+        )[0]
+        self.assertIn("let input = NSSecureTextField(", secret)
+        self.assertIn("setButton?.isEnabled = false", secret)
+        self.assertIn("input.window?.makeFirstResponder(input)", secret)
+        self.assertIn('input.stringValue = ""', secret)
+        self.assertIn("self.leaf.presentSecretPrompt(", module)
+        # The post-login password question is that panel too, not an attached
+        # sheet on a window that may go away underneath it.
+        self.assertIn("NativeDecisionAnswer(id: \"remember\", title: text(\"Remember Password\", \"记住密码\"), isDefault: true)", leaf)
+
+        # The version acknowledgement is the same panel with one answer.
+        version = leaf.split("func showVersion() {", 1)[1].split("/// Version strings", 1)[0]
+        self.assertIn("presentDecisionPanel(", version)
+        self.assertIn('id: "ok",', version)
+
+        # Windows draws the same window: every question is the shared decision
+        # window, `Confirm` is one case of it, and a destructive answer marks
+        # itself the platform's way.
+        windows_decision = windows_leaf.split(
+            "std::optional<std::wstring> WinUI3NativeLeaf::ShowDecisionWindow(", 1
+        )[1].split("bool WinUI3NativeLeaf::DecideChoice(", 1)[0]
+        self.assertIn("dialog.Title(winrt::hstring(title))", windows_decision)
+        self.assertIn("auto cancel_answer = std::find_if(", windows_decision)
+        self.assertIn("button.Foreground(brush ? brush : xaml::Media::SolidColorBrush(critical));", windows_decision)
+        self.assertIn("winrt::Windows::System::VirtualKey::Escape", windows_decision)
+        self.assertIn("winrt::Windows::System::VirtualKey::Enter", windows_decision)
+        self.assertIn("primary_button.Focus(xaml::FocusState::Programmatic);", windows_decision)
+        self.assertIn("body.Measure(winrt::Windows::Foundation::Size{", windows_decision)
+        self.assertIn("constexpr double kDialogMinWidth = 300;", windows_decision)
+        self.assertIn("constexpr double kDialogMaxWidth = 420;", windows_decision)
+        self.assertIn("RunOwnedModalWindow(dialog, window_handle_, {dialog_width, dialog_height}, finished)", windows_decision)
+        confirm = windows_leaf.split("bool WinUI3NativeLeaf::Confirm(", 1)[1].split(
+            "void WinUI3NativeLeaf::DecideChoice(", 1
+        )[0]
+        self.assertIn('cancel_answer.id = L"cancel";', confirm)
+        self.assertIn('confirm_answer.id = L"confirm";', confirm)
+        self.assertIn("confirm_answer.destructive = destructive;", confirm)
+        # The version acknowledgement is one answer on that window, not a
+        # MessageBox: one acknowledgement, one surface.
+        version = windows_leaf.split("void WinUI3NativeLeaf::ShowVersion() const {", 1)[1].split(
+            "WinUI3NativeLeaf::VersionInfoResult", 1
+        )[0]
+        self.assertIn('ShowDecisionWindow(Localized("appTitle", L"Young Router"), VersionText(), {ok});', version)
+        self.assertIn("ok.primary = true;", version)
+        self.assertNotIn("MessageBoxW", windows_leaf)
+        # The sign-in browser asks its post-login question through the host's own
+        # window too, so one question has one surface on each host.
+        windows_relay = (WIN_NATIVE / "WindowsRelayLogin.cpp").read_text(encoding="utf-8")
+        self.assertIn("co_return state->options.decide(title, message, remember, session_only);", windows_relay)
+        self.assertNotIn("controls::ContentDialog prompt;", windows_relay)
+        self.assertIn("bool WinUI3NativeLeaf::DecideChoice(", windows_leaf)
+        self.assertIn("native_options.decide = [leaf = leaf_](", windows_module)
+        self.assertIn("bool destructive,", windows_module)
+        self.assertIn("self.leaf.presentDecisionPanel(", module)
+
+        # The destructive fact travels from the shared UI through the typed
+        # adapter into the positional native call on both hosts.
+        self.assertIn("showConfirmation(options: { title: string; message: string; confirmLabel: string; destructive?: boolean }): Promise<boolean>;", types)
+        self.assertIn("showConfirmation(title: string, message: string, confirmLabel: string, destructive: boolean): Promise<boolean>;", bridge_types)
+        self.assertIn("leaf.showConfirmation?.(title, message, confirmLabel, destructive === true)", platform)
+        self.assertIn("destructive:(BOOL)destructive", bridge)
+        self.assertIn("destructive: Bool,", module)
 
     def test_shared_ui_owns_lifecycle_menu_actions_startup_and_safe_recovery(self) -> None:
         """Both native leaves route lifecycle commands through one React IPC path."""
@@ -1597,7 +1767,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("native.restoreRelaySession", relay_ui)
         self.assertIn("username: account.username || undefined", relay_ui)
         self.assertIn("const attemptedAccounts = useRef(new Set<string>());", relay_ui)
-        self.assertIn("await refreshAccountResources(account, true);", relay_ui)
+        self.assertIn("await refreshAccountResources(account, { silent: true });", relay_ui)
         self.assertNotIn('translate("relay.lastUpdated"', relay_ui)
         self.assertNotIn("accountAvatar", relay_ui)
         self.assertNotIn("native.showActionMenu", relay_ui)

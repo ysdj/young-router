@@ -28,7 +28,9 @@ from config_editor_core.schema import (
     MENU_RELAY_KEYS_KEY,
     MENU_RELAY_KEYS_VERSION,
     MODEL_ORDER_MODES,
+    PUBLIC_MODEL_CONTEXT_KEY,
     _menu_order,
+    _positive_int,
     _provider_key_id,
     _provider_auth,
     _provider_source,
@@ -38,6 +40,7 @@ from config_editor_core.schema import (
 )
 
 from ... import traceone
+from ... import workbuddy as workbuddy_module
 from ...browser_identity import browser_request_headers
 from ...api_base import isolated_http_opener, service_root
 from ..persistence import atomic_write_text
@@ -60,7 +63,7 @@ from ._shared import (
 def _relay_site_key(value: object) -> tuple[str, str, int | None] | None:
     """Canonical relay site identity used to compare provider and station URLs.
 
-    The comparison is host-exact: ``atlas.example`` and ``www.atlas.example``
+    The comparison is host-exact: ``station.example.test`` and ``www.station.example.test``
     are different sites.  A trailing ``/v1`` API path does not change the
     site, so a provider base URL that differs only in that suffix is treated
     as the same site and keeps its existing spelling.
@@ -94,6 +97,31 @@ def _provider_issue_label(provider: Mapping[str, Any]) -> str:
 
     label = str(provider.get("display_name") or provider.get("name") or "").strip()
     return re.sub(r"[^A-Za-z0-9_-]+", "-", label).strip("-") or "provider"
+
+
+def _environment_text(value: object) -> str:
+    """Resolve a configured value that may be an ``os.environ/`` reference."""
+
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if not text.startswith("os.environ/"):
+        return text
+    return _environment_reference(text.removeprefix("os.environ/").strip())
+
+
+def _environment_reference(name: str) -> str:
+    """Resolve one ``os.environ/`` reference owned by this deployment.
+
+    Core publishes the loopback base URLs and the bearer of its own managed
+    services for the proxy child. A Core-side read resolves the same values,
+    so a probe and the proxy child can never disagree about one route.
+    """
+
+    value = os.environ.get(name, "").strip()
+    if value:
+        return value
+    return str(workbuddy_module.published_environment().get(name, "")).strip()
 
 
 class ProvidersModelsDomain:
@@ -134,6 +162,14 @@ class ProvidersModelsDomain:
     _MAX_DEGRADATION_PROBE_BYTES = 512 * 1024
     _DEGRADATION_SURFACE = "openai/responses"
     _API_KEY_TARGET_SEPARATOR = "\x1f"
+    # The provider wizard stages the key it is about to give a provider it has
+    # not created yet, so one secret target names the wizard's own token
+    # instead of a provider id: ``__wizard_provider__<token>\x1f<key name>``.
+    # ``provider.add`` adopts the staged value when it creates that provider.
+    _WIZARD_KEY_TARGET_PREFIX = "__wizard_provider__"
+    # A wizard that never finishes must not accumulate credentials for the
+    # life of the process; the oldest token goes when a newer one arrives.
+    _MAX_PENDING_PROVIDER_KEYS = 4
     _WEB_SEARCH_CAPABILITY_ALIASES = {
         "supports_responses_web_search": "supports_responses_web_search",
         "supports_web_search": "supports_web_search",
@@ -184,9 +220,16 @@ class ProvidersModelsDomain:
         "openrouter.web_search",
     }
 
-    def __init__(self, config_path: Path | str | None = None, *, auth_manager: object | None = None):
+    def __init__(
+        self,
+        config_path: Path | str | None = None,
+        *,
+        auth_manager: object | None = None,
+        workbuddy: object | None = None,
+    ):
         self.config_path = Path(config_path).expanduser() if config_path else _default_provider_config_path()
         self.auth_manager = auth_manager
+        self.workbuddy = workbuddy
         self._raw: dict[str, Any] = {}
         self._draft: dict[str, Any] = {}
         self._probe_overlay: dict[str, dict[str, dict[str, Any]]] = {}
@@ -201,6 +244,13 @@ class ProvidersModelsDomain:
         self._provider_editor_keys: dict[str, str] = {}
         self._model_editor_keys: dict[str, str] = {}
         self._cosmetic_binding = False
+        # Key values staged by a wizard for a provider it has not created yet.
+        self._pending_provider_keys: dict[str, dict[str, str]] = {}
+        # Why the last relay-bound Apply refused, as secret-free rows the pane
+        # can mark: a binding failure is a property of one relay key or one
+        # linked route, and the pane must point at it instead of only stating
+        # that the change is not in effect.
+        self._binding_issues: list[dict[str, str]] = []
         self.revision = 0
         self.reload()
 
@@ -210,6 +260,15 @@ class ProvidersModelsDomain:
 
             self.auth_manager = ProviderAuthManager(self.config_path.parent)
         return self.auth_manager
+
+    def _workbuddy(self):
+        """The WorkBuddy worker owner; created on demand for a bare domain."""
+
+        if self.workbuddy is None:
+            from ...workbuddy import WorkBuddyRuntime
+
+            self.workbuddy = WorkBuddyRuntime(self.config_path.parent)
+        return self.workbuddy
 
     @staticmethod
     def _empty_document() -> dict[str, str | None]:
@@ -375,6 +434,10 @@ class ProvidersModelsDomain:
             return "anthropic"
         if auth_kind == "openai_login":
             return "openai/responses"
+        if auth_kind in workbuddy_module.WORKBUDDY_AUTH_KINDS:
+            # The WorkBuddy upstream is a chat-completions endpoint only, so a
+            # WorkBuddy route never falls back to the Responses surface.
+            return "openai/chat"
         return infer_upstream_fallback_surface(model.get("litellm_model"))
 
     @classmethod
@@ -530,6 +593,9 @@ class ProvidersModelsDomain:
                         "order_mode": order_mode,
                         "manual_order": manual_order,
                         "effective_order": effective_order,
+                        # The user's public-model context window; absent means
+                        # the client resolves the model's own default.
+                        "max_input_tokens": _positive_int(model.get("max_input_tokens")),
                         "binding_health": self._binding_health(model, keys_by_id),
                         "enabled": model_enabled,
                         "model_enabled": model_enabled,
@@ -604,8 +670,76 @@ class ProvidersModelsDomain:
             "exists": self._exists,
             "providers": safe,
             "provider_count": len(safe),
+            "model_contexts": self._model_context_projection(),
+            "binding_issues": [dict(item) for item in self._binding_issues],
             "raw_editor_available": True,
         }
+
+    def _context_registry(self):
+        """The read-only registry that resolves public-model metadata.
+
+        The Codex domain owns the writable cache and the network refresh; this
+        instance only reads what is already on disk, so a pane snapshot never
+        reaches the network.
+        """
+
+        registry = getattr(self, "_model_context_registry", None)
+        if registry is not None:
+            return registry
+        from ..model_contexts import ModelContextRegistry, default_context_cache_path
+
+        registry = ModelContextRegistry(
+            runtime_config_path=self.config_path,
+            runtime_settings_path=_default_runtime_settings_path(),
+            cache_path=default_context_cache_path(self.config_path.parent),
+            refresh_enabled=False,
+        )
+        self._model_context_registry = registry
+        return registry
+
+    def _model_context_projection(self) -> dict[str, Any]:
+        """Registry defaults for every public model the draft exposes.
+
+        Keys are the public model names; each value is the metadata a client
+        resolves when the user has not set a custom limit.  A public model the
+        registry cannot resolve still reports the unknown-window default rather
+        than disappearing from the pane.
+        """
+
+        names: list[str] = []
+        seen: set[str] = set()
+        for provider in self._draft.get("providers", []):
+            if not isinstance(provider, Mapping):
+                continue
+            models = provider.get("models", [])
+            if not isinstance(models, list):
+                continue
+            for model in models:
+                if not isinstance(model, Mapping):
+                    continue
+                name = str(model.get("model_name", "")).strip()
+                if name and name not in seen:
+                    seen.add(name)
+                    names.append(name)
+        if not names:
+            return {}
+        try:
+            registry = self._context_registry()
+        except Exception:
+            # A pane snapshot is a projection; a registry problem must not
+            # take the whole providers workspace down with it.
+            return {}
+        projection: dict[str, Any] = {}
+        for name in names:
+            try:
+                record = registry.default_record_for(name)
+            except Exception:
+                continue
+            projection[name] = {
+                "context_window": record.context_window,
+                "max_context_window": record.max_context_window,
+            }
+        return projection
 
     def draft_state(self) -> object:
         return copy.deepcopy(self._draft)
@@ -622,6 +756,7 @@ class ProvidersModelsDomain:
         return {
             "raw": copy.deepcopy(self._raw),
             "draft": copy.deepcopy(self._draft),
+            "pending_provider_keys": copy.deepcopy(self._pending_provider_keys),
             "probe_overlay": copy.deepcopy(self._probe_overlay),
             "disk_revision": copy.deepcopy(self._disk_revision),
             "exists": self._exists,
@@ -639,6 +774,7 @@ class ProvidersModelsDomain:
 
         self._raw = copy.deepcopy(checkpoint["raw"])
         self._draft = copy.deepcopy(checkpoint["draft"])
+        self._pending_provider_keys = copy.deepcopy(checkpoint.get("pending_provider_keys", {}))
         self._probe_overlay = copy.deepcopy(checkpoint["probe_overlay"])
         self._disk_revision = copy.deepcopy(checkpoint["disk_revision"])
         self._exists = bool(checkpoint["exists"])
@@ -749,17 +885,17 @@ class ProvidersModelsDomain:
     def _provider_api_base(provider: Mapping[str, Any]) -> str:
         """Get the provider's effective base without projecting it to clients."""
 
-        base = provider.get("api_base")
-        if isinstance(base, str) and base.strip():
-            return base.strip()
+        base = _environment_text(provider.get("api_base"))
+        if base:
+            return base
         models = provider.get("models", [])
         if isinstance(models, Sequence) and not isinstance(models, (str, bytes, bytearray)):
             for model in models:
                 if not isinstance(model, Mapping):
                     continue
-                candidate = model.get("api_base")
-                if isinstance(candidate, str) and candidate.strip():
-                    return candidate.strip()
+                candidate = _environment_text(model.get("api_base"))
+                if candidate:
+                    return candidate
         return ""
 
     @classmethod
@@ -777,7 +913,7 @@ class ProvidersModelsDomain:
             if not text.startswith("os.environ/"):
                 return text
             variable = text.removeprefix("os.environ/").strip()
-            return os.environ.get(variable, "").strip()
+            return _environment_reference(variable)
 
         keys = cls._provider_api_keys(provider)
         if api_key_name is not None:
@@ -1062,6 +1198,10 @@ class ProvidersModelsDomain:
         return result
 
     def _fetch_models(self, data: Mapping[str, Any]) -> dict[str, Any]:
+        pending = data.get("pending_provider")
+        if isinstance(pending, Mapping):
+            self._last_operation = self._fetch_pending_provider_models(pending)
+            return self._last_operation
         index = self._provider_index(data)
         provider = self._draft["providers"][index]
         if not isinstance(provider, Mapping):
@@ -1074,6 +1214,34 @@ class ProvidersModelsDomain:
         )
         self._last_operation = summary
         return summary
+
+    def _fetch_pending_provider_models(self, pending: Mapping[str, Any]) -> dict[str, Any]:
+        """List one not-yet-created provider's models from its staged key.
+
+        The wizard discovers models before it creates the provider: the
+        address and key arrive as one throwaway provider description, and the
+        credential is the key staged under the wizard's own token.  Nothing
+        of it reaches the draft, so a listing that fails leaves no record.
+        """
+
+        token = str(pending.get("pending_api_key", "")).strip()
+        api_base = str(pending.get("api_base", "")).strip()
+        if not token or not api_base:
+            raise DomainError("The staged provider is unavailable")
+        key_name = self._api_key_name(pending.get("api_key_name"))
+        credential = self._pending_provider_credential(token, key_name)
+        if credential is None:
+            raise DomainError("The staged API key has no value")
+        transient = {
+            "name": str(pending.get("name", "")).strip() or key_name,
+            "api_base": api_base,
+            "api_keys": [{"name": key_name, "value": credential}],
+        }
+        return self._fetch_provider_models(
+            transient,
+            token,
+            key_name,
+        )
 
     def _fetch_relay_resource_models(self, data: Mapping[str, Any]) -> dict[str, Any]:
         """Fetch models through a dynamically discovered relay API key.
@@ -1134,9 +1302,12 @@ class ProvidersModelsDomain:
         provider: Mapping[str, Any],
         model: Mapping[str, Any],
     ) -> str:
+        # A model carries its service's base URL, often as the same
+        # ``os.environ/`` reference the provider does: resolve it here, or the
+        # probe would read the reference itself as an address.
         value = model.get("api_base")
         if isinstance(value, str) and value.strip():
-            return value.strip()
+            return _environment_text(value)
         return cls._provider_api_base(provider)
 
     @classmethod
@@ -1553,6 +1724,36 @@ class ProvidersModelsDomain:
             result["detail"] = f"Fingerprint matches {label} instead of the requested route {target}"
         return result
 
+    _PROBE_SURFACES: tuple[str, ...] = ("openai/responses", "openai/chat", "anthropic")
+    _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+    @classmethod
+    def _probe_surfaces(
+        cls,
+        api_base: str,
+        model: Mapping[str, Any],
+    ) -> list[str]:
+        """Choose the surfaces a probe may test.
+
+        A route served by this deployment's own loopback service exposes
+        exactly the surface the route was mounted on: asking it for the other
+        two protocols measures this app's own routing, not the remote service,
+        so the probe verifies the configured surface alone.
+        """
+
+        root = service_root(api_base)
+        if isinstance(root, str) and root:
+            try:
+                host = urlsplit(root).hostname or ""
+            except ValueError:
+                host = ""
+            if host in cls._LOOPBACK_HOSTS:
+                configured = str(model.get("upstream_url_surface", "")).strip()
+                if configured in cls._PROBE_SURFACES:
+                    return [configured]
+                return ["openai/chat"]
+        return list(cls._PROBE_SURFACES)
+
     def _probe_model(
         self,
         provider: Mapping[str, Any],
@@ -1566,7 +1767,7 @@ class ProvidersModelsDomain:
         api_base = self._model_api_base(provider, model)
         _key_name, credential = self._model_credential(provider, model)
         model_name = self._wire_model_name(model)
-        surfaces = ["openai/responses", "openai/chat", "anthropic"]
+        surfaces = self._probe_surfaces(api_base, model)
 
         with ThreadPoolExecutor(max_workers=len(surfaces)) as executor:
             surface_futures = {
@@ -1819,7 +2020,101 @@ class ProvidersModelsDomain:
         except ValueError:
             raise DomainError("Provider authentication is invalid") from None
 
+    def _workbuddy_catalog_models(self, auth_kind: str) -> list[dict[str, Any]]:
+        """Import the desktop app's live roster as this account's models."""
+
+        provider_id = workbuddy_module.AUTH_KIND_TO_PROVIDER[auth_kind]
+        try:
+            document = self._workbuddy().models(provider_id, refresh=True)
+        except Exception:
+            raise DomainError("The WorkBuddy model list is unavailable") from None
+        if document.get("available") is not True:
+            raise DomainError(
+                "Sign in to the WorkBuddy desktop app before adding this account"
+            )
+        models: list[dict[str, Any]] = []
+        for order, entry in enumerate(document.get("models") or [], start=1):
+            if not isinstance(entry, Mapping):
+                continue
+            model_id = str(entry.get("id", "")).strip()
+            if not model_id:
+                continue
+            models.append(
+                {
+                    "name": model_id,
+                    "upstream_model": model_id,
+                    "enabled": True,
+                    "order": order,
+                }
+            )
+        if not models:
+            raise DomainError("The WorkBuddy account reported no models")
+        return models
+
+    def _workbuddy_operation(self, action: str, data: Mapping[str, Any]) -> None:
+        """Answer the wizard's account and catalog questions.
+
+        Both actions are reads: they never edit the draft, and the caller sees
+        the result as this domain's ``operation_summary``.
+        """
+
+        try:
+            provider_id = workbuddy_module.validated_provider(
+                data.get("provider", workbuddy_module.WORKBUDDY_PROVIDER)
+            )
+        except ValueError:
+            raise DomainError("The requested WorkBuddy provider is unavailable") from None
+        runtime = self._workbuddy()
+        try:
+            if action == "workbuddy_login":
+                # Opening the desktop app is how this account signs in: the
+                # app owns the credential, so the pane can only hand the user
+                # to it and then re-read what it wrote.
+                document = runtime.open_desktop_app(provider_id)
+                self._last_operation = {
+                    "operation": action,
+                    "provider": provider_id,
+                    "app_name": str(document.get("app_name", "")),
+                    "app_path": str(document.get("app_path", "")),
+                    "opened": document.get("opened") is True,
+                }
+                return
+            if action == "workbuddy_status":
+                document = runtime.status(refresh=bool(data.get("refresh")))
+                providers = document.get("providers")
+                self._last_operation = {
+                    "operation": action,
+                    "available": document.get("available") is True,
+                    "detail": str(document.get("detail", "")),
+                    "providers": dict(providers) if isinstance(providers, Mapping) else {},
+                }
+                return
+            document = runtime.models(provider_id, refresh=bool(data.get("refresh", True)))
+        except Exception:
+            raise DomainError("The WorkBuddy integration is unavailable") from None
+        self._last_operation = {
+            "operation": action,
+            "provider": provider_id,
+            "display_name": workbuddy_module.WORKBUDDY_DISPLAY_NAMES[provider_id],
+            **document,
+        }
+
+    def _workbuddy_login_status(self, auth: Mapping[str, Any]) -> dict[str, Any]:
+        """The worker's account record for one WorkBuddy login provider."""
+
+        try:
+            provider = workbuddy_module.AUTH_KIND_TO_PROVIDER[str(auth.get("kind", ""))]
+        except KeyError:
+            return {}
+        try:
+            entry = self._workbuddy().provider_status(provider)
+        except Exception:
+            return {}
+        return dict(entry) if isinstance(entry, Mapping) else {}
+
     def _provider_auth_configured(self, provider: Mapping[str, Any], auth: Mapping[str, Any]) -> bool:
+        if auth.get("kind") in workbuddy_module.WORKBUDDY_AUTH_KINDS:
+            return str(self._workbuddy_login_status(auth).get("state", "")) == "signed-in"
         if auth.get("kind") in {"openai_login", "claude_login"}:
             credential_ref = str(auth.get("credential_ref", "")).strip()
             if not credential_ref:
@@ -1835,6 +2130,18 @@ class ProvidersModelsDomain:
 
     def _provider_auth_status(self, provider: Mapping[str, Any], auth: Mapping[str, Any]) -> str:
         kind = str(auth.get("kind", "api_key"))
+        if kind in workbuddy_module.WORKBUDDY_AUTH_KINDS:
+            # The credential belongs to the desktop app, so there is no login
+            # this app can start or end: only its observed state is reported.
+            entry = self._workbuddy_login_status(auth)
+            state = str(entry.get("state", ""))
+            if state == "signed-in":
+                return "signed_in"
+            if state == "signed-out":
+                return "signed_out"
+            if state == "error":
+                return "error"
+            return "unsupported" if not workbuddy_module.available() else "signed_out"
         if kind in {"openai_login", "claude_login"}:
             credential_ref = str(auth.get("credential_ref", "")).strip()
             if not credential_ref:
@@ -1971,6 +2278,25 @@ class ProvidersModelsDomain:
         if auth_kind == "openai_login":
             provider["api_base"] = ""
             cls._sync_primary_api_key(provider, [])
+        elif auth_kind in workbuddy_module.WORKBUDDY_AUTH_KINDS:
+            # The provider points at this Core's own loopback worker, never at
+            # the WorkBuddy upstream: the worker owns the desktop credential,
+            # the request fingerprint, and every wire quirk.  Both the base URL
+            # and the key stay environment references, so the worker port and
+            # its bearer never enter config.yaml.
+            provider_id = workbuddy_module.AUTH_KIND_TO_PROVIDER[auth_kind]
+            provider["api_base"] = workbuddy_module.api_base_reference(provider_id)
+            cls._sync_primary_api_key(
+                provider,
+                [
+                    {
+                        "id": cls._new_provider_key_id(),
+                        "name": workbuddy_module.API_KEY_NAME,
+                        "value": workbuddy_module.api_key_reference(provider_id),
+                        "source": {"kind": "independent"},
+                    }
+                ],
+            )
         elif auth_kind == "claude_login":
             provider["api_base"] = ""
             cls._sync_primary_api_key(
@@ -1984,12 +2310,12 @@ class ProvidersModelsDomain:
                     }
                 ],
             )
-        if auth_kind in {"openai_login", "claude_login"}:
+        if auth_kind in {"openai_login", "claude_login", "workbuddy_login", "workbuddy_ai_login"}:
             models = provider.get("models")
             if isinstance(models, list):
                 for model in models:
                     if isinstance(model, dict):
-                        model["api_base"] = ""
+                        model["api_base"] = provider.get("api_base", "")
         return auth
 
     @classmethod
@@ -1998,7 +2324,11 @@ class ProvidersModelsDomain:
         if not isinstance(models, list):
             return
         keys = cls._provider_api_keys(provider)
-        selected_key = keys[0] if auth_kind == "claude_login" and keys else None
+        selected_key = (
+            keys[0]
+            if auth_kind in {"claude_login", *workbuddy_module.WORKBUDDY_AUTH_KINDS} and keys
+            else None
+        )
         for model in models:
             if not isinstance(model, dict):
                 continue
@@ -2008,6 +2338,12 @@ class ProvidersModelsDomain:
             elif auth_kind == "claude_login":
                 model["upstream_url_surface"] = "anthropic"
                 model["upstream_protocol_mode"] = "fixed"
+            elif auth_kind in workbuddy_module.WORKBUDDY_AUTH_KINDS:
+                # The worker serves Chat Completions only; pinning the surface
+                # keeps the router from probing a Responses endpoint that
+                # cannot exist on this route.
+                model["upstream_url_surface"] = "openai/chat"
+                model["upstream_protocol_mode"] = "fixed"
             else:
                 model["upstream_url_surface"] = infer_upstream_fallback_surface(
                     model.get("litellm_model")
@@ -2016,6 +2352,12 @@ class ProvidersModelsDomain:
             model["litellm_model"] = cls._canonical_upstream_model(
                 model.get("litellm_model"), model, provider
             )
+            if auth_kind in workbuddy_module.WORKBUDDY_AUTH_KINDS:
+                # The provider's loopback base is inherited by every model: a
+                # model added after the provider was configured must carry the
+                # same reference, or the dumper would leave the route without
+                # a base URL.
+                model["api_base"] = str(provider.get("api_base", ""))
             model["provider_key_id"] = selected_key["id"] if selected_key else ""
             model["api_key_name"] = selected_key["name"] if selected_key else ""
 
@@ -2324,6 +2666,48 @@ class ProvidersModelsDomain:
         index = self._provider_index({"provider_id": provider_id})
         return index, self._api_key_name(key_name)
 
+    def _pending_secret_target(self, target: str) -> tuple[str, str | None] | None:
+        """Resolve a wizard's own token instead of an existing provider.
+
+        The (token, key name) pair is returned only for a target that carries
+        the wizard prefix; every other target stays a provider target, so a
+        typo cannot silently file a credential under a name nothing adopts.
+        """
+
+        if target.count(self._API_KEY_TARGET_SEPARATOR) > 1:
+            raise DomainError("The requested secret field is unavailable")
+        provider_id, separator, key_name = target.partition(self._API_KEY_TARGET_SEPARATOR)
+        if not provider_id.startswith(self._WIZARD_KEY_TARGET_PREFIX):
+            return None
+        token = provider_id[len(self._WIZARD_KEY_TARGET_PREFIX):].strip()
+        if not token or len(token) > 128:
+            raise DomainError("The requested secret field is unavailable")
+        return token, (self._api_key_name(key_name) if separator and key_name else None)
+
+    def _stage_pending_provider_key(self, token: str, key_name: str | None, value: str) -> None:
+        """File one wizard-staged key until the provider it belongs to exists."""
+
+        staged = self._pending_provider_keys.setdefault(token, {})
+        staged[key_name or ""] = value
+        while len(self._pending_provider_keys) > self._MAX_PENDING_PROVIDER_KEYS:
+            self._pending_provider_keys.pop(next(iter(self._pending_provider_keys)), None)
+
+    def _take_pending_provider_keys(self, token: str) -> dict[str, str]:
+        """Adopt, and forget, every key one wizard token staged."""
+
+        if not token:
+            return {}
+        return self._pending_provider_keys.pop(token, {})
+
+    def _pending_provider_credential(self, token: str, key_name: str | None) -> str | None:
+        staged = self._pending_provider_keys.get(token, {})
+        value = staged.get(key_name) if key_name is not None else None
+        if value is None:
+            # The wizard names its key in its own field: the one value this
+            # token filed belongs to whatever placeholder name it used.
+            value = next((item for item in staged.values() if item.strip()), None)
+        return value if isinstance(value, str) and value.strip() else None
+
     def _stage_provider_secret(self, provider_index: int, key_name: str | None, value: str) -> None:
         providers = self._draft["providers"]
         provider = self._copy_provider_for_edit(providers[provider_index])
@@ -2423,7 +2807,9 @@ class ProvidersModelsDomain:
     # editor remains API-key-only, while the persisted provider shape stays
     # compatible with the LiteLLM config writer and older installations that
     # already contain login metadata.
-    _SERVICE_PROVIDER_KINDS = frozenset({"openai_login", "claude_login"})
+    _SERVICE_PROVIDER_KINDS = frozenset(
+        {"openai_login", "claude_login", *workbuddy_module.WORKBUDDY_AUTH_KINDS}
+    )
     _SERVICE_PROVIDER_DEFAULTS: dict[str, dict[str, str]] = {
         "openai_login": {
             "name": "OpenAI",
@@ -2434,6 +2820,15 @@ class ProvidersModelsDomain:
             "name": "Claude",
             "model_name": "claude-sonnet-4-5",
             "upstream_model": "claude-sonnet-4-5",
+        },
+        # WorkBuddy carries no default model: the desktop app's own catalog is
+        # the roster, so a newly added account imports exactly what the account
+        # can call today.
+        workbuddy_module.WORKBUDDY_AUTH_KIND: {
+            "name": workbuddy_module.WORKBUDDY_DISPLAY_NAMES[workbuddy_module.WORKBUDDY_PROVIDER],
+        },
+        workbuddy_module.WORKBUDDY_AI_AUTH_KIND: {
+            "name": workbuddy_module.WORKBUDDY_DISPLAY_NAMES[workbuddy_module.WORKBUDDY_AI_PROVIDER],
         },
     }
 
@@ -2512,6 +2907,11 @@ class ProvidersModelsDomain:
         # explicitly supplied a model list. The model list remains editable by
         # the service-management surface, but no raw secret crosses IPC.
         raw_models = supplied.get("models")
+        if raw_models is None and kind in workbuddy_module.WORKBUDDY_AUTH_KINDS:
+            # A WorkBuddy account owns no free-text roster: the desktop app's
+            # live catalog is the source of truth, and importing it is the
+            # whole point of adding the account.
+            raw_models = self._workbuddy_catalog_models(kind)
         if raw_models is None:
             raw_model = supplied.get("model")
             raw_models = [raw_model] if isinstance(raw_model, Mapping) else [
@@ -2559,8 +2959,11 @@ class ProvidersModelsDomain:
         changes = self._changes(data, "provider")
         current_auth = self._provider_auth_state(provider)
         requested_kind = changes.pop("auth_kind", changes.pop("kind", None))
-        if requested_kind is not None and self._service_provider_kind(requested_kind) != current_auth["kind"]:
-            raise DomainError("Change the login type through a new service provider")
+        if requested_kind is not None:
+            next_kind = self._service_provider_kind(requested_kind)
+            if next_kind != current_auth["kind"]:
+                self._retype_service_provider(provider, current_auth, next_kind, index)
+                current_auth = self._provider_auth_state(provider)
         changes.pop("auth_credential_ref", None)
         for forbidden in ("api_key", "api_keys", "api_base", "endpoint", "provider_type", "relay_station_id"):
             if forbidden in changes:
@@ -2603,6 +3006,39 @@ class ProvidersModelsDomain:
             "provider_id": self._safe_provider(provider, index)["id"],
             "auth_kind": current_auth["kind"],
         }
+
+    def _retype_service_provider(
+        self,
+        provider: dict[str, Any],
+        current_auth: Mapping[str, Any],
+        next_kind: str,
+        index: int,
+    ) -> None:
+        """Switch a login provider's type, which is also its endpoint.
+
+        The type owns the address, the key slot, and every model's protocol
+        surface, so the switch rewires all three together. The account that
+        belonged to the previous type is left behind: it signed in against a
+        service this provider no longer points at, and the new type starts
+        signed out.
+        """
+
+        existing_refs = {
+            str(self._provider_auth_state(candidate).get("credential_ref", "")).strip()
+            for candidate_index, candidate in enumerate(self._draft.get("providers", []))
+            if candidate_index != index and isinstance(candidate, Mapping)
+        }
+        self._configure_provider_auth(provider, next_kind, existing_refs=existing_refs)
+        self._apply_auth_to_models(provider, next_kind)
+        provider["enabled"] = False
+        previous_ref = str(current_auth.get("credential_ref", "")).strip()
+        if previous_ref:
+            try:
+                self._auth_manager().logout(
+                    str(current_auth.get("kind", "")), previous_ref
+                )
+            except Exception:
+                pass
 
     def _dispatch_service_provider(self, action: str, data: Mapping[str, Any]) -> None:
         if action in {"service_provider_add", "service_add_provider"}:
@@ -2692,11 +3128,26 @@ class ProvidersModelsDomain:
                 )
             self._select_provider_relay_station(data)
             return
+        if action == "provider_discard_pending_key":
+            # A wizard that closed without finishing reserves nothing: the
+            # credential it staged is dropped with the token that filed it.
+            self._pending_provider_keys.pop(str(data.get("pending_api_key", "")).strip(), None)
+            return
         if action in {"provider_add", "add_provider"}:
             value = data.get("provider", data.get("value", data))
             provider = _copy_mapping(value, "provider")
             create_default_api_key = provider.pop("create_default_api_key", False) is True
             initial_api_key_name = str(provider.pop("initial_api_key_name", "")).strip()
+            # The wizard stages its key before its provider exists, so the
+            # create hands the provider the value its own token filed: this is
+            # the only action that can mint that provider, and a create whose
+            # staged key never arrived must not leave a valueless key behind.
+            pending_token = str(
+                provider.pop("pending_api_key", data.get("pending_api_key", "")) or ""
+            ).strip()
+            pending_keys = self._take_pending_provider_keys(pending_token) if pending_token else {}
+            if pending_token and not pending_keys:
+                raise DomainError("The staged API key is unavailable")
             # UI-created providers may request a safe key slot before their
             # first native-secret edit. The intent marker is consumed here;
             # React never constructs or transports a credential value.  The
@@ -2714,6 +3165,15 @@ class ProvidersModelsDomain:
                 )
             if create_default_api_key and requested_auth_kind == "api_key" and "api_keys" not in provider:
                 provider["api_keys"] = [{"name": initial_api_key_name or "default", "value": ""}]
+            if pending_keys and requested_auth_kind == "api_key":
+                # The staged key carries the wizard's own placeholder name;
+                # its value belongs to the slot this create just made, which
+                # the wizard's key step named for the user.
+                keys = self._provider_api_keys(provider) if "api_keys" in provider else []
+                if not keys:
+                    keys = [{"name": initial_api_key_name or "default", "value": ""}]
+                keys[0] = {**keys[0], "value": next(iter(pending_keys.values()))}
+                provider["api_keys"] = keys
             if "api_keys" in provider and requested_auth_kind == "api_key":
                 self._sync_primary_api_key(provider, self._provider_api_keys(provider))
             source = self._provider_source_state(provider)
@@ -3575,14 +4035,21 @@ class ProvidersModelsDomain:
                 )
                 continue
             materials[resource_key] = dict(raw_resource)
+        # A station read the relay could not make is only a *problem* for a
+        # binding that still needs it: a slot that carries its own persisted
+        # credential resolves regardless, and reporting the station's refusal
+        # beside it would mark a row that is fine.
+        deferred_issues: dict[tuple[str, str], dict[str, str]] = {}
         for raw_issue in payload.get("issues", []):
             safe_issue = self._safe_relay_material_issue(raw_issue)
-            if safe_issue is not None:
-                issues.append(safe_issue)
+            if safe_issue is None:
+                continue
+            deferred_issues[(safe_issue.get("account_id", ""), safe_issue.get("resource_id", ""))] = safe_issue
 
         affected_models: list[dict[str, str]] = []
         materialized_keys = 0
         materialized_models = 0
+        resolved_sources: set[tuple[str, str, str]] = set()
         providers = self._draft.get("providers", [])
         if not isinstance(providers, list):
             raise DomainError("Provider/model configuration is invalid")
@@ -3613,17 +4080,41 @@ class ProvidersModelsDomain:
                     and str(model.get("provider_key_id", "")).strip() == key["id"]
                 ]
                 if resource is None:
-                    issue = {
-                        "code": "resource_missing",
-                        "provider_key_id": key["id"],
-                        "source": copy.deepcopy(source),
-                    }
-                    issues.append(issue)
-                    for model in linked_models:
-                        model["binding_health"] = {
-                            "status": "resource_missing",
-                            "detail": "The linked relay API key is unavailable",
+                    # A relay key slot that already carries its materialized
+                    # value needs nothing from the station: the credential is
+                    # this document's own persisted data, and using it keeps a
+                    # local model edit independent of relay sign-in.  Only a
+                    # slot with no value at all has an unresolved binding to
+                    # report.
+                    stored_credential = key.get("value")
+                    if not isinstance(stored_credential, str) or not stored_credential.strip():
+                        issue = {
+                            "code": "resource_missing",
+                            "provider_key_id": key["id"],
+                            "source": copy.deepcopy(source),
                         }
+                        issues.append(issue)
+                        for model in linked_models:
+                            model["binding_health"] = {
+                                "status": "resource_missing",
+                                "detail": "The linked relay API key is unavailable",
+                            }
+                        continue
+                    key["value"] = stored_credential.strip()
+                    materialized_keys += 1
+                    resolved_sources.add(resource_key)
+                    # The station could not be read, so this route keeps the
+                    # credential it already had and is not re-judged against a
+                    # catalog nobody could fetch; 探测 and the relay's own
+                    # errors still state what the upstream answers.
+                    for model in linked_models:
+                        model["api_key_name"] = key["name"]
+                        model["api_key"] = ""
+                        model["provider_key_id"] = key["id"]
+                        model["catalog_mode"] = "relay_linked"
+                        model["source_model_id"] = self._wire_model_name(model)
+                        model["binding_health"] = {"status": "linked"}
+                        materialized_models += 1
                     continue
                 if resource.get("enabled") is not True:
                     issues.append(
@@ -3672,6 +4163,7 @@ class ProvidersModelsDomain:
                 provider_base = api_base
                 key["value"] = credential
                 materialized_keys += 1
+                resolved_sources.add(resource_key)
                 catalog = set(self._relay_import_models(resource))
                 multiplier_raw = resource.get("multiplier")
                 multiplier: int | float | None
@@ -3746,12 +4238,127 @@ class ProvidersModelsDomain:
                 provider["api_base"] = provider_base
             self._sync_primary_api_key(provider, keys)
             providers[provider_index] = provider
+        # Report the station read only where it left a binding unresolved.  An
+        # account-level failure names no resource, so it stays a row of its own
+        # and marks that account's keys whole — but only while none of them
+        # resolved from a credential this document already held.
+        for (account_id, resource_id), issue in deferred_issues.items():
+            if resource_id:
+                if any(
+                    resolved_account == account_id and resolved_resource == resource_id
+                    for _, resolved_account, resolved_resource in resolved_sources
+                ):
+                    continue
+            elif any(
+                resolved_account == account_id for _, resolved_account, _ in resolved_sources
+            ):
+                continue
+            issues.append(issue)
         return {
             "materialized": materialized_models,
             "materialized_provider_keys": materialized_keys,
             "affected_models": affected_models,
             "issues": issues,
         }
+
+    def record_binding_issues(self, issues: object) -> None:
+        """Keep the last relay-materialization issues as markable rows.
+
+        A linked key the relay could not resolve is one row's problem, and the
+        pane can only say which row when Core tells it: these rows carry the
+        issue code beside the provider key and the route it affects, so the
+        strip's sentence and the marked row name the same thing.  Nothing here
+        is secret or user-authored text — codes and stable ids only.
+        """
+
+        projection = self._binding_issue_rows(issues)
+        if projection == self._binding_issues:
+            return
+        self._binding_issues = projection
+        self.revision += 1
+
+    def _binding_issue_rows(self, issues: object) -> list[dict[str, str]]:
+        """Resolve issue targets to the ids this pane selects rows by."""
+
+        if not isinstance(issues, Sequence) or isinstance(issues, (str, bytes, bytearray)):
+            return []
+        provider_of_key: dict[str, str] = {}
+        keys_by_source: dict[tuple[str, str], str] = {}
+        keys_by_account: dict[str, list[str]] = {}
+        models_by_key: dict[str, list[str]] = {}
+        models_by_ref: dict[str, str] = {}
+        providers = self._draft.get("providers", [])
+        if isinstance(providers, list):
+            for provider in providers:
+                if not isinstance(provider, Mapping):
+                    continue
+                provider_id = self._editor_id(provider)
+                for key in self._provider_api_keys(provider):
+                    key_id = str(key.get("id", "")).strip()
+                    if not key_id:
+                        continue
+                    provider_of_key[key_id] = provider_id
+                    source = key.get("source") if isinstance(key.get("source"), Mapping) else {}
+                    if source.get("kind") == "relay":
+                        account_id = str(source.get("account_id", ""))
+                        keys_by_source[(account_id, str(source.get("resource_id", "")))] = key_id
+                        keys_by_account.setdefault(account_id, []).append(key_id)
+                models = provider.get("models", [])
+                if not isinstance(models, list):
+                    continue
+                for model in models:
+                    if not isinstance(model, Mapping):
+                        continue
+                    editor_id = self._editor_id(model, model=True)
+                    models_by_ref[editor_id] = editor_id
+                    deployment_id = str(model.get("deployment_id", "")).strip()
+                    if deployment_id:
+                        models_by_ref[deployment_id] = editor_id
+                    key_id = str(model.get("provider_key_id", "")).strip()
+                    if key_id:
+                        models_by_key.setdefault(key_id, []).append(editor_id)
+        rows: list[dict[str, str]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for item in issues:
+            if not isinstance(item, Mapping):
+                continue
+            code = str(item.get("code", "")).strip()
+            if not code:
+                continue
+            key_id = str(item.get("provider_key_id", "")).strip()
+            account_id = ""
+            if not key_id:
+                source = item.get("source") if isinstance(item.get("source"), Mapping) else {}
+                account_id = str(item.get("account_id", source.get("account_id", ""))).strip()
+                resource_id = str(item.get("resource_id", source.get("resource_id", ""))).strip()
+                key_id = keys_by_source.get((account_id, resource_id), "")
+            model_id = models_by_ref.get(str(item.get("model_id", "")).strip(), "")
+            account_keys = keys_by_account.get(account_id, []) if account_id else []
+            if not key_id and not model_id and not account_keys:
+                continue
+            # An issue that named one route marks that route; a key-level issue
+            # (a station that could not be read) marks every route on its keys.
+            if model_id:
+                targets = [(key_id, model_id)]
+            elif key_id:
+                targets = [(key_id, target) for target in (models_by_key.get(key_id) or [""])]
+            else:
+                targets = [
+                    (account_key, target)
+                    for account_key in account_keys
+                    for target in (models_by_key.get(account_key) or [""])
+                ]
+            for target_key, target in targets:
+                signature = (code, target_key, target)
+                if signature in seen:
+                    continue
+                seen.add(signature)
+                row = {"code": code, "provider_key_id": target_key, "model_id": target}
+                provider_id = provider_of_key.get(target_key)
+                if provider_id:
+                    row["provider"] = provider_id
+                rows.append(row)
+        return rows
 
     @staticmethod
     def _relay_source_filter(value: object) -> dict[str, str]:
@@ -4285,6 +4892,12 @@ class ProvidersModelsDomain:
             }
             for value in values:
                 models.append(self._new_model(provider, value, used_deployment_ids))
+            auth_kind = self._provider_auth_state(provider)["kind"]
+            if auth_kind != "api_key":
+                # A model added to an account-backed provider inherits the
+                # provider's surface, protocol, and credential slot; the
+                # service-provider path does the same when it adds models.
+                self._apply_auth_to_models(provider, auth_kind)
         elif action in {"model_patch", "patch_model"}:
             index = self._model_index(provider, data)
             model = self._copy_model_for_edit(models[index])
@@ -4356,6 +4969,16 @@ class ProvidersModelsDomain:
                 merged_extra = dict(model.get("litellm_extra", {})) if isinstance(model.get("litellm_extra"), Mapping) else {}
                 merged_extra.update(changes["litellm_extra"])
                 changes["litellm_extra"] = merged_extra
+            for limit_key, limit_label in (
+                (PUBLIC_MODEL_CONTEXT_KEY, "Context window"),
+            ):
+                if limit_key not in changes:
+                    continue
+                limit = self._public_model_limit(changes.pop(limit_key), label=limit_label)
+                if limit is None:
+                    model.pop(limit_key, None)
+                else:
+                    model[limit_key] = limit
             model.update(changes)
             if api_key_name_changed and not provider_key_changed:
                 selected_name = str(changes.get("api_key_name", "")).strip()
@@ -4443,6 +5066,7 @@ class ProvidersModelsDomain:
         if any(not value for value in requested) or len(set(requested)) != len(requested):
             raise DomainError("The route order is invalid")
         matched: dict[str, tuple[int, int]] = {}
+        order_values: dict[str, int | float] = {}
         for provider_index, provider in enumerate(self._draft["providers"]):
             if not isinstance(provider, Mapping):
                 continue
@@ -4461,10 +5085,18 @@ class ProvidersModelsDomain:
                         "Routes that follow a relay multiplier cannot be manually reordered"
                     )
                 matched[route_id] = (provider_index, model_index)
+                order_values[route_id] = self._order_value(
+                    model.get("manual_order", model.get("order", 0)),
+                    label="Manual route order",
+                )
         if set(matched) != set(requested):
             raise DomainError("The route order changed; refresh and try again")
         changed_providers: dict[int, dict[str, Any]] = {}
-        for order, deployment_id in enumerate(requested, start=1):
+        # The order values travel with the routes: a reorder permutes the
+        # numbers the user typed (decimals included) instead of renumbering
+        # the group, so a move never rewrites a value it did not touch.
+        existing_orders = sorted(order_values.values())
+        for order, deployment_id in zip(existing_orders, requested):
             provider_index, model_index = matched[deployment_id]
             provider = changed_providers.get(provider_index)
             if provider is None:
@@ -4477,6 +5109,113 @@ class ProvidersModelsDomain:
             model["order"] = order
             model["manual_order"] = order
             model["effective_order"] = order
+            models[model_index] = model
+        for provider_index, provider in changed_providers.items():
+            self._draft["providers"][provider_index] = provider
+
+    @staticmethod
+    def _public_model_limit(value: object, *, label: str) -> int | None:
+        """Normalize one public-model limit; None (or empty/zero) clears it."""
+
+        if value is None or value is False:
+            return None
+        if value is True:
+            raise DomainError(f"{label} must be a positive integer")
+        if str(value).strip() in {"", "0"}:
+            return None
+        limit = _positive_int(value)
+        if limit is None:
+            raise DomainError(f"{label} must be a positive integer")
+        return limit
+
+    def _patch_public_model(self, data: Mapping[str, Any]) -> None:
+        """Rename one public model or set the limits every route shares.
+
+        A public model is the client-facing name several routes share, not a
+        record of its own: a rename writes the new ``model_name`` on every
+        route, and the context/output limits are written to each route's
+        ``model_info`` so the managed catalog and the proxy's model metadata
+        read the same numbers.  One staged action keeps the group consistent
+        instead of leaving the pane to patch its routes one by one.
+        """
+
+        public_model = str(
+            data.get("public_model", data.get("model_name", data.get("name", "")))
+        ).strip()
+        if not public_model:
+            raise DomainError("A public model is required")
+        changes = self._changes(data, "public_model")
+        if "name" in changes and "model_name" not in changes:
+            changes["model_name"] = changes.pop("name")
+        unsupported = set(changes).difference(
+            {"model_name", PUBLIC_MODEL_CONTEXT_KEY}
+        )
+        if unsupported:
+            raise DomainError("The public model change is unavailable")
+        next_name = public_model
+        if "model_name" in changes:
+            next_name = str(changes["model_name"]).strip()
+            if not next_name:
+                raise DomainError("The public model needs a name")
+        limits: dict[str, int | None] = {}
+        for limit_key, limit_label in (
+            (PUBLIC_MODEL_CONTEXT_KEY, "Context window"),
+        ):
+            if limit_key in changes:
+                limits[limit_key] = self._public_model_limit(
+                    changes[limit_key], label=limit_label
+                )
+
+        matched: list[tuple[int, int]] = []
+        for provider_index, provider in enumerate(self._draft["providers"]):
+            if not isinstance(provider, Mapping):
+                continue
+            models = provider.get("models", [])
+            if not isinstance(models, list):
+                continue
+            for model_index, model in enumerate(models):
+                if isinstance(model, Mapping) and str(
+                    model.get("model_name", "")
+                ).strip() == public_model:
+                    matched.append((provider_index, model_index))
+        if not matched:
+            raise DomainError("The selected public model is unavailable")
+        if next_name != public_model:
+            matched_set = set(matched)
+            for provider_index, provider in enumerate(self._draft["providers"]):
+                if not isinstance(provider, Mapping):
+                    continue
+                models = provider.get("models", [])
+                if not isinstance(models, list):
+                    continue
+                for model_index, model in enumerate(models):
+                    if (
+                        isinstance(model, Mapping)
+                        and (provider_index, model_index) not in matched_set
+                        and str(model.get("model_name", "")).strip() == next_name
+                    ):
+                        raise DomainError(
+                            "A public model with that name already exists"
+                        )
+
+        changed_providers: dict[int, dict[str, Any]] = {}
+        for provider_index, model_index in matched:
+            provider = changed_providers.get(provider_index)
+            if provider is None:
+                provider = self._copy_provider_for_edit(
+                    self._draft["providers"][provider_index]
+                )
+                changed_providers[provider_index] = provider
+            models = provider.get("models", [])
+            if not isinstance(models, list) or model_index >= len(models):
+                raise DomainError("The selected public model is unavailable")
+            model = self._copy_model_for_edit(models[model_index])
+            model["model_name"] = next_name
+            for limit_key, limit in limits.items():
+                if limit is None:
+                    model.pop(limit_key, None)
+                else:
+                    model[limit_key] = limit
             models[model_index] = model
         for provider_index, provider in changed_providers.items():
             self._draft["providers"][provider_index] = provider
@@ -4520,8 +5259,15 @@ class ProvidersModelsDomain:
             self._draft = copy.deepcopy(self._raw)
             self._restore_editor_id_bindings(provider_bindings, model_bindings)
             self._probe_overlay.clear()
+            # A discarded draft takes the wizard keys staged for it: nothing
+            # is reserved for a provider that will never be created.
+            self._pending_provider_keys.clear()
         elif name in {"routes_reorder_group", "route_reorder_group"}:
             self._reorder_route_group(data)
+        elif name in {"public_model_patch", "public_models_patch"}:
+            self._patch_public_model(data)
+        elif name in {"workbuddy_status", "workbuddy_models", "workbuddy_login"}:
+            self._workbuddy_operation(name, data)
         elif name in {"provider_auth_start", "provider_auth_cancel", "provider_auth_logout", "provider_auth_status"}:
             self._provider_auth_operation(name, data)
         elif name.startswith("service_provider_") or name in {
@@ -4569,6 +5315,9 @@ class ProvidersModelsDomain:
                 return False
         if field != "api_key" or not isinstance(target, str):
             raise DomainError("The requested secret field is unavailable")
+        pending = self._pending_secret_target(target)
+        if pending is not None:
+            return self._pending_provider_credential(pending[0], pending[1]) is not None
         index, key_name = self._secret_target(target)
         provider = self._draft["providers"][index]
         if not isinstance(provider, Mapping):
@@ -4593,6 +5342,9 @@ class ProvidersModelsDomain:
 
         if field != "api_key" or not isinstance(target, str):
             raise DomainError("The requested secret field is unavailable")
+        pending = self._pending_secret_target(target)
+        if pending is not None:
+            return self._pending_provider_credential(pending[0], pending[1]) or ""
         index, key_name = self._secret_target(target)
         provider = self._draft["providers"][index]
         if not isinstance(provider, Mapping):
@@ -4632,6 +5384,11 @@ class ProvidersModelsDomain:
             return
         if field != "api_key" or not isinstance(target, str):
             raise DomainError("The requested secret field is unavailable")
+        pending = self._pending_secret_target(target)
+        if pending is not None:
+            self._stage_pending_provider_key(pending[0], pending[1], value)
+            self.revision += 1
+            return
         index, key_name = self._secret_target(target)
         self._stage_provider_secret(index, key_name, value)
         self.revision += 1

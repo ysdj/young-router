@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import tempfile
 import unittest
@@ -8,8 +9,8 @@ from typing import Any
 from unittest.mock import patch
 
 from young_router.core.domains.providers_models import ProvidersModelsDomain
-from young_router.core.domains.relay_accounts import RelayAccountsDomain
-from young_router.core.service import CoreStore
+from young_router.core.domains.relay_accounts import RelayAccountsDomain, RelayAccountsError
+from young_router.core.service import CoreError, CoreStore, _relay_binding_projection
 
 
 class RelayCoordinatorHTTP:
@@ -323,6 +324,241 @@ class RelayApplyCoordinatorIntegrationTests(unittest.TestCase):
             self.assertEqual("relay_linked", model["catalog_mode"])
             self.assertNotIn("replace-secret", json.dumps(core.snapshot()))
 
+    def test_a_linked_route_the_relay_cannot_resolve_names_its_own_cause(self) -> None:
+        """A binding the relay cannot resolve is not a bare rollback.
+
+        The linked route's upstream model is absent from the key's catalog, so
+        materialization refuses the write before any remote mutation.  Core
+        reports that cause (``relay_binding_failed``) instead of the generic
+        ``apply_failed`` the strip renders as 更改未生效, and the refused draft
+        leaves the key unmaterialized.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            http = RelayCoordinatorHTTP()
+            relay = RelayAccountsDomain(root, http_client=http)
+            providers = ProvidersModelsDomain(root / "config.yaml")
+            core = CoreStore(domains=[relay, providers])
+            core.dispatch(
+                {
+                    "domain": "relay_accounts",
+                    "type": "account.add",
+                    "payload": {"type": "newapi", "label": "Relay", "origin": "https://relay.example.test"},
+                }
+            )
+            account_id = relay.snapshot()["accounts"][0]["id"]
+            core.accept_relay_login(
+                account_id=account_id,
+                account_type="newapi",
+                label="Relay",
+                origin="https://relay.example.test",
+                username="person",
+                cookie="session=fixture",
+            )
+            core.refresh_relay_resources(account_id, revision=core.revision)
+            account = relay.snapshot()["accounts"][0]
+            resource_id = account["resources"][0]["id"]
+            core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "provider.add",
+                    "payload": {"provider": {"name": "provider-a", "enabled": True, "api_base": "https://relay.example.test/v1", "models": []}},
+                },
+                expected_revision=core.revision,
+            )
+            provider_id = providers.snapshot()["providers"][0]["id"]
+            core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "model.add",
+                    "payload": {
+                        "provider_id": provider_id,
+                        "model": {"name": "public-chat", "upstream_model": "model-not-in-the-catalog"},
+                    },
+                },
+                expected_revision=core.revision,
+            )
+            model_id = providers.snapshot()["providers"][0]["models"][0]["id"]
+            core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "model.select_relay_resource",
+                    "payload": {
+                        "provider_id": provider_id,
+                        "model_id": model_id,
+                        "station_id": account["station_id"],
+                        "account_id": account_id,
+                        "resource_id": resource_id,
+                    },
+                },
+                expected_revision=core.revision,
+            )
+            config_path = root / "config.yaml"
+            self.assertFalse(config_path.exists())
+
+            with self.assertRaises(CoreError) as raised:
+                core.apply(domain="providers_models", revision=core.revision)
+
+            self.assertEqual("relay_binding_failed", raised.exception.code)
+            # Nothing was written and the refused draft stays staged for repair.
+            self.assertFalse(config_path.exists())
+            relay_key = next(
+                key for key in providers.snapshot()["providers"][0]["key_states"] if key["source"]["kind"] == "relay"
+            )
+            self.assertFalse(relay_key["configured"])
+            model = providers.snapshot()["providers"][0]["models"][0]
+            self.assertEqual("relay_linked", model["catalog_mode"])
+            # The pane can mark the row that refused the write: the issue the
+            # relay reported names its key and the route on it.
+            self.assertEqual(
+                [{
+                    "code": "catalog_model_missing",
+                    "provider_key_id": relay_key["id"],
+                    "model_id": model["editor_id"],
+                    "provider": providers.snapshot()["providers"][0]["editor_id"],
+                }],
+                providers.snapshot()["binding_issues"],
+            )
+            # A resolution that worked clears them again.
+            providers.record_binding_issues([])
+            self.assertEqual([], providers.snapshot()["binding_issues"])
+
+    def test_an_aged_out_station_session_does_not_read_as_a_dead_linked_key(self) -> None:
+        """A linked route still applies after its station session ages out.
+
+        Every part of a relay-bound Apply is authenticated by the same dashboard
+        session: the resource refresh, the key materialization.  A sub2api
+        session lives about two days, so a window that stayed open past that
+        used to end with `refresh_failed`/`resource_key_unavailable` and then
+        `relay_binding_failed` — the pane reported the linked key as
+        unavailable and the route never applied — while the account's remembered
+        password could still mint a session.  Core renews that session and
+        retries the read instead.
+        """
+
+        class Sub2ApiHTTP:
+            def __init__(self) -> None:
+                self.expired = False
+                self.password_logins: list[tuple[str, str, str, str]] = []
+                self.calls: list[tuple[str, str]] = []
+
+            def json(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
+                del origin
+                self.calls.append(("GET", path))
+                if self.expired:
+                    # The station rejects the stored dashboard session, exactly
+                    # as it does once that session ages out.
+                    raise RelayAccountsError("Relay login has expired")
+                if path == "/api/v1/keys?page=1&page_size=100":
+                    return {
+                        "code": 0,
+                        "data": {
+                            "items": [
+                                {"id": 51, "name": "GroupFixture", "status": "active", "key": "replace-linked-key", "group_id": 51},
+                            ]
+                        },
+                    }
+                if path == "/api/v1/channels/available":
+                    return {"code": 0, "data": []}
+                if path == "/api/v1/user/profile":
+                    return {"code": 0, "data": {"balance": 1.0}}
+                if path == "/api/v1/groups/available":
+                    return {"code": 0, "data": [{"id": 51, "name": "GroupFixture"}]}
+                if path == "/api/v1/groups/rates":
+                    return {"code": 0, "data": {"51": 0.15}}
+                if path == "/v1/models":
+                    return {"object": "list", "data": [{"id": "claude-opus-5-5"}]}
+                raise AssertionError(f"unexpected GET {path}")
+
+            def post(self, origin: str, path: str, *, headers: dict[str, str], body: object = None) -> object:
+                del origin, headers, body
+                self.calls.append(("POST", path))
+                raise AssertionError(f"unexpected POST {path}")
+
+            def password_login(self, origin: str, account_type: str, username: str, password: str) -> dict[str, str]:
+                self.password_logins.append((origin, account_type, username, password))
+                self.expired = False
+                return {
+                    "username": username,
+                    "cookie": "",
+                    "access_token": "replace-renewed-token",
+                    "refresh_token": "replace-renewed-refresh",
+                }
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            http = Sub2ApiHTTP()
+            relay = RelayAccountsDomain(root, http_client=http)
+            providers = ProvidersModelsDomain(root / "config.yaml")
+            core = CoreStore(domains=[relay, providers])
+            core.dispatch(
+                {
+                    "domain": "relay_accounts",
+                    "type": "account.add",
+                    "payload": {"type": "sub2api", "label": "Relay", "origin": "https://relay.example.test", "remember_password": True},
+                }
+            )
+            account = relay.snapshot()["accounts"][0]
+            core.accept_relay_login(
+                account_id=account["id"],
+                account_type="sub2api",
+                label="Relay",
+                origin="https://relay.example.test",
+                username="person@example.test",
+                access_token="replace-stale-token",
+                password="replace-password",
+            )
+            core.refresh_relay_resources(account["id"], revision=core.revision)
+            resource_id = relay.snapshot()["accounts"][0]["resources"][0]["id"]
+            self.assertEqual("sub2api-51", resource_id)
+            core.import_relay_resources(account["id"], [resource_id], revision=core.revision)
+
+            # The session ages out while the window is still open.
+            http.expired = True
+            core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "model.add",
+                    "payload": {
+                        "provider_id": "relay-" + relay.snapshot()["accounts"][0]["station_id"],
+                        "model": {"model_name": "claude-opus-5-5", "litellm_model": "anthropic/claude-opus-5-5"},
+                    },
+                },
+                expected_revision=core.revision,
+            )
+            provider = providers.snapshot()["providers"][0]
+            model = next(item for item in provider["models"] if item["model_name"] == "claude-opus-5-5")
+            core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "model.select_relay_resource",
+                    "payload": {
+                        "provider_id": provider["id"],
+                        "model_id": model["id"],
+                        "station_id": relay.snapshot()["accounts"][0]["station_id"],
+                        "account_id": account["id"],
+                        "resource_id": resource_id,
+                    },
+                },
+                expected_revision=core.revision,
+            )
+
+            applied = core.apply(domain="providers_models", revision=core.revision)
+
+            self.assertEqual("applied", applied["status"])
+            self.assertEqual([], providers.snapshot()["binding_issues"])
+            self.assertEqual(
+                [("https://relay.example.test", "sub2api", "person@example.test", "replace-password")],
+                http.password_logins,
+            )
+            # The renewed session is what wrote the route, and the linked key
+            # carries its materialized credential.
+            written = (root / "config.yaml").read_text(encoding="utf-8")
+            self.assertIn("claude-opus-5-5", written)
+            self.assertIn("replace-linked-key", written)
+            self.assertEqual("signed_in", relay.snapshot()["accounts"][0]["login_status"])
+
     def test_fetch_models_uses_the_same_dynamic_relay_key_without_exposing_it(self) -> None:
         class ModelListResponse:
             status = 200
@@ -629,6 +865,134 @@ class RelayApplyCoordinatorIntegrationTests(unittest.TestCase):
             self.assertEqual("applied", result["status"])
             self.assertEqual(0, result["pending_operations"])
             self.assertEqual(1, http.calls.count(("PUT", "/api/token/")))
+
+
+class LocalEditBesideARelayBacklogTests(unittest.TestCase):
+    """A local provider/model edit must not inherit the relay's backlog.
+
+    The coordination exists for a draft that actually binds relay material.
+    Dragging every providers_models edit into the relay transaction made an
+    ordinary ＋ (a new model on an independent provider) report the relay's own
+    pending key work as a validation failure of that edit.
+    """
+
+    def _providers(self) -> dict[str, object]:
+        return {
+            "providers": [
+                {
+                    "name": "independent",
+                    "api_base": "https://api.example.test/v1",
+                    "api_keys": [{"name": "primary", "value": "secret", "source": {"kind": "independent"}}],
+                    "models": [],
+                }
+            ]
+        }
+
+    def test_projection_ignores_a_local_only_edit_and_keeps_relay_bindings(self) -> None:
+        before = {
+            "providers": [
+                {
+                    "name": "independent",
+                    "api_keys": [{"name": "primary", "value": "secret", "source": {"kind": "independent"}}],
+                    "models": [{"model_name": "one", "api_key_name": "primary"}],
+                },
+                {
+                    "name": "relay",
+                    "api_keys": [
+                        {
+                            "id": "slot-1",
+                            "name": "station-key",
+                            "value": "",
+                            "source": {
+                                "kind": "relay",
+                                "station_id": "station-1",
+                                "account_id": "account-1",
+                                "resource_id": "resource-1",
+                            },
+                        }
+                    ],
+                    "models": [{"model_name": "linked", "api_key_name": "station-key", "provider_key_id": "slot-1"}],
+                },
+            ]
+        }
+        local_edit = copy.deepcopy(before)
+        local_edit["providers"][0]["models"].append({"model_name": "新建模型", "api_key_name": ""})
+        local_edit["providers"][0]["name"] = "renamed"
+        self.assertEqual(
+            _relay_binding_projection(before),
+            _relay_binding_projection(local_edit),
+        )
+
+        relay_key_edit = copy.deepcopy(before)
+        relay_key_edit["providers"][1]["api_keys"][0]["source"]["resource_id"] = "resource-2"
+        self.assertNotEqual(
+            _relay_binding_projection(before),
+            _relay_binding_projection(relay_key_edit),
+        )
+
+        bound_model = copy.deepcopy(before)
+        bound_model["providers"][1]["models"].append(
+            {"model_name": "another", "api_key_name": "station-key", "provider_key_id": "slot-1"}
+        )
+        self.assertNotEqual(
+            _relay_binding_projection(before),
+            _relay_binding_projection(bound_model),
+        )
+
+    def test_a_local_model_edit_applies_while_the_relay_is_not_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            http = RelayCoordinatorHTTP()
+            relay = RelayAccountsDomain(root, http_client=http)
+            providers = ProvidersModelsDomain(root / "config.yaml")
+            core = CoreStore(domains=[relay, providers])
+            core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "provider.add",
+                    "payload": {
+                        "provider": {
+                            "name": "independent",
+                            "enabled": True,
+                            "api_base": "https://api.example.test/v1",
+                        }
+                    },
+                },
+                expected_revision=core.revision,
+            )
+            # The relay cannot finish its own work here; that backlog is not
+            # this edit's business.
+            with patch.object(RelayAccountsDomain, "prepare_apply", return_value={"ready": False, "issues": []}):
+                core.dispatch(
+                    {
+                        "domain": "providers_models",
+                        "type": "model.add",
+                        "payload": {
+                            "provider_id": "independent",
+                            "model": {"name": "新建模型", "upstream_model": "新建模型", "enabled": False, "order": 0},
+                        },
+                    },
+                    expected_revision=core.revision,
+                )
+                result = core.apply(domains=["providers_models"], revision=core.revision)
+
+            self.assertTrue(result["applied"])
+            self.assertEqual("applied", result["status"])
+            self.assertEqual(["providers_models"], result["domains"])
+
+    def test_a_relay_bound_edit_still_states_the_relay_itself(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            core, relay, providers, _http, account_id, resource_id = RelayApplyCoordinatorIntegrationTests()._linked_core(root)
+            self.assertTrue(providers.dependency_summary()["provider_key_count"] > 0)
+            with patch.object(RelayAccountsDomain, "prepare_apply", return_value={"ready": False, "issues": []}):
+                try:
+                    core.apply(domains=["providers_models", "relay_accounts"], revision=core.revision)
+                except CoreError as exc:
+                    self.assertIn(exc.code, {"relay_not_ready", "relay_preflight_failed"})
+                else:
+                    self.fail("the relay's own backlog must be reported as a relay failure")
+            del account_id, resource_id, relay
 
 
 if __name__ == "__main__":

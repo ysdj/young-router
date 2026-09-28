@@ -34,7 +34,7 @@ export interface NativeLeafBridge {
   saveFilePicker(suggestedName: string): Promise<string | undefined>;
   showActionMenu(title: string, items: string[], anchor: NativeMenuAnchor): Promise<number | undefined>;
   showGroupedActionMenu?(title: string, groups: Array<{ title: string; items: string[] }>, anchor: NativeMenuAnchor): Promise<{ group: number; item: number } | undefined>;
-  showConfirmation(title: string, message: string, confirmLabel: string): Promise<boolean>;
+  showConfirmation(title: string, message: string, confirmLabel: string, destructive: boolean): Promise<boolean>;
   showReadOnlyText(title: string, text: string, closeLabel: string, language: "json" | "toml" | "text", html: string): Promise<void>;
   showProviderAuth?(options: {
     provider: "openai" | "claude";
@@ -55,6 +55,18 @@ export interface NativeLeafBridge {
     /** True while the account's aligned layout is still loading. */
     loading?: boolean;
   } & RelayGroupManagerSnapshot): Promise<RelayGroupManagerResult | undefined>;
+  /**
+   * The next 保存并关闭 request from the open 分组管理 sheet; the sheet stays
+   * up (and locked over the window that opened it) until
+   * `finishGroupManagerApply` answers it.  Undefined means the sheet ended
+   * without saving, and a call with no sheet open answers immediately.
+   */
+  awaitGroupManagerApply?(): Promise<RelayGroupManagerResult | undefined>;
+  /**
+   * Answer an apply request: the sheet states `status` in its own status strip
+   * and closes, or keeps its rows for another try.
+   */
+  finishGroupManagerApply?(options: { status: string; close: boolean }): Promise<void>;
   /**
    * Replace the open group manager sheet's content with a later snapshot of the
    * same account and end its loading state; false when no sheet is open.
@@ -161,7 +173,7 @@ export function createNativeLeafBridgeAdapter(bridge: NativeLeafBridge): NativeL
     showGroupedActionMenu: bridge.showGroupedActionMenu
       ? ({ title, groups, anchor }) => bridge.showGroupedActionMenu!(title, groups, anchor)
       : undefined,
-    showConfirmation: ({ title, message, confirmLabel }) => bridge.showConfirmation(title, message, confirmLabel),
+    showConfirmation: ({ title, message, confirmLabel, destructive }) => bridge.showConfirmation(title, message, confirmLabel, destructive === true),
     showReadOnlyText: ({ title, text, closeLabel, language, html }) => bridge.showReadOnlyText(title, text, closeLabel, language, html),
     showProviderAuth: bridge.showProviderAuth
       ? (options) => bridge.showProviderAuth!(options)
@@ -169,6 +181,12 @@ export function createNativeLeafBridgeAdapter(bridge: NativeLeafBridge): NativeL
     showCodexRestartConfirmation: ({ title, message, restartLabel, laterLabel }) => bridge.showCodexRestartConfirmation(title, message, restartLabel, laterLabel),
     chooseModelsToAdd: ({ models, providerName, keyName }) => bridge.chooseModelsToAdd(models, providerName, keyName),
     showGroupManager: (options) => bridge.showGroupManager(options),
+    awaitGroupManagerApply: bridge.awaitGroupManagerApply
+      ? () => bridge.awaitGroupManagerApply!()
+      : undefined,
+    finishGroupManagerApply: bridge.finishGroupManagerApply
+      ? (options) => bridge.finishGroupManagerApply!(options)
+      : undefined,
     updateGroupManager: bridge.updateGroupManager
       ? (options) => bridge.updateGroupManager!(options)
       : undefined,

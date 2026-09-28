@@ -17,9 +17,16 @@ The staged layout consumed by ``young_router/traceone.py``::
     traceone.js                              dist/traceone.js
     prompt.txt                               prompts/identity-web-v1.txt
     manifest.json                            staging record
-    data/unified_bank.json                   dist/data/unified_bank.json
-    data/codex_low_v4_adapter_415.json       dist/data/...
-    data/codex_low_v4_support_415.json       dist/data/...
+    data/<artifact>.json                     every dist/data/*.json artifact, by
+                                             the role its file name declares
+                                             (bank / adapter / support)
+
+The artifact file names are discovered instead of pinned: upstream renames them
+on classifier revisions (``unified_bank.json`` became ``unified_bank_v2_16.json``,
+``codex_low_v4_adapter_415.json`` became ``codex_low_v7_adapter_791.json``), and a
+build that hard-codes the old spelling would fail on a rename the engine itself
+handles.  Each role has to resolve to exactly one artifact, so a genuinely
+dropped role still fails the build.
 
 ``TRACEONE_ARCHIVE_URL`` (or ``--archive-url``) points at an explicit archive
 for offline and unit-test fixtures; the same environment variable family is
@@ -57,26 +64,21 @@ DEFAULT_REF = "main"
 DEFAULT_TIMEOUT_SECONDS = 180
 USER_AGENT = "Young-Router/traceone-build"
 
-# Files copied out of the upstream archive.  Every path is required: a missing
-# one means upstream moved or renamed it, and packaging a partial adaptation is
-# worse than failing the build.
-REQUIRED_DIST_FILES = (
-    "dist/traceone.js",
-    "dist/data/unified_bank.json",
-    "dist/data/codex_low_v4_adapter_415.json",
-    "dist/data/codex_low_v4_support_415.json",
-)
+# The module and the prompt are pinned by path; the classifier artifacts are
+# discovered by the role their file name declares.
+REQUIRED_DIST_FILES = ("dist/traceone.js",)
 PROMPT_SOURCE = "prompts/identity-web-v1.txt"
 PROMPT_TARGET = "prompt.txt"
 MANIFEST_TARGET = "manifest.json"
+DATA_PREFIX = "dist/data/"
 
-STAGED_FILES = (
-    "traceone.js",
-    PROMPT_TARGET,
-    "data/unified_bank.json",
-    "data/codex_low_v4_adapter_415.json",
-    "data/codex_low_v4_support_415.json",
-)
+# One artifact per role: ``bank`` carries the reference fingerprints, and
+# ``adapter``/``support`` are the fitted documents that shape the comparison.
+DATA_ROLE_PATTERNS = {
+    "bank": re.compile(r"unified_bank[^/]*\.json$"),
+    "adapter": re.compile(r"_adapter_[^/]*\.json$"),
+    "support": re.compile(r"_support_[^/]*\.json$"),
+}
 
 TARGET_MODELS_PATTERN = re.compile(r"export const TARGET_MODELS = \[(.*?)\]", re.S)
 STRING_LITERAL_PATTERN = re.compile(r"[\"']([^\"']+)[\"']")
@@ -158,9 +160,40 @@ def extract(archive: bytes) -> dict[str, bytes]:
                 if handle is None:
                     raise SystemExit(f"The TraceOne archive entry is unreadable: {wanted}")
                 files[wanted] = handle.read()
+            members_for_data = sorted(
+                name for name in members if name.endswith(".json") and f"/{DATA_PREFIX}" in name
+            )
+            for _role, name in data_roles(members_for_data).items():
+                handle = archive_file.extractfile(members[name])
+                if handle is None:
+                    raise SystemExit(f"The TraceOne archive entry is unreadable: {name}")
+                files[staged_data_name(name)] = handle.read()
             return files
     except tarfile.TarError as exc:
         raise SystemExit(f"The TraceOne archive could not be read: {exc}") from exc
+
+
+def data_roles(names: list[str]) -> dict[str, str]:
+    """Resolve each classifier artifact role to exactly one archive member."""
+
+    roles: dict[str, str] = {}
+    for role, pattern in DATA_ROLE_PATTERNS.items():
+        matches = [name for name in names if pattern.search(name)]
+        if not matches:
+            raise SystemExit(f"The TraceOne archive has no {role} artifact under {DATA_PREFIX}")
+        if len(matches) > 1:
+            raise SystemExit(
+                f"The TraceOne archive declares more than one {role} artifact: "
+                + ", ".join(sorted(matches))
+            )
+        roles[role] = matches[0]
+    return roles
+
+
+def staged_data_name(member_name: str) -> str:
+    """The staged ``data/<basename>`` path for one archive data artifact."""
+
+    return f"data/{member_name.rsplit('/', 1)[-1]}"
 
 
 def revision_from_archive(archive: bytes) -> str:
@@ -224,25 +257,34 @@ def validate(files: dict[str, bytes]) -> list[str]:
     models = target_models(module_text)
     if not models:
         raise SystemExit("The staged TraceOne module declares no target routes")
-    try:
-        bank = json.loads(files["dist/data/unified_bank.json"].decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise SystemExit(f"The staged TraceOne bank is not valid JSON: {exc}") from exc
-    if not isinstance(bank, dict) or not bank:
-        raise SystemExit("The staged TraceOne bank is empty")
+    for name in sorted(name for name in files if name.startswith("data/")):
+        try:
+            artifact = json.loads(files[name].decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"The staged TraceOne artifact {name} is not valid JSON: {exc}") from exc
+        if not isinstance(artifact, dict) or not artifact:
+            raise SystemExit(f"The staged TraceOne artifact {name} is empty")
     if not files[PROMPT_SOURCE].decode("utf-8", errors="replace").strip():
         raise SystemExit("The staged TraceOne prompt is empty")
     return models
 
 
-def stage(output: Path, files: dict[str, bytes]) -> None:
+def staged_files(files: dict[str, bytes]) -> tuple[str, ...]:
+    """The staged layout: module, prompt, and every discovered artifact."""
+
+    return ("traceone.js", PROMPT_TARGET, *sorted(name for name in files if name.startswith("data/")))
+
+
+def stage(output: Path, files: dict[str, bytes]) -> tuple[str, ...]:
     if output.exists():
         shutil.rmtree(output)
     (output / "data").mkdir(parents=True, exist_ok=True)
     (output / "traceone.js").write_bytes(files["dist/traceone.js"])
     (output / PROMPT_TARGET).write_bytes(files[PROMPT_SOURCE])
-    for name in ("unified_bank.json", "codex_low_v4_adapter_415.json", "codex_low_v4_support_415.json"):
-        (output / "data" / name).write_bytes(files[f"dist/data/{name}"])
+    names = sorted(name for name in files if name.startswith("data/"))
+    for name in names:
+        (output / name).write_bytes(files[name])
+    return ("traceone.js", PROMPT_TARGET, *names)
 
 
 def digest(path: Path) -> str:
@@ -257,6 +299,7 @@ def write_manifest(
     url: str,
     models: list[str],
     archive_digest: str,
+    staged: tuple[str, ...],
 ) -> dict[str, Any]:
     manifest = {
         "name": "TraceOne",
@@ -267,7 +310,7 @@ def write_manifest(
         "archive_sha256": archive_digest,
         "staged_at": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "target_models": models,
-        "files": {name: digest(output / name) for name in STAGED_FILES},
+        "files": {name: digest(output / name) for name in staged},
     }
     (output / MANIFEST_TARGET).write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return manifest
@@ -337,9 +380,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     archive_digest = hashlib.sha256(archive).hexdigest()
     output = Path(arguments.output)
+    staged: tuple[str, ...] = ()
     with tempfile.TemporaryDirectory(prefix="traceone-stage-") as directory:
         staging = Path(directory) / "traceone"
-        stage(staging, files)
+        staged = stage(staging, files)
         if not arguments.no_smoke_test:
             smoke_test(staging, arguments.node or None)
         if output.exists():
@@ -353,6 +397,7 @@ def main(argv: list[str] | None = None) -> int:
         url=url,
         models=models,
         archive_digest=archive_digest,
+        staged=staged,
     )
     _log(
         "staged TraceOne "

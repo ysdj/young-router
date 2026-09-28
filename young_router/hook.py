@@ -137,6 +137,7 @@ class YoungRouterHook(CustomLogger):
             _responses_request_module._with_codex_external_web_search_bridge_tool,
             _responses_request_module._with_codex_tool_registry_instruction,
             _responses_request_module._with_codex_descendant_cleanup_instruction,
+            _responses_request_module._with_codex_commentary_discipline_instruction,
             _responses_request_module._with_empty_tool_controls_removed,
             _responses_request_module._with_codex_compaction_controls,
             _responses_request_module._with_responses_native_extra_body,
@@ -308,6 +309,10 @@ class YoungRouterHook(CustomLogger):
             request_data, response
         )
         response = _responses_web_search_bridge_module._sanitize_response_stream_payload(
+            response,
+            request_data,
+        )
+        response = _responses_output_module._sanitize_reasoning_wrapper_response(
             response,
             request_data,
         )

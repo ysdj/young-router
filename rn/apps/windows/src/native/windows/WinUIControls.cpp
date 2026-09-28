@@ -80,6 +80,14 @@ using winrt::Microsoft::UI::Xaml::Thickness;
 namespace web = winrt::Microsoft::Web::WebView2::Core;
 
 constexpr double kUIFontSize = 13.0;
+// Mirrors the Core's own raw-editor budget (``MAX_EDITOR_DOCUMENT_BYTES`` and
+// ``MAX_MESSAGE_BYTES`` in ``young_router/core/protocol.py``).  One editor
+// frame carries the document plus its baseline, and the page bootstrap embeds
+// both, so the message budget has to cover two documents.  The managed Codex
+// catalog this app writes is already past 2 MB, so a smaller gate refused a
+// document Core itself had handed over.
+constexpr size_t kMaxEditorDocumentBytes = 6 * 1024 * 1024;
+constexpr size_t kMaxEditorMessageBytes = 16 * 1024 * 1024;
 // The settings sidebar follows the native reference: a 13.5pt medium label, a
 // half step above the 13pt body text like the macOS source list.
 constexpr double kSourceListFontSize = 13.5;
@@ -770,7 +778,7 @@ struct TableComponentView final
         return;
       }
       if (index >= static_cast<int32_t>(Props()->rowKeys.size())) return;
-      if (IsSpanningKey(Props()->rowKeys[static_cast<size_t>(index)])) {
+      if (IsClickableSpanningKey(Props()->rowKeys[static_cast<size_t>(index)])) {
         RestoreControlledSelection();
         return;
       }
@@ -785,7 +793,7 @@ struct TableComponentView final
       if (!Props()) return;
       uint32_t index = 0;
       if (!list_.Items().IndexOf(args.ClickedItem(), index) || index >= Props()->rowKeys.size()) return;
-      if (IsSpanningKey(Props()->rowKeys[index])) return;
+      if (IsClickableSpanningKey(Props()->rowKeys[index])) return;
       if (auto emitter = EventEmitter()) {
         winrt::YoungRouter::Codegen::LiteLLMWinUITableEventEmitter::OnSelectionChange event;
         event.index = static_cast<int32_t>(index);
@@ -851,6 +859,7 @@ struct TableComponentView final
     disabled_row_keys_.clear();
     secondary_cell_keys_.clear();
     spanning_row_keys_.clear();
+    selectable_spanning_row_keys_.clear();
     row_symbols_.clear();
     row_symbol_colors_.clear();
     row_image_names_.clear();
@@ -890,6 +899,19 @@ struct TableComponentView final
     return std::find(spanning_row_keys.begin(), spanning_row_keys.end(), key) != spanning_row_keys.end();
   }
 
+  // A spanning row stays a section header unless the shared view marks it as
+  // an entry of its own (the routes table's public-model rows).  A selectable
+  // one keeps the spanning layout but answers selection like every other row.
+  bool IsSelectableSpanningKey(std::string const& key) const noexcept {
+    if (!Props() || !Props()->selectableSpanningRowKeys) return false;
+    auto const& selectable_row_keys = *Props()->selectableSpanningRowKeys;
+    return std::find(selectable_row_keys.begin(), selectable_row_keys.end(), key) != selectable_row_keys.end();
+  }
+
+  bool IsClickableSpanningKey(std::string const& key) const noexcept {
+    return IsSpanningKey(key) && !IsSelectableSpanningKey(key);
+  }
+
   void RestoreControlledSelection() noexcept {
     if (!Props()) return;
     auto const& props = *Props();
@@ -911,6 +933,7 @@ struct TableComponentView final
     const auto secondary_cell_keys = props.secondaryCellKeys.value_or(std::vector<std::string>{});
     const auto alert_row_keys = props.alertRowKeys.value_or(std::vector<std::string>{});
     const auto spanning_row_keys = props.spanningRowKeys.value_or(std::vector<std::string>{});
+    const auto selectable_spanning_row_keys = props.selectableSpanningRowKeys.value_or(std::vector<std::string>{});
     const auto column_count = props.columnLabels.size();
     const bool source_list = props.sourceList.value_or(false);
     const bool source_list_changed = !has_applied_ || source_list_ != source_list;
@@ -918,7 +941,7 @@ struct TableComponentView final
     const auto row_symbol_colors = props.rowSymbolColors.value_or(std::vector<std::string>{});
     const auto row_image_names = props.rowImageNames.value_or(std::vector<std::string>{});
     const bool columns_changed = !has_applied_ || column_labels_ != props.columnLabels || column_widths_ != props.columnWidths || compact_ != props.compact;
-    const bool rows_changed = !has_applied_ || row_keys_ != props.rowKeys || cells_ != props.cells || alternating_rows_ != props.alternatingRows || disabled_row_keys_ != disabled_row_keys || secondary_cell_keys_ != secondary_cell_keys || alert_row_keys_ != alert_row_keys || spanning_row_keys_ != spanning_row_keys || compact_ != props.compact || source_list_changed || row_symbols_ != row_symbols || row_symbol_colors_ != row_symbol_colors || row_image_names_ != row_image_names;
+    const bool rows_changed = !has_applied_ || row_keys_ != props.rowKeys || cells_ != props.cells || alternating_rows_ != props.alternatingRows || disabled_row_keys_ != disabled_row_keys || secondary_cell_keys_ != secondary_cell_keys || alert_row_keys_ != alert_row_keys || spanning_row_keys_ != spanning_row_keys || selectable_spanning_row_keys_ != selectable_spanning_row_keys || compact_ != props.compact || source_list_changed || row_symbols_ != row_symbols || row_symbol_colors_ != row_symbol_colors || row_image_names_ != row_image_names;
     const bool selection_changed = !has_applied_ || selected_key_ != props.selectedKey;
     const bool was_following_bottom = props.followBottom.value_or(false) && rows_changed
         ? (!has_applied_ || ListIsFollowingBottom(list_))
@@ -1120,6 +1143,7 @@ struct TableComponentView final
     secondary_cell_keys_ = secondary_cell_keys;
     alert_row_keys_ = alert_row_keys;
     spanning_row_keys_ = spanning_row_keys;
+    selectable_spanning_row_keys_ = selectable_spanning_row_keys;
     if (props.followBottom.value_or(false) && rows_changed && was_following_bottom && !props.rowKeys.empty()) {
       list_.ScrollIntoView(list_.Items().GetAt(static_cast<uint32_t>(props.rowKeys.size() - 1)));
     }
@@ -1153,6 +1177,7 @@ struct TableComponentView final
   std::vector<std::string> secondary_cell_keys_;
   std::vector<std::string> alert_row_keys_;
   std::vector<std::string> spanning_row_keys_;
+  std::vector<std::string> selectable_spanning_row_keys_;
 };
 
 struct TextEditorComponentView final
@@ -1416,9 +1441,9 @@ struct CodeWebViewComponentView final
     auto const& props = *Props();
     if (props.html.empty() || props.documentKey.empty() ||
         (props.language != "json" && props.language != "toml" && props.language != "yaml" && props.language != "text") ||
-        props.html.size() > 4 * 1024 * 1024 ||
-        props.value.size() > 2 * 1024 * 1024 ||
-        props.baseline.size() > 2 * 1024 * 1024) {
+        props.html.size() > kMaxEditorMessageBytes ||
+        props.value.size() > kMaxEditorDocumentBytes ||
+        props.baseline.size() > kMaxEditorDocumentBytes) {
       EmitEditorError("editor_document_too_large");
       return;
     }

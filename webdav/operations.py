@@ -4,6 +4,8 @@ import json
 import pathlib
 from typing import Any
 
+from collections.abc import Sequence
+
 from .core import (
     CONFIG_BUNDLE_MAX_BYTES,
     MANIFEST_MAX_BYTES,
@@ -12,12 +14,15 @@ from .core import (
     WebDAVClient,
     WebDAVHTTPError,
     _validate_bundle_header,
+    archived_bundle_name,
     bundle_url,
     collection_url,
     create_bundle,
     install_bundle,
+    manifest_name,
     manifest_url,
     read_config_bundle,
+    remote_sibling_url,
     save_sync_state,
 )
 
@@ -74,6 +79,72 @@ def read_manifest_from_remote_bundle(client: WebDAVClient, settings: Settings) -
         raise SyncError(f"Remote bundle manifest could not be read: {exc}") from exc
     _validate_bundle_header(manifest)
     return manifest
+
+
+def adopt_renamed_remote_bundle(
+    client: WebDAVClient,
+    settings: Settings,
+    legacy_names: Sequence[str],
+) -> dict[str, Any] | None:
+    """Move a bundle left under an earlier default name to this one.
+
+    Renaming the setting alone would leave the previous file behind as a stale
+    copy that still answers to the misleading name.  The bundle and its sidecar
+    manifest are copied together, and nothing is removed before the new file
+    exists.  A WebDAV server may refuse DELETE and MOVE outright (this app's own
+    server answers 403 to both), so the removals are best-effort: the copy is
+    what matters, and the caller states the leftover when the server keeps it.
+    """
+    target_url = bundle_url(settings)
+    if _remote_file_exists(client, target_url):
+        return None
+    for name in legacy_names:
+        if name == settings.remote_name:
+            continue
+        source_url = remote_sibling_url(settings, name)
+        if not _remote_file_exists(client, source_url):
+            continue
+        client.put(target_url, client.get(source_url, max_bytes=CONFIG_BUNDLE_MAX_BYTES), "application/json; charset=utf-8")
+        removals = [source_url]
+        source_manifest_url = remote_sibling_url(settings, manifest_name(name))
+        if _remote_file_exists(client, source_manifest_url):
+            client.put(
+                remote_sibling_url(settings, manifest_name(settings.remote_name)),
+                client.get(source_manifest_url, max_bytes=MANIFEST_MAX_BYTES),
+                "application/json; charset=utf-8",
+            )
+            removals.insert(0, source_manifest_url)
+        removed = True
+        for url in removals:
+            try:
+                client.delete(url)
+            except Exception:
+                removed = False
+        return {"name": name, "removed": removed}
+    return None
+
+
+def _remote_file_exists(client: WebDAVClient, url: str) -> bool:
+    try:
+        client.head(url)
+        return True
+    except WebDAVHTTPError as exc:
+        if exc.code == 404:
+            return False
+        raise
+
+
+def archive_remote_bundle(client: WebDAVClient, settings: Settings) -> str:
+    """Copy a remote bundle this version cannot read to a dated sibling name.
+
+    Smart sync replaces such a file with this Mac's state.  The file is copied
+    aside first, so replacing a bundle written by another app identity or an
+    older archive version never destroys what was there.
+    """
+    data = client.get(bundle_url(settings), max_bytes=CONFIG_BUNDLE_MAX_BYTES)
+    name = archived_bundle_name(settings.remote_name)
+    client.put(remote_sibling_url(settings, name), data, "application/json; charset=utf-8")
+    return name
 
 
 def push_bundle(

@@ -1067,5 +1067,86 @@ class ModelCatalogTests(unittest.TestCase):
             self.assertIsNone(catalog_model_names(path))
 
 
+class PublicModelLimitTests(unittest.TestCase):
+    """A public model's explicitly configured context window overrides metadata."""
+
+    @staticmethod
+    def _registry(root: Path, body: str, *, cache_records: dict | None = None) -> ModelContextRegistry:
+        runtime = root / "config.yaml"
+        runtime.write_text(f"model_list:\n{body}", encoding="utf-8")
+        cache = root / "contexts.json"
+        if cache_records is not None:
+            cache.write_text(json.dumps({"records": cache_records}), encoding="utf-8")
+        return ModelContextRegistry(
+            runtime_config_path=runtime,
+            cache_path=cache,
+            refresh_enabled=False,
+        )
+
+    def test_public_model_context_wins_over_registry_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry = self._registry(
+                root,
+                "  - model_name: gpt-5.6-sol\n"
+                "    litellm_params:\n"
+                "      model: openai/gpt-5.6-sol\n"
+                "    model_info:\n"
+                "      max_input_tokens: 372000\n",
+                cache_records={
+                    "openai/gpt-5.6-sol": {
+                        "context_window": 1_000_000,
+                        "max_context_window": 1_000_000,
+                        "source": MODEL_CONTEXT_SOURCES[0],
+                        "priority": 40,
+                    }
+                },
+            )
+            effective = registry.record_for("gpt-5.6-sol")
+            default = registry.default_record_for("gpt-5.6-sol")
+            catalog = catalog_payload(["gpt-5.6-sol"], registry=registry)["models"][0]
+
+        self.assertEqual(372_000, effective.context_window)
+        self.assertEqual(372_000, effective.max_context_window)
+        # The registry default stays visible for the pane's fallback hint.
+        self.assertEqual(1_000_000, default.context_window)
+        # The managed catalog carries the user's policy, not the registry's.
+        self.assertEqual(372_000, catalog["context_window"])
+        self.assertEqual(372_000, catalog["max_context_window"])
+
+    def test_the_smallest_declared_context_wins_across_a_groups_routes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry = self._registry(
+                root,
+                "  - model_name: gpt-5.6-sol\n"
+                "    litellm_params:\n"
+                "      model: openai/gpt-5.6-sol\n"
+                "    model_info:\n"
+                "      max_input_tokens: 372000\n"
+                "  - model_name: gpt-5.6-sol\n"
+                "    litellm_params:\n"
+                "      model: openai/gpt-5.6-sol\n"
+                "    model_info:\n"
+                "      max_input_tokens: 262144\n",
+            )
+            record = registry.record_for("gpt-5.6-sol")
+
+        self.assertEqual(262_144, record.context_window)
+
+    def test_a_route_without_a_context_keeps_the_resolved_default(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry = self._registry(
+                root,
+                "  - model_name: gpt-5.6-sol\n"
+                "    litellm_params:\n"
+                "      model: openai/gpt-5.6-sol\n",
+            )
+            record = registry.record_for("gpt-5.6-sol")
+
+        self.assertEqual(272_000, record.context_window)
+
+
 if __name__ == "__main__":
     unittest.main()

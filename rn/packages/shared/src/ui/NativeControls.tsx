@@ -223,6 +223,13 @@ type TableProps = {
   secondaryCellKeys?: string[];
   /** Rows whose text renders in the warning (brown) color. */
   alertRowKeys?: string[];
+  /**
+   * Spanning (group) rows that are entries of their own: they keep the
+   * spanning layout but a click selects them like an ordinary row (the
+   * routes table's public-model rows).  Every other spanning row stays a
+   * section header the native table refuses to select.
+   */
+  selectableSpanningRowKeys?: string[];
   onSelectionChange?: (key: string, index: number) => void;
   onRowDoublePress?: (key: string, index: number) => void;
   style?: StyleProp<ViewStyle>;
@@ -384,9 +391,10 @@ export function NativePicker({ labels, selectedValue, disabled, compact = true, 
 }
 
 
-export function NativeTable({ columns, rows, selectedKey = "", striped = true, alternatingRows = false, compact = true, followBottom = false, framed = true, sourceList = false, rowSymbols = [], rowSymbolColors = [], rowImageNames = [], cellHorizontalPadding = 8, firstColumnHorizontalPadding = 8, preserveColumnWidths = false, scrollTrailingColumnOverflow = false, disabledRowKeys = [], secondaryCellKeys = [], onSelectionChange, onRowDoublePress, style, alertRowKeys = [] }: TableProps): React.JSX.Element {
+export function NativeTable({ columns, rows, selectedKey = "", striped = true, alternatingRows = false, compact = true, followBottom = false, framed = true, sourceList = false, rowSymbols = [], rowSymbolColors = [], rowImageNames = [], cellHorizontalPadding = 8, firstColumnHorizontalPadding = 8, preserveColumnWidths = false, scrollTrailingColumnOverflow = false, disabledRowKeys = [], secondaryCellKeys = [], selectableSpanningRowKeys = [], onSelectionChange, onRowDoublePress, style, alertRowKeys = [] }: TableProps): React.JSX.Element {
   const stripedRows = striped && !sourceList && (alternatingRows || rows.length > 0);
   const spanningRowKeys = rows.filter((row) => row.spanning).map((row) => row.key);
+  const selectableSpanningKeys = new Set(selectableSpanningRowKeys.filter((key) => spanningRowKeys.includes(key)));
   const nativeProps = {
     columnLabels: columns.map((column) => column.label),
     columnWidths: columns.map((column) => column.width),
@@ -410,6 +418,7 @@ export function NativeTable({ columns, rows, selectedKey = "", striped = true, a
     secondaryCellKeys,
     alertRowKeys,
     spanningRowKeys,
+    selectableSpanningRowKeys: Array.from(selectableSpanningKeys),
   };
   if (Platform.OS === "windows") {
     return <WinUITable {...nativeProps} onSelectionChange={(event) => onSelectionChange?.(event.nativeEvent.key, event.nativeEvent.index)} onRowDoublePress={(event) => onRowDoublePress?.(event.nativeEvent.key, event.nativeEvent.index)} style={[styles.table, style]} />;
@@ -421,7 +430,10 @@ export function NativeTable({ columns, rows, selectedKey = "", striped = true, a
     const selected = row.key === selectedKey;
     const stripe = stripedRows && !selected && index % 2 === 1 ? styles.tableFallbackStripe : undefined;
     if (row.spanning) {
-      return <View key={row.key} style={[styles.tableFallbackGroupRow, stripe]}><Text numberOfLines={1} style={[styles.selectableTitle, styles.tableFallbackGroupText]}>{row.cells[0] ?? ""}</Text></View>;
+      if (!selectableSpanningKeys.has(row.key)) {
+        return <View key={row.key} style={[styles.tableFallbackGroupRow, stripe]}><Text numberOfLines={1} style={[styles.selectableTitle, styles.tableFallbackGroupText]}>{row.cells[0] ?? ""}</Text></View>;
+      }
+      return <Pressable key={row.key} onPress={() => onSelectionChange?.(row.key, index)} onLongPress={() => onRowDoublePress?.(row.key, index)}><NativeSelectableRow title={row.cells[0] ?? ""} selected={selected} style={[styles.tableFallbackGroupRow, stripe]} /></Pressable>;
     }
     return <Pressable key={row.key} onPress={() => onSelectionChange?.(row.key, index)} onLongPress={() => onRowDoublePress?.(row.key, index)}><NativeSelectableRow title={row.cells[0] ?? ""} detail={row.cells.slice(1).join(" | ")} selected={selected} style={stripe} /></Pressable>;
   })}</View>;

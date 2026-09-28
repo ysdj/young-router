@@ -29,12 +29,14 @@ from .schema import (
     MENU_RELAY_SOURCE_MODEL_KEY,
     MENU_ROUTE_KEY,
     MODEL_ORDER_MODES,
+    PUBLIC_MODEL_CONTEXT_KEY,
     RANDOM_DEPLOYMENT_ID_RE,
     UPSTREAM_PROTOCOL_MODE_KEY,
     UPSTREAM_URL_SURFACE_KEY,
     _as_dict,
     _as_list,
     _bool_value,
+    _positive_int,
     _provider_key_id,
     _provider_auth,
     _provider_source,
@@ -452,6 +454,14 @@ def _entry_from_editor(
         model_info["supports_responses_image_generation_tool"] = supports_responses_image_tool
     model_info[UPSTREAM_URL_SURFACE_KEY] = upstream_url_surface
     model_info[UPSTREAM_PROTOCOL_MODE_KEY] = upstream_protocol_mode
+    # The public model's custom context window is written only when the user
+    # set it: an absent key keeps the metadata its client resolves, and the
+    # Codex catalog falls back to the resolved default.
+    limit = _positive_int(model.get("max_input_tokens"))
+    if limit is None:
+        model_info.pop(PUBLIC_MODEL_CONTEXT_KEY, None)
+    else:
+        model_info[PUBLIC_MODEL_CONTEXT_KEY] = limit
 
     if params:
         entry["litellm_params"] = params
