@@ -2,10 +2,10 @@
 
 Codex and Claude keep their own domains because their settings are also
 structured.  The remaining clients only need direct file editing: the pi
-coding agent, DeepSeek Harness (the ``dsh`` CLI and DSH Desktop), and
-opencode.  This adapter owns exactly those registered files, so Core never
-accepts an arbitrary path from the UI and the pane can show where each file
-lives without a general filesystem capability.
+coding agent, DeepSeek Harness (the ``dsh`` CLI and its Desktop
+application), and opencode.  This adapter owns exactly those registered
+files, so Core never accepts an arbitrary path from the UI and the pane can
+show where each file lives without a general filesystem capability.
 """
 
 from __future__ import annotations
@@ -15,13 +15,13 @@ import hashlib
 import json
 import os
 import stat
-import sys
 from pathlib import Path
 from collections.abc import Mapping
 from typing import Any
 
 from ..model_catalog import CATALOG_FILE_NAME, managed_catalog_path
 from ..persistence import PersistenceError, atomic_write_text, read_bytes
+from ..protocol import MAX_EDITOR_DOCUMENT_BYTES
 from ._shared import DomainError, _action_name, _mapping
 
 # Every document is a fixed, Core-owned path.  ``document`` is the value that
@@ -32,7 +32,11 @@ _DOCUMENT_SPECS: tuple[dict[str, Any], ...] = (
     {"id": "pi_models", "client": "pi", "name": "models.json", "language": "json", "strict_json": True},
     {"id": "pi_auth", "client": "pi", "name": "auth.json", "language": "json", "strict_json": True},
     {"id": "dsh_settings", "client": "dsh", "name": "settings.yaml", "language": "yaml", "strict_json": False},
-    {"id": "dsh_desktop_settings", "client": "dshDesktop", "name": "settings.yaml", "language": "yaml", "strict_json": False},
+    # DeepSeek Harness Desktop owns the reserved ``desktop`` profile under the
+    # shared Harness home, and every setting its own UI writes lands in that
+    # profile's Cordis patch layer — never in a separate application-data
+    # home.  It shares the ``dsh`` group with the CLI's own settings document.
+    {"id": "dsh_desktop_settings", "client": "dsh", "name": "cordis.patch.yml", "language": "yaml", "strict_json": False},
     {"id": "opencode_config", "client": "opencode", "name": "opencode.json", "language": "json", "strict_json": False},
     {"id": "opencode_auth", "client": "opencode", "name": "auth.json", "language": "json", "strict_json": True},
     # Codex keeps more than config.toml and auth.json: the global instruction
@@ -65,27 +69,16 @@ def dsh_home() -> Path:
     return Path(explicit).expanduser() if explicit else _home() / ".dsh"
 
 
-def dsh_desktop_home() -> Path:
-    """Return the DSH Desktop data directory that owns ``harness/``.
+def dsh_desktop_profile_dir() -> Path:
+    """Return the DeepSeek Harness Desktop profile that owns its patch layer.
 
-    DSH Desktop is an Electron application, so its Harness home lives under
-    the per-user application data directory instead of ``~/.dsh``.
+    The official Desktop application is an Electron host over the same Harness
+    home as the ``dsh`` CLI, so it owns the reserved ``desktop`` profile and
+    keeps its settings in that profile's ``cordis.patch.yml`` instead of in a
+    separate application-data directory.
     """
 
-    explicit = os.environ.get("DSH_DESKTOP_HOME", "").strip()
-    if explicit:
-        root = Path(explicit).expanduser()
-    elif sys.platform == "darwin":
-        root = _home() / "Library" / "Application Support"
-    elif os.name == "nt":
-        app_data = os.environ.get("APPDATA", "").strip()
-        root = Path(app_data).expanduser() if app_data else _home() / "AppData" / "Roaming"
-    else:
-        config_home = os.environ.get("XDG_CONFIG_HOME", "").strip()
-        root = Path(config_home).expanduser() if config_home else _home() / ".config"
-    if explicit:
-        return root
-    return root / "dsh-desktop"
+    return dsh_home() / "profiles" / "desktop"
 
 
 def opencode_config_dir() -> Path:
@@ -140,7 +133,7 @@ def _client_paths() -> dict[str, Path]:
     codex_dir = codex_home()
     pi_dir = pi_config_dir()
     dsh_dir = dsh_home()
-    desktop_dir = dsh_desktop_home()
+    desktop_profile = dsh_desktop_profile_dir()
     opencode_config = opencode_config_dir()
     opencode_data = opencode_data_dir()
     # opencode accepts both JSON and JSONC spellings for its global config and
@@ -150,7 +143,7 @@ def _client_paths() -> dict[str, Path]:
         "pi_models": pi_dir / "models.json",
         "pi_auth": pi_dir / "auth.json",
         "dsh_settings": dsh_dir / "settings.yaml",
-        "dsh_desktop_settings": desktop_dir / "harness" / "settings.yaml",
+        "dsh_desktop_settings": desktop_profile / "cordis.patch.yml",
         "opencode_config": _first_existing((opencode_config / "opencode.json", opencode_config / "opencode.jsonc")),
         "opencode_auth": opencode_data / "auth.json",
         "codex_agents": codex_dir / "AGENTS.md",
@@ -281,7 +274,10 @@ class ClientSettingsDomain:
     def stage(self, document: object, text: str) -> None:
         if document not in self.documents:
             raise DomainError("The requested client configuration is unavailable")
-        if not isinstance(text, str) or len(text.encode("utf-8")) > 2 * 1024 * 1024:
+        # The raw editor's own budget applies here too: a registered file this
+        # app generates (the managed Codex catalog) is already past the old
+        # 2 MB ceiling, and staging it must not be refused for its size alone.
+        if not isinstance(text, str) or len(text.encode("utf-8")) > MAX_EDITOR_DOCUMENT_BYTES:
             raise DomainError("The client configuration is invalid")
         self._draft[str(document)] = text
 
@@ -304,7 +300,11 @@ class ClientSettingsDomain:
                 if spec["language"] == "yaml":
                     import yaml
 
-                    yaml.safe_load(text)
+                    # Compose the document instead of constructing it: a
+                    # Cordis patch layer may carry ``!!js`` expressions, which
+                    # a safe load rejects as an unknown tag, while malformed
+                    # YAML still fails here.
+                    yaml.compose(text, Loader=yaml.SafeLoader)
                 elif spec["strict_json"]:
                     json.loads(text)
             except Exception:
@@ -397,7 +397,7 @@ class ClientSettingsDomain:
 __all__ = [
     "ClientSettingsDomain",
     "codex_home",
-    "dsh_desktop_home",
+    "dsh_desktop_profile_dir",
     "dsh_home",
     "opencode_config_dir",
     "opencode_data_dir",

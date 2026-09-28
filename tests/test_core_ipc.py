@@ -97,8 +97,18 @@ class CoreProtocolTests(unittest.TestCase):
         server_started = threading.Event()
 
         class FakeCore:
+            def webdav_scheduler(self) -> "FakeScheduler":
+                return FakeScheduler()
+
             def shutdown(self) -> None:
                 events.append("core.shutdown")
+
+        class FakeScheduler:
+            def start(self) -> None:
+                events.append("scheduler.start")
+
+            def stop(self) -> None:
+                events.append("scheduler.stop")
 
         class FakeServer:
             def __init__(self, _core: object, *, address: str, port: int) -> None:
@@ -126,7 +136,12 @@ class CoreProtocolTests(unittest.TestCase):
         ):
             self.assertEqual(0, core_main.run(["--parent-pid", "4321"]))
 
-        self.assertEqual(["server.start", "core.shutdown", "server.stop"], events)
+        # The interval loop starts with the IPC endpoint and stops before the
+        # store it dispatches into is shut down.
+        self.assertEqual(
+            ["server.start", "scheduler.start", "scheduler.stop", "core.shutdown", "server.stop"],
+            events,
+        )
         self.assertTrue(create_core.call_args.kwargs["reset_transient_routing_state"])
 
     def test_shared_schema_matches_python_and_typescript_method_contract(self) -> None:

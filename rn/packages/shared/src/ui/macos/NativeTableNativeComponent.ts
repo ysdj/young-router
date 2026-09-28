@@ -32,6 +32,7 @@ export interface NativeTableProps extends ViewProps {
   secondaryCellKeys?: ReadonlyArray<string>;
   alertRowKeys?: ReadonlyArray<string>;
   spanningRowKeys?: ReadonlyArray<string>;
+  selectableSpanningRowKeys?: ReadonlyArray<string>;
   onSelectionChange?: DirectEventHandler<SelectionChangeEvent>;
   onRowDoublePress?: DirectEventHandler<RowDoublePressEvent>;
 }

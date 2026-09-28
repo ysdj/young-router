@@ -83,7 +83,7 @@ export type EditorDocument =
  */
 export interface ClientFile {
   id: string;
-  client: "codex" | "claude" | "claudeCode" | "claudeDesktop" | "pi" | "dsh" | "dshDesktop" | "opencode";
+  client: "codex" | "claude" | "claudeCode" | "claudeDesktop" | "pi" | "dsh" | "opencode";
   domain: "codex" | "claude" | "clients";
   document:
     | "config"
@@ -208,7 +208,12 @@ export interface ApplyIssue {
   retryable?: boolean;
 }
 
-export type ProviderAuthKind = "api_key" | "openai_login" | "claude_login";
+export type ProviderAuthKind =
+  | "api_key"
+  | "openai_login"
+  | "claude_login"
+  | "workbuddy_login"
+  | "workbuddy_ai_login";
 
 export type ProviderAuthStatus = "signed_out" | "authorizing" | "signed_in" | "expired" | "error" | "unsupported";
 
@@ -294,6 +299,7 @@ export interface ModelDeepProbePlan {
 export interface ProviderModelSummary {
   id: string;
   display_name: string;
+  model_name?: string;
   public_model?: string;
   upstream_model: string;
   enabled: boolean;
@@ -305,6 +311,8 @@ export interface ProviderModelSummary {
   order_mode?: "manual" | "relay_multiplier";
   manual_order?: number;
   effective_order?: number;
+  /** The user's public-model context window; absent means the client resolves it. */
+  max_input_tokens?: number | null;
   binding_health?: ModelBindingHealth;
   upstream_protocol_mode?: "fallback" | "fixed";
   upstream_url_surface?: ProbeSurfaceName;
@@ -319,8 +327,15 @@ export interface ProviderModelSummary {
   };
 }
 
+export interface PublicModelContext {
+  context_window: number;
+  max_context_window: number;
+}
+
 export interface ProvidersModelsSummary {
   providers: ProviderSummary[];
+  /** Registry defaults per public model, shown when the user sets no limit. */
+  model_contexts?: Record<string, PublicModelContext>;
   revision: number;
 }
 
@@ -603,10 +618,18 @@ export interface NativeLocalization {
   routeProviderWizard: string;
   routeFileEditor: string;
   routeLogs: string;
+  /**
+   * The words a child surface states beside its own footer buttons while a save
+   * it handed over is in flight.  A child reports its own work there — never in
+   * a status bar of its own, and never in the window that opened it.
+   */
+  childSaving: string;
   providerAuthInstruction?: string;
   providerAuthCode?: string;
   providerAuthCopy?: string;
   providerAuthBlocked?: string;
+  /** The read-only code viewer's own record label, read to a screen reader. */
+  logOriginal?: string;
   modelChooserTitle: string;
   modelChooserHeading: string;
   modelChooserProvider: string;
@@ -676,7 +699,6 @@ export type RelayGroupManagerLabels = {
   valueLabel: string;
   /** The copy icon button's tooltip and accessibility name. */
   copyLabel: string;
-  copiedLabel: string;
   failedLabel: string;
   /** The selected key's model list section title (模型列表). */
   modelsLabel: string;
@@ -720,7 +742,13 @@ export interface NativeLeafAdapter {
    * navigable under its provider.  Resolves the chosen group/item pair.
    */
   showGroupedActionMenu?(options: { title: string; groups: Array<{ title: string; items: string[] }>; anchor: NativeMenuAnchor }): Promise<{ group: number; item: number } | undefined>;
-  showConfirmation(options: { title: string; message: string; confirmLabel: string }): Promise<boolean>;
+  /**
+   * One question with one primary answer, drawn by the app's own decision
+   * surface on both hosts.  `destructive` marks an answer that cannot be
+   * undone (删除, 放弃更改), so it draws the way every other destructive answer
+   * in the app draws.
+   */
+  showConfirmation(options: { title: string; message: string; confirmLabel: string; destructive?: boolean }): Promise<boolean>;
   showReadOnlyText(options: { title: string; text: string; closeLabel: string; language: "json" | "toml" | "text"; html: string }): Promise<void>;
   /**
    * Show an official provider login through the platform-owned auth surface.
@@ -756,6 +784,22 @@ export interface NativeLeafAdapter {
      */
     loading?: boolean;
   } & RelayGroupManagerSnapshot): Promise<RelayGroupManagerResult | undefined>;
+  /**
+   * The next 保存并关闭 request from the open 分组管理 sheet, held until the
+   * sheet hands its staged edits over.  The sheet stays open (and locked over
+   * the window that opened it) while the caller writes and applies them, and
+   * states the outcome in its own status strip through
+   * `finishGroupManagerApply`.  Resolves undefined when the sheet ends instead
+   * of saving — a call with no sheet open answers immediately, so a caller
+   * waits for the next request by asking again.
+   */
+  awaitGroupManagerApply?(): Promise<RelayGroupManagerResult | undefined>;
+  /**
+   * Answer an apply request: the sheet shows `status` in its own status strip
+   * and either closes (the save landed) or keeps its rows — and its 保存并关闭 —
+   * for another try.
+   */
+  finishGroupManagerApply?(options: { status: string; close: boolean }): Promise<void>;
   /**
    * Replace the open sheet's content with a later snapshot of the same account
    * and end its loading state, so the sheet never holds the window closed for a

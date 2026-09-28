@@ -46,6 +46,27 @@ class ReactNativeUiParityTests(unittest.TestCase):
     def assert_ui_not_has(self, marker: str) -> None:
         self.assertNotIn(marker, self.ui, marker)
 
+    @staticmethod
+    def jsx_tags(source: str, name: str) -> list[str]:
+        """Every `<Name …>` opening tag, arrow-function `>` included."""
+        tags: list[str] = []
+        start = source.find(f"<{name}")
+        while start != -1:
+            depth = 0
+            index = start + len(name) + 1
+            while index < len(source):
+                character = source[index]
+                if character in "({[":
+                    depth += 1
+                elif character in ")}]":
+                    depth -= 1
+                elif character == ">" and depth == 0:
+                    break
+                index += 1
+            tags.append(source[start:index + 1])
+            start = source.find(f"<{name}", index)
+        return tags
+
     def test_menu_bar_home_is_not_a_dashboard_or_sidebar_shell(self) -> None:
         """The menu-bar host stays hidden; the status icon opens the settings shell."""
         self.assert_ui_has('route === "home" ? <View style={styles.menuBarHost} />')
@@ -61,17 +82,218 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.assertNotIn(removed_shell, self.ui, removed_shell)
 
     def test_pane_status_bar_stays_mounted_and_falls_back_to_ready(self) -> None:
-        # The pane status bar is a permanent strip: a pane window always shows
-        # it, and an idle pane shows the localized Ready label instead of an
-        # empty row that appears and disappears with each action.
-        self.assert_ui_has('{shell ? <View style={styles.routeStatusBar}><Text numberOfLines={2} style={styles.routeStatusText}>{result ?? translate("common.ready")}</Text></View> : null}')
-        self.assertNotIn("{shell && result ? <View style={styles.routeStatusBar}>", self.ui)
+        # A settings pane window keeps one permanent strip: the last result
+        # replaces the idle Ready label, so it never appears or disappears
+        # mid-action.  A child window keeps no strip of its own.
+        self.assert_ui_has('{shell ? <View style={styles.routeStatusBar}><Text numberOfLines={2} style={styles.routeStatusText}>{routeStatus ?? translate("common.ready")}</Text></View> : null}')
+        self.assertNotIn("{shell && routeStatus ? <View style={styles.routeStatusBar}>", self.ui)
         self.assertIn('"common.ready": "Ready"', self.en)
         self.assertIn('"common.ready": "就绪"', self.zh)
         translation_keys = (ROOT / "rn/packages/shared/src/i18n/types.ts").read_text(encoding="utf-8")
         self.assertIn('| "common.ready"', translation_keys)
         # The strip is a tip surface: one type step below body text.
         self.assert_ui_has('routeStatusText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE }')
+
+    def test_child_surfaces_state_their_result_beside_their_own_buttons(self) -> None:
+        # A child window (分组管理, the provider wizard, the raw file editor)
+        # keeps no status bar of its own: it states its result beside its own
+        # footer buttons, and the buttons keep their position.  The window that
+        # opened it states nothing about work it did not start.
+        types = (ROOT / "rn/packages/shared/src/types.ts").read_text(encoding="utf-8")
+        self.assertIn("  childSaving: string;", types)
+        self.assert_ui_has('childSaving: translate("common.saving"),')
+        # The wizard's footer states its own line beside its buttons again.
+        # Exactly one status line, and no step body repeats it.
+        self.assert_ui_has('const wizardStatus = validation || loginFeedback.current || (loginPhase === "sign-in" ? translate("relay.loginWorking") : "");')
+        self.assert_ui_has('{wizardStatus ? <Text accessibilityLiveRegion="polite" numberOfLines={2} style={styles.providerWizardFooterStatus}>{wizardStatus}</Text> : <View style={styles.providerWizardFooterSpacer} />}')
+        self.assert_ui_not_has("providerWizardValidation")
+        self.assert_ui_not_has('<Text style={styles.providerWizardHint}>{loginFeedback.current}')
+        self.assert_ui_not_has("{loginFeedback.current ? <Text")
+        self.assert_ui_not_has("loginFeedback.current ?? translate")
+        # A required field wears its mark at its own label, so the message about
+        # required fields points at something the user can see.
+        self.assertIn("export function NativeFormRow({ label, required = false, children }", (ROOT / "rn/packages/shared/src/ui/RelayAccountManager.tsx").read_text(encoding="utf-8"))
+        self.assertIn('{required ? <Text style={styles.formLabelRequired}>＊</Text> : null}', (ROOT / "rn/packages/shared/src/ui/RelayAccountManager.tsx").read_text(encoding="utf-8"))
+        for marker in (
+            '<NativeFormRow required label={translate("providers.wizard.selectProvider")}>',
+            '<NativeFormRow required label={translate("providers.wizard.baseUrl")}>',
+            '<NativeFormRow required label={translate("providers.wizard.providerName")}>',
+            '<NativeFormRow required label={translate("providers.wizard.selectApiKey")}>',
+            '<NativeFormRow required label={translate("providers.wizard.apiKeyName")}>',
+            '<NativeFormRow required label={translate("providers.wizard.apiKeyValue")}>',
+        ):
+            self.assert_ui_has(marker)
+        # The manual-model pair is one entry, and says so instead of a mark.
+        self.assert_ui_has('setValidation(translate("providers.wizard.manualModelPairRequired"));')
+        self.assertIn('"providers.wizard.manualModelPairRequired": "手动模型需要同时填写模型名与上游模型。"', self.zh)
+        self.assertIn('"providers.wizard.manualModelPairRequired": "A manual model needs both its name and its upstream model."', self.en)
+        # The raw file editor keeps its save result beside 关闭 / 保存并关闭.
+        self.assert_ui_has('const [footerStatus, setFooterStatus] = useState<string>();')
+        self.assert_ui_has('setFooterStatus(translate("common.saving"));')
+        self.assert_ui_has('setFooterStatus(translate("common.saved"));')
+        self.assert_ui_has('setFooterStatus(errorMessage(reason, translate));')
+        self.assert_ui_has('<Text numberOfLines={1} style={assistantFileSurfaceStyles.editorFooterStatus}>{footerStatus ?? ""}</Text>')
+        self.assert_ui_has('editorFooterStatus: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },')
+        # 分组管理 hands its staged edits over and stays up while they are
+        # written and applied: a failed save keeps its rows and its
+        # 保存并关闭 and states 更改未生效 beside those buttons.
+        for marker in (
+            "const answersApplies = Boolean(native.awaitGroupManagerApply && native.finishGroupManagerApply);",
+            "const edits = await ask;",
+            "await applyStagedQuietly();",
+            'await native.finishGroupManagerApply?.({ status, close }).catch(() => undefined);',
+            'status = translate("common.notApplied");',
+            "if (!close) void answerOneApplyRequest();",
+            "setGroupManagerOpen(true);",
+            "setGroupManagerOpen(false);",
+        ):
+            self.assertIn(marker, self.relay)
+        # The pane's own immediate apply stays away while the sheet is up, and
+        # the apply the sheet asked for is quiet: the child states the outcome.
+        gate = (ROOT / "rn/packages/shared/src/ui/providerWizardGate.ts").read_text(encoding="utf-8")
+        self.assertIn("export function setGroupManagerOpen(open: boolean): void {", gate)
+        self.assertIn("export function isGroupManagerOpen(): boolean {", gate)
+        self.assert_ui_has("return isProviderWizardOpen() || isAssistantEditorOpen() || isGroupManagerOpen();")
+        self.assert_ui_has("const applyStagedQuietly = (): Promise<void> => apply({ quiet: true });")
+        # A host whose sheet can only save on close stages those same edits
+        # after it is gone and states that host's outcome in the pane.
+        self.assertIn('onStatus?.(translate("common.saved"));', self.relay)
+        self.assert_ui_has("    quiet = false,\n  ): Promise<void> => {\n    const publishResult = (next: string | undefined): void => {\n      if (quiet) return;")
+        self.assert_ui_has("true, undefined, options?.quiet === true);")
+
+    def test_a_new_model_is_a_draft_and_a_relay_block_is_not_the_edits_fault(self) -> None:
+        """Standards for create-then-configure: a new row is a draft.
+
+        Inline validation must not fire for a record the user has not finished
+        (SAP draft handling; NN/g's error guidelines), and an error must name
+        the thing that actually refused the write.  ＋ therefore creates a
+        disabled draft — never served, never reported as a validation failure —
+        and a relay that is not ready states its own cause instead of blaming
+        the edit.
+        """
+        # ＋ creates a disabled draft row that carries the placeholder name and
+        # inherits the key the user is looking at, so it lands in a real key
+        # group instead of one the app invents.
+        self.assert_ui_has('const inheritedKey = modelProviderKeyState(model, provider) ?? providerKeyStates(provider)[0];')
+        self.assert_ui_has('...(inheritedKey ? { api_key_name: inheritedKey.name, provider_key_id: inheritedKey.id } : {})')
+        self.assert_ui_has('model: {')
+        self.assert_ui_has('enabled: false, order: 0,')
+        self.assert_ui_has('const name = uniquePlaceholderName(models.map((item) => stringValue(item.model_name ?? item.name)), base);')
+        # The list draws a group row only for a key the model actually belongs
+        # to; a keyless draft is listed without an invented 未定义密钥 group.
+        self.assert_ui_has("if (!modelProviderKeyState(item, provider ?? {})) {")
+        self.assert_ui_has("ungrouped.push(item);")
+        self.assert_ui_has("for (const item of ungrouped) {")
+        # The draft states what is left where its own fields are.
+        self.assert_ui_has("function isDraftModel(model: UnknownRecord, translate: Translate): boolean {")
+        self.assert_ui_has('<Text style={styles.fieldHint}>{translate(selectedProviderKey ? "providers.draftModelHint" : "providers.draftModelKeylessHint")}</Text>')
+        self.assertIn('"providers.draftModelKeylessHint": "尚未启用：填写公开模型名、上游模型，并选择密钥，然后勾选“启用”，客户端才会看到它。"', self.zh)
+        self.assertIn('"providers.draftModelHint": "尚未启用：填写公开模型名与上游模型，然后勾选“启用”，客户端才会看到它。"', self.zh)
+        self.assertIn('"providers.draftModelHint": "Not enabled yet: fill in the public name and the upstream model, then check Enable for clients to see it."', self.en)
+        self.assertIn('"providers.draftModelKeylessHint": "Not enabled yet: fill in the public name, the upstream model, and a key, then check Enable for clients to see it."', self.en)
+        # Core names the domain that refused: a relay that is not ready is not
+        # the user's edit failing validation.
+        self.assertIn('provider_model_invalid: "error.validationFailed",', self.ui)
+        self.assertIn('relay_preflight_failed: "error.relayNotReady",', self.ui)
+        self.assertIn('relay_not_ready: "error.relayNotReady",', self.ui)
+        self.assertIn('"error.relayNotReady": "中转站还有待处理的操作，本次更改未生效。请在“供应商与模型”中刷新资源或重新登录后重试。"', self.zh)
+        self.assertIn('"error.relayNotReady": "The relay still has work pending, so the change was not applied. Refresh its resources or sign in again under Providers & Models, then try again."', self.en)
+        # A linked key the relay could resolve but whose binding the station
+        # cannot serve names that cause too, instead of a bare 更改未生效.
+        self.assertIn('relay_binding_failed: "error.relayBindingFailed",', self.ui)
+        self.assertIn('"error.relayBindingFailed": "已链接的中转密钥无法解析该路由（资源、域名或上游模型），本次更改未生效。请刷新资源并核对该路由的上游模型。"', self.zh)
+        self.assertIn('"error.relayBindingFailed": "The linked relay key could not be resolved for this route (its resource, base URL, or upstream model), so the change was not applied. Refresh the relay resources and check this route\'s upstream model."', self.en)
+        self.assertIn('| "error.relayBindingFailed"', (ROOT / "rn/packages/shared/src/i18n/types.ts").read_text(encoding="utf-8"))
+        service = (ROOT / "young_router/core/service.py").read_text(encoding="utf-8")
+        # Only a draft that binds relay material enters the relay transaction.
+        self.assertIn("def _relay_binding_projection(state: object) -> list[tuple[str, ...]]:", service)
+        self.assertIn("if baseline is None or _relay_binding_projection(", service)
+        self.assertIn('raise CoreError("relay_not_ready", "Fix the relay connection or binding issues")', service)
+
+    def test_one_window_states_each_result_once(self) -> None:
+        """A window prints a status once: no message twice on one screen."""
+        relay_manager = (ROOT / "rn/packages/shared/src/ui/RelayAccountManager.tsx").read_text(encoding="utf-8")
+        mac_leaf = MACOS_LEAF.read_text(encoding="utf-8")
+        windows_leaf = WINDOWS_LEAF.read_text(encoding="utf-8")
+
+        # The provider wizard's own line is its footer's, and no step body
+        # repeats it (the validation line and the two feedback hints are gone).
+        self.assert_ui_not_has("providerWizardValidation")
+        self.assert_ui_not_has("{loginFeedback.current ? <Text")
+        self.assert_ui_not_has("loginFeedback.current ?? translate")
+        self.assert_ui_has('{wizardStatus ? <Text accessibilityLiveRegion="polite"')
+        # Its required controls wear the mark the message talks about, and the
+        # manual-model pair — one entry, not two required fields — says so.
+        self.assertIn("{required ? <Text style={styles.formLabelRequired}>＊</Text> : null}", relay_manager)
+        self.assertIn("<NativeFormRow required label={translate(\"providers.wizard.baseUrl\")}>", self.ui)
+        self.assert_ui_has('setValidation(translate("providers.wizard.manualModelPairRequired"));')
+        # 分组管理's copy result takes its one status line beside the buttons
+        # instead of a second line under the detail rows.
+        self.assertNotIn("copyStatusField", mac_leaf)
+        self.assertIn("func showTransientStatus(_ message: String, clearAfter seconds: Double = 4) {", mac_leaf)
+        self.assertNotIn("controls::TextBlock copy_status;", windows_leaf)
+        self.assertIn("controls::TextBlock footer_status;", windows_leaf)
+        # 常规 states the action that landed; the 服务 row already prints the
+        # state, so the strip never repeats that word.
+        self.assert_ui_has('onStatus(translate(serviceRestart ? "service.restarted" : "service.started"));')
+        self.assert_ui_not_has('onStatus(translate("service.running"));')
+
+    def test_a_refused_write_reports_not_applied_in_the_strip_only(self) -> None:
+        # A settings pane never draws a validation card over its content: a
+        # write Core refused, rolled back, or could not finish says so in the
+        # pane's own permanent status strip, in the user's words.
+        self.assert_ui_not_has("function IssueList(")
+        self.assert_ui_not_has("styles.issueBox")
+        self.assert_ui_not_has("styles.issue:")
+        self.assert_ui_not_has("styles.validationText")
+        self.assertNotIn("<WindowTitle title={windowTitle} validation=", self.ui)
+        self.assert_ui_not_has("setIssues(")
+        self.assertIn('publishResult(value.valid ? translate("common.saved") : translate("error.validationFailed"));', self.ui)
+        self.assertIn('publishResult(applyResultMessage(value, translate, typeof message === "string" ? message : null));', self.ui)
+        self.assertIn('if (result.status === "partial") return translate("common.notAppliedPartial");', self.ui)
+        self.assertIn('if (result.status === "failed") return translate("common.notApplied");', self.ui)
+        self.assertIn('apply_failed: "common.notApplied",', self.ui)
+        self.assertIn('"common.notApplied": "Changes not applied"', self.en)
+        self.assertIn('"common.notApplied": "更改未生效"', self.zh)
+        self.assertIn('"common.notAppliedPartial": "Some changes not applied"', self.en)
+        self.assertIn('"common.notAppliedPartial": "部分更改未生效"', self.zh)
+        self.assertIn('"error.validationFailed": "Validation failed; changes not applied."', self.en)
+        self.assertIn('"error.validationFailed": "校验未通过，更改未生效。"', self.zh)
+        translation_keys = (ROOT / "rn/packages/shared/src/i18n/types.ts").read_text(encoding="utf-8")
+        for key in ("common.notApplied", "common.notAppliedPartial"):
+            self.assertIn(f'| "{key}"', translation_keys)
+        # Core's own step names stay internal: a bare snake_case identifier is
+        # not a cause the user can act on, so it never reaches the strip.
+        self.assertIn("const INTERNAL_STEP_NAME = /^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$/;", self.ui)
+        self.assertIn("if (detail && detail.length <= 160 && !INTERNAL_STEP_NAME.test(detail)) return detail;", self.ui)
+        # The vocabulary the card and the relay-sync sentences used is gone.
+        for removed in (
+            "common.validationIssues",
+            "relay.applyIssue",
+            "relay.applyPartial",
+            "relay.applyFailed",
+            "relay.apiKeyGroupStaged",
+            # A copy that worked says nothing anywhere: no confirmation line.
+            "relay.apiKeyCopied",
+            "copiedLabel",
+            "copied_label = read(",
+        ):
+            for source in (self.ui, self.relay, self.en, self.zh, translation_keys):
+                self.assertNotIn(f'"{removed}"', source)
+
+    def test_group_manager_status_stays_out_of_the_pane_status_strip(self) -> None:
+        # 分组管理 is its own surface with its own status bar: its edits are
+        # written and applied by its own 保存并关闭, and the sheet states the
+        # outcome.  The pane never announces a group-shaped status, and the
+        # group vocabulary that used to reach it is gone.
+        self.assertNotIn('onStatus?.(translate("relay.apiKeyGroupStaged"));', self.relay)
+        self.assertNotIn('onStatus?.(translate("relay.operationFailed"));', self.relay)
+        self.assertNotIn('translate("relay.apiKeyGroupStaged")', self.relay)
+        self.assertIn("await refreshAccounts();", self.relay)
+        # The bridge hands the child the apply it asked for, without a word in
+        # the pane's strip.
+        relay_manager = (ROOT / "rn/packages/shared/src/ui/RelayAccountManager.tsx").read_text(encoding="utf-8")
+        self.assertIn("  applyStagedQuietly: () => Promise<void>;", relay_manager)
 
     def test_bootstrap_menu_uses_the_system_language_before_core_snapshot(self) -> None:
         routes = (ROOT / "rn/packages/shared/src/routes.ts").read_text(encoding="utf-8")
@@ -163,7 +385,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn("lastDispatchError", self.ui)
 
     def test_shared_assistant_apply_is_not_blocked_by_the_undefined_default_domain(self) -> None:
-        apply_body = self.ui.split('const apply = (options?: { silent?: boolean; message?: string; keepControlsEnabled?: boolean }): Promise<void> => {', 1)[1].split(
+        apply_body = self.ui.split('const apply = (options?: { silent?: boolean; quiet?: boolean; message?: string; keepControlsEnabled?: boolean }): Promise<void> => {', 1)[1].split(
             "const autoAppliedKey",
             1,
         )[0]
@@ -225,7 +447,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('closeRoute();', close_body)
 
     def test_apply_rebases_one_live_projection_revision_conflict(self) -> None:
-        apply_body = self.ui.split('const apply = (options?: { silent?: boolean; message?: string; keepControlsEnabled?: boolean }): Promise<void> => {', 1)[1].split(
+        apply_body = self.ui.split('const apply = (options?: { silent?: boolean; quiet?: boolean; message?: string; keepControlsEnabled?: boolean }): Promise<void> => {', 1)[1].split(
             'const activateProviderAndRestart',
             1,
         )[0]
@@ -344,10 +566,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
         macos_bridge = (ROOT / "rn/apps/macos/src/native/macos/CoreIPCBridge.swift").read_text(encoding="utf-8")
         windows_bridge = (ROOT / "rn/apps/windows/src/native/windows/CoreIPCBridge.cpp").read_text(encoding="utf-8")
-        self.assertIn("private static func responseTimeoutInterval(for method: String) -> TimeInterval {", macos_bridge)
-        self.assertIn("method == \"probe\" ? 900 : 30", macos_bridge)
-        self.assertIn("timeoutInterval: Self.responseTimeoutInterval(for: metadata.method)", macos_bridge)
-        self.assertIn('const int receive_timeout_ms = method == "probe" ? 900000 : 30000;', windows_bridge)
+        self.assertIn("private static func responseTimeoutInterval(for method: String, request: Data) -> TimeInterval {", macos_bridge)
+        self.assertIn("if method == \"probe\" { return 900 }", macos_bridge)
+        # A WebDAV sync crosses the network like the probe, so it earns the same
+        # wait instead of the 30 s cap that hid a sync Core was still running.
+        self.assertIn('if method == "dispatch", webdavRemoteOperation(in: request) != nil { return 900 }', macos_bridge)
+        self.assertIn("timeoutInterval: Self.responseTimeoutInterval(for: metadata.method, request: data)", macos_bridge)
+        self.assertIn('const int receive_timeout_ms = slow_remote_operation ? 900000 : 30000;', windows_bridge)
+        self.assertIn('const bool slow_remote_operation = method == "probe" || IsWebdavRemoteOperation(request_json);', windows_bridge)
         self.assertIn('Request(endpoint, L"", L"POST", request_json, session, receive_timeout_ms);', windows_bridge)
 
     def test_model_detail_deep_test_names_the_degradation_probe_before_it_runs(self) -> None:
@@ -568,7 +794,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'busy={cooldownClearPending}',
             'busy={pendingAction === "import"}',
             'busy={pendingAction === "export"}',
-            'busy={probeBusy} disabled={busy && !probeBusy}',
+            'busy={pendingAction === "probe"} disabled={webDavBusy("probe")}',
             'busy={pendingAction === "sync"}',
         ):
             self.assert_ui_has(marker)
@@ -613,7 +839,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # with a validation error nobody can act on.
         self.assert_ui_has('const base = translate("providers.newModel");')
         self.assert_ui_has('const name = uniquePlaceholderName(models.map((item) => stringValue(item.model_name ?? item.name)), base);')
-        self.assert_ui_has('model: { name, upstream_model: name, enabled: true, order: 0 }')
+        # ＋ creates a draft: disabled, so an unfinished new row is never an
+        # error and the placeholder never reaches the served model list.
+        self.assert_ui_has('model: { name, upstream_model: name, enabled: false, order: 0, ...(inheritedKey ?')
         self.assert_ui_has('models: selectedModels.map((upstreamModel) => ({ name: upstreamModel, upstream_model: upstreamModel, api_key_name: apiKeyName, enabled: true, order: 0 }))')
         self.assert_ui_has('value={String(displayedOrder)}')
         self.assert_ui_has('label={translate("providers.order")}')
@@ -698,17 +926,20 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn('viewMode === "routes" ? <View style={styles.providerWorkspace}', self.ui)
         self.assertNotIn('routeWorkspaceWithInspector', self.ui)
         self.assert_ui_has('routeTablePane: { flex: 1, minWidth: 0, minHeight: 0 }')
-        self.assert_ui_has('onSelectionChange={selectRoute}')
-        self.assert_ui_has('label: translate("providers.provider"), width: 96 }, { label: translate("providers.providerKey"), width: 130')
-        self.assert_ui_has('label: translate("common.order"), width: 64 }, { label: translate("providers.upstream"), width: 120')
+        self.assert_ui_has('onSelectionChange={(key) => selectRouteTableRow(key)}')
+        self.assert_ui_has('label: translate("providers.upstream"), width: 120 }, { label: translate("providers.provider"), width: 96 }, { label: translate("providers.providerKey"), width: 130')
+        # The routes table leads with the upstream model — the model a route
+        # actually calls — then names its provider, key, and order.
+        self.assert_ui_has('{ label: translate("common.order"), width: 64 }]} rows={routeRows}')
+        self.assert_ui_has(r'cells: [`\t${modelUpstreamDisplay(editorIdentifier(entry.provider), entry.model) || translate("common.notAvailable")}`, providerDisplayName(entry.provider), modelProviderKeyLabel(entry.model, entry.provider, translate, undefined, relaySources), order]')
         self.assertNotIn('providers.orderSource', self.ui)
         self.assertNotIn('providers.effectiveOrder', self.ui)
         self.assert_ui_has('modelOrderMode(activeRoute.model) === "relay_multiplier"')
         self.assertNotIn('const displayRoutes = useMemo', self.ui)
-        self.assert_ui_has('key: `route-public-model:${entry.publicModel}`')
+        self.assert_ui_has('key: routePublicModelRowKey(group.name)')
         self.assert_ui_has('spanning: true')
-        self.assert_ui_has(r'cells: [`\t${providerDisplayName(entry.provider)}`')
-        self.assert_ui_has('rows={routeRows} disabledRowKeys={disabledRouteKeys} selectedKey={selectedRoute ?? ""} compact onSelectionChange={selectRoute}')
+        self.assert_ui_has(r'cells: [`\t${modelUpstreamDisplay(editorIdentifier(entry.provider), entry.model)')
+        self.assert_ui_has('rows={routeRows} disabledRowKeys={disabledRouteKeys} alertRowKeys={alertRouteKeys} selectedKey={selectedPublicModel !== undefined ? routePublicModelRowKey(selectedPublicModel) : (selectedRoute ?? "")} compact selectableSpanningRowKeys={selectableRouteGroupKeys} onSelectionChange={(key) => selectRouteTableRow(key)}')
         self.assert_ui_has('rows={providerRows} disabledRowKeys={disabledProviderKeys} alertRowKeys={alertProviderKeys} selectedKey={providerId} compact firstColumnHorizontalPadding={0} onSelectionChange=')
         self.assert_ui_has('rows={modelRows} disabledRowKeys={disabledModelKeys} alertRowKeys={alertModelKeys} selectedKey={selectedModel ?? ""} compact firstColumnHorizontalPadding={0} onSelectionChange=')
         self.assert_ui_has('columns={nativeTableColumns} rows={nativeTableRows} selectedKey={selectedKey} compact preserveColumnWidths')
@@ -727,6 +958,70 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn('serviceProviderRows', self.ui)
         self.assertNotIn('renderRelayManager', self.ui)
         self.assertNotIn('serviceProviderTab', self.ui)
+
+    def test_routes_view_public_model_rows_open_a_settings_surface(self) -> None:
+        """A public model is one clickable row with its own limits and order list."""
+        self.assert_ui_has('const ROUTE_PUBLIC_MODEL_PREFIX = "route-public-model:";')
+        self.assert_ui_has('function routePublicModelRowKey(publicModel: string): string')
+        self.assert_ui_has('selectableSpanningRowKeys={selectableRouteGroupKeys}')
+        self.assert_ui_has('onSelectionChange={(key) => selectRouteTableRow(key)}')
+        # The click maps the row key back to the public model, not to a route.
+        select_public = self.ui.split("const selectRouteTableRow = useCallback", 1)[1].split("const chooseViewMode", 1)[0]
+        self.assertIn('rowKey.startsWith(ROUTE_PUBLIC_MODEL_PREFIX)', select_public)
+        self.assertIn('rowKey.slice(ROUTE_PUBLIC_MODEL_PREFIX.length)', select_public)
+        self.assertIn('setSelectedPublicModel(publicModel);', select_public)
+        self.assertIn('setSelectedRoute("");', select_public)
+
+        inspector = self.ui.split("function PublicModelInspector(", 1)[1].split("function ModelInspector(", 1)[0]
+        # One surface owns the rename and the context window; the route order
+        # list lives in the routes table, not here.
+        self.assertIn('dispatchSnapshot("public.model_patch", { public_model: group.name, changes: { name: renamed } })', inspector)
+        self.assertIn('dispatch("public.model_patch", { public_model: group.name, changes: { max_input_tokens: next.trim() } })', inspector)
+        self.assertIn('translate("providers.contextWindow")', inspector)
+        self.assertNotIn("routes.reorder_group", inspector)
+        self.assertNotIn("publicModelRouteRow", inspector)
+        self.assertNotIn("styles.publicModelRoutes", inspector)
+        # The context field states the registry fallback in its placeholder,
+        # never as a second line under the field.
+        self.assertIn('placeholder={contextHint}', inspector)
+        self.assertNotIn('hint={contextHint}', inspector)
+        self.assertNotIn("max_output_tokens", inspector)
+        # Arriving from a model detail keeps a breadcrumb back to that model.
+        self.assertIn('backLabel && onBackToModel', inspector)
+        self.assertIn('translate("providers.backToModel", { model: backLabel })', inspector)
+        # The return link sits on the trailing edge of the provider editor's own
+        # header shape, after the title and the route count.
+        self.assertLess(inspector.index('providerEditorHeading}>{group.name}'), inspector.index('providers.backToModel'))
+        self.assertIn('style={styles.providerReturnToModel} /> : null}', inspector)
+
+        # The model detail shows the resolved context window and links to its
+        # public model, and its routes-view breadcrumb walks back through it.
+        model_detail = self.ui.split("function ModelInspector(", 1)[1].split("// The protocol-mode sentence is a tip", 1)[0]
+        self.assertIn('publicModelCustomLimit(providers, publicModelName, "max_input_tokens")', model_detail)
+        self.assertIn('publicModelTokensText(windowContext, translate)', model_detail)
+        self.assertIn('onOpenPublicModel', model_detail)
+        # The breadcrumb's public-model segment is the navigation; the upstream
+        # model is not a segment of its own (the pane's 上游模型 field states it).
+        self.assertIn('<NativeButton title={displayLabel(modelName, translate("providers.unnamedModel"))} link disabled={busy || !publicModelName} onPress={() => onOpenPublicModel?.()} style={styles.breadcrumbProvider} />', model_detail)
+        self.assertNotIn('tooltip={upstreamName} style={styles.inspectorHeading}', model_detail)
+        # The navigation is a real button (设置), never a link-dressed one.
+        self.assertIn('title={translate("providers.publicModelSettings")} compact disabled=', model_detail)
+        self.assertNotIn('title={translate("providers.publicModelSettings")} link', model_detail)
+        self.assertIn('setViewMode("routes"); selectRouteTableRow(routePublicModelRowKey(publicModel));', self.ui)
+        self.assert_ui_has('dispatchSnapshot={dispatchWithOutcome} modelContexts={modelContexts} bindingIssue={bindingIssueFor(')
+        # Both entrances to the public-model pane record their origin, and the
+        # recorded route is what the breadcrumb returns to.
+        self.assertIn('const [publicModelReturn, setPublicModelReturn] = useState<{ routeKey: string; label: string }>();', self.ui)
+        self.assertIn('setPublicModelReturn({ routeKey: activeRoute.key,', self.ui)
+        self.assertIn('setPublicModelReturn({ routeKey: originRouteKey,', self.ui)
+        self.assertIn('selectRoute(publicModelReturn.routeKey);', self.ui)
+        self.assert_ui_has('backLabel={publicModelReturn?.label} onBackToModel={returnToPublicModelOrigin}')
+
+        # The AppKit wrapper forwards the prop: a wrapper that lists its props
+        # by hand is where a new native prop silently disappears otherwise.
+        appkit_controls = (ROOT / "rn/packages/shared/src/ui/AppKitControls.tsx").read_text(encoding="utf-8")
+        table_wrapper = appkit_controls.split("export function AppKitTable(", 1)[1].split("export function AppKitTextEditor(", 1)[0]
+        self.assertIn("selectableSpanningRowKeys", table_wrapper)
 
     def test_provider_empty_state_keeps_the_native_table_frames(self) -> None:
         for marker in (
@@ -758,47 +1053,124 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'const switchDataManagementTab = (next: DataManagementTab): void => {',
             'const previous = tab;',
             'const pending = onFlushPendingFields();',
-            'setTab(next);',
+            # The active tab belongs to the route surface, because it decides
+            # whose result the window's one status strip reports.
+            'onTabChange(next);',
             'void pending.catch((reason: unknown) => {',
             'onTabSwitchError(previous, reason);',
             # The detail column is the one shared rail detail: its header band
-            # names the active tab, so the pane body opens on its content
-            # instead of repeating the tab name as a heading.
+            # names the active tab and carries that pane's commands, so the pane
+            # body opens on its content instead of repeating the tab name as a
+            # heading and no pane draws an action bar of its own.
             '<View style={styles.settingsRailDetail}>',
             '<SettingsDetailHeader title={dataManagementTabRows.find((row) => row.key === tab)?.cells[0] ?? ""} />',
             '{tab === "import" ? <PersistentScrollView style={styles.dataManagementPane} contentContainerStyle={[styles.dataManagementPaneScrollContent, dataManagementPolishStyles.paneScrollContent]}>',
-            '{tab === "export" ? <View style={styles.dataManagementPane}>',
-            '{tab === "webdav" ? <View style={[styles.dataManagementWebDavPane, styles.dataManagementWebDavContent, dataManagementPolishStyles.webDavContent]}>',
+            '{tab === "export" ? <PersistentScrollView style={styles.dataManagementPane} contentContainerStyle={[styles.dataManagementPaneScrollContent, dataManagementPolishStyles.paneScrollContent]}>',
+            '{tab === "webdav" ? <PersistentScrollView style={styles.dataManagementPane} contentContainerStyle={[styles.dataManagementPaneScrollContent, dataManagementPolishStyles.paneScrollContent]}>',
         ):
             self.assert_ui_has(marker)
-        self.assertNotIn('<ScrollView style={styles.dataManagementWebDavPane}', workspace)
+        self.assert_ui_has('const [dataManagementTab, setDataManagementTab] = useState<DataManagementTab>("import");')
+        self.assert_ui_has('tab={dataManagementTab} onTabChange={setDataManagementTab}')
+        self.assertNotIn('const [tab, setTab] = useState<DataManagementTab>(', self.ui)
+        # Every tab of this pane scrolls through the one shared scroll surface.
+        self.assertEqual(3, workspace.count('<PersistentScrollView style={styles.dataManagementPane}'))
         self.assertNotIn("dataManagementPolishStyles.paneHeading", self.ui)
         self.assertNotIn("paneIntro", self.ui)
         self.assertEqual(3, workspace.count('{tab === "'))
 
-    def test_data_management_status_messages_stay_with_their_originating_tab(self) -> None:
+    def test_a_pane_result_stands_beside_the_command_that_produced_it(self) -> None:
+        # A backup & sync result belongs to the pane that produced it, on the
+        # line of the command that produced it: the header band states it, and
+        # it stays keyed per tab, so a message one tab produced never appears
+        # while another tab is showing.  The window's strip keeps the window's
+        # own state.
         workspace = self.ui.split("function DataManagementWorkspace(", 1)[1].split(
             "function RuntimeField(",
             1,
         )[0]
         for marker in (
-            'const runDataManagement = (tab: DataManagementTab, operation: () => Promise<unknown>, message: string | null, keepControlsEnabled = false): Promise<void> => run(operation, message, keepControlsEnabled, true, tab);',
-            'statuses={dataManagementStatuses}',
+            'const runDataManagement = (tab: DataManagementTab, operation: () => Promise<unknown>, message: ResultMessage, keepControlsEnabled = false): Promise<void> => run(operation, message, keepControlsEnabled, true, tab);',
             'onTabSwitchError={(tab, reason) => setDataManagementStatuses((current) => ({ ...current, [tab]: errorMessage(reason, translate) }))}',
-            'statuses.import ? <Text',
-            'statuses.export ? <Text',
-            'status={statuses.webdav}',
             'const [dataManagementStatuses, setDataManagementStatuses] = useState<Partial<Record<DataManagementTab, string>>>({});',
             'const publishResult = (next: string | undefined): void => {',
             'setDataManagementStatuses((current) => ({ ...current, [dataManagementTab]: next }))',
+            'statuses: Partial<Record<DataManagementTab, string>>;',
+            'statuses={dataManagementStatuses}',
+            'const actionRow = (controls: React.ReactNode, result?: string, hint?: string): React.JSX.Element => <View style={SETTINGS_FIELD}>',
+            '<Text numberOfLines={2} style={styles.dataManagementActionStatus}>{result ?? ""}</Text>',
+            'const routeStatus = result;',
+            '{routeStatus ?? translate("common.ready")}',
             'const dispatchDataManagement: Dispatch = (type, payload = {}, targetDomain = "webdav")',
         ):
             self.assert_ui_has(marker)
-        export_pane = workspace.split('{tab === "export"', 1)[1].split(
-            '{tab === "webdav"',
-            1,
-        )[0]
-        self.assertNotIn('{status ? <Text', export_pane)
+        # The command and its result share one field row: the row names the
+        # action, the control column holds the button, and the result stands
+        # immediately beside that button on the same line.
+        self.assertLess(
+            workspace.index('const actionRow = (controls: React.ReactNode, result?: string, hint?: string)'),
+            workspace.index('{controls}'),
+        )
+        self.assertLess(workspace.index('{controls}'), workspace.index('<Text numberOfLines={2} style={styles.dataManagementActionStatus}>{result ?? ""}</Text>'))
+        self.assert_ui_has('dataManagementActionStatus: { flexShrink: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 14 }')
+        # The WebDAV row also states when the last sync landed, so a probe
+        # that succeeds beside a sync that fails says why: the pane names the
+        # cause Core reported (an incompatible remote bundle, a conflict, or a
+        # plain failure) instead of repeating one generic sentence.
+        self.assert_ui_has('const lastSyncAt = stringValue(asRecord(asRecord(state.last_sync)).at);')
+        self.assert_ui_has('translate("dataManagement.lastSync", { time: formatActionTimestamp(lastSyncAt) })')
+        self.assert_ui_has('function formatActionTimestamp(value: string): string {')
+        self.assert_ui_has("</>, status, actionHint)}")
+        self.assert_ui_has('const lastFailed = lastResult.ok === false && ["sync", "push", "pull"].includes(stringValue(lastResult.action));')
+        self.assertIn('"dataManagement.lastSyncFailed": "上次同步失败（{time}），将在下个间隔重试"', self.zh)
+        self.assert_ui_has("{hint === undefined ? null : <View style={SETTINGS_FIELD_HELP_SLOT}><Text style={SETTINGS_FIELD_HELP_TEXT}>{hint}</Text></View>}")
+        for marker in (
+            'webdav_sync_incompatible: "error.webdavSyncIncompatible"',
+            'webdav_sync_conflict: "error.webdavSyncConflict"',
+            'webdav_sync_failed: "error.webdavSyncFailed"',
+        ):
+            self.assert_ui_has(marker)
+        # The words themselves live in the localization tables.
+        for marker in (
+            '"error.webdavSyncIncompatible": "远端文件由旧版本创建，无法直接同步。请改用“推送到远端”覆盖。"',
+            '"error.webdavSyncConflict": "本机有未同步的改动，或两侧都已改动，同步已停止。请先保存或重新加载，或改用“推送到远端”/“从远端拉取”。"',
+            '"error.webdavSyncFailed": "同步失败，请检查网络与 WebDAV 设置。"',
+            '"dataManagement.lastSync": "上次同步 {time}"',
+        ):
+            self.assertIn(marker, self.zh)
+        self.assertIn('"dataManagement.lastSync": "Last sync {time}"', self.en)
+        # A sync that had to set an unreadable remote file aside says so, using
+        # the summary Core returns with the dispatch.
+        self.assert_ui_has('if (stringValue(summary.archived_remote) !== "") return "dataManagement.syncedReplacingRemote";')
+        self.assert_ui_has('if (stringValue(adopted.name) !== "" && adopted.removed !== true) return "dataManagement.syncedLeftoverRemote";')
+        self.assertIn('"dataManagement.syncedLeftoverRemote": "同步完成；远端旧文件无法删除（服务器拒绝），请在 WebDAV 客户端里手动删除"', self.zh)
+        self.assertIn('"dataManagement.syncedReplacingRemote": "同步完成；远端旧文件已另存为 .bak 备份"', self.zh)
+        # The interval field is the automatic sync's cadence, so it says when
+        # the loop runs and what 0 means, and the direction it follows is saved
+        # rather than per-window: the interval loop reads the same setting.
+        self.assert_ui_has('translate("webdav.syncEveryHint")')
+        self.assertIn(
+            '"webdav.syncEveryHint": "分钟；开启同步后按此间隔自动同步，填 0 表示只手动同步。"',
+            self.zh,
+        )
+        self.assert_ui_has('const savedDirection = stringValue(state.sync_direction);')
+        # The pane's settings are what the interval loop reads, so changing one
+        # stages the patch and applies it — the switch has to reach the flag
+        # file, and a draft the route never applies would leave it meaningless.
+        self.assert_ui_has("const commitWebDavSettings = (patch: UnknownRecord): Promise<void> => {")
+        self.assert_ui_has('const staged = await enqueueDispatch("patch", patch, "webdav");')
+        self.assert_ui_has('const applied = await ipc.apply("webdav", revision.current, diskChanged ? ["overwrite_external_webdav"] : undefined);')
+        self.assert_ui_has('onCommitSetting={(patch) => { void onCommitWebDavSettings(patch); }}')
+        self.assert_ui_has('onValueChange={(enabled) => onCommitSetting({ enabled })}')
+        self.assertIn("const DATA_MANAGEMENT_DIRTY_DOMAINS: readonly ConfigDomain[] = DATA_PACKAGE_DOMAINS;", self.ui)
+        self.assert_ui_has('onCommitSetting({ sync_direction: option.id === "sync" ? "smart" : option.id })')
+        self.assert_ui_has("onPress={() => onSync(selectedSync.id)}")
+        self.assertNotIn("const [syncAction, setSyncAction] = useState<WebDavSyncAction>", self.ui)
+        # Every secondary line of a data-management pane is one typography: the
+        # result beside the buttons reads exactly like the tips under them.
+        self.assertNotIn('dataManagementActionStatus: { flexShrink: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE', self.ui)
+        self.assert_ui_has('dataManagementActionStatus: { flexShrink: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 14 }')
+        self.assertNotIn('statuses.import ? <Text', workspace)
+        self.assertNotIn('statuses.export ? <Text', workspace)
 
     def test_import_starts_with_file_selection_while_export_defaults_to_every_section(self) -> None:
         section_block = self.ui.split("const DATA_PACKAGE_SECTIONS", 1)[1].split(
@@ -881,9 +1253,15 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn('importLandingContent', self.ui)
         self.assert_ui_has('importIntro: { minHeight: 0, paddingHorizontal: 12, paddingVertical: 0, gap: 10 }')
         self.assert_ui_has('paneHint: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }')
-        self.assert_ui_has('compactText: { fontSize: UI_FONT_SIZE, lineHeight: 16 }')
-        self.assert_ui_has('dataManagementGroup: { gap: 6 }')
-        self.assert_ui_has('dataManagementSectionPicker: { flexDirection: "row", flexWrap: "wrap"')
+        # The WebDAV tab is a pane of the same grid: its fields spread the one
+        # shared field list instead of a form with its own widths and gaps, and
+        # the per-pane copy override that made its tips a different type step
+        # is gone.
+        self.assert_ui_has('webdavFieldList: { ...SETTINGS_FIELD_LIST }')
+        self.assertNotIn('compactText:', self.ui)
+        self.assertNotIn('webDavFormRows:', self.ui)
+        self.assert_ui_has('dataManagementSectionList: { gap: 4 }')
+        self.assert_ui_has('dataManagementSectionItem: { minHeight: 22 }')
         self.assert_ui_has('const SETTINGS_FIELD_ROW_INDENTED: ViewStyle = { ...SETTINGS_FIELD_ROW, paddingLeft: SETTINGS_FIELD_LEAD };')
         # The runtime row carries the lead as padding like the others; its
         # marker bar is positioned in that lead instead of pushing the label.
@@ -910,57 +1288,95 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn('dataManagementImportEmpty:', self.ui)
         self.assertNotIn('setContentSize?.("data-management", Platform.OS === "windows" ? 740 : 720', self.ui)
 
-    def test_export_action_uses_the_compact_bottom_right_row(self) -> None:
+    def test_export_pane_is_a_section_list_without_an_action_bar(self) -> None:
         workspace = self.ui.split("function DataManagementWorkspace(", 1)[1].split(
             "function RuntimeField(",
             1,
         )[0]
-        export_pane = workspace.split('{tab === "export"', 1)[1].split(
-            '{tab === "webdav"',
+        export_pane = workspace.split('{tab === "export" ? <PersistentScrollView', 1)[1].split(
+            '<WebDavWorkspace',
             1,
-        )[0]
-        self.assertIn('<View style={styles.dataManagementPane}>', export_pane)
-        self.assertIn('<PersistentScrollView style={styles.dataManagementPane} contentContainerStyle={[styles.dataManagementPaneScrollContent, dataManagementPolishStyles.paneScrollContent]}>', export_pane)
-        self.assertIn('<View style={[styles.dataManagementBottomActions, dataManagementPolishStyles.bottomActions]}>', export_pane)
-        self.assertGreater(
-            export_pane.index('<View style={[styles.dataManagementBottomActions, dataManagementPolishStyles.bottomActions]}>'),
-            export_pane.index('</PersistentScrollView>'),
-        )
-        self.assertIn('<View style={styles.dataManagementBottomMessage}>', export_pane)
-        self.assertIn('title={translate("dataManagement.exportSelected")}', export_pane)
+        )[0].rsplit('{tab === "webdav" ?', 1)[0]
+        self.assertIn('{tab === "export" ? <PersistentScrollView style={styles.dataManagementPane} contentContainerStyle={[styles.dataManagementPaneScrollContent, dataManagementPolishStyles.paneScrollContent]}>', workspace)
+        # The pane is one field of the shared grid: the row names the list, the
+        # field carries the list's own line (what is chosen, and the tool that
+        # chooses it all) and then one row per section.  The command that
+        # consumes the choice rides the header band, so nothing sits outside
+        # the scroll surface and the strip stays the only bar at the bottom.
+        for marker in (
+            '<Text style={SETTINGS_FIELD_LABEL}>{translate("dataManagement.sections")}</Text>',
+            '<View style={styles.dataManagementSectionsField}>',
+            '{sectionListHeader(translate("dataManagement.selectedCount", { count: exportSections.length }), selectionTool(exportSections.length, DATA_PACKAGE_DOMAINS.length, () => setExportSections([...DATA_PACKAGE_DOMAINS]), () => setExportSections([])))}',
+            '{sectionList(DATA_PACKAGE_DOMAINS, exportSections, busy, (domain, enabled) => toggleSection(setExportSections, domain, enabled))}',
+            '<View style={SETTINGS_FIELD_HELP_SLOT}><Text numberOfLines={2} style={SETTINGS_FIELD_HELP_TEXT}>{translate("dataManagement.sensitiveHint")}</Text></View>',
+        ):
+            self.assertIn(marker, export_pane)
+        # The tool that picks the whole list sits on the list, not beside the
+        # command that consumes it, and the command itself is not here at all.
         self.assertLess(
-            export_pane.index('styles.dataManagementSensitiveNote, dataManagementPolishStyles.compactText'),
-            export_pane.index('title={translate("dataManagement.exportSelected")}'),
+            export_pane.index('<View style={styles.dataManagementSectionsField}>'),
+            export_pane.index('selectionTool(exportSections.length, DATA_PACKAGE_DOMAINS.length'),
         )
-        self.assertIn('<ActionButton primary title={translate("dataManagement.exportSelected")}', export_pane)
+        self.assertIn('{actionRow(<ActionButton primary title={translate("dataManagement.exportSelected")}', export_pane)
+        self.assertIn('statuses.export)', export_pane)
+        self.assertNotIn('dataManagementBottomActions', self.ui)
+        self.assertNotIn('dataManagementBottomMessage', self.ui)
+        self.assertNotIn('dataManagementSensitiveNote', self.ui)
+        self.assertNotIn('bottomActions:', self.ui)
+        self.assertNotIn('dataManagementStatus:', self.ui)
+        self.assertNotIn('dataManagementGroup:', self.ui)
+        self.assertNotIn('dataManagementSectionPicker:', self.ui)
         for header_tip in (
             'description={translate("dataManagement.importHint")}',
             'description={translate("dataManagement.importRecognizedHint")}',
             'description={translate("dataManagement.exportHint")}',
         ):
             self.assertNotIn(header_tip, workspace)
-        self.assert_ui_has('bottomActions: { minHeight: 58, flexShrink: 0, alignItems: "center", paddingHorizontal: 12, paddingTop: 10, paddingBottom: 14, borderTopWidth: 1, borderTopColor: systemColors.separator }')
-        self.assert_ui_has('dataManagementBottomMessage: { flex: 1, minWidth: 0, gap: 2 }')
+        self.assert_ui_has('dataManagementSectionList: { gap: 4 }')
         self.assert_ui_has('paneScrollContent: { flexGrow: 1, paddingTop: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, paddingBottom: SETTINGS_PANE_INSET, gap: 14 }')
-        self.assert_ui_has('compactText: { fontSize: UI_FONT_SIZE, lineHeight: 16 }')
 
     def test_data_management_uses_native_preference_groups_not_web_cards(self) -> None:
         workspace = self.ui.split("function DataManagementWorkspace(", 1)[1].split(
             "function RuntimeField(",
             1,
         )[0]
+        webdav = self.ui.split("function WebDavWorkspace(", 1)[1].split("function WebDavPasswordField(", 1)[0]
         for marker in (
-            "webdavSyncArea:",
             "dataManagementToolbarButtons:",
-            'const labelAlign = "left";',
-            'dataManagementSyncScope: { ...SETTINGS_FIELD_ROW_INDENTED, minHeight: 24 }',
-            'dataManagementSyncScopeLabel: { ...SETTINGS_FIELD_LABEL }',
-            'dataManagementDirection: { ...SETTINGS_FIELD_ROW_INDENTED }',
-            'dataManagementDirectionLabel: { ...SETTINGS_FIELD_LABEL }',
-            'dataManagementImportFileRow: { width: "100%", minHeight: 28, flexDirection: "row", alignItems: "center", gap: SETTINGS_FIELD_GAP, paddingLeft: SETTINGS_FIELD_LEAD }',
-            'dataManagementImportFileLabel: { ...SETTINGS_FIELD_LABEL }',
+            "dataManagementImportFileRow: { width: \"100%\", minHeight: 28, flexDirection: \"row\", alignItems: \"center\", gap: SETTINGS_FIELD_GAP, paddingLeft: SETTINGS_FIELD_LEAD }",
+            "dataManagementImportFileLabel: { ...SETTINGS_FIELD_LABEL }",
         ):
             self.assert_ui_has(marker)
+        # The WebDAV form is fields of the shared grid, not a card of its own:
+        # every row spreads the one row/label/slot geometry the other panes use.
+        for marker in (
+            '<View style={styles.webdavFieldList}>',
+            '<View style={SETTINGS_FIELD}>',
+            '<View style={SETTINGS_FIELD_ROW_INDENTED}>',
+            'style={SETTINGS_FIELD_SWITCH_SLOT}',
+            '<View style={SETTINGS_FIELD_HELP_SLOT}>',
+            'style={SETTINGS_FIELD_ROW_INDENTED}',
+            'style={SETTINGS_FIELD_LABEL}',
+            'style={SETTINGS_FIELD_HELP_TEXT}',
+        ):
+            self.assertIn(marker, webdav)
+        self.assertNotIn('<DataManagementGroup style={styles.webDavForm}>', self.ui)
+        for legacy_form in (
+            "webdavFormBody:",
+            "webdavFormRows:",
+            "webdavSyncArea:",
+            "webdavActionRow:",
+            "webdavActionStatus:",
+            "webdavStateSpacer:",
+            "webdavStateStatus:",
+            "webdavStateRow:",
+            "dataManagementSyncScope:",
+            "dataManagementSyncScopeLabel:",
+            "dataManagementDirection:",
+            "dataManagementDirectionLabel:",
+            "dataManagementSyncContent:",
+        ):
+            self.assertNotIn(legacy_form, self.ui)
         for legacy_card in (
             "dataManagementOutlinedPanel:",
             "dataManagementCardHeader:",
@@ -971,9 +1387,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.assertNotIn(legacy_card, self.ui)
         self.assertNotIn('dataManagementWarningPanel:', self.ui)
         self.assertNotIn('webDavForm: { flexGrow: 0, borderWidth:', self.ui)
-        self.assertNotIn('webdavStateRow: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6, marginLeft:', self.ui)
         self.assertNotIn('dataManagementSelectionList:', self.ui)
-        self.assertIn('dataManagementSectionPicker: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", columnGap: 14, rowGap: 2', self.ui)
+        self.assertIn('dataManagementSectionItem: { minHeight: 22 }', self.ui)
         self.assertNotIn('dataManagementSectionRow:', self.ui)
         self.assertNotIn('dataManagementSectionGrid:', self.ui)
         self.assertNotIn('dataManagementSectionRowFirstColumn:', self.ui)
@@ -984,14 +1399,19 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn('DataManagementGroup title=', workspace)
         self.assertIn('dataManagementImportFileRow: { width: "100%", minHeight: 28, flexDirection: "row", alignItems: "center", gap: SETTINGS_FIELD_GAP, paddingLeft: SETTINGS_FIELD_LEAD }', self.ui)
         self.assertIn('dataManagementImportFileValue: { flex: 1, minWidth: 0, minHeight: 26, justifyContent: "center", paddingHorizontal: 8, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 4, backgroundColor: systemColors.textBackground }', self.ui)
-        self.assertIn('<NativePicker labels={syncOptions.map(({ title }) => title)} selectedValue={selectedSyncLabel}', workspace)
-        self.assertIn('dataManagementDirectionPicker: { width: SETTINGS_FIELD_ROUTE_WIDTH, height: 24', self.ui)
+        self.assertIn('<NativePicker labels={syncOptions.map(({ title }) => title)} selectedValue={selectedSync.title}', webdav)
+        # A sync direction is a short fixed list, so its picker takes the one
+        # control column the text fields above it take.
+        self.assertIn('dataManagementDirectionPicker: { width: SETTINGS_FIELD_VALUE_WIDTH, height: 24', self.ui)
         self.assertNotIn('<WindowTabs values={syncOptions}', workspace)
         self.assertNotIn('<ActionButton primary title={translate("dataManagement.chooseImportFile")}', workspace)
-        self.assertNotIn('<ActionButton primary title={translate("dataManagement.importSelected")}', workspace)
+        self.assertIn('{actionRow(<ActionButton primary title={translate("dataManagement.importSelected")}', workspace)
+        # One primary action per pane, and it is a field of that pane's grid:
+        # export keeps its own, while the WebDAV pane's two actions live in the
+        # WebDAV field surface it draws.
         self.assertIn('<ActionButton primary title={translate("dataManagement.exportSelected")}', workspace)
-        self.assertNotIn('<ActionButton primary title={translate("dataManagement.testConnection")}', workspace)
-        self.assertNotIn('<ActionButton primary title={translate("dataManagement.syncNow")}', workspace)
+        self.assertIn('title={translate("dataManagement.testConnection")}', webdav)
+        self.assertIn('title={translate("dataManagement.syncNow")}', webdav)
 
     def test_import_stages_sections_and_immediate_apply_writes_them(self) -> None:
         workspace = self.ui.split("function DataManagementWorkspace(", 1)[1].split(
@@ -1008,7 +1428,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'const importSelected = async (): Promise<void> => {',
             1,
         )[1].split(
-            'const syncOptions:',
+            'const selectionTool:',
             1,
         )[0]
         self.assertNotIn('onApplyImported(', import_selected)
@@ -1031,10 +1451,26 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # in-pane Apply button.
         self.assertNotIn('title={translate("status.apply")}', workspace)
         self.assertNotIn('title={translate("common.saveAndApply")}', workspace)
-        webdav = self.ui.split("function WebDavWorkspace(", 1)[1].split("function RuntimeField(", 1)[0]
-        self.assertIn('title={translate("dataManagement.testConnection")}', webdav)
-        self.assertIn('webdavActionRow', webdav)
-        self.assertNotIn('title={translate("common.saveAndApply")}', webdav)
+        # No pane draws a bar under its scroll surface: each pane's command is
+        # its own last field row, so the window's status strip is the only bar
+        # left at the bottom.
+        self.assertEqual(1, workspace.count('const actionRow = (controls: React.ReactNode, result?: string, hint?: string)'))
+        for command in (
+            '{actionRow(<ActionButton primary title={translate("dataManagement.importSelected")}',
+            '{actionRow(<ActionButton primary title={translate("dataManagement.exportSelected")}',
+            '{actionRow(<><ActionButton title={translate("dataManagement.testConnection")}',
+            '<ActionButton primary title={translate("dataManagement.syncNow")}',
+        ):
+            self.assertIn(command, self.ui)
+        # A command stands in the control column of an unlabelled action row:
+        # the label column stays (so the buttons land on the pane's control
+        # column) and stays empty, because each button names its own action.
+        for marker in (
+            '<Text style={SETTINGS_FIELD_LABEL}>{""}</Text>',
+            'dataManagementActionStatus: { flexShrink: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 14 }',
+        ):
+            self.assert_ui_has(marker)
+        self.assertNotIn('translate("dataManagement.actions")', self.ui)
 
     def test_provider_and_runtime_surfaces_have_no_individual_transfer_entry(self) -> None:
         provider_workspace = self.ui.split("function ProviderWorkspace(", 1)[1].split(
@@ -1173,7 +1609,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('setLogTabRequest(tab && LOG_TABS.includes(tab) ? tab : "requests");', bootstrap)
         self.assert_ui_has('useState<typeof LOG_TABS[number]>(() => requestedTab ?? "requests")')
         self.assert_ui_has('return rightTime - leftTime || right.index - left.index;')
-        self.assert_ui_has('compact onSelectionChange=')
+        self.assert_ui_has('compact preserveColumnWidths scrollTrailingColumnOverflow onSelectionChange=')
         self.assertNotIn('compact followBottom onSelectionChange=', self.ui)
         self.assert_ui_has('requestedTabKey={nativeAction?.sequence ?? 0}')
         self.assert_ui_has('const clearTabRef = useRef<typeof LOG_TABS[number] | undefined>(undefined);')
@@ -1304,6 +1740,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.assertIn("rowImageNames?: ReadonlyArray<string>;", spec)
             self.assertIn("secondaryCellKeys?: ReadonlyArray<string>;", spec)
             self.assertIn("spanningRowKeys?: ReadonlyArray<string>;", spec)
+            self.assertIn("selectableSpanningRowKeys?: ReadonlyArray<string>;", spec)
         self.assertIn("striped = true, alternatingRows = false", self.native_controls)
         self.assertIn("const stripedRows = striped && !sourceList && (alternatingRows || rows.length > 0);", self.native_controls)
         self.assertIn("alternatingRows: stripedRows,", self.native_controls)
@@ -1314,6 +1751,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("secondaryCellKeys,", self.native_controls)
         self.assertIn("const spanningRowKeys = rows.filter((row) => row.spanning).map((row) => row.key);", self.native_controls)
         self.assertIn("spanningRowKeys,", self.native_controls)
+        self.assertIn("selectableSpanningRowKeys?: string[];", self.native_controls)
+        self.assertIn("selectableSpanningRowKeys = []", self.native_controls)
+        self.assertIn("selectableSpanningRowKeys: Array.from(selectableSpanningKeys),", self.native_controls)
         # Five data tables, the settings shell's pane source list, and the one
         # subordinate rail every split pane renders from the shared component.
         self.assertEqual(self.ui.count("<NativeTable"), 7)
@@ -1374,7 +1814,28 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("_tableView.floatsGroupRows = NO;", table_native)
         self.assertIn("isGroupRow:(NSInteger)row", table_native)
         self.assertIn("shouldSelectRow:(NSInteger)row", table_native)
+        # A spanning row keeps its section-header look (the name spans the
+        # columns), and a marked one is clickable: AppKit refuses to select
+        # group rows, so the mouse action reports it instead.
+        self.assertIn("return [self isSpanningRow:row];", table_native)
         self.assertIn("return ![self isSpanningRow:row];", table_native)
+        self.assertIn("([self isSpanningRow:row] && ![self isSelectableSpanningRow:row])", table_native)
+        self.assertIn("selectedIndex >= 0 && [self isSelectableSpanningRow:selectedIndex]", table_native)
+        self.assertIn("viewProps.selectableSpanningRowKeys", table_native)
+        # AppKit draws no selection for a group row, so a clickable spanning
+        # row paints its own bar: the row view fills the whole row (the cell
+        # span stops at the scroller gutter), in the appearance the table would
+        # have used itself, and the cell only flips its label ink.
+        self.assertIn("selectedForModel", table_native)
+        self.assertIn("refreshSelectableSpanningSelection", table_native)
+        self.assertIn("LiteLLMSelectableGroupRowView", mac_native)
+        self.assertIn("rowViewForRow:(NSInteger)row", table_native)
+        self.assertIn("drawSelectionInRect:(NSRect)dirtyRect", mac_native)
+        self.assertIn("drawBackgroundInRect:(NSRect)dirtyRect", mac_native)
+        self.assertIn("NSColor *fill = self.isEmphasized", mac_native)
+        self.assertIn("NSColor.unemphasizedSelectedContentBackgroundColor;", mac_native)
+        self.assertIn("- (void)syncCellEmphasis", mac_native)
+        self.assertIn("NSColor.alternateSelectedControlTextColor", mac_native)
         self.assertIn('identifier = @"LiteLLMAppKitTableGroupCell";', table_native)
         self.assertIn("@interface LiteLLMTableGroupCellView : NSView", mac_native)
         self.assertIn("cell = [[LiteLLMTableGroupCellView alloc] initWithFrame:NSZeroRect];", table_native)
@@ -1389,8 +1850,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("label.font = TableCellFont();", table_native)
         self.assertIn("cell.label.font = TableCellFont();", table_native)
         self.assertIn("MAX(\n        LiteLLMTableMinimumHorizontalPadding,\n        static_cast<CGFloat>(viewProps.firstColumnHorizontalPadding))", table_native)
-        self.assertIn("cell.label.textColor = NSColor.labelColor;", table_native)
-        self.assertIn("cell.label.attributedStringValue = TableCellTitle(value, NSColor.labelColor);", table_native)
+        self.assertIn("cell.label.stringValue = value;", table_native)
+        self.assertIn("[cell applyLabelInk];", table_native)
+        self.assertIn("self.label.attributedStringValue = TableCellTitle(self.label.stringValue, ink);", mac_native)
         self.assertIn("label.attributedStringValue = TableCellTitle(value, textColor);", table_native)
         self.assertIn("heightOfRow:(NSInteger)row", table_native)
         self.assertIn("NSMaxY([_tableView rectOfRow:rowCount - 1])", table_native)
@@ -1420,11 +1882,15 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("style={[styles.selectableTitle, styles.tableFallbackGroupText]}", self.native_controls)
         self.assertIn('tableFallbackGroupText: { fontWeight: "400" },', self.native_controls)
         self.assertIn("spanningRowKeys", windows_native)
+        self.assertIn("selectableSpanningRowKeys", windows_native)
+        self.assertIn("bool IsSelectableSpanningKey(std::string const& key) const noexcept", windows_native)
+        self.assertIn("bool IsClickableSpanningKey(std::string const& key) const noexcept", windows_native)
+        self.assertIn("if (IsClickableSpanningKey(Props()->rowKeys[index])) return;", windows_native)
         self.assertIn("sourceList", windows_native)
         self.assertIn("header_frame_.Visibility(source_list ? winrt::Microsoft::UI::Xaml::Visibility::Collapsed", windows_native)
         self.assertIn('L"ms-appx:///Assets/Sidebar/"', windows_native)
         self.assertIn("Grid::SetColumnSpan(label", windows_native)
-        self.assertIn("if (IsSpanningKey(Props()->rowKeys[index])) return;", windows_native)
+        self.assertIn("if (IsClickableSpanningKey(Props()->rowKeys[index])) return;", windows_native)
         self.assertIn("RestoreControlledSelection();", windows_native)
         self.assertIn('rowKey + "\\x1f" + std::to_string(columnIndex)', mac_native)
         self.assertIn("static_cast<size_t>(row) >= viewProps.rowKeys.size()", mac_native)
@@ -1718,7 +2184,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "AssistantSettingsWorkspace": ("externalSettingsWorkspace:", "externalSettingsPane:"),
             "RuntimeWorkspace": ("runtimeWorkspace:", "runtimeScrollSurface:"),
             "DataManagementWorkspace": ("dataManagementWorkspace:", "dataManagementPane:"),
-            "WebDavWorkspace": ("webDavForm:", "webdavFormRows:"),
+            "WebDavWorkspace": ("dataManagementPane:", "webdavFieldList:"),
             "LogsWorkspace": (
                 "logsWindow:",
                 "logsToolbar:",
@@ -1971,8 +2437,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'native.window.close("file-editor");',
             'native.window.open("codex-settings");',
             "await ipc.applyDomains([...domains], refreshed.revision);",
-            'onStatus(translate("common.saving"));',
-            'onStatus(translate("common.saved"));',
+            'setFooterStatus(translate("common.saving"));',
+            'setFooterStatus(translate("common.saved"));',
             'translate("status.close")',
             'translate("status.saveAndClose")',
             "assistantFileSurfaceStyles.editorFooterActions",
@@ -1986,6 +2452,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'translate("settings.discardDraftBody")',
             'translate("common.discard")',
             'type: "cancel"',
+            # Its own save result stays beside the two actions, and the buttons
+            # keep the trailing edge.
+            'setFooterStatus(translate("common.saving"));',
+            "assistantFileSurfaceStyles.editorFooterStatus",
         ):
             self.assertIn(marker, editor)
         self.assertNotIn('translate("common.save")', editor)
@@ -1995,8 +2465,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'editorFooterActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 10 },',
             self.ui,
         )
-        # The footer is the two actions alone: the old hint text is gone and
-        # the actions keep the trailing edge of the row.
+        # The footer is the two actions plus this window's own result line:
+        # the old hint text is gone and the actions keep the trailing edge.
         self.assertNotIn("editorFooterHint", self.ui)
         self.assertIn('justifyContent: "flex-end", gap: 12', self.ui)
         # Copy and Cut work on the current line with no selection, like every
@@ -2244,6 +2714,15 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("if (descriptor.text === stagedTextRef.current)", raw_editor)
         self.assertIn("const resolution = await onConflict(domain, document);", raw_editor)
         self.assertIn("setError(isEditorCapabilityConflict(reason) ? translate(\"error.generic\") : errorMessage(reason, translate));", raw_editor)
+        # A refused read names its own cause too: the old catch answered every
+        # failure with the dead-Core string, so a document past the raw
+        # editor's size budget read as 本地 Core 不可用。
+        self.assertIn("setError(errorMessage(reason, translate));", raw_editor)
+        self.assertNotIn('setError(translate("error.coreUnavailable"));', raw_editor)
+        self.assertIn('core_unavailable: "error.coreUnavailable"', self.ui)
+        self.assertIn('editor_too_large: "error.editorTooLarge"', self.ui)
+        self.assertIn('"error.editorTooLarge": "文件过大，内置编辑器无法打开。"', (ROOT / "rn/packages/shared/src/i18n/zh-Hans.ts").read_text(encoding="utf-8"))
+        self.assertIn('"error.editorTooLarge": "This file is too large for the built-in editor, so it was not opened."', (ROOT / "rn/packages/shared/src/i18n/en.ts").read_text(encoding="utf-8"))
         self.assertNotIn("throw new IpcProtocolError", raw_editor)
         self.assertLess(
             raw_editor.index("if (descriptor.text === stagedTextRef.current)"),
@@ -2534,10 +3013,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'function apiKeyDisplayName(value: unknown, translate: Translate): string {',
             'if (!name) return translate("common.notAvailable");',
             'return name === "default" ? translate("providers.defaultKey") : name;',
-            'const sourceName = choice.source',
-            'join("/")',
+            'const sourceName = relaySourceName(choice.source) || name;',
+            'return source ? [source.accountLabel, source.resourceLabel].filter(Boolean).join("/") : "";',
             'const accountLabel = username ? username.split("@", 1)[0].trim() || username : stringValue(account.label, accountID).trim();',
-            'return `${sourceName || name}${multiplier}`;',
+            'return `${sourceName}${multiplier}`;',
         ):
             self.assert_ui_has(marker)
         self.assertNotIn('keys.length <= 1', self.ui)
@@ -2660,9 +3139,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn('translate("providers.endpointSource")', self.ui)
         self.assertNotIn('translate("providers.addRelayAccountHint")', self.ui)
         editor = self.ui.split("function ProviderEditor(", 1)[1].split("function CodexWorkspace(", 1)[0]
-        self.assertIn('<Text style={styles.panelTitle}>{translate("providers.accounts")}</Text>', editor)
+        # A provider addressed at an official service links that service; every
+        # other provider keeps the relay-station association header.
+        self.assertIn('{translate(providerService(provider) ? "providers.serviceLinks" : "providers.accounts")}', editor)
         self.assertIn("providerAccountsHeader", editor)
         self.assertIn("addRelayAccountToVendor", editor)
+        self.assertIn("{vendorBaseURL && !providerService(provider) ?", editor)
 
     def test_provider_inspector_keeps_the_compact_provider_form_and_return_link(self) -> None:
         """The provider editor uses compact, consistently aligned rows and a source-model return link."""
@@ -2697,12 +3179,95 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('"providers.wizard.duplicateName": "供应商名称已存在，请输入其他名称。"', self.zh)
         self.assertIn('"providers.wizard.duplicateName": "A provider with this name already exists. Enter a different name."', self.en)
 
+    def test_workbuddy_provider_types_borrow_the_desktop_app_sign_in(self) -> None:
+        """WorkBuddy keeps its sign-in and its model catalog in its own app."""
+        for marker in (
+            'type WizardType = "api" | "openai" | "claude" | "workbuddy" | "workbuddyAI";',
+            'const isWorkBuddyType = providerType === "workbuddy" || providerType === "workbuddyAI";',
+            'const workbuddyAuthKind: ServiceProviderKind = providerType === "workbuddyAI" ? "workbuddy_ai_login" : "workbuddy_login";',
+            'dispatchWithOutcome("workbuddy_status", { refresh });',
+            # The wizard creates only the service entry, and 完成 is what
+            # creates it; the account and its models are linked in the
+            # provider's own service-links section.
+            'kind: workbuddyAuthKind,\n        name,\n        models: [],',
+            'translate("providers.wizard.serviceUrlFixed")',
+            'translate("providers.wizard.workbuddyAssociationHint")',
+            'translate("providers.wizard.authPath")',
+            'translate("providers.wizard.pathWebLogin")',
+            'translate("providers.wizard.pathCustomKey")',
+            'const refreshWorkBuddyAccount = async (): Promise<void> => {',
+            'if (account && stringValue(account.state) !== "signed-in") void loadWorkBuddyAccount(true);',
+            # The account re-read is an icon button, like the relay block's +.
+            'symbol="refresh" compact toolTip={translate("providers.wizard.workbuddyRefresh")}',
+            # The account links in the one association block; models keep the
+            # provider's own key slot and the key-driven 获取模型 path.
+            'const refreshWorkBuddyAccount = async (): Promise<void> => {',
+            'const isOfficialAccount = kind === "openai" || kind === "claude";',
+            'const isWorkBuddyAccount = kind === "workbuddy" || kind === "workbuddyAI";',
+            'const service = providerService(provider);',
+            'translate("providers.wizard.providerType")',
+            'translate("providers.wizard.baseUrl")',
+            # The model detail states the service's own rate.
+            'translate("providers.modelRate")',
+            'async function serviceModelRate(',
+            'const SERVICE_RATE_TTL_MS = 5 * 60 * 1000;',
+            # The rate is cached, so switching models never reflows the pane.
+            'function peekServiceRate(service: ServiceID | undefined, modelID: string): string | undefined {',
+            'const [serviceRate, setServiceRate] = useState<string>(() => peekServiceRate(service, upstreamModelID) ?? "");',
+            # A service provider's type is an ordinary editable field: the
+            # pane offers the same picker the wizard does, so WorkBuddy is
+            # wired and retargeted like any other service.
+            'const SERVICE_KIND_OPTIONS: ReadonlyArray<{ kind: ProviderKind; label: TranslationKey }> = [',
+            'dispatch("service_provider.patch", { provider_id: id, provider: { auth_kind: next } })',
+            # Every label column in the pane is the shared one, so a rate row
+            # lines up with the fields beside it.
+            'providerAuthStatusLabel: { width: 88, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE }',
+            'modelStatusLabel: { width: 60 }',
+            'serviceRate.trim() || translate("common.none")',
+            # One association block is labelled by the provider's service, its
+            # right-hand control follows the sign-in state, and an account-backed
+            # provider keeps its key slot and fetch path.
+            '{translate(providerService(provider) ? "providers.serviceLinks" : "providers.accounts")}',
+            '{(!isLogin || isWorkBuddyAccount) && !station ? <View style={styles.providerAccountsHeader}>',
+            'providerKindSelected !== "openai" && providerKindSelected !== "claude"',
+            # An unread account is handed to the desktop app, then confirmed.
+            'const workbuddySignedIn = stringValue(workbuddyAccount?.state) === "signed-in";',
+            'await dispatchWithOutcome("workbuddy_login", { provider: providerKey }, "providers_models", true);',
+            'title: translate("providers.wizard.workbuddyLoginTitle"),',
+            # Reading the account never disables the rest of the pane, and the
+            # pane-wide wait is counted only by the runs that ask for it.
+            'await dispatchWithOutcome("workbuddy_status", { refresh }, "providers_models", true);',
+            'const busyRuns = useRef(0);',
+            'if (!keepControlsEnabled) {\n        busyRuns.current = Math.max(busyRuns.current - 1, 0);\n        if (busyRuns.current === 0) setBusy(false);\n      }',
+        ):
+            self.assert_ui_has(marker)
+        # The wizard's keys step never asks a WorkBuddy user for a secret.
+        wizard = self.ui.split("function ProviderSetupWizard(", 1)[1].split("function ProviderWorkspace(", 1)[0]
+        workbuddy_keys = wizard.split('isWorkBuddyType ? <>', 1)[1].split('</> : <>', 1)[0]
+        self.assertNotIn("NativeSecureTextInput", workbuddy_keys)
+        self.assertNotIn("NativePicker", workbuddy_keys)
+        # Both products and both service labels are named for the user.
+        for text in (self.en, self.zh):
+            self.assertIn('"providers.type.workbuddy": "WorkBuddy"', text)
+            self.assertIn('"providers.type.workbuddyAI": "WorkBuddy AI"', text)
+            self.assertIn('"providers.wizard.workbuddyCredits":', text)
+            self.assertIn('"providers.serviceLinks":', text)
+        self.assertIn('"providers.wizard.workbuddySignInRequired": "Sign in to the WorkBuddy desktop app first."', self.en)
+        self.assertIn('"providers.wizard.workbuddySignInRequired": "请先在 WorkBuddy 桌面 App 中登录。"', self.zh)
+        self.assertIn('"providers.serviceLinks": "服务商关联"', self.zh)
+        self.assertIn('"providers.wizard.pathCustomKey": "自定义 API 密钥"', self.zh)
+
     def test_unified_provider_workspace_lists_every_provider_kind(self) -> None:
         """服务商管理 is integrated: the provider table shows all kinds."""
         types = (ROOT / "rn/packages/shared/src/types.ts").read_text(encoding="utf-8")
 
         self.assertIn(
-            'export type ProviderAuthKind = "api_key" | "openai_login" | "claude_login";',
+            'export type ProviderAuthKind =\n'
+            '  | "api_key"\n'
+            '  | "openai_login"\n'
+            '  | "claude_login"\n'
+            '  | "workbuddy_login"\n'
+            '  | "workbuddy_ai_login";',
             types,
         )
         self.assertIn("auth_status?: ProviderAuthStatus;", types)
@@ -2711,7 +3276,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn('route === "relay-accounts"', self.ui)
         self.assertNotIn('route === "relay-add"', self.ui)
         for marker in (
-            "function providerKind(provider: UnknownRecord): ProviderKind {",
+            "function providerKind(provider: UnknownRecord | undefined): ProviderKind {",
+            "function providerService(provider: UnknownRecord | undefined): ServiceID | undefined {",
+            "function serviceFromURL(value: string): ServiceID | undefined {",
             "function providerAuthKind(provider: UnknownRecord | undefined): ProviderAuthKind {",
             "function providerKindLabel(kind: ProviderKind, translate: Translate): string {",
             "const providers = useMemo(() => {",
@@ -2719,7 +3286,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         ):
             self.assert_ui_has(marker)
         # Deleting routes through the kind-specific core action.
-        self.assert_ui_has('const action = kind === "openai" || kind === "claude"')
+        self.assert_ui_has('const action = kind === "openai" || kind === "claude" || workbuddyProviderIDFor(kind) !== undefined')
         self.assert_ui_has('? "service_provider.delete"')
         self.assert_ui_has(': "provider.delete";')
         # Deleting the last provider of a station also removes the station
@@ -2772,10 +3339,30 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "apiKeyActions: relayApiKeyActions,",
         ):
             self.assert_ui_has(marker)
-        apply_body = self.ui.split("const apply = (options?: { silent?: boolean; message?: string; keepControlsEnabled?: boolean }): Promise<void> => {", 1)[1].split("const autoAppliedKey", 1)[0]
+        apply_body = self.ui.split("const apply = (options?: { silent?: boolean; quiet?: boolean; message?: string; keepControlsEnabled?: boolean }): Promise<void> => {", 1)[1].split("const autoAppliedKey", 1)[0]
         self.assertIn('settingsRoute || route === "providers-models" || route === "data-management" || domain === undefined', apply_body)
         self.assertIn("await dispatchQueue.current;", apply_body)
         self.assertIn('return { draftStaged: next.drafts.relay_accounts?.dirty === true };', self.ui)
+
+    def test_one_relay_read_serves_every_implicit_caller(self) -> None:
+        """One station round trip per account; a sign-in is the only forced read."""
+
+        refresh = self.ui.split("const refreshRelayResources = useCallback(async (", 1)[1].split("const relayApiKeyActions = useMemo", 1)[0]
+        self.assertIn("const RELAY_RESOURCE_REUSE_MS = 15_000;", self.ui)
+        self.assertIn("const relayRefreshInFlight = useRef(new Map<string, Promise<\"ready\" | \"unavailable\">>());", self.ui)
+        self.assertIn("const relayRefreshFresh = useRef(new Map<string, { at: number; status: \"ready\" | \"unavailable\" }>());", self.ui)
+        # An implicit caller joins the read in flight, or reuses the read that
+        # just succeeded; a failed read is never reused.
+        self.assertIn("if (!forced && inFlight) return inFlight;", refresh)
+        self.assertIn("if (fresh && Date.now() - fresh.at < RELAY_RESOURCE_REUSE_MS) return fresh.status;", refresh)
+        self.assertIn('if (status === "ready") relayRefreshFresh.current.set(accountId, { at: Date.now(), status });', refresh)
+        self.assertIn("relayRefreshInFlight.current.delete(accountId);", refresh)
+        # The station round trip after a sign-in is the one read that must not
+        # come out of the reuse window, in the panel and in both host flows.
+        forced = [line for line in self.ui.splitlines() if "refreshResources(pendingID" in line]
+        self.assertEqual(2, len(forced))
+        for line in forced:
+            self.assertIn("{ force: true }", line)
 
     def test_semantic_dispatch_rebases_one_stale_cross_window_revision(self) -> None:
         dispatch = self.ui.split(
@@ -2877,8 +3464,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('const serviceRestart = serviceState === "unhealthy";', general)
         self.assertIn('const serviceActionAvailable = serviceState === "stopped" || serviceRestart;', general)
         self.assertIn('await dispatchServiceAction(serviceRestart ? "service.restart" : "service.start");', general)
-        self.assertIn('onStatus(translate("service.running"));', general)
+        # The strip names the action that landed; the 服务 row already states the
+        # state, so the same word is never printed twice on one screen.
+        self.assertIn('onStatus(translate(serviceRestart ? "service.restarted" : "service.started"));', general)
         self.assertIn("onStatus(errorMessage(reason, translate));", general)
+        for locale in (self.zh, self.en):
+            self.assertIn('"service.started"', locale)
+            self.assertIn('"service.restarted"', locale)
         self.assertIn('title={serviceRestart ? translate("service.restart") : translate("service.start")}', general)
         # The action reports its own progress instead of swapping its title or
         # graying out while the service restarts.
@@ -2917,6 +3509,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'routingState === "unselected"',
             'translate("logs.notRouted")',
             "function logColumns(",
+            "const LOG_TIME_COLUMN_WIDTH = 168",
+            "const time = { label: translate(\"logs.localTime\"), width: LOG_TIME_COLUMN_WIDTH,",
             '<NativeTable columns={nativeTableColumns} rows={nativeTableRows}',
             "translate(\"logs.failed\")",
             "function requestStatusLabel(",
@@ -3141,8 +3735,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "native.restoreRelaySession({",
         ):
             self.assertIn(marker, relay)
-        self.assertIn("const refreshAccountResources = async (target: ResourceRefreshTarget, silent = false)", relay)
-        self.assertIn("await refreshResources(target.id);", relay)
+        self.assertIn("const refreshAccountResources = async (target: ResourceRefreshTarget, options: { silent?: boolean; force?: boolean } = {})", relay)
+        self.assertIn("const status = await refreshResources(target.id, { force });", relay)
+        # A read is forced only where stale facts would be wrong (a sign-in that
+        # just landed); the pane's mount read stays implicit so 分组管理 can join
+        # it instead of paying for the same station round trip twice.
+        self.assertIn("await refreshAccountResources({ id: account.id }, { silent: true, force: true });", relay)
         # Removal stages the dependency policy before the native erase and
         # persists a retry tombstone when the erase fails.
         removal = relay.split("const removeSelected = async (): Promise<void> => {", 1)[1].split("const setStationDraftValue", 1)[0]
@@ -3158,7 +3756,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("attemptedAccounts.current.add(account.id);", relay)
         self.assertNotIn("if (!(await restoreSavedSession(account))) return;", relay)
         self.assertIn("await restoreSavedSession(account);", relay)
-        self.assertIn("await refreshAccountResources(account, true);", relay)
+        self.assertIn("await refreshAccountResources(account, { silent: true });", relay)
         self.assertNotIn("const canAutoLogin =", relay)
         # Station connection details stay editable through staged updates.
         self.assertIn("const stageStationUpdate = async (overrides: StationDraft = {}): Promise<void> => {", relay)
@@ -3195,14 +3793,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # it carries the pre-refactor keys list: every key is shown with its
         # group and the sheet drafts create / re-group / delete edits.
         self.assertIn("const openGroupManager = async (): Promise<void> => {", relay)
-        self.assertIn("const result = await native.showGroupManager({", relay)
+        self.assertIn("const shown = native.showGroupManager({ ...groupManagerRequest(current), loading: Boolean(pending) });", relay)
         self.assertIn("apiKeyActions?.create?.(account.id, { name: create.name, groupID: create.groupID, enabled: true });", relay)
-        self.assertIn("apiKeyActions?.setGroup?.(account.id, update.keyID, update.groupID)", relay)
-        self.assertIn("apiKeyActions?.setEnabled?.(account.id, update.keyID, update.enabled)", relay)
-        self.assertIn("apiKeyActions?.update?.(account.id, update.keyID, update.name)", relay)
+        self.assertIn("apiKeyActions?.setGroup?.(account.id, edit.keyID, edit.groupID)", relay)
+        self.assertIn("apiKeyActions?.setEnabled?.(account.id, edit.keyID, edit.enabled)", relay)
+        self.assertIn("apiKeyActions?.update?.(account.id, edit.keyID, edit.name)", relay)
         self.assertIn('apiKeyActions?.remove?.(account.id, keyID, "detach_disabled");', relay)
         self.assertIn("await apiKeyActions?.setAutoGrouping?.(account.id, false);", relay)
-        self.assertIn('onStatus?.(translate("relay.apiKeyGroupStaged"));', relay)
+        self.assertNotIn('onStatus?.(translate("relay.apiKeyGroupStaged"));', relay)
         types = (ROOT / "rn/packages/shared/src/types.ts").read_text(encoding="utf-8")
         native_bridge = (ROOT / "rn/packages/shared/src/platform/nativeBridge.ts").read_text(encoding="utf-8")
         platform_entry = (ROOT / "rn/packages/shared/src/platformEntry.ts").read_text(encoding="utf-8")
@@ -3250,6 +3848,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("append_column_label(0, labels.name_label);", windows_leaf)
         self.assertIn("append_column_label(1, labels.group_label);", windows_leaf)
         self.assertIn("append_column_label(2, labels.multiplier_label);", windows_leaf)
+        # Neither host draws a status bar inside the sheet.
+        self.assertNotIn("status_strip", windows_leaf)
+        self.assertNotIn("status_row", windows_leaf)
         self.assertIn("list_frame.Child(list_body);", windows_leaf)
         # The footer saves and closes, and its button stays disabled until the
         # draft would change something: no no-op verification round-trip.
@@ -3258,8 +3859,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('"status.saveAndClose": "Save and Close"', self.en)
         self.assertIn("applyButton.isEnabled = false", mac_leaf)
         self.assertIn("private func refreshApplyButton() {", mac_leaf)
-        self.assertIn("guard applied, hasStagedChanges else { return nil }", mac_leaf)
-        self.assertIn("guard hasStagedChanges else { return }", mac_leaf)
+        self.assertIn("guard applied else { return nil }", mac_leaf)
+        self.assertIn("guard hasStagedChanges, !saving else { return }", mac_leaf)
         self.assertIn("apply.IsEnabled(false);", windows_leaf)
         self.assertIn("auto refresh_apply = ", windows_leaf)
         self.assertIn("if (!*applied || !has_staged_changes()) return;", windows_leaf)
@@ -3296,7 +3897,6 @@ class ReactNativeUiParityTests(unittest.TestCase):
         for label in (
             'valueLabel: translate("providers.keyValue")',
             'copyLabel: translate("relay.apiKeyCopy")',
-            'copiedLabel: translate("relay.apiKeyCopied")',
             'failedLabel: translate("relay.operationFailed")',
             'modelsLabel: translate("relay.apiKeyModelList")',
             'emptyLabel: translate("common.none")',
@@ -3318,7 +3918,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("private func copySelectedKey(_ sender: NSButton) {", mac_leaf)
         self.assertIn("CoreIPCBridge.shared.readPlainTextSecret(", mac_leaf)
         self.assertIn('domain: "relay_accounts",', mac_leaf)
-        self.assertIn("private func showCopyStatus(_ message: String) {", mac_leaf)
+        # A copy states its own result on the window's one status line.
+        self.assertIn("func showTransientStatus(_ message: String, clearAfter seconds: Double = 4) {", mac_leaf)
+        self.assertNotIn("copyStatusField", mac_leaf)
+        self.assertNotIn("controls::TextBlock copy_status;", windows_leaf)
+        self.assertIn("controls::TextBlock footer_status;", windows_leaf)
         self.assertIn("copyButton?.isEnabled = canCopy(row)", mac_leaf)
         # 密钥值 is one line that shows the key's head, an ellipsis, and its
         # tail; the field keeps the whole value, so selecting it or pressing the
@@ -3353,19 +3957,30 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # The sheet explains itself through its rows: the staged-changes tip
         # is gone, so the copy result is the detail column's last line.
         self.assertNotIn("hint: translate(\"relay.groupManagerHint\")", relay)
-        self.assertIn("copyStatus.bottomAnchor.constraint(equalTo: toggle.topAnchor, constant: -14),", mac_leaf)
+        self.assertIn("modelsList.bottomAnchor.constraint(lessThanOrEqualTo: toggle.topAnchor, constant: -14),", mac_leaf)
         # Close drops the draft, so a sheet that would lose edits confirms.
         self.assertIn('discardTitle: translate("relay.groupManagerDiscardTitle"),', relay)
         self.assertIn('discardBody: translate("relay.groupManagerDiscardBody"),', relay)
         self.assertIn('discardConfirm: translate("common.discard"),', relay)
         self.assertIn('"relay.groupManagerDiscardTitle": "放弃未保存的更改？"', self.zh)
         self.assertIn('"relay.groupManagerDiscardBody": "关闭分组管理会丢弃尚未保存的密钥更改。"', self.zh)
-        self.assertIn("func confirmDiscardIfNeeded() -> Bool {", mac_leaf)
-        self.assertIn("AppKitNativeLeaf.shared.confirm(", mac_leaf)
-        # The title-bar close button asks the same question the footer Close
-        # does, so the window never drops staged edits silently.
-        self.assertIn("return groupManagerController?.confirmDiscardIfNeeded() ?? true", mac_leaf)
-        self.assertIn("if (has_staged_changes() && !Confirm(labels.discard_title, labels.discard_body, labels.discard_confirm)) return;", windows_leaf)
+        # Close drops the draft, so a sheet that would lose edits asks through the
+        # app's own decision panel — one surface, one destructive answer — and the
+        # answer decides whether the draft goes away.
+        self.assertIn("func askToDiscardStagedChanges(completion: @escaping (Bool) -> Void) {", mac_leaf)
+        self.assertIn("AppKitNativeLeaf.shared.presentDecisionPanel(", mac_leaf)
+        self.assertIn("func closeGroupManager(applied: Bool) {", mac_leaf)
+        # Every dismissal path ends the window through that one call: the footer's
+        # Close, the title-bar close button, and the workspace window going away.
+        # Save and Close hands the draft over instead (the child states the
+        # outcome in its own status bar) and ends the window through the answer
+        # that reports the write landed.
+        self.assertIn("AppKitNativeLeaf.shared.closeGroupManager(applied: false)", mac_leaf)
+        self.assertIn("AppKitNativeLeaf.shared.handGroupManagerApply()", mac_leaf)
+        self.assertIn("controller.markApplied(true)\n        finishGroupManager()", mac_leaf)
+        self.assertIn("closeGroupManager(applied: false)\n            return false", mac_leaf)
+        self.assertNotIn("AppKitNativeLeaf.shared.endChildPanel(panel)", mac_leaf.split("@objc private func closePanel", 1)[1].split("func resultOnEnd()", 1)[0])
+        self.assertIn("if (has_staged_changes() && !Confirm(labels.discard_title, labels.discard_body, labels.discard_confirm, /*destructive=*/true)) return;", windows_leaf)
         self.assertIn('labels.discard_title = read("discardTitle");', windows_module)
         self.assertNotIn("hint.Text(winrt::hstring(labels.hint));", windows_leaf)
         # The sheet opens on the account facts the provider window already
@@ -3382,7 +3997,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('"relay.groupManagerLoading": "正在读取中转站…"', self.zh)
         self.assertIn('"relay.groupManagerLoading": "Reading the station…"', self.en)
         self.assertIn("const pending = update && groupManagerNeedsAlignment(account) ? loadGroupManagerAccount(account) : undefined;", relay)
-        self.assertIn("const result = await native.showGroupManager({ ...groupManagerRequest(current), loading: Boolean(pending) });", relay)
+        self.assertIn("const shown = native.showGroupManager({ ...groupManagerRequest(current), loading: Boolean(pending) });", relay)
         self.assertIn("if (!update) current = await loadGroupManagerAccount(account);", relay)
         # The update carries the sheet's content alone, which is exactly the
         # field set the native side accepts for it.
@@ -3396,8 +4011,36 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("controller.applyData(", mac_leaf)
         self.assertIn("func applyData(accountLabel: String, groups: [GroupOption], rows: [KeyRow], autoGrouping: Bool) {", mac_leaf)
         self.assertIn("private func updateLoadingChrome() {", mac_leaf)
-        self.assertIn("applyButton?.isEnabled = !loading && hasStagedChanges", mac_leaf)
-        self.assertIn("!loading && toggle?.state == .off", mac_leaf)
+        self.assertIn("applyButton?.isEnabled = !loading && !saving && hasStagedChanges", mac_leaf)
+        self.assertIn("!loading && !saving && toggle?.state == .off", mac_leaf)
+        # The sheet states its own result beside its footer buttons: one line
+        # between the switch and the buttons, which keep their trailing edge,
+        # so a message never moves them.
+        self.assertIn("let footerStatus = NSTextField(labelWithString: \"\")", mac_leaf)
+        self.assertIn("footerStatus.leadingAnchor.constraint(equalTo: toggle.trailingAnchor, constant: 12)", mac_leaf)
+        self.assertIn("footerStatus.trailingAnchor.constraint(lessThanOrEqualTo: closeButton.leadingAnchor, constant: -8)", mac_leaf)
+        self.assertIn("footerStatus.centerYAnchor.constraint(equalTo: toggle.centerYAnchor)", mac_leaf)
+        self.assertIn("func setStatus(_ text: String) {", mac_leaf)
+        self.assertIn("func setSaving(_ value: Bool) {", mac_leaf)
+        self.assertIn('AppKitNativeLeaf.shared.localizedText("childSaving", fallback: "Saving…")', mac_leaf)
+        # A copy that worked says nothing; only a failure takes that line.
+        self.assertNotIn('showCopyStatus(copied ? label("copiedLabel")', mac_leaf)
+        self.assertIn('if (!copied) { showTransientStatus(label("failedLabel")) }', mac_leaf)
+        # The apply-answer pair is exported for the shared UI on both hosts.
+        self.assertIn("@objc(awaitGroupManagerApply:rejecter:)", mac_module)
+        self.assertIn("@objc(finishGroupManagerApply:resolver:rejecter:)", mac_module)
+        self.assertIn("RCT_EXTERN_METHOD(awaitGroupManagerApply:(RCTPromiseResolveBlock)resolve", mac_bridge)
+        self.assertIn("RCT_EXTERN_METHOD(finishGroupManagerApply:(NSDictionary *)options resolver:(RCTPromiseResolveBlock)resolve", mac_bridge)
+        self.assertIn("func handGroupManagerApply() {", mac_leaf)
+        self.assertIn("func awaitGroupManagerApply(completion: @escaping (NativeGroupManagerResult?) -> Void) {", mac_leaf)
+        self.assertIn("func finishGroupManagerApply(status: String, close: Bool) {", mac_leaf)
+        self.assertIn("func stagedResult() -> NativeGroupManagerResult? {", mac_leaf)
+        self.assertIn("awaitGroupManagerApply?(): Promise<RelayGroupManagerResult | undefined>;", types)
+        self.assertIn("finishGroupManagerApply?(options: { status: string; close: boolean }): Promise<void>;", types)
+        self.assertIn("awaitGroupManagerApply?(): Promise<RelayGroupManagerResult | undefined>;", native_bridge)
+        self.assertIn("finishGroupManagerApply?(options: { status: string; close: boolean }): Promise<void>;", native_bridge)
+        self.assertIn("awaitGroupManagerApply?: () => Promise<RelayGroupManagerResult | undefined>;", platform_entry)
+        self.assertIn("finishGroupManagerApply?: (options: { status: string; close: boolean }) => Promise<void>;", platform_entry)
         # The list header carries the load: the wheel turns beside 密钥 on the
         # key list the station answer is about to replace, and the words for
         # that wait ride the wheel as its tooltip.  It is the button's own wheel
@@ -3437,7 +4080,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("value_text.Text(winrt::hstring(EllipsizeMiddle(*revealed_value)));", windows_leaf)
         self.assertNotIn("value_text.IsTextSelectionEnabled(true);", windows_leaf)
         self.assertIn("content.widthAnchor.constraint(equalToConstant: contentWidth),", mac_leaf)
-        self.assertIn("let contentWidth = 20 + listWidth + 18 + detailWidth + 20", mac_leaf)
+        # The sheet keeps the one panel inset every child window keeps, so its
+        # heading, its columns, and its footer start at the same edge as the
+        # model chooser's and the file editor's.
+        self.assertIn("let contentWidth = nativePanelInset + listWidth + 18 + detailWidth + nativePanelInset", mac_leaf)
         self.assertIn("modelNames: (entry[\"models\"] ?? \"\").split(separator: \"\\n\").map(String.init),", mac_leaf)
         self.assertIn('"models": models.prefix(256).joined(separator: "\\n"),', mac_module)
         self.assertIn("auto reveal_value = ", windows_leaf)
@@ -3473,18 +4119,31 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("copy_button.Content(copy_glyph);", windows_leaf)
         self.assertIn("copy_button.Click(", windows_leaf)
         self.assertIn('CoreIPCBridge::Shared().ReadPlainTextSecret("relay_accounts", "api_key"', windows_leaf)
-        self.assertIn("auto show_copy_status = [copy_status, status_timer]", windows_leaf)
+        # The transient copy result takes the sheet's own status line in the
+        # footer, beside its buttons.
+        self.assertIn("auto show_copy_status = [footer_status, status_timer]", windows_leaf)
+        self.assertIn("controls::Grid::SetColumn(footer_status, 1);", windows_leaf)
         # 自动分组 owns one key per group: the sheet refreshes the station facts
         # and stages Core's alignment first, then lists only the keys still in a
         # group, so a checked switch never shows an ungrouped row or item.  That
         # load lands in the sheet that is already open, never in front of it.
         self.assertIn("await alignAutoGroupingAction(current.id);", relay)
+        # 自动分组's layout is built over the groups Core holds, so the sheet
+        # reads the station only when there is no usable key list to align yet:
+        # opening it right after the pane's own read never waits for a station
+        # round trip it does not need.
+        self.assertIn("const groupManagerHasUsableFacts = (current: RelayAccount): boolean =>", relay)
+        self.assertIn('current.resourceStatus === "ready" && current.resources.length > 0;', relay)
+        self.assertIn('if (!groupManagerHasUsableFacts(current) && await refreshResources(current.id) !== "ready") return current;', relay)
         self.assertIn("pendingDelete: entry.pending_delete === true,", relay)
         self.assertIn("current.resources.filter((resource) => !resource.pendingDelete && resourceGroup(resource, current.groups) !== undefined)", relay)
         self.assertIn('if (current.type === "newapi" && !current.autoGrouping) {', relay)
         # The relay refresh reports its status through the dispatch action
-        # summary; the top-level result carries the revision alone.
-        self.assertIn('return asRecord(staged.action_summary).resource_status === "ready" ? "ready" : "unavailable";', (ROOT / "rn/packages/shared/src/ui/YoungRouterApp.tsx").read_text(encoding="utf-8"))
+        # summary; the top-level result carries the revision alone.  Only a
+        # successful read is remembered for the reuse window, so the next
+        # implicit caller never inherits a failure.
+        self.assertIn('const status = asRecord(staged.action_summary).resource_status === "ready" ? "ready" : "unavailable";', (ROOT / "rn/packages/shared/src/ui/YoungRouterApp.tsx").read_text(encoding="utf-8"))
+        self.assertIn('if (status === "ready") relayRefreshFresh.current.set(accountId, { at: Date.now(), status });', (ROOT / "rn/packages/shared/src/ui/YoungRouterApp.tsx").read_text(encoding="utf-8"))
         # The frame fits all three columns inside the pane, and both hosts floor
         # the trailing 未分组 text instead of clipping the multiplier column.
         # The sheet opens in the middle of the display like every other child
@@ -3589,7 +4248,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("await relay.commit(\"station.update\", { id: station.id, name, origin, type });", self.ui)
         self.assertIn("onStageStationUpdate=", self.ui)
         self.assertIn('translate("relay.stationUpdateStaged")', relay)
-        apply_body = self.ui.split("const apply = (options?: { silent?: boolean; message?: string; keepControlsEnabled?: boolean }): Promise<void> => {", 1)[1].split("const autoAppliedKey", 1)[0]
+        apply_body = self.ui.split("const apply = (options?: { silent?: boolean; quiet?: boolean; message?: string; keepControlsEnabled?: boolean }): Promise<void> => {", 1)[1].split("const autoAppliedKey", 1)[0]
         self.assertIn("await dispatchQueue.current;", apply_body)
         # Relay/provider drafts are committed by the shell's immediate apply;
         # the removed footer no longer renders a route-level Apply button.
@@ -3637,6 +4296,69 @@ class ReactNativeUiParityTests(unittest.TestCase):
         ):
             self.assertIn(marker, relay)
 
+    def test_a_relay_key_is_named_by_its_account_and_group_everywhere(self) -> None:
+        """One name for one relay key: 账号/分组, never the group alone.
+
+        The provider's own slot name is only the group name, so a surface
+        without the account beside it (the model list's group rows, the routes
+        table's key column, the wizard's provided-key list) read as a truncated
+        key.  Every one of them composes the same `account/GroupName`
+        label the key picker and the relay key table already use.
+        """
+
+        self.assertIn('return source ? [source.accountLabel, source.resourceLabel].filter(Boolean).join("/") : "";', self.ui)
+        self.assertIn('return relaySourceName(relaySourceForKey(key, relaySources)) || name;', self.ui)
+        self.assertIn('const keyName = modelProviderKeyLabel(item, provider ?? {}, translate, undefined, relaySources);', self.ui)
+        self.assertIn('providerDisplayName(entry.provider), modelProviderKeyLabel(entry.model, entry.provider, translate, undefined, relaySources), order],', self.ui)
+        self.assertIn('const sourceName = relaySourceName(choice.source) || name;', self.ui)
+        self.assertIn('label={relaySourceName(source) || source.resourceLabel}', self.ui)
+        self.assertIn('label: remoteDelete.label', self.ui)
+        # The relay key table already composes the same label from the account.
+        self.assertIn('label: `${accountKeyPrefix(account, translate)}/${resourceGroupName(resource, account.groups, translate)}`', self.relay)
+
+    def test_a_refused_relay_binding_marks_the_row_it_belongs_to(self) -> None:
+        """A binding failure names its row: the strip keeps the outcome, rows get marked.
+
+        Core publishes the materialization's secret-free issues as
+        `binding_issues` (code + provider key + route), and the pane marks those
+        rows and states the reason where the key is edited, in the same
+        account/group form.  The routes table carries the marker too, because a
+        route is what the user is looking at when the write is refused.
+        """
+
+        providers = (ROOT / "young_router/core/domains/providers_models.py").read_text(encoding="utf-8")
+        self.assertIn("    def record_binding_issues(self, issues: object) -> None:", providers)
+        self.assertIn('"binding_issues": [dict(item) for item in self._binding_issues],', providers)
+        self.assertIn('row = {"code": code, "provider_key_id": target_key, "model_id": target}', providers)
+        service = (ROOT / "young_router/core/service.py").read_text(encoding="utf-8")
+        self.assertIn('recorder(materialized.get("issues") if isinstance(materialized, Mapping) else ())', service)
+        self.assertIn("const bindingIssues = asRecords(state.binding_issues);", self.ui)
+        self.assertIn("const bindingIssueFor = useCallback((model: UnknownRecord): UnknownRecord | undefined => {", self.ui)
+        self.assertIn("() => models.filter((item) => modelNeedsAttention(item) || Boolean(bindingIssueFor(item))).map(editorIdentifier),", self.ui)
+        self.assertIn("alertRowKeys={alertRouteKeys}", self.ui)
+        self.assertIn('<Text style={styles.fieldHint}>{bindingIssueText}</Text>', self.ui)
+        # A relay key is a row in the provider's key table too, and the reason
+        # stands beside the key it belongs to.
+        self.assertIn("const bindingIssueForProvidedRow = useCallback((row: ProvidedKeyRow): UnknownRecord | undefined => {", self.ui)
+        self.assertIn("alertRowKeys={providedRows.filter((row) => Boolean(bindingIssueForProvidedRow(row))).map((row) => `provided:${row.key}`)}", self.ui)
+        self.assertIn("<Text style={styles.fieldHint}>{relayBindingIssueText(selectedProvidedIssue, selectedProvided.label, translate)}</Text>", self.ui)
+        self.assertIn("if (bindingIssues.some((issue) => stringValue(issue.provider) === editorIdentifier(item))) return true;", self.ui)
+        self.assertIn('account_unavailable: "providers.bindingIssueAccount",', self.ui)
+        self.assertIn('resource_missing: "providers.bindingIssueResource",', self.ui)
+        self.assertIn('catalog_model_missing: "providers.bindingIssueCatalog",', self.ui)
+        types = (ROOT / "rn/packages/shared/src/i18n/types.ts").read_text(encoding="utf-8")
+        for key in (
+            "providers.bindingIssueAccount",
+            "providers.bindingIssueResource",
+            "providers.bindingIssueCredential",
+            "providers.bindingIssueCatalog",
+            "providers.bindingIssueBaseUrl",
+            "providers.bindingIssueGeneric",
+        ):
+            self.assertIn(f'| "{key}"', types)
+            self.assertIn(f'"{key}":', self.zh)
+            self.assertIn(f'"{key}":', self.en)
+
     def test_relay_dialogs_avoid_the_unregistered_macos_fabric_modal_host(self) -> None:
         relay = RELAY_MANAGER.read_text(encoding="utf-8")
 
@@ -3650,6 +4372,31 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'relayDialogLayer: { position: "absolute", top: 0, right: 0, bottom: 0, left: 0, zIndex: 100 }',
             relay,
         )
+
+    def test_confirmations_state_their_destructive_answer_instead_of_inferring_it(self) -> None:
+        """One confirmation semantic: the caller says the answer cannot be undone."""
+        relay = self.relay
+        ui = self.ui
+
+        # A React confirmation draws its destructive answer because the caller
+        # states it, never because a translated label happened to read 删除.
+        self.assertNotIn('destructive={confirmLabel === translate("common.delete")}', relay)
+        self.assertIn("  destructive?: boolean;", relay)
+        self.assertIn("destructive={destructive} busy={busy}", relay)
+        self.assertIn("destructive={remoteDeletePolicy !== \"detach_only\"}", ui)
+        # The dialog layer is one component per surface, and 移除本地账号 mounts its
+        # question once: two identical dialogs stacked a second scrim, a second
+        # modal layer, and a second confirm button over one decision.
+        self.assertEqual(2, relay.count("<RelayDialogLayer visible={visible} onRequestClose={onClose}>"))
+        self.assertEqual(1, relay.count('<DependencyPolicyDialog\n      visible={Boolean(removal)}'))
+        self.assertIn('      confirmLabel={translate("relay.removeLocal")}\n      destructive\n', relay)
+        # Every confirmation that deletes or discards says so: the provider,
+        # model, and API key deletes, the route close that drops staged changes,
+        # and the raw file editor's discarded draft.
+        self.assertEqual(2, ui.count('confirmLabel: translate("common.delete"), destructive: true }).then('))
+        self.assertIn('      confirmLabel: translate("common.delete"),\n      destructive: true,\n', ui)
+        self.assertIn('        confirmLabel: translate("status.close"),\n        destructive: true,\n', ui)
+        self.assertIn('          confirmLabel: translate("common.discard"),\n          destructive: true,\n', ui)
 
     def test_relay_keys_are_discovered_by_base_url_without_manual_import_or_linking(self) -> None:
         relay = RELAY_MANAGER.read_text(encoding="utf-8")
@@ -3678,7 +4425,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '{canFollowMultiplier ? <NativeCheckbox',
             'result.status === "partial"',
             'result.status === "failed"',
-            'setIssues(applyIssuesForDisplay(value));',
+            'publishResult(applyResultMessage(value, translate, typeof message === "string" ? message : null));',
             '// Core restarts the managed proxy for providers_models and runtime',
         ):
             self.assertIn(marker, self.ui)
@@ -3773,10 +4520,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # like a value the user could edit.
         self.assertNotIn('translate("providers.keyListHint")', self.ui)
         self.assertNotIn('translate("providers.providedKeysNeedAccount")', self.ui)
-        self.assertIn('} style={styles.panelActionButton} />)}\n      </> : null}\n    </View>;', self.ui)
+        self.assertIn('} style={styles.panelActionButton} />)}\n        {selectedProvidedIssue ? <Text style={styles.fieldHint}>{relayBindingIssueText(selectedProvidedIssue, selectedProvided.label, translate)}</Text> : null}\n      </> : null}\n    </View>;', self.ui)
         # The relay account section's + shares the key panel's right edge.
         self.assertIn(
-            '<View style={styles.panelHeader}>\n        <Text style={styles.panelTitle}>{translate("providers.accounts")}</Text>\n        <View style={styles.panelActions}>',
+            '<View style={styles.panelHeader}>\n        {/* The one association block: a station-backed provider links a relay\n            station, a provider addressed at an official service links that\n            service\'s own account.  The label follows the provider. */}\n        <Text style={styles.panelTitle}>{translate(providerService(provider) ? "providers.serviceLinks" : "providers.accounts")}</Text>\n        <View style={styles.panelActions}>',
             self.ui,
         )
         self.assertNotIn('<View style={styles.providerKeyActions}>\n          <NativeButton title="" symbol="plus"', self.ui)
@@ -3797,7 +4544,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         """Nested Codex controls, disk choices, and toolbar actions reflow instead of clipping."""
         for marker in (
             'officialActionsRow: { minHeight: 28, flexDirection: "row", flexWrap: "wrap"',
-            'dataManagementSectionPicker: { flexDirection: "row", flexWrap: "wrap"',
+            'dataManagementSectionItem: { minHeight: 22 }',
             'const promptedDiskGeneration = useRef<Partial<Record<EditableDiskDomain, number>>>({});',
             'void native.showConfirmation({',
             'message: translate("settings.diskChangedBody"),',
@@ -3854,6 +4601,52 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("const goBack = (): void => {", wizard)
         self.assertIn("cancelRelaySignIn();", wizard)
         self.assertNotIn("<ScrollView", wizard.split('loginPhase === "sign-in" ? <', 1)[0])
+
+    def test_the_wizard_creates_nothing_before_it_finishes(self) -> None:
+        """添加向导 stages every step; 完成 is the one act that creates.
+
+        The provider (with its key and its models) may not appear because the
+        user pressed 下一步, and a wizard that is closed without finishing
+        reserves nothing — the key it staged is dropped with its token.
+        """
+
+        wizard = self.ui.split("function ProviderSetupWizard(", 1)[1].split("function ProviderWorkspace(", 1)[0]
+        core = (ROOT / "young_router/core/domains/providers_models.py").read_text(encoding="utf-8")
+        # The staged key's target is the wizard's own token, and both sides
+        # spell its prefix the same way.
+        self.assertIn('const WIZARD_PENDING_KEY_PREFIX = "__wizard_provider__";', self.ui)
+        self.assertIn('_WIZARD_KEY_TARGET_PREFIX = "__wizard_provider__"', core)
+        self.assertIn("const [pendingKeyToken] = useState(() => `wizard-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`);", wizard)
+        self.assertIn("const stagedKeyTarget = providerWizardKeyTarget(pendingKeyToken, stagedKeyName);", wizard)
+        self.assertIn("target={stagedKeyTarget}", wizard)
+        # 下一步 walks the steps; it never mints the provider.
+        self.assertNotIn("createProvider", wizard)
+        self.assertIn('if (!providerStepValid()) return;\n        setStep("keys");\n        return;', wizard)
+        self.assertIn('if (creatingProvider) {', wizard)
+        self.assertIn("const targetProviderID = providerID || await commitWizardProvider();", wizard)
+        self.assertIn('dispatchWithOutcome("provider.add", {\n      provider: {', wizard)
+        self.assertIn("{ pending_api_key: `${WIZARD_PENDING_KEY_PREFIX}${pendingKeyToken}` }", wizard)
+        # The model step lists a provider that does not exist yet through that
+        # same token, so discovery leaves no record either.
+        self.assertIn("pending_provider: {", wizard)
+        self.assertIn("const fetchIdentity = creatingProvider ? pendingKeyToken : providerID;", wizard)
+        # An official account is created by the press that signs in to it: the
+        # sign-in needs the record it belongs to.
+        self.assertIn('target = await addOfficialAccount(', wizard)
+        self.assertIn('const startOfficialLogin = async (): Promise<void> => {', wizard)
+        # The window that opened the wizard drops what it staged on every
+        # dismissal path — quietly, and never into the pane that opened it.
+        self.assertIn('if (route === "provider-wizard") dropProviderWizardStagedKey();', self.ui)
+        self.assertIn("const registerProviderWizardKeyToken = (token: string): void => {", self.ui)
+        self.assertIn('"provider.discard_pending_key",', self.ui)
+        self.assertIn("onKeyToken(pendingKeyToken);", wizard)
+        self.assertIn("onKeyToken={registerProviderWizardKeyToken}", self.ui)
+        self.assertIn('if action == "provider_discard_pending_key":', core)
+        # ...and Core files that value only for a target it can adopt: a
+        # provider target still needs a provider.
+        self.assertIn('if not provider_id.startswith(self._WIZARD_KEY_TARGET_PREFIX):', core)
+        self.assertIn("pending_keys = self._take_pending_provider_keys(pending_token) if pending_token else {}", core)
+        self.assertIn('raise DomainError("The staged API key is unavailable")', core)
 
     def test_provider_table_columns_fit_the_fixed_provider_pane(self) -> None:
         self.assertIn('"providers.modelCount": "Count"', self.en)
@@ -3957,16 +4750,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
         )[0]
         for marker in (
             "function WebDavWorkspace(",
-            '{tab === "webdav" ? <View style={[styles.dataManagementWebDavPane, styles.dataManagementWebDavContent, dataManagementPolishStyles.webDavContent]}>',
-            '<WebDavWorkspace snapshot={snapshot} busy={busy || webDavOperationBusy} probeBusy={pendingAction === "probe"} status={statuses.webdav} translate={translate} dispatch={dispatch} onSecretState={onSecretState} onProbe={() => runPendingAction("probe", onProbeWebDav)}>',
-            '<NativeToggle accessibilityLabel={translate("webdav.enabled")} value={booleanValue(state.enabled)} disabled={busy} onValueChange={(enabled) => dispatch("patch", { enabled })} />',
-            '<View style={[SETTINGS_FIELD_ROW_INDENTED, styles.webdavStateRow]}><Text numberOfLines={1} style={SETTINGS_FIELD_LABEL}>{translate("webdav.enabled")}</Text>',
-            "webdavStateRow:",
-            "webdavStateStatus:",
-            "webdavFormBody:",
-            'webDavFormRows: { width: "100%", maxWidth: 560, gap: 7 }',
-            "dataManagementWebDavPane:",
-            "dataManagementWebDavContent:",
+            '{tab === "webdav" ? <PersistentScrollView style={styles.dataManagementPane} contentContainerStyle={[styles.dataManagementPaneScrollContent, dataManagementPolishStyles.paneScrollContent]}>',
+            '<WebDavWorkspace snapshot={snapshot} busy={busy || webDavOperationBusy} pendingAction={pendingAction} webDavBusy={webDavBusy} actionRow={actionRow} onProbe={() => { void runPendingAction("probe", onProbeWebDav); }} onSync={(direction) => { void runPendingAction("sync", () => onSyncWebDav(direction)); }} status={statuses.webdav} translate={translate} dispatch={dispatch} onSecretState={onSecretState} onCommitSetting={(patch) => { void onCommitWebDavSettings(patch); }} />',
+            '<NativeToggle accessibilityLabel={translate("webdav.enabled")} value={booleanValue(state.enabled)} disabled={busy} onValueChange={(enabled) => onCommitSetting({ enabled })} style={SETTINGS_FIELD_SWITCH_SLOT} />',
+            '<View style={SETTINGS_FIELD_ROW_INDENTED}>',
+            '<Text style={SETTINGS_FIELD_LABEL}>{translate("webdav.enabled")}</Text>',
+            'webdavFieldList: { ...SETTINGS_FIELD_LIST }',
+            'webdavFieldUnit: { width: 68, flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }',
             'label={translate("webdav.url")}',
             'label={translate("webdav.remoteFile")}',
             'label={translate("webdav.syncEvery")}',
@@ -3976,10 +4766,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'webdavPasswordInput: { width: SETTINGS_FIELD_VALUE_WIDTH, minHeight: 26 }',
             'labelWidth={SETTINGS_FIELD_LABEL_WIDTH}',
             'controlWidth={SETTINGS_FIELD_VALUE_WIDTH}',
-            'labelAlign={labelAlign}',
-            "dataManagementSyncContent:",
+            'style={SETTINGS_FIELD_ROW_INDENTED}',
             "dataManagementToolbarButtons:",
-            "webdavSyncArea:",
         ):
             self.assert_ui_has(marker)
         self.assertNotIn(
@@ -3992,17 +4780,34 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn("dataManagement.syncSettings", self.ui)
         self.assertNotIn("dataManagementPolishStyles.paneHeading", self.ui)
         self.assertNotIn('dataManagementGroupDivider', workspace)
-        self.assertIn('<View style={[styles.webdavSyncArea, dataManagementPolishStyles.webDavSyncArea]}>{children}</View>', self.ui)
-        self.assertIn('webDavSyncArea: { borderTopWidth: 0, paddingTop: 4, marginTop: 2 }', self.ui)
-        self.assertIn('webDavActionRow: { borderTopWidth: 0, paddingTop: 4, marginTop: 10 }', self.ui)
+        # The form was a stack of its own rows, its own two action lines, and
+        # two style layers that cancelled each other's rules; the pane now
+        # draws grid fields and lets one action row and the strip report.
+        for legacy in (
+            "webdavFormBody:",
+            "webdavFormRows:",
+            "webdavStateRow:",
+            "webdavStateStatus:",
+            "webdavSyncArea:",
+            "webdavActionRow:",
+            "webdavActionStatus:",
+            "dataManagementWebDavPane:",
+            "dataManagementWebDavContent:",
+            "dataManagementSyncContent:",
+        ):
+            self.assertNotIn(legacy, self.ui)
         self.assertNotIn('webdavActionSpacer:', self.ui)
         self.assertNotIn('webdavHeaderActions:', self.ui)
         webdav_component = self.ui.split("function WebDavWorkspace(", 1)[1].split("function WebDavPasswordField(", 1)[0]
-        # Immediate apply: the WebDAV form keeps only the connection probe; the
-        # staged fields are written by the shell's auto-apply.
-        self.assertIn('title={translate("dataManagement.testConnection")}', webdav_component)
+        # The enable row states the setting and nothing else: the connection
+        # state is the pane's own work, and the window's one strip reports it.
+        # A status line under the switch read as a second report surface.
+        self.assertNotIn("webdavMenuStatus(snapshot.service.webdav", webdav_component)
+        # Immediate apply: neither the fields nor the pane's action row keeps
+        # an Apply button — the staged fields are written by the shell's
+        # auto-apply, and 测试连接 / 立即同步 run the two WebDAV operations.
         self.assertNotIn('title={translate("common.saveAndApply")}', webdav_component)
-        self.assertGreater(webdav_component.index('title={translate("dataManagement.testConnection")}'), webdav_component.index('<View style={[styles.webdavSyncArea, dataManagementPolishStyles.webDavSyncArea]}>{children}</View>'))
+        self.assertIn('const syncOptions = WEBDAV_SYNC_OPTIONS.map(', webdav_component)
         self.assertNotIn("dataManagementSectionGrid:", self.ui)
         self.assertNotIn("footerCompact:", self.ui)
         self.assertNotIn("dataManagementRelayRow:", self.ui)
@@ -4011,18 +4816,33 @@ class ReactNativeUiParityTests(unittest.TestCase):
         for marker in (
             'type WebDavSyncAction = "sync" | "push" | "pull";',
             'const WEBDAV_SYNC_DOMAINS: readonly ConfigDomain[] = ["providers_models", "relay_accounts"];',
-            '{ id: "sync", title: translate("dataManagement.syncSmart") }',
-            '{ id: "push", title: translate("dataManagement.syncPush") }',
-            '{ id: "pull", title: translate("dataManagement.syncPull") }',
+            '{ id: "sync", labelKey: "dataManagement.syncSmart", hintKey: "dataManagement.syncSmartHint" }',
+            '{ id: "push", labelKey: "dataManagement.syncPush", hintKey: "dataManagement.syncPushHint" }',
+            '{ id: "pull", labelKey: "dataManagement.syncPull", hintKey: "dataManagement.syncPullHint" }',
             'onSyncWebDav: (action: WebDavSyncAction) => Promise<void>;',
-            'const runWebDavOperation = async (operation: () => Promise<unknown>, message: string): Promise<void> => {',
+            'const runWebDavOperation = async (operation: () => Promise<unknown>, message: ResultMessage): Promise<void> => {',
             'if (webDavOperationInFlight.current) return;',
             'webDavOperationBusy={webDavOperationBusy}',
             'disabled={webDavBusy("sync") || snapshot?.webdav.enabled !== true}',
             'type: action, payload: { sections: [...WEBDAV_SYNC_DOMAINS] }',
-            'onPress={() => { void runPendingAction("sync", () => onSyncWebDav(syncAction)); }}',
+            '{actionRow(<><ActionButton title={translate("dataManagement.testConnection")} busy={pendingAction === "probe"} disabled={webDavBusy("probe")} onPress={onProbe} />',
         ):
             self.assert_ui_has(marker)
+        # The scope sentence is derived from the sections Core actually syncs,
+        # so the pane cannot claim a scope the dispatch does not send.
+        self.assert_ui_has('const syncScope = DATA_PACKAGE_SECTIONS.filter(({ domain }) => WEBDAV_SYNC_DOMAINS.includes(domain)).map(({ labelKey }) => translate(labelKey)).join(" · ");')
+        self.assertNotIn('translate("dataManagement.section.providersModels")} · {translate("dataManagement.section.relayAccounts")', self.ui)
+
+    def test_native_toggles_size_themselves_instead_of_a_wrapper(self) -> None:
+        """A native control owns its frame; a wrapper view cannot size it."""
+        toggles = self.jsx_tags(self.ui, "NativeToggle")
+        self.assertGreaterEqual(len(toggles), 5)
+        for toggle in toggles:
+            self.assertIn("style={", toggle)
+        # Wrapping an unstyled native toggle in a sized view drew the switch a
+        # row above its own label (the wrapper sized itself, the toggle kept
+        # its natural frame), so the slot rides the control, never the view.
+        self.assertNotIn("<View style={SETTINGS_FIELD_SWITCH_SLOT}><NativeToggle", self.ui)
 
     def test_text_fields_keep_active_typing_local_and_project_dependent_views(self) -> None:
         for marker in (
@@ -4064,7 +4884,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("key={`model:${providerId}:${editorIdentifier(model)}`}", self.ui)
         self.assertIn('cells: [providerDisplayName(item)]', self.ui)
         self.assertIn('const grouped = new Map<string, UnknownRecord[]>();', self.ui)
-        self.assertIn(r'cells: [`\t${providerDisplayName(entry.provider)}`', self.ui)
+        self.assertIn(r'cells: [`\t${modelUpstreamDisplay(editorIdentifier(entry.provider), entry.model)', self.ui)
         self.assertIn("modelUpstreamDisplay", self.ui)
         self.assertIn("providerKeyDisplayName", self.ui)
         self.assertIn('value={drafts?.providerKeyDisplayName(providerId, selectedCustom.id, selectedCustom.name) ?? selectedCustom.name}', self.ui)
@@ -4159,14 +4979,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '      : upstreamModelLabel(entryModel);',
             self.ui,
         )
-        self.assertIn('model_name_required: "validation.modelNameRequired"', self.ui)
-        self.assertIn('model_upstream_required: "validation.modelUpstreamRequired"', self.ui)
-        self.assertIn(
-            'if (stringValue(asRecord(reason).code) === "validation_failed" && (domain === "providers_models" || route === "providers-models")) {',
-            self.ui,
-        )
-        self.assertIn('const summary = await ipc.validate("providers_models");', self.ui)
-        self.assertIn('setIssues(summary.issues);', self.ui)
+        # A refused write no longer draws an issue card over the pane: the
+        # strip states the outcome and the offending row is marked in place.
+        self.assert_ui_not_has("function IssueList(")
+        self.assert_ui_not_has('setIssues(summary.issues);')
+        self.assertIn('publishResult(value.valid ? translate("common.saved") : translate("error.validationFailed"));', self.ui)
 
         for locale in (self.zh, self.en):
             self.assertIn('"validation.modelNameRequired"', locale)
@@ -4176,7 +4993,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # the entry instead of asking the user to hunt for it.
         self.assertIn("function modelNeedsAttention(model: UnknownRecord): boolean {", self.ui)
         self.assertIn(
-            "const alertModelKeys = useMemo(() => models.filter(modelNeedsAttention).map(editorIdentifier), [models]);",
+            "() => models.filter((item) => modelNeedsAttention(item) || Boolean(bindingIssueFor(item))).map(editorIdentifier),",
             self.ui,
         )
         self.assertIn("alertRowKeys={alertModelKeys}", self.ui)
@@ -4233,7 +5050,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn("paneContentHeight", self.ui)
         self.assertIn('const vendorBaseURL = (drafts?.providerBaseURL(provider) ?? stringValue(provider.endpoint, stringValue(provider.api_base))).trim();', self.ui)
         self.assertIn(
-            '{vendorBaseURL ? <NativeButton title="" symbol="plus" compact toolTip={translate("providers.addRelayAccount")}',
+            '{vendorBaseURL && !providerService(provider) ? <NativeButton title="" symbol="plus" compact toolTip={translate("providers.addRelayAccount")}',
             self.ui,
         )
         relay = self.relay
@@ -4284,8 +5101,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("function uniqueKeyName(existing: string[]): string {", self.ui)
         self.assertIn("const RANDOM_KEY_NAME_WORDS = [", self.ui)
         self.assertIn("function randomKeyName(existing: string[]): string {", self.ui)
-        self.assertIn("setKeyName(pendingNewKeyName ?? randomKeyName([]));", self.ui)
-        self.assertIn("const initialKeyName = randomKeyName([]);", self.ui)
+        self.assertIn("setKeyName(creatingProvider ? stagedKeyName : randomKeyName([]));", self.ui)
+        self.assertIn("const [stagedKeyName] = useState(() => randomKeyName([]));", self.ui)
         self.assertIn("const name = uniqueKeyName(customKeyNames);", self.ui)
         self.assertNotIn("randomWordName", self.ui)
         self.assertNotIn("RANDOM_NAME_WORDS", self.ui)
@@ -4345,9 +5162,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # pane showed as a fixed key the user never picked.  The model stays
         # unbound ("default") until the user chooses a key.
         self.assertIn(
-            'return key ? keyName?.(key.id, key.name) ?? key.name : displayLabel(model.api_key_name, translate("providers.undefinedKey"));',
+            'return relaySourceName(relaySourceForKey(key, relaySources)) || name;',
             self.ui,
         )
+        self.assertIn('if (!key) return displayLabel(model.api_key_name, translate("providers.undefinedKey"));', self.ui)
         # The list matches the key the way the editor does, so a moved slot id
         # cannot leave the list under "undefined key" while the editor shows it.
         self.assertIn("const keyStates = providerKeyStates(provider);", self.ui)
@@ -4480,7 +5298,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
                 self.assertNotIn(f'"{removed}"', source)
         # The status strip reports the save (or the reload) that actually
         # happened; the shell's own commit stays the only write path.
-        self.assertIn('message: string | null = "common.saved"', self.ui)
+        self.assertIn('message: ResultMessage = "common.saved"', self.ui)
         self.assertIn('options?.message ?? "common.saved"', self.ui)
         self.assertIn('translate(appliedKey ?? "common.saved")', self.ui)
         self.assertIn('}, "common.reloaded");', self.ui)
@@ -4490,9 +5308,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # A rejected live write names the fix, not an action that does not
         # exist, and Core reports the missing key value as a coded location so
         # the pane can point at the provider row it has to open.
-        self.assertIn('"error.validationFailed": "Validation failed. Fix the problems listed above."', english)
-        self.assertIn('"error.validationFailed": "校验失败，请修正列出的问题。"', chinese)
-        self.assertIn('api_key_value_required: "validation.apiKeyValueRequired"', self.ui)
+        self.assertIn('publishResult(value.valid ? translate("common.saved") : translate("error.validationFailed"));', self.ui)
+        self.assertIn('"error.validationFailed": "Validation failed; changes not applied."', english)
+        self.assertIn('"error.validationFailed": "校验未通过，更改未生效。"', chinese)
+        self.assertNotIn('api_key_value_required: "validation.apiKeyValueRequired"', self.ui)
         self.assertIn('"code": "api_key_value_required"', (ROOT / "young_router/core/domains/providers_models.py").read_text(encoding="utf-8"))
         # Every literal key the two pane surfaces translate must resolve in both
         # locales to copy that never instructs an Apply press. The only writes

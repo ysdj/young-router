@@ -63,6 +63,7 @@ class WebDAVSettingsDomain:
             "remote_name": str(getattr(settings, "remote_name", "")),
             "sync_interval_minutes": getattr(settings, "sync_interval_minutes", 30),
             "timeout_seconds": getattr(settings, "timeout_seconds", 30),
+            "sync_direction": getattr(settings, "sync_direction", "smart"),
         }
 
     def _enabled(self) -> bool:
@@ -124,12 +125,53 @@ class WebDAVSettingsDomain:
             "sync_interval": sanitized["sync_interval_minutes"],
             "timeout_seconds": sanitized["timeout_seconds"],
             "timeout": sanitized["timeout_seconds"],
+            "sync_direction": sanitized["sync_direction"],
             # The Core projection redacts this field again; its only purpose
             # is to give the summary a presence bit without carrying a value.
             "password": REDACTED if password_present else "",
             "password_configured": password_present,
             "last_probe": self._last_probe,
+            # When the last sync (push, pull, or smart sync) finished, so the
+            # pane can state it next to the button that runs one.  The sync
+            # state file stays Core's: only its stamp and action travel here.
+            "last_sync": self._last_sync(),
+            # The outcome recorded for the most recent run, automatic or not.
+            # A window that opens after a failed automatic sync has no result
+            # of its own, so the pane reads this to say why the stamp stopped.
+            "last_result": self._last_result(),
         }
+
+    def _last_result(self) -> dict[str, Any] | None:
+        """The status file's last run: action, outcome, and when it checked."""
+
+        from webdav import core as webdav_core
+
+        try:
+            status = webdav_core.read_status_file(self.status_path)
+        except Exception:
+            return None
+        checked_at = status.get("checked_at")
+        if not isinstance(checked_at, str) or not checked_at.strip():
+            return None
+        action = status.get("action")
+        return {
+            "action": action if isinstance(action, str) else "",
+            "ok": status.get("ok") is True,
+            "at": checked_at,
+        }
+
+    def _last_sync(self) -> dict[str, str] | None:
+        from webdav import core as webdav_core
+
+        try:
+            state = webdav_core.load_sync_state(self.state_path)
+        except Exception:
+            return None
+        updated_at = state.get("updated_at")
+        action = state.get("action")
+        if not isinstance(updated_at, str) or not updated_at.strip():
+            return None
+        return {"at": updated_at, "action": action if isinstance(action, str) else ""}
 
     def draft_state(self) -> object:
         return {
@@ -138,12 +180,13 @@ class WebDAVSettingsDomain:
         }
 
     def _patch(self, data: Mapping[str, Any]) -> None:
-        allowed = {"url", "username", "password", "remote_name", "sync_interval_minutes", "timeout_seconds"}
+        allowed = {"url", "username", "password", "remote_name", "sync_interval_minutes", "timeout_seconds", "sync_direction"}
         source = data.get("settings", data.get("values", data))
         updates = _mapping(source, "WebDAV settings")
         aliases = {
             "sync_interval": "sync_interval_minutes",
             "timeout": "timeout_seconds",
+            "direction": "sync_direction",
         }
         updates = {aliases.get(key, key): value for key, value in updates.items()}
         unknown = set(updates).difference(allowed | {"enabled", "keep_password", "clear_password"})
@@ -183,6 +226,7 @@ class WebDAVSettingsDomain:
                 "remote_name": "young-router-config.json",
                 "sync_interval_minutes": 30,
                 "timeout_seconds": 30,
+                "sync_direction": "smart",
             }
             self._draft_enabled = False
         elif name in {"reset", "cancel", "reload"}:

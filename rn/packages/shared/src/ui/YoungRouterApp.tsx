@@ -17,6 +17,7 @@ import {
   NativeWizardProgress,
   normalizeRelayOrigin,
   providedKeyRows,
+  type ProvidedKeyRow,
   pendingCredentialCleanups,
   StationAccountsPanel,
   stationDisplayName,
@@ -32,7 +33,7 @@ import {
   type StationDraft,
 } from "./RelayAccountManager";
 import { suggestedProviderName, suggestedRelayStationName } from "./relayOrigin";
-import { isAssistantEditorOpen, isProviderWizardOpen, setAssistantEditorOpen, setProviderWizardOpen, subscribeProviderWizard } from "./providerWizardGate";
+import { isAssistantEditorOpen, isGroupManagerOpen, isProviderWizardOpen, setAssistantEditorOpen, setGroupManagerOpen, setProviderWizardOpen, subscribeProviderWizard } from "./providerWizardGate";
 import { SOURCE_LIST_FONT_SIZE, UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
 import type {
   AppRoute,
@@ -95,9 +96,18 @@ type AssistantSettingsDomain = "codex" | "claude" | "clients";
 type RawEditorConflictHandler = (domain: AssistantSettingsDomain, document: EditorDocument) => Promise<RawEditorConflictResolution>;
 type RawEditorDocument = EditorDocument;
 type DataManagementTab = "import" | "export" | "webdav";
+/** Which data-management action is running, so only its own button spins. */
+type DataManagementAction = "inspect" | "import" | "export" | "probe" | "sync";
 type WebDavSyncAction = "sync" | "push" | "pull";
+/**
+ * How a finished pane action reads in the window's one status strip: a fixed
+ * message key, no message at all, or the key its own result picks — a probe
+ * that reached the server and one that did not are not the same sentence, and
+ * repeating the button's own name states neither.
+ */
+type ResultMessage = string | null | ((value: unknown) => string | null);
 
-const PROVIDER_AUTH_OPTIONS = ["api_key", "openai_login", "claude_login"] as const satisfies readonly ProviderAuthKind[];
+const PROVIDER_AUTH_OPTIONS = ["api_key", "openai_login", "claude_login", "workbuddy_login", "workbuddy_ai_login"] as const satisfies readonly ProviderAuthKind[];
 
 function providerAuthKind(provider: UnknownRecord | undefined): ProviderAuthKind {
   const value = stringValue(provider?.auth_kind, "api_key");
@@ -111,22 +121,166 @@ function providerAuthStatus(provider: UnknownRecord | undefined): ProviderAuthSt
 }
 
 /** The merged workspace shows every provider kind; this drives row labels. */
-type ProviderKind = "relay" | "openai" | "claude" | "apiKey";
+type ProviderKind = "relay" | "openai" | "claude" | "workbuddy" | "workbuddyAI" | "apiKey";
 
-function providerKind(provider: UnknownRecord): ProviderKind {
-  if (providerAuthKind(provider) === "openai_login") return "openai";
-  if (providerAuthKind(provider) === "claude_login") return "claude";
-  return stringValue(provider.provider_type, "custom") === "relay" ? "relay" : "apiKey";
+function providerKind(provider: UnknownRecord | undefined): ProviderKind {
+  const auth = providerAuthKind(provider);
+  if (auth === "openai_login") return "openai";
+  if (auth === "claude_login") return "claude";
+  if (auth === "workbuddy_login") return "workbuddy";
+  if (auth === "workbuddy_ai_login") return "workbuddyAI";
+  return stringValue(provider?.provider_type, "custom") === "relay" ? "relay" : "apiKey";
 }
 
-function officialStatusLabel(status: ProviderAuthStatus, translate: Translate): string {
-  return status === "signed_in" ? translate("providers.authStatusSignedIn")
+/**
+ * The official services this app can configure.
+ *
+ * `openai` is the GPT service ("gpt" in the product's own vocabulary) and
+ * `workbuddy`/`workbuddyAI` are the two WorkBuddy desktop products. A service
+ * decides two things everywhere below: which address a provider carries, and
+ * whether its association section reads as a service link rather than a relay
+ * station link.
+ */
+type ServiceID = "openai" | "claude" | "workbuddy" | "workbuddyAI";
+
+/** The provider-key slot a WorkBuddy provider carries for its loopback route. */
+const WORKBUDDY_LOCAL_KEY_NAME = "workbuddy-local";
+
+/** The address each service is addressed by, used for the wizard's URL field. */
+const SERVICE_BASE_URLS: Record<ServiceID, string> = {
+  openai: "https://api.openai.com/v1",
+  claude: "https://api.anthropic.com",
+  workbuddy: "https://copilot.tencent.com",
+  workbuddyAI: "https://www.workbuddy.ai",
+};
+
+/** Service origins, so a hand-typed provider URL is recognized the same way. */
+function serviceFromURL(value: string): ServiceID | undefined {
+  const host = (() => {
+    const text = value.trim();
+    if (!text) return "";
+    try {
+      return new URL(text.includes("://") ? text : `https://${text}`).hostname.toLowerCase();
+    } catch {
+      return "";
+    }
+  })();
+  if (!host) return undefined;
+  const matches = (suffix: string): boolean => host === suffix || host.endsWith(`.${suffix}`);
+  if (matches("workbuddy.ai")) return "workbuddyAI";
+  if (matches("codebuddy.ai") || matches("codebuddy.cn") || matches("copilot.tencent.com")) return "workbuddy";
+  if (matches("api.openai.com") || matches("openai.com") || matches("chatgpt.com")) return "openai";
+  if (matches("api.anthropic.com") || matches("anthropic.com") || matches("claude.ai")) return "claude";
+  return undefined;
+}
+
+/** The service behind one provider entry: its kind first, then its address. */
+function providerService(provider: UnknownRecord | undefined): ServiceID | undefined {
+  const kind = providerKind(provider ?? {});
+  if (kind === "openai" || kind === "claude" || kind === "workbuddy" || kind === "workbuddyAI") return kind;
+  return serviceFromURL(stringValue(provider?.endpoint, stringValue(provider?.api_base)));
+}
+
+/**
+ * One service's catalog, keyed by model id and refreshed on a short interval.
+ * The rate the picker shows has to survive into the detail pane without a
+ * fetch per selected model.
+ */
+const SERVICE_RATE_TTL_MS = 5 * 60 * 1000;
+const serviceRates = new Map<string, { at: number; rates: Record<string, string> }>();
+
+function peekServiceRate(service: ServiceID | undefined, modelID: string): string | undefined {
+  if (!service || !modelID) return undefined;
+  const cached = serviceRates.get(service);
+  if (!cached || Date.now() - cached.at >= SERVICE_RATE_TTL_MS) return undefined;
+  return cached.rates[modelID];
+}
+
+/** Whether this service's catalog is already loaded and still fresh. */
+function hasFreshServiceRates(service: ServiceID | undefined): boolean {
+  if (!service) return false;
+  const cached = serviceRates.get(service);
+  return cached !== undefined && Date.now() - cached.at < SERVICE_RATE_TTL_MS;
+}
+
+async function serviceModelRate(
+  service: ServiceID,
+  read: (providerId: string) => Promise<CoreSnapshot | undefined>,
+): Promise<Record<string, string>> {
+  const cached = serviceRates.get(service);
+  if (cached && Date.now() - cached.at < SERVICE_RATE_TTL_MS) return cached.rates;
+  const providerId = service === "workbuddyAI" ? "workbuddy-ai" : service === "workbuddy" ? "workbuddy" : "";
+  if (!providerId) return {};
+  const snapshot = await read(providerId);
+  const summary = asRecord(asRecord(snapshot?.action_summaries?.providers_models).operation_summary);
+  const rates: Record<string, string> = {};
+  if (summary.available === true) {
+    for (const entry of asRecords(summary.models)) {
+      const modelID = stringValue(entry.id).trim();
+      if (!modelID) continue;
+      const billing = asRecord(entry.billing);
+      const credits = stringValue(billing.credits).trim();
+      rates[modelID] = credits ? credits.replace(/\s*credits?$/i, "") : billing.free === true ? "x0.00" : "";
+    }
+  }
+  serviceRates.set(service, { at: Date.now(), rates });
+  return rates;
+}
+
+/** Which WorkBuddy product a provider kind borrows its sign-in from. */
+function workbuddyProviderIDFor(kind: ProviderKind): "workbuddy" | "workbuddy-ai" | undefined {
+  if (kind === "workbuddy") return "workbuddy";
+  if (kind === "workbuddyAI") return "workbuddy-ai";
+  return undefined;
+}
+
+/** The desktop app a WorkBuddy account signs in through. */
+function workbuddyAppName(kind: ProviderKind, translate: Translate): string {
+  return translate(kind === "workbuddyAI" ? "providers.type.workbuddyAI" : "providers.type.workbuddy");
+}
+
+function officialStatusLabel(status: ProviderAuthStatus, translate: Translate): string {  return status === "signed_in" ? translate("providers.authStatusSignedIn")
     : status === "authorizing" ? translate("providers.authStatusAuthorizing")
       : status === "expired" ? translate("providers.authStatusExpired")
         : status === "error" ? translate("providers.authStatusError")
           : status === "unsupported" ? translate("providers.authStatusUnsupported")
             : translate("providers.authStatusSignedOut");
 }
+
+/**
+ * The WorkBuddy account's remaining credit, as the desktop app reports it.
+ *
+ * The value is the upstream's own number of credits, not a currency: the
+ * wizard shows it beside the account so a signed-in-but-out-of-credit account
+ * is visible before models are added.
+ */
+function workbuddyCreditsText(account: UnknownRecord | undefined, translate: Translate): string {
+  const credits = asRecord(account?.credits);
+  if (credits.unlimited === true) return translate("providers.wizard.workbuddyUnlimited");
+  const total = credits.total;
+  return typeof total === "number" && Number.isFinite(total) ? String(total) : "";
+}
+
+/** One model's credit multiplier, as the catalog spells it (e.g. `x0.29`). */
+function workbuddyModelRate(model: UnknownRecord, translate: Translate): string {
+  const billing = asRecord(model.billing);
+  const credits = stringValue(billing.credits).trim();
+  if (credits) return credits.replace(/\s*credits?$/i, "");
+  return billing.free === true ? translate("providers.wizard.workbuddyFree") : "";
+}
+
+/** The shared busy word, or nothing when the read has settled. */
+function progressText(busy: boolean, translate: Translate): string | undefined {
+  return busy ? translate("common.loading") : undefined;
+}
+
+/** The login types a service provider can be switched between, in menu order. */
+const SERVICE_KIND_OPTIONS: ReadonlyArray<{ kind: ProviderKind; label: TranslationKey }> = [
+  { kind: "openai", label: "providers.type.openai" },
+  { kind: "claude", label: "providers.type.claude" },
+  { kind: "workbuddy", label: "providers.type.workbuddy" },
+  { kind: "workbuddyAI", label: "providers.type.workbuddyAI" },
+];
 
 function providerKindLabel(kind: ProviderKind, translate: Translate): string {
   return kind === "relay"
@@ -135,7 +289,11 @@ function providerKindLabel(kind: ProviderKind, translate: Translate): string {
       ? translate("providers.type.openai")
       : kind === "claude"
         ? translate("providers.type.claude")
-        : translate("providers.type.apiKey");
+        : kind === "workbuddy"
+          ? translate("providers.type.workbuddy")
+          : kind === "workbuddyAI"
+            ? translate("providers.type.workbuddyAI")
+            : translate("providers.type.apiKey");
 }
 
 const DATA_PACKAGE_SECTIONS: ReadonlyArray<{ domain: ConfigDomain; labelKey: string }> = [
@@ -150,6 +308,16 @@ const DATA_PACKAGE_SECTIONS: ReadonlyArray<{ domain: ConfigDomain; labelKey: str
 const DATA_PACKAGE_DOMAINS = DATA_PACKAGE_SECTIONS.map(({ domain }) => domain);
 const DATA_MANAGEMENT_DIRTY_DOMAINS: readonly ConfigDomain[] = DATA_PACKAGE_DOMAINS;
 const WEBDAV_SYNC_DOMAINS: readonly ConfigDomain[] = ["providers_models", "relay_accounts"];
+/**
+ * The three directions a WebDAV sync can take. Each names itself and its own
+ * consequence, so the field where the direction is chosen is also where the
+ * choice is explained.
+ */
+const WEBDAV_SYNC_OPTIONS: ReadonlyArray<{ id: WebDavSyncAction; labelKey: TranslationKey; hintKey: TranslationKey }> = [
+  { id: "sync", labelKey: "dataManagement.syncSmart", hintKey: "dataManagement.syncSmartHint" },
+  { id: "push", labelKey: "dataManagement.syncPush", hintKey: "dataManagement.syncPushHint" },
+  { id: "pull", labelKey: "dataManagement.syncPull", hintKey: "dataManagement.syncPullHint" },
+];
 
 const PendingFieldContext = createContext<PendingFieldRegistry | undefined>(undefined);
 const TranslationContext = createContext<Translate | undefined>(undefined);
@@ -200,6 +368,11 @@ const LOG_VIEW_POLL_MS = 5_000;
 const REQUEST_LOG_POLL_MS = 1_000;
 const RECOVERY_LOG_POLL_MS = 1_000;
 const ONLINE_USAGE_POLL_MS = 15_000;
+// How long one relay read answers later implicit callers for the same account.
+// It exists to stop the account pane's mount read and 分组管理's aligned draft
+// from paying for the same station round trip twice; an explicit read (a
+// sign-in that just landed) passes ``force`` and never uses it.
+const RELAY_RESOURCE_REUSE_MS = 15_000;
 const ROUTE_TRACE_REQUEST_ROW_HEIGHT = 70;
 const ROUTE_TRACE_SCROLL_IDLE_MS = 150;
 const ROUTE_TRACE_TIMELINE_MIN_WIDTH = 400;
@@ -480,11 +653,9 @@ function providerKeyChoices(provider: UnknownRecord, relaySources: RelaySourceOp
 function providerKeyChoiceLabel(choice: Pick<ProviderKeyChoice, "name" | "kind" | "source">, translate: Translate): string {
   const name = apiKeyDisplayName(choice.name, translate);
   if (choice.kind !== "relay") return name;
-  const sourceName = choice.source
-    ? [choice.source.accountLabel, choice.source.resourceLabel].filter(Boolean).join("/")
-    : name;
+  const sourceName = relaySourceName(choice.source) || name;
   const multiplier = choice.source && Number.isFinite(choice.source.multiplier) ? ` (${choice.source.multiplier}x)` : "";
-  return `${sourceName || name}${multiplier}`;
+  return `${sourceName}${multiplier}`;
 }
 
 function modelOrderMode(model: UnknownRecord): "manual" | "relay_multiplier" {
@@ -495,15 +666,55 @@ function modelEffectiveOrder(model: UnknownRecord): number {
   return numberValue(model.effective_order, numberValue(model.order, 0));
 }
 
-function modelProviderKeyLabel(model: UnknownRecord, provider: UnknownRecord, translate: Translate, keyName?: (keyID: string, name: string) => string): string {
+function modelProviderKeyState(model: UnknownRecord | undefined, provider: UnknownRecord): ProviderKeyState | undefined {
+  if (!model) return undefined;
   // Match the key the way the model editor does: by slot id first, then by the
   // key name the model carries.  A stored id can move (Core re-derives a
   // renamed key's slot when it reads the document back), and matching by id
   // alone left the list under "undefined key" while the editor showed the key.
   const keyStates = providerKeyStates(provider);
-  const key = keyStates.find((entry) => entry.id === stringValue(model.provider_key_id))
+  return keyStates.find((entry) => entry.id === stringValue(model.provider_key_id))
     ?? keyStates.find((entry) => entry.name === stringValue(model.api_key_name));
-  return key ? keyName?.(key.id, key.name) ?? key.name : displayLabel(model.api_key_name, translate("providers.undefinedKey"));
+}
+
+function relaySourceName(source: RelaySourceOption | undefined): string {
+  // Relay keys are named by the account and the group they belong to
+  // (`account/GroupName`): the provider's own slot name is only the group
+  // name, which reads as a truncated key wherever the account is not already
+  // on screen (the model list's group rows, the routes table, the wizard's
+  // provided-key list).
+  return source ? [source.accountLabel, source.resourceLabel].filter(Boolean).join("/") : "";
+}
+
+function modelProviderKeyLabel(model: UnknownRecord, provider: UnknownRecord, translate: Translate, keyName?: (keyID: string, name: string) => string, relaySources: RelaySourceOption[] = []): string {
+  const key = modelProviderKeyState(model, provider);
+  if (!key) return displayLabel(model.api_key_name, translate("providers.undefinedKey"));
+  const name = keyName?.(key.id, key.name) ?? key.name;
+  return relaySourceName(relaySourceForKey(key, relaySources)) || name;
+}
+
+// Why a relay-bound Apply refused, in the user's own words: Core names the kind
+// of binding problem on the row it belongs to (`binding_issues`), and the pane
+// states that sentence where the key is edited — the strip keeps the outcome.
+const RELAY_BINDING_ISSUE_KEYS: Record<string, TranslationKey> = {
+  account_unavailable: "providers.bindingIssueAccount",
+  refresh_failed: "providers.bindingIssueAccount",
+  login_required: "providers.bindingIssueAccount",
+  resource_unavailable: "providers.bindingIssueResource",
+  resource_missing: "providers.bindingIssueResource",
+  resource_disabled: "providers.bindingIssueResource",
+  created_resource_unresolved: "providers.bindingIssueResource",
+  resource_key_unavailable: "providers.bindingIssueCredential",
+  credential_missing: "providers.bindingIssueCredential",
+  catalog_model_missing: "providers.bindingIssueCatalog",
+  multiplier_missing: "providers.bindingIssueCatalog",
+  api_base_missing: "providers.bindingIssueBaseUrl",
+  provider_api_base_conflict: "providers.bindingIssueBaseUrl",
+};
+
+function relayBindingIssueText(issue: UnknownRecord, keyLabel: string, translate: Translate): string {
+  const key = RELAY_BINDING_ISSUE_KEYS[stringValue(issue.code)] ?? "providers.bindingIssueGeneric";
+  return translate(key, { key: keyLabel });
 }
 
 function isApplyResult(value: unknown): value is IpcResults["apply"] {
@@ -515,19 +726,19 @@ function isApplyResult(value: unknown): value is IpcResults["apply"] {
 }
 
 function applyResultMessage(result: IpcResults["apply"], translate: Translate, appliedKey?: string | null): string {
-  if (result.status === "partial") return translate("relay.applyPartial", { completed: result.completed_operations, pending: result.pending_operations });
-  if (result.status === "failed") return translate("relay.applyFailed", { pending: result.pending_operations });
+  // A write that did not finish is reported for what the user can see: the
+  // change is not in effect.  Core's own operation accounting (the completed
+  // and pending relay steps) stays internal, and no pane renders an issue card
+  // over its content — the permanent status strip states the outcome.
+  if (result.status === "partial") return translate("common.notAppliedPartial");
+  if (result.status === "failed") return translate("common.notApplied");
   return translate(appliedKey ?? "common.saved");
 }
 
-function applyIssuesForDisplay(result: IpcResults["apply"]): ValidationSummary["issues"] {
-  return result.issues.map((issue) => ({
-    path: [issue.domain, issue.station_id, issue.account_id, issue.resource_id, issue.provider_id, issue.model_id].filter(Boolean).join(" / "),
-    code: issue.code ?? "relay_apply",
-    message: issue.message ?? "",
-    severity: result.status === "partial" ? "warning" : "error",
-  }));
-}
+// A bare lowercase step name (`relay_binding_materialization_failed`) names the
+// Core step that failed, not anything the user can act on, so it never reaches
+// the status strip: the pane reports the outcome instead.
+const INTERNAL_STEP_NAME = /^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$/;
 
 function errorMessage(reason: unknown, translate: Translate): string {
   const code = stringValue(asRecord(reason).code);
@@ -535,16 +746,40 @@ function errorMessage(reason: unknown, translate: Translate): string {
     return translate("validation.claudeFallbackModelLimit");
   }
   const keyByCode: Record<string, string> = {
+    // The host bridge names a Core that never answered; the editor names a
+    // document Core refused to hand over because it is past the raw editor's
+    // own size budget.  Neither may read as the other.
+    core_unavailable: "error.coreUnavailable",
+    editor_too_large: "error.editorTooLarge",
     confirmation_required: "error.confirmationRequired",
     revision_conflict: "error.revisionConflict",
     validation_failed: "error.validationFailed",
+    // Core names the domain that refused the write: a provider/model draft
+    // that is genuinely unusable reads as a validation failure, while a relay
+    // that is not ready states its own cause instead of blaming the edit.
+    provider_model_invalid: "error.validationFailed",
+    relay_preflight_failed: "error.relayNotReady",
+    relay_not_ready: "error.relayNotReady",
+    // A linked relay key that could not be resolved names its own cause: the
+    // route's resource, base URL, or upstream model, never a bare rollback.
+    relay_binding_failed: "error.relayBindingFailed",
+    // A write that rolled back: name the outcome the pane can show, never the
+    // relay step that raised it.
+    apply_failed: "common.notApplied",
+    // A WebDAV sync names its cause: the remote bundle is from another app
+    // version, the two sides diverged, or the sync simply failed.  Each case
+    // states the way out, because the probe beside it already said the
+    // connection itself is fine.
+    webdav_sync_incompatible: "error.webdavSyncIncompatible",
+    webdav_sync_conflict: "error.webdavSyncConflict",
+    webdav_sync_failed: "error.webdavSyncFailed",
   };
   const known = keyByCode[code];
   if (known) return translate(known);
   // Surface the Core's already-sanitized failure detail instead of a generic
   // "error" so an actionable cause (for example a rejected value) is visible.
   const detail = stringValue(asRecord(reason).message).trim();
-  if (detail && detail.length <= 160) return detail;
+  if (detail && detail.length <= 160 && !INTERNAL_STEP_NAME.test(detail)) return detail;
   return translate("error.generic");
 }
 
@@ -678,6 +913,22 @@ function formatMenuTimestamp(value: string): string {
   return new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit", hour12: false }).format(parsed);
 }
 
+/**
+ * The stamp beside a pane's command: today reads as a time, anything older
+ * carries its date, because a sync that last landed weeks ago must not read
+ * like one that just ran.
+ */
+function formatActionTimestamp(value: string): string {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return value;
+  const now = new Date();
+  const sameDay = parsed.getFullYear() === now.getFullYear() && parsed.getMonth() === now.getMonth() && parsed.getDate() === now.getDate();
+  const options: Intl.DateTimeFormatOptions = sameDay
+    ? { hour: "2-digit", minute: "2-digit", hour12: false }
+    : { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false };
+  return new Intl.DateTimeFormat(undefined, options).format(parsed);
+}
+
 function containsPrivateMarker(value: unknown): boolean {
   if (typeof value === "string") return value.includes("configured") || value.includes("<private-path>");
   if (Array.isArray(value)) return value.some(containsPrivateMarker);
@@ -786,9 +1037,12 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
       routeRuntimeSettings: translate("card.runtimeSettings"),
       routeDataManagement: translate("card.dataManagement"), routeProviderWizard: translate("providers.wizard.title"), routeFileEditor: translate("settings.editFile"), routeLogs: translate("card.logs"),
       providerAuthInstruction: translate("relay.officialProviderWebViewHint"),
+      providerAuthBlocked: translate("relay.officialProviderAuthBlocked"),
+      logOriginal: translate("logs.originalRecord"),
       providerAuthCode: translate("providers.authUserCode"),
       providerAuthCopy: translate("common.copy"),
       modelChooserTitle: translate("modelChooser.title"), modelChooserHeading: translate("modelChooser.heading"),
+      childSaving: translate("common.saving"),
       modelChooserProvider: translate("modelChooser.provider"), modelChooserKey: translate("modelChooser.key"),
       modelChooserSearch: translate("modelChooser.search"), modelChooserAll: translate("modelChooser.all"),
       modelChooserSelectAllVisible: translate("modelChooser.selectAllVisible"), modelChooserInvert: translate("modelChooser.invert"),
@@ -1284,14 +1538,18 @@ function SettingsDetailHeader({ title, hint, actions }: { title: string; hint?: 
   </View>;
 }
 
-function WindowTitle({ title, validation }: { title: string; validation?: string }): React.JSX.Element {
-  return <View style={styles.windowTitleBlock}><Text style={styles.windowTitle}>{title}</Text>{validation ? <Text style={styles.validationText}>{validation}</Text> : null}</View>;
+function WindowTitle({ title }: { title: string }): React.JSX.Element {
+  return <View style={styles.windowTitleBlock}><Text style={styles.windowTitle}>{title}</Text></View>;
 }
 
 /** Immediate apply is blocked while a sub-window with explicit actions is open. */
+function immediateApplyBlocked(): boolean {
+  return isProviderWizardOpen() || isAssistantEditorOpen() || isGroupManagerOpen();
+}
+
 function useImmediateApplyBlocked(): boolean {
-  const [blocked, setBlocked] = useState<boolean>(() => isProviderWizardOpen() || isAssistantEditorOpen());
-  useEffect(() => subscribeProviderWizard(() => setBlocked(isProviderWizardOpen() || isAssistantEditorOpen())), []);
+  const [blocked, setBlocked] = useState<boolean>(immediateApplyBlocked);
+  useEffect(() => subscribeProviderWizard(() => setBlocked(immediateApplyBlocked())), []);
   return blocked;
 }
 
@@ -1316,7 +1574,6 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
   const [busy, setBusy] = useState(false);
   const [webDavOperationBusy, setWebDavOperationBusy] = useState(false);
   const [result, setResult] = useState<string>();
-  const [issues, setIssues] = useState<ValidationSummary["issues"]>([]);
   const [settingsRawReloadToken, setSettingsRawReloadToken] = useState(0);
   const [settingsRawBaselineToken, setSettingsRawBaselineToken] = useState(0);
   // Windows hosts one window, so its editor is a plain route the shared UI
@@ -1329,16 +1586,33 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
     native.prepareFileEditor?.();
   }, [native]);
   const [dataManagementStatuses, setDataManagementStatuses] = useState<Partial<Record<DataManagementTab, string>>>({});
+  // Which backup & sync tab is showing, so the window's one status strip
+  // reports that tab's own result instead of a message another tab produced.
+  const [dataManagementTab, setDataManagementTab] = useState<DataManagementTab>("import");
   const [keptDiskGeneration, setKeptDiskGeneration] = useState<Partial<Record<EditableDiskDomain, number>>>({});
   const promptedDiskGeneration = useRef<Partial<Record<EditableDiskDomain, number>>>({});
   const diskPromptInFlight = useRef(false);
   const activeRuns = useRef(0);
+  // Only the runs that ask for the pane-wide wait are counted by it. A run
+  // that keeps the controls available (a block's own read) must never be the
+  // one that holds — or clears — that wait.
+  const busyRuns = useRef(0);
   const webDavOperationInFlight = useRef(false);
   const revision = useRef<number | undefined>(snapshot?.revision);
   const latestSnapshot = useRef<CoreSnapshot | undefined>(snapshot);
   const dispatchQueue = useRef<Promise<void>>(Promise.resolve());
+  // One relay read owns each account at a time. The account pane's mount read
+  // and 分组管理's aligned draft ask for the same station facts seconds apart,
+  // and each read costs the station one round trip of five requests, so a read
+  // already in flight is joined instead of repeated and a read that just
+  // succeeded answers the next implicit caller from its own result.
+  const relayRefreshInFlight = useRef(new Map<string, Promise<"ready" | "unavailable">>());
+  const relayRefreshFresh = useRef(new Map<string, { at: number; status: "ready" | "unavailable" }>());
   const probedSurfaceApplyQueue = useRef<Promise<void>>(Promise.resolve());
   const importPlanToken = useRef<string | undefined>(undefined);
+  // The token the provider wizard staged its key value under, reported by the
+  // wizard itself, so closing that surface can drop exactly what it staged.
+  const providerWizardKeyToken = useRef("");
   const pendingFields = useRef(new Map<symbol, PendingField>());
   // The pending-field dirty set lives in a ref for synchronous reads, but a
   // state counter makes it reactive: the immediate-apply effect must re-run
@@ -1413,12 +1687,17 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
   }, null);
   const run = async (
     operation: () => Promise<unknown>,
-    message: string | null = "common.saved",
+    message: ResultMessage = "common.saved",
     keepControlsEnabled = false,
     refreshAfter = true,
     dataManagementTab?: DataManagementTab,
+    // A child surface's own apply: it states the outcome in its own status
+    // bar, so this window publishes nothing at all — not the wait, not the
+    // result, and not the failure.
+    quiet = false,
   ): Promise<void> => {
     const publishResult = (next: string | undefined): void => {
+      if (quiet) return;
       if (dataManagementTab) {
         setDataManagementStatuses((current) => ({ ...current, [dataManagementTab]: next }));
         return;
@@ -1426,45 +1705,43 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
       setResult(next);
     };
     activeRuns.current += 1;
-    if (!keepControlsEnabled) setBusy(true);
+    if (!keepControlsEnabled) {
+      busyRuns.current += 1;
+      setBusy(true);
+    }
     publishResult(undefined);
     try {
       const value = await operation();
       if (asRecord(value).cancelled === true) {
         publishResult(undefined);
       } else if (isValidation(value)) {
-        setIssues(value.issues);
-        publishResult(value.valid ? translate("common.saved") : `${value.issues.length} ${translate("common.validationIssues")}`);
+        // A rejected draft leaves its own rows marked in the pane
+        // (`alertRowKeys`), so the strip states the outcome instead of a
+        // second report of the same problem.
+        publishResult(value.valid ? translate("common.saved") : translate("error.validationFailed"));
       } else if (isApplyResult(value)) {
-        setIssues(applyIssuesForDisplay(value));
         // An explicit caller message wins for the applied case so instant
         // applies can say "Saved" instead of the generic "Applied".
-        publishResult(applyResultMessage(value, translate, message));
+        publishResult(applyResultMessage(value, translate, typeof message === "string" ? message : null));
+      } else if (typeof message === "function") {
+        const key = message(value);
+        publishResult(key === null ? undefined : translate(key));
       } else {
-        setIssues([]);
         publishResult(message === null ? undefined : translate(message));
       }
       if (refreshAfter) await refresh();
     } catch (reason: unknown) {
       publishResult(errorMessage(reason, translate));
-      // A rejected Apply only says the draft is invalid. Ask the domain which
-      // entries failed so the pane can name them instead of leaving the user
-      // with a message that points at nothing.
-      if (stringValue(asRecord(reason).code) === "validation_failed" && (domain === "providers_models" || route === "providers-models")) {
-        try {
-          const summary = await ipc.validate("providers_models");
-          setIssues(summary.issues);
-        } catch {
-          // Keep the Apply failure; naming the issues is best-effort.
-        }
-      }
     } finally {
       activeRuns.current -= 1;
-      if (!keepControlsEnabled && activeRuns.current === 0) setBusy(false);
+      if (!keepControlsEnabled) {
+        busyRuns.current = Math.max(busyRuns.current - 1, 0);
+        if (busyRuns.current === 0) setBusy(false);
+      }
     }
   };
-  const runDataManagement = (tab: DataManagementTab, operation: () => Promise<unknown>, message: string | null, keepControlsEnabled = false): Promise<void> => run(operation, message, keepControlsEnabled, true, tab);
-  const runWebDavOperation = async (operation: () => Promise<unknown>, message: string): Promise<void> => {
+  const runDataManagement = (tab: DataManagementTab, operation: () => Promise<unknown>, message: ResultMessage, keepControlsEnabled = false): Promise<void> => run(operation, message, keepControlsEnabled, true, tab);
+  const runWebDavOperation = async (operation: () => Promise<unknown>, message: ResultMessage): Promise<void> => {
     if (webDavOperationInFlight.current) return;
     webDavOperationInFlight.current = true;
     setWebDavOperationBusy(true);
@@ -1559,16 +1836,18 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
     }, null, keepControlsEnabled, false);
     return succeeded ? outcome : undefined;
   };
-  const addOfficialAccount = async (kind: ServiceProviderKind): Promise<string> => {
+  const addOfficialAccount = async (kind: ServiceProviderKind, name?: string): Promise<string> => {
     const currentProviders = serviceProviderRecords(latestSnapshot.current ?? snapshot);
-    const name = nextServiceProviderName(currentProviders, kind);
-    const next = await dispatchWithOutcome("service_provider.add", { kind, name }, "providers_models");
+    // A caller that holds the account's own name wins: the surface the user
+    // typed it into is the one that names the entry.
+    const resolvedName = (name ?? "").trim() || nextServiceProviderName(currentProviders, kind);
+    const next = await dispatchWithOutcome("service_provider.add", { kind, name: resolvedName }, "providers_models");
     if (!next) throw new Error("service_provider.add was rejected");
     const summary = asRecord(asRecord(next.action_summaries?.providers_models).operation_summary);
     const summaryID = stringValue(summary.provider_id);
     const added = serviceProviderRecords(next).find((provider) => {
       const displayName = stringValue(provider.display_name, stringValue(provider.name)).trim();
-      return displayName === name;
+      return displayName === resolvedName;
     });
     const providerID = summaryID || (added ? editorIdentifier(added) : "");
     if (!providerID) throw new Error("service_provider.add did not return provider_id");
@@ -1772,7 +2051,7 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
     }
     return "keep";
   }, [ipc, native, onSnapshot, translate]);
-  const apply = (options?: { silent?: boolean; message?: string; keepControlsEnabled?: boolean }): Promise<void> => {
+  const apply = (options?: { silent?: boolean; quiet?: boolean; message?: string; keepControlsEnabled?: boolean }): Promise<void> => {
     if ((!settingsRoute && !domain) || domain === "logs") return Promise.resolve();
     return run(async () => {
       await flushPendingFields();
@@ -1793,7 +2072,7 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
         if (!accepted) return { cancelled: true };
       }
       if (risks.length > 0) {
-        const accepted = await native.showConfirmation({ title: translate("claude.confirmation.required"), message: translate("claude.confirmation.required"), confirmLabel: translate("screen.confirm") });
+        const accepted = await native.showConfirmation({ title: translate("claude.confirmation.title"), message: translate("claude.confirmation.required"), confirmLabel: translate("screen.confirm") });
         if (!accepted) return { cancelled: true };
       }
       const confirmations = [...risks, ...diskConflicts.map((name) => `overwrite_external_${name}`)];
@@ -1835,8 +2114,12 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
       // and a later edit is not stuck behind it.
       if (diskConflicts.length > 0) setKeptDiskGeneration({});
       return result;
-    }, options?.silent ? null : (options?.message ?? "common.saved"), options?.keepControlsEnabled === true);
+    }, options?.silent ? null : (options?.message ?? "common.saved"), options?.keepControlsEnabled === true, true, undefined, options?.quiet === true);
   };
+  // A child surface applies the draft it wrote itself (分组管理's 保存并关闭):
+  // the pane it was opened from must stay silent about work it did not start,
+  // and the child reports the outcome in its own status bar.
+  const applyStagedQuietly = (): Promise<void> => apply({ quiet: true });
   // The settings shell commits as the user changes controls. Wait for the
   // route's serial dispatch queue, then apply the staged domains; the debounce
   // coalesces a burst of toggles into one Core apply. A failed apply keeps its
@@ -1966,7 +2249,7 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
   const probeWebDav = (): Promise<void> => runWebDavOperation(async () => {
     await flushPendingFields();
     return ipc.probe(undefined, undefined, "webdav");
-  }, "webdav.probe");
+  }, (value) => (asRecord(value).ok === true ? "webdav.probeOk" : "webdav.probeFailed"));
   const syncWebDav = (action: WebDavSyncAction): Promise<void> => runWebDavOperation(async () => {
     await flushPendingFields();
     const refreshed = await ipc.snapshot();
@@ -1986,8 +2269,38 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
     const dispatched = await ipc.dispatch({ domain: "webdav", type: action, payload: { sections: [...WEBDAV_SYNC_DOMAINS] } }, revision.current);
     revision.current = dispatched.revision;
     return dispatched;
-  }, "dataManagement.synced");
+  }, (value) => {
+    const summary = asRecord(asRecord(value).action_summary);
+    if (stringValue(summary.archived_remote) !== "") return "dataManagement.syncedReplacingRemote";
+    // A setting renamed from an earlier default copies its file; a server that
+    // refuses DELETE keeps the old one, which the reader has to clear.
+    const adopted = asRecord(summary.adopted_remote);
+    if (stringValue(adopted.name) !== "" && adopted.removed !== true) return "dataManagement.syncedLeftoverRemote";
+    return "dataManagement.synced";
+  });
   const dispatchDataManagement: Dispatch = (type, payload = {}, targetDomain = "webdav") => runDataManagement("webdav", async () => enqueueDispatch(type, payload, targetDomain), null, true);
+  // A WebDAV setting is what the interval loop reads, so changing one applies
+  // it instead of leaving it in an open window's draft: the enable switch has
+  // to reach the flag file the loop checks, or it would mean nothing.  Commits
+  // are serialized because each one is its own stage-then-apply pair.
+  const webDavSettingsQueue = useRef<Promise<void>>(Promise.resolve());
+  const commitWebDavSettings = (patch: UnknownRecord): Promise<void> => {
+    const commit = async (): Promise<void> => {
+      await flushPendingFields();
+      const refreshed = await ipc.snapshot();
+      revision.current = refreshed.revision;
+      latestSnapshot.current = refreshed;
+      onSnapshot(refreshed);
+      const staged = await enqueueDispatch("patch", patch, "webdav");
+      revision.current = staged.revision;
+      const diskChanged = refreshed.disk.webdav?.changed === true;
+      const applied = await ipc.apply("webdav", revision.current, diskChanged ? ["overwrite_external_webdav"] : undefined);
+      revision.current = applied.revision;
+    };
+    const next = webDavSettingsQueue.current.catch(() => undefined).then(() => runDataManagement("webdav", commit, "common.saved"));
+    webDavSettingsQueue.current = next.catch(() => undefined);
+    return next;
+  };
   const applyProbedSurface: ApplyProbedSurface = (providerId, modelId, nextSurface, options) => {
     let applied = false;
     const queued = probedSurfaceApplyQueue.current.catch(() => undefined).then(async () => {
@@ -2064,9 +2377,28 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
       return false;
     });
   };
+  // The provider wizard reports the token its staged key is filed under, so
+  // every dismissal path of that surface can drop what it staged: a wizard the
+  // user closes reserves nothing.  The drop is quiet — a child surface's own
+  // bookkeeping never reports into the window that opened it — and it is a
+  // no-op once 完成 adopted the key.
+  const registerProviderWizardKeyToken = (token: string): void => {
+    providerWizardKeyToken.current = token;
+  };
+  const dropProviderWizardStagedKey = (): void => {
+    const token = providerWizardKeyToken.current;
+    providerWizardKeyToken.current = "";
+    if (!token) return;
+    void enqueueDispatch(
+      "provider.discard_pending_key",
+      { pending_api_key: `${WIZARD_PENDING_KEY_PREFIX}${token}` },
+      "providers_models",
+    ).catch(() => undefined);
+  };
   const closeRoute = (): void => {
     // Keep the React route close independent from the native window registry.
     // A stale/missing native window must not strand the route on screen.
+    if (route === "provider-wizard") dropProviderWizardStagedKey();
     if (route === "data-management") importPlanToken.current = undefined;
     if (route === "file-editor") {
       // The editor owns one document of the settings pane; closing it returns
@@ -2090,9 +2422,7 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
   };
   const requestClose = async (): Promise<void> => {
     // The provider wizard is a native modal child window. Its Cancel button
-    // and title-bar close both dismiss that child directly; partial staged
-    // provider edits remain in Core just as they did when the wizard was an
-    // in-window surface.
+    // and title-bar close both dismiss that child directly.
     if (route === "provider-wizard") {
       closeRoute();
       return;
@@ -2128,9 +2458,10 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
         return;
       }
       const confirmed = await native.showConfirmation({
-        title: translate("status.close"),
+        title: translate("settings.discardDraftTitle"),
         message: translate("common.discarded"),
         confirmLabel: translate("status.close"),
+        destructive: true,
       });
       if (!confirmed) {
         restoreWindow();
@@ -2184,12 +2515,34 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
     const detected = asRecord(next.action_summaries?.relay_accounts).detected_type;
     return detected === "newapi" || detected === "sub2api" ? detected : undefined;
   }, [enqueueDispatch, refresh]);
-  const refreshRelayResources = useCallback(async (accountId: string): Promise<"ready" | "unavailable"> => {
-    const staged = await enqueueDispatch("resources.refresh", { account_id: accountId }, "relay_accounts");
-    revision.current = staged.revision;
-    // The refresh reports its own projection as the action summary; the
-    // dispatch result itself only carries the revision and that summary.
-    return asRecord(staged.action_summary).resource_status === "ready" ? "ready" : "unavailable";
+  const refreshRelayResources = useCallback(async (accountId: string, options?: { force?: boolean }): Promise<"ready" | "unavailable"> => {
+    // Only a caller that must not see stale facts — a sign-in that just landed
+    // — passes ``force``: it always pays for a station round trip, while an
+    // implicit caller reuses a read that is running or one that just finished.
+    // A failed read is never reused, so the next implicit caller retries the
+    // station instead of inheriting the failure.
+    const forced = options?.force === true;
+    const inFlight = relayRefreshInFlight.current.get(accountId);
+    if (!forced && inFlight) return inFlight;
+    if (!forced) {
+      const fresh = relayRefreshFresh.current.get(accountId);
+      if (fresh && Date.now() - fresh.at < RELAY_RESOURCE_REUSE_MS) return fresh.status;
+    }
+    const pending = (async (): Promise<"ready" | "unavailable"> => {
+      const staged = await enqueueDispatch("resources.refresh", { account_id: accountId }, "relay_accounts");
+      revision.current = staged.revision;
+      // The refresh reports its own projection as the action summary; the
+      // dispatch result itself only carries the revision and that summary.
+      const status = asRecord(staged.action_summary).resource_status === "ready" ? "ready" : "unavailable";
+      if (status === "ready") relayRefreshFresh.current.set(accountId, { at: Date.now(), status });
+      return status;
+    })();
+    relayRefreshInFlight.current.set(accountId, pending);
+    try {
+      return await pending;
+    } finally {
+      relayRefreshInFlight.current.delete(accountId);
+    }
   }, [enqueueDispatch]);
   const relayApiKeyActions = useMemo<RelayApiKeyActions>(() => ({
     create: async (accountId, options) => {
@@ -2246,7 +2599,8 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
       return refresh();
     },
     apiKeyActions: relayApiKeyActions,
-  }), [commitRelayMetadata, detectRelayType, refresh, refreshRelayResources, relayApiKeyActions]);
+    applyStagedQuietly,
+  }), [applyStagedQuietly, commitRelayMetadata, detectRelayType, refresh, refreshRelayResources, relayApiKeyActions]);
   // The assistant file editor is its own window on macOS and a route on
   // Windows: RouteSurface owns its state, and the host presents the window
   // instead of a pane-clipped overlay in the detail column it opened from.
@@ -2265,24 +2619,28 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
   // toggles: checked installs this app's public model list as Codex's own
   // catalog, unchecked removes the pointer so Codex keeps its built-in list.
   const codexModelCatalogEnabled = booleanValue(codexModelCatalogState(snapshot).enabled);
+  // One strip per window. Backup & sync reports per tab, so the strip shows the
+  // active tab's own result; every other route reports its own work here.
+  const routeStatus = result;
 
   return <TranslationContext.Provider value={settingsRoute ? translate : undefined}><PendingFieldContext.Provider value={fieldRegistry}><View style={styles.windowSurface}>
-    {!shell && route !== "providers-models" && route !== "logs" && route !== "provider-wizard" && route !== "data-management" ? <WindowTitle title={windowTitle} validation={issues.length > 0 ? `${issues.length} ${translate("common.validationIssues")}` : undefined} /> : null}
+    {!shell && route !== "providers-models" && route !== "logs" && route !== "provider-wizard" && route !== "data-management" ? <WindowTitle title={windowTitle} /> : null}
     {route === "providers-models" || route === "provider-wizard" || route === "file-editor" || settingsRoute || route === "logs" || route === "runtime-settings" || route === "data-management" || route === "general-settings" ? <View style={[styles.windowContent, compactStyles.windowContent, styles.windowContentFixed, route === "file-editor" && styles.fileEditorRouteContent, route === "providers-models" && styles.providersContent, route === "provider-wizard" && styles.providerWizardRouteContent, settingsRoute && styles.assistantSettingsContent, route === "logs" && styles.logsContent, route === "runtime-settings" && styles.runtimeContent, route === "data-management" && styles.dataManagementContent]}>
     {route === "providers-models" ? <ProviderWorkspace snapshot={snapshot} ipc={ipc} onSnapshot={onSnapshot} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onStatus={setResult} onSecretState={onSecretState} applyProbedSurface={applyProbedSurface} onOpenWizard={() => { if (Platform.OS === "windows") onNavigate("provider-wizard"); native.window.open("provider-wizard"); }} relay={relayBridge} addOfficialAccount={addOfficialAccount} onActivateAndRestart={activateProviderAndRestart} /> : null}
-    {route === "file-editor" ? <FileEditorWorkspace file={inlineEditorFile} fileId={fileIdRequest} nativeAction={nativeAction} ipc={ipc} native={native} translate={translate} busy={busy} onEditorConflict={resolveRawEditorConflict} reloadToken={settingsRawReloadToken} baselineToken={settingsRawBaselineToken} syncRevision={snapshot?.revision} onFlushPendingFields={flushPendingFields} onStatus={setResult} onClose={closeRoute} /> : null}
-    {route === "provider-wizard" ? <ProviderSetupWizard snapshot={snapshot} native={native} providers={providerWizardProviders} relaySources={providerWizardRelaySources} relayStations={providerWizardRelayStations} busy={busy} translate={translate} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onStatus={setResult} onClose={closeRoute} relay={relayBridge} addOfficialAccount={addOfficialAccount} /> : null}
+    {route === "file-editor" ? <FileEditorWorkspace file={inlineEditorFile} fileId={fileIdRequest} nativeAction={nativeAction} ipc={ipc} native={native} translate={translate} busy={busy} onEditorConflict={resolveRawEditorConflict} reloadToken={settingsRawReloadToken} baselineToken={settingsRawBaselineToken} syncRevision={snapshot?.revision} onFlushPendingFields={flushPendingFields} onClose={closeRoute} /> : null}
+    {route === "provider-wizard" ? <ProviderSetupWizard snapshot={snapshot} native={native} providers={providerWizardProviders} relaySources={providerWizardRelaySources} relayStations={providerWizardRelayStations} busy={busy} translate={translate} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onStatus={setResult} onClose={closeRoute} onKeyToken={registerProviderWizardKeyToken} relay={relayBridge} addOfficialAccount={addOfficialAccount} /> : null}
     {settingsRoute ? <AssistantSettingsWorkspace busy={busy} native={native} codexModels={codexModelRows} codexModelCatalogEnabled={codexModelCatalogEnabled} clientProvider={codexClientProvider} clientModel={codexClientModel} localApiActive={codexUsesLocalApi} onToggleCodexModelCatalog={(enabled) => dispatch("codex.model_catalog.set", { enabled }, "codex")} onUseLocalApi={(selection) => dispatch("use_local_api", selection, "codex")} onUseSavedModel={(selection) => dispatch("use_saved_model", selection, "codex")} translate={translate} ipc={ipc} filesToken={settingsRawBaselineToken} onOpenFile={openAssistantFile} /> : null}
     {route === "logs" ? <LogsWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} translate={translate} dispatch={dispatch} onStatus={setResult} requestedTab={nativeAction?.id === "open-recovery" ? "recovery" : logTabRequest} requestedTabKey={nativeAction?.sequence ?? 0} /> : null}
     {route === "general-settings" ? <GeneralWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} dispatch={dispatch} dispatchServiceAction={enqueueServiceDispatch} translate={translate} onStatus={setResult} onSnapshot={onSnapshot} /> : null}
     {route === "runtime-settings" ? <RuntimeWorkspace snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} clearSecret={clearSecret} /> : null}
-    {route === "data-management" ? <DataManagementWorkspace snapshot={snapshot} busy={busy} webDavOperationBusy={webDavOperationBusy} statuses={dataManagementStatuses} translate={translate} dispatch={dispatchDataManagement} onSecretState={onSecretState} onFlushPendingFields={flushPendingFields} onTabSwitchError={(tab, reason) => setDataManagementStatuses((current) => ({ ...current, [tab]: errorMessage(reason, translate) }))} onInspectImport={inspectImportDataManagement} onImport={importDataManagement} onConfirmImportReplace={confirmImportDraftReplacement} onExport={exportDataManagement} onProbeWebDav={probeWebDav} onSyncWebDav={syncWebDav} /> : null}
-    {issues.length > 0 ? <IssueList issues={issues} translate={translate} /> : null}
+    {route === "data-management" ? <DataManagementWorkspace snapshot={snapshot} tab={dataManagementTab} onTabChange={setDataManagementTab} statuses={dataManagementStatuses} busy={busy} webDavOperationBusy={webDavOperationBusy} translate={translate} dispatch={dispatchDataManagement} onSecretState={onSecretState} onFlushPendingFields={flushPendingFields} onTabSwitchError={(tab, reason) => setDataManagementStatuses((current) => ({ ...current, [tab]: errorMessage(reason, translate) }))} onInspectImport={inspectImportDataManagement} onImport={importDataManagement} onConfirmImportReplace={confirmImportDraftReplacement} onExport={exportDataManagement} onProbeWebDav={probeWebDav} onSyncWebDav={syncWebDav} onCommitWebDavSettings={commitWebDavSettings} /> : null}
     </View> : null}
-    {/* One permanent status bar per pane window: the last result replaces the
-        idle Ready label, so the strip never appears or disappears mid-action
-        and the pane below it keeps a stable height. */}
-    {shell ? <View style={styles.routeStatusBar}><Text numberOfLines={2} style={styles.routeStatusText}>{result ?? translate("common.ready")}</Text></View> : null}
+    {/* One permanent status strip per settings window: the last result replaces
+        the idle Ready label, so the strip never appears or disappears
+        mid-action and the pane below it keeps a stable height.  A child window
+        keeps no strip of its own: it states its result beside its own footer
+        buttons instead. */}
+    {shell ? <View style={styles.routeStatusBar}><Text numberOfLines={2} style={styles.routeStatusText}>{routeStatus ?? translate("common.ready")}</Text></View> : null}
   </View></PendingFieldContext.Provider></TranslationContext.Provider>;
 }
 
@@ -2299,8 +2657,21 @@ function riskCodes(snapshot: CoreSnapshot, domain: ConfigDomain): string[] {
 
 const PROVIDER_WIZARD_NEW_PROVIDER = "__provider_wizard_new_provider__";
 const PROVIDER_WIZARD_NEW_KEY = "__provider_wizard_new_key__";
+/**
+ * The token a wizard files its key value under while the provider it belongs
+ * to does not exist yet: 添加向导 stages every field in its own steps, and
+ * 完成 is the one act that creates the provider, its key, and its models
+ * together. Core holds that value (its `_WIZARD_KEY_TARGET_PREFIX`) and
+ * `provider.add` adopts it — so 下一步 never mints a provider, and a wizard
+ * the user closes reserves nothing.
+ */
+const WIZARD_PENDING_KEY_PREFIX = "__wizard_provider__";
 
-type ServiceProviderKind = "openai_login" | "claude_login";
+function providerWizardKeyTarget(token: string, keyName: string): string {
+  return `${WIZARD_PENDING_KEY_PREFIX}${token}\u001f${keyName}`;
+}
+
+type ServiceProviderKind = "openai_login" | "claude_login" | "workbuddy_login" | "workbuddy_ai_login";
 
 function serviceProviderRecords(snapshot: CoreSnapshot | undefined): UnknownRecord[] {
   const state = domainState(snapshot, "providers_models");
@@ -2317,7 +2688,10 @@ function serviceProviderKindLabel(kind: ServiceProviderKind, translate: Translat
 }
 
 function nextServiceProviderName(providers: UnknownRecord[], kind: ServiceProviderKind): string {
-  const base = kind === "openai_login" ? "OpenAI" : "Claude";
+  const base = kind === "openai_login" ? "OpenAI"
+    : kind === "claude_login" ? "Claude"
+      : kind === "workbuddy_login" ? "WorkBuddy"
+        : "WorkBuddy AI";
   const names = new Set(providers.map((provider) => stringValue(provider.display_name, stringValue(provider.name)).trim().toLocaleLowerCase()).filter(Boolean));
   if (!names.has(base.toLocaleLowerCase())) return base;
   let suffix = 2;
@@ -2325,9 +2699,9 @@ function nextServiceProviderName(providers: UnknownRecord[], kind: ServiceProvid
   return `${base} ${suffix}`;
 }
 
-function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayStations, busy, translate, dispatchWithOutcome, onSecretState, onStatus, onClose, relay, addOfficialAccount }: { snapshot?: CoreSnapshot; native: NativeLeafAdapter; providers: UnknownRecord[]; relaySources: RelaySourceOption[]; relayStations: RelayStationOption[]; busy: boolean; translate: Translate; dispatchWithOutcome: (type: string, payload?: UnknownRecord, domain?: ConfigDomain, keepControlsEnabled?: boolean) => Promise<CoreSnapshot | undefined>; onSecretState: (state: SecretState) => void; onStatus: (status?: string) => void; onClose: () => void; relay: RelayWorkspaceBridge; addOfficialAccount: (kind: ServiceProviderKind) => Promise<string> }): React.JSX.Element {
+function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayStations, busy, translate, dispatchWithOutcome, onSecretState, onStatus, onClose, onKeyToken, relay, addOfficialAccount }: { snapshot?: CoreSnapshot; native: NativeLeafAdapter; providers: UnknownRecord[]; relaySources: RelaySourceOption[]; relayStations: RelayStationOption[]; busy: boolean; translate: Translate; dispatchWithOutcome: (type: string, payload?: UnknownRecord, domain?: ConfigDomain, keepControlsEnabled?: boolean) => Promise<CoreSnapshot | undefined>; onSecretState: (state: SecretState) => void; onStatus: (status?: string) => void; onClose: () => void; onKeyToken: (token: string) => void; relay: RelayWorkspaceBridge; addOfficialAccount: (kind: ServiceProviderKind, name?: string) => Promise<string> }): React.JSX.Element {
   type WizardStep = "provider" | "keys" | "model";
-  type WizardType = "api" | "openai" | "claude";
+  type WizardType = "api" | "openai" | "claude" | "workbuddy" | "workbuddyAI";
   const [step, setStep] = useState<WizardStep>("provider");
   const [providerType, setProviderType] = useState<WizardType>("api");
   const [providerMode, setProviderMode] = useState<"new" | "existing">("new");
@@ -2347,10 +2721,17 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   const [keySelection, setKeySelection] = useState("");
   const [keyName, setKeyName] = useState("");
   const [keyReady, setKeyReady] = useState(false);
-  // Core-side name of the key slot a fresh provider received.  The wizard
-  // presents that slot as「添加新的 API 密钥」instead of selecting it, so
-  // the picker never shows the generated word as a pre-selected key.
-  const [pendingNewKeyName, setPendingNewKeyName] = useState<string | undefined>(undefined);
+  // The key the wizard will give the provider it creates, and the token its
+  // value is staged under until then.  The value's target never moves while
+  // the user types: it carries this session's token and this session's key
+  // name, and the finished step names the key the user actually kept.
+  const [stagedKeyName] = useState(() => randomKeyName([]));
+  const [pendingKeyToken] = useState(() => `wizard-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`);
+  useEffect(() => {
+    // The window that opened this surface drops the staged key on every
+    // dismissal path, so it needs the token while the wizard is still up.
+    onKeyToken(pendingKeyToken);
+  }, [onKeyToken, pendingKeyToken]);
   // Model step.
   const [modelName, setModelName] = useState("");
   const [upstreamModel, setUpstreamModel] = useState("");
@@ -2364,13 +2745,24 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   const manualModelID = useRef(0);
   const [processing, setProcessing] = useState(false);
   const [validation, setValidation] = useState("");
+  // WorkBuddy: the account is the desktop app's own sign-in and the roster is
+  // its live catalog, so the wizard reads both instead of asking for a secret.
+  const [workbuddyAccount, setWorkbuddyAccount] = useState<UnknownRecord | undefined>(undefined);
+  const [workbuddyBusy, setWorkbuddyBusy] = useState(false);
+  // The wizard's one status line: its own validation or feedback, and the wait
+  // while the embedded sign-in page is up.  No step body repeats it.
+  const wizardStatus = validation || loginFeedback.current || (loginPhase === "sign-in" ? translate("relay.loginWorking") : "");
   const shownChallenge = useRef<Record<string, string>>({});
   const setLoginFeedbackMessage = (message: string | undefined): void => {
     loginFeedback.current = message;
     forceLoginFeedbackRender((value) => value + 1);
   };
 
-  const isLoginType = providerType === "openai" || providerType === "claude";
+  const isOfficialLoginType = providerType === "openai" || providerType === "claude";
+  const isWorkBuddyType = providerType === "workbuddy" || providerType === "workbuddyAI";
+  const isLoginType = isOfficialLoginType || isWorkBuddyType;
+  const workbuddyProvider = providerType === "workbuddyAI" ? "workbuddy-ai" : "workbuddy";
+  const workbuddyAuthKind: ServiceProviderKind = providerType === "workbuddyAI" ? "workbuddy_ai_login" : "workbuddy_login";
   const selectedProvider = providers.find((entry) => editorIdentifier(entry) === providerSelection);
   const providerID = selectedProvider ? editorIdentifier(selectedProvider) : "";
   const selectedProviderName = selectedProvider
@@ -2402,8 +2794,13 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     { value: PROVIDER_WIZARD_NEW_KEY, label: translate("providers.wizard.addApiKey") },
     ...keyChoices.filter((choice) => choice.kind === "independent").map((choice) => ({ value: choice.id, label: providerKeyChoiceLabel(choice, translate) })),
   ];
-  const activeKeySelection = keySelection || (pendingNewKeyName ? PROVIDER_WIZARD_NEW_KEY : keyOptions[1]?.value ?? PROVIDER_WIZARD_NEW_KEY);
+  const activeKeySelection = keySelection || (keyOptions[1]?.value ?? PROVIDER_WIZARD_NEW_KEY);
   const selectedKeyChoice = keyChoices.find((choice) => choice.id === activeKeySelection);
+  // A provider this wizard is creating does not exist yet, so its key value is
+  // staged under the wizard's own token (see `providerWizardKeyTarget`).
+  const creatingProvider = providerMode === "new" && !providerID;
+  const stagedKeyTarget = providerWizardKeyTarget(pendingKeyToken, stagedKeyName);
+  const finishedProviderKeyName = keyName.trim() || stagedKeyName;
   const selectedProvidedChoice = providedChoices.find((source) => `relay:${relaySourceSelectionID(source)}` === providedKeySelection) ?? providedChoices[0];
   const manualSelectedKeyName = selectedKeyChoice?.name ?? (activeKeySelection === PROVIDER_WIZARD_NEW_KEY ? keyName.trim() : "");
   const selectedKeyReady = Boolean(selectedKeyChoice && selectedKeyChoice.kind === "independent" && selectedKeyChoice.state?.configured) || keyReady;
@@ -2411,20 +2808,74 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     const values = [...(selectedProvidedChoice?.models ?? []), ...fetchedModelCandidates];
     return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
   }, [fetchedModelCandidates, selectedProvidedChoice?.models]);
+  // "Select an existing provider" matches by service: an official address
+  // typed by hand is the same service as the one the wizard injects.
+  const wizardService: ServiceID | undefined = providerType === "api" ? undefined : providerType;
   const providerOptions = providers
-    .filter((entry) => isLoginType ? providerKind(entry) === providerType : providerKind(entry) === "apiKey" || providerKind(entry) === "relay")
+    .filter((entry) => wizardService === undefined
+      ? providerKind(entry) === "apiKey" || providerKind(entry) === "relay"
+      : providerService(entry) === wizardService && !(providerAuthKind(entry) === "api_key" && keyPath === "login"))
     .map((entry) => {
       const id = editorIdentifier(entry);
       return { value: id, label: stringValue(entry.display_name, stringValue(entry.name, id)) };
     });
-  const officialStatus = isLoginType && selectedProvider ? providerAuthStatus(selectedProvider) : "signed_out";
-  const modelChoicesForOfficial = useMemo(() => (isLoginType && selectedProvider ? asRecords(selectedProvider.models).map(modelRecord) : []), [isLoginType, selectedProvider]);
+  const officialStatus = isOfficialLoginType && selectedProvider ? providerAuthStatus(selectedProvider) : "signed_out";
+  const modelChoicesForOfficial = useMemo(() => (isOfficialLoginType && selectedProvider ? asRecords(selectedProvider.models).map(modelRecord) : []), [isOfficialLoginType, selectedProvider]);
+  const servicePickerItems: Array<{ type: WizardType; label: string }> = [
+    { type: "api", label: translate("providers.wizard.typeApi") },
+    { type: "openai", label: translate("providers.type.openai") },
+    { type: "claude", label: translate("providers.type.claude") },
+    { type: "workbuddy", label: translate("providers.type.workbuddy") },
+    { type: "workbuddyAI", label: translate("providers.type.workbuddyAI") },
+  ];
+  const servicePickerLabels = servicePickerItems.map((item) => item.label);
+  // A service provider always carries its own address; only the custom entry
+  // edits the URL field.
+  const serviceBaseURL = providerType === "api" ? providerBaseURL : SERVICE_BASE_URLS[providerType];
+  const selectedServiceLabel = servicePickerItems.find((item) => item.type === providerType)?.label ?? servicePickerLabels[0] ?? "";
   const stepItems: Array<{ id: WizardStep; title: string }> = [
     { id: "provider", title: translate("providers.wizard.stepProvider") },
     { id: "keys", title: translate("providers.wizard.stepKeys") },
     { id: "model", title: translate("providers.wizard.stepModel") },
   ];
 
+  const loadWorkBuddyAccount = async (refresh = false): Promise<UnknownRecord | undefined> => {
+    setWorkbuddyBusy(true);
+    try {
+      const next = await dispatchWithOutcome("workbuddy_status", { refresh });
+      if (!next) return undefined;
+      const summary = asRecord(asRecord(next.action_summaries?.providers_models).operation_summary);
+      const account = asRecord(asRecord(summary.providers)[workbuddyProvider]);
+      setWorkbuddyAccount(account);
+      return account;
+    } finally {
+      setWorkbuddyBusy(false);
+    }
+  };
+  useEffect(() => {
+    if (step === "keys" && isWorkBuddyType) void loadWorkBuddyAccount(true);
+    // The selected type and the reached step are the only triggers: a reload
+    // on every render would fight the refresh button beside the account.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [step, providerType]);
+  const providerStepValid = (): boolean => {
+    const name = providerName.trim();
+    if (!name) {
+      setValidation(translate("providers.wizard.required"));
+      return false;
+    }
+    if (providerNameExists(providers, name, providerMode === "existing" ? providerID : "")) {
+      setValidation(translate("providers.wizard.duplicateName"));
+      return false;
+    }
+    // A custom provider carries its own address, and the step that asks for
+    // it is where its absence is stated.
+    if (providerMode === "new" && !serviceBaseURL.trim()) {
+      setValidation(translate("providers.wizard.required"));
+      return false;
+    }
+    return true;
+  };
   // Present the device-code challenge for official account logins.
   const presentAuthChallenge = (next: CoreSnapshot | undefined, kind: ServiceProviderKind, label: string, accountFingerprint: string): void => {
     const summary = asRecord(asRecord(next?.action_summaries?.providers_models).operation_summary);
@@ -2458,7 +2909,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     }
   };
   useEffect(() => {
-    if (!isLoginType || officialStatus !== "authorizing" || !providerID) return;
+    if (!isOfficialLoginType || officialStatus !== "authorizing" || !providerID) return;
     const kind: ServiceProviderKind = providerType === "claude" ? "claude_login" : "openai_login";
     const timer = setInterval(() => {
       void dispatchWithOutcome("service_provider.auth_status", { provider_id: providerID }, "providers_models", true)
@@ -2477,26 +2928,28 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   }, [loginPhase, native.window]);
 
   useEffect(() => {
-    if (!selectedProvider || processing || pendingNewKeyName || keySelection === PROVIDER_WIZARD_NEW_KEY || keyOptions.some((choice) => choice.value === keySelection)) return;
+    if (!selectedProvider || processing || keySelection === PROVIDER_WIZARD_NEW_KEY || keyOptions.some((choice) => choice.value === keySelection)) return;
     setKeySelection(keyOptions[1]?.value ?? PROVIDER_WIZARD_NEW_KEY);
     setKeyReady(false);
-  }, [keyOptions, keySelection, pendingNewKeyName, processing, selectedProvider]);
+  }, [keyOptions, keySelection, processing, selectedProvider]);
 
-  // Seed the editable key-name field once per key selection: a new key gets
-  // a random word, an existing independent key gets its current name.
+  // Seed the editable key-name field once per key selection: the name the
+  // staged value is filed under for a provider this wizard will create, a
+  // random word for a new key of an existing one, and an existing independent
+  // key's own name.
   const keyNameSeedSelection = useRef<string>("");
   useEffect(() => {
     if (step !== "keys" || keyNameSeedSelection.current === activeKeySelection) return;
     if (activeKeySelection === PROVIDER_WIZARD_NEW_KEY) {
       keyNameSeedSelection.current = activeKeySelection;
-      setKeyName(pendingNewKeyName ?? randomKeyName([]));
+      setKeyName(creatingProvider ? stagedKeyName : randomKeyName([]));
       return;
     }
     if (selectedKeyChoice && selectedKeyChoice.kind === "independent") {
       keyNameSeedSelection.current = activeKeySelection;
       setKeyName(selectedKeyChoice.name);
     }
-  }, [activeKeySelection, pendingNewKeyName, selectedKeyChoice, step]);
+  }, [activeKeySelection, creatingProvider, selectedKeyChoice, stagedKeyName, step]);
 
   useEffect(() => {
     modelFetchRequest.current += 1;
@@ -2517,18 +2970,67 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     setKeySelection("");
     setKeyName("");
     setKeyReady(false);
-    setPendingNewKeyName(undefined);
+    // The keys step re-seeds its own fields for the type just chosen.
+    keyNameSeedSelection.current = "";
     setValidation("");
+    // An official service signs in through its own web login first; a custom
+    // key stays available as the second choice for OpenAI and Claude.
     setKeyPath(value === "api" ? "manual" : "login");
     setSignedInAccountID(undefined);
     setProvidedKeySelection("");
+    // A non-custom type carries the service's own address, so the URL field is
+    // filled from the service table and every later step treats it as fixed.
+    setProviderBaseURL(value === "api" ? "" : SERVICE_BASE_URLS[value]);
+    // The entry is named after its own product, and a second entry for the
+    // same account has to stay distinguishable.
+    setProviderName(value === "workbuddy" ? nextServiceProviderName(providers, "workbuddy_login")
+      : value === "workbuddyAI" ? nextServiceProviderName(providers, "workbuddy_ai_login")
+        : value === "openai" ? nextServiceProviderName(providers, "openai_login")
+          : value === "claude" ? nextServiceProviderName(providers, "claude_login")
+            : "");
+    setWorkbuddyAccount(undefined);
+    setSelectedModels([]);
+    setModelFetchState("idle");
+  };
+  useEffect(() => {
+    // Keep a service entry's suggested name unique. The first suggestion runs
+    // from the picker's own callback, which may still see the provider list of
+    // the render that mounted it; this effect re-runs whenever that list
+    // arrives and repairs the untouched default (never a name the user typed).
+    // Only the provider step renames: once the entry exists, the suggestion is
+    // no longer this draft's to change.
+    if (step !== "provider" || providerMode !== "new" || providerType === "api") return;
+    const kind: ServiceProviderKind = providerType === "workbuddy" ? "workbuddy_login"
+      : providerType === "workbuddyAI" ? "workbuddy_ai_login"
+        : providerType === "claude" ? "claude_login"
+          : "openai_login";
+    const baseName = nextServiceProviderName([], kind);
+    const suggested = nextServiceProviderName(providers, kind);
+    setProviderName((current) => (current.trim() === "" || current.trim() === baseName ? suggested : current));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [providers, providerType, providerMode, keyPath, step]);
+
+  /** Switch one official service between its web login and a custom key. */
+  const chooseOfficialAuthPath = (path: "login" | "manual"): void => {
+    setKeyPath(path);
+    setKeySelection("");
+    setKeyName("");
+    setKeyReady(false);
+    keyNameSeedSelection.current = "";
+    setValidation("");
+    setProviderName(path === "login"
+      ? nextServiceProviderName(providers, providerType === "claude" ? "claude_login" : "openai_login")
+      : "");
   };
   const chooseExistingProvider = (value: string): void => {
     setProviderMode("existing");
     setProviderSelection(value);
+    // An existing account-backed entry keeps its own key path: a login
+    // provider shows the account, a custom-key entry shows its key.
+    const existing = providers.find((entry) => editorIdentifier(entry) === value);
+    setKeyPath(existing && providerAuthKind(existing) === "api_key" ? "manual" : "login");
     setKeySelection("");
     keyNameSeedSelection.current = "";
-    setPendingNewKeyName(undefined);
     setKeyName("");
     setKeyReady(false);
     setValidation("");
@@ -2539,9 +3041,11 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     const first = providerOptions[0];
     setProviderMode(value);
     setProviderSelection(value === "new" ? PROVIDER_WIZARD_NEW_PROVIDER : first?.value ?? PROVIDER_WIZARD_NEW_PROVIDER);
+    setKeyPath(value === "new" ? (providerType === "api" ? "manual" : "login") : first && providerAuthKind(first) === "api_key" ? "manual" : "login");
     setKeySelection("");
     setKeyName("");
     setKeyReady(false);
+    keyNameSeedSelection.current = "";
     setValidation("");
     setSignedInAccountID(undefined);
     setProvidedKeySelection("");
@@ -2551,6 +3055,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   // the user edits the name manually.
   const lastSuggestedProviderName = useRef("");
   const updateProviderBaseURL = (value: string): void => {
+    if (providerType !== "api") return;
     setProviderBaseURL(value);
     const suggested = suggestedProviderName(value);
     const current = providerName.trim();
@@ -2587,7 +3092,9 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     const name = modelName.trim();
     const upstream = upstreamModel.trim();
     if (!name || !upstream) {
-      setValidation(translate("providers.wizard.required"));
+      // These two are one entry, not two required fields: the message names
+      // the pair instead of a mark it cannot carry.
+      setValidation(translate("providers.wizard.manualModelPairRequired"));
       return;
     }
     const existing = manualModels.find((model) => model.name === name && model.upstream_model === upstream);
@@ -2614,17 +3121,29 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     if (modelFetchState === "loading") return;
     const keyChoice = selectedKeyChoice;
     const keyNameValue = manualSelectedKeyName;
-    if (!providerID || !keyNameValue) return;
+    // A provider this wizard has not created yet is addressed by the wizard's
+    // own token and the address its steps hold: the listing reads the staged
+    // key and leaves no provider behind.
+    const pendingAddress = serviceBaseURL.trim();
+    const fetchIdentity = creatingProvider ? pendingKeyToken : providerID;
+    if (!keyNameValue || (creatingProvider ? !pendingAddress : !providerID)) return;
     const request = ++modelFetchRequest.current;
     setModelFetchState("loading");
     setFetchedModelCapabilities({});
-    const relaySource = keyChoice?.kind === "relay" ? keyChoice.source : undefined;
+    const relaySource = !creatingProvider && keyChoice?.kind === "relay" ? keyChoice.source : undefined;
     const action = relaySource ? "provider.fetch_relay_resource_models" : "providers.fetch_models";
     const payload = relaySource ? {
       provider_id: providerID,
       station_id: relaySource.stationID,
       account_id: relaySource.accountID,
       resource_id: relaySource.resourceID,
+    } : creatingProvider ? {
+      pending_provider: {
+        pending_api_key: `${WIZARD_PENDING_KEY_PREFIX}${pendingKeyToken}`,
+        name: providerName.trim(),
+        api_base: pendingAddress,
+        api_key_name: keyNameValue,
+      },
     } : {
       provider_id: providerID,
       api_key_name: keyNameValue,
@@ -2636,7 +3155,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       const summaryProviderID = stringValue(summary.provider_id);
       const providerIdentity = selectedProvider ? identifier(selectedProvider) : "";
       if (stringValue(summary.operation) !== "fetch_models"
-        || (summaryProviderID !== providerID && summaryProviderID !== providerIdentity)) {
+        || (summaryProviderID !== fetchIdentity && summaryProviderID !== providerIdentity)) {
         setModelFetchState("unavailable");
         return;
       }
@@ -2665,64 +3184,81 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       }
     }
   };
-  const createProvider = async (): Promise<boolean> => {
-    if (providerType === "openai" || providerType === "claude") {
-      setProcessing(true);
-      try {
-        const providerNewID = await addOfficialAccount(providerType === "claude" ? "claude_login" : "openai_login");
-        setProviderMode("existing");
-        setProviderSelection(providerNewID);
-        setValidation("");
-        return true;
-      } catch {
-        setValidation(translate("relay.operationFailed"));
-        return false;
-      } finally {
-        setProcessing(false);
-      }
-    }
+  /**
+   * The wizard's one create — 完成 is what mints the provider.
+   *
+   * Its own steps staged the name, the address, and (for a custom key) the
+   * key value, so 下一步 never creates anything and a wizard the user closes
+   * reserves nothing.  The key value is adopted here through the token the
+   * wizard filed it under; the models are added by the caller right after.
+   */
+  const commitWizardProvider = async (): Promise<string | undefined> => {
     const name = providerName.trim();
-    const baseURL = providerBaseURL.trim();
-    if (!name || !baseURL) {
-      setValidation(translate("providers.wizard.required"));
-      return false;
+    if (!name || !providerStepValid()) return undefined;
+    if (isWorkBuddyType) {
+      // The service entry is created empty: the desktop app's account and its
+      // model roster are associated in the provider's 「服务商关联」 section.
+      const next = await dispatchWithOutcome("service_provider.add", {
+        kind: workbuddyAuthKind,
+        name,
+        models: [],
+      });
+      if (!next) return undefined;
+      const summary = asRecord(asRecord(next.action_summaries?.providers_models).operation_summary);
+      const added = serviceProviderRecords(next).find((entry) => editorIdentifier(entry) === stringValue(summary.provider_id))
+        ?? serviceProviderRecords(next).find((entry) => stringValue(entry.display_name, stringValue(entry.name)).trim() === name);
+      if (!added) return undefined;
+      const createdServiceID = editorIdentifier(added);
+      setProviderMode("existing");
+      setProviderSelection(createdServiceID);
+      return createdServiceID;
     }
-    if (providerNameExists(providers, name)) {
-      setProviderName("");
-      setProviderBaseURL("");
-      setValidation(translate("providers.wizard.duplicateName"));
-      return false;
+    const baseURL = serviceBaseURL.trim();
+    if (!baseURL) {
+      setValidation(translate("providers.wizard.required"));
+      return undefined;
     }
     const existingIDs = new Set(providers.map(editorIdentifier));
-    setProcessing(true);
-    try {
-      const initialKeyName = randomKeyName([]);
-      const next = await dispatchWithOutcome("provider.add", { provider: {
+    const usingProvidedKey = keyPath === "login";
+    const next = await dispatchWithOutcome("provider.add", {
+      provider: {
         name,
         api_base: baseURL,
         auth_kind: "api_key",
         enabled: true,
         models: [],
-        create_default_api_key: true,
-        initial_api_key_name: initialKeyName,
-      } });
-      if (!next) return false;
-      const nextState = domainState(next, "providers_models");
-      const nextProviders = asRecords(nextState.providers).length > 0
-        ? asRecords(nextState.providers)
-        : (next.providers_models.providers ?? []).map(providerRecord);
-      const added = nextProviders.find((entry) => !existingIDs.has(editorIdentifier(entry)))
-        ?? nextProviders.find((entry) => stringValue(entry.name).trim() === name);
-      if (!added) return false;
-      setPendingNewKeyName(initialKeyName);
-      setKeyName(initialKeyName);
-      setProviderMode("existing");
-      setProviderSelection(editorIdentifier(added));
-      setValidation("");
-      return true;
-    } finally {
-      setProcessing(false);
+        // A provided key is the provider's key: it arrives with the model's
+        // own relay resource, so no empty independent slot is created.
+        ...(usingProvidedKey ? {} : {
+          create_default_api_key: true,
+          initial_api_key_name: finishedProviderKeyName,
+        }),
+      },
+      ...(usingProvidedKey ? {} : { pending_api_key: `${WIZARD_PENDING_KEY_PREFIX}${pendingKeyToken}` }),
+    });
+    if (!next) return undefined;
+    const nextState = domainState(next, "providers_models");
+    const nextProviders = asRecords(nextState.providers).length > 0
+      ? asRecords(nextState.providers)
+      : (next.providers_models.providers ?? []).map(providerRecord);
+    const added = nextProviders.find((entry) => !existingIDs.has(editorIdentifier(entry)))
+      ?? nextProviders.find((entry) => stringValue(entry.name).trim() === name);
+    if (!added) return undefined;
+    const createdID = editorIdentifier(added);
+    // The wizard now edits the provider it just made: a 完成 that still has
+    // work left (its models) continues on this entry instead of creating a
+    // second one with the same name.
+    setProviderMode("existing");
+    setProviderSelection(createdID);
+    // A provider that belongs to a relay station is bound to it now, while
+    // its provided keys are what its models route through.
+    if (usingProvidedKey) {
+      const station = stationForProvider
+        ?? relayStations.find((candidate) => candidate.id === (selectedProvidedChoice?.stationID ?? ""));
+      if (station) await dispatchWithOutcome("provider.select_relay_station", { provider_id: createdID, station_id: station.id });
     }
+    setValidation("");
+    return createdID;
   };
   const createKey = async (): Promise<boolean> => {
     if (!providerID || !keyName.trim()) {
@@ -2805,7 +3341,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         if (signedInAccountID === pendingID) setSignedInAccountID(undefined);
         return;
       }
-      const status = await relay.refreshResources(pendingID);
+      const status = await relay.refreshResources(pendingID, { force: true });
       if (status !== "ready") setLoginFeedbackMessage(translate("relay.loginResourcesUnavailable"));
       else setLoginFeedbackMessage(translate("relay.loginComplete"));
       // Bind the vendor to the station so its keys become linkable.
@@ -2835,11 +3371,32 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     native.cancelRelayLogin();
   };
   const startOfficialLogin = async (): Promise<void> => {
-    if (!providerID) return;
+    // An official service's account is the one record this wizard creates
+    // before 完成: the sign-in needs the provider it belongs to, so pressing
+    // 登录 is what mints it — never 下一步.
+    let target = providerID;
+    if (!target) {
+      if (!providerStepValid()) return;
+      setProcessing(true);
+      try {
+        target = await addOfficialAccount(
+          providerType === "claude" ? "claude_login" : "openai_login",
+          providerName.trim(),
+        );
+      } catch {
+        setValidation(translate("relay.operationFailed"));
+        return;
+      } finally {
+        setProcessing(false);
+      }
+      setProviderMode("existing");
+      setProviderSelection(target);
+      setValidation("");
+    }
     const kind = providerType === "claude" ? "claude_login" : "openai_login";
-    delete shownChallenge.current[providerID];
-    const next = await dispatchWithOutcome("service_provider.auth_start", { provider_id: providerID }, "providers_models");
-    presentAuthChallenge(next, kind, selectedProviderName || serviceProviderKindLabel(kind, translate), providerID);
+    delete shownChallenge.current[target];
+    const next = await dispatchWithOutcome("service_provider.auth_start", { provider_id: target }, "providers_models");
+    presentAuthChallenge(next, kind, selectedProviderName || serviceProviderKindLabel(kind, translate), target);
   };
   const cancelOfficialLogin = async (): Promise<void> => {
     if (!providerID) return;
@@ -2856,9 +3413,15 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     setValidation("");
     if (step === "provider") {
       if (providerMode === "new") {
-        const ready = await createProvider();
-        if (!ready) return;
-      } else if (!providerID) {
+        // 下一步 stages the step's own fields; it never creates the provider.
+        // 完成 is the one create (a WorkBuddy entry and a custom provider
+        // both wait for it), and an official account is created by the press
+        // that signs in to it.
+        if (!providerStepValid()) return;
+        setStep("keys");
+        return;
+      }
+      if (!providerID) {
         setValidation(translate("providers.wizard.required"));
         return;
       }
@@ -2866,11 +3429,33 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       return;
     }
     if (step === "keys") {
+      if (isWorkBuddyType) {
+        // Nothing is typed here: the desktop app owns the sign-in, and the
+        // account is associated in the provider's 「服务商关联」 section.
+        setStep("model");
+        return;
+      }
+      if (creatingProvider) {
+        // The provider does not exist yet, so this step states the field its
+        // own create will carry: a custom key that is staged, or the provided
+        // key this provider's models will route through.
+        if (!usingProvidedKeyPath(keyPath) && (!keyName.trim() || !keyReady)) {
+          setValidation(translate("providers.wizard.required"));
+          return;
+        }
+        if (usingProvidedKeyPath(keyPath) && !selectedProvidedChoice) {
+          setValidation(translate("providers.wizard.loginRequired"));
+          return;
+        }
+        setStep("model");
+        if (!usingProvidedKeyPath(keyPath) && modelCandidates.length === 0) void fetchWizardModels();
+        return;
+      }
       if (!selectedProvider) {
         setValidation(translate("providers.wizard.required"));
         return;
       }
-      if (isLoginType) {
+      if (isOfficialLoginType && keyPath === "login") {
         if (officialStatus !== "signed_in") {
           setValidation(translate("providers.wizard.loginRequired"));
           return;
@@ -2888,26 +3473,6 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         return;
       }
       if (activeKeySelection === PROVIDER_WIZARD_NEW_KEY) {
-        if (pendingNewKeyName) {
-          const editedName = keyName.trim();
-          if (!editedName || !keyReady) {
-            setValidation(translate("providers.wizard.required"));
-            return;
-          }
-          if (editedName !== pendingNewKeyName) {
-            setProcessing(true);
-            try {
-              const renamed = await dispatchWithOutcome("provider.key_patch", { provider_id: providerID, old_name: pendingNewKeyName, name: editedName });
-              if (!renamed) return;
-              setPendingNewKeyName(editedName);
-            } finally {
-              setProcessing(false);
-            }
-          }
-          setStep("model");
-          if (modelCandidates.length === 0) void fetchWizardModels();
-          return;
-        }
         if (await createKey()) return;
         return;
       }
@@ -2936,9 +3501,24 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       return;
     }
     // Model step.
-    if (isLoginType) {
+    if (isOfficialLoginType && keyPath === "login") {
       onStatus(translate("providers.wizard.complete"));
       onClose();
+      return;
+    }
+    // WorkBuddy imported nothing here: its models arrive with the account in
+    // the provider's own association section, and 完成 is what creates its
+    // service entry.
+    if (isWorkBuddyType) {
+      setProcessing(true);
+      try {
+        const created = providerID || await commitWizardProvider();
+        if (!created) return;
+        onStatus(translate("providers.wizard.complete"));
+        onClose();
+      } finally {
+        setProcessing(false);
+      }
       return;
     }
     const draftModelName = modelName.trim();
@@ -2965,45 +3545,45 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       ...(draftModel ? [draftModel] : []),
     ];
     const uniqueRequestedModels = requestedModels.filter((model, index, all) => all.findIndex((candidate) => candidate.name === model.name && candidate.upstream_model === model.upstream_model) === index);
-    if (!providerID || uniqueRequestedModels.length === 0 || (!usingProvidedKey && !manualSelectedKeyName)) {
+    if (uniqueRequestedModels.length === 0 || (!usingProvidedKey && !manualSelectedKeyName)) {
       setValidation(translate("providers.wizard.selectAtLeastOneModel"));
       return;
     }
     setProcessing(true);
     try {
+      // The wizard's create lands here, with everything its steps staged: the
+      // provider arrives with its key, and the models follow on it.
+      const targetProviderID = providerID || await commitWizardProvider();
+      if (!targetProviderID) return;
       const existingModelIDs = selectedProvider ? new Set(asRecords(selectedProvider.models).map(modelRecord).map(editorIdentifier)) : new Set<string>();
       const transientRelaySource = usingProvidedKey && selectedProvidedChoice ? {
         stationID: selectedProvidedChoice.stationID,
         accountID: selectedProvidedChoice.accountID,
         resourceID: selectedProvidedChoice.resourceID,
       } : undefined;
-      const pendingKeyChoice = selectedProvider && pendingNewKeyName
-        ? providerKeyStates(selectedProvider).find((key) => key.name === pendingNewKeyName)
-        : undefined;
       const keyIDForModels = usingProvidedKey
         ? undefined
-        : selectedKeyChoice?.id && selectedKeyChoice.kind === "independent" ? selectedKeyChoice.id : pendingKeyChoice?.id;
+        : selectedKeyChoice?.id && selectedKeyChoice.kind === "independent" ? selectedKeyChoice.id : undefined;
       const modelPayload = uniqueRequestedModels.map((model, index) => ({
         ...model,
-        api_key_name: usingProvidedKey ? selectedProvidedChoice?.resourceLabel ?? "" : manualSelectedKeyName,
+        api_key_name: usingProvidedKey ? selectedProvidedChoice?.resourceLabel ?? "" : creatingProvider ? finishedProviderKeyName : manualSelectedKeyName,
         ...(keyIDForModels ? { provider_key_id: keyIDForModels } : {}),
         enabled: true,
-        order: index + 1,
       }));
-      const next = await dispatchWithOutcome("model.add_many", { provider_id: providerID, models: modelPayload });
+      const next = await dispatchWithOutcome("model.add_many", { provider_id: targetProviderID, models: modelPayload });
       if (!next) return;
       if (transientRelaySource) {
         const nextState = domainState(next, "providers_models");
         const nextProviders = asRecords(nextState.providers).length > 0
           ? asRecords(nextState.providers)
           : (next.providers_models.providers ?? []).map(providerRecord);
-        const nextProvider = nextProviders.find((entry) => editorIdentifier(entry) === providerID);
+        const nextProvider = nextProviders.find((entry) => editorIdentifier(entry) === targetProviderID);
         const addedModels = nextProvider ? asRecords(nextProvider.models).map(modelRecord) : [];
         for (const requested of uniqueRequestedModels) {
           const addedModel = addedModels.find((entry) => !existingModelIDs.has(editorIdentifier(entry)) && stringValue(entry.name).trim() === requested.name);
           if (!addedModel) return;
           const relayed = await dispatchWithOutcome("model.select_relay_resource", {
-            provider_id: providerID,
+            provider_id: targetProviderID,
             model_id: editorIdentifier(addedModel),
             source: {
               kind: "relay",
@@ -3045,26 +3625,30 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         </View>
         {loginPhase === "sign-in" ? <View style={styles.providerWizardSignInPanel}>
           <Text style={styles.providerWizardPanelTitle}>{translate("relay.stepSignIn")}</Text>
-          <Text style={styles.providerWizardHint}>{loginFeedback.current ?? translate("relay.loginWorking")}</Text>
         </View> : <>
         {step === "provider" ? <View style={styles.providerWizardFormSection}>
           <NativeFormRow label={translate("providers.wizard.providerType")}>
-            <NativeSegmentedControl labels={[translate("providers.wizard.typeApi"), translate("providers.type.openai"), translate("providers.type.claude")]} selectedValue={providerType === "api" ? translate("providers.wizard.typeApi") : providerKindLabel(providerType, translate)} disabled={wizardBusy} onChange={({ nativeEvent }) => { const kinds: WizardType[] = ["api", "openai", "claude"]; chooseProviderType(kinds[nativeEvent.index] ?? "api"); }} style={styles.providerWizardModeControl} />
+            <NativePicker labels={servicePickerLabels} selectedValue={selectedServiceLabel} disabled={wizardBusy} onChange={({ nativeEvent }) => { const kinds: WizardType[] = ["api", "openai", "claude", "workbuddy", "workbuddyAI"]; chooseProviderType(kinds[nativeEvent.index] ?? "api"); }} style={styles.providerWizardPicker} />
           </NativeFormRow>
+          {providerMode === "new" && isOfficialLoginType ? <NativeFormRow label={translate("providers.wizard.authPath")}>
+            <NativePicker labels={[translate("providers.wizard.pathWebLogin"), translate("providers.wizard.pathCustomKey")]} selectedValue={keyPath === "login" ? translate("providers.wizard.pathWebLogin") : translate("providers.wizard.pathCustomKey")} disabled={wizardBusy} onChange={({ nativeEvent }) => { chooseOfficialAuthPath(nativeEvent.index === 1 ? "manual" : "login"); }} style={styles.providerWizardPicker} />
+          </NativeFormRow> : null}
           {providerOptions.length > 0 ? <NativeFormRow label={translate("providers.wizard.sourceMode")}>
             <NativeSegmentedControl labels={[translate("providers.wizard.addProvider"), translate("providers.wizard.selectProvider")]} selectedValue={providerMode === "new" ? translate("providers.wizard.addProvider") : translate("providers.wizard.selectProvider")} disabled={wizardBusy} onChange={({ nativeEvent }) => chooseProviderMode(nativeEvent.index === 1 ? "existing" : "new")} style={styles.providerWizardModeControl} />
           </NativeFormRow> : null}
-          {providerMode === "existing" ? <NativeFormRow label={translate("providers.wizard.selectProvider")}><NativePicker labels={providerPickerLabels} selectedValue={selectedProviderPickerLabel} disabled={wizardBusy || providerPickerLabels.length === 0} onChange={({ nativeEvent }) => { const option = providerOptions[nativeEvent.index]; if (option) chooseExistingProvider(option.value); }} style={styles.providerWizardPicker} /></NativeFormRow> : null}
-          {providerMode === "new" && providerType === "api" ? <>
-            <NativeFormRow label={translate("providers.wizard.baseUrl")}><NativeTextField value={providerBaseURL} placeholder={translate("providers.wizard.baseUrlPlaceholder")} editable={!wizardBusy} autoCapitalize="none" autoCorrect={false} onChangeText={updateProviderBaseURL} accessibilityLabel={translate("providers.wizard.baseUrl")} style={styles.providerWizardInput} /></NativeFormRow>
-            <NativeFormRow label={translate("providers.wizard.providerName")}><NativeTextField value={providerName} placeholder={translate("providers.wizard.providerNamePlaceholder")} editable={!wizardBusy} autoCapitalize="none" autoCorrect={false} onChangeText={updateProviderName} accessibilityLabel={translate("providers.wizard.providerName")} style={styles.providerWizardInput} /></NativeFormRow>
+          {providerMode === "existing" ? <NativeFormRow required label={translate("providers.wizard.selectProvider")}><NativePicker labels={providerPickerLabels} selectedValue={selectedProviderPickerLabel} disabled={wizardBusy || providerPickerLabels.length === 0} onChange={({ nativeEvent }) => { const option = providerOptions[nativeEvent.index]; if (option) chooseExistingProvider(option.value); }} style={styles.providerWizardPicker} /></NativeFormRow> : null}
+          {providerMode === "new" ? <>
+            <NativeFormRow required label={translate("providers.wizard.baseUrl")}><NativeTextField value={serviceBaseURL} placeholder={translate("providers.wizard.baseUrlPlaceholder")} editable={providerType === "api" && !wizardBusy} autoCapitalize="none" autoCorrect={false} onChangeText={updateProviderBaseURL} accessibilityLabel={translate("providers.wizard.baseUrl")} style={styles.providerWizardInput} /></NativeFormRow>
+            <NativeFormRow required label={translate("providers.wizard.providerName")}><NativeTextField value={providerName} placeholder={translate("providers.wizard.providerNamePlaceholder")} editable={!wizardBusy} autoCapitalize="none" autoCorrect={false} onChangeText={updateProviderName} accessibilityLabel={translate("providers.wizard.providerName")} style={styles.providerWizardInput} /></NativeFormRow>
           </> : null}
-          {providerMode === "new" && isLoginType ? <Text style={styles.providerWizardHint}>{providerType === "openai" ? translate("relay.officialProviderWebViewHint") : translate("relay.officialProviderBrowserHint")}</Text> : null}
+          {providerMode === "new" && providerType !== "api" ? <Text style={styles.providerWizardHint}>{translate("providers.wizard.serviceUrlFixed")}</Text> : null}
+          {providerMode === "new" && isOfficialLoginType && keyPath === "login" ? <Text style={styles.providerWizardHint}>{providerType === "openai" ? translate("relay.officialProviderWebViewHint") : translate("relay.officialProviderBrowserHint")}</Text> : null}
+          {providerMode === "new" && isWorkBuddyType ? <Text style={styles.providerWizardHint}>{translate("providers.wizard.workbuddyAppHint")}</Text> : null}
           {providerMode === "existing" && selectedProvider ? <Text numberOfLines={1} style={styles.providerWizardHint}>{activeProviderBaseURL || translate("common.notAvailable")}</Text> : null}
         </View> : null}
         {step === "keys" ? <View style={styles.providerWizardFormSection}>
           <View style={styles.providerWizardSectionHeader}><Text style={styles.providerWizardPanelTitle}>{translate("providers.wizard.stepKeys")}</Text><Text numberOfLines={1} style={styles.providerWizardHint}>{selectedProviderName}</Text></View>
-          {isLoginType ? <>
+          {isOfficialLoginType && keyPath === "login" ? <>
             <Text style={styles.providerWizardHint}>{translate("providers.wizard.loginKeyHint")}</Text>
             <View style={styles.providerWizardAuthRow}>
               <Text style={styles.providerWizardAuthStatus}>{officialStatusLabel(officialStatus, translate)}</Text>
@@ -3074,10 +3658,24 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
                   ? <NativeButton title={translate("relay.officialProviderCancel")} compact disabled={wizardBusy} onPress={() => { void cancelOfficialLogin(); }} />
                   : <NativeButton title={translate("relay.officialProviderLogin")} primary compact disabled={wizardBusy} onPress={() => { void startOfficialLogin(); }} />}
             </View>
+          </> : isWorkBuddyType ? <>
+            {/* The account is associated in the provider's own 「服务商关联」
+                section, so this step only states the desktop app's sign-in and
+                never asks for a WorkBuddy secret. */}
+            <Text style={styles.providerWizardHint}>{translate("providers.wizard.workbuddyKeyHint")}</Text>
+            <View style={styles.providerWizardAuthRow}>
+              <Text style={styles.providerWizardAuthStatus}>{stringValue(workbuddyAccount?.state) === "signed-in" ? translate("providers.authStatusSignedIn") : progressText(workbuddyBusy, translate) ?? translate("providers.authStatusSignedOut")}</Text>
+              <NativeButton title={translate("providers.wizard.workbuddyRefresh")} compact busy={workbuddyBusy} disabled={busy && !workbuddyBusy} onPress={() => { void loadWorkBuddyAccount(true); }} />
+            </View>
+            {stringValue(workbuddyAccount?.state) === "signed-in" ? <>
+              <Text numberOfLines={1} style={styles.providerWizardHint}>{translate("providers.wizard.workbuddyAccount")}: {stringValue(workbuddyAccount?.nickname) || translate("common.notAvailable")} · {stringValue(workbuddyAccount?.domain)}</Text>
+              {workbuddyCreditsText(workbuddyAccount, translate) ? <Text numberOfLines={1} style={styles.providerWizardHint}>{translate("providers.wizard.workbuddyCredits")}: {workbuddyCreditsText(workbuddyAccount, translate)}</Text> : null}
+            </> : <Text style={styles.providerWizardHint}>{translate("providers.wizard.workbuddySignInRequired")}</Text>}
+            <Text style={styles.providerWizardHint}>{translate("providers.wizard.workbuddyAssociationHint")}</Text>
           </> : <>
-            <NativeFormRow label={translate("providers.wizard.keyPath")}>
+            {providerType === "api" ? <NativeFormRow label={translate("providers.wizard.keyPath")}>
               <NativeSegmentedControl labels={[translate("providers.wizard.pathManual"), translate("providers.wizard.pathLogin")]} selectedValue={keyPath === "login" ? translate("providers.wizard.pathLogin") : translate("providers.wizard.pathManual")} disabled={wizardBusy} onChange={({ nativeEvent }) => { setKeyPath(nativeEvent.index === 1 ? "login" : "manual"); setValidation(""); }} style={styles.providerWizardModeControl} />
-            </NativeFormRow>
+            </NativeFormRow> : null}
             {keyPath === "login" ? <>
               {providedChoices.length > 0 ? <>
                 <Text style={styles.providerWizardHint}>{translate("providers.wizard.providedKeysHint", { count: providedChoices.length })}</Text>
@@ -3086,7 +3684,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
                     const value = `relay:${relaySourceSelectionID(source)}`;
                     return <NativeCheckbox
                       key={value}
-                      label={`${source.resourceLabel} · ${source.accountLabel}`}
+                      label={relaySourceName(source) || source.resourceLabel}
                       value={(selectedProvidedChoice && `relay:${relaySourceSelectionID(selectedProvidedChoice)}`) === value}
                       disabled={wizardBusy}
                       onValueChange={() => setProvidedKeySelection(value)}
@@ -3096,26 +3694,25 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
                 </View>
               </> : <>
                 <Text style={styles.providerWizardHint}>{signedInAccountID ? translate("relay.resourcesNotLoaded") : translate("providers.wizard.loginFirstHint")}</Text>
-                <NativeButton title={translate("relay.login")} primary compact busy={loginBusy} disabled={(wizardBusy && !loginBusy) || !providerID || !activeProviderBaseURL.trim()} onPress={() => { void beginRelayLogin(); }} />
+                <NativeButton title={translate("relay.login")} primary compact busy={loginBusy} disabled={(wizardBusy && !loginBusy) || !activeProviderBaseURL.trim()} onPress={() => { void beginRelayLogin(); }} />
               </>}
-              {loginFeedback.current ? <Text style={styles.providerWizardHint}>{loginFeedback.current}</Text> : null}
             </> : <>
-              <NativeFormRow label={translate("providers.wizard.selectApiKey")}><NativePicker labels={keyPickerLabels} selectedValue={selectedKeyPickerLabel} disabled={wizardBusy} onChange={({ nativeEvent }) => { const option = keyOptions[nativeEvent.index]; if (!option) return; setKeySelection(option.value); setKeyReady(false); setKeyName(""); setValidation(""); }} style={styles.providerWizardPicker} /></NativeFormRow>
+              <NativeFormRow required label={translate("providers.wizard.selectApiKey")}><NativePicker labels={keyPickerLabels} selectedValue={selectedKeyPickerLabel} disabled={wizardBusy} onChange={({ nativeEvent }) => { const option = keyOptions[nativeEvent.index]; if (!option) return; setKeySelection(option.value); setKeyReady(false); setKeyName(""); setValidation(""); }} style={styles.providerWizardPicker} /></NativeFormRow>
               {activeKeySelection === PROVIDER_WIZARD_NEW_KEY ? <>
-                <NativeFormRow label={translate("providers.wizard.apiKeyName")}><NativeTextField value={keyName} placeholder={translate("providers.wizard.apiKeyNamePlaceholder")} editable={!wizardBusy} autoCapitalize="none" autoCorrect={false} onChangeText={setKeyName} accessibilityLabel={translate("providers.wizard.apiKeyName")} style={styles.providerWizardInput} /></NativeFormRow>
-                {pendingNewKeyName ? (keyReady
-                  ? <Text style={styles.providerWizardHint}>{pendingNewKeyName}</Text>
-                  : <NativeFormRow label={translate("providers.wizard.apiKeyValue")}><NativeSecureTextInput label={translate("providers.wizard.apiKeyValue")} domain="providers_models" field="api_key" target={`${providerID}\u001f${pendingNewKeyName}`} plainText autoCommit disabled={wizardBusy} onSecretState={(state) => { setKeyReady(state.present); onSecretState(state); }} style={styles.providerWizardSecretInput} /></NativeFormRow>) : null}
+                <NativeFormRow required label={translate("providers.wizard.apiKeyName")}><NativeTextField value={keyName} placeholder={translate("providers.wizard.apiKeyNamePlaceholder")} editable={!wizardBusy} autoCapitalize="none" autoCorrect={false} onChangeText={setKeyName} accessibilityLabel={translate("providers.wizard.apiKeyName")} style={styles.providerWizardInput} /></NativeFormRow>
+                {creatingProvider ? (keyReady
+                  ? <Text style={styles.providerWizardHint}>{finishedProviderKeyName}</Text>
+                  : <NativeFormRow required label={translate("providers.wizard.apiKeyValue")}><NativeSecureTextInput label={translate("providers.wizard.apiKeyValue")} domain="providers_models" field="api_key" target={stagedKeyTarget} plainText autoCommit disabled={wizardBusy} onSecretState={(state) => { setKeyReady(state.present); onSecretState(state); }} style={styles.providerWizardSecretInput} /></NativeFormRow>) : null}
               </>
                 : selectedKeyChoice?.kind === "independent" ? <>
-                    <NativeFormRow label={translate("providers.wizard.apiKeyName")}><NativeTextField value={keyName} placeholder={translate("providers.wizard.apiKeyNamePlaceholder")} editable={!wizardBusy} autoCapitalize="none" autoCorrect={false} onChangeText={setKeyName} accessibilityLabel={translate("providers.wizard.apiKeyName")} style={styles.providerWizardInput} /></NativeFormRow>
+                    <NativeFormRow required label={translate("providers.wizard.apiKeyName")}><NativeTextField value={keyName} placeholder={translate("providers.wizard.apiKeyNamePlaceholder")} editable={!wizardBusy} autoCapitalize="none" autoCorrect={false} onChangeText={setKeyName} accessibilityLabel={translate("providers.wizard.apiKeyName")} style={styles.providerWizardInput} /></NativeFormRow>
                     {selectedKeyReady ? <Text style={styles.providerWizardHint}>{selectedKeyChoice.name}</Text>
-                      : <NativeFormRow label={translate("providers.wizard.apiKeyValue")}><NativeSecureTextInput label={translate("providers.wizard.apiKeyValue")} domain="providers_models" field="api_key" target={`${providerID}\u001f${selectedKeyChoice.name}`} plainText autoCommit disabled={wizardBusy} onSecretState={(state) => { setKeyReady(state.present); onSecretState(state); }} style={styles.providerWizardSecretInput} /></NativeFormRow>}
+                      : <NativeFormRow required label={translate("providers.wizard.apiKeyValue")}><NativeSecureTextInput label={translate("providers.wizard.apiKeyValue")} domain="providers_models" field="api_key" target={`${providerID}\u001f${selectedKeyChoice.name}`} plainText autoCommit disabled={wizardBusy} onSecretState={(state) => { setKeyReady(state.present); onSecretState(state); }} style={styles.providerWizardSecretInput} /></NativeFormRow>}
                   </> : <Text style={styles.providerWizardHint}>{translate("providers.wizard.selectApiKey")}</Text>}
             </>}
           </>}
         </View> : null}
-        {step === "model" ? isLoginType ? <View style={styles.providerWizardFormSection}>
+        {step === "model" ? isOfficialLoginType && keyPath === "login" ? <View style={styles.providerWizardFormSection}>
           <View style={styles.providerWizardSectionHeader}><Text style={styles.providerWizardPanelTitle}>{translate("providers.wizard.models")}</Text><Text numberOfLines={1} style={styles.providerWizardHint}>{selectedProviderName}</Text></View>
           <Text style={styles.providerWizardHint}>{translate("providers.wizard.officialModelsHint")}</Text>
           <View style={styles.providerWizardModelList}>
@@ -3128,12 +3725,15 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
             })}
             {modelChoicesForOfficial.length === 0 ? <Text style={styles.providerWizardHint}>{translate("common.loading")}</Text> : null}
           </View>
+        </View> : isWorkBuddyType ? <View style={styles.providerWizardFormSection}>
+          <View style={styles.providerWizardSectionHeader}><Text style={styles.providerWizardPanelTitle}>{translate("providers.wizard.models")}</Text><Text numberOfLines={1} style={styles.providerWizardHint}>{selectedProviderName}</Text></View>
+          <Text style={styles.providerWizardHint}>{translate("providers.wizard.workbuddyAssociationHint")}</Text>
         </View> : <PersistentScrollView style={styles.providerWizardModelScroll} contentContainerStyle={styles.providerWizardModelScrollContent} showsVerticalScrollIndicator keyboardShouldPersistTaps="handled">
           <View style={styles.providerWizardFormSection}>
             <View style={styles.providerWizardSectionHeader}><Text style={styles.providerWizardPanelTitle}>{translate("providers.wizard.models")}</Text><Text numberOfLines={1} style={styles.providerWizardHint}>{selectedProviderName}</Text></View>
             {!usingProvidedKeyPath(keyPath) ? <View style={styles.providerWizardModelToolbar}>
               <Text numberOfLines={2} style={styles.providerWizardHint}>{modelFetchState === "loading" ? translate("providers.wizard.fetchingModels") : modelCandidates.length > 0 ? translate("providers.wizard.modelsFound", { count: modelCandidates.length }) : modelFetchState === "unavailable" ? translate("providers.wizard.modelsUnavailable") : modelFetchState === "empty" ? translate("providers.wizard.modelsEmpty") : translate("providers.wizard.noModels")}</Text>
-              <NativeButton title={translate("providers.wizard.refreshModels")} compact link busy={modelFetchState === "loading"} disabled={(wizardBusy && modelFetchState !== "loading") || !providerID || !manualSelectedKeyName} onPress={() => { void fetchWizardModels(); }} />
+              <NativeButton title={translate("providers.wizard.refreshModels")} compact link busy={modelFetchState === "loading"} disabled={(wizardBusy && modelFetchState !== "loading") || !manualSelectedKeyName || (creatingProvider ? !serviceBaseURL.trim() : !providerID)} onPress={() => { void fetchWizardModels(); }} />
             </View> : <View style={styles.providerWizardModelToolbar}>
               <Text numberOfLines={2} style={styles.providerWizardHint}>{modelCandidates.length > 0 ? translate("providers.wizard.modelsFound", { count: modelCandidates.length }) : translate("relay.resourcesNoModels")}</Text>
             </View>}
@@ -3157,12 +3757,14 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
             <Text style={styles.providerWizardModelSummary}>{translate("providers.wizard.modelsToAdd", { count: usingProvidedKeyPath(keyPath) ? selectedModels.length : selectedModels.length + selectedManualModelIDs.length + Number(Boolean(modelName.trim() && upstreamModel.trim())) })}</Text>
           </View>
         </PersistentScrollView> : null}
-        {validation ? <Text style={styles.providerWizardValidation}>{validation}</Text> : null}
         </>}
       </View>
     </View>
     <View style={styles.providerWizardFooter}>
-      {validation || loginFeedback.current ? <Text accessibilityLiveRegion="polite" numberOfLines={2} style={styles.providerWizardFooterStatus}>{validation || loginFeedback.current}</Text> : <View style={styles.providerWizardFooterSpacer} />}
+      {/* The wizard's one status line: its own validation or feedback, and the
+          wait while the embedded sign-in page is up.  The step body never
+          repeats it. */}
+      {wizardStatus ? <Text accessibilityLiveRegion="polite" numberOfLines={2} style={styles.providerWizardFooterStatus}>{wizardStatus}</Text> : <View style={styles.providerWizardFooterSpacer} />}
       <View style={styles.providerWizardFooterActions}>
         <NativeButton title={translate("status.close")} disabled={processing} onPress={onClose} />
         {step !== "provider" || loginPhase === "sign-in" ? <NativeButton title={translate("providers.wizard.back")} disabled={busy || processing} onPress={goBack} /> : null}
@@ -3252,8 +3854,8 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       : stringValue(entry.endpoint, stringValue(entry.api_base));
   }, [providerBaseUrlDrafts]);
   // A custom provider whose base URL already targets a relay station is
-  // rebound to that station automatically (flux-code.cc and
-  // www.flux-code.cc stay distinct sites).  Core treats a rebind that leaves
+  // rebound to that station automatically (`station.example.test` and
+  // `www.station.example.test` stay distinct sites).  Core treats a rebind that leaves
   // the visible name and URL untouched as cosmetic, so the draft stays clean
   // and closing the window never asks to discard a change that altered
   // nothing visible.
@@ -3305,6 +3907,11 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   );
   const [viewMode, setViewMode] = useState<"providers" | "routes">("providers");
   const [selectedRoute, setSelectedRoute] = useState<string>();
+  // The routes view selects either one route (its model detail) or one public
+  // model's group (its own settings surface).
+  const [selectedPublicModel, setSelectedPublicModel] = useState<string>();
+  // Where 设置 came from: the route detail the public-model pane can return to.
+  const [publicModelReturn, setPublicModelReturn] = useState<{ routeKey: string; label: string }>();
   const [fetchKeyID, setFetchKeyID] = useState<string>();
   const [fetchModelsBusy, setFetchModelsBusy] = useState(false);
   const probingModelKeys = useRef(new Set<string>());
@@ -3323,6 +3930,15 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     [fetchKeyChoices, translate],
   );
   const selectedFetchKey = fetchKeyID ?? fetchKeyChoices[0]?.id ?? "";
+  const selectedService = provider ? providerService(provider) : undefined;
+  useEffect(() => {
+    // Read the service's catalog as soon as its provider is selected, so every
+    // model switch paints its rate from the cache instead of asking mid-switch.
+    if (!selectedService || hasFreshServiceRates(selectedService)) return;
+    void serviceModelRate(selectedService, (providerId) => dispatchWithOutcome("workbuddy_models", { provider: providerId }))
+      .catch(() => undefined);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedService]);
   async function probeModel(targetProviderId: string, targetModelId: string, options?: { confirmRecommendation?: boolean }): Promise<void> {
     const key = modelProbeKey(targetProviderId, targetModelId);
     if (probingModelKeys.current.has(key)) return;
@@ -3480,13 +4096,21 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     if (!provider) return;
     const knownModelIds = new Set(models.map(editorIdentifier));
     pendingModelIds.current = { providerId, ids: knownModelIds };
-    // The pane commits every edit, so a new model is valid the moment it
-    // exists: it carries the localized placeholder name (and that name as its
-    // upstream route) that the user renames afterwards, instead of an empty
-    // name that blocks the commit with a validation error nobody can act on.
+    // A new model is a draft, the way a new record is a draft in every
+    // create-then-configure surface: it is created **disabled** and carries the
+    // localized placeholder name (and that name as its upstream route), so
+    // pressing ＋ never raises a validation failure the user has to read — an
+    // entry whose key and names are not filled in yet is simply not live.  A
+    // disabled model never reaches the runtime model list, so the placeholder is
+    // never served to a client; the user finishes the row and enables it.
     const base = translate("providers.newModel");
     const name = uniquePlaceholderName(models.map((item) => stringValue(item.model_name ?? item.name)), base);
-    void dispatch("model.add", { provider_id: providerId, model: { name, upstream_model: name, enabled: true, order: 0 } });
+    // The row inherits the key the user is looking at — the selected model's
+    // key, else the provider's first key — so ＋ files it in a real key group
+    // instead of one the app invents.  A provider with no key yet gets the
+    // keyless draft row, and its inspector asks for the key.
+    const inheritedKey = modelProviderKeyState(model, provider) ?? providerKeyStates(provider)[0];
+    void dispatch("model.add", { provider_id: providerId, model: { name, upstream_model: name, enabled: false, order: 0, ...(inheritedKey ? { api_key_name: inheritedKey.name, provider_key_id: inheritedKey.id } : {}) } });
   };
   const addProvider = (): void => {
     // The pane commits every edit, so a new provider is valid the moment it
@@ -3593,6 +4217,24 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     if (providerOrder !== 0) return providerOrder;
     return left.deploymentID.localeCompare(right.deploymentID);
   }), [modelDisplayName, modelOrderValue, providerDisplayName, providers]);
+  // Routes grouped by their client-facing name: one public model is one group
+  // in the routes table and one settings surface.
+  const routeGroups = useMemo(() => {
+    const groups = new Map<string, Array<(typeof routes)[number]>>();
+    for (const entry of routes) {
+      const list = groups.get(entry.publicModel);
+      if (list) list.push(entry);
+      else groups.set(entry.publicModel, [entry]);
+    }
+    return Array.from(groups, ([name, entries]) => ({ name, entries }));
+  }, [routes]);
+  const modelContexts = asRecord(state.model_contexts);
+  // Why the last relay-bound Apply refused: Core hands back the rows it named,
+  // so the pane marks the key or route instead of only stating the outcome.
+  const bindingIssues = asRecords(state.binding_issues);
+  const activePublicGroup = selectedPublicModel === undefined
+    ? undefined
+    : routeGroups.find((group) => group.name === selectedPublicModel);
   const activeRoute = routes.find((entry) => entry.key === selectedRoute);
   const activeRouteGroup = activeRoute ? routes.filter((entry) => entry.publicModel === activeRoute.publicModel) : [];
   const activeRouteIndex = activeRoute ? activeRouteGroup.findIndex((entry) => entry.key === activeRoute.key) : -1;
@@ -3617,7 +4259,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     if (!provider) return;
     const label = providerDisplayName(provider);
     const kind = providerKindSelected;
-    const action = kind === "openai" || kind === "claude"
+    const action = kind === "openai" || kind === "claude" || workbuddyProviderIDFor(kind) !== undefined
       ? "service_provider.delete"
       : "provider.delete";
     const stationBeingRemoved = kind === "relay" ? stationForProvider(provider) : undefined;
@@ -3629,7 +4271,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
           models: models.length,
         })
       : `${label} (${models.length} ${translate("providers.models")})`;
-    void native.showConfirmation({ title: translate("providers.deleteProvider"), message, confirmLabel: translate("common.delete") }).then((confirmed) => {
+    void native.showConfirmation({ title: translate("providers.deleteProvider"), message, confirmLabel: translate("common.delete"), destructive: true }).then((confirmed) => {
       if (!confirmed) return undefined;
       return dispatch(action, { provider_id: providerId }).then(async () => {
         // A 中转站 provider owns its station connection: once the last
@@ -3664,7 +4306,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   const confirmDeleteModel = (): void => {
     if (!model) return;
     const modelId = editorIdentifier(model);
-    void native.showConfirmation({ title: translate("providers.deleteModel"), message: modelDisplayName(providerId, model) || modelId, confirmLabel: translate("common.delete") }).then((confirmed) => confirmed ? dispatch("model.delete", { provider_id: providerId, model_id: modelId }).then(() => setSelectedModel(undefined)) : undefined);
+    void native.showConfirmation({ title: translate("providers.deleteModel"), message: modelDisplayName(providerId, model) || modelId, confirmLabel: translate("common.delete"), destructive: true }).then((confirmed) => confirmed ? dispatch("model.delete", { provider_id: providerId, model_id: modelId }).then(() => setSelectedModel(undefined)) : undefined);
   };
   const providerRows = useMemo(
     () => providers.map((item) => ({
@@ -3679,14 +4321,25 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   );
   const modelRows = useMemo(() => {
     // The key name is its own column: one spanning row per key, with that
-    // key's models listed (and indented) underneath it.
+    // key's models listed (and indented) underneath it.  A model that belongs
+    // to no key yet — the draft ＋ just created on a provider that has none —
+    // is listed first *without* a group row: filing it under an invented
+    // 未定义密钥 group would present a group the app made up as its route.
     const rows: Array<{ key: string; cells: string[]; spanning?: boolean }> = [];
+    const ungrouped: UnknownRecord[] = [];
     const grouped = new Map<string, UnknownRecord[]>();
     for (const item of models) {
-      const keyName = modelProviderKeyLabel(item, provider ?? {}, translate);
+      if (!modelProviderKeyState(item, provider ?? {})) {
+        ungrouped.push(item);
+        continue;
+      }
+      const keyName = modelProviderKeyLabel(item, provider ?? {}, translate, undefined, relaySources);
       const list = grouped.get(keyName);
       if (list) list.push(item);
       else grouped.set(keyName, [item]);
+    }
+    for (const item of ungrouped) {
+      rows.push({ key: editorIdentifier(item), cells: [`\t${modelUpstreamDisplay(providerId, item)}`, modelDisplayName(providerId, item), modelOrderText(providerId, item)] });
     }
     for (const [keyName, list] of grouped) {
       rows.push({ key: `key:${keyName}`, cells: [keyName], spanning: true });
@@ -3695,61 +4348,125 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       }
     }
     return rows;
-  }, [modelDisplayName, modelOrderText, modelUpstreamDisplay, models, provider, providerId, translate]);
+  }, [modelDisplayName, modelOrderText, modelUpstreamDisplay, models, provider, providerId, relaySources, translate]);
   const disabledModelKeys = useMemo(
     () => models.filter((item) => !booleanValue(provider?.enabled, true) || !booleanValue(item.model_enabled, booleanValue(item.enabled, true))).map(editorIdentifier),
     [models, provider?.enabled],
   );
   // Rows that cannot materialize a route keep the pane honest about what
   // blocks Apply: Core rejects a model without a public name, so the row that
-  // needs the name is marked where it is edited.
-  const alertModelKeys = useMemo(() => models.filter(modelNeedsAttention).map(editorIdentifier), [models]);
+  // needs the name is marked where it is edited — and a linked route the relay
+  // could not resolve is marked on the row Core named, because that key or
+  // route, not the pane, is what refused the write.
+  const bindingIssueFor = useCallback((model: UnknownRecord): UnknownRecord | undefined => {
+    const modelID = editorIdentifier(model);
+    const keyID = stringValue(model.provider_key_id);
+    return bindingIssues.find((issue) => {
+      const issueModel = stringValue(issue.model_id);
+      if (issueModel && issueModel === modelID) return true;
+      const issueKey = stringValue(issue.provider_key_id);
+      return Boolean(issueKey) && issueKey === keyID;
+    });
+  }, [bindingIssues]);
+  const alertModelKeys = useMemo(
+    () => models.filter((item) => modelNeedsAttention(item) || Boolean(bindingIssueFor(item))).map(editorIdentifier),
+    [bindingIssueFor, models],
+  );
   const alertProviderKeys = useMemo(
-    () => providers.filter((item) => asRecords(item.models).some(modelNeedsAttention)).map(editorIdentifier),
-    [providers],
+    () => providers.filter((item) => {
+      if (bindingIssues.some((issue) => stringValue(issue.provider) === editorIdentifier(item))) return true;
+      return asRecords(item.models).some((model) => modelNeedsAttention(model) || Boolean(bindingIssueFor(model)));
+    }).map(editorIdentifier),
+    [bindingIssueFor, bindingIssues, providers],
   );
   const routeRows = useMemo(() => {
     const rows: Array<{ key: string; cells: string[]; spanning?: boolean }> = [];
-    let previousPublicModel = "";
-    for (const entry of routes) {
-      if (entry.publicModel !== previousPublicModel) {
-        rows.push({
-          key: `route-public-model:${entry.publicModel}`,
-          cells: [entry.publicModel, "", "", ""],
-          spanning: true,
-        });
-        previousPublicModel = entry.publicModel;
-      }
-      const order = modelOrderText(editorIdentifier(entry.provider), entry.model);
+    for (const group of routeGroups) {
       rows.push({
-        key: entry.key,
-        cells: [`\t${providerDisplayName(entry.provider)}`, modelProviderKeyLabel(entry.model, entry.provider, translate), order, modelUpstreamDisplay(editorIdentifier(entry.provider), entry.model) || translate("common.notAvailable")],
+        key: routePublicModelRowKey(group.name),
+        cells: [group.name, "", "", ""],
+        spanning: true,
       });
+      for (const entry of group.entries) {
+        const order = modelOrderText(editorIdentifier(entry.provider), entry.model);
+        rows.push({
+          key: entry.key,
+          // The upstream model leads the row: it is what tells the routes of
+          // one public model apart, before the provider that serves it.
+          cells: [`\t${modelUpstreamDisplay(editorIdentifier(entry.provider), entry.model) || translate("common.notAvailable")}`, providerDisplayName(entry.provider), modelProviderKeyLabel(entry.model, entry.provider, translate, undefined, relaySources), order],
+        });
+      }
     }
     return rows;
-  }, [modelOrderText, modelUpstreamDisplay, providerDisplayName, routes, translate]);
+  }, [modelOrderText, modelUpstreamDisplay, providerDisplayName, relaySources, routeGroups, translate]);
+  const selectableRouteGroupKeys = useMemo(
+    () => routeGroups.map((group) => routePublicModelRowKey(group.name)),
+    [routeGroups],
+  );
+  const alertRouteKeys = useMemo(
+    () => routeGroups.flatMap((group) => group.entries.filter((entry) => Boolean(bindingIssueFor(entry.model))).map((entry) => entry.key)),
+    [bindingIssueFor, routeGroups],
+  );
   const disabledRouteKeys = useMemo(
     () => routes.filter((entry) => !entry.providerEnabled || !entry.modelEnabled || !entry.keyAvailable).map((entry) => entry.key),
     [routes],
   );
   const selectRoute = useCallback((routeId: string): void => {
+    setPublicModelReturn(undefined);
     if (!routeId) {
       // A click below the route rows clears the selection: the inspector
       // empties instead of keeping a route active without a highlighted row.
       setSelectedRoute("");
+      setSelectedPublicModel(undefined);
       setProviderSourceModel(undefined);
       return;
     }
     const selected = routes.find((entry) => entry.key === routeId);
     if (!selected) return;
     setSelectedRoute(routeId);
+    setSelectedPublicModel(undefined);
     setSelectedProvider(editorIdentifier(selected.provider));
     setSelectedModel(editorIdentifier(selected.model));
     setProviderSourceModel(undefined);
   }, [routes]);
+  // One routes table answers clicks for both row kinds: a public-model row
+  // opens that group's own settings, a route row opens the model detail.
+  const selectRouteTableRow = useCallback((rowKey: string): void => {
+    if (!rowKey) {
+      selectRoute("");
+      return;
+    }
+    if (rowKey.startsWith(ROUTE_PUBLIC_MODEL_PREFIX)) {
+      const publicModel = rowKey.slice(ROUTE_PUBLIC_MODEL_PREFIX.length);
+      const group = routeGroups.find((entry) => entry.name === publicModel);
+      if (!group) return;
+      setSelectedPublicModel(publicModel);
+      setSelectedRoute("");
+      setProviderSourceModel(undefined);
+      // A row click has no origin model to return to; only 设置 records one.
+      setPublicModelReturn(undefined);
+      const first = group.entries[0];
+      setSelectedProvider(editorIdentifier(first.provider));
+      setSelectedModel(editorIdentifier(first.model));
+      return;
+    }
+    selectRoute(rowKey);
+  }, [routeGroups, selectRoute]);
+  // A public model the draft no longer carries (renamed elsewhere, or its last
+  // route removed) drops its selection instead of leaving an empty pane.
+  useEffect(() => {
+    if (selectedPublicModel === undefined) return;
+    if (routeGroups.some((group) => group.name === selectedPublicModel)) return;
+    setSelectedPublicModel(undefined);
+    if (viewMode === "routes" && routes.length > 0) setSelectedRoute(routes[0].key);
+  }, [routeGroups, routes, selectedPublicModel, viewMode]);
+  const returnToPublicModelOrigin = useCallback((): void => {
+    if (!publicModelReturn) return;
+    selectRoute(publicModelReturn.routeKey);
+  }, [publicModelReturn, selectRoute]);
   const chooseViewMode = (value: "providers" | "routes"): void => {
     if (value === viewMode) return;
-    if (value === "routes") {
+    if (value === "routes" && selectedPublicModel === undefined) {
       const first = routes[0];
       if (first) selectRoute(first.key);
     }
@@ -3795,7 +4512,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       </View>
       {viewMode === "routes" ? <View style={styles.routeWorkspace}>
         <TablePane wide style={styles.routeTablePane} title={translate("providers.routes")} actions={<><IconButton label="↑" title={translate("common.moveUp")} disabled={busy || !canMoveRouteUp} onPress={() => moveRoute("up")} /><IconButton label="↓" title={translate("common.moveDown")} disabled={busy || !canMoveRouteDown} onPress={() => moveRoute("down")} /></>}>
-          <NativeTable columns={[{ label: translate("providers.provider"), width: 96 }, { label: translate("providers.providerKey"), width: 130 }, { label: translate("common.order"), width: 64 }, { label: translate("providers.upstream"), width: 120 }]} rows={routeRows} disabledRowKeys={disabledRouteKeys} selectedKey={selectedRoute ?? ""} compact onSelectionChange={selectRoute} style={styles.nativeRouteTable} />
+          <NativeTable columns={[{ label: translate("providers.upstream"), width: 120 }, { label: translate("providers.provider"), width: 96 }, { label: translate("providers.providerKey"), width: 130 }, { label: translate("common.order"), width: 64 }]} rows={routeRows} disabledRowKeys={disabledRouteKeys} alertRowKeys={alertRouteKeys} selectedKey={selectedPublicModel !== undefined ? routePublicModelRowKey(selectedPublicModel) : (selectedRoute ?? "")} compact selectableSpanningRowKeys={selectableRouteGroupKeys} onSelectionChange={(key) => selectRouteTableRow(key)} style={styles.nativeRouteTable} />
         </TablePane>
       </View> : <View style={styles.providerWorkspace}>
         <View style={styles.providerModelColumns}>
@@ -3811,7 +4528,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
         </View>
       </View>}
     </View>
-    <View style={styles.providerInspector}>{viewMode === "routes" ? (activeRoute ? (providerSourceModel ? <ProviderEditor key={`provider:${editorIdentifier(activeRoute.provider)}`} provider={activeRoute.provider} relaySources={relaySources} relayStations={relayStations} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onNameDraftChange={(value) => setProviderNameDraft(editorIdentifier(activeRoute.provider), value)} sourceModel={activeRoute.model} onReturnToModel={() => { setProviderSourceModel(undefined); setSelectedModel(editorIdentifier(activeRoute.model)); }} station={stationForProvider(activeRoute.provider)} stationAccounts={stationAccountsFor(activeRoute.provider)} relay={relay} addOfficialAccount={addOfficialAccount} onActivateAndRestart={onActivateAndRestart} onStatus={onStatus} language={snapshot?.language ?? "system"} snapshotForCleanups={snapshot} /> : <ModelInspector key={`model:${editorIdentifier(activeRoute.provider)}:${editorIdentifier(activeRoute.model)}`} providers={providers} providerLabels={providers.map(providerDisplayName)} provider={activeRoute.provider} providerId={editorIdentifier(activeRoute.provider)} model={activeRoute.model} modelName={modelDisplayName(editorIdentifier(activeRoute.provider), activeRoute.model)} relaySources={relaySources} native={native} busy={busy} translate={translate} dispatch={dispatch} probe={() => probeModel(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model))} {...modelProbeProps(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model))} onNameDraftChange={(value) => setModelNameDraft(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model), value)} onProviderClick={() => setProviderSourceModel(editorIdentifier(activeRoute.model))} onProviderChange={(destinationProviderId) => dispatch("model.move_provider", { provider_id: editorIdentifier(activeRoute.provider), model_id: editorIdentifier(activeRoute.model), destination_provider_id: destinationProviderId }).then(() => { setSelectedProvider(destinationProviderId); setSelectedModel(editorIdentifier(activeRoute.model)); setSelectedRoute(`${destinationProviderId}:${activeRoute.deploymentID}`); setProviderSourceModel(undefined); })} />) : <EmptyState translate={translate} />) : provider && model ? <ModelInspector key={`model:${providerId}:${editorIdentifier(model)}`} providers={providers} providerLabels={providers.map(providerDisplayName)} provider={provider} providerId={providerId} model={model} modelName={modelDisplayName(providerId, model)} relaySources={relaySources} native={native} busy={busy} translate={translate} dispatch={dispatch} probe={() => probeModel(providerId, editorIdentifier(model))} {...modelProbeProps(providerId, editorIdentifier(model))} onNameDraftChange={(value) => setModelNameDraft(providerId, editorIdentifier(model), value)} onProviderClick={() => { setProviderSourceModel(editorIdentifier(model)); setSelectedModel(undefined); }} onProviderChange={(destinationProviderId) => dispatch("model.move_provider", { provider_id: providerId, model_id: editorIdentifier(model), destination_provider_id: destinationProviderId }).then(() => { setSelectedProvider(destinationProviderId); setSelectedModel(editorIdentifier(model)); setProviderSourceModel(undefined); })} /> : provider ? <ProviderEditor key={`provider:${providerId}`} provider={provider} relaySources={relaySources} relayStations={relayStations} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onNameDraftChange={(value) => setProviderNameDraft(providerId, value)} sourceModel={models.find((item) => editorIdentifier(item) === providerSourceModel)} onReturnToModel={() => { if (providerSourceModel) setSelectedModel(providerSourceModel); setProviderSourceModel(undefined); }} station={selectedStation} stationAccounts={selectedStationAccounts} relay={relay} addOfficialAccount={addOfficialAccount} onActivateAndRestart={onActivateAndRestart} onStatus={onStatus} language={snapshot?.language ?? "system"} snapshotForCleanups={snapshot} /> : <EmptyState translate={translate} />}</View>
+    <View style={styles.providerInspector}>{viewMode === "routes" ? (activePublicGroup ? <PublicModelInspector key={`public:${activePublicGroup.name}`} group={activePublicGroup} modelContexts={modelContexts} backLabel={publicModelReturn?.label} onBackToModel={returnToPublicModelOrigin} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} onRenamed={(next) => { setSelectedPublicModel(next); setSelectedRoute(""); }} /> : activeRoute ? (providerSourceModel ? <ProviderEditor key={`provider:${editorIdentifier(activeRoute.provider)}`} provider={activeRoute.provider} relaySources={relaySources} relayStations={relayStations} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onNameDraftChange={(value) => setProviderNameDraft(editorIdentifier(activeRoute.provider), value)} sourceModel={activeRoute.model} onReturnToModel={() => { setProviderSourceModel(undefined); setSelectedModel(editorIdentifier(activeRoute.model)); }} station={stationForProvider(activeRoute.provider)} stationAccounts={stationAccountsFor(activeRoute.provider)} relay={relay} addOfficialAccount={addOfficialAccount} onActivateAndRestart={onActivateAndRestart} onStatus={onStatus} language={snapshot?.language ?? "system"} bindingIssues={bindingIssues} snapshotForCleanups={snapshot} /> : <ModelInspector key={`model:${editorIdentifier(activeRoute.provider)}:${editorIdentifier(activeRoute.model)}`} providers={providers} providerLabels={providers.map(providerDisplayName)} provider={activeRoute.provider} providerId={editorIdentifier(activeRoute.provider)} model={activeRoute.model} modelName={modelDisplayName(editorIdentifier(activeRoute.provider), activeRoute.model)} relaySources={relaySources} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} modelContexts={modelContexts} bindingIssue={bindingIssueFor(activeRoute.model)} probe={() => probeModel(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model))} {...modelProbeProps(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model))} onNameDraftChange={(value) => setModelNameDraft(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model), value)} onProviderClick={() => setProviderSourceModel(editorIdentifier(activeRoute.model))} onOpenPublicModel={() => { const publicModel = stringValue(activeRoute.model.model_name, stringValue(activeRoute.model.name)).trim(); if (!publicModel) return; selectRouteTableRow(routePublicModelRowKey(publicModel)); setPublicModelReturn({ routeKey: activeRoute.key, label: modelUpstreamDisplay(editorIdentifier(activeRoute.provider), activeRoute.model) || publicModel }); }} onProviderChange={(destinationProviderId) => dispatch("model.move_provider", { provider_id: editorIdentifier(activeRoute.provider), model_id: editorIdentifier(activeRoute.model), destination_provider_id: destinationProviderId }).then(() => { setSelectedProvider(destinationProviderId); setSelectedModel(editorIdentifier(activeRoute.model)); setSelectedRoute(`${destinationProviderId}:${activeRoute.deploymentID}`); setProviderSourceModel(undefined); })} />) : <EmptyState translate={translate} />) : provider && model ? <ModelInspector key={`model:${providerId}:${editorIdentifier(model)}`} providers={providers} providerLabels={providers.map(providerDisplayName)} provider={provider} providerId={providerId} model={model} modelName={modelDisplayName(providerId, model)} relaySources={relaySources} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} modelContexts={modelContexts} bindingIssue={bindingIssueFor(model)} probe={() => probeModel(providerId, editorIdentifier(model))} {...modelProbeProps(providerId, editorIdentifier(model))} onNameDraftChange={(value) => setModelNameDraft(providerId, editorIdentifier(model), value)} onProviderClick={() => { setProviderSourceModel(editorIdentifier(model)); setSelectedModel(undefined); }} onOpenPublicModel={() => { const publicModel = stringValue(model.model_name, stringValue(model.name)).trim(); if (!publicModel) return; const originRouteKey = `${providerId}:${stringValue(model.editor_id, stringValue(model.deployment_id, identifier(model))).trim()}`; setViewMode("routes"); selectRouteTableRow(routePublicModelRowKey(publicModel)); setPublicModelReturn({ routeKey: originRouteKey, label: modelUpstreamDisplay(providerId, model) || publicModel }); }} onProviderChange={(destinationProviderId) => dispatch("model.move_provider", { provider_id: providerId, model_id: editorIdentifier(model), destination_provider_id: destinationProviderId }).then(() => { setSelectedProvider(destinationProviderId); setSelectedModel(editorIdentifier(model)); setProviderSourceModel(undefined); })} /> : provider ? <ProviderEditor key={`provider:${providerId}`} provider={provider} relaySources={relaySources} relayStations={relayStations} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onNameDraftChange={(value) => setProviderNameDraft(providerId, value)} sourceModel={models.find((item) => editorIdentifier(item) === providerSourceModel)} onReturnToModel={() => { if (providerSourceModel) setSelectedModel(providerSourceModel); setProviderSourceModel(undefined); }} station={selectedStation} stationAccounts={selectedStationAccounts} relay={relay} addOfficialAccount={addOfficialAccount} onActivateAndRestart={onActivateAndRestart} onStatus={onStatus} language={snapshot?.language ?? "system"} bindingIssues={bindingIssues} snapshotForCleanups={snapshot} /> : <EmptyState translate={translate} />}</View>
   </View></ProviderWorkspaceDraftContext.Provider>;
 }
 
@@ -3825,7 +4542,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
  * variant "pane" renders its own titled pane for the middle column;
  * variant "inline" renders a compact section for the right detail pane.
  */
-function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native, busy, translate, dispatch, onSecretState, relay, onStatus, language, variant = "pane" }: { provider?: UnknownRecord; providerId: string; kind: ProviderKind; stationAccounts: RelayAccount[]; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; relay: RelayWorkspaceBridge; onStatus: (status?: string) => void; language: "system" | "en" | "zh-Hans"; snapshotForCleanups?: CoreSnapshot; variant?: "pane" | "inline" }): React.JSX.Element {
+function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native, busy, translate, dispatch, onSecretState, relay, onStatus, language, bindingIssues, variant = "pane" }: { provider?: UnknownRecord; providerId: string; kind: ProviderKind; stationAccounts: RelayAccount[]; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; relay: RelayWorkspaceBridge; onStatus: (status?: string) => void; language: "system" | "en" | "zh-Hans"; bindingIssues?: UnknownRecord[]; snapshotForCleanups?: CoreSnapshot; variant?: "pane" | "inline" }): React.JSX.Element {
   const drafts = useContext(ProviderWorkspaceDraftContext);
   const isRelay = kind === "relay";
   const customKeys = useMemo(() => provider ? providerKeyStates(provider).filter((key) => key.source.kind === "independent") : [], [provider]);
@@ -3841,7 +4558,7 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
   const [providedNameDrafts, setProvidedNameDrafts] = useState<Record<string, string>>({});
   const [formBusy, setFormBusy] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
-  const [remoteDelete, setRemoteDelete] = useState<{ account: RelayAccount; resource: RelayResource }>();
+  const [remoteDelete, setRemoteDelete] = useState<{ account: RelayAccount; resource: RelayResource; label: string }>();
   const [remoteDeletePolicy, setRemoteDeletePolicy] = useState<"delete_models" | "detach_disabled" | "detach_only">("detach_disabled");
   const selectedCustom = selectedKey.startsWith("custom:")
     ? customKeys.find((key) => `custom:${key.id}` === selectedKey)
@@ -3849,6 +4566,18 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
   const selectedProvided = selectedKey.startsWith("provided:")
     ? providedRows.find((row) => `provided:${row.key}` === selectedKey)
     : undefined;
+  // A relay key is one row in this table and one slot in the provider: the
+  // issue Core reported is keyed by the slot, so the row is matched back
+  // through the relay source the slot carries, and the reason is stated
+  // beside the key it belongs to.
+  const bindingIssueForProvidedRow = useCallback((row: ProvidedKeyRow): UnknownRecord | undefined => {
+    if (!provider || !bindingIssues || bindingIssues.length === 0) return undefined;
+    const slot = providerKeyStates(provider).find((key) => key.source.kind === "relay"
+      && key.source.accountID === row.account.id
+      && key.source.resourceID === row.resource.id);
+    if (!slot) return undefined;
+    return bindingIssues.find((issue) => stringValue(issue.provider_key_id) === slot.id);
+  }, [bindingIssues, provider]);
   const selectedGroup: "custom" | "provided" = selectedProvided ? "provided" : "custom";
   const autoGrouping = stationAccounts.some((account) => account.autoGrouping);
   const controlsBusy = busy || formBusy;
@@ -3949,7 +4678,7 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
     if (selectedProvided) {
       if (autoGrouping) return;
       setRemoteDeletePolicy("detach_disabled");
-      setRemoteDelete({ account: selectedProvided.account, resource: selectedProvided.resource });
+      setRemoteDelete({ account: selectedProvided.account, resource: selectedProvided.resource, label: selectedProvided.label });
       return;
     }
     if (!selectedCustom) return;
@@ -3968,6 +4697,7 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
         ? translate("providers.deleteApiKeyModelsMessage", { models: affectedModelLines.join("\n") })
         : translate("providers.deleteApiKeyNoModelsMessage"),
       confirmLabel: translate("common.delete"),
+      destructive: true,
     }).then((confirmed) => {
       if (!confirmed) return undefined;
       return dispatch("provider.key_delete", { provider_id: providerId, name: selectedKeyName });
@@ -3982,6 +4712,7 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
     {canDeleteKey ? <IconButton label="−" title={translate("common.delete")} disabled={controlsBusy} onPress={deleteSelected} /> : null}
   </>;
   const selectedProvidedName = selectedProvided ? providedNameDrafts[selectedProvided.key] ?? selectedProvided.keyName : "";
+  const selectedProvidedIssue = selectedProvided ? bindingIssueForProvidedRow(selectedProvided) : undefined;
   // The inline keys panel shows one list of a fixed height beside its editor
   // (see KEYS_INLINE_LIST_HEIGHT): a fixed frame is what keeps the panel calm
   // while the user switches vendors, loads data, or works in the sections
@@ -3993,6 +4724,7 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
       rows={tableRows}
       selectedKey={selectedCustom ? `custom:${selectedCustom.id}` : selectedProvided ? `provided:${selectedProvided.key}` : ""}
       disabledRowKeys={providedRows.filter((row) => row.unavailable).map((row) => `provided:${row.key}`)}
+      alertRowKeys={providedRows.filter((row) => Boolean(bindingIssueForProvidedRow(row))).map((row) => `provided:${row.key}`)}
       compact
       cellHorizontalPadding={6}
       firstColumnHorizontalPadding={6}
@@ -4036,8 +4768,10 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
           <NativeButton title="" symbol="copy" compact disabled={controlsBusy || !booleanValue(selectedCustom.configured)} toolTip={translate("relay.apiKeyCopy")} accessibilityLabel={translate("relay.apiKeyCopy")} onPress={() => {
             void (async () => {
               try {
+                // A copy that worked says nothing: only a failure is worth a
+                // word, and even that leaves every button where it was.
                 const copied = await native.copySecret({ domain: "providers_models", field: "api_key", target: `${providerId}\u001f${selectedCustom.name}` });
-                onStatus?.(translate(copied ? "relay.apiKeyCopied" : "relay.operationFailed"));
+                if (!copied) onStatus?.(translate("relay.operationFailed"));
               } catch {
                 onStatus?.(translate("relay.operationFailed"));
               }
@@ -4074,13 +4808,15 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
         />, <NativeButton title="" symbol="copy" compact disabled={controlsBusy || !selectedProvided.resource.keyHint} toolTip={translate("relay.apiKeyCopy")} accessibilityLabel={translate("relay.apiKeyCopy")} onPress={() => {
           void (async () => {
             try {
+              // A copy that worked says nothing: only a failure is worth a word.
               const copied = await native.copySecret({ domain: "relay_accounts", field: "api_key", target: `${selectedProvided.account.id}:${selectedProvided.resource.id}` });
-              onStatus?.(translate(copied ? "relay.apiKeyCopied" : "relay.operationFailed"));
+              if (!copied) onStatus?.(translate("relay.operationFailed"));
             } catch {
               onStatus?.(translate("relay.operationFailed"));
             }
           })();
         }} style={styles.panelActionButton} />)}
+        {selectedProvidedIssue ? <Text style={styles.fieldHint}>{relayBindingIssueText(selectedProvidedIssue, selectedProvided.label, translate)}</Text> : null}
       </> : null}
     </View>;
   const dialogs = <>
@@ -4100,7 +4836,7 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
       <DependencyPolicyDialog
         visible={Boolean(remoteDelete)}
         title={translate("relay.apiKeyDeleteImpactTitle")}
-        message={remoteDelete ? translate("relay.apiKeyDeleteImpactBody", { count: remoteDelete.resource.linkedModelCount, label: remoteDelete.resource.apiName || remoteDelete.resource.name }) : ""}
+        message={remoteDelete ? translate("relay.apiKeyDeleteImpactBody", { count: remoteDelete.resource.linkedModelCount, label: remoteDelete.label }) : ""}
         options={[
           { value: "detach_disabled", label: translate("relay.policyReleaseDisabled"), hint: translate("relay.policyReleaseDisabledHint") },
           { value: "delete_models", label: translate("relay.policyDeleteModels"), hint: translate("relay.policyDeleteModelsHint") },
@@ -4109,6 +4845,7 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
         value={remoteDeletePolicy}
         disabled={controlsBusy}
         confirmLabel={remoteDeletePolicy === "detach_only" ? translate("screen.confirm") : translate("common.delete")}
+        destructive={remoteDeletePolicy !== "detach_only"}
         onValueChange={setRemoteDeletePolicy}
         onClose={() => setRemoteDelete(undefined)}
         onConfirm={() => {
@@ -4171,8 +4908,73 @@ const PersistentScrollView = React.forwardRef<ScrollView, ScrollViewProps & { on
   </ScrollView>;
 });
 
-function ModelInspector({ providers, providerLabels, provider, providerId, model, modelName, relaySources, native, busy, translate, dispatch, probe, probing, probeResult, onNameDraftChange, onProviderClick, onProviderChange }: { providers: UnknownRecord[]; providerLabels: string[]; provider: UnknownRecord; providerId: string; model: UnknownRecord; modelName: string; relaySources: RelaySourceOption[]; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; probe: () => void; probing: boolean; probeResult?: IpcResults["probe"]; onNameDraftChange?: (name: string) => void; onProviderClick: () => void; onProviderChange: (providerId: string) => void }): React.JSX.Element {
+// One public model's own settings: the client-facing name, the limits its
+// routes declare, and the order numbers of those routes.
+type RouteGroupEntry = {
+  key: string;
+  deploymentID: string;
+  publicModel: string;
+  provider: UnknownRecord;
+  model: UnknownRecord;
+};
+
+function PublicModelInspector({ group, modelContexts, backLabel, busy, translate, dispatch, dispatchSnapshot, onBackToModel, onRenamed }: { group: { name: string; entries: RouteGroupEntry[] }; modelContexts: UnknownRecord; backLabel?: string; busy: boolean; translate: Translate; dispatch: Dispatch; dispatchSnapshot: (type: string, payload?: UnknownRecord, domain?: ConfigDomain) => Promise<CoreSnapshot | undefined>; onBackToModel?: () => void; onRenamed: (next: string) => void }): React.JSX.Element {
+  const providers = useMemo(() => group.entries.map((entry) => entry.provider), [group.entries]);
+  // The group's own value is the smallest one its routes declare, so the field
+  // shows what every route can honour and a commit writes it to all of them.
+  const customContext = publicModelCustomLimit(providers, group.name, "max_input_tokens");
+  const defaultContext = publicModelDefault(modelContexts, group.name);
+  const contextHint = translate("providers.publicModelDefaultHint", { value: publicModelTokensText(defaultContext, translate) });
+  const commitContext = (next: string): Promise<void> => dispatch("public.model_patch", { public_model: group.name, changes: { max_input_tokens: next.trim() } });
+  return <View style={styles.inspectorContent}>
+    {/* The provider editor's own header shape: the title takes the row and the
+        return link sits on the trailing edge, never in front of the title. */}
+    <View style={styles.providerEditorHeader}>
+      <Text numberOfLines={1} style={styles.providerEditorHeading}>{group.name}</Text>
+      <Text style={styles.publicModelRouteCount}>{translate("providers.publicModelRouteCount", { count: group.entries.length })}</Text>
+      {backLabel && onBackToModel ? <NativeButton title={translate("providers.backToModel", { model: backLabel })} link disabled={busy} onPress={onBackToModel} style={styles.providerReturnToModel} /> : null}
+    </View>
+    <View style={styles.inspectorDivider} />
+    <View style={styles.inspectorBody}>
+      <TextField label={translate("providers.publicModel")} labelWidth={60} value={group.name} disabled={busy} onCommit={(next) => {
+        const renamed = next.trim();
+        if (!renamed || renamed === group.name) return undefined;
+        return dispatchSnapshot("public.model_patch", { public_model: group.name, changes: { name: renamed } }).then((snapshot) => { if (snapshot) onRenamed(renamed); });
+      }} />
+      <TextField label={translate("providers.contextWindow")} labelWidth={60} value={customContext !== undefined ? String(customContext) : ""} placeholder={contextHint} keyboardType="numeric" disabled={busy} onCommit={commitContext} />
+    </View>
+  </View>;
+}
+
+function ModelInspector({ providers, providerLabels, provider, providerId, model, modelName, relaySources, native, busy, translate, dispatch, probe, probing, probeResult, modelContexts, bindingIssue, onNameDraftChange, onProviderClick, onProviderChange, onOpenPublicModel, dispatchSnapshot }: { providers: UnknownRecord[]; providerLabels: string[]; provider: UnknownRecord; providerId: string; model: UnknownRecord; modelName: string; relaySources: RelaySourceOption[]; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; probe: () => void; probing: boolean; probeResult?: IpcResults["probe"]; modelContexts?: UnknownRecord; bindingIssue?: UnknownRecord; onNameDraftChange?: (name: string) => void; onProviderClick: () => void; onProviderChange: (providerId: string) => void; onOpenPublicModel?: () => void; dispatchSnapshot: (type: string, payload?: UnknownRecord, domain?: ConfigDomain) => Promise<CoreSnapshot | undefined> }): React.JSX.Element {
   const id = editorIdentifier(model);
+  // A service's own catalog states each model's credit rate; the rate is shown
+  // beside the route it belongs to, so the picker's `x0.79` stays visible here.
+  const service = providerService(provider);
+  const upstreamModelID = stringValue(model.upstream_model).trim();
+  const [serviceRate, setServiceRate] = useState<string>(() => peekServiceRate(service, upstreamModelID) ?? "");
+  useEffect(() => {
+    if (!service || !upstreamModelID) {
+      setServiceRate("");
+      return;
+    }
+    // Switching models remounts this pane, so it paints the cached rate in the
+    // same frame; only a cold catalog fills in a moment later, and the row
+    // itself is always mounted so nothing below it moves.
+    const cached = peekServiceRate(service, upstreamModelID);
+    if (cached !== undefined) {
+      setServiceRate(cached);
+      return;
+    }
+    setServiceRate("");
+    let cancelled = false;
+    // `dispatch` hands back the snapshot this action produced, so the catalog
+    // travels with the action that asked for it.
+    void serviceModelRate(service, (providerId) => dispatchSnapshot("workbuddy_models", { provider: providerId })).then((rates) => {
+      if (!cancelled) setServiceRate(rates[upstreamModelID] ?? "");
+    }).catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [service, upstreamModelID]);
   const providerIndex = providers.findIndex((item) => editorIdentifier(item) === providerId);
   const providerLabel = providerLabels[Math.max(0, providerIndex)] ?? "";
   const drafts = useContext(ProviderWorkspaceDraftContext);
@@ -4183,6 +4985,12 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
   // only labels the list row and the breadcrumb, so the pane never looks like a
   // name is set while validation still reports it missing.
   const modelFieldName = stringValue(model.model_name, stringValue(model.name));
+  // The public model's client-facing context window: the value the user
+  // declared wins, otherwise the registry default the managed catalog
+  // resolves.  The link opens that public model's own settings.
+  const publicModelName = modelFieldName.trim();
+  const publicModelWindow = publicModelDefault(modelContexts ?? {}, publicModelName);
+  const windowContext = publicModelCustomLimit(providers, publicModelName, "max_input_tokens") ?? publicModelWindow;
   const keyStates = providerAuthKind(provider) === "api_key" ? providerKeyStates(provider) : [];
   const selectedProviderKey = keyStates.find((key) => key.id === stringValue(model.provider_key_id))
     ?? keyStates.find((key) => key.name === stringValue(model.api_key_name));
@@ -4220,6 +5028,17 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
     ? booleanValue(model.api_key_configured)
     : providerAuthStatus(provider) === "signed_in";
   const probeReady = Boolean(providerBaseUrl.trim() && upstreamName.trim() && authenticationReady);
+  // A linked key the relay could not resolve says so here, on the route that
+  // failed, naming the key in the same `账号/分组` form the picker uses.
+  const bindingIssueText = bindingIssue
+    ? relayBindingIssueText(
+      bindingIssue,
+      selectedProviderKey
+        ? providerKeyChoiceLabel({ name: selectedProviderKey.name, kind: selectedProviderKey.source.kind, source: relaySourceForKey(selectedProviderKey, relaySources) }, translate)
+        : providerLabel,
+      translate,
+    )
+    : "";
   const openProbeDetails = (): void => {
     if (!probePresentation.full) return;
     void native.showReadOnlyText({
@@ -4260,13 +5079,26 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
     });
   };
   return <View style={styles.inspectorContent}>
-    <View style={styles.modelBreadcrumb}><NativeButton title={providerLabel} link disabled={busy} onPress={onProviderClick} style={styles.breadcrumbProvider} /><Text style={styles.breadcrumbSeparator}>&gt;</Text><Text numberOfLines={1} style={styles.inspectorHeading}>{displayLabel(modelName, translate("providers.unnamedModel"))}</Text></View>
+    <View style={styles.modelBreadcrumb}><NativeButton title={providerLabel} link disabled={busy} onPress={onProviderClick} style={styles.breadcrumbProvider} /><Text style={styles.breadcrumbSeparator}>&gt;</Text>{onOpenPublicModel ? <NativeButton title={displayLabel(modelName, translate("providers.unnamedModel"))} link disabled={busy || !publicModelName} onPress={() => onOpenPublicModel?.()} style={styles.breadcrumbProvider} /> : <Text numberOfLines={1} style={styles.inspectorHeading}>{displayLabel(modelName, translate("providers.unnamedModel"))}</Text>}</View>
     <View style={styles.inspectorDivider} />
     <View style={styles.inspectorBody}>
       <View style={styles.inspectorEnabledRow}><View style={styles.inspectorEnableControl}><NativeCheckbox label={translate("common.enable")} value={booleanValue(model.model_enabled, booleanValue(model.enabled, true))} disabled={busy} onValueChange={(model_enabled) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { model_enabled } })} /></View><ActionButton title={probeTitle} titleWidth="tight" busy={probing} toolTip={(probePresentation.compact ? probePresentation.tooltip : "") || (degradationIncluded ? translate("providers.deepTestHint") : undefined)} disabled={(busy && !probing) || !probeReady} onPress={probe} />{probePresentation.compactSentence ? <Pressable style={styles.inspectorProbeFinding} onPress={openProbeDetails} accessibilityRole="link" accessibilityLabel={probePresentation.compactSentence}><TooltipText numberOfLines={1} ellipsizeMode="tail" tooltip={probePresentation.tooltip} style={styles.inspectorProbeFindingText}>{probePresentation.compactSentence}</TooltipText></Pressable> : null}</View>
       <TextField label={translate("providers.publicModel")} labelWidth={60} value={modelFieldName} onDraftChange={onNameDraftChange} onCommit={(name) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { name } })} />
       <PickerField label={translate("providers.provider")} labelWidth={60} allowShrink value={providerLabel} values={providerLabels} disabled={busy || providers.length <= 1} onSelect={(label) => { const next = providers[providerLabels.indexOf(label)]; if (next) onProviderChange(editorIdentifier(next)); }} />
+      {isDraftModel(model, translate) ? <Text style={styles.fieldHint}>{translate(selectedProviderKey ? "providers.draftModelHint" : "providers.draftModelKeylessHint")}</Text> : null}
       {providerKeyOptions.length > 0 ? <PickerField label={translate("providers.providerKey")} labelWidth={60} allowShrink value={selectedProviderKey?.id ?? ""} values={[{ value: "", label: translate("providers.undefinedKey") }, ...providerKeyOptions]} disabled={busy} onSelect={selectProviderKey} /> : null}
+      {bindingIssueText ? <Text style={styles.fieldHint}>{bindingIssueText}</Text> : null}
+      {service ? <View style={styles.formRow}>
+        <Text style={[styles.formRowLabel, styles.modelStatusLabel]}>{translate("providers.modelRate")}</Text>
+        <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{serviceRate.trim() || translate("common.none")}</Text>
+      </View> : null}
+      {publicModelName ? <View style={styles.formRow}>
+        <Text style={[styles.formRowLabel, styles.modelStatusLabel]}>{translate("providers.contextWindow")}</Text>
+        <View style={styles.modelWindowValue}>
+          <Text numberOfLines={1} style={styles.modelWindowText}>{publicModelTokensText(windowContext, translate)}</Text>
+          <NativeButton title={translate("providers.publicModelSettings")} compact disabled={busy || !onOpenPublicModel} onPress={() => onOpenPublicModel?.()} style={styles.modelWindowLink} />
+        </View>
+      </View> : null}
       <TextField label={translate("providers.upstream")} labelWidth={60} value={upstreamFieldValue} onDraftChange={(value) => drafts?.setModelUpstreamDraft(providerId, id, value)} onCommit={(upstream_model) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { upstream_model } })} />
       <View style={styles.orderEditorRow}>
         <TextField label={translate("providers.order")} labelWidth={60} controlWidth={64} value={String(displayedOrder)} keyboardType="numeric" disabled={busy || followsMultiplier} onDraftChange={(value) => drafts?.setModelOrderDraft(providerId, id, value)} onCommit={(nextOrder) => {
@@ -4375,6 +5207,17 @@ function modelRecord(model: UnknownRecord): UnknownRecord {
 // A staged model that cannot materialize a route yet.  Without a public name
 // (or an upstream model) Core rejects Apply, so the shared pane marks the row
 // where the model is edited instead of only reporting that the draft is invalid.
+/**
+ * A model ＋ created and not finished yet: still carrying the placeholder name
+ * it was born with.  Its fields say what is left instead of reporting an
+ * incomplete new record as an error.
+ */
+function isDraftModel(model: UnknownRecord, translate: Translate): boolean {
+  const name = stringValue(model.model_name, stringValue(model.name)).trim();
+  if (!name) return false;
+  return name === translate("providers.newModel") || name.startsWith(`${translate("providers.newModel")} `);
+}
+
 function modelNeedsAttention(model: UnknownRecord): boolean {
   if (!booleanValue(model.model_enabled, booleanValue(model.enabled, true))) return false;
   const name = stringValue(model.model_name).trim() || stringValue(model.name).trim();
@@ -4405,6 +5248,43 @@ function upstreamModelLabel(model: UnknownRecord): string {
   const value = stringValue(model.upstream_model, stringValue(model.litellm_model));
   const separator = value.indexOf("/");
   return separator >= 0 ? value.slice(separator + 1) : value;
+}
+
+// The public-model row key the routes table uses for one public model.  The
+// name itself is the selection identity, so the key prefix only marks the
+// row kind.
+const ROUTE_PUBLIC_MODEL_PREFIX = "route-public-model:";
+
+function routePublicModelRowKey(publicModel: string): string {
+  return `${ROUTE_PUBLIC_MODEL_PREFIX}${publicModel}`;
+}
+
+function publicModelTokensText(value: number | null | undefined, translate: Translate): string {
+  if (value === null || value === undefined || !Number.isFinite(value) || value <= 0) return translate("common.none");
+  return Math.round(value).toLocaleString("en-US");
+}
+
+// One public model's declared limit: the smallest value its routes carry, so a
+// group never promises more than every route behind it can deliver.  Absent
+// means the registry default stands.
+function publicModelCustomLimit(providers: UnknownRecord[], publicModel: string, field: "max_input_tokens"): number | undefined {
+  const name = publicModel.trim();
+  if (!name) return undefined;
+  const values: number[] = [];
+  for (const provider of providers) {
+    for (const raw of asRecords(provider.models)) {
+      const model = modelRecord(raw);
+      if (stringValue(model.model_name, stringValue(model.name)).trim() !== name) continue;
+      const value = numberValue(model[field], 0);
+      if (value > 0) values.push(value);
+    }
+  }
+  return values.length > 0 ? Math.min(...values) : undefined;
+}
+
+function publicModelDefault(contexts: UnknownRecord, publicModel: string): number | undefined {
+  const record = asRecord(contexts[publicModel]);
+  return numberValue(record.context_window, 0) || undefined;
 }
 
 function identifier(record: UnknownRecord): string {
@@ -4478,11 +5358,14 @@ function ProviderSourceFields({ provider, providerID, relayStations, busy, trans
   </View>;
 }
 
-function ProviderEditor({ provider, relaySources, relayStations, native, busy, translate, dispatch, dispatchWithOutcome, onSecretState, onNameDraftChange, sourceModel, onReturnToModel, station, stationAccounts, relay, addOfficialAccount, onActivateAndRestart, onStatus, language, snapshotForCleanups }: { provider: UnknownRecord; relaySources: RelaySourceOption[]; relayStations: RelayStationOption[]; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; dispatchWithOutcome: (type: string, payload?: UnknownRecord, domain?: ConfigDomain) => Promise<CoreSnapshot | undefined>; onSecretState: (state: SecretState) => void; onNameDraftChange?: (name: string) => void; sourceModel?: UnknownRecord; onReturnToModel: () => void; station?: RelayStation; stationAccounts: RelayAccount[]; relay: RelayWorkspaceBridge; addOfficialAccount: (kind: ServiceProviderKind) => Promise<string>; onActivateAndRestart: () => Promise<boolean>; onStatus: (status?: string) => void; language: "system" | "en" | "zh-Hans"; snapshotForCleanups?: CoreSnapshot }): React.JSX.Element {
+function ProviderEditor({ provider, relaySources, relayStations, native, busy, translate, dispatch, dispatchWithOutcome, onSecretState, onNameDraftChange, sourceModel, onReturnToModel, station, stationAccounts, relay, addOfficialAccount, onActivateAndRestart, onStatus, language, bindingIssues, snapshotForCleanups }: { provider: UnknownRecord; relaySources: RelaySourceOption[]; relayStations: RelayStationOption[]; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; dispatchWithOutcome: (type: string, payload?: UnknownRecord, domain?: ConfigDomain, keepControlsEnabled?: boolean) => Promise<CoreSnapshot | undefined>; onSecretState: (state: SecretState) => void; onNameDraftChange?: (name: string) => void; sourceModel?: UnknownRecord; onReturnToModel: () => void; station?: RelayStation; stationAccounts: RelayAccount[]; relay: RelayWorkspaceBridge; addOfficialAccount: (kind: ServiceProviderKind) => Promise<string>; onActivateAndRestart: () => Promise<boolean>; onStatus: (status?: string) => void; language: "system" | "en" | "zh-Hans"; bindingIssues?: UnknownRecord[]; snapshotForCleanups?: CoreSnapshot }): React.JSX.Element {
   const id = editorIdentifier(provider);
   const drafts = useContext(ProviderWorkspaceDraftContext);
   const kind = providerKind(provider);
-  const isLogin = kind === "openai" || kind === "claude";
+  const service = providerService(provider);
+  const isOfficialAccount = kind === "openai" || kind === "claude";
+  const isWorkBuddyAccount = kind === "workbuddy" || kind === "workbuddyAI";
+  const isLogin = isOfficialAccount || isWorkBuddyAccount;
   // Which account action is running, so only the button that started it shows
   // the spinner; every sibling stays disabled while one of them works.
   const [authPending, setAuthPending] = useState<"auth" | "activate" | "sibling">();
@@ -4528,6 +5411,89 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
   };
   const model = asRecords(provider.models)[0];
   const modelNameText = model ? stringValue(model.display_name, stringValue(model.name, stringValue(model.upstream_model, translate("common.notAvailable")))) : translate("common.notAvailable");
+  useEffect(() => {
+    // Opening a WorkBuddy entry reads its desktop-app account and credit once;
+    // the section's own 刷新 button re-reads them on demand.
+    if (!workbuddyProviderIDFor(kind)) return;
+    void loadWorkBuddyAccount(false).then((account) => {
+      // A worker that was just started can answer its first read before it has
+      // the desktop credential in hand; re-read once so the block never states
+      // a stale “not signed in”.
+      if (account && stringValue(account.state) !== "signed-in") void loadWorkBuddyAccount(true);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id, kind]);
+  // A WorkBuddy account is read through the Core-owned worker: the editor
+  // links the desktop app's own sign-in here and never asks for a secret.
+  const [workbuddyStatusBusy, setWorkbuddyStatusBusy] = useState(false);
+  const [workbuddyAccount, setWorkbuddyAccount] = useState<UnknownRecord | undefined>(undefined);
+  const loadWorkBuddyAccount = async (refresh: boolean): Promise<UnknownRecord | undefined> => {
+    const providerKey = workbuddyProviderIDFor(kind);
+    if (!providerKey) return undefined;
+    setWorkbuddyStatusBusy(true);
+    try {
+      // Reading the account is this block's own wait: the name field, the
+      // association controls and every other input stay usable throughout.
+      const next = await dispatchWithOutcome("workbuddy_status", { refresh }, "providers_models", true);
+      if (!next) return undefined;
+      const summary = asRecord(asRecord(next.action_summaries?.providers_models).operation_summary);
+      const account = asRecord(asRecord(summary.providers)[providerKey]);
+      setWorkbuddyAccount(account);
+      return account;
+    } finally {
+      setWorkbuddyStatusBusy(false);
+    }
+  };
+  // The account is the desktop app's own sign-in, so this block only re-reads
+  // it and states what it found; its models come through the key path below.
+  const refreshWorkBuddyAccount = async (): Promise<void> => {
+    if (workbuddyStatusBusy) return;
+    try {
+      const account = await loadWorkBuddyAccount(true);
+      if (!account) return;
+      if (stringValue(account.state) !== "signed-in") {
+        onStatus?.(translate("providers.wizard.workbuddySignInRequired"));
+        return;
+      }
+      const credits = workbuddyCreditsText(account, translate);
+      onStatus?.(credits ? `${translate("providers.wizard.workbuddyCredits")}: ${credits}` : translate("providers.authStatusSignedIn"));
+    } catch {
+      onStatus?.(translate("relay.operationFailed"));
+    }
+  };
+  // An account that is not signed in is handed to the desktop app that owns
+  // the sign-in: this pane can only open it and then re-read what it wrote.
+  const openWorkBuddyApp = async (): Promise<void> => {
+    if (workbuddyStatusBusy) return;
+    try {
+      const providerKey = workbuddyProviderIDFor(kind);
+      if (!providerKey) return;
+      await dispatchWithOutcome("workbuddy_login", { provider: providerKey }, "providers_models", true);
+    } catch {
+      // Opening the app is a courtesy: the confirm below still asks whether
+      // the user signed in, so a failure here is not reported as one.
+    }
+    setWorkbuddyStatusBusy(true);
+    try {
+      const accepted = await native.showConfirmation({
+        title: translate("providers.wizard.workbuddyLoginTitle"),
+        message: translate("providers.wizard.workbuddyLoginPrompt", { name: workbuddyAppName(kind, translate) }),
+        confirmLabel: translate("providers.wizard.workbuddyLoggedIn"),
+      });
+      if (!accepted) return;
+      const account = await loadWorkBuddyAccount(true);
+      const state = stringValue(account?.state);
+      const credits = workbuddyCreditsText(account, translate);
+      if (state === "signed-in") {
+        onStatus?.(credits ? `${translate("providers.wizard.workbuddyCredits")}: ${credits}` : translate("providers.authStatusSignedIn"));
+      } else {
+        onStatus?.(translate("providers.authStatusSignedOut"));
+      }
+    } finally {
+      setWorkbuddyStatusBusy(false);
+    }
+  };
+  const workbuddySignedIn = stringValue(workbuddyAccount?.state) === "signed-in";
   const startLogin = async (): Promise<void> => {
     if (authPending !== undefined) return;
     const kind = providerKind(provider) === "claude" ? "claude_login" : "openai_login";
@@ -4623,7 +5589,7 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
         return;
       }
       await relay.refreshAccounts();
-      await relay.refreshResources(pendingID);
+      await relay.refreshResources(pendingID, { force: true });
       onStatus?.(translate("relay.loginComplete"));
     } catch {
       onStatus?.(translate("relay.operationFailed"));
@@ -4656,7 +5622,7 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
         onCommit={() => { void stageStationUpdate(); }}
       />
     </> : null}
-    {kind !== "openai" && kind !== "claude" ? <ProviderKeysPanel
+    {!isLogin ? <ProviderKeysPanel
       provider={provider}
       providerId={id}
       kind={kind}
@@ -4669,16 +5635,14 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
       relay={relay}
       onStatus={onStatus}
       language={language}
+      bindingIssues={bindingIssues}
       variant="inline"
     /> : null}
-    {isLogin ? <View style={styles.officialAccountSection}>
-      <View style={styles.panelHeader}><Text style={styles.panelTitle}>{translate("providers.accounts")}</Text></View>
-      <View style={styles.officialStatusRow}>
-        <Text style={styles.providerAuthStatusLabel}>{translate("providers.authStatus")}</Text>
-        <Text style={styles.providerAuthStatusValue}>{statusLabels[authStatus]}</Text>
-      </View>
+    {service ? <View style={styles.officialAccountSection}>
+      {/* The service's own identity: the name stays editable here, while the
+          type and the address are what this provider is bound to. */}
       <TextField
-        key={`official-name:${id}`}
+        key={`service-name:${id}`}
         label={translate("providers.providerName")}
         labelWidth={88}
         value={providerName}
@@ -4689,6 +5653,27 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
           if (next && next !== providerName) void dispatch("service_provider.patch", { provider_id: id, provider: { name: next } });
         }}
       />
+      <PickerField
+        label={translate("providers.wizard.providerType")}
+        labelWidth={88}
+        value={kind}
+        values={SERVICE_KIND_OPTIONS.map((option) => ({ value: option.kind, label: translate(option.label) }))}
+        disabled={busy}
+        onSelect={(next) => {
+          if (next !== kind) void dispatch("service_provider.patch", { provider_id: id, provider: { auth_kind: next } });
+        }}
+      />
+      <View style={styles.officialStatusRow}>
+        <Text style={styles.providerAuthStatusLabel}>{translate("providers.wizard.baseUrl")}</Text>
+        <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{SERVICE_BASE_URLS[service]}</Text>
+      </View>
+    </View> : null}
+    {isOfficialAccount ? <View style={styles.officialAccountSection}>
+      <View style={styles.panelHeader}><Text style={styles.panelTitle}>{translate("providers.serviceLinks")}</Text></View>
+      <View style={styles.officialStatusRow}>
+        <Text style={styles.providerAuthStatusLabel}>{translate("providers.authStatus")}</Text>
+        <Text style={styles.providerAuthStatusValue}>{statusLabels[authStatus]}</Text>
+      </View>
       <Text style={styles.providerAuthLine}>{translate("relay.officialProviderModels")}: {modelNameText}</Text>
       <Text style={styles.keysHint}>{kind === "openai" ? translate("relay.officialProviderWebViewHint") : translate("relay.officialProviderBrowserHint")}</Text>
       {kind === "openai" && authActive ? <Text style={styles.officialActiveHint}>{translate("relay.officialProviderActive")}</Text> : null}
@@ -4700,7 +5685,7 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
       </View>
       {kind === "claude" && authStatus === "error" ? <NativeSecretField autoCommit label={translate("providers.authTypeClaude")} hint={translate("relay.officialProviderTokenHint")} busy={busy} disabled={busy} domain="providers_models" field="provider_auth_token" target={id} onSecretState={onSecretState} /> : null}
     </View> : null}
-    {kind !== "openai" && kind !== "claude" && station ? <StationAccountsPanel
+    {!isLogin && station ? <StationAccountsPanel
       key={`station-accounts:${station.id}`}
       station={station}
       accounts={stationAccounts}
@@ -4713,19 +5698,38 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
       refreshAccounts={relay.refreshAccounts}
       refreshResources={relay.refreshResources}
       apiKeyActions={relay.apiKeyActions}
+      applyStagedQuietly={relay.applyStagedQuietly}
       detectType={relay.detectType}
       stationDraft={stationDraft}
       onStationDraftChange={setStationDraftValue}
       onStageStationUpdate={stageStationUpdate}
       onStatus={onStatus}
     /> : null}
-    {kind !== "openai" && kind !== "claude" && !station ? <View style={styles.providerAccountsHeader}>
+    {(!isLogin || isWorkBuddyAccount) && !station ? <View style={styles.providerAccountsHeader}>
       <View style={styles.panelHeader}>
-        <Text style={styles.panelTitle}>{translate("providers.accounts")}</Text>
+        {/* The one association block: a station-backed provider links a relay
+            station, a provider addressed at an official service links that
+            service's own account.  The label follows the provider. */}
+        <Text style={styles.panelTitle}>{translate(providerService(provider) ? "providers.serviceLinks" : "providers.accounts")}</Text>
         <View style={styles.panelActions}>
-          {vendorBaseURL ? <NativeButton title="" symbol="plus" compact toolTip={translate("providers.addRelayAccount")} accessibilityLabel={translate("providers.addRelayAccount")} busy={relayAddBusy} disabled={busy} onPress={() => { void addRelayAccountToVendor(); }} style={styles.iconButton} /> : null}
+          {isWorkBuddyAccount && workbuddySignedIn ? <NativeButton title="" symbol="refresh" compact toolTip={translate("providers.wizard.workbuddyRefresh")} accessibilityLabel={translate("providers.wizard.workbuddyRefresh")} busy={workbuddyStatusBusy} disabled={busy && !workbuddyStatusBusy} onPress={() => { void refreshWorkBuddyAccount(); }} style={styles.iconButton} /> : null}
+          {isWorkBuddyAccount && !workbuddySignedIn && workbuddyAccount ? <NativeButton title={translate("providers.wizard.workbuddyLogin")} compact busy={workbuddyStatusBusy} disabled={busy && !workbuddyStatusBusy} onPress={() => { void openWorkBuddyApp(); }} /> : null}
+          {vendorBaseURL && !providerService(provider) ? <NativeButton title="" symbol="plus" compact toolTip={translate("providers.addRelayAccount")} accessibilityLabel={translate("providers.addRelayAccount")} busy={relayAddBusy} disabled={busy} onPress={() => { void addRelayAccountToVendor(); }} style={styles.iconButton} /> : null}
         </View>
       </View>
+      {isWorkBuddyAccount ? <>
+        <View style={styles.officialStatusRow}>
+          <Text style={styles.providerAuthStatusLabel}>{translate("providers.workbuddyAccount")}</Text>
+          <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{stringValue(workbuddyAccount?.state) === "signed-in"
+            ? [stringValue(workbuddyAccount?.nickname), stringValue(workbuddyAccount?.domain)].filter(Boolean).join(" · ")
+            : progressText(workbuddyStatusBusy, translate) ?? translate("providers.wizard.workbuddySignInRequired", { name: workbuddyAppName(kind, translate) })}</Text>
+        </View>
+        {workbuddyCreditsText(workbuddyAccount, translate) ? <View style={styles.officialStatusRow}>
+          <Text style={styles.providerAuthStatusLabel}>{translate("providers.wizard.workbuddyCredits")}</Text>
+          <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{workbuddyCreditsText(workbuddyAccount, translate)}</Text>
+        </View> : null}
+      </> : null}
+      {providerService(provider) && !isWorkBuddyAccount ? <Text style={styles.keysHint}>{translate("providers.serviceKeyHint")}</Text> : null}
     </View> : null}
     </View>
   </PersistentScrollView>;
@@ -4741,7 +5745,6 @@ const CLIENT_FILE_GROUPS: ReadonlyArray<{ client: ClientFile["client"]; titleKey
   { client: "claudeDesktop", titleKey: "claude.desktopSection", hintKey: "clients.claudeDesktopFilesHint" },
   { client: "pi", titleKey: "clients.pi", hintKey: "clients.piFilesHint" },
   { client: "dsh", titleKey: "clients.dsh", hintKey: "clients.dshFilesHint" },
-  { client: "dshDesktop", titleKey: "clients.dshDesktop", hintKey: "clients.dshDesktopFilesHint" },
   { client: "opencode", titleKey: "clients.opencode", hintKey: "clients.opencodeFilesHint" },
 ];
 
@@ -4808,7 +5811,7 @@ function editorTargetFromPayload(payload: string | undefined): ClientFile | unde
   }
 }
 
-function FileEditorWorkspace({ file, fileId, nativeAction, ipc, native, translate, busy, onEditorConflict, reloadToken, baselineToken, syncRevision, onFlushPendingFields, onStatus, onClose }: {
+function FileEditorWorkspace({ file, fileId, nativeAction, ipc, native, translate, busy, onEditorConflict, reloadToken, baselineToken, syncRevision, onFlushPendingFields, onClose }: {
   file?: ClientFile;
   fileId?: string;
   nativeAction?: { id: string; sequence: number };
@@ -4821,12 +5824,13 @@ function FileEditorWorkspace({ file, fileId, nativeAction, ipc, native, translat
   baselineToken: number;
   syncRevision?: number;
   onFlushPendingFields: () => Promise<void>;
-  onStatus: (message?: string) => void;
   onClose: () => void;
 }): React.JSX.Element {
   const [listed, setListed] = useState<ClientFile>();
   const [loadError, setLoadError] = useState<string>();
   const [saving, setSaving] = useState(false);
+  // This child window states its own save result beside its footer buttons.
+  const [footerStatus, setFooterStatus] = useState<string>();
   const readHostTarget = useCallback((): ClientFile | undefined => (
     editorTargetFromPayload(native.pendingFileEditorTarget?.())
     ?? editorTargetFromPayload(fileId)
@@ -4901,6 +5905,7 @@ function FileEditorWorkspace({ file, fileId, nativeAction, ipc, native, translat
           title: translate("settings.discardDraftTitle"),
           message: translate("settings.discardDraftBody"),
           confirmLabel: translate("common.discard"),
+          destructive: true,
         });
         if (!confirmed) return;
       }
@@ -4919,7 +5924,7 @@ function FileEditorWorkspace({ file, fileId, nativeAction, ipc, native, translat
   const save = (): void => {
     if (!target || saving) return;
     setSaving(true);
-    onStatus(translate("common.saving"));
+    setFooterStatus(translate("common.saving"));
     void (async () => {
       await onFlushPendingFields();
       const refreshed = await ipc.snapshot();
@@ -4935,9 +5940,9 @@ function FileEditorWorkspace({ file, fileId, nativeAction, ipc, native, translat
           await ipc.applyDomains([...domains], current.revision);
         }
       }
-      onStatus(translate("common.saved"));
+      setFooterStatus(translate("common.saved"));
     })().then(closeWindow).catch((reason: unknown) => {
-      onStatus(errorMessage(reason, translate));
+      setFooterStatus(errorMessage(reason, translate));
       setSaving(false);
     });
   };
@@ -4953,6 +5958,9 @@ function FileEditorWorkspace({ file, fileId, nativeAction, ipc, native, translat
       ? <View style={assistantFileSurfaceStyles.editorLoading}><Text style={assistantFileSurfaceStyles.filesStatus}>{translate("common.loading")}</Text></View>
       : <RawEditor showLabel={false} showDiff codexPane syncRevision={syncRevision} style={assistantFileSurfaceStyles.editorRouteRaw} label={target.name} domain={target.domain} document={target.document} language={target.language === "text" ? "json" : target.language} ipc={ipc} translate={translate} onConflict={onEditorConflict} reloadToken={reloadToken} baselineToken={baselineToken} />}
     <View style={assistantFileSurfaceStyles.editorFooter}>
+      {/* The child states its own result beside its buttons; the buttons keep
+          their trailing edge, so a message never moves them. */}
+      <Text numberOfLines={1} style={assistantFileSurfaceStyles.editorFooterStatus}>{footerStatus ?? ""}</Text>
       <View style={assistantFileSurfaceStyles.editorFooterActions}>
         <ActionButton title={translate("status.close")} disabled={busy || saving} onPress={close} />
         <ActionButton primary title={translate("status.saveAndClose")} busy={saving} disabled={(busy && !saving) || target === undefined} onPress={save} />
@@ -5300,7 +6308,9 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
     try {
       await dispatchServiceAction(serviceRestart ? "service.restart" : "service.start");
       onSnapshot(await ipc.snapshot());
-      onStatus(translate("service.running"));
+      // The 服务 row states the state itself; the strip names the action that
+      // just landed instead of repeating the state word beside it.
+      onStatus(translate(serviceRestart ? "service.restarted" : "service.started"));
     } catch (reason: unknown) {
       onStatus(errorMessage(reason, translate));
     } finally {
@@ -5395,11 +6405,16 @@ function RuntimeWorkspace({ snapshot, busy, translate, dispatch, onSecretState, 
   </View>;
 }
 
-function DataManagementWorkspace({ snapshot, busy, webDavOperationBusy, statuses, translate, dispatch, onSecretState, onFlushPendingFields, onTabSwitchError, onInspectImport, onImport, onConfirmImportReplace, onExport, onProbeWebDav, onSyncWebDav }: {
+function DataManagementWorkspace({ snapshot, tab, onTabChange, statuses, busy, webDavOperationBusy, translate, dispatch, onSecretState, onFlushPendingFields, onTabSwitchError, onInspectImport, onImport, onConfirmImportReplace, onExport, onProbeWebDav, onSyncWebDav, onCommitWebDavSettings }: {
   snapshot?: CoreSnapshot;
+  /** The active tab is the route surface's, because it decides whose result the
+   * window's one status strip reports. */
+  tab: DataManagementTab;
+  onTabChange: (tab: DataManagementTab) => void;
+  /** Each pane's last result, whose own header band states it. */
+  statuses: Partial<Record<DataManagementTab, string>>;
   busy: boolean;
   webDavOperationBusy: boolean;
-  statuses: Partial<Record<DataManagementTab, string>>;
   translate: Translate;
   dispatch: Dispatch;
   onSecretState: (state: SecretState) => void;
@@ -5411,18 +6426,30 @@ function DataManagementWorkspace({ snapshot, busy, webDavOperationBusy, statuses
   onExport: (sections: ConfigDomain[]) => Promise<void>;
   onProbeWebDav: () => Promise<void>;
   onSyncWebDav: (action: WebDavSyncAction) => Promise<void>;
+  onCommitWebDavSettings: (patch: UnknownRecord) => Promise<void>;
 }): React.JSX.Element {
-  const [tab, setTab] = useState<DataManagementTab>("import");
   // Which data operation is running: only the button that started it shows the
   // spinner, while the pane's other controls stay disabled as before.
-  const [pendingAction, runPendingAction] = usePendingAction<"inspect" | "import" | "export" | "probe" | "sync">();
-  const controlsBusy = (action?: "inspect" | "import" | "export" | "probe" | "sync"): boolean => busy && pendingAction !== action;
+  const [pendingAction, runPendingAction] = usePendingAction<DataManagementAction>();
+  const controlsBusy = (action?: DataManagementAction): boolean => busy && pendingAction !== action;
   const webDavBusy = (action: "probe" | "sync"): boolean => (busy || webDavOperationBusy) && pendingAction !== action;
   const [importPreview, setImportPreview] = useState<IpcResults["import_preview"]>();
   const [importSections, setImportSections] = useState<ConfigDomain[]>([]);
   const [stagedSections, setStagedSections] = useState<ConfigDomain[]>([]);
   const [exportSections, setExportSections] = useState<ConfigDomain[]>([...DATA_PACKAGE_DOMAINS]);
-  const [syncAction, setSyncAction] = useState<WebDavSyncAction>("sync");
+  // A pane's command is a field like any other: the label column names the row,
+  // the control column holds the button, and the result of that command stands
+  // on the same line, immediately beside it.
+  // The row keeps the label column (so its controls land on the pane's control
+  // column) and leaves it empty: the buttons name their own actions.
+  const actionRow = (controls: React.ReactNode, result?: string, hint?: string): React.JSX.Element => <View style={SETTINGS_FIELD}>
+    <View style={SETTINGS_FIELD_ROW_INDENTED}>
+      <Text style={SETTINGS_FIELD_LABEL}>{""}</Text>
+      {controls}
+      <Text numberOfLines={2} style={styles.dataManagementActionStatus}>{result ?? ""}</Text>
+    </View>
+    {hint === undefined ? null : <View style={SETTINGS_FIELD_HELP_SLOT}><Text style={SETTINGS_FIELD_HELP_TEXT}>{hint}</Text></View>}
+  </View>;
   const dataManagementTabRows = useMemo(() => ([
     { id: "import" as DataManagementTab, title: translate("dataManagement.tab.import") },
     { id: "export" as DataManagementTab, title: translate("dataManagement.tab.export") },
@@ -5437,7 +6464,7 @@ function DataManagementWorkspace({ snapshot, busy, webDavOperationBusy, statuses
     // Keep navigation immediate even if Core is slow or unavailable. Pending
     // field writes finish in the background and report their own failure.
     const pending = onFlushPendingFields();
-    setTab(next);
+    onTabChange(next);
     void pending.catch((reason: unknown) => {
       onTabSwitchError(previous, reason);
     });
@@ -5449,8 +6476,13 @@ function DataManagementWorkspace({ snapshot, busy, webDavOperationBusy, statuses
     const sections = DATA_PACKAGE_SECTIONS.filter(({ domain }) => available.includes(domain));
     // Choosing among many saved sections is a multi-select, so these stay
     // checkboxes: a switch is for one on/off setting, not for a checkbox list.
-    return <View style={[styles.dataManagementSectionPicker, dataManagementPolishStyles.sectionPicker]}>{sections.map(({ domain, labelKey }) => <NativeCheckbox key={domain} label={translate(labelKey)} value={selected.includes(domain)} disabled={disabled} onValueChange={(enabled) => onToggle(domain, enabled)} style={styles.dataManagementSectionControl} />)}</View>;
+    // One section is one checkbox row, and the checkbox carries its own label:
+    // a short list of names stays one tight column instead of stretching a
+    // label to the far edge of the pane, where the eye has to travel for it.
+    return <View style={styles.dataManagementSectionList}>{sections.map(({ domain, labelKey }) => <NativeCheckbox key={domain} label={translate(labelKey)} value={selected.includes(domain)} disabled={disabled} onValueChange={(enabled) => onToggle(domain, enabled)} style={styles.dataManagementSectionItem} />)}</View>;
   };
+  // The list's own line: what is chosen now, and the tool that chooses it all.
+  const sectionListHeader = (summary: string, tools?: React.ReactNode): React.JSX.Element => <View style={styles.dataManagementSelectionBar}><Text numberOfLines={1} style={styles.dataManagementSelectionCount}>{summary}</Text><View style={styles.dataManagementToolbarButtons}>{tools}</View></View>;
   const chooseImportFile = async (): Promise<void> => {
     if (pendingAction === "inspect") return;
     await runPendingAction("inspect", async () => {
@@ -5480,12 +6512,6 @@ function DataManagementWorkspace({ snapshot, busy, webDavOperationBusy, statuses
       setStagedSections(DATA_PACKAGE_DOMAINS.filter((domain) => imported.draft_domains.includes(domain)));
     });
   };
-  const syncOptions: Array<{ id: WebDavSyncAction; title: string }> = [
-    { id: "sync", title: translate("dataManagement.syncSmart") },
-    { id: "push", title: translate("dataManagement.syncPush") },
-    { id: "pull", title: translate("dataManagement.syncPull") },
-  ];
-  const selectedSyncLabel = syncOptions.find(({ id }) => id === syncAction)?.title ?? syncOptions[0].title;
   const selectionTool = (selectedCount: number, availableCount: number, onSelectAll: () => void, onDeselectAll: () => void): React.JSX.Element => {
     const allSelected = availableCount > 0 && selectedCount === availableCount;
     return <ActionButton title={translate(allSelected ? "dataManagement.deselectAll" : "dataManagement.selectAll")} disabled={busy || availableCount === 0} onPress={allSelected ? onDeselectAll : onSelectAll} />;
@@ -5505,50 +6531,49 @@ function DataManagementWorkspace({ snapshot, busy, webDavOperationBusy, statuses
       {!importPreview ? <View style={[styles.dataManagementImportIntro, dataManagementPolishStyles.importIntro]}><View style={styles.dataManagementImportFileRow}><Text style={styles.dataManagementImportFileLabel}>{translate("dataManagement.importFile")}</Text><View style={styles.dataManagementImportFileValue}><Text numberOfLines={1} style={styles.dataManagementImportFilePlaceholder}>{translate("dataManagement.noImportFile")}</Text></View><ActionButton title={translate("dataManagement.chooseImportFile")} busy={pendingAction === "inspect"} disabled={controlsBusy("inspect")} onPress={() => { void chooseImportFile(); }} /></View><Text style={dataManagementPolishStyles.paneHint}>{translate("dataManagement.importHint")}</Text></View> : null}
       {importReviewReady ? <>
         <Text style={dataManagementPolishStyles.paneHint}>{translate("dataManagement.importRecognizedHint")}</Text>
-        <DataManagementGroup>
-          <View style={styles.dataManagementSelectionBar}><Text style={[styles.dataManagementSelectionCount, dataManagementPolishStyles.compactText]}>{translate("dataManagement.importDetectedCount", { count: detectedImportSections.length })} · {translate("dataManagement.selectedCount", { count: importSections.length })}</Text><View style={styles.dataManagementToolbarButtons}><ActionButton title={translate("dataManagement.changeImportFile")} busy={pendingAction === "inspect"} disabled={controlsBusy("inspect")} onPress={() => { void chooseImportFile(); }} />{selectionTool(importSections.length, detectedImportSections.length, () => setImportSections([...detectedImportSections]), () => setImportSections([]))}<ActionButton title={translate("dataManagement.importSelected")} busy={pendingAction === "import"} disabled={controlsBusy("import") || importSections.length === 0} onPress={() => { void importSelected(); }} /></View></View>
-          {sectionList(detectedImportSections, importSections, busy, (domain, enabled) => toggleSection(setImportSections, domain, enabled))}
-          {replacingDraftSections.length > 0 ? <Text numberOfLines={2} style={[styles.dataManagementSensitiveHint, dataManagementPolishStyles.compactText]}>{translate("dataManagement.importReplaceDraftWarning", { sections: DATA_PACKAGE_SECTIONS.filter(({ domain }) => replacingDraftSections.includes(domain)).map(({ labelKey }) => translate(labelKey)).join(" · ") })}</Text> : null}
-        </DataManagementGroup>
+        <View style={SETTINGS_FIELD}>
+          <View style={SETTINGS_FIELD_ROW_INDENTED}>
+            <Text style={SETTINGS_FIELD_LABEL}>{translate("dataManagement.sections")}</Text>
+            <View style={styles.dataManagementSectionsField}>
+              {sectionListHeader(`${translate("dataManagement.importDetectedCount", { count: detectedImportSections.length })} · ${translate("dataManagement.selectedCount", { count: importSections.length })}`, <><ActionButton title={translate("dataManagement.changeImportFile")} busy={pendingAction === "inspect"} disabled={controlsBusy("inspect")} onPress={() => { void chooseImportFile(); }} />{selectionTool(importSections.length, detectedImportSections.length, () => setImportSections([...detectedImportSections]), () => setImportSections([]))}</>)}
+              {sectionList(detectedImportSections, importSections, busy, (domain, enabled) => toggleSection(setImportSections, domain, enabled))}
+            </View>
+          </View>
+          {replacingDraftSections.length > 0 ? <View style={SETTINGS_FIELD_HELP_SLOT}><Text numberOfLines={2} style={styles.dataManagementSensitiveHint}>{translate("dataManagement.importReplaceDraftWarning", { sections: DATA_PACKAGE_SECTIONS.filter(({ domain }) => replacingDraftSections.includes(domain)).map(({ labelKey }) => translate(labelKey)).join(" · ") })}</Text></View> : null}
+          {actionRow(<ActionButton primary title={translate("dataManagement.importSelected")} busy={pendingAction === "import"} disabled={controlsBusy("import") || importSections.length === 0} onPress={() => { void importSelected(); }} />, statuses.import)}
+        </View>
       </> : null}
-      {stagedSections.length > 0 ? <DataManagementGroup>
-        <View style={styles.dataManagementSelectionBar}><Text style={[styles.dataManagementSelectionCount, dataManagementPolishStyles.compactText]}>{translate("dataManagement.selectedCount", { count: stagedSections.length })}</Text></View>
-          {sectionList(stagedSections, stagedSections, true, () => undefined)}
-      </DataManagementGroup> : null}
-      {statuses.import ? <Text style={[styles.dataManagementStatus, dataManagementPolishStyles.compactText]}>{statuses.import}</Text> : null}
+      {stagedSections.length > 0 ? <View style={SETTINGS_FIELD}>
+        <View style={SETTINGS_FIELD_ROW_INDENTED}>
+          <Text style={SETTINGS_FIELD_LABEL}>{translate("dataManagement.sections")}</Text>
+          <View style={styles.dataManagementSectionsField}>
+            {sectionListHeader(statuses.import ?? translate("dataManagement.selectedCount", { count: stagedSections.length }), null)}
+            {sectionList(stagedSections, stagedSections, true, () => undefined)}
+          </View>
+        </View>
+      </View> : null}
     </PersistentScrollView> : null}
-    {tab === "export" ? <View style={styles.dataManagementPane}>
-      <PersistentScrollView style={styles.dataManagementPane} contentContainerStyle={[styles.dataManagementPaneScrollContent, dataManagementPolishStyles.paneScrollContent]}>
-        <Text style={dataManagementPolishStyles.paneHint}>{translate("dataManagement.exportHint")}</Text>
-        <DataManagementGroup>
-          <View style={styles.dataManagementSelectionBar}><Text style={[styles.dataManagementSelectionCount, dataManagementPolishStyles.compactText]}>{translate("dataManagement.selectedCount", { count: exportSections.length })}</Text><View style={styles.dataManagementToolbarButtons}>{selectionTool(exportSections.length, DATA_PACKAGE_DOMAINS.length, () => setExportSections([...DATA_PACKAGE_DOMAINS]), () => setExportSections([]))}</View></View>
-          {sectionList(DATA_PACKAGE_DOMAINS, exportSections, busy, (domain, enabled) => toggleSection(setExportSections, domain, enabled))}
-        </DataManagementGroup>
-      </PersistentScrollView>
-      <View style={[styles.dataManagementBottomActions, dataManagementPolishStyles.bottomActions]}>
-        <View style={styles.dataManagementBottomMessage}>
-          <Text numberOfLines={2} style={[styles.dataManagementSensitiveNote, dataManagementPolishStyles.compactText]}>{translate("dataManagement.sensitiveHint")}</Text>
-          {statuses.export ? <Text style={[styles.dataManagementStatus, dataManagementPolishStyles.compactText]}>{statuses.export}</Text> : null}
+    {tab === "export" ? <PersistentScrollView style={styles.dataManagementPane} contentContainerStyle={[styles.dataManagementPaneScrollContent, dataManagementPolishStyles.paneScrollContent]}>
+      <Text style={dataManagementPolishStyles.paneHint}>{translate("dataManagement.exportHint")}</Text>
+      <View style={SETTINGS_FIELD}>
+        <View style={SETTINGS_FIELD_ROW_INDENTED}>
+          <Text style={SETTINGS_FIELD_LABEL}>{translate("dataManagement.sections")}</Text>
+          <View style={styles.dataManagementSectionsField}>
+            {sectionListHeader(translate("dataManagement.selectedCount", { count: exportSections.length }), selectionTool(exportSections.length, DATA_PACKAGE_DOMAINS.length, () => setExportSections([...DATA_PACKAGE_DOMAINS]), () => setExportSections([])))}
+            {sectionList(DATA_PACKAGE_DOMAINS, exportSections, busy, (domain, enabled) => toggleSection(setExportSections, domain, enabled))}
+          </View>
         </View>
-        <ActionButton primary title={translate("dataManagement.exportSelected")} busy={pendingAction === "export"} disabled={controlsBusy("export") || exportSections.length === 0} onPress={() => { void runPendingAction("export", () => onExport(exportSections)); }} />
+        {actionRow(<ActionButton primary title={translate("dataManagement.exportSelected")} busy={pendingAction === "export"} disabled={controlsBusy("export") || exportSections.length === 0} onPress={() => { void runPendingAction("export", () => onExport(exportSections)); }} />, statuses.export)}
+        {/* The standing warning is this field's tip, where every pane explains
+            the row it draws. */}
+        <View style={SETTINGS_FIELD_HELP_SLOT}><Text numberOfLines={2} style={SETTINGS_FIELD_HELP_TEXT}>{translate("dataManagement.sensitiveHint")}</Text></View>
       </View>
-    </View> : null}
-    {tab === "webdav" ? <View style={[styles.dataManagementWebDavPane, styles.dataManagementWebDavContent, dataManagementPolishStyles.webDavContent]}>
+    </PersistentScrollView> : null}
+    {tab === "webdav" ? <PersistentScrollView style={styles.dataManagementPane} contentContainerStyle={[styles.dataManagementPaneScrollContent, dataManagementPolishStyles.paneScrollContent]}>
       <Text style={dataManagementPolishStyles.paneHint}>{translate("dataManagement.webdavHint")}</Text>
-      <WebDavWorkspace snapshot={snapshot} busy={busy || webDavOperationBusy} probeBusy={pendingAction === "probe"} status={statuses.webdav} translate={translate} dispatch={dispatch} onSecretState={onSecretState} onProbe={() => runPendingAction("probe", onProbeWebDav)}>
-        <View style={[styles.dataManagementSyncContent, dataManagementPolishStyles.syncContent]}>
-          <View style={styles.dataManagementSyncScope}><Text style={styles.dataManagementSyncScopeLabel}>{translate("dataManagement.webdavScope")}</Text><Text numberOfLines={2} style={styles.dataManagementSyncScopeValue}>{translate("dataManagement.section.providersModels")} · {translate("dataManagement.section.relayAccounts")}</Text></View>
-          <View style={styles.dataManagementDirection}><Text style={styles.dataManagementDirectionLabel}>{translate("dataManagement.syncDirection")}</Text><NativePicker labels={syncOptions.map(({ title }) => title)} selectedValue={selectedSyncLabel} disabled={busy || webDavOperationBusy} onChange={({ nativeEvent }) => { const option = syncOptions[nativeEvent.index]; if (option) setSyncAction(option.id); }} style={styles.dataManagementDirectionPicker} /><ActionButton title={translate("dataManagement.syncNow")} busy={pendingAction === "sync"} disabled={webDavBusy("sync") || snapshot?.webdav.enabled !== true} onPress={() => { void runPendingAction("sync", () => onSyncWebDav(syncAction)); }} /></View>
-        </View>
-      </WebDavWorkspace>
-    </View> : null}
+      <WebDavWorkspace snapshot={snapshot} busy={busy || webDavOperationBusy} pendingAction={pendingAction} webDavBusy={webDavBusy} actionRow={actionRow} onProbe={() => { void runPendingAction("probe", onProbeWebDav); }} onSync={(direction) => { void runPendingAction("sync", () => onSyncWebDav(direction)); }} status={statuses.webdav} translate={translate} dispatch={dispatch} onSecretState={onSecretState} onCommitSetting={(patch) => { void onCommitWebDavSettings(patch); }} />
+    </PersistentScrollView> : null}
     </View>
-  </View>;
-}
-
-function DataManagementGroup({ children, style }: { children?: React.ReactNode; style?: StyleProp<ViewStyle> }): React.JSX.Element {
-  return <View style={[styles.dataManagementGroup, style]}>
-    {children ? <View style={[styles.dataManagementGroupBody, dataManagementPolishStyles.groupBody]}>{children}</View> : null}
   </View>;
 }
 
@@ -5814,27 +6839,76 @@ function RuntimeValueField({ label, value, keyboardType, validate, resetToken = 
   return <NativeTextField style={[styles.input, styles.runtimeValueControl, field.error !== undefined && styles.runtimeValueControlInvalid]} value={field.draft} onChangeText={field.onChangeText} onBlur={() => { void field.commit().catch(() => undefined); }} onSubmitEditing={() => { void field.commit().catch(() => undefined); }} autoCapitalize="none" autoCorrect={false} keyboardType={keyboardType} accessibilityLabel={label} />;
 }
 
-function WebDavWorkspace({ snapshot, busy, probeBusy, status, translate, dispatch, onSecretState, onProbe, children }: { snapshot?: CoreSnapshot; busy: boolean; probeBusy: boolean; status?: string; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; onProbe: () => Promise<unknown>; children: React.ReactNode }): React.JSX.Element {
+/**
+ * The WebDAV fields, drawn on the one settings grid every other pane uses:
+ * the enable switch, the connection fields, the sync scope and direction, and
+ * the pane's two actions as the last field row.  The pane's work reports in the
+ * window's one status strip, so no footer bar carries it.
+ */
+function WebDavWorkspace({ snapshot, busy, pendingAction, webDavBusy, actionRow, onProbe, onSync, status, translate, dispatch, onSecretState, onCommitSetting }: { snapshot?: CoreSnapshot; busy: boolean; pendingAction?: DataManagementAction; webDavBusy: (action: "probe" | "sync") => boolean; actionRow: (controls: React.ReactNode, result?: string, hint?: string) => React.JSX.Element; onProbe: () => void; onSync: (action: WebDavSyncAction) => void; status?: string; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; onCommitSetting: (patch: UnknownRecord) => void }): React.JSX.Element {
   const state = domainState(snapshot, "webdav");
-  const labelAlign = "left";
-  return <DataManagementGroup style={styles.webDavForm}>
-    <View style={[styles.webdavFormBody, dataManagementPolishStyles.webDavFormBody]}>
-      <View style={[SETTINGS_FIELD_ROW_INDENTED, styles.webdavStateRow]}><Text numberOfLines={1} style={SETTINGS_FIELD_LABEL}>{translate("webdav.enabled")}</Text><View style={SETTINGS_FIELD_SWITCH_SLOT}><NativeToggle accessibilityLabel={translate("webdav.enabled")} value={booleanValue(state.enabled)} disabled={busy} onValueChange={(enabled) => dispatch("patch", { enabled })} /></View><View style={styles.webdavStateSpacer} /><Text numberOfLines={1} style={[styles.webdavStateStatus, dataManagementPolishStyles.compactText]}>{snapshot ? webdavMenuStatus(snapshot.service.webdav, snapshot.webdav.enabled, translate) : ""}</Text></View>
-      <View style={[styles.webdavFormRows, dataManagementPolishStyles.webDavFormRows]}>
-        <TextField label={translate("webdav.url")} value={stringValue(state.url)} labelWidth={SETTINGS_FIELD_LABEL_WIDTH} controlWidth={SETTINGS_FIELD_VALUE_WIDTH} labelAlign={labelAlign} hintStyle={dataManagementPolishStyles.compactText} onCommit={(url) => dispatch("patch", { url })} />
-        <TextField label={translate("webdav.username")} value={stringValue(state.username)} labelWidth={SETTINGS_FIELD_LABEL_WIDTH} controlWidth={SETTINGS_FIELD_VALUE_WIDTH} labelAlign={labelAlign} hintStyle={dataManagementPolishStyles.compactText} onCommit={(username) => dispatch("patch", { username })} />
-        <WebDavPasswordField labelWidth={SETTINGS_FIELD_LABEL_WIDTH} labelAlign={labelAlign} configured={snapshot?.webdav.password.present === true} busy={busy} translate={translate} onSecretState={onSecretState} />
-        <TextField label={translate("webdav.remoteFile")} value={stringValue(state.remote_name)} labelWidth={SETTINGS_FIELD_LABEL_WIDTH} controlWidth={SETTINGS_FIELD_VALUE_WIDTH} labelAlign={labelAlign} hintStyle={dataManagementPolishStyles.compactText} onCommit={(remote_name) => dispatch("patch", { remote_name })} />
-        <TextField label={translate("webdav.syncEvery")} value={stringValue(state.sync_interval)} labelWidth={SETTINGS_FIELD_LABEL_WIDTH} labelAlign={labelAlign} controlWidth={SETTINGS_FIELD_VALUE_WIDTH} suffix={translate("webdav.minutes")} hintStyle={dataManagementPolishStyles.compactText} keyboardType="numeric" onCommit={(sync_interval) => dispatch("patch", { sync_interval })} />
-        <TextField label={translate("webdav.httpTimeout")} value={stringValue(state.timeout)} labelWidth={SETTINGS_FIELD_LABEL_WIDTH} labelAlign={labelAlign} controlWidth={SETTINGS_FIELD_VALUE_WIDTH} suffix={translate("webdav.seconds")} hintStyle={dataManagementPolishStyles.compactText} keyboardType="numeric" onCommit={(timeout) => dispatch("patch", { timeout })} />
-      </View>
-      <View style={[styles.webdavSyncArea, dataManagementPolishStyles.webDavSyncArea]}>{children}</View>
-      <View style={[styles.webdavActionRow, dataManagementPolishStyles.webDavActionRow]}><ActionButton title={translate("dataManagement.testConnection")} busy={probeBusy} disabled={busy && !probeBusy} onPress={() => { void onProbe(); }} />{status ? <Text numberOfLines={1} style={[styles.webdavActionStatus, dataManagementPolishStyles.compactText]}>{status}</Text> : null}</View>
+  // The scope sentence names the sections Core actually syncs, so it cannot
+  // drift from WEBDAV_SYNC_DOMAINS the way a hand-written copy would.
+  const syncScope = DATA_PACKAGE_SECTIONS.filter(({ domain }) => WEBDAV_SYNC_DOMAINS.includes(domain)).map(({ labelKey }) => translate(labelKey)).join(" · ");
+  // When the last sync landed, from the stamp Core keeps for it.
+  const lastSyncAt = stringValue(asRecord(asRecord(state.last_sync)).at);
+  const lastSync = lastSyncAt === "" ? undefined : translate("dataManagement.lastSync", { time: formatActionTimestamp(lastSyncAt) });
+  // The direction is saved, not per-window state: the interval loop syncs the
+  // way this field says, so an automatic run cannot disagree with the button.
+  const syncOptions = WEBDAV_SYNC_OPTIONS.map((option) => ({ ...option, title: translate(option.labelKey) }));
+  const savedDirection = stringValue(state.sync_direction);
+  const selectedSync = syncOptions.find(({ id }) => id === (savedDirection === "smart" ? "sync" : savedDirection)) ?? syncOptions[0];
+  // What the last recorded run did, so a window opened after an automatic
+  // failure says why the stamp stopped instead of looking merely stale.
+  const lastResult = asRecord(state.last_result);
+  const lastFailed = lastResult.ok === false && ["sync", "push", "pull"].includes(stringValue(lastResult.action));
+  const actionHint = lastFailed && lastSyncAt !== ""
+    ? translate("dataManagement.lastSyncFailed", { time: formatActionTimestamp(lastSyncAt) })
+    : lastSync;
+  return <View style={styles.webdavFieldList}>
+    {/* The switch carries its own control style, the way every other switch
+        row in the app does: a wrapper view does not size an unstyled native
+        toggle, so the pill drew a row above its own label.  The row states
+        the setting only — the connection state is this pane's work, and the
+        window's strip reports it (webdav.probeOk / webdav.probeFailed). */}
+    <View style={SETTINGS_FIELD_ROW_INDENTED}>
+      <Text style={SETTINGS_FIELD_LABEL}>{translate("webdav.enabled")}</Text>
+      <NativeToggle accessibilityLabel={translate("webdav.enabled")} value={booleanValue(state.enabled)} disabled={busy} onValueChange={(enabled) => onCommitSetting({ enabled })} style={SETTINGS_FIELD_SWITCH_SLOT} />
     </View>
-  </DataManagementGroup>;
+    <TextField label={translate("webdav.url")} value={stringValue(state.url)} labelWidth={SETTINGS_FIELD_LABEL_WIDTH} controlWidth={SETTINGS_FIELD_VALUE_WIDTH} style={SETTINGS_FIELD_ROW_INDENTED} onCommit={(url) => onCommitSetting({ url })} />
+    <TextField label={translate("webdav.username")} value={stringValue(state.username)} labelWidth={SETTINGS_FIELD_LABEL_WIDTH} controlWidth={SETTINGS_FIELD_VALUE_WIDTH} style={SETTINGS_FIELD_ROW_INDENTED} onCommit={(username) => onCommitSetting({ username })} />
+    <WebDavPasswordField configured={snapshot?.webdav.password.present === true} busy={busy} translate={translate} onSecretState={onSecretState} />
+    <View style={SETTINGS_FIELD}>
+      <TextField label={translate("webdav.remoteFile")} value={stringValue(state.remote_name)} labelWidth={SETTINGS_FIELD_LABEL_WIDTH} controlWidth={SETTINGS_FIELD_VALUE_WIDTH} style={SETTINGS_FIELD_ROW_INDENTED} onCommit={(remote_name) => onCommitSetting({ remote_name })} />
+      <View style={SETTINGS_FIELD_HELP_SLOT}><Text style={SETTINGS_FIELD_HELP_TEXT}>{translate("webdav.remoteFileHint")}</Text></View>
+    </View>
+    <View style={SETTINGS_FIELD}>
+      <TextField label={translate("webdav.syncEvery")} value={stringValue(state.sync_interval)} labelWidth={SETTINGS_FIELD_LABEL_WIDTH} controlWidth={SETTINGS_FIELD_VALUE_WIDTH} style={SETTINGS_FIELD_ROW_INDENTED} suffix={translate("webdav.minutes")} hintStyle={styles.webdavFieldUnit} keyboardType="numeric" onCommit={(sync_interval) => onCommitSetting({ sync_interval })} />
+      {/* The interval is the automatic sync's cadence, so the row says when it
+          runs and what 0 means instead of leaving the number unexplained. */}
+      <View style={SETTINGS_FIELD_HELP_SLOT}><Text style={SETTINGS_FIELD_HELP_TEXT}>{translate("webdav.syncEveryHint")}</Text></View>
+    </View>
+    <TextField label={translate("webdav.httpTimeout")} value={stringValue(state.timeout)} labelWidth={SETTINGS_FIELD_LABEL_WIDTH} controlWidth={SETTINGS_FIELD_VALUE_WIDTH} style={SETTINGS_FIELD_ROW_INDENTED} suffix={translate("webdav.seconds")} hintStyle={styles.webdavFieldUnit} keyboardType="numeric" onCommit={(timeout) => onCommitSetting({ timeout })} />
+    <View style={SETTINGS_FIELD}>
+      <View style={SETTINGS_FIELD_ROW_INDENTED}>
+        <Text style={SETTINGS_FIELD_LABEL}>{translate("dataManagement.webdavScope")}</Text>
+        <Text numberOfLines={1} style={styles.dataManagementSyncScopeValue}>{syncScope}</Text>
+      </View>
+    </View>
+    <View style={SETTINGS_FIELD}>
+      <View style={SETTINGS_FIELD_ROW_INDENTED}>
+        <Text style={SETTINGS_FIELD_LABEL}>{translate("dataManagement.syncDirection")}</Text>
+        <NativePicker labels={syncOptions.map(({ title }) => title)} selectedValue={selectedSync.title} disabled={busy} onChange={({ nativeEvent }) => { const option = syncOptions[nativeEvent.index]; if (option) onCommitSetting({ sync_direction: option.id === "sync" ? "smart" : option.id }); }} style={styles.dataManagementDirectionPicker} />
+      </View>
+      {/* The chosen direction states what it will do, so the picker and its
+          consequence read as one field. */}
+      <View style={SETTINGS_FIELD_HELP_SLOT}><Text style={SETTINGS_FIELD_HELP_TEXT}>{translate(selectedSync.hintKey)}</Text></View>
+    </View>
+    {actionRow(<><ActionButton title={translate("dataManagement.testConnection")} busy={pendingAction === "probe"} disabled={webDavBusy("probe")} onPress={onProbe} /><ActionButton primary title={translate("dataManagement.syncNow")} busy={pendingAction === "sync"} disabled={webDavBusy("sync") || snapshot?.webdav.enabled !== true} onPress={() => onSync(selectedSync.id)} /></>, status, actionHint)}
+  </View>;
 }
 
-function WebDavPasswordField({ configured, busy, translate, onSecretState, labelWidth = SETTINGS_FIELD_LABEL_WIDTH, labelAlign = "left", style }: { configured: boolean; busy: boolean; translate: Translate; onSecretState: (state: SecretState) => void; labelWidth?: number; labelAlign?: "left" | "right"; style?: StyleProp<ViewStyle> }): React.JSX.Element {
+function WebDavPasswordField({ configured, busy, translate, onSecretState }: { configured: boolean; busy: boolean; translate: Translate; onSecretState: (state: SecretState) => void }): React.JSX.Element {
   const [commitRequest, setCommitRequest] = useState(0);
   const [resetRequest, setResetRequest] = useState(0);
   const [status, setStatus] = useState("ready");
@@ -5865,7 +6939,7 @@ function WebDavPasswordField({ configured, busy, translate, onSecretState, label
       registry?.register(fieldId.current);
     };
   }, [registry, requestCommit, reset]);
-  return <View style={[styles.formRow, compactStyles.formRow, style]}><Text style={[styles.formRowLabel, { width: labelWidth, textAlign: labelAlign }]}>{translate("webdav.password")}</Text><View style={[styles.formRowControl, compactStyles.formRowControl]}><NativeSecureTextInput domain="webdav" field="password" label={translate("webdav.password")} placeholder={configured ? translate("webdav.passwordHintConfigured") : translate("webdav.passwordHintOptional")} disabled={busy || status === "saving"} commitRequest={commitRequest} resetRequest={resetRequest} onSecretState={(state) => {
+  return <View style={SETTINGS_FIELD_ROW_INDENTED}><Text style={SETTINGS_FIELD_LABEL}>{translate("webdav.password")}</Text><NativeSecureTextInput domain="webdav" field="password" label={translate("webdav.password")} placeholder={configured ? translate("webdav.passwordHintConfigured") : translate("webdav.passwordHintOptional")} disabled={busy || status === "saving"} commitRequest={commitRequest} resetRequest={resetRequest} onSecretState={(state) => {
     setStatus(state.status);
     if (state.status === "dirty") {
       dirtyRef.current = true;
@@ -5884,7 +6958,7 @@ function WebDavPasswordField({ configured, busy, translate, onSecretState, label
       setResetRequest((current) => current + 1);
       onSecretState(state);
     }
-  }} style={styles.webdavPasswordInput} /></View></View>;
+  }} style={styles.webdavPasswordInput} /></View>;
 }
 
 type RouteTraceAttempt = {
@@ -6613,13 +7687,19 @@ function routeTraceOutcomeLabel(outcome: RouteTraceRequest["outcome"], translate
 }
 
 const LOG_DETAIL_COLUMN_FLOOR = 240;
+// Every log record renders its stamp as `YYYY-MM-DD HH:MM:SS` in the table's
+// 13 pt face. Measured against the widest possible digit run
+// ("2026-09-30 22:58:58" -> 136 pt) plus the 8 pt cell padding on each side,
+// 168 keeps the seconds visible for every row: the requests tab used to ask for
+// 148, which clipped the tail of the widest digit runs into an ellipsis.
+const LOG_TIME_COLUMN_WIDTH = 168;
 
 function logColumns(tab: LogTab, translate: Translate): LogColumn[] {
-  const time = { label: translate("logs.localTime"), width: 164, value: (row: RenderedLogRecord) => row.time };
+  const time = { label: translate("logs.localTime"), width: LOG_TIME_COLUMN_WIDTH, value: (row: RenderedLogRecord) => row.time };
   const status = { label: translate("common.status"), width: 68, value: (row: RenderedLogRecord) => row.status };
   const detail = { label: translate("logs.detail"), width: 260, flex: true, value: (row: RenderedLogRecord) => row.detail };
   if (tab === "requests") return [
-    { ...time, width: 148 },
+    time,
     { label: translate("providers.publicModel"), width: 106, value: (row) => row.model },
     { label: translate("providers.upstream"), width: 106, value: (row) => row.upstreamModel },
     { label: translate("common.provider"), width: 78, value: (row) => row.provider },
@@ -7146,9 +8226,9 @@ const ActionButton = React.forwardRef<HostInstance, { title: string; onPress: ()
   return <NativeButton ref={ref} title={title} disabled={disabled} busy={busy} primary={primary} destructive={danger} titleWidth={titleWidth} toolTip={toolTip} onPress={onPress} style={style} />;
 });
 
-function TextField({ label, value, onCommit, onDraftChange, hint, hintStyle, secret, multiline, compactMultiline, keyboardType, stacked, labelWidth, labelAlign, controlWidth, labelVisible = true, suffix, disabled, style }: { label: string; value: string; onCommit: (value: string) => void | Promise<void>; onDraftChange?: (value: string) => void; hint?: string; hintStyle?: StyleProp<TextStyle>; secret?: boolean; multiline?: boolean; compactMultiline?: boolean; keyboardType?: "default" | "numeric"; stacked?: boolean; labelWidth?: number; labelAlign?: "left" | "right"; controlWidth?: number; /** The caller renders the label itself (a stacked keys-editor row). */ labelVisible?: boolean; suffix?: string; disabled?: boolean; style?: StyleProp<ViewStyle> }): React.JSX.Element {
+function TextField({ label, value, onCommit, onDraftChange, hint, hintStyle, placeholder, secret, multiline, compactMultiline, keyboardType, stacked, labelWidth, labelAlign, controlWidth, labelVisible = true, suffix, disabled, style }: { label: string; value: string; onCommit: (value: string) => void | Promise<void>; onDraftChange?: (value: string) => void; hint?: string; hintStyle?: StyleProp<TextStyle>; placeholder?: string; secret?: boolean; multiline?: boolean; compactMultiline?: boolean; keyboardType?: "default" | "numeric"; stacked?: boolean; labelWidth?: number; labelAlign?: "left" | "right"; controlWidth?: number; /** The caller renders the label itself (a stacked keys-editor row). */ labelVisible?: boolean; suffix?: string; disabled?: boolean; style?: StyleProp<ViewStyle> }): React.JSX.Element {
   const field = usePendingTextField(value, onCommit, label, onDraftChange);
-  return <View style={[styles.formRow, compactStyles.formRow, (stacked || multiline) && styles.formRowStacked, style]}>{labelVisible ? <Text style={[styles.formRowLabel, labelWidth === undefined ? null : { width: labelWidth }, labelAlign === undefined ? null : { textAlign: labelAlign }, (stacked || multiline) && styles.formRowLabelStacked]}>{label}</Text> : null}<View style={[styles.formRowControl, compactStyles.formRowControl, controlWidth === undefined ? null : { width: controlWidth, flex: 0 }]}><NativeTextField style={[styles.input, compactStyles.input, multiline && styles.textArea, compactMultiline && styles.compactTextArea]} value={field.draft} editable={!disabled} onChangeText={field.onChangeText} onBlur={() => { if (!disabled) void field.commit().catch(() => undefined); }} onSubmitEditing={multiline ? undefined : () => { if (!disabled) void field.commit().catch(() => undefined); }} multiline={multiline} secureTextEntry={secret} autoCapitalize="none" autoCorrect={false} keyboardType={keyboardType} accessibilityLabel={label} />{hint ? <Text style={[styles.fieldHint, hintStyle]}>{hint}</Text> : null}</View>{suffix ? <Text style={[styles.fieldHint, hintStyle]}>{suffix}</Text> : null}</View>;
+  return <View style={[styles.formRow, compactStyles.formRow, (stacked || multiline) && styles.formRowStacked, style]}>{labelVisible ? <Text style={[styles.formRowLabel, labelWidth === undefined ? null : { width: labelWidth }, labelAlign === undefined ? null : { textAlign: labelAlign }, (stacked || multiline) && styles.formRowLabelStacked]}>{label}</Text> : null}<View style={[styles.formRowControl, compactStyles.formRowControl, controlWidth === undefined ? null : { width: controlWidth, flex: 0 }]}><NativeTextField style={[styles.input, compactStyles.input, multiline && styles.textArea, compactMultiline && styles.compactTextArea]} value={field.draft} placeholder={placeholder} editable={!disabled} onChangeText={field.onChangeText} onBlur={() => { if (!disabled) void field.commit().catch(() => undefined); }} onSubmitEditing={multiline ? undefined : () => { if (!disabled) void field.commit().catch(() => undefined); }} multiline={multiline} secureTextEntry={secret} autoCapitalize="none" autoCorrect={false} keyboardType={keyboardType} accessibilityLabel={label} />{hint ? <Text style={[styles.fieldHint, hintStyle]}>{hint}</Text> : null}</View>{suffix ? <Text style={[styles.fieldHint, hintStyle]}>{suffix}</Text> : null}</View>;
 }
 
 function NativeSecretInputControl({ label, hint, busy, domain, field, target, multiline = false, plainText = false, autoCommit = false, resetToken = 0, onSecretState, setTitle, setBelow, onSetReady, inputMinWidth }: { label: string; hint?: string; busy: boolean; domain: "providers_models" | "relay_accounts" | "codex" | "claude" | "runtime" | "webdav"; field: string; target?: string; multiline?: boolean; plainText?: boolean; autoCommit?: boolean; resetToken?: number; onSecretState: (state: SecretState) => void; setTitle?: string; setBelow?: boolean; onSetReady?: (requestSet: () => void, saving: boolean) => void; inputMinWidth?: number }): React.JSX.Element {
@@ -7489,10 +8569,10 @@ function RawEditor({ label, domain, document, language, ipc, translate, showLabe
       registry?.setDirty(fieldId.current, false);
       setStatus("ready");
       setLoading(false);
-    }).catch(() => {
+    }).catch((reason: unknown) => {
       if (!active) return;
       setLoading(false);
-      setError(translate("error.coreUnavailable"));
+      setError(errorMessage(reason, translate));
     });
     return () => { active = false; };
   }, [baselineToken, document, domain, ipc, registry, reloadNonce, reloadToken, reset, translate]);
@@ -7644,7 +8724,9 @@ function modelProbePresentation(model: UnknownRecord, result: IpcResults["probe"
                     ? translate("providers.probeInlineHttpError")
                     : uniformStatus === "invalid_response"
                       ? translate("providers.probeInlineInvalidResponse")
-                      : translate("providers.probeInlineBlocked")
+                      : uniformStatus === "invalid_config"
+                        ? translate("providers.probeInlineInvalidConfig")
+                        : translate("providers.probeInlineBlocked")
     : booleanValue(probe.unreachable)
       ? translate("providers.probeSummaryUnreachable")
       : translate("providers.probeSummaryUnavailable");
@@ -7791,23 +8873,6 @@ function probeSurfaceLabel(surface: string, translate: Translate): string {
   return translate("providers.probeNotRun");
 }
 
-function IssueList({ issues, translate }: { issues: ValidationSummary["issues"]; translate: Translate }): React.JSX.Element {
-  const keyByCode: Record<string, string> = {
-    confirmation_required: "error.confirmationRequired",
-    invalid_language: "validation.invalid_language",
-    invalid_settings: "validation.invalid_settings",
-    model_name_required: "validation.modelNameRequired",
-    model_upstream_required: "validation.modelUpstreamRequired",
-    api_key_value_required: "validation.apiKeyValueRequired",
-    revision_conflict: "error.revisionConflict",
-    relay_apply: "relay.applyIssue",
-  };
-  return <View style={styles.issueBox}><Text style={styles.sectionTitle}>{translate("common.validationIssues")}</Text>{issues.map((issue, index) => {
-    const message = keyByCode[issue.code] ? translate(keyByCode[issue.code]) : issue.message || translate("error.validationFailed");
-    return <Text key={`${issue.path}-${index}`} style={styles.issue}>{issue.path ? `${issue.path}: ${message}` : message}</Text>;
-  })}</View>;
-}
-
 function stringList(value: unknown): string[] { return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : []; }
 function webSearchCapabilityChanges(value: unknown): UnknownRecord {
   const source = asRecord(value);
@@ -7903,18 +8968,8 @@ const SETTINGS_FIELD_SWITCH_SLOT: ViewStyle = { width: 44, minWidth: 44, height:
 // the same inset, helper-copy treatment, and native-preference spacing.
 const dataManagementPolishStyles = StyleSheet.create({
   paneScrollContent: { flexGrow: 1, paddingTop: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, paddingBottom: SETTINGS_PANE_INSET, gap: 14 },
-  webDavContent: { flexGrow: 1, gap: 14, paddingTop: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, paddingBottom: SETTINGS_PANE_INSET },
-  compactText: { fontSize: UI_FONT_SIZE, lineHeight: 16 },
   paneHint: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 },
   importIntro: { minHeight: 0, paddingHorizontal: 12, paddingVertical: 0, gap: 10 },
-  groupBody: { gap: 8, paddingVertical: 6 },
-  sectionPicker: { rowGap: 8, paddingVertical: 6 },
-  bottomActions: { minHeight: 58, flexShrink: 0, alignItems: "center", paddingHorizontal: 12, paddingTop: 10, paddingBottom: 14, borderTopWidth: 1, borderTopColor: systemColors.separator },
-  syncContent: { gap: 10, paddingVertical: 2 },
-  webDavFormBody: { gap: 10 },
-  webDavFormRows: { width: "100%", maxWidth: 560, gap: 7 },
-  webDavSyncArea: { borderTopWidth: 0, paddingTop: 4, marginTop: 2 },
-  webDavActionRow: { borderTopWidth: 0, paddingTop: 4, marginTop: 10 },
 });
 
 const assistantFileSurfaceStyles = StyleSheet.create({
@@ -7942,7 +8997,7 @@ const assistantFileSurfaceStyles = StyleSheet.create({
   // One footer row holds the only two actions this surface owns.  Removing
   // the old hint leaves the actions right-aligned like every other pane
   // footer, with an explicit gap so a mis-click cannot land on the other one.
-  editorFooter: { minHeight: 50, flexShrink: 0, flexDirection: "row", alignItems: "center", justifyContent: "flex-end", gap: 12, paddingHorizontal: 12, paddingVertical: 9, borderTopWidth: 1, borderTopColor: systemColors.separator, backgroundColor: systemColors.window },
+  editorFooter: { minHeight: 50, flexShrink: 0, flexDirection: "row", alignItems: "center", justifyContent: "flex-end", gap: 12, paddingHorizontal: 12, paddingVertical: 9, borderTopWidth: 1, borderTopColor: systemColors.separator, backgroundColor: systemColors.window }, editorFooterStatus: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
   editorFooterActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 10 },
 });
 
@@ -8016,7 +9071,7 @@ const styles = StyleSheet.create({
   routeTraceNoSelectionText: { color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "center" },
   root: { flex: 1, minWidth: 420 },
   menuBarHost: { flex: 1 }, error: { margin: 20, color: systemColors.red, fontSize: UI_FONT_SIZE },
-  windowSurface: { flex: 1, position: "relative", backgroundColor: systemColors.window }, windowContent: { flexGrow: 1, paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, gap: 8 }, windowContentFixed: { flex: 1, minHeight: 0 }, fileEditorRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providersContent: { paddingBottom: 6, gap: 6 }, providerWizardRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providerWizardSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, logsContent: { paddingHorizontal: 12, paddingTop: 8, paddingBottom: 0 }, runtimeContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, dataManagementContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, assistantSettingsContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, windowTitleBlock: { paddingHorizontal: 20, paddingTop: 12, paddingBottom: 3, gap: 3 }, windowTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, validationText: { color: systemColors.red, fontSize: UI_FONT_SIZE },
+  windowSurface: { flex: 1, position: "relative", backgroundColor: systemColors.window }, windowContent: { flexGrow: 1, paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, gap: 8 }, windowContentFixed: { flex: 1, minHeight: 0 }, fileEditorRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providersContent: { paddingBottom: 6, gap: 6 }, providerWizardRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providerWizardSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, logsContent: { paddingHorizontal: 12, paddingTop: 8, paddingBottom: 0 }, runtimeContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, dataManagementContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, assistantSettingsContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, windowTitleBlock: { paddingHorizontal: 20, paddingTop: 12, paddingBottom: 3, gap: 3 }, windowTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
   // Settings window: a native source-list sidebar next to the active pane.
   settingsShell: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row" }, settingsSidebar: { width: 200, flexShrink: 0, minHeight: 0, borderRightWidth: 1, borderRightColor: systemColors.separator }, settingsSidebarHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 16, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarAppIcon: { width: 20, height: 20, borderRadius: 4 }, settingsSidebarTitle: { color: systemColors.label, fontSize: SOURCE_LIST_FONT_SIZE, fontWeight: "600" }, settingsSidebarDivider: { height: 1, flexShrink: 0, marginHorizontal: 12, backgroundColor: systemColors.separator }, settingsSidebarSpacer: { flex: 1, minHeight: 8 }, settingsSidebarList: { flex: 1, minHeight: 0 }, settingsRail: { width: SETTINGS_RAIL_WIDTH, flexShrink: 0, minHeight: 0, paddingTop: 6, borderRightWidth: 1, borderRightColor: systemColors.separator }, settingsRailList: { flex: 1, minHeight: 0 }, settingsRailDetail: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsRailDetailHeader: { minHeight: 50, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 14, paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: systemColors.separator, backgroundColor: systemColors.window }, settingsRailDetailTitleBlock: { flex: 1, minWidth: 0, gap: 2 }, settingsRailDetailActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, settingsRailDetailTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, settingsRailDetailHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16 }, settingsDetail: { minWidth: 0, flex: 1, paddingTop: SETTINGS_TITLEBAR_INSET }, settingsDetailBody: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsDetailBodyBare: { backgroundColor: "transparent" }, settingsDetailPane: { flex: 1, minWidth: 0 }, settingsPaneHeader: { flexShrink: 0, paddingHorizontal: 20, paddingTop: 10, paddingBottom: 8 }, settingsPaneTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600" }, settingsPaneDivider: { height: 1, flexShrink: 0, backgroundColor: systemColors.separator },  routeStatusBar: { minHeight: 24, flexShrink: 0, justifyContent: "center", paddingHorizontal: 16, paddingVertical: 4, borderTopWidth: 1, borderTopColor: systemColors.separator }, routeStatusText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE },
   generalScroll: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, generalContent: { paddingTop: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, paddingBottom: 16, gap: 18 }, generalSection: { gap: 4 }, generalSectionTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, generalRow: { ...SETTINGS_FIELD_ROW_INDENTED }, generalRowLabel: { ...SETTINGS_FIELD_LABEL }, generalRowValue: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, generalToggle: { ...SETTINGS_FIELD_SWITCH_SLOT }, generalHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }, generalHelpText: { ...SETTINGS_FIELD_HELP_TEXT }, generalServiceAction: { minWidth: 96 }, providerToolbar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardToolbarButton: { minWidth: 104 }, toolbarSpacer: { flex: 1 }, windowTabs: { width: 224, height: 24 },
@@ -8036,10 +9091,15 @@ const styles = StyleSheet.create({
   providerAuthLine: { color: systemColors.label, fontSize: UI_FONT_SIZE },
   officialActiveHint: { color: systemColors.green, fontSize: UI_TIP_FONT_SIZE, fontWeight: "600" },
   officialActionsRow: { minHeight: 28, flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 6 },
-  providerWizardHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerWizardDescription: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 17 }, providerWizardSectionHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardPanelTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerWizardFormSection: { width: "100%", maxWidth: 520, paddingVertical: 0, gap: 10 }, providerWizardModelScroll: { flex: 1, minHeight: 0, width: "100%" }, providerWizardModelScrollContent: { width: "100%", paddingBottom: 8 }, providerWizardModelToolbar: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 8 }, providerWizardModelGroup: { gap: 6, paddingTop: 4 }, providerWizardModelGroupHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }, providerWizardModelList: { borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground, paddingHorizontal: 8, paddingVertical: 5, gap: 1 }, providerWizardModelCheckbox: { width: "100%", minHeight: 24 }, providerWizardManualModelRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardManualModelCheckbox: { flex: 1, minWidth: 0 }, providerWizardManualModelUpstream: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE }, providerWizardModelSummary: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "500", paddingTop: 4 }, providerWizardModeControl: { width: "100%", height: 26, flexShrink: 0 }, providerWizardPicker: { width: "100%", minWidth: 0, height: 26 }, providerWizardInput: { width: "100%", minHeight: 26, color: systemColors.label, fontSize: UI_FONT_SIZE }, providerWizardSecretInput: { width: "100%", minHeight: 26 }, providerWizardHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15, paddingVertical: 2 }, providerWizardValidation: { color: systemColors.red, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, providerWizardFooter: { minHeight: 46, paddingHorizontal: 20, paddingVertical: 8, flexDirection: "row", alignItems: "center", gap: 6, borderTopWidth: 0, backgroundColor: systemColors.window }, providerWizardFooterSpacer: { flex: 1 }, providerWizardFooterStatus: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, providerWizardFooterActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 },
+  providerWizardHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerWizardDescription: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 17 }, providerWizardSectionHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardPanelTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerWizardFormSection: { width: "100%", maxWidth: 520, paddingVertical: 0, gap: 10 }, providerWizardModelScroll: { flex: 1, minHeight: 0, width: "100%" }, providerWizardModelScrollContent: { width: "100%", paddingBottom: 8 }, providerWizardModelToolbar: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 8 }, providerWizardModelGroup: { gap: 6, paddingTop: 4 }, providerWizardModelGroupHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }, providerWizardModelList: { borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground, paddingHorizontal: 8, paddingVertical: 5, gap: 1 }, providerWizardModelCheckbox: { width: "100%", minHeight: 24 }, providerWizardManualModelRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardManualModelCheckbox: { flex: 1, minWidth: 0 }, providerWizardManualModelUpstream: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE }, providerWizardModelSummary: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "500", paddingTop: 4 }, providerWizardModeControl: { width: "100%", height: 26, flexShrink: 0 }, providerWizardPicker: { width: "100%", minWidth: 0, height: 26 }, providerWizardInput: { width: "100%", minHeight: 26, color: systemColors.label, fontSize: UI_FONT_SIZE }, providerWizardSecretInput: { width: "100%", minHeight: 26 }, providerWizardHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15, paddingVertical: 2 }, providerWizardFooter: { minHeight: 46, paddingHorizontal: 20, paddingVertical: 8, flexDirection: "row", alignItems: "center", gap: 6, borderTopWidth: 0, backgroundColor: systemColors.window }, providerWizardFooterSpacer: { flex: 1 }, providerWizardFooterStatus: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, providerWizardFooterActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 },
   routeTablePane: { flex: 1, minWidth: 0, minHeight: 0 },
-  providerAuthStatusLabel: { width: 68, flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
-  providerAuthStatusValue: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE },
+  // Both the label and its value read at full strength: these are labelled
+  // rows of a settings surface, not hints.
+  providerAuthStatusLabel: { width: 88, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE },
+  // The model pane's own label column, so its rows line up with the fields
+  // beside them.
+  modelStatusLabel: { width: 60 },
+  providerAuthStatusValue: { flex: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE },
   // The provider workspace's first row is the left column's 24 pt toolbar (the
   // 供应商 / 路由 tabs and the 添加向导… button). The inspector pane's own header
   // row is the same 24 pt row and starts at the pane's top with no extra inset,
@@ -8047,12 +9107,14 @@ const styles = StyleSheet.create({
   // points below it, and the sections under it keep the left column's row pitch.
   providersLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }, providerWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, providerLeftColumn: { flex: 1, minWidth: 0, minHeight: 0, gap: 6 }, providerModelColumns: { flex: 1, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }, routeWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, fetchKeyPicker: { width: 170, height: 24, marginRight: 6, flexShrink: 0 }, providerListPane: { width: 140, minWidth: 140, maxWidth: 140, flexGrow: 0, flexShrink: 0 }, modelListPane: { flex: 1, minWidth: 0 }, tablePane: { flex: 1, minWidth: 0, gap: 6 }, tablePaneWide: { flex: 1, minWidth: 0 }, tableTitleRow: { height: 24, flexDirection: "row", alignItems: "center" }, tableTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, tableActions: { marginLeft: "auto", flexDirection: "row", gap: 6 }, iconButton: { minWidth: 22, width: 22, minHeight: 22, height: 22, alignItems: "center", justifyContent: "center" }, tableBottomRow: { minHeight: 26, flexDirection: "row", alignItems: "center" }, nativeProviderTable: { flex: 1, minHeight: 0 }, nativeModelTable: { flex: 1, minHeight: 0 }, nativeRouteTable: { flex: 1, minHeight: 0 }, providerInspector: { width: 290, minWidth: 290, maxWidth: 290, flexGrow: 0, flexShrink: 0 }, providerEditorContent: { flex: 1, minHeight: 0 }, providerEditorScrollContent: { paddingLeft: 0, paddingRight: 16, paddingBottom: 12, gap: 6 }, persistentScrollIndicator: { position: "absolute", width: 0, height: 0 }, providerEditorHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerEditorHeading: { flex: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerReturnToModel: { flexShrink: 1 }, providerEditorSection: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 3, gap: 4 }, providerEnabledRow: { minHeight: 22, flexDirection: "row", alignItems: "center" }, providerSourceFields: { minWidth: 0, gap: 4 }, inspectorContent: { paddingLeft: 0, paddingRight: 6, paddingBottom: 12, gap: 6 }, inspectorBody: { gap: 4 }, modelBreadcrumb: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 4 }, breadcrumbProvider: { flexShrink: 1, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, breadcrumbSeparator: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorHeading: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorDivider: { height: 1, backgroundColor: systemColors.separator }, inspectorEnabledRow: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, // A link is also a cursor: the row shows the pointing hand over the whole
 // finding, label included, exactly like every native link in the app.
-inspectorProbeFinding: { flexShrink: 1, minWidth: 0, cursor: "pointer" }, inspectorProbeFindingText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textDecorationLine: "underline" }, inspectorEnableControl: { flexShrink: 0 }, orderEditorRow: { width: "100%", minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, orderEditorField: { flex: 1, width: undefined }, orderFollowControl: { flexShrink: 0 }, protocolSettings: { gap: 4 }, helpTipAnchor: { position: "relative", zIndex: 2 }, helpTipDismiss: { position: "absolute", left: -2400, right: -2400, top: -2400, bottom: -2400 }, helpTipButton: { width: 16, height: 16, minWidth: 16, minHeight: 16 }, helpTipPopup: { position: "absolute", right: 0, bottom: 22, width: 208, paddingHorizontal: 8, paddingVertical: 6, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.control, shadowColor: "#000000", shadowOpacity: 0.18, shadowRadius: 8, shadowOffset: { width: 0, height: 2 } }, helpTipText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
-  externalSettingsWorkspace: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }, externalSettingsFieldList: { ...SETTINGS_FIELD_LIST }, externalSettingsField: { ...SETTINGS_FIELD }, externalSettingsInputRow: { ...SETTINGS_FIELD_ROW_INDENTED }, externalSettingsFieldLabel: { ...SETTINGS_FIELD_LABEL }, externalSettingsValueSlot: { ...SETTINGS_FIELD_ROUTE_SLOT }, externalSettingsBooleanControl: { ...SETTINGS_FIELD_SWITCH_SLOT }, externalSettingsHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }, externalSettingsHelpText: { ...SETTINGS_FIELD_HELP_TEXT }, externalSettingsPane: { flex: 1, minHeight: 0 }, externalSettingsPaneContent: { paddingVertical: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, gap: 14 }, codexRawEditorBase: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, minHeight: 0, gap: 5 }, codexRawEditorHeader: { minHeight: 18 }, codexRawEditorLabel: { fontFamily: Platform.select({ macos: "Menlo", windows: "Cascadia Mono", default: "monospace" }), fontWeight: "600" }, codexRawNativeEditor: { minHeight: 0 }, codexRawEditorLoading: { minHeight: 0 }, sectionTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
+inspectorProbeFinding: { flexShrink: 1, minWidth: 0, cursor: "pointer" }, inspectorProbeFindingText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textDecorationLine: "underline" }, inspectorEnableControl: { flexShrink: 0 }, orderEditorRow: { width: "100%", minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, orderEditorField: { flex: 1, width: undefined }, orderFollowControl: { flexShrink: 0 }, publicModelRouteCount: { flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE }, modelWindowValue: { flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 6 }, modelWindowText: { flexShrink: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE }, modelWindowLink: { flexShrink: 0 }, protocolSettings: { gap: 4 }, helpTipAnchor: { position: "relative", zIndex: 2 }, helpTipDismiss: { position: "absolute", left: -2400, right: -2400, top: -2400, bottom: -2400 }, helpTipButton: { width: 16, height: 16, minWidth: 16, minHeight: 16 }, helpTipPopup: { position: "absolute", right: 0, bottom: 22, width: 208, paddingHorizontal: 8, paddingVertical: 6, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.control, shadowColor: "#000000", shadowOpacity: 0.18, shadowRadius: 8, shadowOffset: { width: 0, height: 2 } }, helpTipText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
+  externalSettingsWorkspace: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }, externalSettingsFieldList: { ...SETTINGS_FIELD_LIST }, externalSettingsField: { ...SETTINGS_FIELD }, externalSettingsInputRow: { ...SETTINGS_FIELD_ROW_INDENTED }, externalSettingsFieldLabel: { ...SETTINGS_FIELD_LABEL }, externalSettingsValueSlot: { ...SETTINGS_FIELD_ROUTE_SLOT }, externalSettingsBooleanControl: { ...SETTINGS_FIELD_SWITCH_SLOT }, externalSettingsHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }, externalSettingsHelpText: { ...SETTINGS_FIELD_HELP_TEXT }, externalSettingsPane: { flex: 1, minHeight: 0 }, externalSettingsPaneContent: { paddingVertical: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, gap: 14 }, codexRawEditorBase: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, minHeight: 0, gap: 5 }, codexRawEditorHeader: { minHeight: 18 }, codexRawEditorLabel: { fontFamily: Platform.select({ macos: "Menlo", windows: "Cascadia Mono", default: "monospace" }), fontWeight: "600" }, codexRawNativeEditor: { minHeight: 0 }, codexRawEditorLoading: { minHeight: 0 },
   runtimeWorkspaceFrame: { flex: 1, minHeight: 0, gap: 6 }, runtimeWorkspaceBody: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }, runtimeWorkspace: { width: "100%", padding: SETTINGS_PANE_INSET, gap: 14 }, runtimeScrollSurface: { flex: 1, minWidth: 0, backgroundColor: systemColors.textBackground }, runtimeFieldList: { ...SETTINGS_FIELD_LIST }, runtimeField: { ...SETTINGS_FIELD }, runtimeInputRow: { ...SETTINGS_FIELD_ROW_INDENTED }, runtimeModifiedBar: { position: "absolute", left: 0, top: 3, bottom: 3, width: 2, borderRadius: 1, backgroundColor: "transparent" }, runtimeModifiedBarInline: { width: 2, alignSelf: "center", height: 16, borderRadius: 1, backgroundColor: "transparent" }, runtimeModifiedBarActive: { backgroundColor: systemColors.blue }, runtimeFieldError: { marginLeft: SETTINGS_FIELD_HELP_INDENT, color: systemColors.red, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, runtimeValueControlInvalid: { borderWidth: 1, borderColor: systemColors.red, borderRadius: 4 }, runtimeResetButton: { minWidth: 28, width: 28, height: 22, paddingHorizontal: 0 }, runtimeFieldLabel: { ...SETTINGS_FIELD_LABEL }, runtimeValueSlot: { ...SETTINGS_FIELD_VALUE_SLOT }, runtimeValueControl: { width: SETTINGS_FIELD_VALUE_WIDTH, minWidth: SETTINGS_FIELD_VALUE_WIDTH, height: 26 }, runtimeBooleanControl: { ...SETTINGS_FIELD_SWITCH_SLOT }, runtimeUnit: { width: 68, flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, runtimeActionSlot: { width: 72, minHeight: 26, flexShrink: 0, justifyContent: "center" }, runtimeHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }, runtimeHelpText: { ...SETTINGS_FIELD_HELP_TEXT }, runtimeMultilineField: { minWidth: 0, flexGrow: 1, flexBasis: "100%", maxWidth: "100%" }, runtimeMultilineHeader: { minHeight: 26, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8, paddingLeft: SETTINGS_FIELD_LEAD }, runtimeMultilineLabel: { flex: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, runtimeMultilineHeaderActions: { flexShrink: 0, minHeight: 26, justifyContent: "center" }, runtimeMultilineEditor: { width: "100%", minWidth: 0, height: 108, flex: 1, alignSelf: "stretch" }, runtimeMultilineHelpSlot: { marginLeft: 0, maxWidth: "100%", minWidth: 0, paddingTop: 6, gap: 3 }, runtimeJsonDefaultHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15, fontWeight: "600", minWidth: 0 },
-  dataManagementWorkspace: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }, dataManagementPane: { flex: 1, minHeight: 0 }, dataManagementPaneScrollContent: { paddingTop: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, paddingBottom: 4, gap: 10 }, dataManagementWebDavPane: { flex: 1, minHeight: 0 }, dataManagementWebDavContent: { gap: 10, paddingTop: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, paddingBottom: SETTINGS_PANE_INSET }, dataManagementImportIntro: { width: "100%", minHeight: 72, paddingHorizontal: 12, paddingVertical: 12, justifyContent: "center" }, dataManagementImportFileRow: { width: "100%", minHeight: 28, flexDirection: "row", alignItems: "center", gap: SETTINGS_FIELD_GAP, paddingLeft: SETTINGS_FIELD_LEAD }, dataManagementImportFileLabel: { ...SETTINGS_FIELD_LABEL }, dataManagementImportFileValue: { flex: 1, minWidth: 0, minHeight: 26, justifyContent: "center", paddingHorizontal: 8, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 4, backgroundColor: systemColors.textBackground }, dataManagementImportFilePlaceholder: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, dataManagementGroup: { gap: 6 }, dataManagementGroupBody: { gap: 5 }, dataManagementSelectionBar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementSelectionCount: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, dataManagementToolbarButtons: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, dataManagementBottomActions: { minHeight: 26, flexDirection: "row", alignItems: "flex-end", justifyContent: "flex-end", gap: 8 }, dataManagementBottomMessage: { flex: 1, minWidth: 0, gap: 2 }, dataManagementSectionPicker: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", columnGap: 14, rowGap: 2, paddingVertical: 2 }, dataManagementSectionControl: { minWidth: 150, minHeight: 22, justifyContent: "center" }, dataManagementSensitiveHint: { color: systemColors.brown, fontSize: UI_FONT_SIZE, lineHeight: 16, paddingVertical: 5, paddingHorizontal: 7, backgroundColor: Platform.select({ macos: (PlatformColor("systemYellow") as unknown as { withAlphaComponent?: (alpha: number) => string })?.withAlphaComponent?.(0.08) ?? "rgba(255, 204, 0, 0.08)", default: "rgba(255, 204, 0, 0.08)" }), borderRadius: 4, borderWidth: 1, borderColor: Platform.select({ macos: (PlatformColor("systemYellow") as unknown as { withAlphaComponent?: (alpha: number) => string })?.withAlphaComponent?.(0.2) ?? "rgba(255, 204, 0, 0.2)", default: "rgba(255, 204, 0, 0.2)" }) }, dataManagementSensitiveNote: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, dataManagementSyncContent: { gap: 6 }, dataManagementSyncScope: { ...SETTINGS_FIELD_ROW_INDENTED, minHeight: 24 }, dataManagementSyncScopeLabel: { ...SETTINGS_FIELD_LABEL }, dataManagementSyncScopeValue: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, dataManagementDirection: { ...SETTINGS_FIELD_ROW_INDENTED }, dataManagementDirectionLabel: { ...SETTINGS_FIELD_LABEL }, dataManagementDirectionPicker: { width: SETTINGS_FIELD_ROUTE_WIDTH, height: 24, flexGrow: 0, flexShrink: 0 }, dataManagementStatus: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 },
-  webDavForm: { flexGrow: 0, paddingHorizontal: 0 }, webdavFormBody: { gap: 6 }, webdavStateRow: { minHeight: 24, justifyContent: "flex-start" }, webdavSyncArea: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 8, marginTop: 2 }, webdavActionRow: { minHeight: 32, flexDirection: "row", alignItems: "center", gap: 8, borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 8, marginTop: 2 }, webdavActionStatus: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, webdavStateSpacer: { flex: 1 }, webdavStateStatus: { maxWidth: 180, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, textAlign: "right", lineHeight: 15 }, webdavFormRows: { gap: 5, alignSelf: "stretch", paddingLeft: SETTINGS_FIELD_LEAD }, webdavPasswordInput: { width: SETTINGS_FIELD_VALUE_WIDTH, minHeight: 26 },
-  logsWindow: { flex: 1, minHeight: 0, gap: 4 }, logsToolbar: { height: 28, minHeight: 28, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, logFilterRow: { width: 360, minWidth: 220, maxWidth: 360, height: 26, flexDirection: "row", alignItems: "center", gap: 8 }, logToolbarSpacer: { flex: 1, minWidth: 0 }, logActionsRow: { height: 26, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, clearCooldownButton: { minWidth: 96, height: 22 }, toolbarLabel: { color: systemColors.label, fontSize: UI_FONT_SIZE, flexShrink: 0 }, logFilterInput: { flex: 1, minWidth: 0, height: 26 }, logsTabs: { width: 640, maxWidth: "100%", minWidth: 0, height: 28, flexShrink: 0 }, logTableFrame: { flex: 1, minHeight: 0, minWidth: 0 }, logTable: { flex: 1, minHeight: 0 }, logEmptySurface: { flex: 1, minHeight: 0, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, logEmptyText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textAlign: "center", paddingHorizontal: 20 }, fieldLabel: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "500" }, fieldHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, input: { width: "100%", minHeight: 26, color: systemColors.label, fontSize: UI_FONT_SIZE }, textArea: { minHeight: 108, textAlignVertical: "top", fontFamily: "Menlo" }, compactTextArea: { minHeight: 56, maxHeight: 56 }, secretFieldActions: { flexDirection: "row", alignItems: "center", gap: 6 }, secretFieldButtons: { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 4 }, secretFieldButton: { flex: 1, minWidth: 0, height: 26 }, nativeSecretControl: { flex: 1, minWidth: 0, minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, nativeSecretInput: { flex: 1, minWidth: 86, minHeight: 26 }, rawEditor: { flex: 1, minHeight: 180, gap: 4 }, rawEditorHeader: { minHeight: 28, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }, rawNativeEditorFrame: { flex: 1, minHeight: 160, position: "relative" }, rawNativeEditor: { flex: 1, minHeight: 160 }, rawEditorOverlay: { position: "absolute", left: 0, right: 0, top: 0, bottom: 0, justifyContent: "center", alignItems: "center", gap: 8, paddingHorizontal: 12, backgroundColor: systemColors.textBackground }, rawEditorLoading: { flex: 1, minHeight: 160, justifyContent: "center", paddingHorizontal: 8, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, empty: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, paddingVertical: 12 }, issueBox: { borderWidth: 1, borderColor: systemColors.separator, borderRadius: 4, backgroundColor: systemColors.control, padding: 12, gap: 5 }, issue: { color: systemColors.red, fontSize: UI_FONT_SIZE }, cardHint: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, marginTop: 2 },
+  dataManagementWorkspace: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }, dataManagementPane: { flex: 1, minHeight: 0 }, dataManagementPaneScrollContent: { paddingTop: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, paddingBottom: 4, gap: 10 }, dataManagementImportIntro: { width: "100%", minHeight: 72, paddingHorizontal: 12, paddingVertical: 12, justifyContent: "center" }, dataManagementImportFileRow: { width: "100%", minHeight: 28, flexDirection: "row", alignItems: "center", gap: SETTINGS_FIELD_GAP, paddingLeft: SETTINGS_FIELD_LEAD }, dataManagementImportFileLabel: { ...SETTINGS_FIELD_LABEL }, dataManagementImportFileValue: { flex: 1, minWidth: 0, minHeight: 26, justifyContent: "center", paddingHorizontal: 8, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 4, backgroundColor: systemColors.textBackground }, dataManagementImportFilePlaceholder: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, dataManagementSelectionBar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementSelectionCount: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, dataManagementToolbarButtons: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, dataManagementSectionsField: { flex: 1, minWidth: 0, gap: 6 }, dataManagementSectionList: { gap: 4 }, dataManagementSectionItem: { minHeight: 22 }, dataManagementActionStatus: { flexShrink: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 14 }, dataManagementSensitiveHint: { color: systemColors.brown, fontSize: UI_FONT_SIZE, lineHeight: 16, paddingVertical: 5, paddingHorizontal: 7, backgroundColor: Platform.select({ macos: (PlatformColor("systemYellow") as unknown as { withAlphaComponent?: (alpha: number) => string })?.withAlphaComponent?.(0.08) ?? "rgba(255, 204, 0, 0.08)", default: "rgba(255, 204, 0, 0.08)" }), borderRadius: 4, borderWidth: 1, borderColor: Platform.select({ macos: (PlatformColor("systemYellow") as unknown as { withAlphaComponent?: (alpha: number) => string })?.withAlphaComponent?.(0.2) ?? "rgba(255, 204, 0, 0.2)", default: "rgba(255, 204, 0, 0.2)" }) }, dataManagementSyncScopeValue: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, dataManagementDirectionPicker: { width: SETTINGS_FIELD_VALUE_WIDTH, height: 24, flexGrow: 0, flexShrink: 0 },
+  // The WebDAV tab is fields of the same grid the other panes draw, so its
+  // list is the shared list rather than a form of its own.
+  webdavFieldList: { ...SETTINGS_FIELD_LIST }, webdavPasswordInput: { width: SETTINGS_FIELD_VALUE_WIDTH, minHeight: 26 }, webdavFieldUnit: { width: 68, flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
+  logsWindow: { flex: 1, minHeight: 0, gap: 4 }, logsToolbar: { height: 28, minHeight: 28, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, logFilterRow: { width: 360, minWidth: 220, maxWidth: 360, height: 26, flexDirection: "row", alignItems: "center", gap: 8 }, logToolbarSpacer: { flex: 1, minWidth: 0 }, logActionsRow: { height: 26, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, clearCooldownButton: { minWidth: 96, height: 22 }, toolbarLabel: { color: systemColors.label, fontSize: UI_FONT_SIZE, flexShrink: 0 }, logFilterInput: { flex: 1, minWidth: 0, height: 26 }, logsTabs: { width: 640, maxWidth: "100%", minWidth: 0, height: 28, flexShrink: 0 }, logTableFrame: { flex: 1, minHeight: 0, minWidth: 0 }, logTable: { flex: 1, minHeight: 0 }, logEmptySurface: { flex: 1, minHeight: 0, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, logEmptyText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textAlign: "center", paddingHorizontal: 20 }, fieldLabel: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "500" }, fieldHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, input: { width: "100%", minHeight: 26, color: systemColors.label, fontSize: UI_FONT_SIZE }, textArea: { minHeight: 108, textAlignVertical: "top", fontFamily: "Menlo" }, compactTextArea: { minHeight: 56, maxHeight: 56 }, secretFieldActions: { flexDirection: "row", alignItems: "center", gap: 6 }, secretFieldButtons: { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 4 }, secretFieldButton: { flex: 1, minWidth: 0, height: 26 }, nativeSecretControl: { flex: 1, minWidth: 0, minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, nativeSecretInput: { flex: 1, minWidth: 86, minHeight: 26 }, rawEditor: { flex: 1, minHeight: 180, gap: 4 }, rawEditorHeader: { minHeight: 28, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }, rawNativeEditorFrame: { flex: 1, minHeight: 160, position: "relative" }, rawNativeEditor: { flex: 1, minHeight: 160 }, rawEditorOverlay: { position: "absolute", left: 0, right: 0, top: 0, bottom: 0, justifyContent: "center", alignItems: "center", gap: 8, paddingHorizontal: 12, backgroundColor: systemColors.textBackground }, rawEditorLoading: { flex: 1, minHeight: 160, justifyContent: "center", paddingHorizontal: 8, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, empty: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, paddingVertical: 12 }, cardHint: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, marginTop: 2 },
   nativeSecretMultilineControl: { alignItems: "flex-start", minHeight: 108 },
   nativeSecretTextArea: { minHeight: 108, height: 108, alignSelf: "stretch" },
   secretActionButton: { width: 64, minWidth: 64, height: 26, flexShrink: 0 },

@@ -4110,6 +4110,64 @@ def _with_codex_descendant_cleanup_instruction(
     return modified_kwargs if changed else None
 
 
+_CODEX_COMMENTARY_DISCIPLINE_ENV = "YOUNG_ROUTER_CODEX_COMMENTARY_DISCIPLINE"
+_CODEX_COMMENTARY_DISCIPLINE_MARKER = "<young_router_codex_commentary_discipline>"
+_CODEX_COMMENTARY_DISCIPLINE_INSTRUCTION = (
+    f"{_CODEX_COMMENTARY_DISCIPLINE_MARKER}\n"
+    "Send at most one progress message per assistant response, and keep it to a "
+    "single short sentence. The client rule to announce a skill or to start with "
+    "a progress update is satisfied once per turn, never once per step, tool "
+    "call, or retry. Once the plan is stated, do not state it again: call the "
+    "tool instead of sending another message that repeats the same intent, "
+    "skill, or promise.\n"
+    f"</young_router_codex_commentary_discipline>"
+)
+
+
+def _with_codex_commentary_discipline_instruction(
+    request_kwargs: dict,
+) -> Optional[dict]:
+    """Keep a Codex client's progress updates from repeating in one response.
+
+    A relay-served Codex route can answer one client request with several
+    near-identical promissory messages ("I will ...") and no real tool call
+    between them.  The client stores every one of those messages and replays
+    them, so the model then imitates its own repetition -- the same
+    self-reinforcing shape the leaked-reasoning-wrapper filter removes from
+    message text.  This instruction is the request-side half of that guard: the
+    client's own rule (announce the skill, start with an update) is kept, but it
+    is spent once per turn rather than once per step.
+    """
+
+    if not _routing_module._env_bool(_CODEX_COMMENTARY_DISCIPLINE_ENV, True):
+        return None
+    if not _request_has_responses_shape(request_kwargs):
+        return None
+    if not _request_has_codex_client_evidence(request_kwargs):
+        return None
+    if _request_is_codex_compaction(request_kwargs):
+        return None
+    # A request that declares no tool cannot make a call instead of talking; its
+    # progress wording is the answer, not a preamble, so leave it alone.
+    if not _codex_declared_tool_names(request_kwargs):
+        return None
+
+    instructions = request_kwargs.get("instructions")
+    if instructions is not None and not isinstance(instructions, str):
+        return None
+    instructions = instructions or ""
+    if _CODEX_COMMENTARY_DISCIPLINE_MARKER in instructions:
+        return None
+
+    modified_kwargs = request_kwargs.copy()
+    modified_kwargs["instructions"] = (
+        f"{instructions.rstrip()}\n\n{_CODEX_COMMENTARY_DISCIPLINE_INSTRUCTION}"
+        if instructions.strip()
+        else _CODEX_COMMENTARY_DISCIPLINE_INSTRUCTION
+    )
+    return modified_kwargs
+
+
 def _is_xhigh_reasoning_effort(value: Any) -> bool:
     return (
         isinstance(value, str)

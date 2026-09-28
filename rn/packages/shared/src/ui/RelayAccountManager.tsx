@@ -1,8 +1,9 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Platform, PlatformColor, StyleSheet, Text, View } from "react-native";
-import type { CoreSnapshot, NativeLeafAdapter } from "../types";
+import type { CoreSnapshot, NativeLeafAdapter, RelayGroupManagerResult } from "../types";
 import { NativeButton, NativeCheckbox, NativePicker, NativeTable, NativeTextField } from "./NativeControls";
 import { usePendingAction } from "./pendingAction";
+import { setGroupManagerOpen } from "./providerWizardGate";
 import { normalizeRelayOrigin } from "./relayOrigin";
 import { UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
 
@@ -347,9 +348,11 @@ export function pendingCredentialCleanups(snapshot?: CoreSnapshot): PendingCrede
   });
 }
 
-export function NativeFormRow({ label, children }: { label: string; children: React.ReactNode }): React.JSX.Element {
+export function NativeFormRow({ label, required = false, children }: { label: string; required?: boolean; children: React.ReactNode }): React.JSX.Element {
+  // A required control says so at its own label: a "fill in the required
+  // fields" message is only actionable when the fields wear the mark.
   return <View style={[styles.formRow, compactStyles.formRow]}>
-    <Text style={styles.formLabel}>{label}</Text>
+    <Text style={styles.formLabel}>{label}{required ? <Text style={styles.formLabelRequired}>＊</Text> : null}</Text>
     <View style={[styles.formValue, compactStyles.formValue]}>{children}</View>
   </View>;
 }
@@ -452,7 +455,7 @@ export function ApiKeyCreateDialog({ visible, groups, disabled, onClose, onCreat
   </RelayDialogLayer>;
 }
 
-export function DependencyPolicyDialog<T extends string>({ visible, title, message, options, value, disabled, busy = false, confirmLabel, onValueChange, onClose, onConfirm, translate }: {
+export function DependencyPolicyDialog<T extends string>({ visible, title, message, options, value, disabled, busy = false, confirmLabel, destructive = false, onValueChange, onClose, onConfirm, translate }: {
   visible: boolean;
   title: string;
   message: string;
@@ -462,6 +465,12 @@ export function DependencyPolicyDialog<T extends string>({ visible, title, messa
   /** The confirm action is running: it reports progress in place instead of graying out. */
   busy?: boolean;
   confirmLabel: string;
+  /**
+   * The answer cannot be undone: it draws destructive, like every other
+   * destructive answer in the app.  The caller states it instead of the dialog
+   * inferring it from the label, which only a 删除 translation happened to match.
+   */
+  destructive?: boolean;
   onValueChange: (value: T) => void;
   onClose: () => void;
   onConfirm: () => void;
@@ -477,7 +486,7 @@ export function DependencyPolicyDialog<T extends string>({ visible, title, messa
           <View style={styles.decisionField}><Text style={styles.decisionLabel}>{translate("relay.dependencyPolicy")}</Text><NativePicker labels={options.map((option) => option.label)} selectedValue={selectedOption.label} disabled={disabled} onChange={({ nativeEvent }) => { const option = options[nativeEvent.index]; if (option) onValueChange(option.value); }} style={styles.decisionControl} /></View>
           <Text style={styles.decisionHint}>{selectedOption.hint}</Text>
         </View>
-        <View style={styles.dialogFooter}><View style={styles.decisionSpacer} /><View style={styles.dialogActions}><NativeButton title={translate("status.cancel")} compact disabled={disabled} onPress={onClose} /><NativeButton title={confirmLabel} primary destructive={confirmLabel === translate("common.delete")} busy={busy} disabled={disabled && !busy} onPress={onConfirm} /></View></View>
+        <View style={styles.dialogFooter}><View style={styles.decisionSpacer} /><View style={styles.dialogActions}><NativeButton title={translate("status.cancel")} compact disabled={disabled} onPress={onClose} /><NativeButton title={confirmLabel} primary destructive={destructive} busy={busy} disabled={disabled && !busy} onPress={onConfirm} /></View></View>
       </View>
     </View>
   </RelayDialogLayer>;
@@ -508,6 +517,7 @@ export function StationAccountsPanel({
   onStageStationUpdate,
   showConnectionFields = true,
   onStatus,
+  applyStagedQuietly,
 }: {
   station: RelayStation;
   accounts: RelayAccount[];
@@ -518,11 +528,18 @@ export function StationAccountsPanel({
   translate: Translate;
   commit: RelayCommit;
   refreshAccounts: () => Promise<CoreSnapshot | void>;
-  refreshResources: (accountID: string) => Promise<"ready" | "unavailable">;
+  /** ``force`` skips the reuse window: a sign-in that just landed reads again. */
+  refreshResources: (accountID: string, options?: { force?: boolean }) => Promise<"ready" | "unavailable">;
   apiKeyActions?: RelayApiKeyActions;
   /** Relay-family auto-detection; the station type has no manual select. */
   detectType?: (origin: string) => Promise<RelayType | undefined>;
   onStatus?: (status?: string) => void;
+  /**
+   * Applies the staged relay draft without a word in this window's status bar:
+   * 分组管理 applies its own save while its sheet is on screen, so the sheet
+   * states the outcome and the pane it was opened from stays silent.
+   */
+  applyStagedQuietly: () => Promise<void>;
   stationDraft?: StationDraft;
   onStationDraftChange?: (draft: StationDraft) => void;
   onStageStationUpdate?: (overrides?: StationDraft) => Promise<void>;
@@ -559,7 +576,6 @@ export function StationAccountsPanel({
   const stationDraftRef = useRef<StationDraft>({});
   stationDraftRef.current = stationDraft;
   const [stationBusy, setStationBusy] = useState(false);
-  const [feedback, setFeedback] = useState<string>();
   const accountsRef = useRef(stationAccounts);
   accountsRef.current = stationAccounts;
   // The account list owns the selection: an explicitly cleared one (a click
@@ -570,7 +586,6 @@ export function StationAccountsPanel({
     ?? (selectedID === undefined ? stationAccounts[0] : undefined);
   const controlsBusy = busy || formBusy || stationBusy;
   const publish = (message: string): void => {
-    setFeedback(undefined);
     onStatus?.(message);
   };
   const effectiveLoginStatus = (account: RelayAccount): "signed_in" | "signed_out" | "expired" | "unknown" => {
@@ -632,14 +647,15 @@ export function StationAccountsPanel({
       return next;
     });
   };
-  const refreshAccountResources = async (target: ResourceRefreshTarget, silent = false): Promise<"ready" | "unavailable"> => {
+  const refreshAccountResources = async (target: ResourceRefreshTarget, options: { silent?: boolean; force?: boolean } = {}): Promise<"ready" | "unavailable"> => {
+    const { silent = false, force = false } = options;
     if (isAccountLoading(target.id)) {
       return accountsRef.current.find((item) => item.id === target.id)?.resourceStatus === "ready" ? "ready" : "unavailable";
     }
     updateLoading(target.id, "resources", true);
-    if (!silent) setFeedback(undefined);
+    if (!silent) onStatus?.(undefined);
     try {
-      const status = await refreshResources(target.id);
+      const status = await refreshResources(target.id, { force });
       try {
         await refreshAccounts();
       } catch {
@@ -683,7 +699,6 @@ export function StationAccountsPanel({
   const loginAccount = async (account: AddedRelayAccount): Promise<boolean> => {
     setFormBusy(true);
     updateLoading(account.id, "session", true);
-    setFeedback(undefined);
     try {
       const result = await native.relayLogin({
         accountId: account.id,
@@ -710,7 +725,10 @@ export function StationAccountsPanel({
           // The username label is cosmetic.
         }
       }
-      await refreshAccountResources({ id: account.id }, true);
+      // The station round trip after a sign-in is paid for once: the key list
+      // this pane shows must be the one the fresh session can read, so it
+      // forces a read instead of reusing a pre-login result.
+      await refreshAccountResources({ id: account.id }, { silent: true, force: true });
       return true;
     } catch {
       markLoginFailure(account.id, true);
@@ -738,7 +756,7 @@ export function StationAccountsPanel({
         // locally known key is local data, and Core still reads the station
         // through an explicitly remembered session when it has one.
         await restoreSavedSession(account);
-        await refreshAccountResources(account, true);
+        await refreshAccountResources(account, { silent: true });
       })();
     }
   }, [busy, stationAccounts]);
@@ -750,12 +768,11 @@ export function StationAccountsPanel({
   // family comes from the station's type, or auto-detection — never a select.
   const startPendingLogin = async (): Promise<void> => {
     setFormBusy(true);
-    setFeedback(undefined);
     const pendingID = `login-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     const stationType = station.type ?? await detectType?.(station.origin);
     if (!stationType) {
       setFormBusy(false);
-      setFeedback(translate("relay.typeNotDetected"));
+      publish(translate("relay.typeNotDetected"));
       return;
     }
     try {
@@ -797,8 +814,7 @@ export function StationAccountsPanel({
     if (pendingAction === "remove") return;
     await runPendingAction("remove", async () => {
       setFormBusy(true);
-      setFeedback(undefined);
-      try {
+        try {
         await commit("account.delete", { id: removal.account.id, dependency_policy: removalPolicy });
         setSelectedID(undefined);
         try {
@@ -827,7 +843,6 @@ export function StationAccountsPanel({
       || type !== station.type;
     if (!dirty) return;
     setStationBusy(true);
-    setFeedback(undefined);
     try {
       await commit("station.update", { id: station.id, name, origin, type });
       await refreshAccounts();
@@ -845,20 +860,31 @@ export function StationAccountsPanel({
   // automatic grouping owns the layout, so the switch is staged around them.
   //
   // 自动分组 owns the key layout, so the list the window shows comes from the
-  // aligned draft: refresh the station facts, let Core stage its one-key-per-
-  // group layout, then read the account back so the list never shows keys the
-  // switch is already replacing.  Without a group list there is no 1:1 layout
-  // to build, so the keys stay as the station last reported them.
+  // aligned draft: let Core stage its one-key-per-group layout over the groups
+  // it already holds, then read the account back so the list never shows keys
+  // the switch is already replacing.  The layout is built from held facts — a
+  // station round trip can only add groups Core has not seen — so the window
+  // reads the station only when there is no usable key list to align yet.
+  // Otherwise opening 分组管理 right after the account pane's own read would
+  // make the user wait for a second station round trip it does not need, which
+  // is exactly the wait this window's wheel used to state.
   const alignAutoGroupingAction = apiKeyActions?.alignAutoGrouping;
   const groupManagerNeedsAlignment = (current: RelayAccount): boolean =>
     Boolean(alignAutoGroupingAction) && current.autoGrouping && current.groups.length > 0;
+  // The held facts a layout still needs: a ready account read with at least one
+  // key.  Without one there is nothing to align, so the window reads first.
+  const groupManagerHasUsableFacts = (current: RelayAccount): boolean =>
+    current.resourceStatus === "ready" && current.resources.length > 0;
   // The account facts the window's rows are built from: the aligned draft while
   // 自动分组 owns the layout, otherwise the account as this pane already holds
   // it.  A station that cannot be refreshed keeps the keys it last reported.
+  // The station is read only when the account has no usable key list, and that
+  // read reuses one the pane already ran when it is seconds old, so the usual
+  // opening never pays for a station round trip twice.
   const loadGroupManagerAccount = async (current: RelayAccount): Promise<RelayAccount> => {
     if (!alignAutoGroupingAction || !groupManagerNeedsAlignment(current)) return current;
     try {
-      if (await refreshResources(current.id) !== "ready") return current;
+      if (!groupManagerHasUsableFacts(current) && await refreshResources(current.id) !== "ready") return current;
       await alignAutoGroupingAction(current.id);
       const snapshot = await refreshAccounts();
       return (snapshot ? accountsFromSnapshot(snapshot) : []).find((entry) => entry.id === current.id) ?? current;
@@ -926,7 +952,6 @@ export function StationAccountsPanel({
     // The copy is an icon button beside the value; these words ride it as its
     // tooltip and its accessibility label.
     copyLabel: translate("relay.apiKeyCopy"),
-    copiedLabel: translate("relay.apiKeyCopied"),
     failedLabel: translate("relay.operationFailed"),
     modelsLabel: translate("relay.apiKeyModelList"),
     emptyLabel: translate("common.none"),
@@ -953,6 +978,11 @@ export function StationAccountsPanel({
     labels: groupManagerLabels(),
     ...groupManagerSnapshot(current),
   });
+  // 分组管理 owns its work: 保存并关闭 hands this pane its staged edits, which
+  // are written and applied while the sheet is still on screen, and the sheet
+  // states the outcome in its own status bar.  The gate keeps the pane's own
+  // immediate apply away while the sheet is up and the pane's strip stays
+  // silent about work it did not start, so one surface reports one save.
   const openGroupManager = async (): Promise<void> => {
     const account = selected;
     if (!account || !native.showGroupManager) return;
@@ -978,37 +1008,96 @@ export function StationAccountsPanel({
         });
       });
     }
-    const result = await native.showGroupManager({ ...groupManagerRequest(current), loading: Boolean(pending) });
-    if (!result) return;
-    // The staged edits are reconciled against the loaded account, which is the
-    // one the window's rows came from.
-    if (pending) current = await pending;
-    setFormBusy(true);
-    setFeedback(undefined);
-    try {
+    // What the sheet has already handed over.  A save that failed leaves these
+    // edits staged in Core, so the next 保存并关闭 stages only what it added on
+    // top instead of writing the same keys twice.
+    let handedOver: RelayGroupManagerResult | undefined;
+    const stageEdits = async (edits: RelayGroupManagerResult): Promise<void> => {
+      // The staged edits are reconciled against the loaded account, which is
+      // the one the window's rows came from.
+      if (pending) current = await pending;
+      const previous = handedOver;
+      const alreadyCreated = new Set((previous?.creates ?? []).map((create) => `${create.name}\u0000${create.groupID}`));
+      const previousUpdate = new Map((previous?.updates ?? []).map((entry) => [entry.keyID, entry]));
+      const alreadyDeleted = new Set(previous?.deletes ?? []);
       // Manual key writes are rejected while auto-grouping owns the layout, so
       // turning it off is staged first and turning it on is staged last.
-      if (current.autoGrouping && !result.autoGrouping) await apiKeyActions?.setAutoGrouping?.(account.id, false);
-      for (const create of result.creates) {
+      const turningOff = current.autoGrouping && !edits.autoGrouping
+        && (previous === undefined || previous.autoGrouping);
+      if (turningOff) await apiKeyActions?.setAutoGrouping?.(account.id, false);
+      for (const create of edits.creates) {
+        if (alreadyCreated.has(`${create.name}\u0000${create.groupID}`)) continue;
         await apiKeyActions?.create?.(account.id, { name: create.name, groupID: create.groupID, enabled: true });
       }
-      for (const update of result.updates) {
-        const resource = current.resources.find((item) => item.id === update.keyID);
+      for (const edit of edits.updates) {
+        const resource = current.resources.find((item) => item.id === edit.keyID);
         if (!resource) continue;
-        if (update.name !== (resource.apiName || resource.name)) await apiKeyActions?.update?.(account.id, update.keyID, update.name);
-        if (update.groupID !== resource.groupID) await apiKeyActions?.setGroup?.(account.id, update.keyID, update.groupID);
-        if (update.enabled !== resource.enabled) await apiKeyActions?.setEnabled?.(account.id, update.keyID, update.enabled);
+        const staged = previousUpdate.get(edit.keyID);
+        const nameChanged = edit.name !== (resource.apiName || resource.name) && (!staged || staged.name !== edit.name);
+        const groupChanged = edit.groupID !== resource.groupID && (!staged || staged.groupID !== edit.groupID);
+        const enabledChanged = edit.enabled !== resource.enabled && (!staged || staged.enabled !== edit.enabled);
+        if (nameChanged) await apiKeyActions?.update?.(account.id, edit.keyID, edit.name);
+        if (groupChanged) await apiKeyActions?.setGroup?.(account.id, edit.keyID, edit.groupID);
+        if (enabledChanged) await apiKeyActions?.setEnabled?.(account.id, edit.keyID, edit.enabled);
       }
-      for (const keyID of result.deletes) {
+      for (const keyID of edits.deletes) {
+        if (alreadyDeleted.has(keyID)) continue;
         await apiKeyActions?.remove?.(account.id, keyID, "detach_disabled");
       }
-      if (!current.autoGrouping && result.autoGrouping) await apiKeyActions?.setAutoGrouping?.(account.id, true);
-      await refreshAccounts();
-      onStatus?.(translate("relay.apiKeyGroupStaged"));
-    } catch {
-      onStatus?.(translate("relay.operationFailed"));
+      const turningOn = !current.autoGrouping && edits.autoGrouping
+        && (previous === undefined || !previous.autoGrouping);
+      if (turningOn) await apiKeyActions?.setAutoGrouping?.(account.id, true);
+      handedOver = edits;
+    };
+    const answersApplies = Boolean(native.awaitGroupManagerApply && native.finishGroupManagerApply);
+    const answerOneApplyRequest = async (): Promise<void> => {
+      const ask = native.awaitGroupManagerApply?.();
+      if (!ask) return;
+      const edits = await ask;
+      if (!edits) return;
+      setFormBusy(true);
+        let status = translate("common.saved");
+      let close = true;
+      try {
+        await stageEdits(edits);
+        // The write is applied by the sheet's own request, so the pane it was
+        // opened from states nothing about it.
+        await applyStagedQuietly();
+        await refreshAccounts();
+      } catch {
+        // The sheet keeps its rows and its 保存并关闭, states the failure in
+        // its own strip, and can be tried again once the cause is fixed.
+        status = translate("common.notApplied");
+        close = false;
+      } finally {
+        setFormBusy(false);
+        await native.finishGroupManagerApply?.({ status, close }).catch(() => undefined);
+        if (!close) void answerOneApplyRequest();
+      }
+    };
+    setGroupManagerOpen(true);
+    try {
+      const shown = native.showGroupManager({ ...groupManagerRequest(current), loading: Boolean(pending) });
+      if (answersApplies) void answerOneApplyRequest();
+      const result = await shown;
+      // A host whose sheet can only save on close stages the same edits after
+      // it is gone; the sheet itself states nothing there, so this pane keeps
+      // the outcome for that host only.
+      if (result && !answersApplies) {
+        setFormBusy(true);
+        try {
+          await stageEdits(result);
+          await applyStagedQuietly();
+          await refreshAccounts();
+          onStatus?.(translate("common.saved"));
+        } catch {
+          onStatus?.(translate("common.notApplied"));
+        } finally {
+          setFormBusy(false);
+        }
+      }
     } finally {
-      setFormBusy(false);
+      setGroupManagerOpen(false);
     }
   };
   const selectedLoginState = selected ? relayLoginState(selected) : "signed_out";
@@ -1087,23 +1176,7 @@ export function StationAccountsPanel({
       disabled={controlsBusy && pendingAction !== "remove"}
       busy={pendingAction === "remove"}
       confirmLabel={translate("relay.removeLocal")}
-      onValueChange={setRemovalPolicy}
-      onClose={() => setRemoval(undefined)}
-      onConfirm={() => { void removeSelected(); }}
-      translate={translate}
-    />
-    <DependencyPolicyDialog
-      visible={Boolean(removal)}
-      title={translate("relay.removeLocalTitle")}
-      message={removal ? translate("relay.removeAccountBody", { label: accountDisplayName(removal.account, translate), keys: removalKeys, models: selectedRemovalModels }) : ""}
-      options={[
-        { value: "detach", label: translate("relay.policyRelease"), hint: translate("relay.policyReleaseHint") },
-        { value: "delete_models", label: translate("relay.policyDeleteModels"), hint: translate("relay.policyDeleteModelsHint") },
-      ]}
-      value={removalPolicy}
-      disabled={controlsBusy && pendingAction !== "remove"}
-      busy={pendingAction === "remove"}
-      confirmLabel={translate("relay.removeLocal")}
+      destructive
       onValueChange={setRemovalPolicy}
       onClose={() => setRemoval(undefined)}
       onConfirm={() => { void removeSelected(); }}
@@ -1157,9 +1230,17 @@ export function providedKeyRows(accounts: RelayAccount[], translate: Translate):
 export type RelayWorkspaceBridge = {
   commit: RelayCommit;
   detectType: (origin: string) => Promise<RelayType | undefined>;
-  refreshResources: (accountID: string) => Promise<"ready" | "unavailable">;
+  /** ``force`` skips the reuse window: a sign-in that just landed reads again. */
+  refreshResources: (accountID: string, options?: { force?: boolean }) => Promise<"ready" | "unavailable">;
   /** Returns the refreshed snapshot so callers avoid stale projections. */
   refreshAccounts: () => Promise<CoreSnapshot | void>;
+  /**
+   * Commit the staged relay draft without a word in this window's status bar:
+   * 分组管理 writes its own edits and applies them while its sheet is still up,
+   * so the sheet states the outcome and the pane it was opened from stays
+   * silent about work it did not start.
+   */
+  applyStagedQuietly: () => Promise<void>;
   apiKeyActions: RelayApiKeyActions;
 };
 
@@ -1172,6 +1253,8 @@ const colors = {
   accent: Platform.OS === "macos" ? PlatformColor("systemBlueColor") : PlatformColor("AccentFillColorDefault"),
   accentText: Platform.OS === "macos" ? PlatformColor("alternateSelectedControlTextColor") : PlatformColor("TextOnAccentFillColorPrimary"),
   success: "#2A9D68",
+  /** The required marker beside a form label. */
+  required: Platform.OS === "macos" ? PlatformColor("systemRedColor") : PlatformColor("SystemFillColorCriticalBrush"),
 };
 
 const compactStyles = StyleSheet.create({
@@ -1194,7 +1277,7 @@ const styles = StyleSheet.create({
   accountNameValue: { flex: 1, minWidth: 0, color: colors.text, fontSize: UI_FONT_SIZE },
   accountActionsRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6, flexWrap: "wrap" },
   fieldRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 },
-  fieldLabel: { width: 64, flexShrink: 0, color: colors.secondary, fontSize: UI_FONT_SIZE },
+  fieldLabel: { width: 64, flexShrink: 0, color: colors.text, fontSize: UI_FONT_SIZE },
   setupProgress: { width: "100%", flexDirection: "row", alignItems: "center", minHeight: 22, gap: 18 },
   setupProgressStep: { flexDirection: "row", alignItems: "center", gap: 7, flexShrink: 0 },
   setupProgressBadge: { width: 20, height: 20, borderRadius: 10, borderWidth: 1, borderColor: colors.separator, alignItems: "center", justifyContent: "center", backgroundColor: colors.window },
@@ -1206,6 +1289,7 @@ const styles = StyleSheet.create({
   setupProgressLabelCurrent: { color: colors.text, fontWeight: "600" },
   formRow: { width: "100%", minHeight: 30, flexDirection: "column", alignItems: "stretch", gap: 5 },
   formLabel: { width: "100%", minWidth: 0, color: colors.text, fontSize: UI_FONT_SIZE, fontWeight: "600" },
+  formLabelRequired: { color: colors.required },
   formValue: { width: "100%", minWidth: 0, minHeight: 26, justifyContent: "center", gap: 4 },
   relayDialogLayer: { position: "absolute", top: 0, right: 0, bottom: 0, left: 0, zIndex: 100 },
   dialogBackdrop: { flex: 1, alignItems: "center", justifyContent: "center", padding: 24, backgroundColor: "rgba(0, 0, 0, 0.22)" },

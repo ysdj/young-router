@@ -23,13 +23,14 @@ import re
 import secrets
 import stat
 import threading
+import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, Protocol, runtime_checkable
 
 from .log_tabs import LOG_TABS
 from .persistence import AtomicJSONStore, PersistenceError, atomic_write_bytes, atomic_write_json, read_bytes, read_json
-from .protocol import PROTOCOL_VERSION, ProtocolError, make_event
+from .protocol import MAX_EDITOR_DOCUMENT_BYTES, PROTOCOL_VERSION, ProtocolError, make_event
 from .security import REDACTED, redact, safe_exception_message, safe_error_message
 
 
@@ -285,6 +286,74 @@ def _safe_public(value: object) -> object:
     if isinstance(value, tuple):
         return [_safe_public(item) for item in value]
     return copy.deepcopy(value)
+
+
+def _relay_binding_projection(state: object) -> list[tuple[str, ...]]:
+    """The relay-bound part of a providers draft, for change detection.
+
+    Two things in a provider draft bind material that only the relay domain can
+    resolve: a key that resolves through a station, and a model that points at
+    such a key.  Comparing this projection against the applied baseline tells an
+    Apply whether it has any relay work to do at all — a draft that only adds an
+    independent model, renames a provider, or edits an order has none, and it
+    must not be dragged into a relay transaction whose backlog (a pending key
+    create, an expired session) would otherwise fail an edit that has nothing to
+    do with the relay.
+    """
+
+    providers = state.get("providers") if isinstance(state, Mapping) else None
+    projection: list[tuple[str, ...]] = []
+    if not isinstance(providers, Sequence) or isinstance(providers, (str, bytes, bytearray)):
+        return projection
+    for provider in providers:
+        if not isinstance(provider, Mapping):
+            continue
+        provider_name = str(provider.get("name", "")).strip()
+        relay_key_names: set[str] = set()
+        relay_key_ids: set[str] = set()
+        api_keys = provider.get("api_keys")
+        if isinstance(api_keys, Sequence) and not isinstance(api_keys, (str, bytes, bytearray)):
+            for key in api_keys:
+                if not isinstance(key, Mapping):
+                    continue
+                source = key.get("source") if isinstance(key.get("source"), Mapping) else {}
+                # Only a key that resolves through a station is relay material;
+                # an independent key, and the provider name it happens to live
+                # under, is this domain's own business.
+                if str(source.get("kind", "")) != "relay":
+                    continue
+                projection.append(
+                    (
+                        "key",
+                        provider_name,
+                        str(key.get("name", "")),
+                        str(source.get("station_id", "")),
+                        str(source.get("account_id", "")),
+                        str(source.get("resource_id", "")),
+                    )
+                )
+                relay_key_names.add(str(key.get("name", "")))
+                if key.get("id"):
+                    relay_key_ids.add(str(key.get("id")))
+        models = provider.get("models")
+        if isinstance(models, Sequence) and not isinstance(models, (str, bytes, bytearray)):
+            for model in models:
+                if not isinstance(model, Mapping):
+                    continue
+                key_name = str(model.get("api_key_name", ""))
+                key_id = str(model.get("provider_key_id", ""))
+                if key_name not in relay_key_names and key_id not in relay_key_ids:
+                    continue
+                projection.append(
+                    (
+                        "model",
+                        provider_name,
+                        str(model.get("model_name", model.get("name", ""))),
+                        key_id,
+                        key_name,
+                    )
+                )
+    return projection
 
 
 def _as_mapping(value: object, label: str = "payload") -> dict[str, Any]:
@@ -700,12 +769,16 @@ class CoreStore:
         domains: Iterable[DomainAdapter] = (),
         file_capabilities: FileCapabilityRegistry | None = None,
         service_handlers: Mapping[str, Callable[[str], object]] | None = None,
+        workbuddy_runtime: object | None = None,
     ) -> None:
         self._lock = threading.RLock()
         self._metadata_store = AtomicJSONStore(metadata_path) if metadata_path else None
         self.file_capabilities = file_capabilities or FileCapabilityRegistry()
         self._service_handlers = dict(service_handlers or {})
         self._shutdown_handler = self._service_handlers.get("stop")
+        # The WorkBuddy worker is Core-owned: it must not outlive the process
+        # that keeps its credential copy and its loopback bearer.
+        self._workbuddy_runtime = workbuddy_runtime
         self._domains: dict[str, DomainAdapter] = {}
         self._baselines: dict[str, object] = {}
         self._drafts: dict[str, dict[str, Any]] = {}
@@ -722,6 +795,12 @@ class CoreStore:
         # replace the same proxy, so they take turns on one transition guard.
         self._service_transition_guard = threading.Lock()
         self._last_actions: dict[str, dict[str, Any]] = {}
+        # The WebDAV interval loop is created on request, started by the Core
+        # entry point, and stopped with the store.
+        self._webdav_scheduler: Any | None = None
+        # When a user action last reached this store.  An automatic WebDAV sync
+        # holds the store for its whole round trip, so it waits for quiet.
+        self._last_activity = time.monotonic()
         self._disk: dict[str, dict[str, Any]] = {}
         self._disk_identities: dict[str, str | None] = {}
         self._logs: dict[str, dict[str, Any]] = {
@@ -775,6 +854,7 @@ class CoreStore:
         from .domains.webdav import WebDAVSettingsDomain
         from .operations import CoreServiceController
         from .provider_auth import ProviderAuthManager
+        from ..workbuddy import WorkBuddyRuntime
 
         controller = CoreServiceController(runtime_root)
         provider_auth = ProviderAuthManager(runtime_root)
@@ -789,9 +869,21 @@ class CoreStore:
         resolved_runtime_root = (
             Path(runtime_root).expanduser() if runtime_root is not None else _default_runtime_root()
         )
+        # One worker per Core process serves both WorkBuddy variants; the
+        # service controller and the provider domain must share that instance
+        # so the proxy child receives the very base URLs it is serving.
+        workbuddy_runtime = WorkBuddyRuntime(resolved_runtime_root)
+        controller.attach_workbuddy(workbuddy_runtime)
         adapters: list[DomainAdapter] = []
         settings_factories: tuple[tuple[str, Callable[[], DomainAdapter]], ...] = (
-            ("providers_models", lambda: ProvidersModelsDomain(config_path, auth_manager=provider_auth)),
+            (
+                "providers_models",
+                lambda: ProvidersModelsDomain(
+                    config_path,
+                    auth_manager=provider_auth,
+                    workbuddy=workbuddy_runtime,
+                ),
+            ),
             (
                 "codex",
                 lambda: CodexSettingsDomain(
@@ -862,7 +954,12 @@ class CoreStore:
         )
         service_handlers = {operation: controller.dispatch for operation in operations}
         initial_service = controller.status()
-        store = cls(metadata_path=metadata_path, domains=adapters, service_handlers=service_handlers)
+        store = cls(
+            metadata_path=metadata_path,
+            domains=adapters,
+            service_handlers=service_handlers,
+            workbuddy_runtime=workbuddy_runtime,
+        )
         if isinstance(initial_service, Mapping):
             store._set_service_from_result(initial_service, increment=False)
         return store
@@ -870,6 +967,7 @@ class CoreStore:
     def shutdown(self) -> dict[str, Any]:
         """Stop only the proxy owned by this Core before the native host exits."""
 
+        self._stop_webdav_scheduler()
         with self._service_reload_guard:
             self._service_reload_stopping = True
             reload_thread = self._service_reload_thread
@@ -882,6 +980,7 @@ class CoreStore:
             handler = self._shutdown_handler
             if handler is None:
                 self._service = {"state": "stopped"}
+                self._stop_workbuddy_runtime()
                 return dict(self._service)
             try:
                 result = handler("stop")
@@ -891,7 +990,19 @@ class CoreStore:
                 raise CoreError("service_error", "LiteLLM service returned invalid status")
             self._set_service_from_result(result, increment=False)
             self._persist_metadata()
+            self._stop_workbuddy_runtime()
             return dict(self._service)
+
+    def _stop_workbuddy_runtime(self) -> None:
+        """Stop the Core-owned WorkBuddy worker; never fail Core shutdown."""
+
+        runtime = self._workbuddy_runtime
+        if runtime is None:
+            return
+        try:
+            runtime.stop()
+        except Exception:
+            pass
 
     def _load_metadata(self) -> None:
         assert self._metadata_store is not None
@@ -1340,8 +1451,10 @@ class CoreStore:
             raise
         except Exception as exc:
             raise CoreError("editor_unavailable", safe_exception_message(exc)) from None
-        if not isinstance(text, str) or len(text.encode("utf-8")) > 2 * 1024 * 1024:
+        if not isinstance(text, str):
             raise CoreError("editor_unavailable", "The requested editor is unavailable")
+        if len(text.encode("utf-8")) > MAX_EDITOR_DOCUMENT_BYTES:
+            raise CoreError("editor_too_large", "The editor document exceeds the size limit")
         return text
 
     def _trusted_editor_baseline_text_unlocked(self, domain: str, document: str) -> str:
@@ -1382,8 +1495,10 @@ class CoreStore:
                 text = json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
         except (TypeError, ValueError, UnicodeError):
             raise CoreError("editor_unavailable", "The requested editor is unavailable") from None
-        if not isinstance(text, str) or len(text.encode("utf-8")) > 2 * 1024 * 1024:
+        if not isinstance(text, str):
             raise CoreError("editor_unavailable", "The requested editor is unavailable")
+        if len(text.encode("utf-8")) > MAX_EDITOR_DOCUMENT_BYTES:
+            raise CoreError("editor_too_large", "The editor document exceeds the size limit")
         return text
 
     @staticmethod
@@ -1410,8 +1525,10 @@ class CoreStore:
     ) -> dict[str, Any]:
         """Stage one versioned code-editor document."""
 
-        if not isinstance(text, str) or len(text.encode("utf-8")) > 2 * 1024 * 1024:
+        if not isinstance(text, str):
             raise CoreError("invalid_editor", "The editor document is invalid")
+        if len(text.encode("utf-8")) > MAX_EDITOR_DOCUMENT_BYTES:
+            raise CoreError("editor_too_large", "The editor document exceeds the size limit")
         with self._lock:
             name, _adapter = self._editor_adapter(domain, document)
             # Global Core revisions also advance for unrelated operations such
@@ -2175,6 +2292,86 @@ class CoreStore:
                 "action_summary": dict(summary) if isinstance(summary, Mapping) else {},
             }
 
+    # -- WebDAV interval sync ---------------------------------------------
+    def quiet_seconds(self) -> float:
+        """Seconds since a user action last reached this store."""
+
+        return max(0.0, time.monotonic() - self._last_activity)
+
+    def webdav_auto_sync_state(self) -> dict[str, Any]:
+        """What the interval loop reads: the saved switch, interval, and stamp.
+
+        Only committed state counts here.  A half-typed URL in an open window
+        must not start background traffic, and the loop re-reads on every pass,
+        so nothing has to be pushed at it when the settings change.
+        """
+
+        from webdav import core as webdav_core
+
+        idle = {"enabled": False, "configured": False, "sync_interval_minutes": 0, "last_sync_at": None}
+        webdav = self._domains.get("webdav")
+        settings_path = getattr(webdav, "settings_path", None)
+        enabled_path = getattr(webdav, "enabled_path", None)
+        state_path = getattr(webdav, "state_path", None)
+        if not all(isinstance(value, (str, Path)) for value in (settings_path, enabled_path, state_path)):
+            return idle
+        try:
+            settings = webdav_core.load_settings(Path(settings_path).expanduser())
+            enabled = Path(enabled_path).expanduser().is_file()
+            state = webdav_core.load_sync_state(Path(state_path).expanduser())
+        except Exception:
+            return idle
+        last_sync_at = state.get("updated_at")
+        return {
+            "enabled": enabled,
+            "configured": settings.configured,
+            "sync_interval_minutes": settings.sync_interval_minutes,
+            "sync_direction": settings.sync_direction,
+            "last_sync_at": last_sync_at if isinstance(last_sync_at, str) else None,
+        }
+
+    def run_automatic_webdav_sync(self) -> None:
+        """Run one sync for the interval loop, in the saved direction.
+
+        This goes straight to the sync rather than through ``dispatch``: only
+        the Core decides to run it, so no IPC action can ask for the unattended
+        behaviour.
+        """
+
+        state = self.webdav_auto_sync_state()
+        direction = state.get("sync_direction")
+        # "smart" compares both sides; the IPC action for it is "sync".
+        operation = direction if direction in {"push", "pull"} else "sync"
+        self._dispatch_webdav_sync(
+            operation,
+            {"sections": ["providers_models", "relay_accounts"]},
+            None,
+            automatic=True,
+        )
+
+    def webdav_scheduler(self) -> Any:
+        """The interval loop, created once and owned by this store."""
+
+        if self._webdav_scheduler is None:
+            from .webdav_scheduler import WebDAVSyncScheduler
+
+            self._webdav_scheduler = WebDAVSyncScheduler(
+                snapshot=self.webdav_auto_sync_state,
+                sync=self.run_automatic_webdav_sync,
+                settle_seconds=self.quiet_seconds,
+            )
+        return self._webdav_scheduler
+
+    def _kick_webdav_scheduler(self) -> None:
+        scheduler = self._webdav_scheduler
+        if scheduler is not None:
+            scheduler.kick()
+
+    def _stop_webdav_scheduler(self) -> None:
+        scheduler = self._webdav_scheduler
+        if scheduler is not None:
+            scheduler.stop()
+
     @staticmethod
     def _webdav_sync_sections(payload: object) -> tuple[str, str]:
         data = _as_mapping(payload)
@@ -2202,8 +2399,18 @@ class CoreStore:
         operation: str,
         payload: object,
         expected_revision: object | None,
+        *,
+        automatic: bool = False,
     ) -> dict[str, Any]:
-        """Run one explicit legacy-bundle WebDAV operation transactionally."""
+        """Run one legacy-bundle WebDAV operation transactionally.
+
+        ``automatic`` marks the interval loop's own run.  A window's unsaved
+        draft stops a *reader's* sync, because that sync would race the edit
+        they are making; an unattended one must not be blocked by it, or the
+        interval would quietly do nothing whenever any pane held a draft.  It
+        syncs the files on disk and lets the pane's disk-changed prompt
+        reconcile whatever the reader had open.
+        """
 
         sections = self._webdav_sync_sections(payload)
         from webdav import core as webdav_core
@@ -2217,10 +2424,11 @@ class CoreStore:
             relay = self._domains.get("relay_accounts")
             if webdav is None or providers is None or relay is None:
                 raise CoreError("webdav_sync_failed", "WebDAV sync sources are unavailable")
-            if any(self._drafts.get(name, {}).get("dirty") for name in ("webdav", *sections)):
-                raise CoreError("webdav_sync_conflict", "Save or discard pending changes before WebDAV sync")
-            if any(self._disk.get(name, {}).get("changed") for name in ("webdav", *sections)):
-                raise CoreError("webdav_sync_conflict", "Reload changed local files before WebDAV sync")
+            if not automatic:
+                if any(self._drafts.get(name, {}).get("dirty") for name in ("webdav", *sections)):
+                    raise CoreError("webdav_sync_conflict", "Save or discard pending changes before WebDAV sync")
+                if any(self._disk.get(name, {}).get("changed") for name in ("webdav", *sections)):
+                    raise CoreError("webdav_sync_conflict", "Reload changed local files before WebDAV sync")
 
             settings_getter = getattr(webdav, "sync_settings", None)
             if not callable(settings_getter):
@@ -2270,8 +2478,19 @@ class CoreStore:
 
             pulled = False
             outcome = operation
+            action_summary: dict[str, Any] = {}
+            archived_remote: str | None = None
+            adopted_remote: dict[str, Any] | None = None
             try:
                 client = webdav_core.WebDAVClient(settings)
+                # A setting that still carried an earlier default name is read
+                # as the current one; move the file it pointed at so the
+                # collection keeps one live bundle under this app's name.
+                if settings.remote_name not in webdav_core.LEGACY_REMOTE_NAMES:
+                    try:
+                        adopted_remote = webdav_operations.adopt_renamed_remote_bundle(client, settings, webdav_core.LEGACY_REMOTE_NAMES)
+                    except Exception:
+                        adopted_remote = None
                 if operation == "push":
                     webdav_operations.push_bundle(client, settings, config_path, state_path, "push")
                 elif operation == "pull":
@@ -2279,7 +2498,20 @@ class CoreStore:
                     pulled = True
                 else:
                     local_manifest = webdav_core.build_manifest(config_path)
-                    remote_manifest = webdav_operations.read_remote_manifest(client, settings)
+                    try:
+                        remote_manifest = webdav_operations.read_remote_manifest(client, settings)
+                    except webdav_core.SyncError as exc:
+                        if exc.code != webdav_core.INCOMPATIBLE_BUNDLE_CODE:
+                            raise
+                        # Smart sync decides by comparing, and a bundle from
+                        # another app identity or archive version cannot be
+                        # compared.  Rather than asking the reader to switch to
+                        # 推送到远端, the sync keeps that file under a dated
+                        # sibling name and pushes this Mac's state over it: the
+                        # file the guard refuses to read is never lost, and the
+                        # user asked for a sync, not for a setting to change.
+                        archived_remote = webdav_operations.archive_remote_bundle(client, settings)
+                        remote_manifest = None
                     base_manifest = webdav_core.baseline_manifest(state_path)
                     if remote_manifest is None:
                         webdav_operations.push_bundle(client, settings, config_path, state_path, "sync-push")
@@ -2288,7 +2520,7 @@ class CoreStore:
                         webdav_core.save_sync_state(state_path, settings, local_manifest, "sync")
                         outcome = "unchanged"
                     elif base_manifest is None:
-                        raise webdav_core.SyncError("WebDAV sync conflict")
+                        raise webdav_core.SyncError("WebDAV sync conflict", "webdav_sync_conflict")
                     else:
                         local_changed = not webdav_core.manifests_match(local_manifest, base_manifest)
                         remote_changed = not webdav_core.manifests_match(remote_manifest, base_manifest)
@@ -2300,7 +2532,7 @@ class CoreStore:
                             pulled = True
                             outcome = "pull"
                         elif local_changed and remote_changed:
-                            raise webdav_core.SyncError("WebDAV sync conflict")
+                            raise webdav_core.SyncError("WebDAV sync conflict", "webdav_sync_conflict")
                         else:
                             webdav_core.save_sync_state(state_path, settings, local_manifest, "sync")
                             outcome = "unchanged"
@@ -2328,6 +2560,20 @@ class CoreStore:
                     "outcome": outcome,
                     "sections": list(sections),
                 }
+                if adopted_remote is not None:
+                    # A setting renamed from an earlier default moved its file;
+                    # the pane states it when the server would not let the old
+                    # one go.
+                    action_summary["adopted_remote"] = adopted_remote
+                if archived_remote is not None:
+                    # What the pane states after the sync: this Mac's state
+                    # replaced a remote file that is still on the server under
+                    # the name below.
+                    action_summary = {
+                        "outcome": outcome,
+                        "archived_remote": archived_remote,
+                        "sections": list(sections),
+                    }
                 self._revision += 1
                 self._persist_metadata()
                 status_handler = self._service_handlers.get("status")
@@ -2357,13 +2603,24 @@ class CoreStore:
                     webdav_core.save_sync_status(status_path, operation, False)
                 except Exception:
                     pass
+                # A sync error names its own cause (an incompatible remote
+                # bundle, a conflict); anything else is a plain failure.  The
+                # cause keeps its name even when the rollback itself failed:
+                # the pane has to state why the sync stopped, and "the rollback
+                # failed too" is not something the reader can act on.
+                cause_code = exc.code if isinstance(exc, webdav_core.SyncError) else "webdav_sync_failed"
                 if rollback_failed:
-                    raise CoreError("webdav_sync_failed", "WebDAV sync could not roll back local files") from None
+                    raise CoreError(cause_code, "WebDAV sync could not roll back local files") from None
                 if isinstance(exc, CoreError):
                     raise
-                raise CoreError("webdav_sync_failed", "WebDAV sync failed") from None
+                if isinstance(exc, webdav_core.SyncError):
+                    raise CoreError(exc.code, str(exc)) from None
+                raise CoreError(cause_code, "WebDAV sync failed") from None
             self._emit()
-            return {"revision": self._revision}
+            result: dict[str, Any] = {"revision": self._revision}
+            if action_summary:
+                result["action_summary"] = action_summary
+            return result
 
     def dispatch(
         self,
@@ -2375,6 +2632,7 @@ class CoreStore:
         if not isinstance(action, Mapping):
             raise CoreError("invalid_action", "A Core action is required")
         data = dict(action)
+        self._last_activity = time.monotonic()
         if not _trusted_native_capability:
             self.reject_plaintext_secret_action(data)
         action_type = data.get("type", data.get("action"))
@@ -2382,6 +2640,10 @@ class CoreStore:
             raise CoreError("invalid_action", "A Core action is required")
         domain_value = data.get("domain")
         normalized_action = action_type.replace("-", "_").replace(".", "_").lower()
+        if domain_value is not None and _canonical_domain(domain_value) == "webdav":
+            # The switch, the interval, and the direction all reshape the
+            # interval loop, so let it re-read instead of waiting out its sleep.
+            self._kick_webdav_scheduler()
         if (
             domain_value is not None
             and _canonical_domain(domain_value) == "codex"
@@ -3171,13 +3433,17 @@ class CoreStore:
                     # material is injected and before any local write.
                     preflight = getattr(adapters[name], "validate_relay_preflight", None)
                     if not callable(preflight) or preflight().get("valid") is not True:
-                        raise CoreError("validation_failed", "Fix the provider/model issues")
+                        raise CoreError("provider_model_invalid", "Fix the provider/model issues")
                     continue
                 if not self.validate(name)["valid"]:
-                    raise CoreError("validation_failed", "Fix the validation errors")
+                    raise CoreError("relay_preflight_failed", "Fix the validation errors")
             prepared = prepare()
             if not isinstance(prepared, Mapping) or prepared.get("ready") is not True:
-                raise CoreError("validation_failed", "Fix the relay connection or binding issues")
+                # The relay is what is not ready here: pending operations, a
+                # session that needs a sign-in, or a target that moved.  Say so
+                # with its own code instead of reporting the user's edit as a
+                # generic validation failure.
+                raise CoreError("relay_not_ready", "Fix the relay connection or binding issues")
             operations = prepared.get("operations", ())
             if isinstance(operations, Sequence) and not isinstance(operations, (str, bytes, bytearray)):
                 operation_total = len(operations)
@@ -3204,9 +3470,11 @@ class CoreStore:
             reconciled = reconcile(prepared, phase="non_destructive")
             # Transport failures are provisional until the immediate factual
             # refresh. A lost response may still have applied remotely; only
-            # unresolved reconciliation issues stop the coordinated Apply.
+            # unresolved reconciliation issues stop the coordinated Apply — and
+            # that is the relay's own outstanding work, which the relay message
+            # names, never the edit the user just made.
             if self._relay_public_issue_count(reconciled):
-                raise RuntimeError("relay_reconciliation_failed")
+                raise CoreError("relay_not_ready", "Fix the relay connection or binding issues")
 
             providers = adapters.get("providers_models")
             if providers is not None:
@@ -3229,10 +3497,24 @@ class CoreStore:
                     # after Apply; private material remains inside Core.
                     materials = binding_materials({"resources": sources}, refresh=True)
                     materialized = materialize(materials)
+                    # Whatever this resolution said becomes the pane's own map
+                    # of the linked rows: a successful one clears it, a failed
+                    # one marks the key or route that refused the write.
+                    recorder = getattr(providers, "record_binding_issues", None)
+                    if callable(recorder):
+                        recorder(materialized.get("issues") if isinstance(materialized, Mapping) else ())
                     if self._relay_public_issue_count(materialized):
-                        raise RuntimeError("relay_binding_materialization_failed")
+                        # A linked key that the relay could not resolve — a moved
+                        # or disabled resource, a base-URL conflict, an upstream
+                        # model the group does not serve — refused the write, so
+                        # the strip names that cause instead of a bare rollback:
+                        # the internal step name stays out of the pane.
+                        raise CoreError(
+                            "relay_binding_failed",
+                            "A linked relay binding could not be resolved",
+                        )
                 if not self.validate("providers_models")["valid"]:
-                    raise CoreError("validation_failed", "Fix the linked model issues")
+                    raise CoreError("provider_model_invalid", "Fix the linked model issues")
                 providers.apply()
                 provider_locally_applied = True
                 self._mark_relay_coordinated_applied("providers_models")
@@ -3421,7 +3703,20 @@ class CoreStore:
                         linked_provider_key_count = count
             if relay_coordinator_available and linked_provider_key_count:
                 if "providers_models" in names and "relay_accounts" not in names:
-                    names.append("relay_accounts")
+                    # Only a draft that actually binds relay material has relay
+                    # work to do.  A plain local edit — a new model on an
+                    # independent provider, a rename, an order — applies on its
+                    # own: dragging it into the relay transaction would report
+                    # the relay's own backlog (a pending key create, an expired
+                    # session) as a failure of an edit that has nothing to do
+                    # with the relay.
+                    baseline = self._baselines.get("providers_models")
+                    if baseline is None or _relay_binding_projection(
+                        self._adapter_draft_state("providers_models")
+                    ) != _relay_binding_projection(baseline):
+                        names.append("relay_accounts")
+                    else:
+                        relay_coordinator_available = False
                 elif "relay_accounts" in names and "providers_models" not in names:
                     names.append("providers_models")
             adapters: dict[str, DomainAdapter] = {}

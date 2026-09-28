@@ -7,7 +7,7 @@
  * Keeping the decision inside the upstream module means a new TraceOne
  * revision only has to be re-staged by scripts/update_traceone.py.
  */
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
@@ -36,12 +36,33 @@ function readRequest(raw) {
   return request;
 }
 
+/**
+ * Load the three classifier artifacts by the role their file name declares.
+ *
+ * The names carry the classifier revision (`unified_bank_v2_16.json`,
+ * `codex_low_v7_adapter_791.json`), so pinning them here would break on every
+ * upstream revision the engine itself handles.  A role that is missing or
+ * ambiguous is an error: the caller must not silently classify with the wrong
+ * document.
+ */
 async function readArtifacts(directory) {
-  const data = (name) => readFile(path.join(directory, "data", name), "utf8");
+  const dataDirectory = path.join(directory, "data");
+  const names = (await readdir(dataDirectory)).filter((name) => name.endsWith(".json"));
+  const role = (pattern) => {
+    const matches = names.filter((name) => pattern.test(name));
+    if (matches.length !== 1) {
+      throw new Error(`expected exactly one ${pattern} artifact, found ${matches.length}`);
+    }
+    return matches[0];
+  };
+  const bankName = role(/unified_bank[^/]*\.json$/);
+  const adapterName = role(/_adapter_[^/]*\.json$/);
+  const supportName = role(/_support_[^/]*\.json$/);
+  const read = (name) => readFile(path.join(dataDirectory, name), "utf8");
   const [bank, adapter, support] = await Promise.all([
-    data("unified_bank.json"),
-    data("codex_low_v4_adapter_415.json"),
-    data("codex_low_v4_support_415.json"),
+    read(bankName),
+    read(adapterName),
+    read(supportName),
   ]);
   return { bank: JSON.parse(bank), adapter: JSON.parse(adapter), support: JSON.parse(support) };
 }

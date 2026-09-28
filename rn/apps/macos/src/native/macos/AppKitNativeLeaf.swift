@@ -7,6 +7,33 @@ import WebKit
 private let nativeUIFontSize: CGFloat = 13
 // Monospaced glyphs have a larger optical body than the surrounding system
 // labels at the same point size. Keep read-only code text visually aligned.
+/// The one heading step inside a native window — the window's own title and the
+/// section headings under it — and the same step the shared UI draws its window
+/// titles with (`windowTitle`: `UI_FONT_SIZE`, weight 600), so a window reads the
+/// same whether its heading comes from React or from the native leaf.
+private let nativeHeadingFont = NSFont.systemFont(ofSize: nativeUIFontSize, weight: .semibold)
+/// The one inset every native child window keeps from its own edges — its
+/// heading, its body, and its footer — matching the inset the shared UI gives a
+/// route window (`windowContent`: 16), so a child surface reads the same
+/// whichever side draws it.
+private let nativePanelInset: CGFloat = 16
+/// The one decision surface for the whole app, drawn the way a macOS alert is
+/// drawn rather than like one of the app's own document windows: a borderless
+/// rounded panel that is dragged by its background, no title bar, the question
+/// in bold over its detail, and equal-width answers across the bottom.  The
+/// numbers are the ones `NSAlert` itself uses — a 220 pt text column (260 pt
+/// window) growing to 380 pt (420 pt) for a longer line, 20 pt insets, a 28 pt
+/// answer with an 8 pt gap, an 11 pt gap between the question, the detail, and
+/// the answers, and the alert's own corner radius.
+private let nativeDecisionTextWidth: CGFloat = 220
+private let nativeDecisionMaxTextWidth: CGFloat = 380
+private let nativeDecisionPanelInset: CGFloat = 20
+private let nativeDecisionCornerRadius: CGFloat = 11
+private let nativeDecisionGap: CGFloat = 11
+private let nativeDecisionAnswerHeight: CGFloat = 28
+private let nativeDecisionAnswerGap: CGFloat = 8
+private let nativeDecisionMaxQuestionHeight: CGFloat = 44
+private let nativeDecisionMaxMessageHeight: CGFloat = 240
 
 private func withoutAnimations(_ changes: () -> Void) {
     NSAnimationContext.runAnimationGroup { context in
@@ -127,8 +154,13 @@ private enum NativeRelayOriginPolicy {
     private var statusMenu: NSMenu?
     private var statusMenuVisible = false
     private var approvedCloseRoutes: Set<String> = []
-    private var codexRestartConfirmationPanel: NSPanel?
-    private var codexRestartConfirmationCompletion: ((String) -> Void)?
+    /// Every decision panel on screen, keyed by its window: the answer Escape
+    /// and the title-bar close button carry, the answers it offers, and the
+    /// completion it settles exactly once. See ``presentDecisionPanel(_:)``.
+    private var decisionPanels: [ObjectIdentifier: DecisionPanelState] = [:]
+    /// The catalog restart question, so a second request settles the one on
+    /// screen instead of stacking two identical panels over the app.
+    private var codexRestartPanel: NSPanel?
     private var childPanels: [ChildPanel] = []
     /// The model chooser on screen: its window, the controller that answers its
     /// controls, and the completion the pending JS promise waits on. AppKit
@@ -141,6 +173,13 @@ private enum NativeRelayOriginPolicy {
     private var groupManagerPanel: NSPanel?
     private var groupManagerCompletionBlock: ((NativeGroupManagerResult?) -> Void)?
     private var groupManagerController: NativeGroupManagerController?
+    /// The 保存并关闭 a caller has not answered yet, and the caller waiting for
+    /// the next one.  The sheet stays up (and keeps the window it was opened
+    /// from locked) while the caller writes and applies its staged edits, and
+    /// states the outcome in its own status strip, so a child surface reports
+    /// the work it started.
+    private var groupManagerPendingApply: NativeGroupManagerResult?
+    private var groupManagerApplyWaiter: ((NativeGroupManagerResult?) -> Void)?
     private var activeReadOnlyCodeController: NativeReadOnlyCodeController?
     // Official device-code browser flow. The controller is deliberately
     // separate from relay login: it never installs script message handlers or
@@ -476,19 +515,22 @@ private enum NativeRelayOriginPolicy {
         }
         // 分组管理 discards its draft on Close, so the title-bar close button
         // asks the same question the footer's Close does before it goes away.
+        // The window stays up until that answer lands (false), and the answer
+        // closes it through ``closeGroupManager(applied:)``.
         if let panel = groupManagerPanel, sender === panel {
-            return groupManagerController?.confirmDiscardIfNeeded() ?? true
+            guard let controller = groupManagerController, controller.hasStagedChanges else { return true }
+            closeGroupManager(applied: false)
+            return false
         }
         return true
     }
 
     public func windowWillClose(_ notification: Notification) {
         guard let window = notification.object as? NSWindow else { return }
-        if let panel = codexRestartConfirmationPanel, window === panel {
-            codexRestartConfirmationPanel = nil
-            let completion = codexRestartConfirmationCompletion
-            codexRestartConfirmationCompletion = nil
-            completion?("later")
+        // A decision panel closed by its own title-bar button answers like
+        // Escape: the question is settled, never abandoned.
+        if let state = decisionPanels[ObjectIdentifier(window)] {
+            finishDecisionPanel(window, answer: state.cancelAnswerID)
             return
         }
         // The group manager's own title-bar close button is one dismissal path
@@ -517,6 +559,22 @@ private enum NativeRelayOriginPolicy {
     private struct ChildPanel {
         let window: NSWindow
         let parent: NSWindow?
+    }
+
+    /// One decision panel on screen: the answer Escape and the title-bar close
+    /// button carry, and the completion the caller waits on.
+    private struct DecisionPanelState {
+        let panel: NSPanel
+        let cancelAnswerID: String
+        let completion: (String) -> Void
+    }
+
+    /// One built decision panel: its window, its answer buttons, and the answer
+    /// Escape and the title-bar close button carry.
+    private struct BuiltDecisionPanel {
+        let panel: NativeDecisionPanel
+        let buttons: [NativeDecisionAnswerButton]
+        let cancelAnswerID: String
     }
 
     /// One open model chooser, owned by the host for as long as its window is
@@ -570,6 +628,15 @@ private enum NativeRelayOriginPolicy {
     /// path — the title-bar close button, an in-surface Close or Apply, and a
     /// resolved completion — comes through here.
     func endChildPanel(_ panel: NSWindow) {
+        // A question that leaves the screen without an answer — its parent is
+        // going away, or AppKit closed it — answers as cancelled, so a decision
+        // panel never leaves its caller waiting.  Its own completion re-enters
+        // this method with the entry already taken, so the window still leaves
+        // the screen and the lock over its parent is still released.
+        if let state = decisionPanels[ObjectIdentifier(panel)] {
+            finishDecisionPanel(panel, answer: state.cancelAnswerID)
+            return
+        }
         for descendant in childPanels.filter({ $0.parent === panel }).map({ $0.window }) {
             endChildPanel(descendant)
         }
@@ -691,19 +758,389 @@ private enum NativeRelayOriginPolicy {
         }
     }
 
-    func confirm(title: String, message: String, confirmTitle: String) -> Bool {
-        let alert = NSAlert()
-        configureImmediatePresentation(alert.window)
-        alert.messageText = title
-        alert.informativeText = message
-        alert.addButton(withTitle: confirmTitle)
-        alert.addButton(withTitle: localized("cancel", fallback: "Cancel"))
-        return alert.runModal() == .alertFirstButtonReturn
+    // MARK: - Decision panels
+
+    /// One question the app puts to the user: 删除供应商, 放弃更改, the catalog
+    /// restart notice, the version acknowledgement, one secret field.  Every
+    /// question this app asks is this panel, so one question is drawn and
+    /// answered the same way as every other one.
+    ///
+    /// It presents itself the way this app presents every subordinate surface —
+    /// its own movable titled window over the window that asked, that window
+    /// locked until the answer lands, the React host still running — and never
+    /// through a modal session; see ``presentChildPanel(_:in:prepare:)`` for why
+    /// `NSApp.runModal` is refused.  A question a background event asks
+    /// (`locksParent` false: the catalog restart) stays a floating window
+    /// instead, because the user is not answering for a window they were using.
+    ///
+    /// The answer reaches `completion` exactly once, as the answer's `id`.  A
+    /// chosen answer, Escape, the title-bar close button, and a parent that goes
+    /// away all settle the same entry, so no caller is left waiting.
+    @discardableResult
+    func presentDecisionPanel(
+        _ title: String,
+        message: String,
+        answers: [NativeDecisionAnswer],
+        in parent: NSWindow? = nil,
+        locksParent: Bool = true,
+        accessory: NSView? = nil,
+        accessoryHeight: CGFloat = 0,
+        prepare: (() -> Void)? = nil,
+        completion: @escaping (String) -> Void
+    ) -> NSPanel? {
+        guard let built = makeDecisionPanel(
+            title: title,
+            message: message,
+            answers: answers,
+            accessory: accessory,
+            accessoryHeight: accessoryHeight
+        ) else {
+            // A question this app cannot draw is answered as cancelled: the
+            // caller hears one answer, never silence.
+            completion(answers.first(where: { $0.isCancel })?.id ?? "")
+            return nil
+        }
+        presentBuiltDecisionPanel(built, in: parent, locksParent: locksParent, prepare: prepare, completion: completion)
+        return built.panel
     }
 
-    /// Presents the catalog restart decision in its own floating panel. This
-    /// deliberately does not use an alert sheet or modal run loop, so the
-    /// app's settings windows remain interactive while the choice is visible.
+    /// Builds one decision panel: the question as its window title, the detail in
+    /// its body, an optional accessory under the detail, and one button per answer
+    /// on the trailing edge with the caller's last answer (the primary) outermost,
+    /// which is where a macOS alert draws it too.  Every question this app asks is
+    /// built here, so a prompt that carries its own control (the secret field)
+    /// still draws the one panel shape.  Nil when the question is not drawable.
+    private func makeDecisionPanel(
+        title: String,
+        message: String,
+        answers: [NativeDecisionAnswer],
+        accessory: NSView? = nil,
+        accessoryHeight: CGFloat = 0
+    ) -> BuiltDecisionPanel? {
+        guard let cancelAnswer = answers.first(where: { $0.isCancel }),
+              !title.isEmpty,
+              !answers.isEmpty,
+              answers.count <= 3,
+              answers.allSatisfy({ !$0.title.isEmpty && $0.title.utf8.count <= 160 }),
+              title.utf8.count <= 160,
+              message.utf8.count <= 4_096
+        else { return nil }
+
+        let inset = nativeDecisionPanelInset
+        let questionFont = nativeHeadingFont
+        let messageFont = NSFont.systemFont(ofSize: nativeUIFontSize, weight: .regular)
+        // One text column for the question, the detail, and the answers: as wide
+        // as the longest line they have to draw, between the alert's own minimum
+        // and maximum, and wide enough for answers at the alert's own 68 pt
+        // floor.
+        let answerFloor = nativeDecisionAnswerGap * CGFloat(answers.count - 1) + 68 * CGFloat(answers.count)
+        let textWidth = min(
+            nativeDecisionMaxTextWidth,
+            max(
+                nativeDecisionTextWidth,
+                answerFloor,
+                Self.decisionLineWidth(title, font: questionFont),
+                Self.decisionLineWidth(message, font: messageFont)
+            )
+        )
+        let questionHeight = Self.decisionTextHeight(
+            title,
+            font: questionFont,
+            width: textWidth,
+            limit: nativeDecisionMaxQuestionHeight
+        )
+        let messageHeight = message.isEmpty ? 0 : Self.decisionTextHeight(
+            message,
+            font: messageFont,
+            width: textWidth,
+            limit: nativeDecisionMaxMessageHeight
+        )
+
+        let panel = NativeDecisionPanel(
+            contentRect: NSRect(x: 0, y: 0, width: textWidth + inset * 2, height: 200),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        configureImmediatePresentation(panel)
+        // The alert shape: no title bar, one rounded panel, moved by dragging its
+        // own background.  The question stays the window's title for the window
+        // that asked (its lock announces the question) and for a screen reader,
+        // even though a borderless panel never draws it.
+        panel.title = title
+        panel.isReleasedWhenClosed = false
+        panel.isFloatingPanel = true
+        panel.hidesOnDeactivate = false
+        panel.isMovableByWindowBackground = true
+        panel.hasShadow = true
+        panel.backgroundColor = .clear
+        panel.isOpaque = false
+        panel.delegate = self
+        panel.onEscape = { [weak self, weak panel] in
+            guard let panel else { return }
+            self?.finishDecisionPanel(panel, answer: cancelAnswer.id)
+        }
+
+        let content = NSView()
+        content.wantsLayer = true
+        content.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        content.layer?.cornerRadius = nativeDecisionCornerRadius
+        content.layer?.masksToBounds = true
+        panel.contentView = content
+
+        let questionLabel = NSTextField(wrappingLabelWithString: title)
+        questionLabel.font = questionFont
+        questionLabel.textColor = .labelColor
+        questionLabel.maximumNumberOfLines = 0
+        let messageLabel = NSTextField(wrappingLabelWithString: message)
+        messageLabel.font = messageFont
+        messageLabel.textColor = .labelColor
+        messageLabel.maximumNumberOfLines = 0
+
+        var buttons: [NativeDecisionAnswerButton] = []
+        for answer in answers {
+            let button = NativeDecisionAnswerButton(
+                title: answer.title,
+                target: self,
+                action: #selector(selectDecisionAnswer(_:))
+            )
+            button.bezelStyle = .rounded
+            button.font = NSFont.systemFont(ofSize: nativeUIFontSize)
+            // The answer's id travels on its own control, so one action serves
+            // every answer of every panel.
+            button.answerID = answer.id
+            if answer.isDefault {
+                button.keyEquivalent = "\r"
+                button.keyEquivalentModifierMask = []
+            } else if answer.isCancel {
+                // Escape answers the cancel answer through its key equivalent as
+                // well as through the panel, so a field that consumes Escape (a
+                // secret field's editor) cannot swallow the question's way out.
+                button.keyEquivalent = "\u{1b}"
+            }
+            // A destructive answer draws the way an alert draws its own: the
+            // ordinary bezel under the system's red ink.  `hasDestructiveAction`
+            // and `bezelColor` only recolour a button AppKit owns (an alert's),
+            // so the ink is set here — and a destructive answer that carries
+            // Return stops drawing the default button's accent fill, which would
+            // paint the delete blue.
+            if answer.isDestructive {
+                button.hasDestructiveAction = true
+                button.drawsNeutralWhileDefault = answer.isDefault
+                button.attributedTitle = NSAttributedString(
+                    string: answer.title,
+                    attributes: [
+                        .font: NSFont.systemFont(ofSize: nativeUIFontSize),
+                        .foregroundColor: NSColor.systemRed
+                    ]
+                )
+            }
+            buttons.append(button)
+        }
+
+        ([questionLabel, messageLabel] + (accessory.map { [$0] } ?? []) + buttons).forEach {
+            $0.translatesAutoresizingMaskIntoConstraints = false
+            content.addSubview($0)
+        }
+        var constraints: [NSLayoutConstraint] = [
+            questionLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: inset),
+            questionLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -inset),
+            questionLabel.topAnchor.constraint(equalTo: content.topAnchor, constant: inset),
+            questionLabel.heightAnchor.constraint(equalToConstant: questionHeight),
+            messageLabel.leadingAnchor.constraint(equalTo: questionLabel.leadingAnchor),
+            messageLabel.trailingAnchor.constraint(equalTo: questionLabel.trailingAnchor),
+            messageLabel.topAnchor.constraint(equalTo: questionLabel.bottomAnchor, constant: messageHeight > 0 ? nativeDecisionGap : 0),
+            messageLabel.heightAnchor.constraint(equalToConstant: messageHeight),
+        ]
+        // An accessory (the secret field) spans the text column under the detail.
+        var aboveAnswers = messageLabel.bottomAnchor
+        if let accessory {
+            constraints.append(accessory.leadingAnchor.constraint(equalTo: questionLabel.leadingAnchor))
+            constraints.append(accessory.trailingAnchor.constraint(equalTo: questionLabel.trailingAnchor))
+            constraints.append(accessory.topAnchor.constraint(equalTo: messageLabel.bottomAnchor, constant: nativeDecisionGap))
+            constraints.append(accessory.heightAnchor.constraint(equalToConstant: max(24, accessoryHeight)))
+            aboveAnswers = accessory.bottomAnchor
+        }
+        // The answers sit across the bottom as one row of equal width, exactly as
+        // an alert draws two or three of them: the first answer starts at the
+        // text column's leading edge, the last ends at its trailing edge, and
+        // every answer takes the same share of the width between them.
+        if let first = buttons.first, let last = buttons.last {
+            constraints.append(first.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: inset))
+            constraints.append(last.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -inset))
+            constraints.append(first.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -inset))
+            constraints.append(first.heightAnchor.constraint(equalToConstant: nativeDecisionAnswerHeight))
+            var placedButton: NSButton?
+            for button in buttons {
+                constraints.append(button.widthAnchor.constraint(equalTo: first.widthAnchor))
+                constraints.append(button.centerYAnchor.constraint(equalTo: first.centerYAnchor))
+                constraints.append(button.topAnchor.constraint(greaterThanOrEqualTo: aboveAnswers, constant: nativeDecisionGap))
+                if let placedButton {
+                    constraints.append(button.leadingAnchor.constraint(equalTo: placedButton.trailingAnchor, constant: nativeDecisionAnswerGap))
+                }
+                placedButton = button
+            }
+        }
+        NSLayoutConstraint.activate(constraints)
+        content.layoutSubtreeIfNeeded()
+        panel.setContentSize(NSSize(
+            width: textWidth + inset * 2,
+            height: max(inset * 2 + nativeDecisionAnswerHeight, content.fittingSize.height)
+        ))
+        return BuiltDecisionPanel(panel: panel, buttons: buttons, cancelAnswerID: cancelAnswer.id)
+    }
+
+    /// The width of the longest line of `text` drawn unwrapped, so a panel only
+    /// grows past the alert's own minimum width for a line that needs it.
+    private static func decisionLineWidth(_ text: String, font: NSFont) -> CGFloat {
+        text.split(separator: "\n", omittingEmptySubsequences: false)
+            .map { ceil(($0 as NSString).size(withAttributes: [.font: font]).width) }
+            .max() ?? 0
+    }
+
+    /// Presents a built decision panel and settles it exactly once, whichever way
+    /// it ends.  ``prepare`` runs once the panel is key, so a question that
+    /// carries a field can put the caret in it.
+    private func presentBuiltDecisionPanel(
+        _ built: BuiltDecisionPanel,
+        in parent: NSWindow?,
+        locksParent: Bool,
+        prepare: (() -> Void)?,
+        completion: @escaping (String) -> Void
+    ) {
+        let panel = built.panel
+        decisionPanels[ObjectIdentifier(panel)] = DecisionPanelState(
+            panel: panel,
+            cancelAnswerID: built.cancelAnswerID,
+            completion: completion
+        )
+        let anchor = locksParent ? (parent ?? activeWindow()) : nil
+        Self.positionDecisionPanel(panel, over: anchor)
+        if let anchor {
+            presentChildPanel(panel, in: anchor, prepare: prepare)
+        } else {
+            panel.isFloatingPanel = true
+            panel.hidesOnDeactivate = false
+            NSApp.activate(ignoringOtherApps: true)
+            withoutAnimations { panel.makeKeyAndOrderFront(nil) }
+            prepare?()
+        }
+    }
+
+    /// Puts a decision panel where a question belongs: centred on the window that
+    /// asked it, or on the screen when a background event asks.  `NSWindow.center()`
+    /// alone is not enough — a borderless panel added as a child of a window that
+    /// is not full screen lands wherever the screen's own centre is relative to
+    /// that window, which put a confirmation at the top edge of a maximised
+    /// workspace window.  The panel is kept inside the anchor's screen so a
+    /// question about a window at the display's edge stays readable.
+    private static func positionDecisionPanel(_ panel: NSWindow, over anchor: NSWindow?) {
+        guard let screen = anchor?.screen ?? panel.screen ?? NSScreen.main else {
+            panel.center()
+            return
+        }
+        let visible = screen.visibleFrame
+        let frame = anchor?.frame
+        let size = panel.frame.size
+        var origin = NSPoint(
+            x: (frame?.midX ?? visible.midX) - size.width / 2,
+            y: (frame?.midY ?? visible.midY) - size.height / 2
+        )
+        origin.x = min(max(origin.x, visible.minX + 8), max(visible.minX + 8, visible.maxX - size.width - 8))
+        origin.y = min(max(origin.y, visible.minY + 8), max(visible.minY + 8, visible.maxY - size.height - 8))
+        withoutAnimations { panel.setFrameOrigin(origin) }
+    }
+
+    /// The app's own prompt for one secret: a decision panel with a secure field
+    /// in it, so reading or replacing a key is the same surface as answering any
+    /// other question — and the React host keeps running while the field is up,
+    /// which the alert's modal loop did not allow (see the child-surface modal
+    /// freeze incident).  The typed value never leaves this call: "set" carries
+    /// it, "clear" carries an empty one, and every other way out answers nil.
+    func presentSecretPrompt(
+        title: String,
+        clearLabel: String?,
+        in parent: NSWindow? = nil,
+        completion: @escaping (_ answer: String?, _ value: String) -> Void
+    ) {
+        let input = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        input.maximumNumberOfLines = 1
+        input.font = NSFont.systemFont(ofSize: nativeUIFontSize)
+        var answers: [NativeDecisionAnswer] = [
+            NativeDecisionAnswer(id: "cancel", title: localized("cancel", fallback: "Cancel"), isCancel: true)
+        ]
+        if let clearLabel, !clearLabel.isEmpty {
+            answers.append(NativeDecisionAnswer(id: "clear", title: clearLabel))
+        }
+        answers.append(NativeDecisionAnswer(id: "set", title: localized("set", fallback: "Set"), isDefault: true))
+        guard let built = makeDecisionPanel(
+            title: title,
+            message: "",
+            answers: answers,
+            accessory: input,
+            accessoryHeight: input.fittingSize.height
+        ) else {
+            completion(nil, "")
+            return
+        }
+        // 设置 stays disabled until the field carries something, so an empty
+        // answer can never be staged.
+        let setButton = built.buttons.first(where: { $0.answerID == "set" })
+        setButton?.isEnabled = false
+        let observer = NotificationCenter.default.addObserver(
+            forName: NSControl.textDidChangeNotification,
+            object: input,
+            queue: .main
+        ) { _ in
+            setButton?.isEnabled = !input.stringValue.isEmpty
+        }
+        presentBuiltDecisionPanel(built, in: parent, locksParent: true, prepare: { [weak input] in
+            guard let input else { return }
+            input.window?.makeFirstResponder(input)
+        }) { answer in
+            NotificationCenter.default.removeObserver(observer)
+            // The typed secret is read once and cleared in the same turn, so it
+            // survives only in the staging call that asked for it.
+            let value = input.stringValue
+            input.stringValue = ""
+            let accepted = answer == "set" || answer == "clear"
+            completion(accepted ? answer : nil, answer == "set" ? value : "")
+        }
+    }
+
+    /// The height a decision panel's own text needs at the panel's width, so the
+    /// window is as tall as its question and no taller.  A message longer than
+    /// the limit clips rather than growing a window past the display.
+    private static func decisionTextHeight(_ text: String, font: NSFont, width: CGFloat, limit: CGFloat) -> CGFloat {
+        let measured = (text as NSString).boundingRect(
+            with: NSSize(width: width, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: [.font: font]
+        ).height
+        return min(limit, ceil(measured))
+    }
+
+    @objc private func selectDecisionAnswer(_ sender: NSButton) {
+        guard let panel = sender.window,
+              let answer = (sender as? NativeDecisionAnswerButton)?.answerID,
+              !answer.isEmpty else { return }
+        finishDecisionPanel(panel, answer: answer)
+    }
+
+    /// Settle a decision panel exactly once: the answer reaches its completion,
+    /// the window leaves the screen, and the lock it held over the window that
+    /// asked is released.  A chosen answer, Escape, the title-bar close button,
+    /// and the window that asked going away all come through here.
+    private func finishDecisionPanel(_ panel: NSWindow, answer: String) {
+        guard let state = decisionPanels.removeValue(forKey: ObjectIdentifier(panel)) else { return }
+        if codexRestartPanel === panel { codexRestartPanel = nil }
+        endChildPanel(panel)
+        state.completion(answer)
+    }
+
+    /// The catalog restart question: the same decision panel, asked by Core
+    /// rather than by something the user just did, so it floats over the app
+    /// without locking the window the user is working in.
     func showCodexRestartConfirmation(
         title: String,
         message: String,
@@ -711,84 +1148,21 @@ private enum NativeRelayOriginPolicy {
         laterLabel: String,
         completion: @escaping (String) -> Void
     ) {
-        guard !title.isEmpty,
-              !message.isEmpty,
-              !restartLabel.isEmpty,
-              !laterLabel.isEmpty,
-              title.utf8.count <= 320,
-              message.utf8.count <= 2_048,
-              restartLabel.utf8.count <= 160,
-              laterLabel.utf8.count <= 160
-        else {
-            completion("later")
-            return
+        // One question at a time: a second request answers the panel on screen
+        // with "later" instead of stacking two identical windows over the app.
+        if let previous = codexRestartPanel, decisionPanels[ObjectIdentifier(previous)] != nil {
+            finishDecisionPanel(previous, answer: "later")
         }
-        finishCodexRestartConfirmation(choice: "later")
-
-        let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 480, height: 194),
-            styleMask: [.titled, .closable, .utilityWindow],
-            backing: .buffered,
-            defer: false
+        codexRestartPanel = presentDecisionPanel(
+            title,
+            message: message,
+            answers: [
+                NativeDecisionAnswer(id: "later", title: laterLabel, isCancel: true),
+                NativeDecisionAnswer(id: "restart", title: restartLabel, isDefault: true),
+            ],
+            locksParent: false,
+            completion: completion
         )
-        configureImmediatePresentation(panel)
-        panel.title = localized("appTitle", fallback: "Young Router")
-        panel.isFloatingPanel = true
-        panel.hidesOnDeactivate = false
-        panel.isReleasedWhenClosed = false
-        panel.delegate = self
-        panel.minSize = NSSize(width: 420, height: 176)
-        panel.maxSize = NSSize(width: 640, height: 280)
-
-        let content = NSView()
-        panel.contentView = content
-        let titleLabel = NSTextField(wrappingLabelWithString: title)
-        titleLabel.font = NSFont.systemFont(ofSize: 17, weight: .semibold)
-        titleLabel.textColor = .labelColor
-        titleLabel.maximumNumberOfLines = 2
-        let messageLabel = NSTextField(wrappingLabelWithString: message)
-        messageLabel.font = NSFont.systemFont(ofSize: nativeUIFontSize, weight: .regular)
-        messageLabel.textColor = .secondaryLabelColor
-        messageLabel.maximumNumberOfLines = 4
-        let laterButton = NSButton(title: laterLabel, target: self, action: #selector(selectCodexRestartLater(_:)))
-        laterButton.bezelStyle = .rounded
-        laterButton.keyEquivalent = "\u{1b}"
-        let restartButton = NSButton(title: restartLabel, target: self, action: #selector(selectCodexRestartNow(_:)))
-        restartButton.bezelStyle = .rounded
-        restartButton.keyEquivalent = "\r"
-        restartButton.keyEquivalentModifierMask = []
-
-        [titleLabel, messageLabel, laterButton, restartButton].forEach {
-            $0.translatesAutoresizingMaskIntoConstraints = false
-            content.addSubview($0)
-        }
-        NSLayoutConstraint.activate([
-            titleLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
-            titleLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
-            titleLabel.topAnchor.constraint(equalTo: content.topAnchor, constant: 18),
-            messageLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
-            messageLabel.trailingAnchor.constraint(equalTo: titleLabel.trailingAnchor),
-            messageLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 8),
-            laterButton.trailingAnchor.constraint(equalTo: restartButton.leadingAnchor, constant: -8),
-            restartButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
-            restartButton.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
-            laterButton.centerYAnchor.constraint(equalTo: restartButton.centerYAnchor),
-            messageLabel.bottomAnchor.constraint(lessThanOrEqualTo: restartButton.topAnchor, constant: -14),
-        ])
-
-        codexRestartConfirmationPanel = panel
-        codexRestartConfirmationCompletion = completion
-        panel.center()
-        NSApp.activate(ignoringOtherApps: true)
-        withoutAnimations { panel.makeKeyAndOrderFront(nil) }
-    }
-
-    @objc private func selectCodexRestartLater(_ sender: NSButton) {
-        finishCodexRestartConfirmation(choice: "later")
-    }
-
-    @objc private func selectCodexRestartNow(_ sender: NSButton) {
-        finishCodexRestartConfirmation(choice: "restart")
     }
 
     /// Native child window of the provider workspace: the station's API keys
@@ -856,6 +1230,29 @@ private enum NativeRelayOriginPolicy {
         presentChildPanel(panel, in: settingsWindow())
     }
 
+    /// Close the group manager and settle its pending result.  `applied` hands
+    /// the staged draft back to the workspace (Save and Close); its false (Close,
+    /// and the window's title-bar close button) drops the draft and asks first
+    /// when edits would be lost.  Every dismissal path comes through here, so the
+    /// window, the lock over the workspace, and the pane's pending promise
+    /// settle together — a footer Close that only hid the window left the pane
+    /// waiting for a result that never came.
+    func closeGroupManager(applied: Bool) {
+        guard let controller = groupManagerController, groupManagerPanel != nil else { return }
+        let finish: () -> Void = { [weak self] in
+            controller.markApplied(applied)
+            self?.finishGroupManager()
+        }
+        guard !applied else {
+            finish()
+            return
+        }
+        controller.askToDiscardStagedChanges { accepted in
+            guard accepted else { return }
+            finish()
+        }
+    }
+
     /// Settle the group manager's pending result once, whichever way its window
     /// went away: the footer's Close or Apply, the title-bar close button, or
     /// the workspace window going away underneath it.
@@ -867,8 +1264,70 @@ private enum NativeRelayOriginPolicy {
         groupManagerController = nil
         let completion = groupManagerCompletionBlock
         groupManagerCompletionBlock = nil
+        // A caller waiting for the next 保存并关闭 hears the window is gone
+        // instead of waiting for a sheet that no longer exists.
+        let waiter = groupManagerApplyWaiter
+        groupManagerApplyWaiter = nil
+        groupManagerPendingApply = nil
         endChildPanel(panel)
         completion?(result)
+        waiter?(nil)
+    }
+
+    /// The sheet's 保存并关闭, handed to the caller that writes those edits: the
+    /// sheet stays up in its saving state until that caller answers through
+    /// ``finishGroupManagerApply(status:close:)``, and a request nobody is
+    /// waiting for yet is held for the next waiter.
+    func handGroupManagerApply() {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in self?.handGroupManagerApply() }
+            return
+        }
+        guard let controller = groupManagerController, groupManagerPanel != nil,
+              let staged = controller.stagedResult() else { return }
+        controller.setSaving(true)
+        guard let waiter = groupManagerApplyWaiter else {
+            groupManagerPendingApply = staged
+            return
+        }
+        groupManagerApplyWaiter = nil
+        waiter(staged)
+    }
+
+    /// The next 保存并关闭 from the open sheet.  A request already waiting is
+    /// answered at once; otherwise the caller waits here until the sheet saves
+    /// (or ends, which answers nil).
+    func awaitGroupManagerApply(completion: @escaping (NativeGroupManagerResult?) -> Void) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in self?.awaitGroupManagerApply(completion: completion) }
+            return
+        }
+        if let staged = groupManagerPendingApply {
+            groupManagerPendingApply = nil
+            completion(staged)
+            return
+        }
+        groupManagerApplyWaiter = completion
+    }
+
+    /// Answer a handed-over save: the sheet states `status` in its own status
+    /// strip and closes (the write landed), or keeps its rows and its
+    /// 保存并关闭 so the cause can be fixed and tried again.
+    func finishGroupManagerApply(status: String, close: Bool) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.finishGroupManagerApply(status: status, close: close)
+            }
+            return
+        }
+        guard let controller = groupManagerController, groupManagerPanel != nil else { return }
+        controller.setResultStatus(status)
+        guard close else {
+            controller.setSaving(false)
+            return
+        }
+        controller.markApplied(true)
+        finishGroupManager()
     }
 
     /// Applies a later snapshot of the same account to the window that is open
@@ -878,9 +1337,9 @@ private enum NativeRelayOriginPolicy {
     /// the window closed.  False when no live window took it: a load that
     /// finishes after Close, or during the window's dismissal, changes nothing.
     ///
-    /// The push arrives while the child window's modal session is running, so
-    /// it reaches the rows through the main queue exactly like the model
-    /// chooser's own callbacks do.
+    /// The push arrives while the child window is on screen, so it reaches the
+    /// rows through the main queue exactly like the model chooser's own
+    /// callbacks do; the window is never a modal session.
     @discardableResult
     func updateGroupManager(accountLabel: String, groups: [[String: String]], keys: [[String: String]], autoGrouping: Bool) -> Bool {
         guard Thread.isMainThread else { return false }
@@ -892,19 +1351,6 @@ private enum NativeRelayOriginPolicy {
             autoGrouping: autoGrouping
         )
         return true
-    }
-
-    private func finishCodexRestartConfirmation(choice: String) {
-        guard let panel = codexRestartConfirmationPanel else { return }
-        codexRestartConfirmationPanel = nil
-        let completion = codexRestartConfirmationCompletion
-        codexRestartConfirmationCompletion = nil
-        panel.delegate = nil
-        withoutAnimations {
-            panel.orderOut(nil)
-            panel.close()
-        }
-        completion?(choice)
     }
 
     func showReadOnlyText(
@@ -1464,7 +1910,7 @@ private enum NativeRelayOriginPolicy {
         let content = NSView()
         panel.contentView = content
         let titleLabel = NSTextField(labelWithString: localized("modelChooserHeading", fallback: "Choose models to add"))
-        titleLabel.font = NSFont.systemFont(ofSize: nativeUIFontSize, weight: .semibold)
+        titleLabel.font = nativeHeadingFont
         let subtitleLabel = NSTextField(labelWithString: "\(localized("modelChooserProvider", fallback: "Provider")): \(providerName)    \(localized("modelChooserKey", fallback: "Key")): \(keyName)")
         subtitleLabel.textColor = .secondaryLabelColor
         subtitleLabel.lineBreakMode = .byTruncatingMiddle
@@ -1540,26 +1986,26 @@ private enum NativeRelayOriginPolicy {
             content.addSubview(view)
         }
         NSLayoutConstraint.activate([
-            titleLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
-            titleLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
+            titleLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: nativePanelInset),
+            titleLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -nativePanelInset),
             titleLabel.topAnchor.constraint(equalTo: content.topAnchor, constant: 14),
-            subtitleLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
-            subtitleLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
+            subtitleLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: nativePanelInset),
+            subtitleLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -nativePanelInset),
             subtitleLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 4),
-            searchField.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
-            searchField.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
+            searchField.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: nativePanelInset),
+            searchField.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -nativePanelInset),
             searchField.topAnchor.constraint(equalTo: subtitleLabel.bottomAnchor, constant: 12),
             searchField.heightAnchor.constraint(equalToConstant: 28),
-            selectionControls.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
-            selectionControls.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
+            selectionControls.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: nativePanelInset),
+            selectionControls.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -nativePanelInset),
             selectionControls.topAnchor.constraint(equalTo: searchField.bottomAnchor, constant: 8),
             selectionControls.heightAnchor.constraint(equalToConstant: 28),
-            scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
-            scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
+            scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: nativePanelInset),
+            scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -nativePanelInset),
             scroll.topAnchor.constraint(equalTo: selectionControls.bottomAnchor, constant: 8),
             scroll.bottomAnchor.constraint(equalTo: cancelButton.topAnchor, constant: -16),
-            addButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
-            addButton.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
+            addButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -nativePanelInset),
+            addButton.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -nativePanelInset),
             cancelButton.trailingAnchor.constraint(equalTo: addButton.leadingAnchor, constant: -8),
             cancelButton.centerYAnchor.constraint(equalTo: addButton.centerYAnchor),
         ])
@@ -1687,13 +2133,20 @@ private enum NativeRelayOriginPolicy {
         let info = Bundle.main.infoDictionary ?? [:]
         let version = info["CFBundleShortVersionString"] as? String ?? "?"
         let build = info["CFBundleVersion"] as? String ?? "?"
-        let alert = NSAlert()
-        configureImmediatePresentation(alert.window)
-        alert.messageText = localized("appTitle", fallback: "Young Router")
-        alert.informativeText = "\(localized("version", fallback: "Version")) \(version) (\(localized("build", fallback: "build")) \(build))"
-        alert.addButton(withTitle: localized("ok", fallback: "OK"))
-        NSApp.activate(ignoringOtherApps: true)
-        alert.runModal()
+        // An acknowledgement is a decision panel with one answer: the same
+        // window, the same keys, and no modal session holding the React host.
+        presentDecisionPanel(
+            localized("appTitle", fallback: "Young Router"),
+            message: "\(localized("version", fallback: "Version")) \(version) (\(localized("build", fallback: "build")) \(build))",
+            answers: [
+                NativeDecisionAnswer(
+                    id: "ok",
+                    title: localized("ok", fallback: "OK"),
+                    isDefault: true,
+                    isCancel: true
+                )
+            ]
+        ) { _ in }
     }
 
     /// Version strings for the shared About pane: the app bundle version plus
@@ -2305,6 +2758,57 @@ private final class NativeChildPanelShield: NSView {
 /// AppKit paint the button with the control accent color; temporarily
 /// clearing the equivalent while drawing restores the ordinary bezel while
 /// the window still routes Return to this cell.
+/// One answer a decision panel offers: its label, the id the caller hears back,
+/// whether the Return key carries it, whether Escape and the title-bar close
+/// button carry it, and whether it destroys what it names.
+struct NativeDecisionAnswer {
+    let id: String
+    let title: String
+    var isDefault = false
+    var isCancel = false
+    var isDestructive = false
+}
+
+/// A decision panel's answer button: it carries the answer's id back to the
+/// panel's single action, and it can draw neutrally while still carrying Return.
+///
+/// A destructive answer that is also the Return default would otherwise be
+/// painted with the default button's accent fill — a blue delete.  An alert
+/// draws that answer with the ordinary bezel and the system's red ink, so this
+/// button drops its key equivalent for the one draw pass and puts it back.
+final class NativeDecisionAnswerButton: NSButton {
+    var answerID = ""
+    var drawsNeutralWhileDefault = false
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard drawsNeutralWhileDefault, keyEquivalent == "\r", window?.defaultButtonCell === cell else {
+            super.draw(dirtyRect)
+            return
+        }
+        keyEquivalent = ""
+        super.draw(dirtyRect)
+        keyEquivalent = "\r"
+    }
+}
+
+/// A decision panel's window.  Escape answers the panel's cancel answer even
+/// when no button carries that key, so every question dismisses the same way.
+/// A decision panel's window: one rounded borderless alert, dragged by its own
+/// background and answering Escape with the question's cancel answer even when
+/// no button carries that key.  A borderless panel only becomes key when it says
+/// so — without this it would never take the keyboard and Escape would do
+/// nothing for every confirmation in the app.
+final class NativeDecisionPanel: NSPanel {
+    var onEscape: (() -> Void)?
+
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+
+    override func cancelOperation(_ sender: Any?) {
+        onEscape?()
+    }
+}
+
 private final class NeutralDefaultButton: NSButton {
     override func draw(_ dirtyRect: NSRect) {
         guard keyEquivalent == "\r", window?.defaultButtonCell === cell else {
@@ -2577,9 +3081,16 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
     /// update lands, so an edit can never be staged against data the load is
     /// about to replace.
     private var loading: Bool
+    private var saving = false
+    /// The last outcome this window stated (a finished save or its failure):
+    /// the strip keeps it until a later load or save replaces it.
+    private var resultStatus: String?
     private var syncingSelection = false
     private var applied = false
-    private var copyStatusToken = 0
+    /// A transient word (a failed copy) that takes the footer's status line
+    /// until it clears itself; a later save result replaces it.
+    private var transientStatus: String?
+    private var transientStatusToken = 0
     ///
     /// Plaintext keys the window already revealed while it is open, keyed by
     /// key id.  Core's lease is read-once, so a re-selection reuses what the
@@ -2605,8 +3116,13 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
     private weak var valueField: NSTextField?
     private weak var modelsList: NativeModelsListView?
     private weak var copyButton: NSButton?
-    private weak var copyStatusField: NSTextField?
+
     private weak var toggle: NSButton?
+    private weak var closeButton: NSButton?
+    /// The window's own result line, beside its footer buttons: a child
+    /// surface states its own save and its own failure there, and the window
+    /// it was opened from never reports them.
+    private weak var footerStatusField: NSTextField?
     /// The list header's busy wheel: the shared frames a working button draws,
     /// turning beside 密钥 while the station round trip is in flight.  The wheel
     /// keeps its box whether it turns or not, so the header never shifts.
@@ -2627,7 +3143,10 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         (toggle?.state ?? (initialAutoGrouping ? .on : .off)) == .on
     }
 
-    private var hasStagedChanges: Bool {
+    /// True while the draft would change the account: the auto-grouping switch,
+    /// a staged create, update, or delete.  The leaf reads it to decide whether
+    /// a Close has to ask before it drops the draft.
+    var hasStagedChanges: Bool {
         guard autoGroupingOn == initialAutoGrouping else { return true }
         if stagedDeleteCount > 0 { return true }
         return rows.contains { row in
@@ -2635,6 +3154,43 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
             return row.name != row.originalName
                 || row.groupID != row.originalGroupID
                 || row.enabled != row.originalEnabled
+        }
+    }
+
+    /// Whether the window is closing to hand its draft back to the workspace
+    /// (Save and Close) instead of dropping it (Close).  The leaf sets it as the
+    /// window ends, so ``resultOnEnd()`` reports the draft exactly once.
+    func markApplied(_ value: Bool) {
+        applied = value
+    }
+
+    /// Ask before a Close that would drop staged edits, through the app's own
+    /// decision panel: the question is drawn and answered like every other
+    /// confirmation, and its copy stays the sheet's own.
+    func askToDiscardStagedChanges(completion: @escaping (Bool) -> Void) {
+        guard hasStagedChanges else {
+            completion(true)
+            return
+        }
+        AppKitNativeLeaf.shared.presentDecisionPanel(
+            label("discardTitle"),
+            message: label("discardBody"),
+            answers: [
+                NativeDecisionAnswer(
+                    id: "cancel",
+                    title: AppKitNativeLeaf.shared.localizedText("cancel", fallback: "Cancel"),
+                    isCancel: true
+                ),
+                NativeDecisionAnswer(
+                    id: "discard",
+                    title: label("discardConfirm"),
+                    isDefault: true,
+                    isDestructive: true
+                ),
+            ],
+            in: panel
+        ) { answer in
+            completion(answer == "discard")
         }
     }
 
@@ -2726,7 +3282,7 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
     }
 
     private var editingEnabled: Bool {
-        !loading && toggle?.state == .off
+        !loading && !saving && toggle?.state == .off
     }
 
     func makePanel() -> NSPanel? {
@@ -2740,7 +3296,7 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         let detailWidth: CGFloat = 189
         // The margins and the gap between the columns, so the window fits its
         // two columns exactly.
-        let contentWidth = 20 + listWidth + 18 + detailWidth + 20
+        let contentWidth = nativePanelInset + listWidth + 18 + detailWidth + nativePanelInset
         // The same child-surface chrome the model chooser uses: a titled window
         // of its own with the platform close button, over the workspace it
         // belongs to.
@@ -2762,7 +3318,7 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         let content = NSView()
         panel.contentView = content
         let titleLabel = NSTextField(labelWithString: title)
-        titleLabel.font = NSFont.systemFont(ofSize: nativeUIFontSize, weight: .semibold)
+        titleLabel.font = nativeHeadingFont
         let accountField = NSTextField(labelWithString: accountLabel)
         self.accountField = accountField
         accountField.font = NSFont.systemFont(ofSize: nativeUIFontSize)
@@ -2772,7 +3328,7 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
 
         // Left column: the key list with the ＋ / － toolbar.
         let listTitle = NSTextField(labelWithString: label("listLabel"))
-        listTitle.font = NSFont.systemFont(ofSize: nativeUIFontSize, weight: .semibold)
+        listTitle.font = nativeHeadingFont
         // 密钥's own header declares the load: the key list is what the station
         // round trip is about to replace, so the wheel turns beside the title
         // those rows belong to, and the footer keeps only the switch and the
@@ -2946,17 +3502,11 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         // aligned line per model, sized for the longest list any key carries so
         // switching groups never resizes the window.
         let modelsTitle = NSTextField(labelWithString: label("modelsLabel"))
-        modelsTitle.font = NSFont.systemFont(ofSize: nativeUIFontSize, weight: .semibold)
+        modelsTitle.font = nativeHeadingFont
         let modelsList = NativeModelsListView(font: detailFont, emptyText: label("emptyLabel"))
         self.modelsList = modelsList
         let modelsHeight = modelsList.heightAnchor.constraint(equalToConstant: CGFloat(NativeGroupManagerController.modelGridRows(rows)) * 17)
         self.modelsListHeight = modelsHeight
-        let copyStatus = NSTextField(labelWithString: "")
-        copyStatus.font = NSFont.systemFont(ofSize: nativeUIFontSize)
-        copyStatus.textColor = .secondaryLabelColor
-        copyStatus.lineBreakMode = .byTruncatingTail
-        copyStatus.maximumNumberOfLines = 1
-        self.copyStatusField = copyStatus
 
         let toggle = NSButton(checkboxWithTitle: label("autoGroupingLabel"), target: self, action: #selector(toggleAutoGrouping(_:)))
         toggle.font = NSFont.systemFont(ofSize: nativeUIFontSize)
@@ -2965,6 +3515,10 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         let closeButton = NSButton(title: label("closeLabel"), target: self, action: #selector(closePanel(_:)))
         closeButton.bezelStyle = .rounded
         closeButton.font = NSFont.systemFont(ofSize: nativeUIFontSize)
+        // Escape is the dismissive answer in every child window the app opens, and
+        // Close asks before it drops a draft, so the key lands on the same question
+        // the button asks.
+        closeButton.keyEquivalent = "\u{1b}"
         let applyButton = NSButton(title: label("applyLabel"), target: self, action: #selector(applyPanel(_:)))
         applyButton.bezelStyle = .rounded
         applyButton.font = NSFont.systemFont(ofSize: nativeUIFontSize)
@@ -2973,7 +3527,19 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         applyButton.isEnabled = false
         self.applyButton = applyButton
 
-        [titleLabel, accountField, listTitle, loadingSpinner, addButton, removeButton, listFrame, enabledCheckbox, nameLabel, nameField, groupFieldLabel, groupPopUp, multiplierLabel, multiplierField, valueLabel, valueField, copyButton, copyStatus, modelsTitle, modelsList, toggle, closeButton, applyButton].forEach {
+        // The window's own result line sits beside its footer buttons: a child
+        // states its own load, its own save, and its own failure there, and the
+        // buttons keep their trailing edge, so a message never moves them.
+        let footerStatus = NSTextField(labelWithString: "")
+        footerStatus.font = NSFont.systemFont(ofSize: nativeUIFontSize)
+        footerStatus.textColor = .secondaryLabelColor
+        footerStatus.lineBreakMode = .byTruncatingTail
+        footerStatus.maximumNumberOfLines = 1
+        footerStatus.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        self.footerStatusField = footerStatus
+        self.closeButton = closeButton
+
+        [titleLabel, accountField, listTitle, loadingSpinner, addButton, removeButton, listFrame, enabledCheckbox, nameLabel, nameField, groupFieldLabel, groupPopUp, multiplierLabel, multiplierField, valueLabel, valueField, copyButton, modelsTitle, modelsList, toggle, footerStatus, closeButton, applyButton].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
             content.addSubview($0)
         }
@@ -2991,8 +3557,8 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
             content.widthAnchor.constraint(equalToConstant: contentWidth),
             detailGuide.leadingAnchor.constraint(equalTo: listFrame.trailingAnchor, constant: 18),
             detailGuide.widthAnchor.constraint(equalToConstant: detailWidth),
-            titleLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
-            titleLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            titleLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: nativePanelInset),
+            titleLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -nativePanelInset),
             titleLabel.topAnchor.constraint(equalTo: content.topAnchor, constant: 16),
             accountField.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
             accountField.trailingAnchor.constraint(equalTo: titleLabel.trailingAnchor),
@@ -3058,16 +3624,18 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
             modelsList.trailingAnchor.constraint(equalTo: detailGuide.trailingAnchor),
             modelsList.topAnchor.constraint(equalTo: modelsTitle.bottomAnchor, constant: 6),
             modelsHeight,
-            copyStatus.leadingAnchor.constraint(equalTo: enabledCheckbox.leadingAnchor),
-            copyStatus.trailingAnchor.constraint(equalTo: detailGuide.trailingAnchor),
-            copyStatus.topAnchor.constraint(equalTo: modelsList.bottomAnchor, constant: 12),
-            // The detail column's last line is the copy result; it ends above
-            // the footer, and the window grows to fit the rows it carries (the
-            // key list stretches with it).
-            copyStatus.bottomAnchor.constraint(equalTo: toggle.topAnchor, constant: -14),
+            // The detail column's last line ends above the footer, and the
+            // window grows to fit the rows it carries (the key list stretches
+            // with it).
+            modelsList.bottomAnchor.constraint(lessThanOrEqualTo: toggle.topAnchor, constant: -14),
             toggle.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
-            toggle.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
-            applyButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            toggle.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -nativePanelInset),
+            // The result line takes the free space between the switch and the
+            // buttons; the buttons keep the trailing edge they had.
+            footerStatus.leadingAnchor.constraint(equalTo: toggle.trailingAnchor, constant: 12),
+            footerStatus.trailingAnchor.constraint(lessThanOrEqualTo: closeButton.leadingAnchor, constant: -8),
+            footerStatus.centerYAnchor.constraint(equalTo: toggle.centerYAnchor),
+            applyButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -nativePanelInset),
             applyButton.centerYAnchor.constraint(equalTo: toggle.centerYAnchor),
             closeButton.trailingAnchor.constraint(equalTo: applyButton.leadingAnchor, constant: -8),
             closeButton.centerYAnchor.constraint(equalTo: toggle.centerYAnchor),
@@ -3143,7 +3711,8 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         } else {
             stopLoadingWheel()
         }
-        toggle?.isEnabled = !loading
+        refreshStatusText()
+        toggle?.isEnabled = !loading && !saving
         loadDetail()
         refreshApplyButton()
     }
@@ -3217,7 +3786,6 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
             valueField?.toolTip = nil
             modelsList?.setModels([])
             copyButton?.isEnabled = false
-            showCopyStatus("")
             syncingSelection = true
             groupPopUp?.selectItem(at: -1)
             syncingSelection = false
@@ -3253,7 +3821,52 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
     }
 
     private func refreshApplyButton() {
-        applyButton?.isEnabled = !loading && hasStagedChanges
+        applyButton?.isEnabled = !loading && !saving && hasStagedChanges
+    }
+
+    /// The words a save in flight shows come from the host's localization
+    /// table, so every child states the same wait in the same vocabulary.
+    private func savingStatusText() -> String {
+        AppKitNativeLeaf.shared.localizedText("childSaving", fallback: "Saving…")
+    }
+
+    /// State one line beside the footer buttons.
+    func setStatus(_ text: String) {
+        footerStatusField?.stringValue = text
+        footerStatusField?.setAccessibilityLabel(text)
+    }
+
+    /// State a finished outcome: it stays until a later save replaces it.
+    func setResultStatus(_ text: String) {
+        resultStatus = text
+        refreshStatusText()
+    }
+
+    /// The one line beside the buttons: the last outcome, else a transient
+    /// word (a failed copy), else the save in flight, else nothing — an idle
+    /// window says nothing here, and the wait for its rows already rides the
+    /// wheel beside 密钥.
+    private func refreshStatusText() {
+        if let resultStatus {
+            setStatus(resultStatus)
+        } else if let transientStatus {
+            setStatus(transientStatus)
+        } else if saving {
+            setStatus(savingStatusText())
+        } else {
+            setStatus("")
+        }
+    }
+
+    /// The write this window handed over is in flight: its rows and its footer
+    /// stay put until the workspace answers, so nothing is staged against data
+    /// that answer is about to replace.
+    func setSaving(_ value: Bool) {
+        saving = value
+        refreshStatusText()
+        closeButton?.isEnabled = !value
+        toggle?.isEnabled = !value && !loading
+        updateLoadingChrome()
     }
 
     private func commitNameField() {
@@ -3410,7 +4023,7 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
                         self.fitPanelToContent()
                     }
                 } else if self.selectedRowID == keyID {
-                    self.showCopyStatus(self.label("failedLabel"))
+                    self.showTransientStatus(self.label("failedLabel"))
                 }
                 self.drainRevealQueue()
             }
@@ -3454,12 +4067,13 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
             pasteboard.clearContents()
             let copied = pasteboard.setString(revealed, forType: .string)
             copyButton?.isEnabled = canCopy(row)
-            showCopyStatus(copied ? label("copiedLabel") : label("failedLabel"))
+            // A copy that worked says nothing: the key is on the pasteboard,
+            // and only a failure is worth a word on the window's status line.
+            if (!copied) { showTransientStatus(label("failedLabel")) }
             return
         }
         let target = "\(accountID):\(row.id)"
         copyButton?.isEnabled = false
-        showCopyStatus("")
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let value = Self.readRevealedKey(target: target)
             DispatchQueue.main.async {
@@ -3473,21 +4087,23 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
                     copied = pasteboard.setString(value, forType: .string)
                 }
                 self.copyButton?.isEnabled = self.canCopy(row)
-                self.showCopyStatus(copied ? self.label("copiedLabel") : self.label("failedLabel"))
+                if (!copied) { self.showTransientStatus(self.label("failedLabel")) }
             }
         }
     }
 
-    /// Show one transient line under the detail rows; a later action replaces
-    /// it and only the newest message clears itself.
-    private func showCopyStatus(_ message: String) {
-        copyStatusField?.stringValue = message
-        copyStatusToken += 1
+    /// State a transient result on the window's one status line; it clears
+    /// itself, and the newest message owns the line.
+    func showTransientStatus(_ message: String, clearAfter seconds: Double = 4) {
+        transientStatusToken += 1
+        transientStatus = message.isEmpty ? nil : message
+        refreshStatusText()
         guard !message.isEmpty else { return }
-        let token = copyStatusToken
-        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
-            guard let self, self.copyStatusToken == token else { return }
-            self.copyStatusField?.stringValue = ""
+        let token = transientStatusToken
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { [weak self] in
+            guard let self, self.transientStatusToken == token else { return }
+            self.transientStatus = nil
+            self.refreshStatusText()
         }
     }
 
@@ -3505,40 +4121,24 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
 
     /// Close discards the draft, so a window that would lose edits asks first;
     /// a window the user never touched closes straight away.
+    /// Close the window: Close drops the staged draft, Save and Close hands it
+    /// back to the workspace.  Either way the leaf settles the pending result,
+    /// so the pane hears an answer the moment the window goes away.
     @objc private func closePanel(_ sender: NSButton) {
-        guard confirmDiscardIfNeeded() else { return }
-        applied = false
-        if let panel {
-            AppKitNativeLeaf.shared.endChildPanel(panel)
-        }
-    }
-
-    /// Confirm a Close that would drop staged edits.  The native alert owns the
-    /// copy so the decision is visible regardless of the shared UI's state, and
-    /// the window's own title-bar close button asks the same question.
-    func confirmDiscardIfNeeded() -> Bool {
-        guard hasStagedChanges else { return true }
-        let title = label("discardTitle")
-        let message = label("discardBody")
-        return AppKitNativeLeaf.shared.confirm(
-            title: title,
-            message: message,
-            confirmTitle: label("discardConfirm")
-        )
+        AppKitNativeLeaf.shared.closeGroupManager(applied: false)
     }
 
     @objc private func applyPanel(_ sender: NSButton) {
-        guard hasStagedChanges else { return }
+        guard hasStagedChanges, !saving else { return }
         commitNameField()
-        applied = true
-        if let panel {
-            AppKitNativeLeaf.shared.endChildPanel(panel)
-        }
+        // The edits go to the workspace while this window stays up: it states
+        // the save in its own status strip and closes when the write landed.
+        AppKitNativeLeaf.shared.handGroupManagerApply()
     }
 
     /// The staged edits, or nil when the draft would not change the account.
-    func resultOnEnd() -> NativeGroupManagerResult? {
-        guard applied, hasStagedChanges else { return nil }
+    func stagedResult() -> NativeGroupManagerResult? {
+        guard hasStagedChanges else { return nil }
         return NativeGroupManagerResult(
             autoGrouping: (toggle?.state ?? (initialAutoGrouping ? .on : .off)) == .on,
             creates: rows.filter { $0.isDraft && !$0.deleted && !$0.name.isEmpty }.map {
@@ -3551,6 +4151,12 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
             },
             deletes: rows.filter { !$0.isDraft && $0.deleted }.map { $0.id }
         )
+    }
+
+    /// The staged edits, once the window is ending with them handed over.
+    func resultOnEnd() -> NativeGroupManagerResult? {
+        guard applied else { return nil }
+        return stagedResult()
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int {
@@ -4278,7 +4884,7 @@ private final class NativeReadOnlyCodeController: NSObject, NSWindowDelegate {
         panel.contentView = content
 
         let titleLabel = NSTextField(labelWithString: title)
-        titleLabel.font = NSFont.systemFont(ofSize: 16, weight: .semibold)
+        titleLabel.font = nativeHeadingFont
         titleLabel.lineBreakMode = .byTruncatingTail
         titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
@@ -4304,16 +4910,18 @@ private final class NativeReadOnlyCodeController: NSObject, NSWindowDelegate {
             content.addSubview(view)
         }
         NSLayoutConstraint.activate([
-            titleLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 18),
-            titleLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -18),
-            titleLabel.topAnchor.constraint(equalTo: content.topAnchor, constant: 16),
-            editorFrame.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
-            editorFrame.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
+            titleLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: nativePanelInset),
+            titleLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -nativePanelInset),
+            titleLabel.topAnchor.constraint(equalTo: content.topAnchor, constant: nativePanelInset),
+            editorFrame.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+            editorFrame.trailingAnchor.constraint(equalTo: titleLabel.trailingAnchor),
             editorFrame.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 12),
             editorFrame.bottomAnchor.constraint(equalTo: closeButton.topAnchor, constant: -14),
-            closeButton.centerXAnchor.constraint(equalTo: content.centerXAnchor),
-            closeButton.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
-            closeButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 160),
+            // One action bar for every child window: the lone dismissal sits at
+            // the trailing edge, exactly where a window with two actions puts
+            // them, instead of floating in the middle of the panel.
+            closeButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -nativePanelInset),
+            closeButton.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -nativePanelInset),
         ])
         panel.initialFirstResponder = webView
         webView.setAccessibilityLabel(title)
@@ -4501,7 +5109,7 @@ private final class NativeProviderAuthController: NSObject, NSWindowDelegate, WK
         panel.contentView = content
 
         let titleLabel = NSTextField(labelWithString: title)
-        titleLabel.font = NSFont.systemFont(ofSize: 16, weight: .semibold)
+        titleLabel.font = nativeHeadingFont
         titleLabel.lineBreakMode = .byTruncatingTail
         titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
@@ -4511,7 +5119,7 @@ private final class NativeProviderAuthController: NSObject, NSWindowDelegate, WK
         instructionLabel.maximumNumberOfLines = 2
 
         let codeLabel = NSTextField(labelWithString: codeLabelText)
-        codeLabel.font = NSFont.systemFont(ofSize: nativeUIFontSize, weight: .semibold)
+        codeLabel.font = nativeHeadingFont
 
         let codeField = NSTextField(labelWithString: userCode ?? "")
         codeField.isSelectable = true
@@ -4561,9 +5169,9 @@ private final class NativeProviderAuthController: NSObject, NSWindowDelegate, WK
             content.addSubview($0)
         }
         var constraints: [NSLayoutConstraint] = [
-            titleLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 18),
-            titleLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -18),
-            titleLabel.topAnchor.constraint(equalTo: content.topAnchor, constant: 16),
+            titleLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: nativePanelInset),
+            titleLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -nativePanelInset),
+            titleLabel.topAnchor.constraint(equalTo: content.topAnchor, constant: nativePanelInset),
             instructionLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
             instructionLabel.trailingAnchor.constraint(equalTo: titleLabel.trailingAnchor),
             instructionLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 4),
@@ -4574,9 +5182,11 @@ private final class NativeProviderAuthController: NSObject, NSWindowDelegate, WK
             webView.trailingAnchor.constraint(equalTo: browserFrame.trailingAnchor),
             webView.topAnchor.constraint(equalTo: browserFrame.topAnchor),
             webView.bottomAnchor.constraint(equalTo: browserFrame.bottomAnchor),
-            closeButton.centerXAnchor.constraint(equalTo: content.centerXAnchor),
-            closeButton.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
-            closeButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 160),
+            // One action bar for every child window: the lone dismissal sits at
+            // the trailing edge, exactly where a window with two actions puts
+            // them, instead of floating in the middle of the panel.
+            closeButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -nativePanelInset),
+            closeButton.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -nativePanelInset),
         ]
         if hasUserCode {
             constraints += [
@@ -5382,7 +5992,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         // Cancel.
         let showsPanelClose = panel != nil && mode == .login && !isEmbeddedPresentation
         let showsPanelActions = showsReloadAction || showsEmbeddedClose || showsPanelClose
-        titleLabel.font = NSFont.systemFont(ofSize: nativeUIFontSize, weight: .semibold)
+        titleLabel.font = nativeHeadingFont
         titleLabel.lineBreakMode = .byTruncatingTail
         let host = originURL.host ?? ""
         // The host subtitle is redundant when the title already shows the URL.
@@ -5498,8 +6108,8 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
                 actionBar.trailingAnchor.constraint(equalTo: content.trailingAnchor),
                 actionBar.bottomAnchor.constraint(equalTo: content.bottomAnchor),
                 actionBar.heightAnchor.constraint(equalToConstant: Self.panelActionBarHeight),
-                cancelButton.leadingAnchor.constraint(greaterThanOrEqualTo: actionBar.leadingAnchor, constant: 18),
-                cancelButton.trailingAnchor.constraint(equalTo: actionBar.trailingAnchor, constant: -18),
+                cancelButton.leadingAnchor.constraint(greaterThanOrEqualTo: actionBar.leadingAnchor, constant: nativePanelInset),
+                cancelButton.trailingAnchor.constraint(equalTo: actionBar.trailingAnchor, constant: -nativePanelInset),
                 cancelButton.centerYAnchor.constraint(equalTo: actionBar.centerYAnchor),
                 cancelButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 76),
             ]
@@ -5527,47 +6137,47 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         }
         if showsReloadAction {
             constraints += [
-                titleLabel.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 18),
+                titleLabel.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: nativePanelInset),
                 titleLabel.topAnchor.constraint(equalTo: header.topAnchor, constant: 12),
                 titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: cancelButton.leadingAnchor, constant: -16),
                 accountLabel.leadingAnchor.constraint(equalTo: titleLabel.trailingAnchor, constant: 10),
                 accountLabel.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
                 accountLabel.trailingAnchor.constraint(lessThanOrEqualTo: cancelButton.leadingAnchor, constant: -16),
-                statusLabel.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 18),
+                statusLabel.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: nativePanelInset),
                 statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: signInButton.leadingAnchor, constant: -16),
                 statusLabel.bottomAnchor.constraint(equalTo: header.bottomAnchor, constant: -12),
                 signInButton.trailingAnchor.constraint(equalTo: cancelButton.leadingAnchor, constant: -8),
                 signInButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
                 signInButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 104),
-                cancelButton.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -18),
+                cancelButton.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -nativePanelInset),
                 cancelButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
                 cancelButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 76),
             ]
         } else if showsEmbeddedClose {
             constraints += [
-                titleLabel.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 18),
+                titleLabel.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: nativePanelInset),
                 titleLabel.topAnchor.constraint(equalTo: header.topAnchor, constant: 12),
                 titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: cancelButton.leadingAnchor, constant: -16),
-                accountLabel.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 18),
+                accountLabel.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: nativePanelInset),
                 accountLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 4),
-                accountLabel.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -18),
-                statusLabel.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 18),
-                statusLabel.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -18),
+                accountLabel.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -nativePanelInset),
+                statusLabel.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: nativePanelInset),
+                statusLabel.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -nativePanelInset),
                 statusLabel.bottomAnchor.constraint(equalTo: header.bottomAnchor, constant: -12),
-                cancelButton.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -18),
+                cancelButton.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -nativePanelInset),
                 cancelButton.topAnchor.constraint(equalTo: header.topAnchor, constant: 10),
                 cancelButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 76),
             ]
         } else if !isEmbeddedPresentation {
             constraints += [
-                titleLabel.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 18),
+                titleLabel.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: nativePanelInset),
                 titleLabel.topAnchor.constraint(equalTo: header.topAnchor, constant: 12),
-                titleLabel.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -18),
-                accountLabel.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 18),
+                titleLabel.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -nativePanelInset),
+                accountLabel.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: nativePanelInset),
                 accountLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 4),
-                accountLabel.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -18),
-                statusLabel.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 18),
-                statusLabel.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -18),
+                accountLabel.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -nativePanelInset),
+                statusLabel.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: nativePanelInset),
+                statusLabel.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -nativePanelInset),
                 statusLabel.bottomAnchor.constraint(equalTo: header.bottomAnchor, constant: -12),
             ]
         }
@@ -5969,23 +6579,28 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     }
 
     /// Post-login subordinate prompt on the sign-in surface: keep the typed
-    /// password on this device, or keep only the current login state.
+    /// password on this device, or keep only the current login state.  It is the
+    /// app's decision surface rather than an attached sheet — the same panel every
+    /// other question uses — and the sign-in window is locked while it is up, so
+    /// the answer always lands before the commit begins.
     private func presentRememberPasswordPrompt(completion: @escaping (Bool) -> Void) {
-        let alert = NSAlert()
-        alert.messageText = text("Remember the password?", "是否记住密码？")
-        alert.informativeText = text(
-            "Save the password on this device to enable automatic sign-in next time. Choose “Session only” to keep just the current sign-in state.",
-            "密码将保存到本机，下次可自动登录。选择「仅记住登录态」则只保留本次登录状态。"
-        )
-        alert.addButton(withTitle: text("Remember Password", "记住密码"))
-        alert.addButton(withTitle: text("Session Only", "仅记住登录态"))
         guard let promptParent = embeddedWindow ?? panel else {
             completion(false)
             return
         }
-        NSApp.activate(ignoringOtherApps: true)
-        alert.beginSheetModal(for: promptParent) { response in
-            completion(response == .alertFirstButtonReturn)
+        AppKitNativeLeaf.shared.presentDecisionPanel(
+            text("Remember the password?", "是否记住密码？"),
+            message: text(
+                "Save the password on this device to enable automatic sign-in next time. Choose “Session only” to keep just the current sign-in state.",
+                "密码将保存到本机，下次可自动登录。选择「仅记住登录态」则只保留本次登录状态。"
+            ),
+            answers: [
+                NativeDecisionAnswer(id: "session", title: text("Session Only", "仅记住登录态"), isCancel: true),
+                NativeDecisionAnswer(id: "remember", title: text("Remember Password", "记住密码"), isDefault: true)
+            ],
+            in: promptParent
+        ) { answer in
+            completion(answer == "remember")
         }
     }
 

@@ -17,7 +17,11 @@
 namespace YoungRouter {
 namespace {
 
-constexpr size_t kMaxIpcMessageBytes = 4 * 1024 * 1024;
+// Mirrors the Core's ``MAX_MESSAGE_BYTES`` (``young_router/core/protocol.py``).
+// One raw-editor read answers with the document plus its baseline, so the
+// frame budget covers two of the Core's own editor documents; the managed
+// Codex catalog alone is past 2 MB.
+constexpr size_t kMaxIpcMessageBytes = 16 * 1024 * 1024;
 
 std::wstring Utf8ToWide(std::string const& value) {
   if (value.empty()) return {};
@@ -189,6 +193,23 @@ std::string RequestMethod(std::string const& request_json) {
   }
 }
 
+// A WebDAV sync reads and writes a remote file, so it can take minutes like a
+// model probe.  Applying the 30 s default to it reported "core unavailable"
+// while Core was still finishing the sync it had already started.
+bool IsWebdavRemoteOperation(std::string const& request_json) {
+  try {
+    auto request = winrt::Windows::Data::Json::JsonObject::Parse(Utf8ToWide(request_json));
+    if (WideToUtf8(request.GetNamedString(L"method", L"").c_str()) != "dispatch") return false;
+    auto action = request.GetNamedObject(L"params").GetNamedObject(L"action");
+    if (WideToUtf8(action.GetNamedString(L"domain", L"").c_str()) != std::string("webdav")) return false;
+    const std::string type = WideToUtf8(action.GetNamedString(L"type", L"").c_str());
+    return type == "push" || type == "webdav_push" || type == "pull" ||
+           type == "webdav_pull" || type == "sync" || type == "webdav_sync";
+  } catch (...) {
+    return false;
+  }
+}
+
 struct WinHttpHandleCloser {
   void operator()(HINTERNET handle) const noexcept {
     if (handle) WinHttpCloseHandle(handle);
@@ -225,8 +246,10 @@ std::string CoreIPCBridge::Send(std::string const& request_json) {
   const std::string method = RequestMethod(request_json);
   const bool is_subscription = method == "subscribe";
   // A model probe waits for the deployment's own first-event budget and then
-  // for a complete fingerprint answer, so it outlives the 30 s default.
-  const int receive_timeout_ms = method == "probe" ? 900000 : 30000;
+  // for a complete fingerprint answer, so it outlives the 30 s default; a
+  // WebDAV remote operation earns the same wait.
+  const bool slow_remote_operation = method == "probe" || IsWebdavRemoteOperation(request_json);
+  const int receive_timeout_ms = slow_remote_operation ? 900000 : 30000;
   for (int attempt = 0; attempt < 2; ++attempt) {
     auto [endpoint, session, generation] = EnsureSession();
     try {

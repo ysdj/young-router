@@ -49,6 +49,7 @@ def _settings_from_payload(payload: dict[str, Any], existing: Settings) -> Setti
         "remote_name": payload.get("remote_name", existing.remote_name),
         "sync_interval_minutes": payload.get("sync_interval_minutes", existing.sync_interval_minutes),
         "timeout_seconds": payload.get("timeout_seconds", existing.timeout_seconds),
+        "sync_direction": payload.get("sync_direction", existing.sync_direction),
     }
     if "password" in payload:
         raw["password"] = payload.get("password", "")

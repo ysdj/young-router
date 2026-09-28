@@ -296,6 +296,7 @@ def _normalize_sse_response_completed_block(
     delimiter: str,
     *,
     input_token_upper_bound: Optional[int] = None,
+    request_data: Optional[dict] = None,
 ) -> str:
     if "data:" not in block:
         return block + delimiter
@@ -325,6 +326,7 @@ def _normalize_sse_response_completed_block(
             input_token_upper_bound=input_token_upper_bound,
         )
     _image_generation_module._normalize_image_generation_result_status(payload)
+    _responses_output_module._sanitize_reasoning_wrapper_event(payload, request_data)
     if payload == original_payload:
         return block + delimiter
     normalized_data = json.dumps(payload, ensure_ascii=False)
@@ -344,6 +346,7 @@ def _normalize_sse_response_completed_text(
     text: str,
     *,
     input_token_upper_bound: Optional[int] = None,
+    request_data: Optional[dict] = None,
 ) -> str:
     if (
         "data:" not in text
@@ -351,6 +354,8 @@ def _normalize_sse_response_completed_text(
             "response.completed" not in text
             and "image_generation_call" not in text
             and "response.output_item.added" not in text
+            and "output_text" not in text
+            and "content_part" not in text
         )
     ):
         return text
@@ -373,6 +378,7 @@ def _normalize_sse_response_completed_text(
                     text[index:],
                     "",
                     input_token_upper_bound=input_token_upper_bound,
+                    request_data=request_data,
                 )
             )
             break
@@ -382,6 +388,7 @@ def _normalize_sse_response_completed_text(
                 text[index:position],
                 delimiter,
                 input_token_upper_bound=input_token_upper_bound,
+                request_data=request_data,
             )
         )
         index = position + len(delimiter)
@@ -392,6 +399,7 @@ def _normalize_sse_response_completed_chunk(
     chunk: str | bytes,
     *,
     input_token_upper_bound: Optional[int] = None,
+    request_data: Optional[dict] = None,
 ) -> str | bytes:
     if isinstance(chunk, bytes):
         try:
@@ -401,6 +409,7 @@ def _normalize_sse_response_completed_chunk(
         normalized_text = _normalize_sse_response_completed_text(
             text,
             input_token_upper_bound=input_token_upper_bound,
+            request_data=request_data,
         )
         if normalized_text == text:
             return chunk
@@ -408,6 +417,7 @@ def _normalize_sse_response_completed_chunk(
     return _normalize_sse_response_completed_text(
         chunk,
         input_token_upper_bound=input_token_upper_bound,
+        request_data=request_data,
     )
 
 
@@ -465,11 +475,16 @@ def _responses_stream_chunk_for_delivery(
             chunk,
             input_token_upper_bound=input_token_upper_bound,
         )
+        _responses_output_module._sanitize_reasoning_wrapper_event(
+            chunk,
+            request_data,
+        )
         return chunk
     if isinstance(chunk, (str, bytes)):
         normalized = _normalize_sse_response_completed_chunk(
             chunk,
             input_token_upper_bound=input_token_upper_bound,
+            request_data=request_data,
         )
         if _request_is_responses_stream(request_data):
             text = (
@@ -507,6 +522,10 @@ def _responses_stream_chunk_for_delivery(
         _normalize_response_completed_event_usage(
             json_chunk,
             input_token_upper_bound=input_token_upper_bound,
+        )
+        _responses_output_module._sanitize_reasoning_wrapper_event(
+            json_chunk,
+            request_data,
         )
         return _json_stream_event(json_chunk)
     return chunk
@@ -2460,6 +2479,11 @@ def _build_streaming_error_fallback_payload(
     )
     if descendant_cleanup_payload is not None:
         payload = descendant_cleanup_payload
+    commentary_discipline_payload = (
+        _responses_request_module._with_codex_commentary_discipline_instruction(payload)
+    )
+    if commentary_discipline_payload is not None:
+        payload = commentary_discipline_payload
     compaction_payload = _responses_request_module._with_codex_compaction_controls(payload)
     if compaction_payload is not None:
         payload = compaction_payload

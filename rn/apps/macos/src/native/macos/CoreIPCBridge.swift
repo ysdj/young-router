@@ -111,7 +111,7 @@ import Foundation
                     route: "",
                     method: "POST",
                     body: data,
-                    timeoutInterval: Self.responseTimeoutInterval(for: metadata.method)
+                    timeoutInterval: Self.responseTimeoutInterval(for: metadata.method, request: data)
                 )
                 guard self.isValidResponseEnvelope(body, requestID: metadata.requestID),
                       let text = String(data: body, encoding: .utf8) else {
@@ -916,8 +916,28 @@ import Foundation
     /// A model probe waits for the deployment's own first-event budget and then
     /// for a complete fingerprint answer, so it outlives the transport default.
     /// Every other method keeps the short bound that keeps the UI responsive.
-    private static func responseTimeoutInterval(for method: String) -> TimeInterval {
-        method == "probe" ? 900 : 30
+    /// How long one Core reply may take.
+    ///
+    /// The probe and a WebDAV sync cross the network, so either can take
+    /// minutes on a slow server.  The short cap is what catches a wedged Core;
+    /// applying it to the sync told the reader "the local Core is unavailable"
+    /// while Core was still finishing the sync it had already started (the
+    /// pane's own status file recorded it succeeding afterwards).
+    private static func responseTimeoutInterval(for method: String, request: Data) -> TimeInterval {
+        if method == "probe" { return 900 }
+        if method == "dispatch", webdavRemoteOperation(in: request) != nil { return 900 }
+        return 30
+    }
+
+    /// The WebDAV operation inside a dispatch request, when it has one: these
+    /// read and write a remote file, so they earn the long wait.
+    private static func webdavRemoteOperation(in data: Data) -> String? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let params = object["params"] as? [String: Any],
+              let action = params["action"] as? [String: Any],
+              (action["domain"] as? String)?.lowercased() == "webdav" else { return nil }
+        let type = ((action["type"] as? String) ?? (action["action"] as? String) ?? "").lowercased()
+        return ["push", "webdav_push", "pull", "webdav_pull", "sync", "webdav_sync"].contains(type) ? type : nil
     }
 
     private func requestMetadata(_ data: Data) -> (requestID: String, method: String)? {

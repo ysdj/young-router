@@ -14,9 +14,14 @@ The staged directory contains::
     traceone.js                     upstream dist module (ESM)
     prompt.txt                      upstream frozen web prompt
     manifest.json                   upstream revision, staging time, target routes
-    data/unified_bank.json          reference fingerprints
-    data/codex_low_v4_adapter_415.json
-    data/codex_low_v4_support_415.json
+    data/<bank>.json                reference fingerprints
+    data/<adapter>.json             fitted adapter document
+    data/<support>.json             fitted support document
+
+The three classifier artifacts are named after the classifier revision upstream
+shipped, so this adapter requires one artifact per role instead of pinning one
+release's spelling: a re-staged build with `unified_bank_v2_16.json` and
+`codex_low_v7_adapter_791.json` runs without a code change here.
 
 Every entry point tolerates an unstaged checkout: :func:`available` reports the
 engine state instead of raising, and :func:`identify` raises
@@ -28,6 +33,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -53,13 +59,35 @@ FALLBACK_TARGET_MODELS = (
     "gpt-6-astra",
 )
 
-_REQUIRED_FILES = (
-    "traceone.js",
-    "prompt.txt",
-    "data/unified_bank.json",
-    "data/codex_low_v4_adapter_415.json",
-    "data/codex_low_v4_support_415.json",
+_REQUIRED_FILES = ("traceone.js", "prompt.txt")
+# The classifier artifacts carry the upstream revision in their names
+# (`unified_bank_v2_16.json`, `codex_low_v7_adapter_791.json`), so the staged
+# set is discovered by role instead of pinned to one release's spelling.
+_REQUIRED_DATA_ROLES = (
+    re.compile(r"unified_bank[^/]*\.json$"),
+    re.compile(r"_adapter_[^/]*\.json$"),
+    re.compile(r"_support_[^/]*\.json$"),
 )
+
+
+def _data_artifact_names(root: Path) -> list[str]:
+    """The staged ``data`` files, or an empty list when a role is missing."""
+
+    try:
+        names = sorted(path.name for path in (root / "data").iterdir() if path.is_file())
+    except OSError:
+        return []
+    for pattern in _REQUIRED_DATA_ROLES:
+        if not any(pattern.search(name) for name in names):
+            return []
+    return names
+
+
+def _missing_staged_files(root: Path) -> list[str]:
+    missing = [name for name in _REQUIRED_FILES if not (root / name).is_file()]
+    if not _data_artifact_names(root):
+        missing.append("data/<classifier artifacts>")
+    return missing
 
 
 class TraceOneUnavailable(RuntimeError):
@@ -195,7 +223,7 @@ def available() -> bool:
     root = staged_root()
     if not worker_path().is_file():
         return False
-    if any(not (root / name).is_file() for name in _REQUIRED_FILES):
+    if _missing_staged_files(root):
         return False
     try:
         node_command()
@@ -231,7 +259,7 @@ def identify(answer_text: str, *, timeout_seconds: float | None = None) -> dict[
     if not isinstance(answer_text, str) or not answer_text.strip():
         raise ValueError("TraceOne needs the model answer text")
     root = staged_root()
-    missing = [name for name in _REQUIRED_FILES if not (root / name).is_file()]
+    missing = _missing_staged_files(root)
     if missing:
         raise TraceOneUnavailable(
             "TraceOne is not staged; run scripts/update_traceone.py before building "

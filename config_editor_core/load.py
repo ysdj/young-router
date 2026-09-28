@@ -20,6 +20,8 @@ from .schema import (
     MENU_RELAY_SOURCE_MODEL_KEY,
     MENU_ROUTE_KEY,
     MENU_PROVIDER_SOURCE_KEY,
+    PUBLIC_MODEL_CONTEXT_KEY,
+    PUBLIC_MODEL_LIMIT_KEYS,
     UPSTREAM_PROTOCOL_MODE_KEY,
     UPSTREAM_URL_SURFACE_KEY,
     _as_dict,
@@ -30,6 +32,7 @@ from .schema import (
     _editor_deployment_id,
     _jsonable,
     _menu_order,
+    _positive_int,
     _provider_key_id,
     _provider_auth,
     _provider_source,
@@ -264,6 +267,7 @@ def _model_to_editor(
             "supported_upstream_url_surfaces",
             "x-young-router-upstream-url-surface-order",
             MENU_MODEL_ENABLED_KEY,
+            *PUBLIC_MODEL_LIMIT_KEYS,
         }
     }
     raw_upstream_url_surface = model_info.get(UPSTREAM_URL_SURFACE_KEY)
@@ -296,6 +300,7 @@ def _model_to_editor(
     return {
         "enabled": enabled,
         "model_enabled": _bool_value(model_info.get(MENU_MODEL_ENABLED_KEY), enabled),
+        "max_input_tokens": _positive_int(model_info.get(PUBLIC_MODEL_CONTEXT_KEY)),
         "provider": provider,
         "model_name": _string_value(entry.get("model_name")),
         "litellm_model": _string_value(params.get("model")),
