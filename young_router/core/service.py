@@ -3510,7 +3510,18 @@ class CoreStore:
                     # persisted on the slot and to the catalog the last
                     # successful read recorded, so signing in is not a
                     # precondition for managing a model.
-                    materials = binding_materials({"resources": sources}, refresh=True)
+                    # The durable half of "a key this Core already holds":
+                    # the provider document persists each linked slot's value,
+                    # and the relay domain's own cache does not survive a
+                    # restart.  Passing it here is what makes a model edit work
+                    # on a fresh Core while the station is unreachable.
+                    slot_reader = getattr(providers, "relay_slot_credentials", None)
+                    slot_credentials = slot_reader() if callable(slot_reader) else None
+                    materials = binding_materials(
+                        {"resources": sources},
+                        refresh=True,
+                        slot_credentials=slot_credentials,
+                    )
                     materialized = materialize(materials)
                     # Whatever this resolution said becomes the pane's own map
                     # of the linked rows: a successful one clears it, a failed
@@ -3611,8 +3622,13 @@ class CoreStore:
             if issue_count or pending:
                 # The local relay document is authoritative for completed
                 # work, while outstanding journal entries keep this domain
-                # dirty and retryable.
-                self._drafts["relay_accounts"]["dirty"] = True
+                # dirty and retryable.  A dependency-only Apply owns none of
+                # that work, so it must not re-dirty the relay either: doing so
+                # would put relay_accounts back into the next edit's domain
+                # list and drag a model edit straight back into the station's
+                # backlog.
+                if not relay_dependency_only:
+                    self._drafts["relay_accounts"]["dirty"] = True
                 self._drafts["relay_accounts"]["validation"] = {"valid": True, "issues": []}
                 self._revision += 1
                 self._persist_metadata()

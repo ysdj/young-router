@@ -4527,7 +4527,13 @@ class RelayAccountsDomain:
         resource_id = str(issue.get("resource_id", source.get("resource_id", ""))).strip()
         return account_id, resource_id
 
-    def binding_materials(self, sources: object | None = None, *, refresh: bool = False) -> dict[str, Any]:
+    def binding_materials(
+        self,
+        sources: object | None = None,
+        *,
+        refresh: bool = False,
+        slot_credentials: object | None = None,
+    ) -> dict[str, Any]:
         """Resolve private relay binding material for the Core Apply coordinator.
 
         A station read is a best-effort *improvement* here, never a
@@ -4537,6 +4543,12 @@ class RelayAccountsDomain:
         all (no dashboard session, an expired one, or a station that is down).
         Model management therefore stays decoupled from relay sign-in — only the
         key value itself is shared, and it needs no sign-in to be used.
+
+        ``slot_credentials`` carries the key values the provider document
+        already persists on its relay slots (account_id, resource_id) -> value.
+        That is the durable half of the same fact: this Core's in-process cache
+        is empty after a restart, so without it a fresh Core would report a
+        key it holds as unavailable while the station is unreachable.
 
         This method is intentionally *not* used by ``snapshot`` or generic
         actions. Its return value can contain ``api_key`` and must remain
@@ -4561,6 +4573,15 @@ class RelayAccountsDomain:
         # credential cache, and that same read is what a station refusing the
         # session makes impossible.
         cached_keys = self._cached_source_keys(raw_sources)
+        if isinstance(slot_credentials, Mapping):
+            for raw_key, value in slot_credentials.items():
+                if not isinstance(value, str) or not value:
+                    continue
+                try:
+                    account_id, resource_id = raw_key
+                except (TypeError, ValueError):
+                    continue
+                cached_keys.setdefault((str(account_id), str(resource_id)), value)
         refresh_issues: list[dict[str, str]] = []
         if refresh:
             try:
