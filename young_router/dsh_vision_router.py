@@ -8,7 +8,7 @@ fallback adapter: the selected LiteLLM deployment remains the source of the
 answer, and this module is entered only after that deployment rejects image
 input.
 
-Mirror reviewed against upstream dsh-vision-router 2.1.6; re-check the latest
+Mirror reviewed against upstream dsh-vision-router 2.2.2; re-check the latest
 upstream release and adapt this module before artifact builds (AGENTS.md,
 Runtime And Compatibility).
 """
@@ -105,6 +105,12 @@ _DEFAULT_HTTP_PROVIDERS = (
 _LOCAL_OLLAMA_BASE_URL = "http://127.0.0.1:11434/v1"
 _LOCAL_OLLAMA_MODEL = "qwen2.5vl"
 _LOCAL_LM_STUDIO_BASE_URL = "http://localhost:1234/v1"
+# The OpenAI-compatible wire carries `reasoning_effort` only for these values;
+# upstream sends the field for a provider that declares one (2.2.1 disables
+# hidden reasoning on generated local Ollama providers so the bounded
+# completion budget goes to visible answer text, while LM Studio stays
+# untouched because it has no documented reasoning wire contract).
+_REASONING_EFFORTS = frozenset({"none", "low", "medium", "high", "max"})
 _DEFAULT_HTTP_BASE_URL = _DEFAULT_HTTP_PROVIDERS[0][1]
 _ACTIVE_PROVIDER: ContextVar[dict[str, Any] | None] = ContextVar(
     "dsh_vision_router_active_provider",
@@ -360,6 +366,7 @@ def _provider_from_entry(
     default_base_url: str = "",
     default_model: str = "",
     default_max_tokens: Optional[int] = None,
+    default_reasoning_effort: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
     if not isinstance(entry, dict):
         return None
@@ -387,6 +394,14 @@ def _provider_from_entry(
     top_p = entry.get("top_p", entry.get("topP"))
     if isinstance(top_p, bool) or not isinstance(top_p, (int, float)) or not 0 <= float(top_p) <= 1:
         top_p = None
+    reasoning_effort = entry.get("reasoningEffort", entry.get("reasoning_effort"))
+    if not isinstance(reasoning_effort, str) or reasoning_effort.strip().lower() not in _REASONING_EFFORTS:
+        reasoning_effort = default_reasoning_effort
+    reasoning_effort = (
+        reasoning_effort.strip().lower()
+        if isinstance(reasoning_effort, str) and reasoning_effort.strip().lower() in _REASONING_EFFORTS
+        else None
+    )
     return {
         "name": str(entry.get("name") or entry.get("provider") or default_name),
         "base_url": base_url.strip().rstrip("/"),
@@ -397,6 +412,7 @@ def _provider_from_entry(
         "max_tokens": max_tokens,
         "temperature": float(temperature) if temperature is not None else None,
         "top_p": float(top_p) if top_p is not None else None,
+        "reasoning_effort": reasoning_effort,
     }
 
 
@@ -503,6 +519,9 @@ def _configured_provider_chain() -> list[dict[str, Any]]:
                     default_base_url=default_base_url,
                     default_model=default_model,
                     default_max_tokens=2048,
+                    # Upstream's generated local Ollama provider disables hidden
+                    # reasoning (2.2.1); LM Studio keeps no reasoning field.
+                    default_reasoning_effort="none" if key == "localOllama" else None,
                 )
                 _append_provider_if_new(local_providers, item)
 
@@ -558,6 +577,7 @@ def _configured_provider_chain() -> list[dict[str, Any]]:
                     "max_tokens": _router_max_tokens(),
                     "temperature": None,
                     "top_p": None,
+                    "reasoning_effort": None,
                 }
             )
     return providers
@@ -633,6 +653,9 @@ def _chat_completion_payload(reference: str, provider: Optional[dict[str, Any]] 
         payload["temperature"] = active["temperature"]
     if active.get("top_p") is not None:
         payload["top_p"] = active["top_p"]
+    reasoning_effort = active.get("reasoning_effort")
+    if isinstance(reasoning_effort, str) and reasoning_effort in _REASONING_EFFORTS:
+        payload["reasoning_effort"] = reasoning_effort
     return payload
 
 

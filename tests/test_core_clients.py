@@ -1,7 +1,7 @@
 """Focused coverage for the external client configuration file surface.
 
-The settings pane edits the remaining desktop clients (pi, DeepSeek Harness,
-DSH Desktop, opencode) as raw documents and needs to show where each file
+The settings pane edits the remaining desktop clients (pi, DeepSeek Harness
+CLI and Desktop, opencode) as raw documents and needs to show where each file
 lives.  These tests pin the two Core-owned boundaries that support it: the
 read-only ``files`` listing and the staged raw-document editor for the
 ``clients`` domain.
@@ -16,18 +16,17 @@ import tempfile
 import unittest
 from unittest import mock
 
-from young_router.core import CoreIPCClient, CoreIPCServer, CoreStore
+from young_router.core import CoreError, CoreIPCClient, CoreIPCServer, CoreStore
 from young_router.core.domains.claude import ClaudeSettingsDomain
 from young_router.core.domains.clients import ClientSettingsDomain
 from young_router.core.domains.codex import CodexSettingsDomain
-from young_router.core.protocol import validate_method_result
+from young_router.core.protocol import MAX_EDITOR_DOCUMENT_BYTES, validate_method_result
 
 
 def _client_environment(directory: str) -> dict[str, str]:
     return {
         "PI_CODING_AGENT_DIR": str(Path(directory) / "pi"),
         "DSH_HOME": str(Path(directory) / "dsh"),
-        "DSH_DESKTOP_HOME": str(Path(directory) / "dsh-desktop"),
         "OPENCODE_CONFIG_DIR": str(Path(directory) / "opencode-config"),
         "OPENCODE_DATA_DIR": str(Path(directory) / "opencode-data"),
         "CODEX_HOME": str(Path(directory) / "codex"),
@@ -59,12 +58,16 @@ class ClientFilesDomainTests(unittest.TestCase):
             self.assertEqual("json", files["pi_settings"]["language"])
             self.assertEqual(str(Path(directory) / "pi" / "settings.json"), files["pi_settings"]["path"])
             self.assertEqual("yaml", files["dsh_settings"]["language"])
-            # DSH Desktop keeps Harness state under the app data directory,
-            # never in the CLI's ``~/.dsh`` profile home.
+            # DeepSeek Harness Desktop owns the reserved ``desktop`` profile
+            # under the shared Harness home, so its file is that profile's
+            # Cordis patch layer, listed in the same ``dsh`` group as the CLI's
+            # settings document.
+            self.assertEqual("cordis.patch.yml", files["dsh_desktop_settings"]["name"])
             self.assertEqual(
-                str(Path(directory) / "dsh-desktop" / "harness" / "settings.yaml"),
+                str(Path(directory) / "dsh" / "profiles" / "desktop" / "cordis.patch.yml"),
                 files["dsh_desktop_settings"]["path"],
             )
+            self.assertEqual("dsh", files["dsh_desktop_settings"]["client"])
             self.assertEqual("opencode.json", files["opencode_config"]["name"])
             # The model catalog the Codex pane's switch installs is listed with
             # the file name Core itself writes, under the same Codex home.
@@ -117,6 +120,26 @@ class ClientFilesDomainTests(unittest.TestCase):
 
                 with self.assertRaises(Exception):
                     domain.dispatch("set_raw", {"document": "unregistered", "text": "{}"})
+
+    def test_clients_domain_accepts_a_desktop_patch_with_cordis_js_expressions(self) -> None:
+        """A Cordis patch layer may carry ``!!js`` expressions."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            environment = _client_environment(directory)
+            with mock.patch.dict(os.environ, environment):
+                domain = ClientSettingsDomain()
+                patch = (
+                    "# user patch layer\n"
+                    "- id: example-plugin\n"
+                    "  name: \"@example/dsh-plugin\"\n"
+                    "  config:\n"
+                    "    mode: !!js process.env.EXAMPLE_MODE ?? 'safe'\n"
+                )
+                domain.dispatch("set_raw", {"document": "dsh_desktop_settings", "text": patch})
+                self.assertTrue(domain.validate()["valid"])
+                domain.apply()
+                written = Path(environment["DSH_HOME"]) / "profiles" / "desktop" / "cordis.patch.yml"
+                self.assertEqual(patch, written.read_text(encoding="utf-8"))
 
     def test_clients_domain_reloads_an_externally_changed_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -180,7 +203,7 @@ class ClientFilesDomainTests(unittest.TestCase):
                     "codex", "codex",
                     "claudeCode", "claudeDesktop", "claudeDesktop",
                     "pi", "pi", "pi",
-                    "dsh", "dshDesktop", "opencode", "opencode",
+                    "dsh", "dsh", "opencode", "opencode",
                     "codex", "codex",
                 ],
                 [row["client"] for row in result["files"]],
@@ -255,6 +278,71 @@ class ClientFilesDomainTests(unittest.TestCase):
 
             with self.assertRaises(Exception):
                 client.call("editor", {"domain": "clients", "document": "unregistered"})
+
+    def test_the_managed_catalog_opens_past_the_old_two_megabyte_ceiling(self) -> None:
+        """A registered file this app generates must stay openable.
+
+        The managed Codex catalog already exceeds 2 MB for a 26-model list,
+        and the pane offers it to the raw editor, so the read has to hand over
+        the whole document and the stage has to accept it back.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            environment = _client_environment(directory)
+            catalog = Path(environment["CODEX_HOME"]) / "model-catalog.json"
+            catalog.parent.mkdir(parents=True, exist_ok=True)
+            document = json.dumps(
+                {"models": [{"slug": f"model-{index}", "base_instructions": "x" * 8192} for index in range(300)]},
+                indent=2,
+            )
+            self.assertGreater(len(document.encode("utf-8")), 2 * 1024 * 1024)
+            self.assertLess(len(document.encode("utf-8")), MAX_EDITOR_DOCUMENT_BYTES)
+            catalog.write_text(document, encoding="utf-8")
+
+            with mock.patch.dict(os.environ, environment):
+                clients = ClientSettingsDomain()
+            core = CoreStore(domains=[clients])
+            server = CoreIPCServer(core)
+            endpoint = server.start()
+            self.addCleanup(server.stop)
+            client = CoreIPCClient(endpoint, server.bootstrap_token)
+            self.addCleanup(client.close)
+
+            editor = client.call("editor", {"domain": "clients", "document": "codex_model_catalog"})
+            self.assertEqual(document, editor["text"])
+            self.assertEqual(document, editor["baseline"])
+
+            staged = client.call(
+                "editor",
+                {"editor_token": editor["editor_token"], "text": document + "\n"},
+            )
+            self.assertEqual(document + "\n", staged["text"])
+
+    def test_a_document_past_the_editor_budget_names_its_size(self) -> None:
+        """A refusal states the document's size instead of blaming the Core."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            environment = _client_environment(directory)
+            catalog = Path(environment["CODEX_HOME"]) / "model-catalog.json"
+            catalog.parent.mkdir(parents=True, exist_ok=True)
+            catalog.write_text(json.dumps({"models": [], "padding": "x" * (MAX_EDITOR_DOCUMENT_BYTES + 1)}), encoding="utf-8")
+
+            with mock.patch.dict(os.environ, environment):
+                clients = ClientSettingsDomain()
+            core = CoreStore(domains=[clients])
+
+            with self.assertRaises(CoreError) as caught:
+                core.editor_document("clients", "codex_model_catalog")
+            self.assertEqual("editor_too_large", caught.exception.code)
+
+            with self.assertRaises(CoreError) as caught:
+                core.stage_editor_text(
+                    "clients",
+                    "codex_model_catalog",
+                    "x" * (MAX_EDITOR_DOCUMENT_BYTES + 1),
+                    revision=core.snapshot()["revision"],
+                )
+            self.assertEqual("editor_too_large", caught.exception.code)
 
 
 if __name__ == "__main__":

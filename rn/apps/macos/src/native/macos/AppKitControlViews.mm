@@ -928,8 +928,19 @@ void DiscardStaleScrollerSubviews(NSScrollView *scrollView);
 // itself should use the same compact regular font as every ordinary cell.  A
 // plain NSView keeps the label out of AppKit's automatic group-cell styling
 // while preserving the native spanning-row layout.
+//
+// A group row is also never selectable in AppKit, so the standard row
+// highlight never draws for one.  A spanning row the shared view marks as
+// clickable (the routes table's public-model rows) therefore paints its own
+// selection in `LiteLLMSelectableGroupRowView`; this cell only follows that
+// state with its label ink.
 @interface LiteLLMTableGroupCellView : NSView
 @property(nonatomic, strong) NSTextField *label;
+/** YES when this clickable section header owns the pane's current selection. */
+@property(nonatomic) BOOL selectedForModel;
+/** YES while the owning table draws the selection in its focused appearance. */
+@property(nonatomic) BOOL emphasized;
+- (void)applyLabelInk;
 @end
 
 @implementation LiteLLMTableGroupCellView
@@ -950,6 +961,116 @@ void DiscardStaleScrollerSubviews(NSScrollView *scrollView);
     ]];
   }
   return self;
+}
+
+- (void)viewDidMoveToSuperview
+{
+  [super viewDidMoveToSuperview];
+  // A recycled cell takes the emphasis of whatever row view hosts it now, so
+  // its ink never survives from the row it last served.
+  if ([self.superview isKindOfClass:[NSTableRowView class]]) {
+    self.emphasized = ((NSTableRowView *)self.superview).isEmphasized;
+  }
+}
+
+- (void)setSelectedForModel:(BOOL)selectedForModel
+{
+  if (_selectedForModel == selectedForModel) {
+    return;
+  }
+  _selectedForModel = selectedForModel;
+  [self applyLabelInk];
+  [self setNeedsDisplay:YES];
+}
+
+- (void)setEmphasized:(BOOL)emphasized
+{
+  if (_emphasized == emphasized) {
+    return;
+  }
+  _emphasized = emphasized;
+  [self applyLabelInk];
+}
+
+- (void)applyLabelInk
+{
+  // An unfocused table keeps its labels readable on the light gray fill, the
+  // same way an ordinary selected row does.
+  NSColor *ink = self.selectedForModel && self.emphasized
+      ? NSColor.alternateSelectedControlTextColor
+      : NSColor.labelColor;
+  self.label.textColor = ink;
+  self.label.attributedStringValue = TableCellTitle(self.label.stringValue, ink);
+}
+
+@end
+
+// The selection bar for a clickable section header.  A group row never gets
+// AppKit's own selection drawing, and its spanning cell does not cover the
+// scroller gutter, so the row view paints the standard fill across the whole
+// row — exactly the geometry an ordinary selected row has, in the appearance
+// (accent when the table is focused, light gray when it is not) AppKit would
+// have used for that row.
+@interface LiteLLMSelectableGroupRowView : NSTableRowView
+@property(nonatomic) BOOL forceSelected;
+@end
+
+@implementation LiteLLMSelectableGroupRowView
+
+- (void)setForceSelected:(BOOL)forceSelected
+{
+  if (_forceSelected == forceSelected) {
+    return;
+  }
+  _forceSelected = forceSelected;
+  [self setNeedsDisplay:YES];
+  [self syncCellEmphasis];
+}
+
+- (void)setEmphasized:(BOOL)emphasized
+{
+  if (self.isEmphasized == emphasized) {
+    return;
+  }
+  [super setEmphasized:emphasized];
+  [self setNeedsDisplay:YES];
+  [self syncCellEmphasis];
+}
+
+- (void)syncCellEmphasis
+{
+  for (NSView *view in self.subviews) {
+    if ([view isKindOfClass:[LiteLLMTableGroupCellView class]]) {
+      ((LiteLLMTableGroupCellView *)view).emphasized = self.isEmphasized;
+    }
+  }
+}
+
+- (void)drawSelectionInRect:(NSRect)dirtyRect
+{
+  if (self.forceSelected) {
+    // The forced bar is painted in the background pass so it covers the whole
+    // row; never let AppKit draw its own copy over a partial rect.
+    return;
+  }
+  [super drawSelectionInRect:dirtyRect];
+}
+
+// AppKit only asks for the selection drawing on a row it selected itself, and
+// it never selects a group row; the background pass is the one it always runs,
+// so the forced bar is painted there — over the row's full bounds, because a
+// partial dirty rect (the scroller's strip) would leave a notch beside the
+// scroller.
+- (void)drawBackgroundInRect:(NSRect)dirtyRect
+{
+  [super drawBackgroundInRect:dirtyRect];
+  if (self.forceSelected && !self.isSelected) {
+    NSColor *fill = self.isEmphasized
+        ? NSColor.selectedContentBackgroundColor
+        : NSColor.unemphasizedSelectedContentBackgroundColor;
+    [fill setFill];
+    NSRectFill(self.bounds);
+  }
 }
 
 @end
@@ -2585,6 +2706,8 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
 - (void)updateScrollerVisibility;
 - (void)tableColumnDidResize:(NSNotification *)notification;
 - (BOOL)isSpanningRow:(NSInteger)row;
+- (BOOL)isSelectableSpanningRow:(NSInteger)row;
+- (void)refreshSelectableSpanningSelection;
 @end
 
 @implementation LiteLLMAppKitTableComponentView {
@@ -2692,7 +2815,8 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
       oldViewProps.disabledRowKeys != newViewProps.disabledRowKeys ||
       oldViewProps.secondaryCellKeys != newViewProps.secondaryCellKeys ||
       oldViewProps.alertRowKeys != newViewProps.alertRowKeys ||
-      oldViewProps.spanningRowKeys != newViewProps.spanningRowKeys;
+      oldViewProps.spanningRowKeys != newViewProps.spanningRowKeys ||
+      oldViewProps.selectableSpanningRowKeys != newViewProps.selectableSpanningRowKeys;
   const bool dataChanged = columnsChanged || compactChanged || paddingChanged || firstColumnPaddingChanged ||
       overflowBehaviorChanged || sourceListChanged || rowsChanged;
   const BOOL initialDataLoad = !_hasLoadedData;
@@ -2779,7 +2903,22 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
 
   const NSInteger selectedIndex = SegmentIndex(newViewProps.rowKeys, newViewProps.selectedKey);
   const BOOL selectionChanged = oldViewProps.selectedKey != newViewProps.selectedKey;
-  if (selectedIndex >= 0) {
+  if (selectedIndex >= 0 && [self isSelectableSpanningRow:selectedIndex]) {
+    // A public-model row is a clickable section header, not a selectable row:
+    // the selected route must not keep its highlight while the pane shows the
+    // public model, so the table clears the row selection instead and paints
+    // the section header itself (refreshSelectableSpanningSelection).
+    if (_tableView.selectedRow >= 0) {
+      [_tableView deselectAll:nil];
+    }
+    if (selectionChanged && _scrollView.hasVerticalScroller) {
+      const NSRect visibleRect = _scrollView.documentVisibleRect;
+      const NSRect selectedRect = [_tableView rectOfRow:selectedIndex];
+      if (!NSIsEmptyRect(visibleRect) && !NSContainsRect(visibleRect, selectedRect)) {
+        [_tableView scrollRowToVisible:selectedIndex];
+      }
+    }
+  } else if (selectedIndex >= 0) {
     if (selectionChanged || _tableView.selectedRow != selectedIndex) {
       [_tableView selectRowIndexes:[NSIndexSet indexSetWithIndex:selectedIndex] byExtendingSelection:NO];
     }
@@ -2796,7 +2935,47 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   } else if (_tableView.selectedRow >= 0) {
     [_tableView deselectAll:nil];
   }
+  if (selectionChanged || dataChanged) {
+    [self refreshSelectableSpanningSelection];
+  }
   _synchronizingSelection = NO;
+}
+
+- (void)refreshSelectableSpanningSelection
+{
+  const auto &viewProps = *std::static_pointer_cast<const LiteLLMAppKitTableProps>(_props);
+  [_tableView enumerateAvailableRowViewsUsingBlock:^(NSTableRowView *rowView, NSInteger row) {
+    if (![self isSelectableSpanningRow:row]) {
+      return;
+    }
+    const BOOL selected = !viewProps.selectedKey.empty() &&
+        viewProps.rowKeys[static_cast<size_t>(row)] == viewProps.selectedKey;
+    if ([rowView isKindOfClass:[LiteLLMSelectableGroupRowView class]]) {
+      ((LiteLLMSelectableGroupRowView *)rowView).forceSelected = selected;
+    }
+    NSView *cell = [self->_tableView viewAtColumn:0 row:row makeIfNecessary:NO];
+    if ([cell isKindOfClass:[LiteLLMTableGroupCellView class]]) {
+      ((LiteLLMTableGroupCellView *)cell).selectedForModel = selected;
+    }
+  }];
+}
+
+- (NSTableRowView *)tableView:(NSTableView *)tableView rowViewForRow:(NSInteger)row
+{
+  if (![self isSelectableSpanningRow:row]) {
+    return nil;
+  }
+  NSUserInterfaceItemIdentifier identifier = @"LiteLLMSelectableGroupRow";
+  LiteLLMSelectableGroupRowView *rowView = (LiteLLMSelectableGroupRowView *)[tableView makeViewWithIdentifier:identifier owner:self];
+  if (rowView == nil) {
+    rowView = [[LiteLLMSelectableGroupRowView alloc] initWithFrame:NSZeroRect];
+    rowView.identifier = identifier;
+  }
+  const auto &viewProps = *std::static_pointer_cast<const LiteLLMAppKitTableProps>(_props);
+  rowView.forceSelected = !viewProps.selectedKey.empty() &&
+      row < static_cast<NSInteger>(viewProps.rowKeys.size()) &&
+      viewProps.rowKeys[static_cast<size_t>(row)] == viewProps.selectedKey;
+  return rowView;
 }
 
 - (void)layout
@@ -3160,8 +3339,32 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
       viewProps.spanningRowKeys.end();
 }
 
+// A spanning row stays a section header unless the shared view marks it as an
+// entry of its own (the routes table's public-model rows).  A selectable one
+// keeps the spanning layout but is an ordinary row to AppKit, so it highlights
+// and answers clicks like every other row.
+- (BOOL)isSelectableSpanningRow:(NSInteger)row
+{
+  if (![self isSpanningRow:row]) {
+    return NO;
+  }
+  const auto &viewProps = *std::static_pointer_cast<const LiteLLMAppKitTableProps>(_props);
+  if (row < 0 || static_cast<size_t>(row) >= viewProps.rowKeys.size()) {
+    return NO;
+  }
+  const std::string &rowKey = viewProps.rowKeys[static_cast<size_t>(row)];
+  return std::find(
+      viewProps.selectableSpanningRowKeys.begin(),
+      viewProps.selectableSpanningRowKeys.end(),
+      rowKey) != viewProps.selectableSpanningRowKeys.end();
+}
+
 - (BOOL)tableView:(__unused NSTableView *)tableView isGroupRow:(NSInteger)row
 {
+  // Every spanning row keeps the group-row look (the name spans the columns
+  // and does not repeat per column).  A selectable one is still an entry of
+  // its own: the marker only lifts the mouse-action guard in handleRowClick,
+  // because AppKit refuses to select group rows at all.
   return [self isSpanningRow:row];
 }
 
@@ -3182,6 +3385,12 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
         (cellIndex >= viewProps.cells.size() || viewProps.cells[cellIndex].empty())) {
       return 14;
     }
+    // A clickable public-model row sits in the list like any ordinary row
+    // (its selection bar is the standard one); only an inert section header
+    // keeps the taller group-row rhythm.
+    if ([self isSelectableSpanningRow:row]) {
+      return tableView.rowHeight;
+    }
     return tableView.rowHeight + 6;
   }
   return tableView.rowHeight;
@@ -3199,7 +3408,11 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   if ([self isSpanningRow:row]) {
     const size_t cellIndex = static_cast<size_t>(row) * columnCount;
     NSString *value = cellIndex < viewProps.cells.size() ? StringFromStdString(viewProps.cells[cellIndex]) : @"";
-    if (viewProps.sourceList && value.length == 0) {
+    if ([self isSelectableSpanningRow:row]) {
+      // A selectable spanning row keeps its section-header look (AppKit spans
+      // it across the columns and refuses to select it), yet it is an entry
+      // the user can click: the mouse action reports it below.
+    } else if (viewProps.sourceList && value.length == 0) {
       NSUserInterfaceItemIdentifier identifier = @"LiteLLMAppKitTableSeparatorCell";
       LiteLLMTableSeparatorView *cell = (LiteLLMTableSeparatorView *)[tableView makeViewWithIdentifier:identifier owner:self];
       if (cell == nil) {
@@ -3222,9 +3435,13 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
       if (constraint.firstAttribute == NSLayoutAttributeLeading) constraint.constant = firstColumnHorizontalPadding;
       else if (constraint.firstAttribute == NSLayoutAttributeTrailing) constraint.constant = -firstColumnHorizontalPadding;
     }
+    const std::string &groupRowKey = viewProps.rowKeys[static_cast<size_t>(row)];
+    cell.selectedForModel = [self isSelectableSpanningRow:row] &&
+        !viewProps.selectedKey.empty() &&
+        groupRowKey == viewProps.selectedKey;
+    cell.label.stringValue = value;
     cell.label.font = TableCellFont();
-    cell.label.textColor = NSColor.labelColor;
-    cell.label.attributedStringValue = TableCellTitle(value, NSColor.labelColor);
+    [cell applyLabelInk];
     cell.label.toolTip = value;
     cell.label.accessibilityLabel = value;
     cell.toolTip = value;
@@ -3359,7 +3576,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   const auto &viewProps = *std::static_pointer_cast<const LiteLLMAppKitTableProps>(_props);
   const NSInteger selectedRow = _tableView.selectedRow;
   if (selectedRow < 0 || static_cast<size_t>(selectedRow) >= viewProps.rowKeys.size() ||
-      [self isSpanningRow:selectedRow]) {
+      ([self isSpanningRow:selectedRow] && ![self isSelectableSpanningRow:selectedRow])) {
     // A click on the empty space below the rows clears the native selection.
     // Report the cleared state so the shared view drops the item its + / −
     // header and editor were acting on instead of keeping a selection the
@@ -3382,7 +3599,8 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   }
   const auto &viewProps = *std::static_pointer_cast<const LiteLLMAppKitTableProps>(_props);
   const NSInteger row = _tableView.clickedRow;
-  if (row < 0 || static_cast<size_t>(row) >= viewProps.rowKeys.size() || [self isSpanningRow:row]) {
+  if (row < 0 || static_cast<size_t>(row) >= viewProps.rowKeys.size() ||
+      ([self isSpanningRow:row] && ![self isSelectableSpanningRow:row])) {
     return;
   }
   LiteLLMAppKitTableEventEmitter::OnSelectionChange event{

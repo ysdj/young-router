@@ -61,6 +61,26 @@ MENU_ACTIONS = frozenset(
 )
 ANSI_CONTROL_SEQUENCE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 SERVICE_TIMESTAMP_PREFIX = re.compile(r"^(?:\[[^]]+\]\s*)+")
+# A service row is one detail line; anything longer would be cut in the table
+# anyway.  The repeat suffix has to fit inside the same bound.
+MAX_TEXT_LOG_CHARS = 512
+# One burst of identical console lines is one event: the managed proxy runs
+# one LiteLLM worker per configured worker and reports its lifecycle per
+# worker, and a client probes one route many times a minute.  The window keeps
+# a repeat hours later its own row instead of folding it into an old burst.
+SERVICE_REPEAT_WINDOW_SECONDS = 60.0
+SERVICE_BANNER_HEADLINE = "litellm: proxy initialized with config"
+# Console art, a client address, a worker PID, and LiteLLM's own clock are the
+# only parts of a repeated line that differ between copies.
+SERVICE_ART = re.compile(r"[█▀▄▌▐░▒▓╔╗╚╝║═╠╣╦╩╬┌┐└┘├┤┬┴┼─]")
+SERVICE_BARE_MODEL = re.compile(r"[A-Za-z0-9_.\-]{1,128}")
+SERVICE_EVENT_VOLATILE = re.compile(
+    r"\d{2}:\d{2}:\d{2}\s+-\s+|\[\d{1,7}\]|\b\d{1,3}(?:\.\d{1,3}){3}:\d{1,5}\b"
+)
+# Every console line starts with this app's own ``[timestamp]`` marker, so a
+# second marker inside a line is the head of the next record: the workers share
+# one log and a partial write lets two of them interleave.
+SERVICE_EMBEDDED_TIMESTAMP = re.compile(r"\[\d{4}-\d{2}-\d{2}T[^\]]+\]")
 LEADING_TIMESTAMP = re.compile(
     r"^\[(?P<bracket>[^\]]+)\]\s*|^(?:Updated\s+)?(?P<iso>\d{4}-\d{2}-\d{2}[T ][^\s]+)\s*"
 )
@@ -1224,15 +1244,23 @@ def _is_service_noise(line: str) -> bool:
         "github.com/berriai/litellm/issues/new" in lowered
         or lowered.startswith("thank you for using litellm")
         or lowered.startswith("give feedback / get help")
+        or lowered.startswith(SERVICE_BANNER_HEADLINE)
     ):
         return True
     if message.startswith("#") and message.endswith("#"):
         return True
     if re.fullmatch(r"[#_|/\\=+* .:-]+", message):
         return True
-    # LiteLLM prints configured model identifiers as bare banner lines. Real
-    # service events carry a severity, PID, timestamp, or explanatory text.
+    # The startup banner draws itself in block characters before it lists the
+    # configured models.
+    if SERVICE_ART.search(message):
+        return True
+    # LiteLLM prints configured model identifiers as bare banner lines, with a
+    # provider prefix or as the configured name alone. Real service events
+    # carry a severity, PID, timestamp, or explanatory text.
     if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.:/-]+", message):
+        return True
+    if SERVICE_BARE_MODEL.fullmatch(message):
         return True
     return False
 
@@ -1392,6 +1420,103 @@ def _service_payload_without_level(line: str) -> str:
     ).strip()
 
 
+def _service_event_identity(line: str) -> str:
+    """The parts of a console line that make it the event the reader sees.
+
+    One worker's copy of a line differs from another's only by its PID, by the
+    client address uvicorn logs beside it, and by the clock LiteLLM prints at
+    the head of its own records.  Two lines that share an identity are copies
+    of one event, not two events.
+    """
+
+    payload = SERVICE_TIMESTAMP_PREFIX.sub("", line).strip()
+    return SERVICE_EVENT_VOLATILE.sub("#", payload)
+
+
+def _service_repeat_row(line: str, count: int) -> str:
+    """One row for a repeated event, bounded like any other service row."""
+
+    if count <= 1:
+        return line
+    suffix = f" (×{count})"
+    return f"{line[: MAX_TEXT_LOG_CHARS - len(suffix)]}{suffix}"
+
+
+def _collapse_service_repeats(lines: list[str]) -> list[str]:
+    """Fold one burst of identical service lines into one row.
+
+    A sixteen-worker proxy reports its uvicorn lifecycle once per worker, so a
+    single start wrote sixteen copies of every line, and a client that probes
+    the endpoint repeats one access line many times a minute. Each burst is
+    one event, and the count is what shows whether every worker arrived, so
+    the row states it instead of the copies.  Workers write concurrently, so
+    their copies interleave with each other's: a burst is every line with the
+    same identity inside the window, wherever it sits, and the row stays at
+    the burst's first line.
+    """
+
+    collapsed: list[str] = []
+    bursts: dict[str, int] = {}
+    counts: list[int] = []
+    stamps: list[float | None] = []
+
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        identity = _service_event_identity(line)
+        moment = _record_timestamp(line)
+        index = bursts.get(identity)
+        if index is not None:
+            last = stamps[index]
+            if moment is None or last is None or abs(moment - last) <= SERVICE_REPEAT_WINDOW_SECONDS:
+                counts[index] += 1
+                if moment is not None:
+                    stamps[index] = moment
+                continue
+        bursts[identity] = len(collapsed)
+        collapsed.append(line)
+        counts.append(1)
+        stamps.append(moment)
+    return [
+        _service_repeat_row(line, count)
+        for line, count in zip(collapsed, counts)
+    ]
+
+
+def _split_merged_service_lines(lines: list[str]) -> list[str]:
+    """Restore records that two proxy workers wrote into one line.
+
+    The workers share one log file and a partial write lets their output
+    interleave, so one console line can carry the head of the next record
+    glued to its tail.  Both records keep their own timestamp marker; split
+    there so each is projected (or dropped) as the line it was.
+    """
+
+    expanded: list[str] = []
+    for raw in lines:
+        # A route-trace record is one JSON document whose preview may quote a
+        # timestamp of its own; it is dropped whole, never split.
+        if "litellm_route_trace" in raw:
+            expanded.append(raw)
+            continue
+        stripped = raw.strip()
+        match = SERVICE_TIMESTAMP_PREFIX.match(stripped)
+        if match is None:
+            expanded.append(raw)
+            continue
+        payload = stripped[match.end() :]
+        if SERVICE_EMBEDDED_TIMESTAMP.search(payload) is None:
+            expanded.append(raw)
+            continue
+        stamp = stripped[: match.end()].strip().split("]", 1)[0] + "]"
+        for part in SERVICE_EMBEDDED_TIMESTAMP.split(payload):
+            part = part.strip()
+            if part:
+                expanded.append(f"{stamp} {part}")
+    return expanded
+
+
 def _group_service_lines(lines: list[str]) -> list[str]:
     """Collapse one logical service event (including traceback lines) to one row."""
     grouped: list[str] = []
@@ -1407,10 +1532,15 @@ def _group_service_lines(lines: list[str]) -> list[str]:
         current_timestamp = ""
         in_traceback = False
 
-    for raw in lines:
-        line = REDACT_TEXT(ANSI_CONTROL_SEQUENCE.sub("", raw)).strip()
-        if not line or "litellm_route_trace" in line or _is_service_noise(line):
+    for raw in _split_merged_service_lines(lines):
+        plain = ANSI_CONTROL_SEQUENCE.sub("", raw).strip()
+        # These two cheap checks have to stay ahead of ``REDACT_TEXT``, which
+        # runs several regexes over every line: the blanks, the startup
+        # banner, and the route-trace records are most of a service log, and
+        # the trace records alone are the bulk of its bytes.
+        if not plain or "litellm_route_trace" in plain or _is_service_noise(plain):
             continue
+        line = REDACT_TEXT(plain)
         timestamp = _leading_timestamp(line)
         same_timestamp = bool(
             current
@@ -2055,12 +2185,10 @@ class LogsDomain:
                 else self._read_lines(path, line_limit=line_limit)
             )
         if tab == "service":
-            lines = [
-                line
-                for line in lines
-                if "litellm_route_trace" not in line and not _is_service_noise(line)
-            ]
-            lines = _group_service_lines(lines)
+            # ``_group_service_lines`` already drops the route trace, the
+            # startup banner, and the console noise; the repeats left behind
+            # are the per-worker copies of one event.
+            lines = _collapse_service_repeats(_group_service_lines(lines))
         configured_deployments = (
             _configured_deployments(self.config_path)
             if tab in {"requests", "route-trace"}
@@ -2116,7 +2244,9 @@ class LogsDomain:
                 if record:
                     records.append(record)
             elif tab not in {"requests", "route-trace"}:
-                records.append(REDACT_TEXT(ANSI_CONTROL_SEQUENCE.sub("", line))[:512])
+                records.append(
+                    REDACT_TEXT(ANSI_CONTROL_SEQUENCE.sub("", line))[:MAX_TEXT_LOG_CHARS]
+                )
         if tab == "requests":
             records = _collapse_request_records(records)
             self._refresh_runtime_settings()

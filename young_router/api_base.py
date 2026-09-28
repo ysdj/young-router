@@ -107,6 +107,12 @@ def _url_with_path(parsed: Any, parts: list[str]) -> str:
 
 
 def normalize_configured_api_base(value: Any) -> str:
+    text = str(value or "").strip()
+    if text.startswith("os.environ/"):
+        # An environment reference resolves to a complete base URL in the
+        # process that owns it (the WorkBuddy worker's loopback origin drives
+        # both of its variants).  It is never a host to guess a scheme for.
+        return text
     split = _split_api_url(value)
     if split is None:
         return str(value or "").strip().rstrip("/")
@@ -121,6 +127,11 @@ def normalize_configured_api_base(value: Any) -> str:
 
 
 def api_base_for_surface(value: Any, surface: Any) -> str:
+    text = str(value or "").strip()
+    if text.startswith("os.environ/"):
+        # See ``normalize_configured_api_base``: the resolved value already
+        # carries the endpoint the surface adapter needs.
+        return text
     root = _api_root_and_version(value)
     if root is None:
         return str(value or "").strip().rstrip("/")

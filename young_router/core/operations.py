@@ -103,6 +103,54 @@ def _bounded_text(value: object, *, limit: int = 240) -> str:
     return REDACT_TEXT(str(value))[:limit]
 
 
+# LiteLLM's Router takes a per-exception retry count only inside
+# ``router_settings.retry_policy``. A count written beside it is a key the
+# Router does not accept: every worker drops it with its own warning on every
+# start (sixteen warnings per key per start in the managed proxy), and the
+# configured retry never takes effect.
+ROUTER_RETRY_POLICY_KEYS = frozenset(
+    {
+        "AuthenticationErrorRetries",
+        "BadRequestErrorRetries",
+        "TimeoutErrorRetries",
+        "RateLimitErrorRetries",
+        "ContentPolicyViolationErrorRetries",
+        "InternalServerErrorRetries",
+        "ServiceUnavailableErrorRetries",
+        "DefaultRetries",
+    }
+)
+
+
+def _router_settings_with_retry_counts(document: object) -> object | None:
+    """Move retry counts the Router reads only in ``retry_policy`` there.
+
+    Returns the staged document when it needs adapting, and ``None`` when the
+    source configuration can be staged as it is.
+    """
+
+    if not isinstance(document, Mapping):
+        return None
+    settings = document.get("router_settings")
+    if not isinstance(settings, Mapping):
+        return None
+    misplaced = {
+        key: value for key, value in settings.items() if key in ROUTER_RETRY_POLICY_KEYS
+    }
+    if not misplaced:
+        return None
+    policy = settings.get("retry_policy")
+    retry_policy: dict[Any, Any] = dict(policy) if isinstance(policy, Mapping) else {}
+    for key, value in misplaced.items():
+        retry_policy.setdefault(key, value)
+    staged = dict(document)
+    staged["router_settings"] = {
+        **{key: value for key, value in settings.items() if key not in ROUTER_RETRY_POLICY_KEYS},
+        "retry_policy": retry_policy,
+    }
+    return staged
+
+
 def _safe_object(value: object, *, limit: int = 64) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         return {}
@@ -177,6 +225,48 @@ class CoreServiceController:
         self.litellm_bin = configured_bin
         self._environment = dict(environment or {})
         self._status_cache: tuple[float, dict[str, Any]] | None = None
+        # Set by ``attach_workbuddy`` when Core owns a WorkBuddy worker; a
+        # bare controller (tests, CLI probes) simply has none.
+        self._workbuddy: object | None = None
+
+    def attach_workbuddy(self, runtime: object | None) -> None:
+        """Share the Core-owned WorkBuddy worker with this controller."""
+
+        self._workbuddy = runtime
+
+    def _runtime_config_references_workbuddy(self) -> bool:
+        """Whether the staged config routes anything through the worker."""
+
+        try:
+            text = self.paths.runtime_config.read_text(encoding="utf-8")
+        except OSError:
+            return False
+        return "YOUNG_ROUTER_WORKBUDDY" in text
+
+    def _workbuddy_environment(self, *, autostart: bool) -> dict[str, str]:
+        """The loopback base URLs and bearer the proxy child resolves.
+
+        ``autostart`` is only for the proxy launch: a status poll or a preview
+        must never spawn a Node worker on its own, and a config that routes
+        nothing through WorkBuddy never starts one either.
+        """
+
+        runtime = self._workbuddy
+        if runtime is None:
+            return {}
+        try:
+            if autostart:
+                if self._runtime_config_references_workbuddy():
+                    return runtime.environment(autostart=True)
+                # Removing every WorkBuddy route releases the worker instead of
+                # leaving a credential-holding process behind an unused port.
+                runtime.stop()
+                return {}
+            return runtime.environment_values()
+        except Exception:
+            # A missing Node runtime or an unstaged package leaves the
+            # WorkBuddy routes unusable; every other provider must still start.
+            return {}
 
     def _invalidate_status_cache(self) -> None:
         self._status_cache = None
@@ -587,6 +677,10 @@ class CoreServiceController:
         # GitHub refresh before serving the local proxy.
         env["LITELLM_LOCAL_MODEL_COST_MAP"] = "true"
         env[CORE_PID_ENV] = str(os.getpid())
+        # WorkBuddy routes resolve their loopback base URL and bearer from the
+        # proxy's own environment; an already-running worker supplies them and
+        # a configured route starts one at proxy launch (see ``start``).
+        env.update(self._workbuddy_environment(autostart=False))
         return env
 
     def _configured_port(self, env: Mapping[str, str] | None = None) -> int:
@@ -744,9 +838,23 @@ class CoreServiceController:
         from config_editor_core.schema import _load_yaml
 
         try:
-            _load_yaml(self.paths.config)
-            data = self.paths.config.read_bytes()
-            atomic_write_bytes(self.paths.runtime_config, data)
+            document = _load_yaml(self.paths.config)
+            staged = _router_settings_with_retry_counts(document)
+            if staged is None:
+                atomic_write_bytes(self.paths.runtime_config, self.paths.config.read_bytes())
+            else:
+                import yaml
+
+                atomic_write_text(
+                    self.paths.runtime_config,
+                    yaml.safe_dump(
+                        staged,
+                        allow_unicode=True,
+                        default_flow_style=False,
+                        sort_keys=False,
+                        width=1000,
+                    ),
+                )
         except PersistenceError:
             raise
         except Exception:
@@ -850,6 +958,10 @@ class CoreServiceController:
         self.reset_transient_routing_state()
         self.paths.runtime_config.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         environment = self._runtime_env()
+        # The proxy resolves the WorkBuddy base URLs and the loopback bearer
+        # from its own environment, so the worker has to be listening before
+        # the child launches and its port must never enter config.yaml.
+        environment.update(self._workbuddy_environment(autostart=True))
         owner_token = secrets.token_urlsafe(OWNER_TOKEN_BYTES)
         environment[OWNER_TOKEN_ENV] = owner_token
         # An occupied configured port steps forward to the next free port; the

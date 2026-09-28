@@ -107,8 +107,71 @@ class HookDshVisionRouterTests(HookTestCase):
                 "max_tokens": 777,
                 "temperature": 0.25,
                 "top_p": 0.8,
+                "reasoning_effort": None,
             },
             providers[0],
+        )
+
+    def test_local_ollama_disables_reasoning_while_lm_studio_stays_unset(self) -> None:
+        """Upstream 2.2.1 spends the local Ollama budget on visible text."""
+
+        from young_router import dsh_vision_router as router
+
+        self._clear_dsh_runtime_overrides()
+        self.set_env(
+            "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON",
+            json.dumps(
+                {
+                    "enabled": True,
+                    "backend": "local",
+                    "providers": [],
+                    "httpProviders": [],
+                    "localOllama": {"enabled": True, "model": "vision-model"},
+                    "localLmStudio": {"enabled": True, "model": "vision-model"},
+                }
+            ),
+        )
+
+        providers = {provider["name"]: provider for provider in router._configured_provider_chain()}
+        self.assertEqual("none", providers["local-ollama"]["reasoning_effort"])
+        self.assertIsNone(providers["local-lmstudio"]["reasoning_effort"])
+
+        router._ACTIVE_PROVIDER.set(providers["local-ollama"])
+        self.assertEqual(
+            "none",
+            router._chat_completion_payload("data:image/png;base64,cG5n")["reasoning_effort"],
+        )
+        router._ACTIVE_PROVIDER.set(providers["local-lmstudio"])
+        self.assertNotIn("reasoning_effort", router._chat_completion_payload("data:image/png;base64,cG5n"))
+
+    def test_an_explicit_provider_reasoning_effort_passes_through(self) -> None:
+        from young_router import dsh_vision_router as router
+
+        self._clear_dsh_runtime_overrides()
+        self.set_env(
+            "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON",
+            json.dumps(
+                {
+                    "enabled": True,
+                    "backend": "api",
+                    "providers": [
+                        {
+                            "name": "configured-http",
+                            "baseURL": "https://vision.example/v1",
+                            "model": "vision-model",
+                            "reasoningEffort": "low",
+                        }
+                    ],
+                }
+            ),
+        )
+
+        provider = router._configured_provider_chain()[0]
+        self.assertEqual("low", provider["reasoning_effort"])
+        router._ACTIVE_PROVIDER.set(provider)
+        self.assertEqual(
+            "low",
+            router._chat_completion_payload("data:image/png;base64,cG5n")["reasoning_effort"],
         )
 
     def test_explicit_auto_quick_backend_does_not_restore_retired_provider(self) -> None:

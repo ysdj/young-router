@@ -9,11 +9,13 @@ Young Router is a native macOS and Windows app that runs a local AI gateway (bui
 ## Highlights
 
 - **Never stops.** Every model can have several routes, failing over same-order → next-order → wraparound. Incompatible protocols switch automatically and are remembered for 10 minutes. Failing routes cool down (2 failures / 300 s by default) and a background loop restores them as soon as they answer; stalled streams fail over instead of hanging. The app owns the service — start, health checks, shutdown — and the local port steps forward when busy.
+- **Public-model context you control.** The **Routes** view groups every route under its public model; click a group to rename it across all of its routes and set its context window (leave the field empty to keep the value pi.dev and the built-in registry resolve). The model detail shows the resolved 上下文 and links straight to it.
 - **Vision bridge.** When a route explicitly rejects image input, Young Router describes the image (local OCR, Ollama / LM Studio, your HTTP vision providers, or a free fallback) and retries the same route with text context. Routes that support vision always get the original image untouched.
 - **Search bridge.** Native hosted web search where supported; otherwise the bundled [pi-web-access](https://github.com/nicobailon/pi-web-access) worker does real searches and page fetches. OpenRouter routes use their native search tool. Transient failures are never remembered as "unsupported".
 - **Relay-station management.** Add a New API / Sub2API station by URL — the app detects its type, you sign in inside the app, and it loads your API keys, groups, models, and balance. Key changes save and sync to the station as you make them; deleting a key first shows which models depend on it; keys auto-bind to providers with the same Base URL. Official OpenAI / Claude accounts live in the same window.
 - **Degradation deep test.** The model detail pane's probe names what it will run: on a Responses route whose name matches a known Codex route it also runs the bundled [TraceOne](https://github.com/wangchao0708/TraceOne) fingerprint check and reports whether the answer came from the requested route or from a different one. A fingerprint mismatch is only reported — the model keeps its enable checkbox and its routing stays yours to change.
 - **Image generation bridge.** Image-generation requests are routed to the deployments that support them, with a forced retry when a capable route returns nothing.
+- **WorkBuddy accounts (China and international).** Add the product in the provider wizard, then link the WorkBuddy desktop app's own sign-in in the provider's **Service links** section: Young Router imports that app's model roster, keeps the token refreshed, and serves it through the bundled [dsh-workbuddy-connect](https://github.com/corrinehu/dsh-workbuddy-connect) worker, which stays the single owner of the upstream protocol. Both products can coexist and each keeps its own account, catalog, and credit.
 - **Codex & Claude in one click.** Codex Settings writes the local endpoint and key without touching your other settings, and adds model catalog, fast tier, compaction, reasoning-effort compatibility, and usage normalization. Claude Settings offers **Use local API**, plus models, permissions, and sandbox.
 - **Private by default.** Prompts, message bodies, authorization headers, and API keys never enter the request log.
 - **Validated, safe configuration.** Every edit is validated as it is saved, a rejected change leaves the previous configuration untouched, and credentials stay in private storage.
@@ -27,6 +29,7 @@ Also included: route-trace HTML reports, online usage, and optional WebDAV confi
 2. Open Young Router — the local service starts automatically; the menu bar / tray icon shows its state.
 3. Open **Service Provider Management…** to sign in to OpenAI / Claude, or add a New API / Sub2API station by URL. Keys and models load automatically.
    Prefer plain API keys? Add them in **Providers & Models…**, or import your current Codex / Claude setup.
+   WorkBuddy users: in the wizard pick WorkBuddy or WorkBuddy AI — the wizard fills the service's own address — then link the desktop app's account in the provider's **Service links** block and press **Manage models** to pick the models to import.
 4. Connect your tools:
    - **Codex** → **Codex Settings…** → choose a LiteLLM deployment
    - **Claude** → **Claude Settings…** → **Use local API**
@@ -95,6 +98,7 @@ MIT License. See [LICENSE](./LICENSE).
 - **中转站智能管理。** 填一个 URL 即可添加 New API / Sub2API 中转站：自动识别类型、在应用内登录、自动加载 API 密钥、分组、模型和余额。密钥改动即时保存并同步到中转站；删除前会提示哪些模型正在使用；Base URL 相同的供应商会自动绑定这些密钥。OpenAI / Claude 官方账号也在同一个窗口管理。
 - **降智深测。** 模型详情页的按钮会说明它将要执行什么：当线路走 responses 协议且模型名对应已知 Codex 线路时，同时运行内置的 [TraceOne](https://github.com/wangchao0708/TraceOne) 指纹探测，给出“指纹与所请求线路一致”还是“指纹更像另一条线路”。指纹不一致只作为结果展示——不会取消模型的启用勾选，路由怎么改仍由你决定。
 - **图像生成桥接。** 图像生成请求会被路由到真正支持该能力的线路；能力线路返回空响应时会强制重试，避免请求白跑。
+- **WorkBuddy 账号（国内版与国际版）。** 在添加向导中选出产品，再在供应商详情页的**服务商关联**里关联 WorkBuddy 桌面 App 自己的登录：漾路由据此导入该 App 的模型列表并自动续期，通过内置的 [dsh-workbuddy-connect](https://github.com/corrinehu/dsh-workbuddy-connect) worker 调用——上游协议始终由这个第三方包负责。两版可以并存，各自使用自己的账号、模型列表与积分。
 - **Codex 与 Claude 一键接入。** Codex 设置会写入本地端点与密钥且不碰你的其他配置，并提供模型目录、Fast 层级、压缩方式、推理强度兼容和用量归一化；Claude 设置提供**使用本机 API**，以及模型、权限和沙箱选项。
 - **默认保护隐私。** 提示词正文、消息内容、授权头和 API 密钥不会进入请求日志。
 - **配置安全可控。** 每次修改都会先校验再保存；校验不通过的修改不会覆盖现有配置，原始凭据保存在私有存储中。
@@ -108,6 +112,7 @@ MIT License. See [LICENSE](./LICENSE).
 2. 打开漾路由——本地服务自动启动，菜单栏 / 托盘图标显示服务状态。
 3. 打开**服务商管理…** 登录 OpenAI / Claude，或填入 URL 添加 New API / Sub2API 中转站，密钥和模型会自动加载。
    如果习惯直接用 API 密钥，可以在**供应商与模型…** 中添加，或导入现有的 Codex / Claude 配置。
+   WorkBuddy 用户：在向导的供应商类型中选择 WorkBuddy 或 WorkBuddy AI（基础 URL 自动填入服务官方地址），然后在供应商详情页的**服务商关联**里关联桌面 App 账号，再用**模型管理**挑选要导入的模型。
 4. 接入工具：
    - **Codex** → **Codex 设置…** → 选择一个 LiteLLM 部署
    - **Claude** → **Claude 设置…** → **使用本机 API**

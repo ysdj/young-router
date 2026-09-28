@@ -430,6 +430,50 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
         self.assertIn("os.environ/YOUNG_ROUTER_AUTH_EXAMPLE", source)
         self.assertNotIn("sk-ant-oat", source)
 
+    def test_workbuddy_login_round_trip_keeps_the_loopback_reference(self) -> None:
+        path = self.write_config(
+            """
+            providers:
+              WorkBuddy:
+                api_base: os.environ/YOUNG_ROUTER_WORKBUDDY_BASE
+                api_keys:
+                  - name: workbuddy-local
+                    value: os.environ/YOUNG_ROUTER_WORKBUDDY_KEY
+                x-young-router-provider-auth:
+                  kind: workbuddy_login
+                  credential_ref: provider-auth-workbuddy
+            model_list:
+              - model_name: glm-5.3
+                litellm_params:
+                  model: openai/glm-5.3
+                  api_base: os.environ/YOUNG_ROUTER_WORKBUDDY_BASE
+                  api_key: os.environ/YOUNG_ROUTER_WORKBUDDY_KEY
+                  order: 1
+                model_info:
+                  id: "00000005"
+                  provider: WorkBuddy
+                  api_key_name: workbuddy-local
+                  upstream_url_surface: openai/chat
+                  upstream_protocol_mode: fixed
+            """
+        )
+
+        payload = config_load.load_config(path)
+        provider = payload["providers"][0]
+        self.assertEqual("workbuddy_login", provider["auth_kind"])
+        self.assertEqual("os.environ/YOUNG_ROUTER_WORKBUDDY_BASE", provider["api_base"])
+        self.assertEqual("openai/glm-5.3", provider["models"][0]["litellm_model"])
+
+        config_api.save_config(payload["providers"], path)
+        source = path.read_text(encoding="utf-8")
+
+        # The loopback base stays a reference: no worker port and no bearer
+        # value may be written into the configuration file.
+        self.assertIn("os.environ/YOUNG_ROUTER_WORKBUDDY_BASE", source)
+        self.assertIn("os.environ/YOUNG_ROUTER_WORKBUDDY_KEY", source)
+        self.assertNotIn("127.0.0.1", source)
+        self.assertIn("model: openai/glm-5.3", source)
+
     def test_save_round_trip_keeps_multiple_providers_nested(self) -> None:
         path = self.write_config(
             """
@@ -738,12 +782,105 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
                 model_info:
                   id: "00000004"
                   provider: provider_alpha
-                  max_input_tokens: 262144
                   context_metadata_source: learned-upstream-error
                   context_metadata_model_id: openai/vendor-chat
             """
         )
-        with self.assertRaisesRegex(ValueError, "unsupported max_input_tokens"):
+        with self.assertRaisesRegex(ValueError, "unsupported context_metadata_source"):
+            config_load.load_config(path)
+
+    def test_public_model_context_round_trips_through_model_info(self) -> None:
+        path = self.write_config(
+            """
+            providers:
+              provider_alpha:
+                api_base: "https://example.com/v1"
+                api_keys:
+                  - name: default
+                    value: "sk-test"
+            model_list:
+              - model_name: balanced-chat
+                litellm_params:
+                  model: openai/vendor-chat
+                  api_base: "https://example.com/v1"
+                  api_key: "sk-test"
+                model_info:
+                  id: "00000004"
+                  provider: provider_alpha
+                  max_input_tokens: 372000
+            """
+        )
+
+        payload = config_load.load_config(path)
+        model = payload["providers"][0]["models"][0]
+        self.assertEqual(372000, model["max_input_tokens"])
+        self.assertNotIn("max_input_tokens", model["model_info_extra"])
+
+        config_api.save_config(payload["providers"], path)
+        source = path.read_text(encoding="utf-8")
+        self.assertIn("max_input_tokens: 372000", source)
+
+        # Clearing the field removes the key instead of writing a zero the
+        # proxy would read as a real limit.
+        model["max_input_tokens"] = None
+        config_api.save_config(payload["providers"], path)
+        source = path.read_text(encoding="utf-8")
+        self.assertNotIn("max_input_tokens", source)
+
+    def test_an_unmanaged_model_info_key_still_round_trips(self) -> None:
+        """The app manages the context window only; other keys stay untouched."""
+        path = self.write_config(
+            """
+            providers:
+              provider_alpha:
+                api_base: "https://example.com/v1"
+                api_keys:
+                  - name: default
+                    value: "sk-test"
+            model_list:
+              - model_name: balanced-chat
+                litellm_params:
+                  model: openai/vendor-chat
+                  api_base: "https://example.com/v1"
+                  api_key: "sk-test"
+                model_info:
+                  id: "00000004"
+                  provider: provider_alpha
+                  max_output_tokens: 64000
+            """
+        )
+
+        payload = config_load.load_config(path)
+        model = payload["providers"][0]["models"][0]
+        self.assertNotIn("max_output_tokens", model)
+        self.assertEqual(64000, model["model_info_extra"]["max_output_tokens"])
+
+        config_api.save_config(payload["providers"], path)
+        source = path.read_text(encoding="utf-8")
+        self.assertIn("max_output_tokens: 64000", source)
+
+    def test_load_rejects_a_non_positive_public_model_context(self) -> None:
+        path = self.write_config(
+            """
+            providers:
+              provider_alpha:
+                api_base: "https://example.com/v1"
+                api_keys:
+                  - name: default
+                    value: "sk-test"
+            model_list:
+              - model_name: balanced-chat
+                litellm_params:
+                  model: openai/vendor-chat
+                  api_base: "https://example.com/v1"
+                  api_key: "sk-test"
+                model_info:
+                  id: "00000004"
+                  provider: provider_alpha
+                  max_input_tokens: -1
+            """
+        )
+        with self.assertRaisesRegex(ValueError, "max_input_tokens must be a positive integer"):
             config_load.load_config(path)
 
     def test_load_rejects_removed_responses_endpoint_flag(self) -> None:

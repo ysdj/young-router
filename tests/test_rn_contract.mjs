@@ -24,7 +24,12 @@ function run(types) {
 }
 
 try {
-  assert.ok(original.includes('export type ProviderAuthKind = "api_key" | "openai_login" | "claude_login";'));
+  assert.ok(original.includes('export type ProviderAuthKind =\n'
+    + '  | "api_key"\n'
+    + '  | "openai_login"\n'
+    + '  | "claude_login"\n'
+    + '  | "workbuddy_login"\n'
+    + '  | "workbuddy_ai_login";'));
   assert.ok(original.includes("auth_status?: ProviderAuthStatus;"));
 
   const valid = run(original);

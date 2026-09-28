@@ -275,14 +275,15 @@ void WinUI3NativeLeafModule::ShowConfirmation(
     std::wstring const& title,
     std::wstring const& message,
     std::wstring const& confirm_label,
+    bool destructive,
     winrt::Microsoft::ReactNative::ReactPromise<bool> const& promise) noexcept {
   try {
     auto leaf = leaf_;
     auto js_dispatcher = context_.JSDispatcher();
-    context_.UIDispatcher().Post([leaf, title, message, confirm_label, promise, js_dispatcher] {
+    context_.UIDispatcher().Post([leaf, title, message, confirm_label, destructive, promise, js_dispatcher] {
       bool accepted = false;
       try {
-        accepted = leaf->Confirm(title, message, confirm_label);
+        accepted = leaf->Confirm(title, message, confirm_label, destructive);
       } catch (...) {
       }
       js_dispatcher.Post([promise, accepted] { promise.Resolve(accepted); });
@@ -739,7 +740,6 @@ void WinUI3NativeLeafModule::ShowGroupManager(
       labels.multiplier_label = read("multiplierLabel");
       labels.value_label = read("valueLabel");
       labels.copy_label = read("copyLabel");
-      labels.copied_label = read("copiedLabel");
       labels.failed_label = read("failedLabel");
       labels.models_label = read("modelsLabel");
       labels.empty_label = read("emptyLabel");
@@ -951,6 +951,16 @@ void WinUI3NativeLeafModule::RelayLogin(
   if (station_name) native_options.station_name = station_name;
   if (station_type) native_options.station_type = station_type;
   if (station_origin) native_options.station_origin = station_origin;
+  // One decision surface for the whole app: the sign-in browser asks its
+  // post-login question through the host's own window instead of a dialog of
+  // its own.
+  native_options.decide = [leaf = leaf_](
+                               std::wstring const& title,
+                               std::wstring const& message,
+                               std::wstring const& primary_label,
+                               std::wstring const& secondary_label) {
+    return leaf->DecideChoice(title, message, primary_label, secondary_label);
+  };
     context_.UIDispatcher().Post([
         owner, native_options = std::move(native_options), promise, js_dispatcher]() mutable {
       std::optional<WindowsRelayLoginResult> result;

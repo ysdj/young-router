@@ -77,6 +77,12 @@ PI_WEB_ACCESS_NODE_WORK="$RUNTIME_WORK/node"
 # The degradation deep test runs the latest upstream TraceOne, so every
 # artifact build re-checks its default branch instead of packaging a stale
 # classifier copy.
+# WorkBuddy access is driven through the published third-party package, so
+# every artifact build re-resolves its latest release instead of shipping a
+# stale protocol copy.
+WORKBUDDY_CONNECT_WORK="$RUNTIME_WORK/workbuddy-connect"
+"${PI_WEB_ACCESS_UPDATE_COMMAND[@]}" "$PROJECT_ROOT/scripts/update_workbuddy_connect.py" \
+  --output "$WORKBUDDY_CONNECT_WORK"
 TRACEONE_WORK="$RUNTIME_WORK/traceone"
 "${PI_WEB_ACCESS_UPDATE_COMMAND[@]}" "$PROJECT_ROOT/scripts/update_traceone.py" \
   --output "$TRACEONE_WORK"
@@ -178,6 +184,7 @@ for directory in young_router config_editor_core webdav; do
 done
 copy_tree "$PI_WEB_ACCESS_PACKAGE_WORK" "$CORE/young_router/pi-web-access"
 copy_tree "$TRACEONE_WORK" "$CORE/young_router/traceone"
+copy_tree "$WORKBUDDY_CONNECT_WORK" "$CORE/young_router/workbuddy-connect"
 
 if [[ -n "$RUNTIME_SOURCE" ]]; then
   if [[ ! -d "$RUNTIME_SOURCE/python" \
@@ -267,6 +274,10 @@ fi
 }
 [[ -f "$CORE/young_router/traceone/prompt.txt" ]] || {
   echo "The bundled TraceOne identity prompt is missing." >&2
+  exit 5
+}
+[[ -f "$CORE/young_router/workbuddy-connect/lib/index.js" ]] || {
+  echo "The bundled dsh-workbuddy-connect package is missing." >&2
   exit 5
 }
 [[ -f "$CORE/config_editor_core/api.py" ]] || {

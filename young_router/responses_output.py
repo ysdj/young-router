@@ -822,3 +822,270 @@ def _append_missing_pending_tool_search_done_events(pending: list[Any]) -> None:
                 "item": done_item,
             }
         )
+
+
+# ---------------------------------------------------------------------------
+# Leaked reasoning wrappers in message text
+# ---------------------------------------------------------------------------
+
+# Relays that serve a reasoning backend sometimes leave the model's thought
+# summary inside the assistant's *visible* text, wrapped in a `<thinking>`
+# opener that is frequently never closed:
+#
+#     <thinking>**Searching official sources**\n**Planning label review**
+#
+# The client stores that text as the assistant message, so the wrapper shows up
+# in the transcript and the next request replays it, which teaches the model to
+# keep writing the tags.  Only the wrapper tokens are removed here: the item,
+# its id, its type, its position and every other character stay exactly as the
+# upstream sent them, so the client's record of the turn keeps its shape and the
+# context the next request replays keeps the same words minus the inert
+# markers.  An opener with no closer keeps its text — a relay that never closes
+# the wrapper is still reporting what the model thought, and that summary is
+# part of the turn.
+_REASONING_WRAPPER_TAGS = ("thinking", "think", "budget:thinking")
+_REASONING_WRAPPER_STATE_KEY = "_young_router_reasoning_wrapper_state"
+_REASONING_WRAPPER_TEXT_EVENT_TYPES = frozenset(
+    {
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.content_part.added",
+        "response.content_part.done",
+        "response.output_item.added",
+        "response.output_item.done",
+        "response.completed",
+    }
+)
+
+
+def _reasoning_wrapper_opener(text: str) -> Optional[tuple[str, int, int]]:
+    """Return ``(tag, start, end)`` when ``text`` opens with a wrapper tag.
+
+    Only the very beginning of the text counts; a tag mentioned later in the
+    message is the model's own words and stays.
+    """
+
+    if not isinstance(text, str) or not text:
+        return None
+    start = 0
+    while start < len(text) and text[start].isspace():
+        start += 1
+    for tag in _REASONING_WRAPPER_TAGS:
+        opener = f"<{tag}>"
+        if text.startswith(opener, start):
+            return tag, start, start + len(opener)
+    return None
+
+
+def _reasoning_wrapper_opener_incomplete(text: str) -> bool:
+    """Return whether ``text`` may still grow into a wrapper opener."""
+
+    if not isinstance(text, str) or not text:
+        return False
+    start = 0
+    while start < len(text) and text[start].isspace():
+        start += 1
+    remainder = text[start:]
+    if not remainder:
+        # Whitespace only: an opener may still be on its way.
+        return True
+    return any(
+        remainder != f"<{tag}>" and f"<{tag}>".startswith(remainder)
+        for tag in _REASONING_WRAPPER_TAGS
+    )
+
+
+def _strip_reasoning_wrapper(text: str) -> str:
+    """Remove a leaked reasoning wrapper from an assistant message's text."""
+
+    opener = _reasoning_wrapper_opener(text)
+    if opener is None:
+        return text
+    tag, start, end = opener
+    closer = f"</{tag}>"
+    index = text.find(closer, end)
+    if index >= 0:
+        return text[:start] + text[end:index] + text[index + len(closer) :]
+    # The wrapper was never closed: everything after the opener is the thought
+    # summary.  A trailing fragment of the closer is a truncated marker rather
+    # than content, so it goes with the opener.
+    trailing = _responses_web_search_bridge_module._raw_tool_call_pending_prefix_len(
+        text,
+        closer,
+    )
+    return text[:start] + (text[end : len(text) - trailing] if trailing else text[end:])
+
+
+class _LeakedReasoningWrapperFilter:
+    """Deliver one message item's text with its leaked wrapper removed.
+
+    The filter works on the text received so far, so a marker split across two
+    chunks is handled as one and the text handed to the client always equals
+    ``_strip_reasoning_wrapper`` of the text received so far.
+    """
+
+    def __init__(self) -> None:
+        self.seen = ""
+        self.emitted = ""
+
+    def consume(self, text: str) -> str:
+        if not isinstance(text, str) or not text:
+            return ""
+        self.seen += text
+        if _reasoning_wrapper_opener_incomplete(self.seen):
+            return ""
+        visible = _strip_reasoning_wrapper(self.seen)
+        if not visible.startswith(self.emitted):
+            # Safety net: hand over the whole visible text rather than a diff
+            # that would drop text the client is still holding.
+            self.emitted = visible
+            return visible
+        delta = visible[len(self.emitted) :]
+        self.emitted = visible
+        return delta
+
+    def reset(self) -> None:
+        self.seen = ""
+        self.emitted = ""
+
+
+class _ReasoningWrapperStreamState:
+    """One leaked-wrapper filter per message item of a request."""
+
+    def __init__(self) -> None:
+        self.filters: dict[str, _LeakedReasoningWrapperFilter] = {}
+
+    def filter_for(self, item_id: Any) -> _LeakedReasoningWrapperFilter:
+        key = item_id if isinstance(item_id, str) and item_id else ""
+        found = self.filters.get(key)
+        if found is None:
+            found = _LeakedReasoningWrapperFilter()
+            self.filters[key] = found
+        return found
+
+    def consume_delta(self, item_id: Any, text: str) -> str:
+        return self.filter_for(item_id).consume(text)
+
+
+def _reasoning_wrapper_stream_state(
+    request_data: Any,
+) -> Optional[_ReasoningWrapperStreamState]:
+    if not isinstance(request_data, dict):
+        return None
+    state = request_data.get(_REASONING_WRAPPER_STATE_KEY)
+    if not isinstance(state, _ReasoningWrapperStreamState):
+        state = _ReasoningWrapperStreamState()
+        request_data[_REASONING_WRAPPER_STATE_KEY] = state
+    return state
+
+
+def _sanitize_reasoning_wrapper_message_item(item: Any) -> bool:
+    """Strip a leaked wrapper from a message item's ``output_text`` parts."""
+
+    if not isinstance(item, dict) or item.get("type") != "message":
+        return False
+    content = item.get("content")
+    if not isinstance(content, list):
+        return False
+    changed = False
+    for part in content:
+        if not isinstance(part, dict) or part.get("type") != "output_text":
+            continue
+        text = part.get("text")
+        if not isinstance(text, str):
+            continue
+        cleaned = _strip_reasoning_wrapper(text)
+        if cleaned != text:
+            part["text"] = cleaned
+            changed = True
+    return changed
+
+
+def _sanitize_reasoning_wrapper_response_objects(response: Any) -> bool:
+    """Strip leaked wrappers from every message item of a finished response."""
+
+    if not isinstance(response, dict):
+        return False
+    changed = False
+    output = response.get("output")
+    if isinstance(output, list):
+        for item in output:
+            if _sanitize_reasoning_wrapper_message_item(item):
+                changed = True
+    output_text = response.get("output_text")
+    if isinstance(output_text, str) and output_text:
+        cleaned = _strip_reasoning_wrapper(output_text)
+        if cleaned != output_text:
+            response["output_text"] = cleaned
+            changed = True
+    return changed
+
+
+def _sanitize_reasoning_wrapper_event(payload: Any, request_data: Any = None) -> bool:
+    """Strip a leaked reasoning wrapper from a delivered Responses event.
+
+    Returns whether the payload changed; the caller decides how to re-encode it.
+    Item ids, item types, item order and every text character that is not a
+    wrapper marker are preserved.
+    """
+
+    if not isinstance(payload, dict):
+        return False
+    event_type = payload.get("type")
+    if event_type not in _REASONING_WRAPPER_TEXT_EVENT_TYPES:
+        return False
+
+    if event_type == "response.output_text.delta":
+        delta = payload.get("delta")
+        if not isinstance(delta, str) or not delta:
+            return False
+        state = _reasoning_wrapper_stream_state(request_data)
+        cleaned = (
+            state.consume_delta(payload.get("item_id"), delta)
+            if state is not None
+            else _strip_reasoning_wrapper(delta)
+        )
+        if cleaned == delta:
+            return False
+        payload["delta"] = cleaned
+        return True
+
+    if event_type == "response.output_text.done":
+        text = payload.get("text")
+        if not isinstance(text, str) or not text:
+            return False
+        cleaned = _strip_reasoning_wrapper(text)
+        if cleaned == text:
+            return False
+        payload["text"] = cleaned
+        return True
+
+    if event_type in {"response.content_part.added", "response.content_part.done"}:
+        part = payload.get("part")
+        if not isinstance(part, dict) or part.get("type") != "output_text":
+            return False
+        text = part.get("text")
+        if not isinstance(text, str) or not text:
+            return False
+        cleaned = _strip_reasoning_wrapper(text)
+        if cleaned == text:
+            return False
+        part["text"] = cleaned
+        return True
+
+    if event_type in {"response.output_item.added", "response.output_item.done"}:
+        return _sanitize_reasoning_wrapper_message_item(payload.get("item"))
+
+    response = payload.get("response")
+    return _sanitize_reasoning_wrapper_response_objects(response)
+
+
+def _sanitize_reasoning_wrapper_response(response: Any, request_data: Any = None) -> Any:
+    """Strip leaked wrappers from a whole Responses payload before delivery."""
+
+    payload = _streaming_module._jsonable(response)
+    if not isinstance(payload, dict):
+        return response
+    if not _sanitize_reasoning_wrapper_response_objects(payload):
+        return response
+    return payload

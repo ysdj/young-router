@@ -842,27 +842,20 @@ std::map<std::string, std::string> ParseCookieHeader(std::string const& header) 
 // Subordinate post-login prompt: keep the typed password on this device, or
 // keep only the current login state. Shown once the sign-in was verified and
 // the commit has begun, so a closed window simply answers "session only".
+//
+// The host draws it on the app's own decision window (the same one every
+// confirmation uses on both hosts) rather than a ContentDialog: one question,
+// one surface.
 winrt::Windows::Foundation::IAsyncOperation<bool> ShowRememberPasswordPrompt(
     std::shared_ptr<LoginState> const& state) {
-  controls::ContentDialog prompt;
-  prompt.Title(winrt::box_value(winrt::hstring(Text(state->options, L"Remember the password?", L"是否记住密码？"))));
-  prompt.Content(winrt::box_value(winrt::hstring(Text(state->options,
+  const std::wstring title = Text(state->options, L"Remember the password?", L"是否记住密码？");
+  const std::wstring message = Text(state->options,
       L"Save the password on this device to enable automatic sign-in next time. Choose “Session only” to keep just the current sign-in state.",
-      L"密码将保存到本机，下次可自动登录。选择「仅记住登录态」则只保留本次登录状态。"))));
-  prompt.PrimaryButtonText(Text(state->options, L"Remember Password", L"记住密码"));
-  prompt.SecondaryButtonText(Text(state->options, L"Session Only", L"仅记住登录态"));
-  prompt.DefaultButton(controls::ContentDialogButton::Primary);
-  try {
-    prompt.XamlRoot(state->dialog.Content().XamlRoot());
-  } catch (...) {
-    co_return false;
-  }
-  try {
-    auto result = co_await prompt.ShowAsync();
-    co_return result == controls::ContentDialogResult::Primary;
-  } catch (...) {
-    co_return false;
-  }
+      L"密码将保存到本机，下次可自动登录。选择「仅记住登录态」则只保留本次登录状态。");
+  const std::wstring remember = Text(state->options, L"Remember Password", L"记住密码");
+  const std::wstring session_only = Text(state->options, L"Session Only", L"仅记住登录态");
+  if (!state->options.decide) co_return false;
+  co_return state->options.decide(title, message, remember, session_only);
 }
 
 winrt::fire_and_forget ProbeLogin(

@@ -769,6 +769,91 @@ class HookResponsesRequestPrepTests(HookTestCase):
             modified["instructions"],
         )
 
+    def test_codex_commentary_discipline_instruction_is_enabled_by_default(self) -> None:
+        hooks, _ = load_hook_module()
+        original = self._codex_collaboration_request()
+
+        modified = hooks._with_codex_commentary_discipline_instruction(original)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        instructions = modified["instructions"]
+        self.assertIn(hooks._CODEX_COMMENTARY_DISCIPLINE_MARKER, instructions)
+        self.assertIn("at most one progress message per assistant response", instructions)
+        self.assertIn("single short sentence", instructions)
+        self.assertIn("once per turn, never once per step", instructions)
+        self.assertIn("Once the plan is stated, do not state it again", instructions)
+        self.assertIn("call the tool instead of sending another message", instructions)
+        self.assertIn("repeats the same intent, skill, or promise", instructions)
+        self.assertEqual(
+            original["instructions"],
+            "Keep the requested implementation complete and tested.",
+        )
+
+        self.assertIsNone(
+            hooks._with_codex_commentary_discipline_instruction(modified)
+        )
+
+    def test_codex_commentary_discipline_instruction_can_be_disabled(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._CODEX_COMMENTARY_DISCIPLINE_ENV, "0")
+
+        self.assertIsNone(
+            hooks._with_codex_commentary_discipline_instruction(
+                self._codex_collaboration_request()
+            )
+        )
+
+    def test_codex_commentary_discipline_needs_a_declared_tool(self) -> None:
+        hooks, _ = load_hook_module()
+        request = self._codex_collaboration_request()
+        request["input"][0]["tools"] = []
+
+        self.assertIsNone(
+            hooks._with_codex_commentary_discipline_instruction(request)
+        )
+
+    def test_codex_commentary_discipline_ignores_compaction_and_non_codex(self) -> None:
+        hooks, _ = load_hook_module()
+        compaction = self._codex_collaboration_request()
+        compaction["input"].append({"type": "compaction_trigger"})
+        self.assertIsNone(
+            hooks._with_codex_commentary_discipline_instruction(compaction)
+        )
+
+        non_codex = self._codex_collaboration_request()
+        non_codex.pop("client_metadata")
+        self.assertIsNone(
+            hooks._with_codex_commentary_discipline_instruction(non_codex)
+        )
+
+    async def test_pre_call_injects_codex_commentary_discipline_instruction(self) -> None:
+        hooks, _ = load_hook_module()
+        hook = hooks.YoungRouterHook()
+
+        modified = await hook.async_pre_call_deployment_hook(
+            self._codex_collaboration_request(),
+            call_type="aresponses",
+        )
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertIn(
+            hooks._CODEX_COMMENTARY_DISCIPLINE_MARKER,
+            modified["instructions"],
+        )
+        # The two Codex instructions keep their own order: the tool registry
+        # first, the completion barrier second, the commentary rule last.
+        instructions = modified["instructions"]
+        self.assertLess(
+            instructions.index(hooks._CODEX_TOOL_REGISTRY_MARKER),
+            instructions.index(hooks._CODEX_DESCENDANT_CLEANUP_MARKER),
+        )
+        self.assertLess(
+            instructions.index(hooks._CODEX_DESCENDANT_CLEANUP_MARKER),
+            instructions.index(hooks._CODEX_COMMENTARY_DISCIPLINE_MARKER),
+        )
+
     @staticmethod
     def _as_root_collaboration_request(request: dict) -> dict:
         request["input"].insert(

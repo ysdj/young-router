@@ -4,14 +4,20 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
+import time
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest import mock
 
+from young_router.core.domains import relay_accounts
 from young_router.core.domains.providers_models import ProvidersModelsDomain
 from young_router.core.domains.relay_accounts import (
     DETECTION_TIMEOUT_SECONDS,
     RelayAccountsDomain,
     RelayAccountsError,
     RelayHTTPClient,
+    RelayTransportError,
 )
 from young_router.core.protocol import validate_method_result
 from young_router.core.service import CoreError, CoreStore
@@ -1515,6 +1521,143 @@ class RelayAccountsDomainTests(unittest.TestCase):
             self.assertEqual("unavailable", second["resource_error"])
             self.assertEqual(["newapi-7"], [item["id"] for item in second["resources"]])
 
+    def test_an_expired_remembered_session_is_renewed_from_the_saved_password(self) -> None:
+        """An aged-out station session is re-authenticated, not read as a dead key.
+
+        A sub2api session lives about two days while the app can stay open for
+        longer.  Every authenticated read — the group manager's key list, and
+        the Apply that materializes a linked route — shares that session, so a
+        rejected read used to end as `login_expired` and the Apply then reported
+        the linked key as unavailable, discarding the one credential that could
+        mint a new session.  The remembered password is that credential.
+        """
+
+        class ExpiringSessionClient(FakeRelayHTTPClient):
+            def __init__(self) -> None:
+                super().__init__(
+                    {
+                        "/api/v1/keys?page=1&page_size=100": {
+                            "code": 0,
+                            "data": {"items": [{"id": 4, "name": "Plus", "status": "active", "key": "sk-replace-plus-key", "group_id": 21}]},
+                        },
+                        "/api/v1/channels/available": {"code": 0, "data": []},
+                        "/api/v1/user/profile": {"code": 0, "data": {"balance": 1.0}},
+                        "/v1/models": {"object": "list", "data": [{"id": "model-a"}]},
+                    },
+                    password_login_result={
+                        "username": "person@example.test",
+                        "cookie": "",
+                        "access_token": "replace-renewed-token",
+                        "refresh_token": "replace-renewed-refresh",
+                    },
+                )
+                self.expired = False
+
+            def json(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
+                # Only the authenticated dashboard read fails, and a fresh
+                # sign-in is exactly what a station accepts again.
+                if self.expired and path == "/api/v1/keys?page=1&page_size=100":
+                    self.requests.append((origin, path, dict(headers)))
+                    raise RelayAccountsError("Relay login has expired")
+                return super().json(origin, path, headers=headers)
+
+            def password_login(self, origin: str, account_type: str, username: str, password: str) -> dict[str, str]:
+                result = super().password_login(origin, account_type, username, password)
+                self.expired = False
+                return result
+
+        with tempfile.TemporaryDirectory() as directory:
+            fake = ExpiringSessionClient()
+            domain = RelayAccountsDomain(directory, http_client=fake)
+            account = domain.dispatch(
+                "add",
+                {"type": "sub2api", "label": "Sub Relay", "origin": "https://sub.example.test", "remember_password": True},
+            )["accounts"][0]
+            domain.accept_login_result(
+                account["id"],
+                username="person@example.test",
+                access_token="replace-stale-token",
+                refresh_token="replace-stale-refresh",
+                password="replace-password",
+            )
+            domain.apply()
+
+            # The stored session ages out on the station side.
+            fake.expired = True
+            result = domain.refresh_resources(account["id"])
+
+            self.assertEqual("ready", result["resource_status"])
+            self.assertEqual("none", result["resource_error"])
+            self.assertEqual("signed_in", result["login_status"])
+            self.assertEqual(["sub2api-4"], [resource["id"] for resource in result["resources"]])
+            # The saved password is what minted the new session, on the same
+            # site and for the same account — never a guessed replacement.
+            self.assertEqual(
+                [("https://sub.example.test", "sub2api", "person@example.test", "replace-password")],
+                fake.password_logins,
+            )
+            # The renewed session replaced the stale one on disk.
+            persisted = json.loads(
+                (Path(directory) / ".litellm-runtime" / "relay-accounts.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual("replace-renewed-token", persisted["accounts"][0]["session"]["access_token"])
+            self.assertNotIn("replace-stale-token", json.dumps(persisted))
+
+    def test_a_renewal_is_attempted_once_and_skipped_without_a_saved_password(self) -> None:
+        """A station that rejects the renewed session is the account's real answer.
+
+        The renewal is bounded to one attempt per read, and an account that
+        never saved its password has nothing to renew from: the expired
+        observation stands and no login is attempted.
+        """
+
+        class AlwaysExpiredClient(FakeRelayHTTPClient):
+            def json(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
+                if path == "/api/v1/keys?page=1&page_size=100":
+                    self.requests.append((origin, path, dict(headers)))
+                    raise RelayAccountsError("Relay login has expired")
+                return super().json(origin, path, headers=headers)
+
+        with tempfile.TemporaryDirectory() as directory:
+            fake = AlwaysExpiredClient({}, password_login_result=RelayAccountsError("Relay username or password is invalid"))
+            domain = RelayAccountsDomain(directory, http_client=fake)
+            account = domain.dispatch(
+                "add",
+                {"type": "sub2api", "label": "Sub Relay", "origin": "https://sub.example.test", "remember_password": True},
+            )["accounts"][0]
+            domain.accept_login_result(
+                account["id"],
+                username="person@example.test",
+                access_token="replace-stale-token",
+                password="replace-password",
+            )
+            domain.apply()
+
+            result = domain.refresh_resources(account["id"])
+
+            self.assertEqual("login_expired", result["resource_error"])
+            self.assertEqual(1, len(fake.password_logins))
+            # A renewal the station refused is the account's real answer: the
+            # read is not sent again, so there is no renewal loop.
+            self.assertEqual(
+                1,
+                len([path for _, path, _ in fake.requests if path == "/api/v1/keys?page=1&page_size=100"]),
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            fake = AlwaysExpiredClient({})
+            domain = RelayAccountsDomain(directory, http_client=fake)
+            account = domain.dispatch(
+                "add",
+                {"type": "sub2api", "label": "Sub Relay", "origin": "https://sub.example.test", "remember_password": False},
+            )["accounts"][0]
+            domain.accept_login_result(account["id"], username="person@example.test", access_token="replace-stale-token")
+
+            result = domain.refresh_resources(account["id"])
+
+            self.assertEqual("login_expired", result["resource_error"])
+            self.assertEqual([], fake.password_logins)
+
     def test_staging_a_new_browser_session_clears_old_resource_selection(self) -> None:
         fake = FakeRelayHTTPClient(
             {
@@ -1693,6 +1836,261 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 [{"Authorization": "Bearer sk-replace-active-key"}],
                 [headers for _, path, headers in fake.requests if path == "/v1/models"],
             )
+
+    def test_sub2api_linked_material_joins_the_keys_own_catalog_over_a_narrower_group_page(self) -> None:
+        """A group page must never veto a model the key's own catalog serves.
+
+        The channel page lists what one channel declares for a group, while the
+        key's own ``/v1/models`` list answers for what that key can call.  A
+        linked route is materialized against both: a page naming six Claude
+        models answered a key whose catalog named a seventh, and the route could
+        never apply while the page alone decided it.
+        """
+
+        fake = FakeRelayHTTPClient(
+            {
+                "/api/v1/keys?page=1&page_size=100": {
+                    "code": 0,
+                    "data": {
+                        "items": [
+                            {"id": 4, "name": "Plus", "status": "active", "key": "sk-replace-plus-key", "group_id": 21},
+                        ]
+                    },
+                },
+                "/api/v1/channels/available": {
+                    "code": 0,
+                    "data": [
+                        {
+                            "name": "plus",
+                            "platforms": [
+                                {
+                                    "platform": "anthropic",
+                                    "groups": [{"id": 21, "name": "Plus分组"}],
+                                    "supported_models": [{"name": "model-a"}],
+                                }
+                            ],
+                        }
+                    ],
+                },
+                "/v1/models": {
+                    "object": "list",
+                    "data": [{"id": "model-a"}, {"id": "model-b"}],
+                },
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RelayAccountsDomain(directory, http_client=fake)
+            account_id = domain.dispatch(
+                "add",
+                {"type": "sub2api", "label": "Sub Relay", "origin": "https://sub.example.test"},
+            )["accounts"][0]["id"]
+            domain.accept_login_result(account_id, username="sample@example.test", cookie="session=replace-cookie")
+
+            resources = domain.refresh_resources(account_id)["resources"]
+
+            # The group manager keeps the page's list: an ordinary read never
+            # fans out one gateway read per key.
+            self.assertEqual([["model-a"]], [resource["models"] for resource in resources])
+            self.assertEqual([], [path for _, path, _ in fake.requests if path == "/v1/models"])
+
+            account = domain.snapshot()["accounts"][0]
+            materials = domain.binding_materials(
+                [
+                    {
+                        "station_id": account["station_id"],
+                        "account_id": account_id,
+                        "resource_id": resources[0]["id"],
+                    }
+                ]
+            )
+
+            self.assertEqual([], materials["issues"])
+            self.assertEqual(["model-a", "model-b"], materials["resources"][0]["models"])
+            self.assertEqual(["model-a", "model-b"], materials["resources"][0]["source_models"])
+            # The gateway read is authenticated by the key it is about.
+            self.assertEqual(
+                [{"Authorization": "Bearer sk-replace-plus-key"}],
+                [headers for _, path, headers in fake.requests if path == "/v1/models"],
+            )
+            # What the key taught Apply stays inside Apply: the stored catalog
+            # the pane renders is unchanged.
+            self.assertEqual(
+                [["model-a"]],
+                [resource["models"] for resource in domain.snapshot()["accounts"][0]["resources"]],
+            )
+
+    def test_a_cached_key_still_materializes_when_the_station_session_expires(self) -> None:
+        """An apply-time refresh must not throw away the key it already holds.
+
+        Model management is decoupled from relay sign-in: the only thing a
+        binding needs from the relay is the key value, and a key this Core
+        already read is cached data.  An apply-time refresh clears that cache
+        before reading the station, so a session that ages out used to leave the
+        index empty and report the key as unavailable — while the same key's own
+        gateway catalog (authenticated by the key, not the session) was still
+        answering.  The read is now an improvement, not a precondition.
+        """
+
+        class ExpiringStation:
+            def __init__(self) -> None:
+                self.alive = True
+                self.calls: list[str] = []
+
+            def json(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
+                del origin
+                self.calls.append(path)
+                if path == "/v1/models" and headers.get("Authorization", "").endswith("sk-replace-plus-key"):
+                    return {"object": "list", "data": [{"id": "model-a"}, {"id": "model-b"}]}
+                if not self.alive:
+                    raise RelayAccountsError("Relay login has expired")
+                if path == "/api/v1/keys?page=1&page_size=100":
+                    return {
+                        "code": 0,
+                        "data": {"items": [{"id": 4, "name": "Plus", "status": "active", "key": "sk-replace-plus-key", "group_id": 21}]},
+                    }
+                if path == "/api/v1/channels/available":
+                    return {"code": 0, "data": []}
+                if path == "/api/v1/user/profile":
+                    return {"code": 0, "data": {"balance": 1.0}}
+                if path == "/api/v1/groups/available":
+                    return {"code": 0, "data": [{"id": 21, "name": "Plus"}]}
+                if path == "/api/v1/groups/rates":
+                    return {"code": 0, "data": {"21": 1.25}}
+                raise AssertionError(f"unexpected GET {path}")
+
+            def post(self, *_: object, **__: object) -> object:
+                raise AssertionError("unexpected POST")
+
+            def password_login(self, *_: object, **__: object) -> dict[str, str]:
+                raise RelayAccountsError("Relay username or password is invalid")
+
+        with tempfile.TemporaryDirectory() as directory:
+            fake = ExpiringStation()
+            domain = RelayAccountsDomain(directory, http_client=fake)
+            account_id = domain.dispatch(
+                "add",
+                {"type": "sub2api", "label": "Sub Relay", "origin": "https://sub.example.test"},
+            )["accounts"][0]["id"]
+            domain.accept_login_result(account_id, username="sample@example.test", access_token="replace-token")
+
+            # The ordinary read is what caches the key value.
+            resources = domain.refresh_resources(account_id)["resources"]
+            self.assertEqual("sk-replace-plus-key", domain.trusted_secret_value("api_key", f"{account_id}:{resources[0]['id']}"))
+            source = {
+                "station_id": domain.snapshot()["accounts"][0]["station_id"],
+                "account_id": account_id,
+                "resource_id": resources[0]["id"],
+            }
+
+            # The session then expires while the relay itself stays reachable.
+            fake.alive = False
+            fake.calls.clear()
+            materials = domain.binding_materials([source], refresh=True)
+
+            self.assertEqual([], materials["issues"])
+            self.assertEqual(1, len(materials["resources"]))
+            self.assertEqual("sk-replace-plus-key", materials["resources"][0]["api_key"])
+            # The key's own catalog still answered, and the station's dashboard
+            # endpoints were only asked, never made into a precondition.
+            self.assertEqual(["model-a", "model-b"], materials["resources"][0]["models"])
+
+    def test_a_key_with_no_cached_value_is_still_unresolved_when_the_session_expires(self) -> None:
+        """The fallback stops where the app's own data does.
+
+        A Core that never read this key has nothing to materialize from, so the
+        station's refusal remains the row's real cause instead of being hidden
+        by the decoupling.
+        """
+
+        class DeadStation:
+            def json(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
+                del origin, path, headers
+                raise RelayAccountsError("Relay login has expired")
+
+            def post(self, *_: object, **__: object) -> object:
+                raise RelayAccountsError("Relay login has expired")
+
+            def password_login(self, *_: object, **__: object) -> dict[str, str]:
+                raise RelayAccountsError("Relay username or password is invalid")
+
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RelayAccountsDomain(directory, http_client=DeadStation())
+            account = domain.dispatch(
+                "add",
+                {"type": "sub2api", "label": "Sub Relay", "origin": "https://sub.example.test"},
+            )["accounts"][0]
+            domain._accounts[0]["resources"] = [
+                {"id": "sub2api-4", "name": "Plus", "enabled": True, "models": ["model-a"]}
+            ]
+
+            materials = domain.binding_materials(
+                [{"station_id": account["station_id"], "account_id": account["id"], "resource_id": "sub2api-4"}],
+                refresh=True,
+            )
+
+            self.assertEqual([], materials["resources"])
+            self.assertEqual(
+                {"resource_key_unavailable", "refresh_failed"},
+                {item["code"] for item in materials["issues"]},
+            )
+
+    def test_sub2api_linked_material_keeps_the_group_page_when_the_key_catalog_is_unavailable(self) -> None:
+        """A rejected key catalog is not a verdict about the group's models.
+
+        Some deployments protect ``/v1/models``; the page's list then remains
+        the catalog, exactly as it did before the key's own read joined it.
+        """
+
+        fake = FakeRelayHTTPClient(
+            {
+                "/api/v1/keys?page=1&page_size=100": {
+                    "code": 0,
+                    "data": {
+                        "items": [
+                            {"id": 4, "name": "Plus", "status": "active", "key": "sk-replace-plus-key", "group_id": 21},
+                        ]
+                    },
+                },
+                "/api/v1/channels/available": {
+                    "code": 0,
+                    "data": [
+                        {
+                            "name": "plus",
+                            "platforms": [
+                                {
+                                    "platform": "anthropic",
+                                    "groups": [{"id": 21, "name": "Plus分组"}],
+                                    "supported_models": [{"name": "model-a"}],
+                                }
+                            ],
+                        }
+                    ],
+                },
+            },
+            errors={"/v1/models": RelayAccountsError("Gateway catalog rejected the key")},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RelayAccountsDomain(directory, http_client=fake)
+            account_id = domain.dispatch(
+                "add",
+                {"type": "sub2api", "label": "Sub Relay", "origin": "https://sub.example.test"},
+            )["accounts"][0]["id"]
+            domain.accept_login_result(account_id, username="sample@example.test", cookie="session=replace-cookie")
+            resources = domain.refresh_resources(account_id)["resources"]
+            account = domain.snapshot()["accounts"][0]
+
+            materials = domain.binding_materials(
+                [
+                    {
+                        "station_id": account["station_id"],
+                        "account_id": account_id,
+                        "resource_id": resources[0]["id"],
+                    }
+                ]
+            )
+
+            self.assertEqual([], materials["issues"])
+            self.assertEqual(["model-a"], materials["resources"][0]["models"])
 
     def test_sub2api_channel_page_supplies_each_groups_models_without_per_key_reads(self) -> None:
         """One channel read describes every group, so no key is probed.
@@ -2007,6 +2405,225 @@ class RelayAccountsDomainTests(unittest.TestCase):
             self.assertEqual(resources[1]["id"], provider["api_keys"][0]["source"]["resource_id"])
             self.assertEqual(["model-a", "model-b"], [item["model_name"] for item in provider["models"]])
             self.assertTrue(core.snapshot()["drafts"]["providers_models"]["dirty"])
+
+
+class RelayReadPolicyTests(unittest.TestCase):
+    """One station read's bound and the one retry a dropped read is allowed.
+
+    A relay commonly fails by dropping the connection instead of answering, and
+    the refresh waits for the slowest read of its round, so a read gets a short
+    attempt bound (``READ_TIMEOUT_SECONDS``) with one more attempt after a
+    transport failure, while a write is never replayed and a documentary read
+    answers from a single short attempt.
+    """
+
+    @staticmethod
+    def _serve(handler: type[BaseHTTPRequestHandler]) -> tuple[ThreadingHTTPServer, threading.Thread]:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return server, thread
+
+    def test_a_read_the_station_drops_is_sent_once_more(self) -> None:
+        attempts: list[str] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                attempts.append(self.path)
+                if len(attempts) == 1:
+                    # The station drops the first connection without answering,
+                    # which is how a flaky relay fails.
+                    self.close_connection = True
+                    self.connection.close()
+                    return
+                body = json.dumps({"data": {"ok": True}}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        server, thread = self._serve(Handler)
+        try:
+            origin = f"http://127.0.0.1:{server.server_address[1]}"
+            payload = RelayHTTPClient().json(origin, "/api/v1/keys?page=1&page_size=100", headers={})
+
+            self.assertEqual({"data": {"ok": True}}, payload)
+            self.assertEqual(["/api/v1/keys?page=1&page_size=100"] * 2, attempts)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_a_read_that_stalls_stops_at_the_read_bound_and_retries(self) -> None:
+        attempts: list[str] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                attempts.append(self.path)
+                # Hold the socket open past the read bound: the client waits for
+                # the bound, gives up, and resends the read with the next bound.
+                time.sleep(0.6)
+                self.close_connection = True
+                self.connection.close()
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        server, thread = self._serve(Handler)
+        try:
+            origin = f"http://127.0.0.1:{server.server_address[1]}"
+            with mock.patch.object(relay_accounts, "READ_ATTEMPT_SECONDS", (0.2, 0.2)):
+                started = time.monotonic()
+                with self.assertRaises(RelayTransportError) as caught:
+                    RelayHTTPClient().json(origin, "/api/v1/keys?page=1&page_size=100", headers={})
+                elapsed = time.monotonic() - started
+
+            self.assertEqual("Relay is unavailable", str(caught.exception))
+            self.assertEqual(2, len(attempts))
+            self.assertLess(elapsed, 1.0)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_a_dropped_read_gets_the_next_longer_bound(self) -> None:
+        """A station that is merely slow is not lost with the short first bound."""
+
+        attempts: list[str] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                attempts.append(self.path)
+                if len(attempts) == 1:
+                    time.sleep(0.5)
+                    self.close_connection = True
+                    self.connection.close()
+                    return
+                body = json.dumps({"data": {"ok": True}}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        server, thread = self._serve(Handler)
+        try:
+            origin = f"http://127.0.0.1:{server.server_address[1]}"
+            with mock.patch.object(relay_accounts, "READ_ATTEMPT_SECONDS", (0.2, 2.0)):
+                started = time.monotonic()
+                payload = RelayHTTPClient().json(origin, "/api/v1/keys?page=1&page_size=100", headers={})
+                elapsed = time.monotonic() - started
+
+            self.assertEqual({"data": {"ok": True}}, payload)
+            self.assertEqual(2, len(attempts))
+            self.assertGreaterEqual(elapsed, 0.2)
+            self.assertLess(elapsed, 1.5)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_a_write_is_never_sent_twice(self) -> None:
+        attempts: list[str] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                attempts.append(self.path)
+                self.close_connection = True
+                self.connection.close()
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        server, thread = self._serve(Handler)
+        try:
+            origin = f"http://127.0.0.1:{server.server_address[1]}"
+            with mock.patch.object(relay_accounts, "REQUEST_TIMEOUT_SECONDS", 0.2):
+                with self.assertRaises(RelayTransportError):
+                    RelayHTTPClient().post(origin, "/api/token/7/key", headers={})
+
+            self.assertEqual(["/api/token/7/key"], attempts)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_a_documentary_read_gets_one_short_attempt(self) -> None:
+        """The balance can never hold the round trip that carries the key list."""
+
+        attempts: list[str] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                attempts.append(self.path)
+                time.sleep(0.6)
+                self.close_connection = True
+                self.connection.close()
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        server, thread = self._serve(Handler)
+        try:
+            origin = f"http://127.0.0.1:{server.server_address[1]}"
+            with mock.patch.object(relay_accounts, "OPTIONAL_READ_TIMEOUT_SECONDS", 0.2), mock.patch.object(
+                relay_accounts, "READ_ATTEMPT_SECONDS", (5.0, 5.0, 5.0)
+            ):
+                started = time.monotonic()
+                with self.assertRaises(RelayTransportError):
+                    RelayHTTPClient().json(origin, "/api/v1/user/profile", headers={})
+                elapsed = time.monotonic() - started
+
+            self.assertEqual(["/api/v1/user/profile"], attempts)
+            self.assertLess(elapsed, 1.0)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_a_key_gateway_catalog_is_documentary(self) -> None:
+        """A key's own model catalog never holds the round trip that carries keys."""
+
+        attempts: list[str] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                attempts.append(self.path)
+                time.sleep(0.6)
+                self.close_connection = True
+                self.connection.close()
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        server, thread = self._serve(Handler)
+        try:
+            origin = f"http://127.0.0.1:{server.server_address[1]}"
+            with mock.patch.object(relay_accounts, "OPTIONAL_READ_TIMEOUT_SECONDS", 0.2), mock.patch.object(
+                relay_accounts, "READ_ATTEMPT_SECONDS", (5.0, 5.0, 5.0)
+            ):
+                started = time.monotonic()
+                with self.assertRaises(RelayTransportError):
+                    RelayHTTPClient().json(origin, "/v1/models", headers={})
+                elapsed = time.monotonic() - started
+
+            self.assertEqual(["/v1/models"], attempts)
+            self.assertLess(elapsed, 1.0)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_a_transport_error_keeps_the_message_every_caller_classifies(self) -> None:
+        self.assertTrue(issubclass(RelayTransportError, RelayAccountsError))
+        self.assertEqual("Relay is unavailable", str(RelayTransportError()))
 
 
 if __name__ == "__main__":
