@@ -4387,6 +4387,43 @@ class ProvidersModelsDomain:
             for key in ("station_id", "account_id", "resource_id")
         )
 
+    def relay_slot_credentials(self) -> dict[tuple[str, str], str]:
+        """The relay credentials this document already persists on its slots.
+
+        A linked key's value is written onto the provider key slot when it is
+        materialized, so it survives a restart.  The relay domain's own
+        in-process cache does not, which is why a fresh Core needs this map:
+        it is what lets a model edit resolve an already-linked key while the
+        station is unreachable.  Values stay inside Core and are never part of
+        a snapshot.
+        """
+
+        credentials: dict[tuple[str, str], str] = {}
+        providers = self._draft.get("providers", [])
+        if not isinstance(providers, list):
+            return credentials
+        for provider in providers:
+            if not isinstance(provider, Mapping):
+                continue
+            try:
+                keys = self._provider_api_keys(provider)
+            except DomainError:
+                continue
+            for raw_key in keys:
+                slot_source = raw_key.get("source")
+                if not isinstance(slot_source, Mapping):
+                    continue
+                if str(slot_source.get("kind", "")) != "relay":
+                    continue
+                value = raw_key.get("value")
+                if not isinstance(value, str) or not value:
+                    continue
+                account_id = str(slot_source.get("account_id", "")).strip()
+                resource_id = str(slot_source.get("resource_id", "")).strip()
+                if account_id and resource_id:
+                    credentials[(account_id, resource_id)] = value
+        return credentials
+
     def dependency_summary(self, source: object | None = None) -> dict[str, Any]:
         """Describe relay-bound dependencies without returning credentials."""
 

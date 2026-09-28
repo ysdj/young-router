@@ -1994,6 +1994,58 @@ class RelayAccountsDomainTests(unittest.TestCase):
             # endpoints were only asked, never made into a precondition.
             self.assertEqual(["model-a", "model-b"], materials["resources"][0]["models"])
 
+    def test_a_persisted_slot_value_resolves_a_key_on_a_fresh_core(self) -> None:
+        """The durable half of "a key this Core already holds".
+
+        ``_resource_secret_cache`` is process-local, so a Core that just started
+        has none of it — while the credential itself is safely on the provider
+        key slot, where the last successful materialization wrote it.  A station
+        that cannot be read must not turn such a key into an unavailable one,
+        and it must not cost the resource its own catalog either: the linked
+        model is judged against the models the resource already reports.
+        """
+
+        class DeadStation:
+            def json(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
+                del origin, path, headers
+                raise RelayAccountsError("Relay login has expired")
+
+            def post(self, *_: object, **__: object) -> object:
+                raise RelayAccountsError("Relay login has expired")
+
+            def password_login(self, *_: object, **__: object) -> dict[str, str]:
+                raise RelayAccountsError("Relay username or password is invalid")
+
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RelayAccountsDomain(directory, http_client=DeadStation())
+            account = domain.dispatch(
+                "add",
+                {"type": "sub2api", "label": "Sub Relay", "origin": "https://sub.example.test"},
+            )["accounts"][0]
+            domain._accounts[0]["resources"] = [
+                {
+                    "id": "sub2api-4",
+                    "name": "Plus",
+                    "enabled": True,
+                    "api_base": "https://sub.example.test/v1",
+                    "models": ["model-a", "model-b"],
+                }
+            ]
+            self.assertEqual({}, domain._resource_secret_cache)
+
+            materials = domain.binding_materials(
+                [{"station_id": account["station_id"], "account_id": account["id"], "resource_id": "sub2api-4"}],
+                refresh=True,
+                slot_credentials={(account["id"], "sub2api-4"): "sk-persisted-on-the-slot"},
+            )
+
+            self.assertEqual([], materials["issues"])
+            self.assertEqual(1, len(materials["resources"]))
+            self.assertEqual("sk-persisted-on-the-slot", materials["resources"][0]["api_key"])
+            # The resource keeps its own catalog, so a model this group serves
+            # is judged against it instead of against an empty list.
+            self.assertEqual(["model-a", "model-b"], materials["resources"][0]["models"])
+
     def test_a_key_with_no_cached_value_is_still_unresolved_when_the_session_expires(self) -> None:
         """The fallback stops where the app's own data does.
 
