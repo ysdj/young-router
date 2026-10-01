@@ -53,6 +53,13 @@ That strip belongs to a settings pane window only: a child window keeps no statu
 
 ## Known Runtime Failure Modes
 
+### A Field States What It Could Not Do (2026-10-02)
+
+- Two controls wrote something other than what the user gave them.
+- **A non-numeric 顺序 became 0.**  The model inspector's order field committed `Number(next) || 0`, so a typo silently moved the route to the first slot.  Fix: the shared `TextField` takes a commit-time validator (the one `usePendingTextField` always supported), draws the message in the field's own row with the invalid outline the runtime fields use, and the order field refuses a draft that is not a number — the rule every other number field in the app already followed.
+- **A refused login item left Core claiming autostart.**  Launch-at-login is two-sided: Core records the preference and the host registers the item.  When the host call failed, the pane reported the error but left Core's preference set, so the switch showed an autostart the system would never perform.  Fix: the host failure hands the preference back with the opposite service action (the same rollback the status menu's own toggle performs) before the error is reported.
+- Verified with `tests/test_rn_ui_parity.py` (`test_a_non_numeric_order_stays_in_the_field_instead_of_becoming_zero`, `test_a_login_item_the_host_refused_hands_cores_preference_back`) and `pnpm run check:macos`.
+
 ### A Malformed Wire Value Never Becomes A Crash (2026-10-02)
 
 - Six places treated a value the wire supplied as if the app had written it, so a malformed field turned a request or a response into an unhandled exception instead of the clean outcome the code otherwise produces.
