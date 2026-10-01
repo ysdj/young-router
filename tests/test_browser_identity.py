@@ -88,7 +88,25 @@ class BrowserIdentityLiteralTests(unittest.TestCase):
         # The sign-in webview and the session proof share that one identity:
         # a relay's session binding stores the fingerprint of the page that
         # signed in, so every later request of ours must repeat it exactly.
-        self.assertIn("webView.customUserAgent = RelayBrowserIdentity.userAgent", macOS)
+        # Every WebView this host creates presents that identity — the relay
+        # sign-in page included.  The relay controller used to leave its page
+        # on WKWebView's default Safari string while every probe and dashboard
+        # read sent the pinned one, so a station that binds a session to its
+        # IP and User-Agent revoked the session the page had just created.
+        for controller, remote in (
+            ("NativeProviderAuthController", True),
+            ("NativeRelayLoginController", True),
+            ("NativeReadOnlyCodeController", False),
+        ):
+            start = macOS.index(f"private final class {controller}")
+            following = macOS.find("\nprivate final class ", start + 1)
+            body = macOS[start:] if following == -1 else macOS[start:following]
+            self.assertIn("webView = WKWebView(frame: .zero, configuration: configuration)", body)
+            self.assertEqual(
+                remote,
+                "webView.customUserAgent = RelayBrowserIdentity.userAgent" in body,
+                controller,
+            )
         for probe_headers in (
             'request.setValue(RelayBrowserIdentity.userAgent, forHTTPHeaderField: "User-Agent")',
         ):

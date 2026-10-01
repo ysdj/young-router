@@ -1223,6 +1223,9 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertTrue(app_icon.is_file())
         self.assertIn("NSApp.setActivationPolicy(.accessory)", leaf)
         self.assertIn("NSApp.setActivationPolicy(.regular)", leaf)
+        # A warm (ordered-out) window is registered but not on screen: it must
+        # not keep the app in the Dock with nothing to show.
+        self.assertIn("let presented = routeWindows.values.contains { $0.isVisible }", leaf)
         self.assertIn('Bundle.main.url(forResource: "AppIcon", withExtension: "icns")!', leaf)
         self.assertIn("NSApp.applicationIconImage = Self.applicationIcon", leaf)
         self.assertLess(
@@ -2485,6 +2488,42 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("value_ = false;", windows)
         self.assertIn("  RegisterCheckbox(package_builder);", windows)
         self.assertIn("  RegisterSwitch(package_builder);", windows)
+
+    def test_a_windows_pane_switch_keeps_the_users_window_geometry(self) -> None:
+        """The initial size belongs to the first presentation, not every open.
+
+        Every route open re-applied the route's initial content size and
+        restored the window, so a resized or maximized window snapped back on
+        the next pane switch or menu action; macOS only applies geometry when
+        it creates a window.
+        """
+
+        windows = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
+        header = (WIN_NATIVE / "WinUI3NativeLeaf.h").read_text(encoding="utf-8")
+        open_route = windows.split("void WinUI3NativeLeaf::OpenRoute(", 1)[1].split("\n}\n", 1)[0]
+        self.assertIn("if (!window_sized_) {", open_route)
+        self.assertIn("window_sized_ = true;", open_route)
+        self.assertIn("if (IsIconic(window_handle_)) ShowWindow(window_handle_, SW_RESTORE);", open_route)
+        self.assertEqual(1, open_route.count("SW_RESTORE"))
+        self.assertIn("bool window_sized_ = false;", header)
+
+    def test_both_trays_open_the_same_pane_on_a_left_click(self) -> None:
+        """macOS opens 供应商与模型; Windows took the first `open-` action.
+
+        The shared UI lists 常规 first in that group, so a Windows left click
+        opened a different pane than the same gesture on macOS.
+        """
+
+        windows = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
+        mac = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
+        self.assertIn('openNamedRoute("providers-models")', mac)
+        dispatch = windows.split("void WinUI3NativeLeaf::DispatchDefaultTrayAction()", 1)[1].split("\n}\n", 1)[0]
+        self.assertIn('action.id == L"open-providers-models"', dispatch)
+        self.assertIn('action.id.rfind(L"open-", 0) == 0', dispatch)
+        self.assertLess(
+            dispatch.index('action.id == L"open-providers-models"'),
+            dispatch.index('action.id.rfind(L"open-", 0) == 0'),
+        )
 
     def test_the_hosts_take_a_core_down_without_losing_the_next_one(self) -> None:
         """Teardown, re-subscribe, and retry survive a replaced Core.
