@@ -429,27 +429,39 @@ class WorkBuddyModuleTests(unittest.TestCase):
             if saved is not None:
                 os.environ[name] = saved
 
-    def test_a_loopback_route_is_probed_on_its_own_surface(self) -> None:
+    def test_a_managed_route_is_probed_on_its_own_surface(self) -> None:
         """The worker mounts one surface, so that is the one a probe tests."""
 
+        from young_router import workbuddy as workbuddy_module
         from young_router.core.domains.providers_models import ProvidersModelsDomain as D
 
-        loopback = "os.environ/YOUNG_ROUTER_WORKBUDDY_BASE"
+        reference = workbuddy_module.api_base_reference("workbuddy")
         model = {"upstream_url_surface": "openai/chat", "upstream_protocol_mode": "fixed"}
+        provider = {"api_base": reference}
         self.assertEqual(
-            D._probe_surfaces("http://127.0.0.1:9931/workbuddy/v1", model),
+            D._probe_surfaces("http://127.0.0.1:9931/workbuddy/v1", model, provider),
             ["openai/chat"],
         )
+        # A model carrying the provider's own reference answers the same way.
         self.assertEqual(
-            D._probe_surfaces("http://localhost:9931/workbuddy/v1", model),
+            D._probe_surfaces(
+                "http://localhost:9931/workbuddy/v1",
+                {**model, "api_base": reference},
+            ),
             ["openai/chat"],
         )
-        # A remote service is still asked about every protocol it might speak.
+        # A service the user runs is asked about every protocol it might
+        # speak, loopback or not: a local server that only serves Chat
+        # Completions has to be discoverable.
+        for address in ("http://127.0.0.1:11434/v1", "http://localhost:9931/v1"):
+            self.assertEqual(
+                sorted(D._probe_surfaces(address, model)),
+                ["anthropic", "openai/chat", "openai/responses"],
+            )
         self.assertEqual(
             sorted(D._probe_surfaces("https://api.example.test/v1", model)),
             ["anthropic", "openai/chat", "openai/responses"],
         )
-        self.assertIsInstance(loopback, str)
 
     def test_a_remembered_worker_publishes_its_environment(self) -> None:
         """Core resolves the loopback base and bearer before it starts one."""
