@@ -30,6 +30,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.ui = UI_SOURCE.read_text(encoding="utf-8")
         cls.native_controls = NATIVE_CONTROLS.read_text(encoding="utf-8")
+        cls.appkit_controls = (ROOT / "rn/packages/shared/src/ui/AppKitControls.tsx").read_text(encoding="utf-8")
         cls.macos_leaf = MACOS_LEAF.read_text(encoding="utf-8")
         cls.macos_project = MACOS_PROJECT.read_text(encoding="utf-8")
         cls.platform_entry = PLATFORM_ENTRY.read_text(encoding="utf-8")
@@ -1808,6 +1809,18 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("selectableSpanningRowKeys?: string[];", self.native_controls)
         self.assertIn("selectableSpanningRowKeys = []", self.native_controls)
         self.assertIn("selectableSpanningRowKeys: Array.from(selectableSpanningKeys),", self.native_controls)
+        # The macOS wrapper forwards props by hand, so every prop the shared
+        # table builds has to be named there: `alertRowKeys` was in both native
+        # implementations and both specs while the wrapper dropped it, so no
+        # warning row ever drew brown on macOS.
+        shared_props = self.native_controls.split("const nativeProps = {", 1)[1].split("};", 1)[0]
+        shared_keys = set(re.findall(r"^\s*([A-Za-z][A-Za-z0-9_]*)\s*[,:]", shared_props, re.MULTILINE))
+        wrapper_params = self.appkit_controls
+        appkit_table = wrapper_params.split("export function AppKitTable({", 1)[1].split("}: ", 1)[0]
+        wrapper_keys = {name.strip().split("=")[0].strip() for name in appkit_table.split(",")}
+        self.assertEqual(set(), shared_keys - wrapper_keys, f"AppKitTable drops {sorted(shared_keys - wrapper_keys)}")
+        self.assertIn("alertRowKeys,", appkit_table)
+        self.assertIn("alertRowKeys={alertRowKeys}", wrapper_params)
         # Five data tables, the settings shell's pane source list, and the one
         # subordinate rail every split pane renders from the shared component.
         self.assertEqual(self.ui.count("<NativeTable"), 7)
@@ -1920,6 +1933,15 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("_frameView.framed = !newViewProps.borderless;", mac_native)
         self.assertIn("_tableView.usesAlternatingRowBackgroundColors = NO;", table_native)
         self.assertIn("props.alternatingRows.value_or(false)", windows_native)
+        # The tab hierarchy step, the inert group row's taller rhythm, and the
+        # row that owns its own double-click are the same three rules on both
+        # hosts; each was a macOS-only behavior before.
+        self.assertIn("constexpr double kTableRowIndentWidth = 16.0;", windows_native)
+        self.assertIn("const bool indented = !cell_text.empty() && cell_text.front() == '\\t';", windows_native)
+        self.assertIn("cell.Margin({indented ? kTableRowIndentWidth + 8.0 : 8.0, vertical_margin, 8, vertical_margin});", windows_native)
+        self.assertIn("row.MinHeight(compact_rows ? 28.0 : 34.0);", windows_native)
+        self.assertIn("row.DoubleTapped([this, double_press_index](auto const&, auto const&) {", windows_native)
+        self.assertNotIn("const auto index = list_.SelectedIndex();\n      if (index < 0 || index >= static_cast<int32_t>(Props()->rowKeys.size())) return;", windows_native)
         self.assertIn("props.borderless.value_or(false) ? Thickness{0, 0, 0, 0} : Thickness{1, 1, 1, 1}", windows_native)
         appkit_controls = (ROOT / "rn/packages/shared/src/ui/AppKitControls.tsx").read_text(encoding="utf-8")
         self.assertIn("borderless={borderless}", appkit_controls)
@@ -2577,7 +2599,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # The assistant file editor is a window-level sheet.
 
             'route === "file-editor" ? <FileEditorWorkspace',
-            'translate("runtime.fixInvalidBeforeClose")',
+            'setResult(translate(purpose === "navigate" ? "runtime.fixInvalidBeforeLeaving" : "runtime.fixInvalidBeforeClose"));',
             'invalidCloseNotice.current = true;',
             'invalidCloseNotice.current = false;',
             # One rail selection is one surface: the pane renders the selected
@@ -4779,6 +4801,19 @@ class ReactNativeUiParityTests(unittest.TestCase):
         for locale in (self.zh, self.en):
             self.assertIn('"providers.relayNameTaken"', locale)
             self.assertIn('"providers.reorderSameOrder"', locale)
+        # The dialogs' scrim is a dismiss target, not a click swallower: both
+        # relay dialogs close on an outside press, the way the app's own
+        # help tip does.
+        self.assertEqual(2, self.relay.count('<Pressable accessible={false} onPress={onClose} style={StyleSheet.absoluteFill} />'))
+        self.assertIn('import { Platform, PlatformColor, Pressable, StyleSheet, Text, View } from "react-native";', self.relay)
+        # Leaving a pane commits what it staged and applies it, exactly as
+        # closing the window does.
+        shell = self.ui.split("function SettingsShell(", 1)[1].split("function SettingsRail(", 1)[0]
+        self.assertIn('void flushActivePane.current?.("navigate").catch(() => undefined);', shell)
+        self.assertIn('setResult(translate(purpose === "navigate" ? "runtime.fixInvalidBeforeLeaving" : "runtime.fixInvalidBeforeClose"));', self.ui)
+        for locale in (self.zh, self.en):
+            self.assertIn('"runtime.fixInvalidBeforeLeaving"', locale)
+        self.assertIn('const flushActivePane = useRef<((purpose?: "close" | "navigate") => Promise<boolean>) | undefined>(undefined);', self.ui)
 
     def test_provider_table_columns_fit_the_fixed_provider_pane(self) -> None:
         self.assertIn('"providers.modelCount": "Count"', self.en)

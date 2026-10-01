@@ -1368,8 +1368,8 @@ function SettingsShell({ route, windowRoute, snapshot, ipc, native, translate, l
   onClose: () => void;
   onRegisterFlush?: (flush?: () => Promise<boolean>) => void;
 }): React.JSX.Element {
-  const flushActivePane = useRef<(() => Promise<boolean>) | undefined>(undefined);
-  const registerFlush = useCallback((flush?: () => Promise<boolean>): void => {
+  const flushActivePane = useRef<((purpose?: "close" | "navigate") => Promise<boolean>) | undefined>(undefined);
+  const registerFlush = useCallback((flush?: (purpose?: "close" | "navigate") => Promise<boolean>): void => {
     flushActivePane.current = flush;
   }, []);
   const closing = useRef(false);
@@ -1430,6 +1430,13 @@ function SettingsShell({ route, windowRoute, snapshot, ipc, native, translate, l
     lastSelection.current = { key, at: now };
     const next = SETTINGS_PANES.find(({ id }) => id === key)?.id;
     if (!next) return;
+    // Leaving a pane commits and applies what that pane staged, exactly as
+    // closing the window does.  A field that commits on blur, a secret that
+    // only stages when asked, and the pane's own debounced apply all belong to
+    // the surface being left: without this, a provider edit stayed an
+    // unapplied draft (the proxy kept serving the old configuration) and a
+    // typed WebDAV password or raw-editor draft was dropped with the unmount.
+    void flushActivePane.current?.("navigate").catch(() => undefined);
     onNavigate(next);
     // Let the native host follow the pane: it retitles the Windows window and
     // keeps the active route in sync so a later close hides that window.
@@ -2165,13 +2172,16 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
   // focused text/secret field and apply it before the native window closes.
   // It reports false when a field still holds an invalid draft, so the shell
   // can keep the window open instead of silently discarding the edit.
-  const flushAndApply = useRef<() => Promise<boolean>>(() => Promise.resolve(true));
+  const flushAndApply = useRef<(purpose?: "close" | "navigate") => Promise<boolean>>(() => Promise.resolve(true));
   const invalidCloseNotice = useRef(false);
-  flushAndApply.current = async (): Promise<boolean> => {
+  flushAndApply.current = async (purpose: "close" | "navigate" = "close"): Promise<boolean> => {
     await flushPendingFields();
     if (hasPendingFieldEdits()) {
+      // The same refusal serves both exits, and each states its own next step:
+      // closing keeps the window open, leaving a pane keeps that pane's draft
+      // until its field is fixed.
       invalidCloseNotice.current = true;
-      setResult(translate("runtime.fixInvalidBeforeClose"));
+      setResult(translate(purpose === "navigate" ? "runtime.fixInvalidBeforeLeaving" : "runtime.fixInvalidBeforeClose"));
       return false;
     }
     await dispatchQueue.current;

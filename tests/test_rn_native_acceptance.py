@@ -2486,6 +2486,48 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("  RegisterCheckbox(package_builder);", windows)
         self.assertIn("  RegisterSwitch(package_builder);", windows)
 
+    def test_windows_controls_carry_their_hint_and_their_name(self) -> None:
+        """A button's hint and a field's name reach the Windows host too.
+
+        The macOS controls state both; the Windows specs did not even declare
+        them, so every icon-only button had no hover hint (and a busy wheel no
+        wording), and every switch and text field was announced as the same
+        untranslated word or as a bare edit box.
+        """
+
+        windows = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
+        button_spec = (SHARED / "ui/windows/NativeButtonNativeComponent.ts").read_text(encoding="utf-8")
+        toggle_spec = (SHARED / "ui/windows/NativeToggleNativeComponent.ts").read_text(encoding="utf-8")
+        input_spec = (SHARED / "ui/windows/NativeTextInputNativeComponent.ts").read_text(encoding="utf-8")
+        controls = (SHARED / "ui/NativeControls.tsx").read_text(encoding="utf-8")
+        mac_button_spec = (SHARED / "ui/macos/NativeButtonNativeComponent.ts").read_text(encoding="utf-8")
+
+        # Both hosts declare the same hint/name fields on their button.
+        for spec in (button_spec, mac_button_spec):
+            self.assertIn("toolTip?: string;", spec)
+            self.assertIn("accessibilityLabel?: string;", spec)
+        self.assertIn("auto const toolTip = ToHString(props.toolTip.value_or(\"\"));", windows)
+        self.assertIn("auto const hint = toolTip.empty() ? ToHString(props.title) : toolTip;", windows)
+        self.assertIn("ToolTipService::SetToolTip(button_, winrt::box_value(hint));", windows)
+        self.assertIn("ToolTipService::SetToolTip(hyperlink_, winrt::box_value(hint));", windows)
+        self.assertIn("AutomationProperties::SetName(button_, label);", windows)
+
+        # A switch and a text field name themselves from the shared label.
+        for spec in (toggle_spec, input_spec):
+            self.assertIn("accessibilityLabel?: string;", spec)
+        self.assertIn("accessibilityLabel={accessibilityLabel}", controls)
+        self.assertIn("accessibilityLabel={props.accessibilityLabel}", controls)
+        switch = windows.split("struct SwitchComponentView final", 1)[1].split("struct SelectableRowComponentView", 1)[0]
+        self.assertIn("winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(toggle_, label);", switch)
+        self.assertIn("text_box_.IsEnabled(Enabled(props.disabled));", windows)
+        self.assertIn("winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(text_box_, label);", windows)
+
+        # The generated Windows headers carry the fields the implementation reads.
+        codegen = WIN_PROJECT / "codegen/react/components/YoungRouter"
+        for name, field in (("LiteLLMWinUIButton.g.h", "toolTip"), ("LiteLLMWinUISwitch.g.h", "accessibilityLabel"), ("LiteLLMWinUITextInput.g.h", "accessibilityLabel")):
+            header = (codegen / name).read_text(encoding="utf-8")
+            self.assertIn(f"REACT_FIELD({field})", header)
+
     def test_macos_menu_autostart_fallback_uses_localization(self) -> None:
         leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
         self.assertIn('"autoStart": "Auto Start at Login"', leaf)

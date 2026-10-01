@@ -359,6 +359,7 @@ export const en: Record<TranslationKey, string> = {
   "runtime.outOfRange": "Enter a value between {min} and {max}",
   "runtime.resetToDefault": "Reset to default",
   "runtime.fixInvalidBeforeClose": "Fix the highlighted settings before closing.",
+  "runtime.fixInvalidBeforeLeaving": "Fix the highlighted settings before leaving this pane.",
   "runtime.secretRetained": "Existing secret is retained until replaced or cleared.",
   "runtime.jsonPlaceholder": "Paste or type JSON here. It is validated when the settings are saved.",
   "runtime.jsonDefaultHint": "Clear the field to restore the built-in template.",

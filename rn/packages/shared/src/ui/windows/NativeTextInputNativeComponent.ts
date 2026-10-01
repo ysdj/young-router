@@ -11,6 +11,11 @@ export interface NativeTextInputProps extends ViewProps {
   secureTextEntry?: WithDefault<boolean, false>;
   search?: WithDefault<boolean, false>;
   disabled?: WithDefault<boolean, false>;
+  /**
+   * The field's name for a screen reader.  A placeholder is not a name: an
+   * unlabeled edit box is announced as “edit” and nothing else.
+   */
+  accessibilityLabel?: string;
   keyboardType?: string;
   onChangeText?: DirectEventHandler<ChangeEvent>;
   onBlur?: DirectEventHandler<Readonly<{}>>;

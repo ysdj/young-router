@@ -341,7 +341,7 @@ export function NativeSegmentedControl(props: SegmentedProps & { ref?: React.Ref
 
 export function NativeTextField({ style, onChangeText, onSubmitEditing, search = false, ...props }: TextInputProps & { search?: boolean }): React.JSX.Element {
   if (Platform.OS === "windows") {
-    return <WinUITextInput value={props.value} placeholder={props.placeholder} multiline={props.multiline} secureTextEntry={props.secureTextEntry} search={search} disabled={props.editable === false} keyboardType={props.keyboardType} onChangeText={(event) => onChangeText?.(event.nativeEvent.text)} onBlur={() => props.onBlur?.({} as never)} onSubmitEditing={(event) => onSubmitEditing?.({ ...event, nativeEvent: { text: event.nativeEvent.text } } as never)} style={style} />;
+    return <WinUITextInput value={props.value} placeholder={props.placeholder} multiline={props.multiline} secureTextEntry={props.secureTextEntry} search={search} disabled={props.editable === false} keyboardType={props.keyboardType} accessibilityLabel={props.accessibilityLabel} onChangeText={(event) => onChangeText?.(event.nativeEvent.text)} onBlur={() => props.onBlur?.({} as never)} onSubmitEditing={(event) => onSubmitEditing?.({ ...event, nativeEvent: { text: event.nativeEvent.text } } as never)} style={style} />;
   }
   if (Platform.OS === "macos") {
     return <AppKitTextField {...props} search={search} style={style} onChangeText={onChangeText} onSubmitEditing={onSubmitEditing} />;
