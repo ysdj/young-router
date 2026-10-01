@@ -28,6 +28,7 @@ struct LiteLLMWinUIButtonProps : winrt::implements<LiteLLMWinUIButtonProps, winr
        title = cloneFromProps->title;
        symbol = cloneFromProps->symbol;
        symbolWithTitle = cloneFromProps->symbolWithTitle;
+       symbolTrailing = cloneFromProps->symbolTrailing;
        disabled = cloneFromProps->disabled;
        busy = cloneFromProps->busy;
        primary = cloneFromProps->primary;
@@ -51,6 +52,9 @@ struct LiteLLMWinUIButtonProps : winrt::implements<LiteLLMWinUIButtonProps, winr
 
   REACT_FIELD(symbolWithTitle)
   std::optional<bool> symbolWithTitle{};
+
+  REACT_FIELD(symbolTrailing)
+  std::optional<bool> symbolTrailing{};
 
   REACT_FIELD(disabled)
   std::optional<bool> disabled{};

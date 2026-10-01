@@ -5164,7 +5164,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         leaf = (ROOT / "rn/apps/macos/src/native/macos/AppKitNativeLeaf.swift").read_text(encoding="utf-8")
         windows = (ROOT / "rn/apps/windows/src/native/windows/WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
         self.assertIn('let base = label("newKeyName", "New key")', leaf)
-        self.assertIn('name = "\(base) \(suffix)"', leaf)
+        self.assertIn(r'name = "\(base) \(suffix)"', leaf)
         self.assertNotIn("randomNameWords", leaf)
         self.assertIn('std::wstring base = labels.new_key_name.empty() ? std::wstring(L"New key") : labels.new_key_name;', windows)
         self.assertIn('name = base + L" " + std::to_wstring(suffix);', windows)
