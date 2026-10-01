@@ -6,6 +6,28 @@ from hook_test_utils import *
 
 
 class HookStreamingCompactionTests(HookTestCase):
+    def test_a_malformed_error_code_does_not_raise_out_of_the_stream_path(self) -> None:
+        """A wire error's ``code`` is not necessarily text.
+
+        The mapper tests that code against a set of known compaction/route
+        failures, so an upstream that sends an object or list there raised
+        TypeError for every chunk instead of producing the clean terminal
+        error this mapping exists for.
+        """
+
+        hooks, _ = load_hook_module()
+        for malformed in ({}, [], 7):
+            stream_event = {
+                "type": "response.failed",
+                "response": {
+                    "status": "failed",
+                    "error": {"code": malformed, "message": "upstream failed"},
+                },
+            }
+            with self.subTest(code=malformed):
+                stream_exception = hooks._stream_chunk_error_exception(stream_event)
+                self.assertIsNotNone(stream_exception)
+
     def test_real_compaction_400_flips_synthesized_error_to_unsupported(self) -> None:
         hooks, _ = load_hook_module()
         self.set_env(hooks._CODEX_COMPACTION_CAPABILITY_TTL_SECONDS_ENV, "600")

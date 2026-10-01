@@ -1720,6 +1720,13 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
         self.assertIsInstance(recovery_request, dict)
         recovery_metadata = recovery_request["litellm_metadata"]
         self.assertTrue(recovery_metadata.get("external_web_search_continuation"))
+        # The fallback is keyed by the exception *object*: an id-keyed map
+        # outlived it, and a later exception at the same address read another
+        # request's recovery body.  An unrelated exception must answer None.
+        self.assertIn(context.exception, hooks._EXTERNAL_WEB_SEARCH_RECOVERY_REQUESTS_BY_EXCEPTION)
+        self.assertIsNone(
+            hooks._external_web_search_recovery_request_from_exception(GatewayTimeout("unrelated"))
+        )
         self.assertNotIn("external_web_search_synthesis", recovery_metadata)
         self.assertTrue(recovery_request["stream"])
         self.assertEqual(

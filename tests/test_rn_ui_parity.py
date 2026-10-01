@@ -4815,6 +4815,21 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.assertIn('"runtime.fixInvalidBeforeLeaving"', locale)
         self.assertIn('const flushActivePane = useRef<((purpose?: "close" | "navigate") => Promise<boolean>) | undefined>(undefined);', self.ui)
 
+    def test_the_log_filter_owns_its_text_until_core_confirms_it(self) -> None:
+        """A poll landing mid-typing must not delete the typed character.
+
+        The field is fed from the Core projection while the edit is debounced
+        for 250 ms, so a snapshot still carrying the previous filter used to
+        overwrite what the user had just typed.
+        """
+
+        logs = self.ui.split("function LogsWorkspace(", 1)[1].split("\nfunction EmptyState(", 1)[0]
+        self.assertIn("const filterDirty = useRef(false);", logs)
+        self.assertIn("if (filterDirty.current && coreFilter !== filterDraftRef.current) return;", logs)
+        self.assertIn("filterDirty.current = true; setFilterDraft(filter);", logs)
+        # A tab switch starts from that tab's own filter.
+        self.assertIn("filterDirty.current = false;\n  }, [selected]);", logs)
+
     def test_provider_table_columns_fit_the_fixed_provider_pane(self) -> None:
         self.assertIn('"providers.modelCount": "Count"', self.en)
         self.assertIn('"providers.modelCount": "模型数"', self.zh)

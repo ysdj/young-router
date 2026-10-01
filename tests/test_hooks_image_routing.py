@@ -1113,5 +1113,40 @@ class HookImageRoutingTests(HookTestCase):
         )
 
 
+class ImageDeliveryGuardTests(HookTestCase):
+    def test_an_echoed_image_with_a_malformed_type_is_still_stripped(self) -> None:
+        """A non-text ``type`` must not raise while stripping echoed images.
+
+        The stripper tests a candidate's type against a small set of image
+        item types, so an echoed dict whose type is a list or a dict raised
+        TypeError on the delivery path instead of being stripped.
+        """
+
+        hooks, _ = load_hook_module()
+        request_data = {
+            "model": "default-chat",
+            "input": [
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_image", "image_url": "data:image/png;base64,abc"},
+                ]},
+            ],
+        }
+        for malformed in ([], {}, ["input_image"]):
+            response = {
+                "id": "resp_1",
+                "output": [
+                    {"type": "message", "content": [
+                        {"type": malformed, "image_url": "data:image/png;base64,abc"},
+                    ]},
+                ],
+            }
+            with self.subTest(malformed=malformed):
+                delivered = hooks._sanitize_response_echoed_request_images_for_delivery(
+                    response,
+                    request_data,
+                )
+                self.assertNotIn("data:image", json.dumps(delivered))
+
+
 if __name__ == "__main__":
     unittest.main()

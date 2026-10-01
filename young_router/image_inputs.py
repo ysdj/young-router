@@ -93,11 +93,16 @@ def _dict_is_echoed_request_image(value: dict, references: set[str]) -> bool:
     )
     if not image_url or image_url not in references:
         return False
-    if item_type in {"input_image", "image_url"}:
-        return True
-    return item_type is None and set(value).issubset(
-        {"image_url", "url", "file_id", "detail"}
-    )
+    if isinstance(item_type, str):
+        return item_type in {"input_image", "image_url"}
+    if item_type is None:
+        return set(value).issubset(
+            {"image_url", "url", "file_id", "detail"}
+        )
+    # A type that is not text is not a shape this app writes, and the image it
+    # carries still matches one the request sent: it is an echo, so it is
+    # stripped rather than handed back to the client that uploaded it.
+    return True
 
 
 def _strip_echoed_request_images(value: Any, references: set[str]) -> tuple[Any, bool]:

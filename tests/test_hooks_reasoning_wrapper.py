@@ -105,6 +105,23 @@ class HookReasoningWrapperTests(HookTestCase):
 
         self.assertEqual(delivered, "**Searching official sources**")
 
+    def test_delivery_passes_a_malformed_event_type_through(self) -> None:
+        """A non-text ``type`` must not raise out of the delivery path.
+
+        The sanitizer tests the event type against a frozenset, so an event
+        whose type is a list or a dict used to raise TypeError for every
+        delivered chunk instead of being passed through untouched.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        request_data = {"model": "default-chat", "stream": True, "input": "go"}
+        for malformed in ([], {}, ["response.output_text.delta"]):
+            event = {"type": malformed, "delta": "kept"}
+            with self.subTest(malformed=malformed):
+                delivered = hooks._responses_stream_chunk_for_delivery(event, request_data)
+                self.assertEqual(delivered["delta"], "kept")
+                self.assertEqual(delivered["type"], malformed)
+
     def test_delivery_keeps_item_identity_and_untouched_events(self) -> None:
         hooks, _proxy_server = load_hook_module()
         request_data = {"model": "default-chat", "stream": True, "input": "go"}

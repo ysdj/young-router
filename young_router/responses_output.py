@@ -517,7 +517,7 @@ def _normalize_custom_tool_input_event(
     input_delta_tracker: _CustomToolInputDeltaTracker,
 ) -> Optional[Any]:
     event_type = _responses_web_search_bridge_module._response_item_get(event, "type")
-    if event_type not in {
+    if not isinstance(event_type, str) or event_type not in {
         "response.function_call_arguments.delta",
         "response.function_call_arguments.done",
     }:
@@ -1032,7 +1032,10 @@ def _sanitize_reasoning_wrapper_event(payload: Any, request_data: Any = None) ->
     if not isinstance(payload, dict):
         return False
     event_type = payload.get("type")
-    if event_type not in _REASONING_WRAPPER_TEXT_EVENT_TYPES:
+    # A delivered event's type is not necessarily text: a malformed upstream
+    # event must pass through untouched instead of raising out of the single
+    # delivery choke point that calls this.
+    if not isinstance(event_type, str) or event_type not in _REASONING_WRAPPER_TEXT_EVENT_TYPES:
         return False
 
     if event_type == "response.output_text.delta":

@@ -123,6 +123,16 @@ class SessionAffinityRecordingTests(HookTestCase):
         self.assertIn(f"k{cap + 9}", pruned)
         self.assertNotIn("k0", pruned)
 
+        # A timestamp that cannot be a time reads as 0 instead of raising out
+        # of every read and write, which used to poison the whole map.
+        poisoned = {
+            "broken": {"deployment_id": "dep-broken", "updated_at": "not-a-time"},
+            "none": {"deployment_id": "dep-none", "updated_at": None},
+            "fresh": {"deployment_id": "dep-fresh", "updated_at": now - 10},
+        }
+        pruned = hooks._prune_session_affinity_entries(poisoned, now)
+        self.assertEqual(set(pruned), {"fresh"})
+
 
 class SessionAffinityFilterTests(HookTestCase):
     def _request(self) -> dict:

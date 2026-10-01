@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 from . import pi_web_access as _pi_web_access_module
 from . import responses_output as _responses_output_module
 from . import responses_request as _responses_request_module
@@ -2051,7 +2052,7 @@ def _external_web_search_call_item_for_action(
     item_id = f"ws_bridge_{os.getpid()}_{time.time_ns()}"
     clean_action = copy.deepcopy(action)
     action_type = clean_action.get("type")
-    if action_type in {"openPage", "findInPage"}:
+    if isinstance(action_type, str) and action_type in {"openPage", "findInPage"}:
         label_action: dict[str, str] = {
             "type": str(action_type),
             "url": str(clean_action.get("url") or ""),
@@ -2825,7 +2826,12 @@ _EXTERNAL_WEB_SEARCH_ROUTE_RECOVERY_MAX_SECONDS = 300.0
 # spending a full answer budget on an internal routing turn.
 _EXTERNAL_WEB_SEARCH_INITIAL_OUTPUT_TOKENS = 128
 _EXTERNAL_WEB_SEARCH_SYNTHESIS_OUTPUT_TOKENS = 1536
-_EXTERNAL_WEB_SEARCH_RECOVERY_REQUESTS_BY_EXCEPTION_ID: dict[int, dict[str, Any]] = {}
+# The recovery request an exception could not carry itself (a frozen class
+# refuses attribute assignment).  It is keyed by the exception *object*, not
+# by its address: an id-keyed map outlived the object, so a later exception
+# allocated at the same address read a different request's payload and the
+# route-recovery poll could replay another request's body.
+_EXTERNAL_WEB_SEARCH_RECOVERY_REQUESTS_BY_EXCEPTION: dict[Exception, dict[str, Any]] = {}
 _EXTERNAL_WEB_SEARCH_RECOVERY_REQUESTS_MAX = 256
 _EXTERNAL_WEB_SEARCH_ORIGINAL_USER_TEXT_KEY = "external_web_search_original_user_text"
 _EXTERNAL_WEB_SEARCH_CONVERSATION_CONTEXT_KEY = (
@@ -3313,7 +3319,7 @@ def _external_web_search_chat_tool_messages(
                 index += 1
                 continue
             item_type = item.get("type")
-            if item_type in {"function_call", "custom_tool_call", "tool_call"}:
+            if isinstance(item_type, str) and item_type in {"function_call", "custom_tool_call", "tool_call"}:
                 tool_calls: list[dict[str, Any]] = []
                 while index < len(input_value):
                     call_item = input_value[index]
@@ -3448,7 +3454,7 @@ def _external_web_search_continuation_tools(
             if not isinstance(tool, dict):
                 continue
             tool_type = tool.get("type")
-            if tool_type in {"web_search", "web_search_preview"}:
+            if isinstance(tool_type, str) and tool_type in {"web_search", "web_search_preview"}:
                 continue
             copied = copy.deepcopy(tool)
             tools.append(copied)
@@ -4203,7 +4209,7 @@ def _external_web_search_request_text(request_kwargs: Optional[dict]) -> str:
             return
         if isinstance(value, dict):
             value_type = value.get("type")
-            if value_type in {"input_text", "output_text"}:
+            if isinstance(value_type, str) and value_type in {"input_text", "output_text"}:
                 append_text(value.get("text"), depth + 1)
                 return
             for key in ("content", "text", "input", "message"):
@@ -4526,18 +4532,31 @@ def _external_web_search_set_recovery_request(
         exception.external_web_search_recovery_request = recovery_request  # type: ignore[attr-defined]
     except Exception:
         pass
-    if len(_EXTERNAL_WEB_SEARCH_RECOVERY_REQUESTS_BY_EXCEPTION_ID) >= (
+    else:
+        # The exception carries the request itself; an entry a previous call
+        # left for this object would only shadow it.
+        _EXTERNAL_WEB_SEARCH_RECOVERY_REQUESTS_BY_EXCEPTION.pop(exception, None)
+        return
+    # The map holds the exception itself, so its identity cannot be reused by a
+    # later failure; the price is that it would also hold the traceback and the
+    # frames it references, so the traceback is dropped here.  Nothing in this
+    # codebase formats a traceback (route traces carry the class and message).
+    try:
+        exception.__traceback__ = None
+    except Exception:
+        pass
+    if len(_EXTERNAL_WEB_SEARCH_RECOVERY_REQUESTS_BY_EXCEPTION) >= (
         _EXTERNAL_WEB_SEARCH_RECOVERY_REQUESTS_MAX
     ):
         try:
-            oldest_key = next(iter(_EXTERNAL_WEB_SEARCH_RECOVERY_REQUESTS_BY_EXCEPTION_ID))
-            _EXTERNAL_WEB_SEARCH_RECOVERY_REQUESTS_BY_EXCEPTION_ID.pop(
+            oldest_key = next(iter(_EXTERNAL_WEB_SEARCH_RECOVERY_REQUESTS_BY_EXCEPTION))
+            _EXTERNAL_WEB_SEARCH_RECOVERY_REQUESTS_BY_EXCEPTION.pop(
                 oldest_key,
                 None,
             )
         except StopIteration:
             pass
-    _EXTERNAL_WEB_SEARCH_RECOVERY_REQUESTS_BY_EXCEPTION_ID[id(exception)] = (
+    _EXTERNAL_WEB_SEARCH_RECOVERY_REQUESTS_BY_EXCEPTION[exception] = (
         _external_web_search_safe_payload_copy(recovery_request)
     )
 
@@ -4548,9 +4567,7 @@ def _external_web_search_recovery_request_from_exception(
     request_kwargs = getattr(exception, "external_web_search_recovery_request", None)
     if isinstance(request_kwargs, dict):
         return _external_web_search_safe_payload_copy(request_kwargs)
-    request_kwargs = _EXTERNAL_WEB_SEARCH_RECOVERY_REQUESTS_BY_EXCEPTION_ID.get(
-        id(exception)
-    )
+    request_kwargs = _EXTERNAL_WEB_SEARCH_RECOVERY_REQUESTS_BY_EXCEPTION.get(exception)
     if isinstance(request_kwargs, dict):
         return _external_web_search_safe_payload_copy(request_kwargs)
     return None
