@@ -2820,7 +2820,7 @@ def _with_neutral_attachment_paths(request_kwargs: dict) -> Optional[dict]:
             continue
         item_type = item.get("type")
         updates: dict[str, Any] = {}
-        if item_type in {"custom_tool_call", "function_call"}:
+        if isinstance(item_type, str) and item_type in {"custom_tool_call", "function_call"}:
             for key in ("input", "arguments"):
                 source = item.get(key)
                 if not isinstance(source, str) or not source:
@@ -3847,7 +3847,7 @@ def _codex_descendant_cleanup_runtime_state(request_kwargs: dict) -> Optional[st
         if not isinstance(item, dict):
             continue
         item_type = item.get("type")
-        if item_type in {"function_call", "custom_tool_call"}:
+        if isinstance(item_type, str) and item_type in {"function_call", "custom_tool_call"}:
             if not batch_open:
                 batch += 1
                 batch_open = True

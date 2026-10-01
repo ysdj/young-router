@@ -2094,6 +2094,30 @@ class CoreIPCTests(unittest.TestCase):
             self.assertNotIn(str(selected), capability)
             self.assertEqual(selected, core.file_capabilities.resolve(capability, "import"))
 
+    def test_a_dead_session_takes_its_subscriptions_with_it(self) -> None:
+        """An expired session's subscriptions are swept with its capabilities.
+
+        Nothing ever removed them, so every relaunched host left subscriptions
+        (and the events queued in them) behind for the Core's lifetime, and a
+        poll reusing the id read as a normal quiet heartbeat.
+        """
+
+        core = CoreStore(domains=[MemoryDomain("language", {"choice": "system"})])
+        server = CoreIPCServer(core)
+        endpoint = server.start()
+        self.addCleanup(server.stop)
+        client = CoreIPCClient(endpoint, server.bootstrap_token)
+        self.addCleanup(client.close)
+
+        subscription_id = client.call("subscribe", {})["subscription_id"]
+        with server._lock:
+            session = next(iter(server._sessions.values()))
+            session.expires_at = 0.0
+
+        self.assertFalse(server._valid_session(session.token))
+        with server._lock:
+            self.assertNotIn(subscription_id, server._subscriptions)
+
     def test_subscription_closes_cleanly_after_server_stops(self) -> None:
         core = CoreStore(domains=[MemoryDomain("language", {"choice": "system"})])
         server = CoreIPCServer(core)

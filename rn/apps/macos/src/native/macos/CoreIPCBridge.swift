@@ -864,11 +864,19 @@ import Foundation
               !subscription.isEmpty else { return }
 
         lock.lock()
-        guard self.generation == generation else { lock.unlock(); return }
+        // The subscribe request is remembered even when the Core that answered
+        // it is already gone: recovery re-subscribes from it.  Recording it
+        // only under a matching generation left the bridge with no
+        // subscription *and* no request, so every later recovery was a no-op
+        // and every window's snapshots stayed frozen until the app restarted.
+        let live = self.generation == generation
         subscriptionRequest = request
-        subscriptionID = subscription
-        pollCancelled = false
+        if live {
+            subscriptionID = subscription
+            pollCancelled = false
+        }
         lock.unlock()
+        guard live else { return }
         DispatchQueue.global(qos: .utility).async { [weak self] in
             self?.poll(subscription: subscription, generation: generation)
         }

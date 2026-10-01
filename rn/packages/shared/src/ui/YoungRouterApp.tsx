@@ -8327,6 +8327,13 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
   const appliedTabRequestKey = useRef(requestedTabKey);
   const clearTabRef = useRef<typeof LOG_TABS[number] | undefined>(undefined);
   const viewRevisionRef = useRef<number | undefined>(undefined);
+  // The filter field owns its text until Core confirms it.  A poll that still
+  // carries the previous filter lands between a keystroke and the 250 ms
+  // dispatch, and syncing the field from it deleted the character the user had
+  // just typed.
+  const filterDirty = useRef(false);
+  const filterDraftRef = useRef("");
+  filterDraftRef.current = filterDraft;
   const selectedTabRef = useRef(selected);
   selectedTabRef.current = selected;
   const active = activeState?.tab === selected ? activeState.log : undefined;
@@ -8335,7 +8342,17 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
     appliedTabRequestKey.current = requestedTabKey;
     if (requestedTab) setSelected(requestedTab);
   }, [requestedTab, requestedTabKey]);
-  useEffect(() => { setFilterDraft(active?.filter ?? ""); }, [active?.filter, selected]);
+  useEffect(() => {
+    // A tab switch starts from that tab's own filter, so the dirty guard is
+    // dropped before the sync effect below reads the new tab's value.
+    filterDirty.current = false;
+  }, [selected]);
+  useEffect(() => {
+    const coreFilter = active?.filter ?? "";
+    if (filterDirty.current && coreFilter !== filterDraftRef.current) return;
+    filterDirty.current = false;
+    setFilterDraft(coreFilter);
+  }, [active?.filter, selected]);
   useEffect(() => () => { if (filterTimer.current) clearTimeout(filterTimer.current); }, []);
   useEffect(() => {
     let mounted = true;
@@ -8545,7 +8562,7 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
   };
   return <View style={styles.logsWindow}>
     <View style={styles.logsToolbar}>
-      <View style={styles.logFilterRow}><Text style={styles.toolbarLabel}>{translate("common.filter")}</Text><NativeTextField style={styles.logFilterInput} value={filterDraft} placeholder={translate("logs.filterCurrent")} onChangeText={(filter) => { setFilterDraft(filter); if (filterTimer.current) clearTimeout(filterTimer.current); filterTimer.current = setTimeout(() => { void dispatch("logs.set_filter", { tab: selected, filter }, "logs"); }, 250); }} accessibilityLabel={translate("common.filter")} /></View>
+      <View style={styles.logFilterRow}><Text style={styles.toolbarLabel}>{translate("common.filter")}</Text><NativeTextField style={styles.logFilterInput} value={filterDraft} placeholder={translate("logs.filterCurrent")} onChangeText={(filter) => { filterDirty.current = true; setFilterDraft(filter); if (filterTimer.current) clearTimeout(filterTimer.current); filterTimer.current = setTimeout(() => { void dispatch("logs.set_filter", { tab: selected, filter }, "logs"); }, 250); }} accessibilityLabel={translate("common.filter")} /></View>
       <View style={styles.logToolbarSpacer} />
       <View style={styles.logActionsRow}>{selected === "recovery" ? <NativeButton title={translate("logs.clearRecoveryCooldown")} accessibilityLabel={translate("logs.clearRecoveryCooldown")} compact busy={cooldownClearPending} disabled={busy && !cooldownClearPending} onPress={clearCooldowns} style={styles.clearCooldownButton} /> : null}<IconButton label="" symbol={paused ? "play" : "pause"} title={paused ? translate("common.resume") : translate("common.pause")} disabled={busy} onPress={togglePaused} /><IconButton label="" symbol="trash" title={translate("common.clearView")} disabled={busy} onPress={clearLogs} /></View>
     </View>

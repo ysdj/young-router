@@ -1199,20 +1199,39 @@ def _session_affinity_state_map(payload: Any) -> dict[str, dict[str, Any]]:
     }
 
 
+def _session_affinity_timestamp(entry: Mapping[str, Any]) -> Optional[float]:
+    """The entry's own timestamp, or None when it cannot be a time.
+
+    Every other state family coerces its timestamps the same way.  A
+    non-numeric ``updated_at`` in a hand-edited or truncated state file used to
+    raise ``ValueError`` out of both the read and the write, so the entry was
+    never pruned: session affinity (and with it deployment filtering) failed on
+    every request until the file was deleted by hand.  An entry whose stamp
+    cannot be read is treated as stale and dropped.
+    """
+
+    try:
+        value = float(entry.get("updated_at"))
+    except (TypeError, ValueError):
+        return None
+    return value if value == value else None
+
+
 def _prune_session_affinity_entries(
     entries: dict[str, dict[str, Any]],
     now: float,
 ) -> dict[str, dict[str, Any]]:
-    pruned = {
-        key: entry
-        for key, entry in entries.items()
-        if now - float(entry.get("updated_at") or 0.0) <= _SESSION_DEPLOYMENT_AFFINITY_TTL_SECONDS
-    }
+    pruned: dict[str, dict[str, Any]] = {}
+    for key, entry in entries.items():
+        stamp = _session_affinity_timestamp(entry)
+        if stamp is None or now - stamp > _SESSION_DEPLOYMENT_AFFINITY_TTL_SECONDS:
+            continue
+        pruned[key] = entry
     if len(pruned) <= _SESSION_DEPLOYMENT_AFFINITY_MAX_ENTRIES:
         return pruned
     keep = sorted(
         pruned.items(),
-        key=lambda item: float(item[1].get("updated_at") or 0.0),
+        key=lambda item: _session_affinity_timestamp(item[1]) or 0.0,
         reverse=True,
     )[:_SESSION_DEPLOYMENT_AFFINITY_MAX_ENTRIES]
     return dict(keep)

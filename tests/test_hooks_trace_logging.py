@@ -4,6 +4,33 @@ from hook_test_utils import *
 
 
 class HookTraceLoggingTests(HookTestCase):
+    def test_the_row_eviction_keeps_a_stream_that_is_still_reporting(self) -> None:
+        """The cap evicts the least recently touched row, not the oldest one.
+
+        Eviction pops the first entry, and re-inserting under an existing key
+        does not move it, so a long stream kept its original position and could
+        be dropped while it was still reporting — its settlement then found no
+        entry and its row stayed "sending" in the viewer.
+        """
+
+        hooks, _ = load_hook_module()
+        cap = hooks._PENDING_RECENT_REQUESTS_MAX
+        with hooks._PENDING_RECENT_REQUESTS_LOCK:
+            hooks._PENDING_RECENT_REQUESTS.clear()
+        self.addCleanup(hooks._PENDING_RECENT_REQUESTS.clear)
+        for index in range(cap):
+            hooks._track_recent_request({
+                "request_id": f"row-{index}",
+                "status": "stream",
+                "model": "default-chat",
+            })
+        # The oldest row is still alive: its heartbeat must protect it.
+        hooks._touch_recent_request("row-0", interval_seconds=9999, )
+        hooks._track_recent_request({"request_id": "row-new", "status": "stream", "model": "default-chat"})
+        with hooks._PENDING_RECENT_REQUESTS_LOCK:
+            self.assertIn("row-0", hooks._PENDING_RECENT_REQUESTS)
+            self.assertNotIn("row-1", hooks._PENDING_RECENT_REQUESTS)
+
     def test_trace_request_preview_scans_tail_of_long_responses_input(self) -> None:
         hooks, _ = load_hook_module()
         input_items = [

@@ -4,6 +4,7 @@
 #include <Windows.h>
 #include <winhttp.h>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cwctype>
 #include <filesystem>
@@ -915,7 +916,14 @@ void CoreIPCBridge::PollEvents(std::string subscription) {
         InvalidateCoreIfGeneration(generation, true);
         return;
       }
-      if (result.status != 200) continue;
+      if (result.status != 200) {
+        // A status that is neither an answer nor a session failure (a
+        // version-mismatched 404, a wedged 500) must not spin: retry at the
+        // same one-second pace the macOS bridge keeps.
+        if (stopping_) return;
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        continue;
+      }
       auto outer = winrt::Windows::Data::Json::JsonObject::Parse(Utf8ToWide(result.body));
       // A missing/null event is the expected quiet heartbeat.
       auto event = outer.GetNamedObject(L"event", nullptr);
@@ -1006,7 +1014,9 @@ void CoreIPCBridge::InvalidateCoreLocked(bool preserve_subscription) {
   subscription_id_.clear();
   if (!preserve_subscription) {
     subscription_request_.clear();
-    event_handler_ = nullptr;
+    // A full teardown drops every window's event handler: the class keeps one
+    // handler per React root, so clearing the map is what releases them all.
+    event_handlers_.clear();
   }
   ++core_generation_;
 }

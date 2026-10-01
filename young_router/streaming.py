@@ -673,7 +673,10 @@ def _stream_chunk_error_exception(chunk: Any) -> Optional[Exception]:
     # as their wire-level type while carrying the exact upstream status in the
     # message. Parse that explicit status before the generic invalid-request
     # inference, otherwise an upstream 404 is incorrectly downgraded to 400.
-    if status_code is None and error_code in {
+    # A wire payload's code is not necessarily text: a malformed upstream
+    # error that carries an object or list there must not turn this mapping
+    # into an unhandled TypeError inside the stream path.
+    if status_code is None and (error_code if isinstance(error_code, str) else "") in {
         "upstream_compaction_failure",
         "upstream_route_failure",
     }:
@@ -6472,7 +6475,7 @@ async def _yield_guarded_original_stream(
         if not pending_tool_items and not completed_custom_tool_items:
             return []
         if any(
-            item.get("type") not in {"reasoning", "custom_tool_call"}
+            not isinstance(item.get("type"), str) or item.get("type") not in {"reasoning", "custom_tool_call"}
             for item in completed_output_items.values()
         ):
             return []
