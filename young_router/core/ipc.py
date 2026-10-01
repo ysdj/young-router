@@ -113,6 +113,11 @@ class _Session:
 class _Subscription:
     subscription_id: str
     session_token: str
+    # The event topics this subscription asked for, or None for every event.
+    # A topic is the event's own ``event`` name; the contract's vocabulary is
+    # exactly what Core publishes, so an empty set is a subscription that asked
+    # for nothing.
+    topics: frozenset[str] | None = None
     queue: queue.Queue[dict[str, Any]] = field(default_factory=lambda: queue.Queue(maxsize=MAX_EVENTS))
 
 
@@ -961,7 +966,12 @@ class CoreIPCServer:
     def _publish(self, event: dict[str, Any]) -> None:
         with self._lock:
             subscriptions = tuple(self._subscriptions.values())
+        topic = str(event.get("event", ""))
         for subscription in subscriptions:
+            if subscription.topics is not None and topic not in subscription.topics:
+                # The client named the topics it wants: it is not sent the
+                # events it did not ask for.
+                continue
             try:
                 subscription.queue.put_nowait(event)
             except queue.Full:
@@ -973,10 +983,10 @@ class CoreIPCServer:
                 except queue.Empty:
                     pass
 
-    def _new_subscription(self, session_token: str) -> str:
+    def _new_subscription(self, session_token: str, topics: frozenset[str] | None = None) -> str:
         subscription_id = uuid.uuid4().hex
         with self._lock:
-            subscription = _Subscription(subscription_id, session_token)
+            subscription = _Subscription(subscription_id, session_token, topics=topics)
             self._subscriptions[subscription_id] = subscription
             session = self._sessions.get(session_token)
             if session is not None:
@@ -1046,7 +1056,11 @@ class CoreIPCServer:
                 topics = params.get("topics")
                 if topics is not None and (not isinstance(topics, Sequence) or isinstance(topics, (str, bytes, bytearray))):
                     raise CoreError("invalid_subscription", "Subscription topics are invalid")
-                result = {"subscription_id": self._new_subscription(session_token)}
+                # The topics a subscription names are the events it is sent;
+                # no topics means every event.  The vocabulary is validated
+                # against the contract, so a subscription cannot ask for an
+                # event Core never publishes.
+                result = {"subscription_id": self._new_subscription(session_token, frozenset(str(topic) for topic in topics) if topics is not None else None)}
             elif request.method == "validate":
                 domain = params.get("domain")
                 if domain is not None and not isinstance(domain, str):

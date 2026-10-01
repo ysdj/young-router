@@ -793,11 +793,20 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("self.leaf.presentDecisionPanel(", module)
 
         # The destructive fact travels from the shared UI through the typed
-        # adapter into the positional native call on both hosts.
-        self.assertIn("showConfirmation(options: { title: string; message: string; confirmLabel: string; destructive?: boolean }): Promise<boolean>;", types)
-        self.assertIn("showConfirmation(title: string, message: string, confirmLabel: string, destructive: boolean): Promise<boolean>;", bridge_types)
-        self.assertIn("leaf.showConfirmation?.(title, message, confirmLabel, destructive === true)", platform)
+        # adapter into the positional native call on both hosts, and the
+        # dismissing answer's words travel the same way: a question whose 取消
+        # means "cancel the move" names that answer instead of leaving the
+        # host's generic Cancel, while a caller that names nothing keeps it.
+        self.assertIn("showConfirmation(options: { title: string; message: string; confirmLabel: string; cancelLabel?: string; destructive?: boolean }): Promise<boolean>;", types)
+        self.assertIn("showConfirmation(title: string, message: string, confirmLabel: string, cancelLabel: string, destructive: boolean): Promise<boolean>;", bridge_types)
+        self.assertIn("leaf.showConfirmation?.(title, message, confirmLabel, cancelLabel, destructive === true)", platform)
         self.assertIn("destructive:(BOOL)destructive", bridge)
+        self.assertIn("cancelLabel:(NSString *)cancelLabel", bridge)
+        self.assertIn('title: cancelTitle.isEmpty ? self.leaf.localizedText("cancel", fallback: "Cancel") : cancelTitle,', module)
+        self.assertIn("let cancelTitle = cancelLabel.trimmingCharacters(in: .whitespacesAndNewlines)", module)
+        self.assertIn("std::wstring const& cancel_label,", windows_module)
+        self.assertIn("leaf->Confirm(title, message, confirm_label, cancel_label, destructive);", windows_module)
+        self.assertIn('cancel_answer.label = cancel_label.empty() ? Localized("cancel", L"Cancel") : std::wstring(cancel_label);', confirm)
         self.assertIn("destructive: Bool,", module)
 
     def test_shared_ui_owns_lifecycle_menu_actions_startup_and_safe_recovery(self) -> None:

@@ -223,6 +223,14 @@ def _validate_schema_value(value: object, raw_schema: Mapping[str, Any]) -> None
                 raise _SchemaMismatch
         if schema.get("additionalProperties") is False and any(name not in properties for name in value):
             raise _SchemaMismatch
+        additional_schema = schema.get("additionalProperties")
+        if isinstance(additional_schema, Mapping):
+            # The object form constrains every key the properties do not name,
+            # which is how the disk-state map validates each domain's record.
+            for name, item in value.items():
+                if name in properties:
+                    continue
+                _validate_schema_value(item, additional_schema)
         for name, item in value.items():
             child_schema = properties.get(name)
             if child_schema is not None:

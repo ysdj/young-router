@@ -2724,11 +2724,15 @@ class CoreStore:
                     "account_resources_import",
                 }:
                     resource_data = _as_mapping(payload)
+                    # The revision the caller stated is the one this dispatch
+                    # checks, exactly as the ordinary path and the codex/webdav
+                    # special cases do: staging an import from a stale window
+                    # has to conflict instead of silently rewriting the draft.
                     return _relay_transient_dispatch_result(
                         self.import_relay_resources(
                             resource_data.get("id", resource_data.get("account_id")),
                             resource_data.get("resource_ids"),
-                            revision=self._revision,
+                            revision=expected_revision if expected_revision is not None else data.get("expected_revision"),
                             mode=resource_data.get("import_mode", resource_data.get("mode", "linked")),
                         )
                     )
@@ -2741,7 +2745,7 @@ class CoreStore:
                     return _relay_transient_dispatch_result(
                         self.refresh_relay_resources(
                             resource_data.get("id", resource_data.get("account_id")),
-                            revision=self._revision,
+                            revision=expected_revision if expected_revision is not None else data.get("expected_revision"),
                         )
                     )
                 if name == "providers_models" and normalized_action == "provider_select_relay_station":

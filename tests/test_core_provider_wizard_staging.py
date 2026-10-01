@@ -299,6 +299,132 @@ class ProviderWizardStagingTests(unittest.TestCase):
             with self.assertRaises(DomainError):
                 domain.stage_secret("api_key", "__wizard_provider__\x1fkey", "replace-orphan-secret")
 
+    def test_adopting_a_staged_key_names_its_token_never_its_target(self) -> None:
+        """``pending_api_key`` is the token the target filed, not the target.
+
+        The wizard stages a value through a target namespaced by the wizard
+        prefix, and Core files it under the bare token that target carried.
+        Every action that adopts, lists, or drops the staged value therefore
+        addresses that token: echoing the target back reads as an unknown
+        token and is refused, which is the shape a caller must not send.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(textwrap.dedent(EMPTY_CONFIG).lstrip(), encoding="utf-8")
+            domain = ProvidersModelsDomain(path)
+            target = wizard_target("wizard-7", "quartz")
+            domain.stage_secret("api_key", target, "replace-staged-secret")
+
+            with self.assertRaises(DomainError):
+                domain.dispatch(
+                    "provider.add",
+                    {
+                        "provider": {
+                            "name": "Staged",
+                            "api_base": "https://example.test/v1",
+                            "auth_kind": "api_key",
+                            "enabled": True,
+                            "models": [],
+                            "create_default_api_key": True,
+                            "initial_api_key_name": "quartz",
+                        },
+                        "pending_api_key": target,
+                    },
+                )
+            # The refusal left both the draft and the staged value alone, so
+            # the same create succeeds once it names the token Core filed.
+            self.assertEqual([], domain.snapshot()["providers"])
+            self.assertTrue(domain.secret_present("api_key", target))
+            created = domain.dispatch(
+                "provider.add",
+                {
+                    "provider": {
+                        "name": "Staged",
+                        "api_base": "https://example.test/v1",
+                        "auth_kind": "api_key",
+                        "enabled": True,
+                        "models": [],
+                        "create_default_api_key": True,
+                        "initial_api_key_name": "quartz",
+                    },
+                    "pending_api_key": "wizard-7",
+                },
+            )
+            provider = created["providers"][0]
+            self.assertEqual([("quartz", True)], [(key["name"], key["configured"]) for key in provider["key_states"]])
+
+    def test_a_refused_create_keeps_the_staged_key_for_the_retry(self) -> None:
+        """A create Core refuses must not swallow the wizard's credential.
+
+        The staged value used to be taken before the validations that can
+        refuse the create, so a duplicate name (the wizard's own retry after a
+        partial attempt) consumed the secret and left 完成 permanently unable
+        to report anything but "the staged API key is unavailable".
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(textwrap.dedent(EMPTY_CONFIG).lstrip(), encoding="utf-8")
+            domain = ProvidersModelsDomain(path)
+            domain.dispatch(
+                "provider.add",
+                {
+                    "provider": {
+                        "name": "Staged",
+                        "api_base": "https://example.test/v1",
+                        "auth_kind": "api_key",
+                        "enabled": True,
+                        "models": [],
+                    }
+                },
+            )
+            target = wizard_target("wizard-9", "quartz")
+            domain.stage_secret("api_key", target, "replace-staged-secret")
+            create = {
+                "provider": {
+                    "name": "Staged",
+                    "api_base": "https://example.test/v1",
+                    "auth_kind": "api_key",
+                    "enabled": True,
+                    "models": [],
+                    "create_default_api_key": True,
+                    "initial_api_key_name": "quartz",
+                },
+                "pending_api_key": "wizard-9",
+            }
+
+            # The duplicate name is refused, and the staged key survives it.
+            with self.assertRaises(DomainError):
+                domain.dispatch("provider.add", create)
+            self.assertEqual(1, len(domain.snapshot()["providers"]))
+            self.assertTrue(domain.secret_present("api_key", target))
+
+            # Once the conflict is gone, the retry adopts that same value.
+            create["provider"]["name"] = "Staged Again"
+            retried = domain.dispatch("provider.add", create)
+            provider = retried["providers"][1]
+            self.assertEqual([("quartz", True)], [(key["name"], key["configured"]) for key in provider["key_states"]])
+            # The token was one-time after all: the value is gone from the
+            # staging area and only lives on the provider it was adopted by.
+            self.assertFalse(domain.secret_present("api_key", target))
+
+    def test_a_discard_names_its_token_too(self) -> None:
+        """A wizard dismissal drops the staged value by the same token."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(textwrap.dedent(EMPTY_CONFIG).lstrip(), encoding="utf-8")
+            domain = ProvidersModelsDomain(path)
+            target = wizard_target("wizard-8", "quartz")
+            domain.stage_secret("api_key", target, "replace-discarded-secret")
+
+            domain.dispatch("provider.discard_pending_key", {"pending_api_key": target})
+            self.assertTrue(domain.secret_present("api_key", target))
+
+            domain.dispatch("provider.discard_pending_key", {"pending_api_key": "wizard-8"})
+            self.assertFalse(domain.secret_present("api_key", target))
+
 
 if __name__ == "__main__":
     unittest.main()

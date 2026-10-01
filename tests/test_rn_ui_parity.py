@@ -105,7 +105,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # The wizard's footer states its own line beside its buttons again.
         # Exactly one status line, and no step body repeats it.
         self.assert_ui_has('const wizardStatus = validation || loginFeedback.current || (loginPhase === "sign-in" ? translate("relay.loginWorking") : "");')
-        self.assert_ui_has('{wizardStatus ? <Text accessibilityLiveRegion="polite" numberOfLines={2} style={styles.providerWizardFooterStatus}>{wizardStatus}</Text> : <View style={styles.providerWizardFooterSpacer} />}')
+        self.assert_ui_has('const wizardFooterStatus = wizardStatus || status || "";')
+        self.assert_ui_has('{wizardFooterStatus ? <Text accessibilityLiveRegion="polite" numberOfLines={2} style={styles.providerWizardFooterStatus}>{wizardFooterStatus}</Text> : <View style={styles.providerWizardFooterSpacer} />}')
         self.assert_ui_not_has("providerWizardValidation")
         self.assert_ui_not_has('<Text style={styles.providerWizardHint}>{loginFeedback.current}')
         self.assert_ui_not_has("{loginFeedback.current ? <Text")
@@ -232,7 +233,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_not_has("providerWizardValidation")
         self.assert_ui_not_has("{loginFeedback.current ? <Text")
         self.assert_ui_not_has("loginFeedback.current ?? translate")
-        self.assert_ui_has('{wizardStatus ? <Text accessibilityLiveRegion="polite"')
+        self.assert_ui_has('{wizardFooterStatus ? <Text accessibilityLiveRegion="polite"')
         # Its required controls wear the mark the message talks about, and the
         # manual-model pair — one entry, not two required fields — says so.
         self.assertIn("{required ? <Text style={styles.formLabelRequired}>＊</Text> : null}", relay_manager)
@@ -987,7 +988,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has(r'cells: [`\t${modelUpstreamDisplay(editorIdentifier(entry.provider), entry.model) || translate("common.notAvailable")}`, providerDisplayName(entry.provider), modelProviderKeyLabel(entry.model, entry.provider, translate, undefined, relaySources), order]')
         self.assertNotIn('providers.orderSource', self.ui)
         self.assertNotIn('providers.effectiveOrder', self.ui)
-        self.assert_ui_has('modelOrderMode(activeRoute.model) === "relay_multiplier"')
+        self.assert_ui_has('const activeRouteGroupUsesMultiplier = activeRouteGroup.some((entry) => modelOrderMode(entry.model) === "relay_multiplier");')
         self.assertNotIn('const displayRoutes = useMemo', self.ui)
         self.assert_ui_has('key: routePublicModelRowKey(group.name)')
         self.assert_ui_has('spanning: true')
@@ -3302,7 +3303,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # pane offers the same picker the wizard does, so WorkBuddy is
             # wired and retargeted like any other service.
             'const SERVICE_KIND_OPTIONS: ReadonlyArray<{ kind: ProviderKind; label: TranslationKey }> = [',
-            'dispatch("service_provider.patch", { provider_id: id, provider: { auth_kind: next } })',
+            # The picker's short type is translated into the persisted login
+            # kind before it is dispatched, the way Core validates it.
+            'function serviceProviderKindFor(kind: ProviderKind): ServiceProviderKind | undefined {',
+            'const authKind = serviceProviderKindFor(next as ProviderKind);',
+            'dispatch("service_provider.patch", { provider_id: id, provider: { auth_kind: authKind } })',
             # Every label column in the pane is the shared one, so a rate row
             # lines up with the fields beside it.
             'providerAuthStatusLabel: { width: 88, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE }',
@@ -3365,7 +3370,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "function serviceFromURL(value: string): ServiceID | undefined {",
             "function providerAuthKind(provider: UnknownRecord | undefined): ProviderAuthKind {",
             "function providerKindLabel(kind: ProviderKind, translate: Translate): string {",
-            "const providers = useMemo(() => {",
+            "const providers = useMemo(() => snapshotProviderRecords(snapshot), [snapshot?.providers_models.providers, state.providers]);",
             "cells: [providerDisplayName(item)]",
         ):
             self.assert_ui_has(marker)
@@ -4064,7 +4069,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("controller.markApplied(true)\n        finishGroupManager()", mac_leaf)
         self.assertIn("closeGroupManager(applied: false)\n            return false", mac_leaf)
         self.assertNotIn("AppKitNativeLeaf.shared.endChildPanel(panel)", mac_leaf.split("@objc private func closePanel", 1)[1].split("func resultOnEnd()", 1)[0])
-        self.assertIn("if (has_staged_changes() && !Confirm(labels.discard_title, labels.discard_body, labels.discard_confirm, /*destructive=*/true)) return;", windows_leaf)
+        self.assertIn("if (has_staged_changes() && !Confirm(labels.discard_title, labels.discard_body, labels.discard_confirm, {}, /*destructive=*/true)) return;", windows_leaf)
         self.assertIn('labels.discard_title = read("discardTitle");', windows_module)
         self.assertNotIn("hint.Text(winrt::hstring(labels.hint));", windows_leaf)
         # The sheet opens on the account facts the provider window already
@@ -4502,7 +4507,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'const providerKeyName = drafts?.providerKeyDisplayName(providerId, providerKey.id, providerKey.name) ?? providerKey.name;',
             'changes: { provider_key_id: providerKey.id, api_key_name: providerKeyName },',
             'providerKeyOptions.length > 0 ? <PickerField label={translate("providers.providerKey")}',
-            'modelOrderMode(activeRoute.model) === "relay_multiplier"',
+            'const activeRouteGroupUsesMultiplier = activeRouteGroup.some((entry) => modelOrderMode(entry.model) === "relay_multiplier");',
             'const canFollowMultiplier = usesRelayKey && relayMultiplier !== undefined;',
             'label={translate("providers.order")}',
             'label={translate("providers.followMultiplier")}',
@@ -4709,11 +4714,16 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('if (creatingProvider) {', wizard)
         self.assertIn("const targetProviderID = providerID || await commitWizardProvider();", wizard)
         self.assertIn('dispatchWithOutcome("provider.add", {\n      provider: {', wizard)
-        self.assertIn("{ pending_api_key: `${WIZARD_PENDING_KEY_PREFIX}${pendingKeyToken}` }", wizard)
+        # The token, never the secret target it was staged under: Core files
+        # the value under the bare token and adopts it by that name, so a
+        # payload that echoed the target would be refused as unknown.
+        self.assertIn("{ pending_api_key: pendingKeyToken }", wizard)
+        self.assertIn("pending_api_key: pendingKeyToken,", wizard)
+        self.assertNotIn("pending_api_key: `${WIZARD_PENDING_KEY_PREFIX}", self.ui)
+        self.assertIn("const fetchIdentity = creatingProvider ? pendingKeyToken : providerID;", wizard)
         # The model step lists a provider that does not exist yet through that
         # same token, so discovery leaves no record either.
         self.assertIn("pending_provider: {", wizard)
-        self.assertIn("const fetchIdentity = creatingProvider ? pendingKeyToken : providerID;", wizard)
         # An official account is created by the press that signs in to it: the
         # sign-in needs the record it belongs to.
         self.assertIn('target = await addOfficialAccount(', wizard)
@@ -4723,14 +4733,52 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('if (route === "provider-wizard") dropProviderWizardStagedKey();', self.ui)
         self.assertIn("const registerProviderWizardKeyToken = (token: string): void => {", self.ui)
         self.assertIn('"provider.discard_pending_key",', self.ui)
+        self.assertIn("{ pending_api_key: token },", self.ui)
         self.assertIn("onKeyToken(pendingKeyToken);", wizard)
         self.assertIn("onKeyToken={registerProviderWizardKeyToken}", self.ui)
         self.assertIn('if action == "provider_discard_pending_key":', core)
         # ...and Core files that value only for a target it can adopt: a
         # provider target still needs a provider.
         self.assertIn('if not provider_id.startswith(self._WIZARD_KEY_TARGET_PREFIX):', core)
-        self.assertIn("pending_keys = self._take_pending_provider_keys(pending_token) if pending_token else {}", core)
+        self.assertIn("pending_keys = self._pending_provider_keys.get(pending_token, {}) if pending_token else {}", core)
         self.assertIn('raise DomainError("The staged API key is unavailable")', core)
+
+    def test_a_staged_surface_keeps_a_way_back_and_reports_the_users_action(self) -> None:
+        """The second half of a two-step surface must stay reachable.
+
+        Four places used to end behind their own result: a staged import had no
+        way to choose another file, a refused key rename selected the namesake,
+        a snapshot refresh failing after a staged key edit reported the edit as
+        failed, and the vendor sign-in claimed 登录成功 over an unread station.
+        """
+
+        # The staged-import result keeps the same choose-file control beside it.
+        self.assert_ui_has('{sectionListHeader(statuses.import ?? translate("dataManagement.selectedCount", { count: stagedSections.length }), <ActionButton title={translate("dataManagement.changeImportFile")} busy={pendingAction === "inspect"} disabled={controlsBusy("inspect")} onPress={() => { void chooseImportFile(); }} />)}')
+        # A rename answers the slot it edits, so a namesake is never selected.
+        self.assert_ui_has('const pendingCustomKeyRename = useRef<{ id: string; name: string } | undefined>(undefined);')
+        self.assert_ui_has('const renamed = customKeys.find((key) => key.id === rename.id);')
+        self.assert_ui_has('pendingCustomKeyRename.current = { id: selectedCustom.id, name };')
+        # A commit is not undone by the snapshot read that follows it.
+        self.assert_ui_has('// The commit is the result the user asked for; the refresh that repaints')
+        self.assert_ui_has('// The subscription, or the next pane action, repaints the staged row.')
+        # The vendor sign-in binds the station it signed in to and states the
+        # station read it actually got.
+        self.assert_ui_has('const resourceStatus = await relay.refreshResources(pendingID, { force: true });')
+        self.assert_ui_has('const bound = await dispatchWithOutcome("provider.select_relay_station", { provider_id: id, station_id: stationID });')
+        self.assert_ui_has('onStatus?.(translate(resourceStatus === "ready" ? "relay.loginComplete" : "relay.loginResourcesUnavailable"));')
+        # An address that cannot bind because its station name is taken says so
+        # instead of looking like a lost keystroke.
+        self.assert_ui_has('onStatus?.(translate("providers.relayNameTaken", { name: station.name }));')
+        # The 分组管理 sheet records each staged edit as it lands, so a retry
+        # writes only the remainder instead of duplicating keys.
+        self.assertIn('const opened = useRef(false);', self.relay)
+        self.assertIn('handedOver = staged;', self.relay)
+        self.assertIn('stagedEdit.name = edit.name;', self.relay)
+        self.assertIn('staged.creates.push(create);', self.relay)
+        self.assertIn('staged.deletes.push(keyID);', self.relay)
+        for locale in (self.zh, self.en):
+            self.assertIn('"providers.relayNameTaken"', locale)
+            self.assertIn('"providers.reorderSameOrder"', locale)
 
     def test_provider_table_columns_fit_the_fixed_provider_pane(self) -> None:
         self.assertIn('"providers.modelCount": "Count"', self.en)
@@ -5310,9 +5358,23 @@ class ReactNativeUiParityTests(unittest.TestCase):
         """
 
         self.assertIn("const routeOrderValues = activeRouteGroup.map((entry) => modelOrderValue(editorIdentifier(entry.provider), entry.model));", self.ui)
+        # One multiplier route in the group locks the whole group's hand
+        # ordering, exactly as Core refuses the rewrite: the pane reads the
+        # group, not only the selected row, before it offers ↑/↓.
+        self.assertIn("const activeRouteGroupUsesMultiplier = activeRouteGroup.some((entry) => modelOrderMode(entry.model) === \"relay_multiplier\");", self.ui)
+        self.assertIn('const routeMoveTitleKey = activeRouteGroupUsesMultiplier ? "providers.reorderMultiplierLocked" : undefined;', self.ui)
+        self.assertIn("const canMoveRouteUp = !activeRouteGroupUsesMultiplier && activeRouteIndex > 0;", self.ui)
+        self.assertIn("if (!activeRoute || activeRouteIndex < 0 || activeRouteGroupUsesMultiplier) return;", self.ui)
+        # A neighbour with the same number cannot trade it, so the press states
+        # that instead of dispatching a permutation that changes nothing.
+        self.assertIn('if (routeOrderValues[activeRouteIndex] === routeOrderValues[targetIndex]) {', self.ui)
+        self.assertIn('onStatus(translate("providers.reorderSameOrder", { order: String(routeOrderValues[activeRouteIndex]) }));', self.ui)
         self.assertIn("const decimals = routeOrderValues.filter((value) => !Number.isInteger(value));", self.ui)
-        self.assertIn('translate("providers.reorderIntegerMessage", { orders: decimals.join("、") })', self.ui)
-        self.assertIn("}).then((renumber) => reorder(renumber));", self.ui)
+        self.assertIn('translate("providers.reorderIntegerMessage", { orders: decimals.join(translate("providers.orderListSeparator")) })', self.ui)
+        # 取消移动 dismisses the move itself: only 改为整数 renumbers and moves,
+        # so a decimal group keeps its order when the question is declined.
+        self.assertIn('cancelLabel: translate("providers.reorderCancelMove"),', self.ui)
+        self.assertIn("if (renumber) void reorder(true);", self.ui)
         self.assertIn("...(renumber ? { renumber: true } : {})", self.ui)
         # No question when every value is already an integer.
         self.assertIn("if (decimals.length === 0) {", self.ui)
@@ -5350,6 +5412,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
                 '"providers.reorderIntegerTitle"',
                 '"providers.reorderIntegerMessage"',
                 '"providers.reorderIntegerConfirm"',
+                '"providers.reorderCancelMove"',
+                '"providers.orderListSeparator"',
+                '"providers.reorderMultiplierLocked"',
+                '"providers.reorderSameOrder"',
             ):
                 self.assertIn(key, locale)
 

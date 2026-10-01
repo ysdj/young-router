@@ -5,6 +5,7 @@ import {
   type IpcClient,
   type IpcEndpoint,
   type IpcEvent,
+  type IpcEventTopic,
   type IpcMethod,
   type IpcParams,
   type IpcRequest,
@@ -86,7 +87,7 @@ export function createIpcClient(transport: IpcTransport, endpoint?: IpcEndpoint)
     files: async (): Promise<IpcResults["files"]> => call("files", {}),
     stageEditor: async (editorToken, text): Promise<IpcResults["editor"]> => call("editor", { editor_token: editorToken, text }),
     dispatch: async (action: DispatchAction, revision?: number): Promise<IpcResults["dispatch"]> => call("dispatch", revision === undefined ? { action } : { action, revision }),
-    subscribe: (listener: (event: IpcEvent) => void, topics?: string[]): (() => void) => {
+    subscribe: (listener: (event: IpcEvent) => void, topics?: IpcEventTopic[]): (() => void) => {
       snapshotListeners.add(listener);
       if (!unsubscribeTransport) {
         unsubscribeTransport = transport.subscribe((event) => {

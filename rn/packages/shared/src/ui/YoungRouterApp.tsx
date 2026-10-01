@@ -2398,7 +2398,7 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
     if (!token) return;
     void enqueueDispatch(
       "provider.discard_pending_key",
-      { pending_api_key: `${WIZARD_PENDING_KEY_PREFIX}${token}` },
+      { pending_api_key: token },
       "providers_models",
     ).catch(() => undefined);
   };
@@ -2507,12 +2507,7 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
   const windowTitle = settingsRoute
     ? translate("status.codex")
     : translate(definition?.titleKey ?? "app.title");
-  const providerWizardProviders = useMemo(() => {
-    const state = domainState(snapshot, "providers_models");
-    const details = asRecords(state.providers);
-    const candidates = details.length > 0 ? details : (snapshot?.providers_models.providers ?? []).map(providerRecord);
-    return candidates;
-  }, [snapshot]);
+  const providerWizardProviders = useMemo(() => snapshotProviderRecords(snapshot), [snapshot]);
   const providerWizardRelaySources = useMemo(() => relaySourcesFromSnapshot(snapshot), [snapshot]);
  const providerWizardRelayStations = useMemo(() => relayStationsFromSnapshot(snapshot), [snapshot]);
   const detectRelayType = useCallback(async (origin: string): Promise<RelayType | undefined> => {
@@ -2635,7 +2630,7 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
     {route === "providers-models" || route === "provider-wizard" || route === "file-editor" || settingsRoute || route === "logs" || route === "runtime-settings" || route === "data-management" || route === "general-settings" ? <View style={[styles.windowContent, compactStyles.windowContent, styles.windowContentFixed, route === "file-editor" && styles.fileEditorRouteContent, route === "providers-models" && styles.providersContent, route === "provider-wizard" && styles.providerWizardRouteContent, settingsRoute && styles.assistantSettingsContent, route === "logs" && styles.logsContent, route === "runtime-settings" && styles.runtimeContent, route === "data-management" && styles.dataManagementContent]}>
     {route === "providers-models" ? <ProviderWorkspace snapshot={snapshot} ipc={ipc} onSnapshot={onSnapshot} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onStatus={setResult} onSecretState={onSecretState} applyProbedSurface={applyProbedSurface} onOpenWizard={() => { if (Platform.OS === "windows") onNavigate("provider-wizard"); native.window.open("provider-wizard"); }} relay={relayBridge} addOfficialAccount={addOfficialAccount} onActivateAndRestart={activateProviderAndRestart} /> : null}
     {route === "file-editor" ? <FileEditorWorkspace file={inlineEditorFile} fileId={fileIdRequest} nativeAction={nativeAction} ipc={ipc} native={native} translate={translate} busy={busy} onEditorConflict={resolveRawEditorConflict} reloadToken={settingsRawReloadToken} baselineToken={settingsRawBaselineToken} syncRevision={snapshot?.revision} onFlushPendingFields={flushPendingFields} onClose={closeRoute} /> : null}
-    {route === "provider-wizard" ? <ProviderSetupWizard snapshot={snapshot} native={native} providers={providerWizardProviders} relaySources={providerWizardRelaySources} relayStations={providerWizardRelayStations} busy={busy} translate={translate} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onStatus={setResult} onClose={closeRoute} onKeyToken={registerProviderWizardKeyToken} relay={relayBridge} addOfficialAccount={addOfficialAccount} /> : null}
+    {route === "provider-wizard" ? <ProviderSetupWizard snapshot={snapshot} native={native} providers={providerWizardProviders} relaySources={providerWizardRelaySources} relayStations={providerWizardRelayStations} busy={busy} translate={translate} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onStatus={setResult} onClose={closeRoute} onKeyToken={registerProviderWizardKeyToken} relay={relayBridge} addOfficialAccount={addOfficialAccount} status={result} /> : null}
     {settingsRoute ? <AssistantSettingsWorkspace busy={busy} native={native} codexModels={codexModelRows} codexModelCatalogEnabled={codexModelCatalogEnabled} clientProvider={codexClientProvider} clientModel={codexClientModel} localApiActive={codexUsesLocalApi} onToggleCodexModelCatalog={(enabled) => dispatch("codex.model_catalog.set", { enabled }, "codex")} onUseLocalApi={(selection) => dispatch("use_local_api", selection, "codex")} onUseSavedModel={(selection) => dispatch("use_saved_model", selection, "codex")} translate={translate} ipc={ipc} filesToken={settingsRawBaselineToken} onOpenFile={openAssistantFile} /> : null}
     {route === "logs" ? <LogsWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} translate={translate} dispatch={dispatch} onStatus={setResult} requestedTab={nativeAction?.id === "open-recovery" ? "recovery" : logTabRequest} requestedTabKey={nativeAction?.sequence ?? 0} /> : null}
     {route === "general-settings" ? <GeneralWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} dispatch={dispatch} dispatchServiceAction={enqueueServiceDispatch} translate={translate} onStatus={setResult} onSnapshot={onSnapshot} /> : null}
@@ -2671,6 +2666,14 @@ const PROVIDER_WIZARD_NEW_KEY = "__provider_wizard_new_key__";
  * together. Core holds that value (its `_WIZARD_KEY_TARGET_PREFIX`) and
  * `provider.add` adopts it — so 下一步 never mints a provider, and a wizard
  * the user closes reserves nothing.
+ *
+ * The prefix namespaces the *secret target* a native secure field stages
+ * under, never the token itself: Core parses the target, files the value
+ * under the bare token, and every action that adopts, lists, or drops the
+ * staged key (`provider.add`, `providers.fetch_models`, and
+ * `provider.discard_pending_key`) addresses that token verbatim.  Sending the
+ * target back where Core expects the token reads as an unknown token, so the
+ * wizard's own create would be refused and its staged value left behind.
  */
 const WIZARD_PENDING_KEY_PREFIX = "__wizard_provider__";
 
@@ -2680,11 +2683,22 @@ function providerWizardKeyTarget(token: string, keyName: string): string {
 
 type ServiceProviderKind = "openai_login" | "claude_login" | "workbuddy_login" | "workbuddy_ai_login";
 
-function serviceProviderRecords(snapshot: CoreSnapshot | undefined): UnknownRecord[] {
+/**
+ * Every provider the snapshot carries, whatever its kind.
+ *
+ * The wizard's own lookups go through this: a provider it has just created
+ * — a WorkBuddy service entry included — has to be found in the same list the
+ * create answered from, and a lookup that filtered by kind would report a
+ * create it never saw as "nothing happened".
+ */
+function snapshotProviderRecords(snapshot: CoreSnapshot | undefined): UnknownRecord[] {
   const state = domainState(snapshot, "providers_models");
   const details = asRecords(state.providers);
-  const candidates = details.length > 0 ? details : (snapshot?.providers_models.providers ?? []).map(providerRecord);
-  return candidates.filter((provider) => {
+  return details.length > 0 ? details : (snapshot?.providers_models.providers ?? []).map(providerRecord);
+}
+
+function serviceProviderRecords(snapshot: CoreSnapshot | undefined): UnknownRecord[] {
+  return snapshotProviderRecords(snapshot).filter((provider) => {
     const kind = providerAuthKind(provider);
     return kind === "openai_login" || kind === "claude_login";
   });
@@ -2692,6 +2706,25 @@ function serviceProviderRecords(snapshot: CoreSnapshot | undefined): UnknownReco
 
 function serviceProviderKindLabel(kind: ServiceProviderKind, translate: Translate): string {
   return kind === "openai_login" ? translate("relay.officialProviderOpenAI") : translate("relay.officialProviderClaude");
+}
+
+/**
+ * The persisted login kind behind each service type the pane offers.
+ *
+ * The pane's own vocabulary for a service provider is its short type
+ * (`openai`, `claude`, `workbuddy`, `workbuddyAI`), while Core persists and
+ * validates the login kind (`openai_login`, `claude_login`,
+ * `workbuddy_login`, `workbuddy_ai_login`).  Anything that retargets a
+ * provider through `service_provider.patch` has to translate between the two:
+ * the short name is not in Core's `_SERVICE_PROVIDER_KINDS`, so a dispatch
+ * that sent it would be refused as an unavailable login type.
+ */
+function serviceProviderKindFor(kind: ProviderKind): ServiceProviderKind | undefined {
+  return kind === "openai" ? "openai_login"
+    : kind === "claude" ? "claude_login"
+      : kind === "workbuddy" ? "workbuddy_login"
+        : kind === "workbuddyAI" ? "workbuddy_ai_login"
+          : undefined;
 }
 
 function nextServiceProviderName(providers: UnknownRecord[], kind: ServiceProviderKind): string {
@@ -2706,7 +2739,7 @@ function nextServiceProviderName(providers: UnknownRecord[], kind: ServiceProvid
   return `${base} ${suffix}`;
 }
 
-function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayStations, busy, translate, dispatchWithOutcome, onSecretState, onStatus, onClose, onKeyToken, relay, addOfficialAccount }: { snapshot?: CoreSnapshot; native: NativeLeafAdapter; providers: UnknownRecord[]; relaySources: RelaySourceOption[]; relayStations: RelayStationOption[]; busy: boolean; translate: Translate; dispatchWithOutcome: (type: string, payload?: UnknownRecord, domain?: ConfigDomain, keepControlsEnabled?: boolean) => Promise<CoreSnapshot | undefined>; onSecretState: (state: SecretState) => void; onStatus: (status?: string) => void; onClose: () => void; onKeyToken: (token: string) => void; relay: RelayWorkspaceBridge; addOfficialAccount: (kind: ServiceProviderKind, name?: string) => Promise<string> }): React.JSX.Element {
+function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayStations, busy, translate, dispatchWithOutcome, onSecretState, onStatus, onClose, onKeyToken, relay, addOfficialAccount, status }: { snapshot?: CoreSnapshot; native: NativeLeafAdapter; providers: UnknownRecord[]; relaySources: RelaySourceOption[]; relayStations: RelayStationOption[]; busy: boolean; translate: Translate; dispatchWithOutcome: (type: string, payload?: UnknownRecord, domain?: ConfigDomain, keepControlsEnabled?: boolean) => Promise<CoreSnapshot | undefined>; onSecretState: (state: SecretState) => void; onStatus: (status?: string) => void; onClose: () => void; onKeyToken: (token: string) => void; relay: RelayWorkspaceBridge; addOfficialAccount: (kind: ServiceProviderKind, name?: string) => Promise<string>; /** The window's own result: a child window keeps no strip, so its footer states it. */ status?: string }): React.JSX.Element {
   type WizardStep = "provider" | "keys" | "model";
   type WizardType = "api" | "openai" | "claude" | "workbuddy" | "workbuddyAI";
   const [step, setStep] = useState<WizardStep>("provider");
@@ -2759,6 +2792,11 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   // The wizard's one status line: its own validation or feedback, and the wait
   // while the embedded sign-in page is up.  No step body repeats it.
   const wizardStatus = validation || loginFeedback.current || (loginPhase === "sign-in" ? translate("relay.loginWorking") : "");
+  // 完成 and every other wizard action report their outcome through the
+  // window's result.  This window renders no strip — its own footer is its one
+  // status line — so a refused create has to land here or the user sees a
+  // press that did nothing at all.
+  const wizardFooterStatus = wizardStatus || status || "";
   const shownChallenge = useRef<Record<string, string>>({});
   const setLoginFeedbackMessage = (message: string | undefined): void => {
     loginFeedback.current = message;
@@ -3146,7 +3184,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       resource_id: relaySource.resourceID,
     } : creatingProvider ? {
       pending_provider: {
-        pending_api_key: `${WIZARD_PENDING_KEY_PREFIX}${pendingKeyToken}`,
+        pending_api_key: pendingKeyToken,
         name: providerName.trim(),
         api_base: pendingAddress,
         api_key_name: keyNameValue,
@@ -3212,8 +3250,8 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       });
       if (!next) return undefined;
       const summary = asRecord(asRecord(next.action_summaries?.providers_models).operation_summary);
-      const added = serviceProviderRecords(next).find((entry) => editorIdentifier(entry) === stringValue(summary.provider_id))
-        ?? serviceProviderRecords(next).find((entry) => stringValue(entry.display_name, stringValue(entry.name)).trim() === name);
+      const added = snapshotProviderRecords(next).find((entry) => editorIdentifier(entry) === stringValue(summary.provider_id))
+        ?? snapshotProviderRecords(next).find((entry) => stringValue(entry.display_name, stringValue(entry.name)).trim() === name);
       if (!added) return undefined;
       const createdServiceID = editorIdentifier(added);
       setProviderMode("existing");
@@ -3241,13 +3279,10 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
           initial_api_key_name: finishedProviderKeyName,
         }),
       },
-      ...(usingProvidedKey ? {} : { pending_api_key: `${WIZARD_PENDING_KEY_PREFIX}${pendingKeyToken}` }),
+      ...(usingProvidedKey ? {} : { pending_api_key: pendingKeyToken }),
     });
     if (!next) return undefined;
-    const nextState = domainState(next, "providers_models");
-    const nextProviders = asRecords(nextState.providers).length > 0
-      ? asRecords(nextState.providers)
-      : (next.providers_models.providers ?? []).map(providerRecord);
+    const nextProviders = snapshotProviderRecords(next);
     const added = nextProviders.find((entry) => !existingIDs.has(editorIdentifier(entry)))
       ?? nextProviders.find((entry) => stringValue(entry.name).trim() === name);
     if (!added) return undefined;
@@ -3277,11 +3312,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     try {
       const next = await dispatchWithOutcome("provider.key_add", { provider_id: providerID, name });
       if (!next) return false;
-      const nextState = domainState(next, "providers_models");
-      const nextProviders = asRecords(nextState.providers).length > 0
-        ? asRecords(nextState.providers)
-        : (next.providers_models.providers ?? []).map(providerRecord);
-      const nextProvider = nextProviders.find((entry) => editorIdentifier(entry) === providerID);
+      const nextProvider = snapshotProviderRecords(next).find((entry) => editorIdentifier(entry) === providerID);
       const addedKey = nextProvider ? providerKeyStates(nextProvider).find((entry) => entry.name === name) : undefined;
       setKeySelection(addedKey?.id ?? PROVIDER_WIZARD_NEW_KEY);
       setKeyReady(false);
@@ -3580,11 +3611,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       const next = await dispatchWithOutcome("model.add_many", { provider_id: targetProviderID, models: modelPayload });
       if (!next) return;
       if (transientRelaySource) {
-        const nextState = domainState(next, "providers_models");
-        const nextProviders = asRecords(nextState.providers).length > 0
-          ? asRecords(nextState.providers)
-          : (next.providers_models.providers ?? []).map(providerRecord);
-        const nextProvider = nextProviders.find((entry) => editorIdentifier(entry) === targetProviderID);
+        const nextProvider = snapshotProviderRecords(next).find((entry) => editorIdentifier(entry) === targetProviderID);
         const addedModels = nextProvider ? asRecords(nextProvider.models).map(modelRecord) : [];
         for (const requested of uniqueRequestedModels) {
           const addedModel = addedModels.find((entry) => !existingModelIDs.has(editorIdentifier(entry)) && stringValue(entry.name).trim() === requested.name);
@@ -3771,7 +3798,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       {/* The wizard's one status line: its own validation or feedback, and the
           wait while the embedded sign-in page is up.  The step body never
           repeats it. */}
-      {wizardStatus ? <Text accessibilityLiveRegion="polite" numberOfLines={2} style={styles.providerWizardFooterStatus}>{wizardStatus}</Text> : <View style={styles.providerWizardFooterSpacer} />}
+      {wizardFooterStatus ? <Text accessibilityLiveRegion="polite" numberOfLines={2} style={styles.providerWizardFooterStatus}>{wizardFooterStatus}</Text> : <View style={styles.providerWizardFooterSpacer} />}
       <View style={styles.providerWizardFooterActions}>
         <NativeButton title={translate("status.close")} disabled={processing} onPress={onClose} />
         {step !== "provider" || loginPhase === "sign-in" ? <NativeButton title={translate("providers.wizard.back")} disabled={busy || processing} onPress={goBack} /> : null}
@@ -3825,11 +3852,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   const relayStations = useMemo(() => relayStationsFromSnapshot(snapshot), [snapshot]);
   const relayAccounts = useMemo(() => accountsFromSnapshot(snapshot), [snapshot]);
   const relayStationsFull = useMemo(() => stationsFromSnapshot(snapshot, relayAccounts), [relayAccounts, snapshot]);
-  const providers = useMemo(() => {
-    const details = asRecords(state.providers);
-    const candidates = details.length > 0 ? details : (snapshot?.providers_models.providers ?? []).map(providerRecord);
-    return candidates;
-  }, [snapshot?.providers_models.providers, state.providers]);
+  const providers = useMemo(() => snapshotProviderRecords(snapshot), [snapshot?.providers_models.providers, state.providers]);
   const [selectedProvider, setSelectedProvider] = useState<string>();
   const [providerNameDrafts, setProviderNameDrafts] = useState<Record<string, string>>({});
   const [providerBaseUrlDrafts, setProviderBaseUrlDrafts] = useState<Record<string, string>>({});
@@ -4289,9 +4312,14 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   const activeRoute = routes.find((entry) => entry.key === selectedRoute);
   const activeRouteGroup = activeRoute ? routes.filter((entry) => entry.publicModel === activeRoute.publicModel) : [];
   const activeRouteIndex = activeRoute ? activeRouteGroup.findIndex((entry) => entry.key === activeRoute.key) : -1;
-  const activeRouteUsesMultiplier = Boolean(activeRoute && modelOrderMode(activeRoute.model) === "relay_multiplier");
-  const canMoveRouteUp = !activeRouteUsesMultiplier && activeRouteIndex > 0;
-  const canMoveRouteDown = !activeRouteUsesMultiplier && activeRouteIndex >= 0 && activeRouteIndex < activeRouteGroup.length - 1;
+  // One route that follows a relay multiplier locks the whole group: its order
+  // is the station's own number, so Core refuses to permute the group's typed
+  // values at all (moving a plain route in such a group is the same rewrite).
+  // The buttons state that here instead of offering a press Core will refuse.
+  const activeRouteGroupUsesMultiplier = activeRouteGroup.some((entry) => modelOrderMode(entry.model) === "relay_multiplier");
+  const routeMoveTitleKey = activeRouteGroupUsesMultiplier ? "providers.reorderMultiplierLocked" : undefined;
+  const canMoveRouteUp = !activeRouteGroupUsesMultiplier && activeRouteIndex > 0;
+  const canMoveRouteDown = !activeRouteGroupUsesMultiplier && activeRouteIndex >= 0 && activeRouteIndex < activeRouteGroup.length - 1;
   useEffect(() => {
     // A cleared route selection stays cleared; the first route only fills in
     // when the selected one is gone from the list.
@@ -4309,16 +4337,27 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   // multiplier has no typed number of its own, so it never reaches here.
   const routeOrderValues = activeRouteGroup.map((entry) => modelOrderValue(editorIdentifier(entry.provider), entry.model));
   const moveRoute = (direction: "up" | "down"): void => {
-    if (!activeRoute || activeRouteIndex < 0 || modelOrderMode(activeRoute.model) === "relay_multiplier") return;
+    if (!activeRoute || activeRouteIndex < 0 || activeRouteGroupUsesMultiplier) return;
     const targetIndex = direction === "up" ? activeRouteIndex - 1 : activeRouteIndex + 1;
     if (targetIndex < 0 || targetIndex >= activeRouteGroup.length) return;
+    // The values travel with the routes, so two routes the group already lists
+    // with the same number cannot trade one: Core would assign the same values
+    // back and the press would look like it did nothing.  The strip says why
+    // instead of letting a live button answer with silence.
+    if (routeOrderValues[activeRouteIndex] === routeOrderValues[targetIndex]) {
+      onStatus(translate("providers.reorderSameOrder", { order: String(routeOrderValues[activeRouteIndex]) }));
+      return;
+    }
     const reordered = [...activeRouteGroup];
     [reordered[activeRouteIndex], reordered[targetIndex]] = [reordered[targetIndex], reordered[activeRouteIndex]];
     const reorder = (renumber: boolean): Promise<unknown> => dispatch("routes.reorder_group", { public_model: activeRoute.publicModel, route_ids: reordered.map((entry) => entry.deploymentID), ...(renumber ? { renumber: true } : {}) });
     // A move keeps the numbers the group already carries — they travel with the
     // routes — so a group holding decimals is asked once whether it should
     // become 1..n instead of being renumbered behind the user's back.  Integers
-    // are already the plain order, so they move without a question.
+    // are already the plain order, so they move without a question.  The
+    // dismissing answer cancels the move: a group whose numbers are a rate
+    // (0.1, 0.12, …) has no plain order to fall back on, and 取消 is read as
+    // "leave everything as it is" rather than "renumber me differently".
     const decimals = routeOrderValues.filter((value) => !Number.isInteger(value));
     if (decimals.length === 0) {
       void reorder(false);
@@ -4326,9 +4365,12 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     }
     void native.showConfirmation({
       title: translate("providers.reorderIntegerTitle"),
-      message: translate("providers.reorderIntegerMessage", { orders: decimals.join("、") }),
+      message: translate("providers.reorderIntegerMessage", { orders: decimals.join(translate("providers.orderListSeparator")) }),
       confirmLabel: translate("providers.reorderIntegerConfirm"),
-    }).then((renumber) => reorder(renumber));
+      cancelLabel: translate("providers.reorderCancelMove"),
+    }).then((renumber) => {
+      if (renumber) void reorder(true);
+    });
   };
   // ＋ adds a route to the group the user is looking at: a draft on the
   // selected route's provider (else the first one) carrying the group's public
@@ -4359,10 +4401,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       },
     }).then((next) => {
       if (!next || !publicModel) return;
-      const nextProviders = asRecords(domainState(next, "providers_models").providers).length > 0
-        ? asRecords(domainState(next, "providers_models").providers)
-        : asRecords(next.providers_models?.providers);
-      const nextProvider = nextProviders.find((entry) => editorIdentifier(entry) === targetProviderID);
+      const nextProvider = snapshotProviderRecords(next).find((entry) => editorIdentifier(entry) === targetProviderID);
       const added = nextProvider ? asRecords(nextProvider.models).map(modelRecord).find((entry) => !knownModelIds.has(editorIdentifier(entry)) && stringValue(entry.model_name ?? entry.name).trim() === name) : undefined;
       pendingModelIds.current = undefined;
       if (added) pendingRouteKey.current = `${targetProviderID}:${stringValue(added.editor_id, stringValue(added.deployment_id, identifier(added))).trim()}`;
@@ -4656,7 +4695,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
         <ActionButton title={translate("providers.addWizard")} disabled={busy} style={styles.providerWizardToolbarButton} onPress={onOpenWizard} />
       </View>
       {viewMode === "routes" ? <View style={styles.routeWorkspace}>
-        <TablePane wide style={styles.routeTablePane} title={translate("providers.routes")} actions={<><IconButton label="+" title={translate("providers.newRoute")} disabled={busy || providers.length === 0} onPress={addRoute} />{activeRoute || selectedPublicModel !== undefined ? <IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteRoute} /> : null}<IconButton label="↑" title={translate("common.moveUp")} disabled={busy || !canMoveRouteUp} onPress={() => moveRoute("up")} /><IconButton label="↓" title={translate("common.moveDown")} disabled={busy || !canMoveRouteDown} onPress={() => moveRoute("down")} /></>}>
+        <TablePane wide style={styles.routeTablePane} title={translate("providers.routes")} actions={<><IconButton label="+" title={translate("providers.newRoute")} disabled={busy || providers.length === 0} onPress={addRoute} />{activeRoute || selectedPublicModel !== undefined ? <IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteRoute} /> : null}<IconButton label="↑" title={routeMoveTitleKey ? translate(routeMoveTitleKey) : translate("common.moveUp")} disabled={busy || !canMoveRouteUp} onPress={() => moveRoute("up")} /><IconButton label="↓" title={routeMoveTitleKey ? translate(routeMoveTitleKey) : translate("common.moveDown")} disabled={busy || !canMoveRouteDown} onPress={() => moveRoute("down")} /></>}>
           <NativeTable columns={[{ label: translate("providers.upstream"), width: 120 }, { label: translate("providers.provider"), width: 96 }, { label: translate("providers.providerKey"), width: 130 }, { label: translate("common.order"), width: 64 }]} rows={routeRows} disabledRowKeys={disabledRouteKeys} alertRowKeys={alertRouteKeys} selectedKey={selectedPublicModel !== undefined ? routePublicModelRowKey(selectedPublicModel) : (selectedRoute ?? "")} compact selectableSpanningRowKeys={selectableRouteGroupKeys} onSelectionChange={(key) => selectRouteTableRow(key)} style={styles.nativeRouteTable} />
         </TablePane>
       </View> : <View style={styles.providerWorkspace}>
@@ -4699,7 +4738,12 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
   // below: the panel keeps no key selected, hides the −, and leaves its editor
   // empty instead of quietly editing the first key again.
   const [selectionCleared, setSelectionCleared] = useState(false);
+  // The key a staged edit is waiting for: a ＋ names the new key by the only
+  // identity it has before it exists, while a rename names the slot it edits
+  // and the name it asked for, so a refused rename can never select another
+  // key that already carries that name.
   const pendingCustomKeyName = useRef<string | undefined>(undefined);
+  const pendingCustomKeyRename = useRef<{ id: string; name: string } | undefined>(undefined);
   const [providedNameDrafts, setProvidedNameDrafts] = useState<Record<string, string>>({});
   const [formBusy, setFormBusy] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
@@ -4756,41 +4800,69 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
   const runProvidedAction = async (action: () => Promise<void>, feedbackKey: string): Promise<void> => {
     setFormBusy(true);
     try {
-      await action();
-      await relay.refreshAccounts();
+      try {
+        await action();
+      } catch {
+        onStatus?.(translate("relay.operationFailed"));
+        return;
+      }
+      // The commit is the result the user asked for; the refresh that repaints
+      // the merged key list is best-effort.  A snapshot read that fails while
+      // Core is busy must not report a staged edit as failed — the same rule
+      // the relay metadata commit states — so the next snapshot settles it.
+      try {
+        await relay.refreshAccounts();
+      } catch {
+        // The subscription, or the next pane action, repaints the staged row.
+      }
       onStatus?.(translate(feedbackKey));
-    } catch {
-      onStatus?.(translate("relay.operationFailed"));
     } finally {
       setFormBusy(false);
     }
   };
   // Quietly keep station groups aligned while auto-grouping is on.
-  const autoGroupingAccounts = useMemo(() => stationAccounts.filter((account) => account.autoGrouping), [stationAccounts]);
+  //
+  // The tick reads the accounts, the bridge, and the busy guard through a ref:
+  // this pane re-renders on every snapshot, and an effect that depended on
+  // those values directly would tear its timer down and restart the half-hour
+  // countdown on each render — so the alignment would effectively never run.
+  // Only the enabled flag and the set of accounts the timer covers re-arm it.
+  const autoGroupingAccountIDs = useMemo(
+    () => stationAccounts.filter((account) => account.autoGrouping).map((account) => account.id),
+    [stationAccounts],
+  );
+  const autoGroupingKey = autoGroupingAccountIDs.join("\n");
+  const autoGroupingTick = useRef({ relay, controlsBusy, accountIDs: autoGroupingAccountIDs });
   useEffect(() => {
-    if (!autoGrouping || !relay.apiKeyActions.alignAutoGrouping) return;
+    autoGroupingTick.current = { relay, controlsBusy, accountIDs: autoGroupingAccountIDs };
+  });
+  useEffect(() => {
+    if (!autoGrouping || !autoGroupingKey) return;
     let active = true;
     const interval = setInterval(() => {
-      if (!active || controlsBusy) return;
+      const current = autoGroupingTick.current;
+      if (!active || current.controlsBusy) return;
+      const align = current.relay.apiKeyActions.alignAutoGrouping;
+      if (!align) return;
       void (async () => {
-        for (const account of autoGroupingAccounts) {
+        for (const accountID of current.accountIDs) {
           if (!active) return;
           try {
-            const status = await relay.refreshResources(account.id);
+            const status = await current.relay.refreshResources(accountID);
             if (!active || status !== "ready") continue;
-            await relay.apiKeyActions.alignAutoGrouping?.(account.id);
+            await align(accountID);
           } catch {
             // The next interval can retry.
           }
         }
-        if (active) await relay.refreshAccounts();
+        if (active) await current.relay.refreshAccounts();
       })();
     }, 30 * 60_000);
     return () => {
       active = false;
       clearInterval(interval);
     };
-  }, [autoGrouping, autoGroupingAccounts, controlsBusy, relay]);
+  }, [autoGrouping, autoGroupingKey]);
   useEffect(() => {
     if (selectionCleared) return;
     // tableRows keys already carry the custom:/provided: prefix; compare the
@@ -4811,12 +4883,27 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
   };
   React.useLayoutEffect(() => {
     const pending = pendingCustomKeyName.current;
-    if (!pending) return;
-    const added = customKeys.find((key) => key.name === pending);
-    if (added) {
-      pendingCustomKeyName.current = undefined;
-      setSelectionCleared(false);
-      setSelectedKey(`custom:${added.id}`);
+    if (pending) {
+      const added = customKeys.find((key) => key.name === pending);
+      if (added) {
+        pendingCustomKeyName.current = undefined;
+        setSelectionCleared(false);
+        setSelectedKey(`custom:${added.id}`);
+      }
+    }
+    const rename = pendingCustomKeyRename.current;
+    if (rename) {
+      const renamed = customKeys.find((key) => key.id === rename.id);
+      // The renamed slot either carries the new name now (accepted) or is
+      // gone; a namesake that already held the requested name is not this key
+      // and must not become the selection.
+      if (!renamed) {
+        pendingCustomKeyRename.current = undefined;
+      } else if (renamed.name === rename.name) {
+        pendingCustomKeyRename.current = undefined;
+        setSelectionCleared(false);
+        setSelectedKey(`custom:${renamed.id}`);
+      }
     }
   }, [customKeys]);
   const deleteSelected = (): void => {
@@ -4904,8 +4991,14 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
           onDraftChange={(value) => drafts?.setProviderKeyNameDraft(providerId, selectedCustom.id, value)}
           onCommit={(name) => {
             if (!name || name === selectedCustom.name) return;
-            pendingCustomKeyName.current = name;
-            void dispatch("provider.key_patch", { provider_id: providerId, old_name: selectedCustom.name, name });
+            pendingCustomKeyRename.current = { id: selectedCustom.id, name };
+            void dispatch("provider.key_patch", { provider_id: providerId, old_name: selectedCustom.name, name }).then(() => {
+              // A rename Core refused leaves the key under its old name: the
+              // marker has no pending selection left to make.
+              if (pendingCustomKeyRename.current?.id === selectedCustom.id && pendingCustomKeyRename.current?.name === name) {
+                pendingCustomKeyRename.current = undefined;
+              }
+            });
           }}
         />)}
         {keysEditorField("key-value", translate("providers.keyValue"), <View style={styles.keysEditorValueRow}>
@@ -4964,15 +5057,21 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
         {selectedProvidedIssue ? <Text style={styles.fieldHint}>{relayBindingIssueText(selectedProvidedIssue, selectedProvided.label, translate)}</Text> : null}
       </> : null}
     </View>;
+  // 新建密钥 creates on the account the user is looking at: this pane's key
+  // list merges every account of the provider's station, so the selected
+  // key's own account is the one whose groups the dialog offers and whose
+  // token the create writes.  Only an empty selection falls back to the first
+  // account, the same fallback the first row already provides.
+  const createKeyAccount = selectedProvided?.account ?? stationAccounts[0];
   const dialogs = <>
       <ApiKeyCreateDialog
         visible={createOpen}
-        groups={stationAccounts[0]?.groups.filter((group) => group.id !== "") ?? []}
+        groups={createKeyAccount?.groups.filter((group) => group.id !== "") ?? []}
         disabled={controlsBusy}
         onClose={() => setCreateOpen(false)}
         onCreate={(options) => {
           setCreateOpen(false);
-          const account = stationAccounts[0];
+          const account = createKeyAccount;
           if (!account) return;
           void runProvidedAction(() => relay.apiKeyActions.create?.(account.id, options) ?? Promise.resolve(), "relay.apiKeyCreateStaged");
         }}
@@ -5496,7 +5595,7 @@ function uniqueProviderName(providers: UnknownRecord[], name: string, excludeID 
   return candidate;
 }
 
-function ProviderSourceFields({ provider, providerID, relayStations, busy, translate, dispatch, onBaseUrlDraftChange, onNameDraftChange }: { provider: UnknownRecord; providerID: string; relayStations: RelayStationOption[]; busy: boolean; translate: Translate; dispatch: Dispatch; onBaseUrlDraftChange?: (baseURL: string) => void; onNameDraftChange?: (name: string) => void }): React.JSX.Element {
+function ProviderSourceFields({ provider, providerID, relayStations, busy, translate, dispatch, onStatus, onBaseUrlDraftChange, onNameDraftChange }: { provider: UnknownRecord; providerID: string; relayStations: RelayStationOption[]; busy: boolean; translate: Translate; dispatch: Dispatch; onStatus?: (status?: string) => void; onBaseUrlDraftChange?: (baseURL: string) => void; onNameDraftChange?: (name: string) => void }): React.JSX.Element {
   const drafts = useContext(ProviderWorkspaceDraftContext);
   const [sourceResetToken, setSourceResetToken] = useState(0);
   const providerName = drafts?.providerDisplayName(provider) ?? stringValue(provider.name, stringValue(provider.display_name));
@@ -5508,6 +5607,10 @@ function ProviderSourceFields({ provider, providerID, relayStations, busy, trans
     const station = relayStationForBaseUrl(endpoint, relayStations);
     if (station) {
       if (providerNameExists(drafts?.providers ?? [], station.name, providerID)) {
+        // The bind needs this provider to take the station's name, and Core
+        // refuses a duplicate name.  The field goes back to its previous value,
+        // so the cause is stated instead of looking like a lost keystroke.
+        onStatus?.(translate("providers.relayNameTaken", { name: station.name }));
         onBaseUrlDraftChange?.("");
         onNameDraftChange?.("");
         setSourceResetToken((value) => value + 1);
@@ -5746,7 +5849,8 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
   const vendorBaseURL = (drafts?.providerBaseURL(provider) ?? stringValue(provider.endpoint, stringValue(provider.api_base))).trim();
   const addRelayAccountToVendor = async (): Promise<void> => {
     if (relayAddBusy) return;
-    const origin = normalizeRelayOrigin(drafts?.providerBaseURL(provider) ?? stringValue(provider.endpoint, stringValue(provider.api_base)));
+    const providerBase = drafts?.providerBaseURL(provider) ?? stringValue(provider.endpoint, stringValue(provider.api_base));
+    const origin = normalizeRelayOrigin(providerBase);
     if (!origin) return;
     // What the sign-in may save is asked after the login completes, inside
     // the native browser flow; no pre-login prompt or checkbox runs here.
@@ -5754,24 +5858,51 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
     const pendingID = `login-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     const stationName = suggestedRelayStationName(origin) || origin;
     try {
+      // The station family decides which login probes the native flow runs
+      // and which session it keeps, so it is resolved before the sign-in the
+      // way every other surface resolves it: a station this provider is
+      // already bound to states its own type, and a bare address is asked.
+      // Guessing one family here would run the wrong probes against the other
+      // station and end in a sign-in that can never complete.
+      const relayType = station?.type ?? await relay.detectType(origin);
+      if (!relayType) {
+        onStatus?.(translate("relay.typeNotDetected"));
+        return;
+      }
       const result = await native.relayLogin({
         accountId: pendingID,
-        type: "newapi",
+        type: relayType,
         label: origin,
         origin,
         language,
         pendingAccount: true,
         stationName,
-        stationType: "newapi",
+        stationType: relayType,
         stationOrigin: origin,
       });
       if (!result) {
         onStatus?.(translate("relay.loginNotCompleted"));
         return;
       }
-      await relay.refreshAccounts();
-      await relay.refreshResources(pendingID, { force: true });
-      onStatus?.(translate("relay.loginComplete"));
+      // Resource discovery is reported, not assumed: the sign-in succeeded
+      // either way, but a station whose keys could not be read says so instead
+      // of claiming 登录成功 over an empty key list.
+      const resourceStatus = await relay.refreshResources(pendingID, { force: true });
+      // Bind this vendor to the station it just signed in to, the way the
+      // wizard binds the vendor it creates: that is what makes the station's
+      // keys linkable here, and it is why the pane does not depend on the
+      // workspace's background rebind (which skips a name collision silently).
+      const next = await relay.refreshAccounts();
+      const accounts = accountsFromSnapshot(next ?? undefined);
+      const targetOrigin = stationOriginKey(origin);
+      const boundAccount = accounts.find((item) => stationOriginKey(item.origin) === targetOrigin);
+      const stationID = boundAccount?.stationID
+        ?? stationsFromSnapshot(next ?? undefined, accounts).find((item) => stationOriginKey(item.origin) === targetOrigin)?.id;
+      if (stationID) {
+        const bound = await dispatchWithOutcome("provider.select_relay_station", { provider_id: id, station_id: stationID });
+        if (!bound) return;
+      }
+      onStatus?.(translate(resourceStatus === "ready" ? "relay.loginComplete" : "relay.loginResourcesUnavailable"));
     } catch {
       onStatus?.(translate("relay.operationFailed"));
     } finally {
@@ -5782,7 +5913,7 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
     <View style={styles.providerEditorHeader}><Text numberOfLines={1} style={styles.providerEditorHeading}>{translate("providers.provider")}: {providerName}</Text>{sourceModel ? <NativeButton title={translate("providers.backToModel", { model: sourceModelLabel })} link disabled={busy} onPress={onReturnToModel} style={styles.providerReturnToModel} /> : null}</View>
     <View style={styles.providerEditorSection}>
     <View style={styles.providerEnabledRow}><NativeCheckbox label={translate("common.enable")} value={booleanValue(provider.enabled, true)} disabled={busy} onValueChange={(enabled) => dispatch(isLogin ? "service_provider.patch" : "provider.patch", isLogin ? { provider_id: id, provider: { enabled } } : { provider_id: id, changes: { enabled } })} /></View>
-    {kind === "apiKey" || (kind === "relay" && !station) ? <ProviderSourceFields provider={provider} providerID={id} relayStations={relayStations} busy={busy} translate={translate} dispatch={dispatch} onBaseUrlDraftChange={(value) => drafts?.setProviderBaseUrlDraft(id, value)} onNameDraftChange={(value) => { if (drafts) drafts.setProviderNameDraft(id, value); else onNameDraftChange?.(value); }} /> : null}
+    {kind === "apiKey" || (kind === "relay" && !station) ? <ProviderSourceFields provider={provider} providerID={id} relayStations={relayStations} busy={busy} translate={translate} dispatch={dispatch} onStatus={onStatus} onBaseUrlDraftChange={(value) => drafts?.setProviderBaseUrlDraft(id, value)} onNameDraftChange={(value) => { if (drafts) drafts.setProviderNameDraft(id, value); else onNameDraftChange?.(value); }} /> : null}
     {kind === "relay" && station ? <>
       <TextField
         key={`vendor-name:${station.id}`}
@@ -5841,7 +5972,8 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
         values={SERVICE_KIND_OPTIONS.map((option) => ({ value: option.kind, label: translate(option.label) }))}
         disabled={busy}
         onSelect={(next) => {
-          if (next !== kind) void dispatch("service_provider.patch", { provider_id: id, provider: { auth_kind: next } });
+          const authKind = serviceProviderKindFor(next as ProviderKind);
+          if (authKind && next !== kind) void dispatch("service_provider.patch", { provider_id: id, provider: { auth_kind: authKind } });
         }}
       />
       <View style={styles.officialStatusRow}>
@@ -6747,7 +6879,10 @@ function DataManagementWorkspace({ snapshot, tab, onTabChange, statuses, busy, w
         <View style={SETTINGS_FIELD_ROW_INDENTED}>
           <Text style={SETTINGS_FIELD_LABEL}>{translate("dataManagement.sections")}</Text>
           <View style={styles.dataManagementSectionsField}>
-            {sectionListHeader(statuses.import ?? translate("dataManagement.selectedCount", { count: stagedSections.length }), null)}
+            {/* A staged import is this pane's result, not its end: the same
+                choose-file control stays beside it, so a second package can be
+                opened without leaving the pane. */}
+            {sectionListHeader(statuses.import ?? translate("dataManagement.selectedCount", { count: stagedSections.length }), <ActionButton title={translate("dataManagement.changeImportFile")} busy={pendingAction === "inspect"} disabled={controlsBusy("inspect")} onPress={() => { void chooseImportFile(); }} />)}
             {sectionList(stagedSections, stagedSections, true, () => undefined)}
           </View>
         </View>

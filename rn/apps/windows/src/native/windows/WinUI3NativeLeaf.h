@@ -160,6 +160,7 @@ class WinUI3NativeLeaf : public std::enable_shared_from_this<WinUI3NativeLeaf> {
       std::wstring_view title,
       std::wstring_view message,
       std::wstring_view confirm_label,
+      std::wstring_view cancel_label,
       bool destructive);
   // A two-answer question on the app's own decision window, for a surface that
   // hosts its own UI (the relay sign-in browser): `primary_label` is the Return

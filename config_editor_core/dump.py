@@ -447,6 +447,20 @@ def _entry_from_editor(
     else:
         order = manual_order
     params["order"] = order
+    # The route's transport trust is part of the entry, not of the editor's own
+    # fields: the loader lifts `ssl_verify` out of the extras bucket and the
+    # pane reads it, so a save has to put it back or an Apply silently
+    # re-enables TLS verification for a route configured against a self-signed
+    # or local upstream.  A boolean stays a boolean and any other value is the
+    # CA bundle path the proxy reads.
+    if model.get("ssl_verify_present") is True:
+        ssl_verify = str(model.get("ssl_verify", "")).strip()
+        if ssl_verify.lower() in {"true", "false"}:
+            params["ssl_verify"] = ssl_verify.lower() == "true"
+        elif ssl_verify:
+            params["ssl_verify"] = ssl_verify
+        else:
+            params.pop("ssl_verify", None)
 
     deployment_id = str(model.get("deployment_id", "")).strip().lower()
     if not RANDOM_DEPLOYMENT_ID_RE.fullmatch(deployment_id):

@@ -886,6 +886,74 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
         source = path.read_text(encoding="utf-8")
         self.assertNotIn("max_input_tokens", source)
 
+    def test_ssl_verify_round_trips_through_litellm_params(self) -> None:
+        """A route keeps the transport trust it was configured with.
+
+        The editor reads `litellm_params.ssl_verify` out of the entry and shows
+        it, so a save that dropped it silently re-enabled TLS verification for
+        a route pointing at a self-signed upstream.  The value keeps its type:
+        a boolean stays a boolean, and anything else is the CA bundle path the
+        proxy reads as a string.
+        """
+
+        path = self.write_config(
+            """
+            providers:
+              provider_alpha:
+                api_base: "https://example.com/v1"
+                api_keys:
+                  - name: default
+                    value: "sk-test"
+            model_list:
+              - model_name: balanced-chat
+                litellm_params:
+                  model: openai/vendor-chat
+                  api_base: "https://example.com/v1"
+                  api_key: "sk-test"
+                  ssl_verify: false
+                model_info:
+                  id: "00000004"
+                  provider: provider_alpha
+              - model_name: bundle-chat
+                litellm_params:
+                  model: openai/vendor-chat
+                  api_base: "https://example.com/v1"
+                  api_key: "sk-test"
+                  ssl_verify: "/etc/ssl/certs/company.pem"
+                model_info:
+                  id: "00000005"
+                  provider: provider_alpha
+              - model_name: plain-chat
+                litellm_params:
+                  model: openai/vendor-chat
+                  api_base: "https://example.com/v1"
+                  api_key: "sk-test"
+                model_info:
+                  id: "00000006"
+                  provider: provider_alpha
+            """
+        )
+
+        payload = config_load.load_config(path)
+        models = {model["model_name"]: model for model in payload["providers"][0]["models"]}
+        self.assertEqual("false", models["balanced-chat"]["ssl_verify"])
+        self.assertTrue(models["balanced-chat"]["ssl_verify_present"])
+        self.assertEqual("/etc/ssl/certs/company.pem", models["bundle-chat"]["ssl_verify"])
+        self.assertFalse(models["plain-chat"]["ssl_verify_present"])
+
+        config_api.save_config(payload["providers"], path)
+        saved = path.read_text(encoding="utf-8")
+        self.assertIn("ssl_verify: false", saved)
+        self.assertIn("ssl_verify: /etc/ssl/certs/company.pem", saved)
+        # The route that stated nothing keeps stating nothing.
+        self.assertEqual(2, saved.count("ssl_verify:"))
+
+        # A second round trip is stable: the boolean is read back as one.
+        reloaded = config_load.load_config(path)
+        again = {model["model_name"]: model for model in reloaded["providers"][0]["models"]}
+        self.assertEqual("false", again["balanced-chat"]["ssl_verify"])
+        self.assertTrue(again["balanced-chat"]["ssl_verify_present"])
+
     def test_an_unmanaged_model_info_key_still_round_trips(self) -> None:
         """The app manages the context window only; other keys stay untouched."""
         path = self.write_config(

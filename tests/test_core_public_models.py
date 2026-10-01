@@ -302,6 +302,87 @@ class PublicModelDomainTests(unittest.TestCase):
         for deployment_id in order:
             self.assertIsInstance(self.model(deployment_id)["manual_order"], int)
 
+    def test_a_public_name_answers_only_while_one_route_carries_it(self) -> None:
+        """The identities a document persists decide their own row.
+
+        A public name is the weaker identity: it answers only while exactly one
+        route in that provider carries it (see the same-name-twice case below),
+        and it never turns into "the first one".
+        """
+
+        # The persisted identities each decide their own row.
+        patched = self.domain.dispatch(
+            "model.patch",
+            {"provider_id": "primary", "model_id": "00000001", "changes": {"model_enabled": False}},
+        )
+        self.assertFalse(self.model("00000001")["model_enabled"])
+        editor_id = next(
+            str(model["editor_id"])
+            for model in patched["providers"][0]["models"]
+            if model["deployment_id"] == "00000001"
+        )
+        self.domain.dispatch(
+            "model.patch",
+            {"provider_id": "primary", "model_id": editor_id, "changes": {"model_enabled": True}},
+        )
+        self.assertTrue(self.model("00000001")["model_enabled"])
+
+        # A name only one route carries is still a usable selector.
+        self.domain.dispatch(
+            "model.patch",
+            {"provider_id": "primary", "model_id": "kimi-k3", "changes": {"model_enabled": False}},
+        )
+        self.assertFalse(self.model("00000003")["model_enabled"])
+
+        # A name this provider does not carry stays unavailable.
+        with self.assertRaisesRegex(DomainError, "selected model is unavailable"):
+            self.domain.dispatch(
+                "model.patch",
+                {"provider_id": "primary", "model_id": "no-such-model", "changes": {"model_enabled": False}},
+            )
+
+    def test_one_provider_serving_a_name_twice_refuses_a_name_selector(self) -> None:
+        """One provider can serve one public name twice; the name is then ambiguous."""
+
+        added = self.domain.dispatch(
+            "model.add",
+            {
+                "provider_id": "primary",
+                "model": {
+                    "name": "gpt-5.6-sol",
+                    "upstream_model": "openai/gpt-5.6-sol-secondary",
+                    "enabled": True,
+                    "order": 3,
+                },
+            },
+        )
+        second_id = str(next(
+            model["editor_id"]
+            for provider in added["providers"]
+            if str(provider["name"]) == "primary"
+            for model in provider["models"]
+            if "secondary" in str(model.get("litellm_model"))
+        ))
+
+        with self.assertRaisesRegex(DomainError, "Several routes serve this public model"):
+            self.domain.dispatch(
+                "model.patch",
+                {"provider_id": "primary", "model_id": "gpt-5.6-sol", "changes": {"model_enabled": False}},
+            )
+        # The new route's own id still answers.
+        self.domain.dispatch(
+            "model.patch",
+            {"provider_id": "primary", "model_id": second_id, "changes": {"model_enabled": False}},
+        )
+        self.assertFalse(
+            next(
+                model["model_enabled"]
+                for provider in self.domain.snapshot()["providers"]
+                for model in provider["models"]
+                if model["editor_id"] == second_id
+            )
+        )
+
     def test_snapshot_carries_the_registry_default_for_each_public_model(self) -> None:
         contexts = self.domain.snapshot()["model_contexts"]
         self.assertEqual(272000, contexts["gpt-5.6-sol"]["context_window"])
