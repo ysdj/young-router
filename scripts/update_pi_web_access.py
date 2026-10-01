@@ -267,12 +267,19 @@ def _flatten_package(npm_root: Path, destination: Path) -> str:
         shutil.rmtree(package_payload)
     _copy_tree(package_root, package_payload)
 
+    # A published package may ship a nested ``node_modules`` of its own (npm
+    # installs a dependency there when the flat tree carries another version of
+    # it, as upstream did with ``undici``).  That copy is the one the package's
+    # own code resolved against, so it stays exactly as published and the peer
+    # closure the worker needs is merged beside it — never over it.
     dependency_payload = package_payload / "node_modules"
-    dependency_payload.mkdir()
+    dependency_payload.mkdir(exist_ok=True)
     for child in dependencies_root.iterdir():
         if child.name in {PACKAGE_NAME, ".bin"}:
             continue
         target = dependency_payload / child.name
+        if target.exists() or target.is_symlink():
+            continue
         if child.is_symlink():
             target.symlink_to(os.readlink(child))
         elif child.is_dir():

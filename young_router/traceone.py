@@ -16,12 +16,15 @@ The staged directory contains::
     manifest.json                   upstream revision, staging time, target routes
     data/<bank>.json                reference fingerprints
     data/<adapter>.json             fitted adapter document
-    data/<support>.json             fitted support document
+    data/<support>.json             fitted support document, when the release
+                                    still ships one separately
 
-The three classifier artifacts are named after the classifier revision upstream
-shipped, so this adapter requires one artifact per role instead of pinning one
-release's spelling: a re-staged build with `unified_bank_v2_16.json` and
-`codex_low_v7_adapter_791.json` runs without a code change here.
+The classifier documents are named after the classifier revision upstream
+shipped, so this adapter requires one document per *required* role instead of
+pinning one release's spelling: a re-staged build with `unified_bank_v2_16.json`
+and `codex_low_v7_adapter_791.json` runs without a code change here.  A separate
+support document is optional: the 2026-10 release folded those statistics into
+the adapter itself (`codex_low_v8_optimized.json`).
 
 Every entry point tolerates an unstaged checkout: :func:`available` reports the
 engine state instead of raising, and :func:`identify` raises
@@ -60,13 +63,15 @@ FALLBACK_TARGET_MODELS = (
 )
 
 _REQUIRED_FILES = ("traceone.js", "prompt.txt")
-# The classifier artifacts carry the upstream revision in their names
-# (`unified_bank_v2_16.json`, `codex_low_v7_adapter_791.json`), so the staged
-# set is discovered by role instead of pinned to one release's spelling.
+# The classifier documents carry the upstream revision in their names
+# (`unified_bank_v2_16.json`, `codex_low_v7_adapter_791.json`,
+# `codex_low_v8_optimized.json`), so the staged set is discovered by role
+# instead of pinned to one release's spelling.  `bank` and `adapter` are the
+# roles every release carries; the separate `support` document became optional
+# when the 2026-10 release folded it into the adapter.
 _REQUIRED_DATA_ROLES = (
     re.compile(r"unified_bank[^/]*\.json$"),
-    re.compile(r"_adapter_[^/]*\.json$"),
-    re.compile(r"_support_[^/]*\.json$"),
+    re.compile(r"(_adapter_|_optimized)[^/]*\.json$"),
 )
 
 
