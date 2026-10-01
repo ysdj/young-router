@@ -1599,6 +1599,56 @@ class ProvidersModelsDomainTests(unittest.TestCase):
         self.assertEqual("mismatch", model["probe"]["degradation"]["status"])
         self.assertFalse(snapshot["drafts"]["providers_models"]["dirty"])
 
+    def test_a_degradation_engine_failure_is_a_finding_not_a_python_error(self) -> None:
+        """A missing prompt or a failed attribution reports its own cause."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            domain = ProvidersModelsDomain(path)
+            plan = {"includes_degradation": True, "target": "gpt-6-astra", "surface": "openai/responses"}
+            arguments = {
+                "plan": plan,
+                "api_base": "https://example.test/v1",
+                "credential": "replace-me-secret",
+                "model_name": "default-chat",
+                "surface_status": "ok",
+            }
+            with mock.patch.object(
+                traceone,
+                "engine",
+                return_value={"name": "TraceOne", "source": "test", "revision": "test", "staged_at": "", "available": True},
+            ), mock.patch.object(
+                traceone,
+                "prompt_text",
+                side_effect=traceone.TraceOneUnavailable("TraceOne prompt is missing"),
+            ):
+                missing = domain._degradation_probe(**arguments)
+            with mock.patch.object(
+                traceone,
+                "engine",
+                return_value={"name": "TraceOne", "source": "test", "revision": "test", "staged_at": "", "available": True},
+            ), mock.patch.object(
+                traceone,
+                "prompt_text",
+                return_value=DEEP_TEST_PROMPT,
+            ), mock.patch.object(
+                domain,
+                "_degradation_request",
+                return_value=("[[1]]", "ok"),
+            ), mock.patch.object(
+                traceone,
+                "identify",
+                side_effect=RuntimeError("engine exploded"),
+            ):
+                broken = domain._degradation_probe(**arguments)
+
+        self.assertEqual("unavailable", missing["status"])
+        self.assertIn("TraceOne prompt is missing", missing["detail"])
+        self.assertEqual("error", broken["status"])
+        self.assertIn("engine exploded", broken["detail"])
+        self.assertNotIn("replace-me-secret", json.dumps(missing) + json.dumps(broken))
+
     def test_model_probe_does_not_retry_a_slow_surface(self) -> None:
         """A read timeout is the verdict; only a dropped connection is retried."""
         attempts: list[str] = []
@@ -2390,9 +2440,12 @@ class CodexSettingsDomainTests(unittest.TestCase):
                 {"domain": "codex", "type": "codex.model_catalog.set", "payload": {"enabled": True}},
                 expected_revision=core.revision,
             )
+            # The switch answers through the dispatch envelope's own
+            # ``action_summary``: the IPC contract has no top-level result
+            # field, so the catalog projection is read there.
             self.assertEqual(
                 ["default-chat", "second-chat", "third-chat"],
-                enabled["result"]["model_catalog"]["public_models"],
+                enabled["action_summary"]["model_catalog"]["public_models"],
             )
             catalog = json.loads((home / "model-catalog.json").read_text(encoding="utf-8"))
             self.assertEqual(

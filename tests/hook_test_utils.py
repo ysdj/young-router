@@ -17,6 +17,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 VALID_IMAGE_RESULT = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+_STUB_MARKER_ATTR = "_young_router_hook_test_stub"
+_STUB_ROOT_ATTR = "_young_router_hook_test_stub_root"
 HOOK_MODULE_NAMES = (
     "base",
     "api_base",
@@ -61,6 +63,22 @@ class HookTestNamespace:
             setattr(owner, name, value)
 
 def load_hook_module():
+    # The stub replaces ``litellm`` in the process-wide module table for the
+    # whole test that loaded it, so it must answer for everything the real
+    # package does.  A later test that reads ``litellm.model_cost`` - the model
+    # catalog and the context registry do - would otherwise see a module with
+    # no cost map, and its failure would look like a bug in the code under
+    # test.  The stub keeps the names it overrides; every other name falls
+    # through to the installed package when this environment has one.
+    installed = sys.modules.get("litellm")
+    root = installed
+    while root is not None and getattr(root, _STUB_MARKER_ATTR, False):
+        root = getattr(root, _STUB_ROOT_ATTR, None)
+    if installed is None:
+        try:
+            root = importlib.import_module("litellm")
+        except Exception:
+            root = None
     for name in [
         "young_router",
         "young_router.callbacks",
@@ -125,6 +143,14 @@ def load_hook_module():
     proxy = types.ModuleType("litellm.proxy")
     proxy_server = types.ModuleType("litellm.proxy.proxy_server")
     proxy_server.llm_router = None
+
+    setattr(litellm, _STUB_MARKER_ATTR, True)
+    setattr(litellm, _STUB_ROOT_ATTR, root)
+    if root is not None:
+        def delegate_to_installed_litellm(name: str) -> object:
+            return getattr(root, name)
+
+        litellm.__getattr__ = delegate_to_installed_litellm
 
     sys.modules["litellm"] = litellm
     sys.modules["litellm.integrations"] = integrations
