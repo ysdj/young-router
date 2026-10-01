@@ -323,6 +323,65 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
         self.assertEqual(["renamed"], [key["name"] for key in reloaded["api_keys"]])
         self.assertEqual("renamed", reloaded["models"][0]["api_key_name"])
 
+    def test_load_keeps_a_key_whose_credential_another_key_already_carries(self) -> None:
+        """One name is one key; one value is not.
+
+        A station key the user also pasted by hand is two slots holding the same
+        credential, and the relay-linked one carries the source a fetch just
+        staged.  Deduplicating by value deleted that slot — and its source — on
+        the next read, which is how a fetched relay key vanished from the pane.
+        """
+
+        path = self.write_config(
+            """
+            providers:
+              experimental_provider:
+                api_base: "https://example.com/v1"
+                api_keys:
+                  - name: hand-made
+                    value: "sk-shared-station-key"
+                  - name: GroupB
+                    value: "sk-shared-station-key"
+                x-young-router-relay-keys:
+                  version: 1
+                  slots:
+                    - id: provider-slot-00000000000000000000000000000101
+                      api_key_name: GroupB
+                      source: {kind: relay, station_id: station-a, account_id: account-a, resource_id: sub2api-7}
+            model_list:
+              - model_name: experimental-chat
+                litellm_params:
+                  model: openai/experimental-chat
+                  api_base: "https://example.com/v1"
+                  api_key: "sk-shared-station-key"
+                model_info:
+                  id: "0000000b"
+                  provider: experimental_provider
+                  upstream_url_surface: openai/responses
+                  supported_upstream_url_surfaces: [openai/responses]
+            """
+        )
+
+        provider = config_load.load_config(path)["providers"][0]
+
+        self.assertEqual(
+            ["hand-made", "GroupB"],
+            [key["name"] for key in provider["api_keys"]],
+        )
+        self.assertEqual(
+            "sk-shared-station-key",
+            provider["api_keys"][1]["value"],
+        )
+        self.assertEqual(
+            {
+                "kind": "relay",
+                "station_id": "station-a",
+                "account_id": "account-a",
+                "resource_id": "sub2api-7",
+            },
+            provider["api_keys"][1]["source"],
+        )
+
     def test_provider_source_metadata_defaults_to_custom_and_round_trips(self) -> None:
         path = self.write_config(
             """
@@ -1069,7 +1128,7 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
               compat_provider:
                 api_base: "https://example.com/v1"
                 api_keys:
-                  - name: r-plus
+                  - name: key-two
                     value: "sk-test"
             model_list: []
             """
@@ -1084,7 +1143,7 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
             "litellm_model": "openai/default-chat",
             "api_base": "https://example.com/v1",
             "api_key": "sk-test",
-            "api_key_name": "r-plus",
+            "api_key_name": "key-two",
             "order": "2",
             "ssl_verify": "",
             "ssl_verify_present": False,
@@ -1104,11 +1163,272 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
         self.assertRegex(reloaded_model["deployment_id"], r"^[0-9a-f]{8}$")
         saved = config_schema._load_yaml(path)["model_list"][0]
         self.assertEqual(
-            "model=balanced-chat / provider=compat_provider / upstream=openai/default-chat / host=example.com / key=r-plus / order=2",
+            "model=balanced-chat / provider=compat_provider / upstream=openai/default-chat / host=example.com / key=key-two / order=2",
             saved["model_info"]["route_key"],
         )
-        self.assertEqual("r-plus", saved["model_info"]["api_key_name"])
+        self.assertEqual("key-two", saved["model_info"]["api_key_name"])
         self.assertNotIn("openai-default-chat-compat_provider", reloaded_model["deployment_id"])
+
+    def test_save_refuses_a_model_naming_a_key_the_provider_does_not_carry(self) -> None:
+        """A dangling key name is never resolved to another slot.
+
+        Falling back to the provider's first key would silently answer the route
+        with a different credential — the wrong station group, the wrong quota —
+        and nothing on screen would say so.  The write names the missing key
+        instead, and the file keeps what it had.
+        """
+
+        path = self.write_config(
+            """
+            providers:
+              compat_provider:
+                api_base: "https://example.com/v1"
+                api_keys:
+                  - name: key-one
+                    value: "sk-first"
+                  - name: key-two
+                    value: "sk-second"
+            model_list:
+              - model_name: balanced-chat
+                litellm_params:
+                  model: openai/default-chat
+                  api_base: "https://example.com/v1"
+                  api_key: "sk-second"
+                model_info:
+                  id: "00000009"
+                  provider: compat_provider
+                  api_key_name: key-two
+                  upstream_url_surface: openai/responses
+                  supported_upstream_url_surfaces: [openai/responses]
+            """
+        )
+        before = path.read_text(encoding="utf-8")
+        payload = config_load.load_config(path)
+        model = payload["providers"][0]["models"][0]
+        # The pane's own add names a key and carries no slot id; only Core's
+        # binding step mints one, and a name it cannot resolve mints none.
+        model["api_key_name"] = "GroupB"
+        model["provider_key_id"] = ""
+        model["api_key"] = ""
+
+        with self.assertRaises(ValueError) as raised:
+            config_api.save_config(payload["providers"], path)
+
+        self.assertIn("GroupB", str(raised.exception))
+        self.assertEqual(before, path.read_text(encoding="utf-8"))
+
+    def test_save_keeps_a_model_that_names_no_key_unbound(self) -> None:
+        """A keyless route follows the provider default without claiming a key.
+
+        The entry carries the default credential — an anchor to that key, so a
+        rotated credential keeps flowing — but records no key name and no slot
+        id: the pane's own “no key” choice has to survive the read that follows
+        Apply, or the row silently joins a key group the user never picked.
+        """
+
+        path = self.write_config(
+            """
+            providers:
+              compat_provider:
+                api_base: "https://example.com/v1"
+                api_keys:
+                  - name: key-one
+                    value: "sk-first"
+                  - name: key-two
+                    value: "sk-second"
+            model_list: []
+            """
+        )
+        payload = config_load.load_config(path)
+        provider = payload["providers"][0]
+        provider["models"].append({
+            "enabled": True,
+            "model_enabled": True,
+            "provider": "compat_provider",
+            "model_name": "balanced-chat",
+            "litellm_model": "openai/default-chat",
+            "api_base": "https://example.com/v1",
+            "api_key": "",
+            "api_key_name": "",
+            "provider_key_id": "",
+            "order": "0",
+            "deployment_id": "",
+            "upstream_url_surface": "openai/responses",
+            "entry_extra": {},
+            "litellm_extra": {},
+            "model_info_extra": {},
+        })
+
+        config_api.save_config(payload["providers"], path)
+        saved = config_schema._load_yaml(path)["model_list"][0]
+
+        self.assertEqual("sk-first", saved["litellm_params"]["api_key"])
+        self.assertNotIn("api_key_name", saved["model_info"])
+        self.assertNotIn("x-young-router-provider-key-id", saved["model_info"])
+
+        # Reading the file back keeps the route unbound, and writing that same
+        # view again changes nothing about the binding: a credential must never
+        # become a claim.
+        reloaded = config_load.load_config(path)
+        model = reloaded["providers"][0]["models"][0]
+        self.assertEqual("", model["api_key_name"])
+        self.assertEqual("", model["provider_key_id"])
+        config_api.save_config(reloaded["providers"], path, document=reloaded.get("document"))
+        again = config_load.load_config(path)["providers"][0]["models"][0]
+        self.assertEqual("", again["api_key_name"])
+        self.assertEqual("", again["provider_key_id"])
+        entry = config_schema._load_yaml(path)["model_list"][0]
+        self.assertNotIn("api_key_name", entry["model_info"])
+        self.assertEqual("sk-first", entry["litellm_params"]["api_key"])
+
+    def test_save_binds_a_route_the_user_gives_a_key_again(self) -> None:
+        """Choosing a key again clears the “no key” record and follows that key."""
+
+        path = self.write_config(
+            """
+            providers:
+              compat_provider:
+                api_base: "https://example.com/v1"
+                api_keys:
+                  - name: key-one
+                    value: "sk-first"
+                  - name: GroupB
+                    value: "sk-second"
+            model_list: []
+            """
+        )
+        payload = config_load.load_config(path)
+        provider = payload["providers"][0]
+        provider["models"].append({
+            "enabled": True,
+            "model_enabled": True,
+            "provider": "compat_provider",
+            "model_name": "unbound-chat",
+            "litellm_model": "openai/default-chat",
+            "api_base": "https://example.com/v1",
+            "api_key": "",
+            "api_key_name": "",
+            "provider_key_id": "",
+            "order": "0",
+            "deployment_id": "",
+            "upstream_url_surface": "openai/responses",
+            "entry_extra": {},
+            "litellm_extra": {},
+            "model_info_extra": {},
+        })
+        config_api.save_config(payload["providers"], path, document=payload.get("document"))
+        self.assertEqual(
+            "unbound",
+            config_schema._load_yaml(path)["model_list"][0]["model_info"]["x-young-router-key-binding"],
+        )
+
+        # The user now picks the second key: the route claims it, and the
+        # unbound record goes away instead of contradicting the binding.
+        payload = config_load.load_config(path)
+        model = payload["providers"][0]["models"][0]
+        second = payload["providers"][0]["api_keys"][1]
+        model["api_key_name"] = second["name"]
+        model["provider_key_id"] = second["id"]
+        config_api.save_config(payload["providers"], path, document=payload.get("document"))
+
+        entry = config_schema._load_yaml(path)["model_list"][0]
+        self.assertNotIn("x-young-router-key-binding", entry["model_info"])
+        self.assertEqual(second["name"], entry["model_info"]["api_key_name"])
+        self.assertEqual(second["id"], entry["model_info"]["x-young-router-provider-key-id"])
+        self.assertEqual("sk-second", entry["litellm_params"]["api_key"])
+        reloaded = config_load.load_config(path)["providers"][0]["models"][0]
+        self.assertEqual(second["name"], reloaded["api_key_name"])
+        self.assertNotIn("x-young-router-key-binding", reloaded["model_info_extra"])
+
+    def test_save_keeps_a_disabled_keyless_route_unbound(self) -> None:
+        """A parked route keeps its own credential and claims no key."""
+
+        path = self.write_config(
+            """
+            providers:
+              compat_provider:
+                api_base: "https://example.com/v1"
+                api_keys:
+                  - name: key-one
+                    value: "sk-first"
+            model_list: []
+            """
+        )
+        payload = config_load.load_config(path)
+        payload["providers"][0]["models"].append({
+            "enabled": False,
+            "model_enabled": False,
+            "provider": "compat_provider",
+            "model_name": "parked-chat",
+            "litellm_model": "openai/default-chat",
+            "api_base": "https://example.com/v1",
+            "api_key": "sk-own",
+            "api_key_name": "",
+            "provider_key_id": "",
+            "order": "0",
+            "deployment_id": "",
+            "upstream_url_surface": "openai/responses",
+            "entry_extra": {},
+            "litellm_extra": {},
+            "model_info_extra": {},
+        })
+
+        config_api.save_config(payload["providers"], path, document=payload.get("document"))
+
+        entry = config_schema._load_yaml(path.with_name("config.disabled-models.yaml"))[
+            "disabled_model_list"
+        ][0]
+        self.assertEqual("unbound", entry["model_info"]["x-young-router-key-binding"])
+        self.assertNotIn("api_key_name", entry["model_info"])
+        self.assertNotIn("x-young-router-provider-key-id", entry["model_info"])
+        self.assertEqual("sk-own", entry["litellm_params"]["api_key"])
+        self.assertEqual(
+            "",
+            config_load.load_config(path)["providers"][0]["models"][0]["api_key_name"],
+        )
+
+    def test_save_keeps_a_disabled_route_naming_a_missing_key(self) -> None:
+        """A disabled route is not served, so it keeps its own key reference."""
+
+        path = self.write_config(
+            """
+            providers:
+              compat_provider:
+                api_base: "https://example.com/v1"
+                api_keys:
+                  - name: key-one
+                    value: "sk-first"
+            model_list: []
+            """
+        )
+        payload = config_load.load_config(path)
+        payload["providers"][0]["models"].append({
+            "enabled": False,
+            "model_enabled": False,
+            "provider": "compat_provider",
+            "model_name": "balanced-chat",
+            "litellm_model": "openai/default-chat",
+            "api_base": "https://example.com/v1",
+            "api_key": "",
+            "api_key_name": "GroupB",
+            "provider_key_id": "",
+            "order": "0",
+            "deployment_id": "",
+            "upstream_url_surface": "openai/responses",
+            "entry_extra": {},
+            "litellm_extra": {},
+            "model_info_extra": {},
+        })
+
+        config_api.save_config(payload["providers"], path)
+
+        disabled = config_schema._load_yaml(path.with_name("config.disabled-models.yaml"))
+        entry = disabled["disabled_model_list"][0]
+        # The route keeps the key it names — never the provider's first key, and
+        # never a credential it did not choose.
+        self.assertEqual("GroupB", entry["model_info"]["api_key_name"])
+        self.assertNotIn("api_key", entry["litellm_params"])
+        self.assertNotIn("x-young-router-provider-key-id", entry["model_info"])
 
     def test_save_allows_duplicate_route_key_for_distinct_deployments(self) -> None:
         path = self.write_config(
@@ -1117,7 +1437,7 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
               compat_provider:
                 api_base: "https://example.com/v1"
                 api_keys:
-                  - name: r-plus
+                  - name: key-two
                     value: "sk-test"
             model_list:
               - model_name: default-chat
@@ -1155,8 +1475,8 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
         )
         self.assertEqual(
             [
-                "model=default-chat / provider=compat_provider / upstream=openai/default-chat / host=example.com / key=r-plus / order=2",
-                "model=default-chat / provider=compat_provider / upstream=openai/default-chat / host=example.com / key=r-plus / order=2",
+                "model=default-chat / provider=compat_provider / upstream=openai/default-chat / host=example.com / key=key-two / order=2",
+                "model=default-chat / provider=compat_provider / upstream=openai/default-chat / host=example.com / key=key-two / order=2",
             ],
             [entry["model_info"]["route_key"] for entry in saved],
         )
@@ -1356,7 +1676,8 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
         self.assertEqual(2, len(set(deployment_ids)))
         self.assertTrue(all(re.fullmatch(r"[0-9a-f]{8}", value) for value in deployment_ids))
 
-    def test_missing_or_blank_order_defaults_to_one(self) -> None:
+    def test_missing_or_blank_order_defaults_to_zero(self) -> None:
+        """The app's automatic order starts at 0, the slot of its own first route."""
         path = self.write_config(
             """
             providers:
@@ -1395,15 +1716,15 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
         payload = config_load.load_config(path)
         models = payload["providers"][0]["models"]
 
-        self.assertEqual(["1", "1"], [model["order"] for model in models])
+        self.assertEqual(["0", "0"], [model["order"] for model in models])
 
         config_api.save_config(payload["providers"], path)
         saved = config_schema._load_yaml(path)["model_list"]
-        self.assertEqual([1, 1], [entry["litellm_params"]["order"] for entry in saved])
+        self.assertEqual([0, 0], [entry["litellm_params"]["order"] for entry in saved])
         self.assertEqual(
             [
-                "model=gpt-image-2 / provider=compat_provider / upstream=openai/gpt-image-2 / host=example.com / key=default / order=1",
-                "model=gpt-image-2 / provider=compat_provider / upstream=openai/gpt-image-2 / host=example.com / key=backup / order=1",
+                "model=gpt-image-2 / provider=compat_provider / upstream=openai/gpt-image-2 / host=example.com / key=default / order=0",
+                "model=gpt-image-2 / provider=compat_provider / upstream=openai/gpt-image-2 / host=example.com / key=backup / order=0",
             ],
             [entry["model_info"]["route_key"] for entry in saved],
         )

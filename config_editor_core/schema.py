@@ -42,6 +42,11 @@ MENU_RELAY_KEYS_VERSION = 1
 MENU_PROVIDER_KEY_ID_KEY = "x-young-router-provider-key-id"
 MENU_RELAY_CATALOG_MODE_KEY = "x-young-router-relay-catalog-mode"
 MENU_RELAY_SOURCE_MODEL_KEY = "x-young-router-relay-source-model"
+# A route the user left with no key of its own (the pane's “未定义密钥”) records that
+# decision, so reading the file back cannot turn it into a claim on whichever key
+# happens to hold the credential the entry carries.
+MENU_KEY_BINDING_KEY = "x-young-router-key-binding"
+MODEL_KEY_BINDINGS = {"unbound"}
 MENU_ORDER_MODE_KEY = "x-young-router-order-mode"
 MENU_MANUAL_ORDER_KEY = "x-young-router-manual-order"
 # A public model's custom context window lives in the deployment's model_info
@@ -629,6 +634,22 @@ def _validate_current_schema(data: dict[str, Any], path: pathlib.Path) -> None:
                     raise ValueError(
                         f"{path.name} {section_name}[{index}] {exc}"
                     ) from exc
+            if MENU_KEY_BINDING_KEY in model_info:
+                key_binding = model_info.get(MENU_KEY_BINDING_KEY)
+                if not isinstance(key_binding, str) or key_binding not in MODEL_KEY_BINDINGS:
+                    raise ValueError(
+                        f"{path.name} {section_name}[{index}] {MENU_KEY_BINDING_KEY} is invalid"
+                    )
+                claims_key = bool(
+                    _string_value(model_info.get(MENU_PROVIDER_KEY_ID_KEY)).strip()
+                    or _string_value(model_info.get(MENU_API_KEY_NAME_KEY)).strip()
+                )
+                if claims_key:
+                    raise ValueError(
+                        f"{path.name} {section_name}[{index}] {MENU_KEY_BINDING_KEY} "
+                        f"{key_binding} names no key but also carries "
+                        f"{MENU_API_KEY_NAME_KEY}"
+                    )
             catalog_mode = model_info.get(MENU_RELAY_CATALOG_MODE_KEY, "independent")
             if not isinstance(catalog_mode, str) or catalog_mode not in MODEL_CATALOG_MODES:
                 raise ValueError(

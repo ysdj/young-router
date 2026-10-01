@@ -161,6 +161,51 @@ class RemoteUsageLogsTests(unittest.TestCase):
         self.assertNotIn("SECRET_RESPONSE_TEXT", output)
         self.assertNotIn("203.0.113.9", output)
 
+    def test_a_route_reads_usage_with_the_slot_it_names(self) -> None:
+        """The slot decides, and a slot the provider does not carry reads nothing.
+
+        Falling back to the provider's `default` key (or its only key) for a route
+        that named another one presents that account's usage as this route's; the
+        slot id the route carries is the answer.
+        """
+
+        provider = {
+            "api_base": "https://relay.example.test/v1",
+            "api_keys": [
+                {"id": "slot-default", "name": "default", "value": "replace-default"},
+                {"id": "slot-bob", "name": "bob", "value": "replace-bob"},
+            ],
+        }
+        self.assertEqual(
+            "replace-bob",
+            remote_usage_logs._credential_for_model(
+                provider, {"api_key_name": "bob", "provider_key_id": "slot-bob"}
+            ),
+        )
+        # A stale name does not decide once a slot is stated.
+        self.assertEqual(
+            "replace-default",
+            remote_usage_logs._credential_for_model(
+                provider, {"api_key_name": "bob", "provider_key_id": "slot-default"}
+            ),
+        )
+        self.assertEqual(
+            "",
+            remote_usage_logs._credential_for_model(
+                provider,
+                {"api_key_name": "bob", "provider_key_id": "provider-slot-00000000000000000000000000000000"},
+            ),
+        )
+        self.assertEqual(
+            "",
+            remote_usage_logs._credential_for_model(provider, {"api_key_name": "gone"}),
+        )
+        # A route that names no key still follows the provider's own default.
+        self.assertEqual(
+            "replace-default",
+            remote_usage_logs._credential_for_model(provider, {}),
+        )
+
     def test_sub2api_credential_usage_summary_is_sanitized(self) -> None:
         target = remote_usage_logs.UsageTarget(
             provider="relay",

@@ -172,18 +172,29 @@ class ReactNativeUiParityTests(unittest.TestCase):
         the edit.
         """
         # ＋ creates a disabled draft row that carries the placeholder name and
-        # inherits the key the user is looking at, so it lands in a real key
+        # inherits the key the user is working in, so it lands in a real key
         # group instead of one the app invents.
-        self.assert_ui_has('const inheritedKey = modelProviderKeyState(model, provider) ?? providerKeyStates(provider)[0];')
+        self.assert_ui_has('const inheritedKey = modelProviderKeyState(model, provider)')
+        self.assert_ui_has('?? providerKeyStates(provider).find((key) => key.id === selectedFetchKey)')
         self.assert_ui_has('...(inheritedKey ? { api_key_name: inheritedKey.name, provider_key_id: inheritedKey.id } : {})')
         self.assert_ui_has('model: {')
         self.assert_ui_has('enabled: false, order: 0,')
         self.assert_ui_has('const name = uniquePlaceholderName(models.map((item) => stringValue(item.model_name ?? item.name)), base);')
         # The list draws a group row only for a key the model actually belongs
         # to; a keyless draft is listed without an invented 未定义密钥 group.
-        self.assert_ui_has("if (!modelProviderKeyState(item, provider ?? {})) {")
+        self.assert_ui_has("const key = modelProviderKeyState(item, provider ?? {});")
+        self.assert_ui_has("if (!key) {")
         self.assert_ui_has("ungrouped.push(item);")
         self.assert_ui_has("for (const item of ungrouped) {")
+        # One group row is one provider key, addressed by its slot id, so the
+        # station's key and a custom key that read the same stay two groups and
+        # a model is filed under the key it names.
+        self.assert_ui_has('const grouped = new Map<string, { label: string; models: UnknownRecord[] }>();')
+        self.assert_ui_has('const list = grouped.get(key.id);')
+        self.assert_ui_has('rows.push({ key: `key:${keyID}`, cells: [group.label], spanning: true });')
+        self.assert_ui_not_has('rows.push({ key: `key:${keyName}`, cells: [keyName], spanning: true });')
+        self.assert_ui_has('const byName = keyStates.filter((entry) => entry.name === keyName && keyName !== "");')
+        self.assert_ui_has('return byName.length === 1 ? byName[0] : undefined;')
         # The draft states what is left where its own fields are.
         self.assert_ui_has("function isDraftModel(model: UnknownRecord, translate: Translate): boolean {")
         self.assert_ui_has('<Text style={styles.fieldHint}>{translate(selectedProviderKey ? "providers.draftModelHint" : "providers.draftModelKeylessHint")}</Text>')
@@ -548,7 +559,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'const nextSurface = stringValue(result.recommended_surface);',
             'isProbeSurface(nextSurface)',
             'dispatch("model.add_many", {',
-            'models: selectedModels.map((upstreamModel) => ({ name: upstreamModel, upstream_model: upstreamModel, api_key_name: apiKeyName, enabled: true, order: 0 }))',
+            'const apiKeyID = stringValue(summary.slot_id);',
+            'models: selectedModels.map((upstreamModel) => ({ name: upstreamModel, upstream_model: upstreamModel, api_key_name: apiKeyName, ...(apiKeyID ? { provider_key_id: apiKeyID } : {}), enabled: true, order: 0 }))',
             '<ProtocolPicker providerId={providerId}',
             'function ProtocolPicker(',
             'const mode = stringValue(model.upstream_protocol_mode, "fallback");',
@@ -775,17 +787,31 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
         # The interface's own result is stored with the inputs it was measured
         # on, so an edited route never shows the verdict of the route it
-        # replaced.
+        # replaced — and the press that asks the route again, and the edit that
+        # changes it, both take the previous finding off screen first.
         self.assert_ui_has('const [probeResults, setProbeResults] = useState<Record<string, { inputs: string; result: IpcResults["probe"] }>>({});')
+        self.assert_ui_has('const [droppedProbeResults, setDroppedProbeResults] = useState<Record<string, true>>({});')
         self.assert_ui_has('stringValue(model.provider_key_id, stringValue(model.api_key_name)),')
         self.assert_ui_has('stringValue(model.upstream_protocol_mode, "fallback"),')
         self.assert_ui_has('setProbeResults((current) => ({ ...current, [key]: { inputs, result } }));')
-        self.assert_ui_has('probeResult: record !== undefined && record.inputs === inputs ? record.result : undefined,')
+        self.assert_ui_has('const measuredHere = record !== undefined && record.inputs === inputs;')
+        self.assert_ui_has('probeResult: droppedProbeResults[key] === true || (record !== undefined && !measuredHere)')
+        self.assert_ui_has('const resultRecord = result === null ? undefined : result as UnknownRecord | undefined;')
+        self.assert_ui_has('const probe = result === null ? ({} as UnknownRecord) : resultRecord ?? asRecord(model.probe);')
         self.assert_ui_has('probe: () => probeModel(targetProviderId, targetModelId, inputs),')
+        # The button reports this question's progress only: the answer stands
+        # the press down before the write it asks for begins, so a probe whose
+        # finding has arrived is never left disabled by its own follow-up.
+        self.assert_ui_has('setDroppedProbeResults((current) => ({ ...current, [key]: true }));')
+        self.assertNotIn('} finally {\n      probingModelKeys.current.delete(key);', self.ui)
+        self.assertIn('probingModelKeys.current.delete(key);\n    setProbeActivityRevision((value) => value + 1);\n    setProbeResults(', self.ui)
         # One expression decides both what the button probes and which result it
         # shows, so the two can never disagree about the route; the address and
         # the model name are the pane's own values, a pending edit included.
         self.assert_ui_has('function probeInputFingerprint(providerBaseUrl: string, upstreamModel: string, model: UnknownRecord): string {')
+        self.assert_ui_has('{...modelProbeProps(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model), probeInputFingerprint(providerBaseURL(activeRoute.provider), modelUpstreamDisplay(editorIdentifier(activeRoute.provider), activeRoute.model), activeRoute.model))}')
+        self.assert_ui_has('{...modelProbeProps(providerId, editorIdentifier(model), probeInputFingerprint(providerBaseURL(provider), modelUpstreamDisplay(providerId, model), model))}')
+        self.assert_ui_not_has('{...modelProbeProps(providerId, editorIdentifier(model))}')
         self.assert_ui_has('{...modelProbeProps(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model), probeInputFingerprint(providerBaseURL(activeRoute.provider), modelUpstreamDisplay(editorIdentifier(activeRoute.provider), activeRoute.model), activeRoute.model))}')
         self.assert_ui_has('{...modelProbeProps(providerId, editorIdentifier(model), probeInputFingerprint(providerBaseURL(provider), modelUpstreamDisplay(providerId, model), model))}')
         self.assert_ui_not_has('{...modelProbeProps(providerId, editorIdentifier(model))}')
@@ -869,7 +895,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # ＋ creates a draft: disabled, so an unfinished new row is never an
         # error and the placeholder never reaches the served model list.
         self.assert_ui_has('model: { name, upstream_model: name, enabled: false, order: 0, ...(inheritedKey ?')
-        self.assert_ui_has('models: selectedModels.map((upstreamModel) => ({ name: upstreamModel, upstream_model: upstreamModel, api_key_name: apiKeyName, enabled: true, order: 0 }))')
+        self.assert_ui_has('models: selectedModels.map((upstreamModel) => ({ name: upstreamModel, upstream_model: upstreamModel, api_key_name: apiKeyName, ...(apiKeyID ? { provider_key_id: apiKeyID } : {}), enabled: true, order: 0 }))')
         self.assert_ui_has('value={String(displayedOrder)}')
         self.assert_ui_has('label={translate("providers.order")}')
         self.assert_ui_has('label={translate("providers.followMultiplier")}')
@@ -929,7 +955,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # fits its header and values, and a narrower pane still squeezes only the
         # trailing column.
         self.assert_ui_has('columns={[{ label: translate("providers.upstream"), width: 120 }, { label: translate("providers.publicModel"), width: 100 }, { label: translate("common.order"), width: 60 }]}')
-        self.assert_ui_has('rows.push({ key: `key:${keyName}`, cells: [keyName], spanning: true });')
+        self.assert_ui_has('rows.push({ key: `key:${keyID}`, cells: [group.label], spanning: true });')
         self.assert_ui_has('rows.push({ key: editorIdentifier(item), cells: [`\\t${modelUpstreamDisplay(providerId, item)}`, modelDisplayName(providerId, item), modelOrderText(providerId, item)] });')
         self.assert_ui_has('columns={variant === "inline"')
         self.assert_ui_has('cellHorizontalPadding={6}')
@@ -4335,7 +4361,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
         self.assertIn('return source ? [source.accountLabel, source.resourceLabel].filter(Boolean).join("/") : "";', self.ui)
         self.assertIn('return relaySourceName(relaySourceForKey(key, relaySources)) || name;', self.ui)
-        self.assertIn('const keyName = modelProviderKeyLabel(item, provider ?? {}, translate, undefined, relaySources);', self.ui)
+        self.assertIn('grouped.set(key.id, { label: modelProviderKeyLabel(item, provider ?? {}, translate, undefined, relaySources), models: [item] });', self.ui)
         self.assertIn('providerDisplayName(entry.provider), modelProviderKeyLabel(entry.model, entry.provider, translate, undefined, relaySources), order],', self.ui)
         self.assertIn('const sourceName = relaySourceName(choice.source) || name;', self.ui)
         self.assertIn('label={relaySourceName(source) || source.resourceLabel}', self.ui)
@@ -4910,7 +4936,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("function providerModelDraftKey(providerID: string, modelID: string)", self.ui)
         self.assertIn("key={`model:${providerId}:${editorIdentifier(model)}`}", self.ui)
         self.assertIn('cells: [providerDisplayName(item)]', self.ui)
-        self.assertIn('const grouped = new Map<string, UnknownRecord[]>();', self.ui)
+        self.assertIn('const grouped = new Map<string, { label: string; models: UnknownRecord[] }>();', self.ui)
         self.assertIn(r'cells: [`\t${modelUpstreamDisplay(editorIdentifier(entry.provider), entry.model)', self.ui)
         self.assertIn("modelUpstreamDisplay", self.ui)
         self.assertIn("providerKeyDisplayName", self.ui)
@@ -5027,9 +5053,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("alertRowKeys={alertProviderKeys}", self.ui)
 
         domain = (ROOT / "young_router/core/domains/providers_models.py").read_text(encoding="utf-8")
-        self.assertIn("def _entry_issues(providers: object) -> list[dict[str, Any]]:", domain)
+        self.assertIn("def _entry_issues(self, providers: object) -> list[dict[str, Any]]:", domain)
         self.assertIn('"code": "model_name_required",', domain)
         self.assertIn('"code": "model_upstream_required",', domain)
+        self.assertIn('"code": "model_provider_key_missing",', domain)
         # The location has to survive the shared issue sanitizer, which drops
         # anything that is not a plain identifier.
         self.assertIn('location = "providers_models.{}.models[{}]".format(', domain)
@@ -5194,12 +5221,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
         )
         self.assertIn('if (!key) return displayLabel(model.api_key_name, translate("providers.undefinedKey"));', self.ui)
         # The list matches the key the way the editor does, so a moved slot id
-        # cannot leave the list under "undefined key" while the editor shows it.
+        # cannot leave the list under "undefined key" while the editor shows it
+        # — and a name resolves the key only while one key carries it, so a
+        # station key is never read as a custom key of the same name.
         self.assertIn("const keyStates = providerKeyStates(provider);", self.ui)
-        self.assertIn(
-            '?? keyStates.find((entry) => entry.name === stringValue(model.api_key_name));',
-            self.ui,
-        )
+        self.assertIn('const keyName = stringValue(model.api_key_name);', self.ui)
+        self.assertIn('const byID = keyStates.find((entry) => entry.id === keyID);', self.ui)
+        self.assertIn('return byName.length === 1 ? byName[0] : undefined;', self.ui)
         self.assertIn(
             'value={selectedProviderKey?.id ?? ""} values={[{ value: "", label: translate("providers.undefinedKey") }, ...providerKeyOptions]} disabled={busy} onSelect={selectProviderKey}',
             self.ui,
@@ -5229,11 +5257,82 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("if key is not None and (explicit_key_id or explicit_key_name):", domain)
         self.assertIn('model["api_key_name"] = key["name"]', domain)
 
-        # Materialization still routes an unbound model through the provider's
-        # default key, so the draft keeps working at runtime.
+        # An unbound model still answers with the provider's default credential,
+        # so the draft keeps working at runtime — and the write records the
+        # route's own “no key” choice, so reading the file back cannot turn that
+        # credential into a claim on the key that happens to carry it.
         dumper = (ROOT / "config_editor_core/dump.py").read_text(encoding="utf-8")
-        self.assertIn("if api_key_item is None and not provider_key_id and not key_name:", dumper)
-        self.assertIn("api_key_item = default_keys[0] if default_keys else None", dumper)
+        self.assertIn("elif not key_name and not provider_key_id:", dumper)
+        self.assertIn('api_key = str(model.get("api_key", "")).strip() or (keys[0]["value"] if keys else "")', dumper)
+        self.assertIn('model_info[MENU_KEY_BINDING_KEY] = "unbound"', dumper)
+        loader = (ROOT / "config_editor_core/load.py").read_text(encoding="utf-8")
+        self.assertIn("def _is_unbound_entry(model_info: dict[str, Any]) -> bool:", loader)
+        self.assertIn("if _is_unbound_entry(model_info):", loader)
+
+    def test_route_actions_ask_before_renumbering_and_offer_add_and_delete(self) -> None:
+        """The routes pane's own buttons: ＋/− beside ↑/↓, and a decimal question.
+
+        A move keeps the numbers the group carries (they travel with the routes),
+        so a group holding decimals is asked once whether it should become 1..n —
+        the pane never renumbers a rate-ordered group behind the user's back.  The
+        pane also offers the same ＋/− shape the providers pane uses.
+        """
+
+        self.assertIn("const routeOrderValues = activeRouteGroup.map((entry) => modelOrderValue(editorIdentifier(entry.provider), entry.model));", self.ui)
+        self.assertIn("const decimals = routeOrderValues.filter((value) => !Number.isInteger(value));", self.ui)
+        self.assertIn('translate("providers.reorderIntegerMessage", { orders: decimals.join("、") })', self.ui)
+        self.assertIn("}).then((renumber) => reorder(renumber));", self.ui)
+        self.assertIn("...(renumber ? { renumber: true } : {})", self.ui)
+        # No question when every value is already an integer.
+        self.assertIn("if (decimals.length === 0) {", self.ui)
+
+        self.assertIn('<IconButton label="+" title={translate("providers.newRoute")} disabled={busy || providers.length === 0} onPress={addRoute} />', self.ui)
+        self.assertIn('<IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteRoute} />', self.ui)
+        self.assertIn("const addRoute = (): void => {", self.ui)
+        self.assertIn("const confirmDeleteRoute = (): void => {", self.ui)
+        self.assertIn('dispatch("model.delete", { provider_id: routeProviderID, model_id: routeModelID })', self.ui)
+        # A selected public model deletes its whole group in one action.
+        self.assertIn("const selectedGroup = selectedPublicModel !== undefined ? routeGroups.find((group) => group.name === selectedPublicModel) : undefined;", self.ui)
+        self.assertIn('dispatch("public.model_delete", { public_model: selectedGroup.name })', self.ui)
+        self.assertIn('translate("providers.deletePublicModelMessage", { routes: selectedGroup.entries.length })', self.ui)
+        self.assertIn('{activeRoute || selectedPublicModel !== undefined ? <IconButton label="−"', self.ui)
+        for locale in (self.zh, self.en):
+            self.assertIn('"providers.deletePublicModel"', locale)
+            self.assertIn('"providers.deletePublicModelMessage"', locale)
+        domain = (ROOT / "young_router/core/domains/providers_models.py").read_text(encoding="utf-8")
+        self.assertIn("def _delete_public_model(self, data: Mapping[str, Any]) -> None:", domain)
+        self.assertIn('"public_model_delete", "public_models_delete", "delete_public_model"', domain)
+        # The new row joins the group the user is looking at, as a disabled draft.
+        self.assertIn("const publicModel = (selectedPublicModel ?? activeRoute?.publicModel ?? \"\").trim();", self.ui)
+        self.assertIn("const knownModelIds = new Set(targetModels.map(editorIdentifier));", self.ui)
+        # The new row is selected through the pending key, never by a key the
+        # routes list does not carry yet (that would be repaired to row one).
+        self.assertIn("const pendingRouteKey = useRef<string | undefined>(undefined);", self.ui)
+        self.assertIn("pendingRouteKey.current = `${targetProviderID}:${stringValue(added.editor_id, stringValue(added.deployment_id, identifier(added))).trim()}`;", self.ui)
+        self.assertIn("name,\n        upstream_model: publicModel || \"\",\n        enabled: false,\n        order: 0,", self.ui)
+
+        for locale in (self.zh, self.en):
+            for key in (
+                '"providers.newRoute"',
+                '"providers.deleteRoute"',
+                '"providers.deleteRouteMessage"',
+                '"providers.reorderIntegerTitle"',
+                '"providers.reorderIntegerMessage"',
+                '"providers.reorderIntegerConfirm"',
+            ):
+                self.assertIn(key, locale)
+
+        # One route is one designate row, and an ambiguous name decides nothing:
+        # two routes of one public name stay two menu entries (named by the key
+        # they answer with), and a client whose provider this pane cannot match
+        # is never moved onto another provider's route.
+        self.assertIn(r"const identity = `${row.provider}\u001f${row.deploymentId}`;", self.ui)
+        self.assertIn(r'`${row.model} · ${row.keyName || translate("providers.undefinedKey")}`', self.ui)
+        self.assertIn("?? (matching.length === 1 ? matching[0] : undefined);", self.ui)
+        self.assertIn("const matching = codexModels.filter(matches);", self.ui)
+        core = (ROOT / "codex_config.py").read_text(encoding="utf-8")
+        self.assertIn('"api_key_name": str(info.get("api_key_name") or "").strip(),', core)
+        self.assertIn('"order": params.get("order"),', core)
 
     def test_standalone_configuration_package_surface_is_removed(self) -> None:
         routes = (ROOT / "rn/packages/shared/src/routes.ts").read_text(encoding="utf-8")

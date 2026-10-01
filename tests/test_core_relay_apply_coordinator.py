@@ -638,6 +638,169 @@ class RelayApplyCoordinatorIntegrationTests(unittest.TestCase):
             self.assertNotIn("replace-secret", json.dumps(fetched))
             self.assertNotIn("replace-secret", json.dumps(core.snapshot()))
 
+    def test_a_fetched_relay_key_survives_a_credential_a_custom_key_shares(self) -> None:
+        """The live incident: a station key the user also pasted by hand.
+
+        Fetching models for a relay resource stages that resource's key slot and
+        resolves its station credential.  When the same credential already sits
+        on a hand-made custom key, reading the applied document back used to drop
+        the linked slot as a "duplicate value" — the pane's 获取模型 picker then
+        fell back to the provider's first key, and the models the user picked
+        from the chooser were filed against *that* slot's credential.  One name is
+        one key; one value is not.
+        """
+
+        class ModelListResponse:
+            status = 200
+
+            def __enter__(self) -> "ModelListResponse":
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                return None
+
+            def getcode(self) -> int:
+                return self.status
+
+            def read(self, _: int) -> bytes:
+                return b'{"data":[{"id":"claude-opus-5-5"},{"id":"claude-fable-5"}]}'
+
+        class ModelListOpener:
+            def open(self, request: Any, *, timeout: float) -> ModelListResponse:
+                del request, timeout
+                return ModelListResponse()
+
+        class SharedCredentialHTTP(RelayCoordinatorHTTP):
+            """One station key answers the gateway catalog like the fetch does."""
+
+            def json(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
+                if path == "/v1/models":
+                    return {"data": [{"id": "claude-opus-5-5"}, {"id": "claude-fable-5"}]}
+                return super().json(origin, path, headers=headers)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            http = SharedCredentialHTTP()
+            relay = RelayAccountsDomain(root, http_client=http)
+            providers = ProvidersModelsDomain(root / "config.yaml")
+            core = CoreStore(domains=[relay, providers])
+            core.dispatch(
+                {
+                    "domain": "relay_accounts",
+                    "type": "account.add",
+                    "payload": {
+                        "type": "newapi",
+                        "label": "Relay",
+                        "origin": "https://relay.example.test",
+                    },
+                }
+            )
+            account_id = relay.snapshot()["accounts"][0]["id"]
+            core.accept_relay_login(
+                account_id=account_id,
+                account_type="newapi",
+                label="Relay",
+                origin="https://relay.example.test",
+                username="person",
+                cookie="session=fixture",
+            )
+            core.refresh_relay_resources(account_id, revision=core.revision)
+            resource_id = relay.snapshot()["accounts"][0]["resources"][0]["id"]
+
+            # The station key the user also pasted by hand: the fixture hands
+            # this resource the credential `sk-replace-materialized-key`, the
+            # same value the relay materializes onto the linked slot.  A
+            # credential only arrives through the native secret path, never as
+            # a payload.
+            core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "provider.add",
+                    "payload": {
+                        "provider": {
+                            "name": "provider-a",
+                            "enabled": True,
+                            "api_base": "https://relay.example.test/v1",
+                            "models": [],
+                        }
+                    },
+                },
+                expected_revision=core.revision,
+            )
+            provider_id = providers.snapshot()["providers"][0]["id"]
+            providers.dispatch("provider.key_add", {"provider_id": provider_id, "name": "hand-made"})
+            providers.stage_secret("api_key", f"{provider_id}\x1fhand-made", "sk-replace-materialized-key")
+            self.assertTrue(providers.snapshot()["providers"][0]["key_states"][0]["configured"])
+
+            with patch(
+                "young_router.core.domains.providers_models.isolated_http_opener",
+                return_value=ModelListOpener(),
+            ):
+                core.dispatch(
+                    {
+                        "domain": "providers_models",
+                        "type": "provider.fetch_relay_resource_models",
+                        "payload": {
+                            "provider_id": provider_id,
+                            "station_id": relay.snapshot()["accounts"][0]["station_id"],
+                            "account_id": account_id,
+                            "resource_id": resource_id,
+                        },
+                    },
+                    expected_revision=core.revision,
+                )
+            summary = core.snapshot()["action_summaries"]["providers_models"]["operation_summary"]
+            self.assertEqual(["claude-opus-5-5", "claude-fable-5"], summary["models"])
+
+            applied = core.apply(domains=["relay_accounts", "providers_models"], revision=core.revision)
+            self.assertEqual("applied", applied["status"])
+            # The staged slot is still the key it was: the credential it resolved
+            # is shared with "hand-made", and sharing is not duplication.
+            staged = next(
+                key
+                for key in providers.snapshot()["providers"][0]["key_states"]
+                if key["id"] == summary["slot_id"]
+            )
+            self.assertTrue(staged["configured"])
+            self.assertEqual("relay", staged["source"]["kind"])
+
+            core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "model.add_many",
+                    "payload": {
+                        "provider_id": provider_id,
+                        "models": [
+                            {
+                                "name": "claude-opus-5-5",
+                                "upstream_model": "claude-opus-5-5",
+                                "api_key_name": summary["api_key_name"],
+                                "provider_key_id": summary["slot_id"],
+                                "enabled": True,
+                                "order": 0,
+                            }
+                        ],
+                    },
+                },
+                expected_revision=core.revision,
+            )
+            applied = core.apply(domains=["relay_accounts", "providers_models"], revision=core.revision)
+            self.assertEqual("applied", applied["status"])
+
+            saved = providers.export(include_sensitive=True)["providers"][0]
+            self.assertEqual(
+                ["hand-made", summary["api_key_name"]],
+                [key["name"] for key in saved["api_keys"]],
+            )
+            linked = next(model for model in saved["models"] if model["model_name"] == "claude-opus-5-5")
+            self.assertEqual(summary["slot_id"], linked["provider_key_id"])
+            self.assertEqual(summary["api_key_name"], linked["api_key_name"])
+            # The route answers with the linked slot's credential, never the
+            # hand-made key that happens to hold the same value.
+            written = (root / "config.yaml").read_text(encoding="utf-8")
+            self.assertIn("claude-opus-5-5", written)
+            self.assertNotIn("replace-secret", json.dumps(core.snapshot()))
+
     def test_fetch_models_reads_relay_key_after_core_restart(self) -> None:
         """A restarted Core has no in-memory session secrets. Fetching relay
         models must fall back to the persisted session, the same behavior as
@@ -933,6 +1096,58 @@ class RelayApplyCoordinatorIntegrationTests(unittest.TestCase):
             # really landed instead of being refused.
             self.assertIn("replace-materialized-key", written)
 
+    def test_a_linked_route_following_the_multiplier_resolves_it_on_its_own(self) -> None:
+        """Following the multiplier is an edit Core can finish by itself.
+
+        The order a linked route takes in the multiplier mode is the station
+        group's own number, so asking for it is relay *dependency* work — the
+        same thing a new model on that key already carries.  Without that
+        dependency the draft reached the local validator with no multiplier
+        materialized, and the pane reported the edit as 校验未通过，更改未生效。
+        while the station's number was already in hand.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            core, _relay, providers, _http, _account_id, _resource_id = self._linked_core(root)
+
+            # The relay cannot finish its own work here; the multiplier this
+            # edit needs is not that work.  The first Apply lands the linked key
+            # and its route — the state the user edits from — so the edit below
+            # is measured against an applied baseline, exactly as the pane's
+            # second edit is.
+            with patch.object(
+                RelayAccountsDomain, "prepare_apply", return_value={"ready": False, "issues": []}
+            ):
+                landed = core.apply(domain="providers_models", revision=core.revision)
+                self.assertEqual("applied", landed["status"])
+                provider_state = providers.snapshot()["providers"][0]
+                model_state = provider_state["models"][0]
+                self.assertEqual("manual", model_state["order_mode"])
+                core.dispatch(
+                    {
+                        "domain": "providers_models",
+                        "type": "model.patch",
+                        "payload": {
+                            "provider_id": provider_state["id"],
+                            "model_id": model_state["id"],
+                            "changes": {"order_mode": "relay_multiplier", "manual_order": 0},
+                        },
+                    },
+                    expected_revision=core.revision,
+                )
+                result = core.apply(domain="providers_models", revision=core.revision)
+
+            self.assertTrue(result["applied"])
+            self.assertEqual("applied", result["status"])
+            self.assertEqual(0, result["pending_operations"])
+            self.assertIn("relay_accounts", result["domains"])
+            written = (root / "config.yaml").read_text(encoding="utf-8")
+            self.assertIn("x-young-router-order-mode: relay_multiplier", written)
+            # The fixture's own group reports a 1.25 ratio; that is the order
+            # the route follows.
+            self.assertIn("order: 1.25", written)
+
 
 class LocalEditBesideARelayBacklogTests(unittest.TestCase):
     """A local provider/model edit must not inherit the relay's backlog.
@@ -1004,6 +1219,40 @@ class LocalEditBesideARelayBacklogTests(unittest.TestCase):
         self.assertNotEqual(
             _relay_binding_projection(before),
             _relay_binding_projection(bound_model),
+        )
+
+        # An order the user typed on a linked route is local: the dumper writes
+        # it as it stands, so that edit keeps the relay out of its way.
+        manual_order_edit = copy.deepcopy(before)
+        manual_order_edit["providers"][1]["models"][0]["order_mode"] = "manual"
+        manual_order_edit["providers"][1]["models"][0]["order"] = 7
+        self.assertEqual(
+            _relay_binding_projection(before),
+            _relay_binding_projection(manual_order_edit),
+        )
+
+        # Following the multiplier is the station group's own number, so the
+        # same route asking for it has relay work to do after all.
+        follow_multiplier = copy.deepcopy(manual_order_edit)
+        follow_multiplier["providers"][1]["models"][0]["order_mode"] = "relay_multiplier"
+        self.assertNotEqual(
+            _relay_binding_projection(before),
+            _relay_binding_projection(follow_multiplier),
+        )
+
+        # A stale name is not a binding: a route whose slot is an independent key
+        # is local work even when its key name reads like the relay key's, or a
+        # renamed key would drag the relay's backlog into an unrelated edit.
+        stale_name = copy.deepcopy(before)
+        stale_name["providers"][0]["models"].append(
+            {"model_name": "local", "api_key_name": "station-key", "provider_key_id": "slot-local"}
+        )
+        stale_name["providers"][0]["api_keys"].append(
+            {"id": "slot-local", "name": "station-key", "value": "secret", "source": {"kind": "independent"}}
+        )
+        self.assertEqual(
+            _relay_binding_projection(before),
+            _relay_binding_projection(stale_name),
         )
 
     def test_a_local_model_edit_applies_while_the_relay_is_not_ready(self) -> None:

@@ -55,12 +55,13 @@ def _credential_value(value: Any) -> str:
     return "" if "\r" in resolved or "\n" in resolved else resolved
 
 
-def _provider_keys(provider: dict[str, Any]) -> tuple[dict[str, str], list[str]]:
+def _provider_keys(provider: dict[str, Any]) -> tuple[dict[str, str], dict[str, str], list[str]]:
     by_name: dict[str, str] = {}
+    by_id: dict[str, str] = {}
     ordered: list[str] = []
     raw_keys = provider.get("api_keys")
     if not isinstance(raw_keys, list):
-        return by_name, ordered
+        return by_name, by_id, ordered
     for index, item in enumerate(raw_keys, start=1):
         if not isinstance(item, dict):
             continue
@@ -69,18 +70,28 @@ def _provider_keys(provider: dict[str, Any]) -> tuple[dict[str, str], list[str]]
         if not value or name in by_name:
             continue
         by_name[name] = value
+        key_id = _string(item.get("id"))
+        if key_id:
+            by_id[key_id] = value
         ordered.append(value)
-    return by_name, ordered
+    return by_name, by_id, ordered
 
 
 def _credential_for_model(provider: dict[str, Any], model: dict[str, Any]) -> str:
     direct = _credential_value(model.get("api_key"))
     if direct:
         return direct
-    by_name, ordered = _provider_keys(provider)
+    by_name, by_id, ordered = _provider_keys(provider)
+    # The slot is the key the route uses, and a name only decides when no slot is
+    # stated.  A route that states a key this provider does not carry has no
+    # usage to read: answering with the provider's default (or its only key)
+    # would present another account's numbers as this route's.
+    key_id = _string(model.get("provider_key_id"))
     preferred_name = _string(model.get("api_key_name"))
-    if preferred_name and preferred_name in by_name:
-        return by_name[preferred_name]
+    if key_id:
+        return by_id.get(key_id, "")
+    if preferred_name:
+        return by_name.get(preferred_name, "")
     if "default" in by_name:
         return by_name["default"]
     return ordered[0] if len(ordered) == 1 else ""

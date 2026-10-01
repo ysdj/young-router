@@ -147,6 +147,65 @@ class ExternalProviderImportTests(unittest.TestCase):
         self.assertEqual("openai/chat", model["upstream_url_surface"])
         self.assertNotIn("supported_upstream_url_surfaces", model)
 
+    def test_imports_two_labels_over_one_credential_as_two_keys(self) -> None:
+        """A credential value is not a key identity in an imported document either.
+
+        The same upstream credential pasted under two labels is two keys, and each
+        route has to keep the label it named: collapsing them would delete a key
+        and re-point the other route at a credential it did not choose.
+        """
+
+        directory = self.temporary_directory()
+        source = directory / "config.yaml"
+        source.write_text(
+            textwrap.dedent(
+                """
+                providers:
+                  primary:
+                    api_base: &base "https://primary.example.test/v1"
+                    api_keys:
+                      - name: alice
+                        value: &key "sk-shared-import"
+                      - name: bob
+                        value: *key
+                model_list:
+                  - model_name: public-chat
+                    litellm_params:
+                      model: openai/upstream-chat
+                      api_base: *base
+                      api_key: *key
+                      order: 1
+                    model_info:
+                      provider: primary
+                      api_key_name: alice
+                  - model_name: public-chat
+                    litellm_params:
+                      model: openai/upstream-chat
+                      api_base: *base
+                      api_key: *key
+                      order: 2
+                    model_info:
+                      provider: primary
+                      api_key_name: bob
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+
+        result = self.run_importer("--input", str(source))
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        provider = json.loads(result.stdout)["providers"][0]
+        self.assertEqual(["alice", "bob"], [key["name"] for key in provider["api_keys"]])
+        self.assertEqual(
+            ["sk-shared-import", "sk-shared-import"],
+            [key["value"] for key in provider["api_keys"]],
+        )
+        self.assertEqual(
+            ["alice", "bob"],
+            [model["api_key_name"] for model in provider["models"]],
+        )
+
     def test_imports_explicit_web_search_capabilities_without_inference(self) -> None:
         directory = self.temporary_directory()
         source = directory / "web-search-capabilities.yaml"

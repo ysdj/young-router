@@ -17,6 +17,7 @@ from young_router.api_base import normalize_configured_api_base
 from .schema import (
     DEFAULT_API_KEY_NAME,
     MENU_API_KEY_NAME_KEY,
+    MENU_KEY_BINDING_KEY,
     MENU_MANUAL_ORDER_KEY,
     MENU_MODEL_ENABLED_KEY,
     MENU_ORDER_MODE_KEY,
@@ -62,7 +63,10 @@ def _parse_scalar(text: str) -> Any:
 def _numeric_order(value: Any) -> int | float:
     text = str(value).strip()
     if not text:
-        return 1
+        # The app's own automatic order starts at 0: the first route of a group
+        # is 0 everywhere else this app writes one (a new model, a renumbered
+        # group), so a value the file states nowhere keeps that same first slot.
+        return 0
     parsed = _parse_scalar(text)
     if isinstance(parsed, bool) or not isinstance(parsed, (int, float)):
         raise ValueError(f"Invalid route order: {text}")
@@ -220,12 +224,21 @@ def _primary_api_key(keys: list[dict[str, Any]]) -> dict[str, Any] | None:
 
 
 def _api_key_by_name(provider: dict[str, Any], key_name: str) -> dict[str, Any] | None:
-    keys = _normalized_api_keys(provider)
-    if key_name:
-        for item in keys:
-            if item["name"] == key_name:
-                return item
-    return _primary_api_key(keys)
+    """The one key this name identifies, or ``None`` when no key carries it.
+
+    An empty name is not a lookup: a model that names no key follows the
+    provider's default and the caller states that itself.  A name that matches
+    nothing is a dangling reference, and resolving it to the provider's first
+    key would silently move the route to another credential — the same key the
+    next model switch would report as its own.
+    """
+
+    if not key_name:
+        return None
+    for item in _normalized_api_keys(provider):
+        if item["name"] == key_name:
+            return item
+    return None
 
 
 def _api_key_by_id(provider: dict[str, Any], provider_key_id: str) -> dict[str, Any] | None:
@@ -359,40 +372,66 @@ def _entry_from_editor(
     entry = dict(_as_dict(model.get("entry_extra")))
     params = dict(_as_dict(model.get("litellm_extra")))
     model_info = dict(_as_dict(model.get("model_info_extra")))
+    # The route's key binding is decided below from what the route itself says;
+    # a marker read back from an earlier write must not survive as stale text.
+    model_info.pop(MENU_KEY_BINDING_KEY, None)
     _set_if_text(entry, "model_name", model_name)
     _set_if_text(params, "model", litellm_model)
     api_base = normalize_configured_api_base(provider.get("api_base", ""))
     provider_key_id = _provider_key_id(model.get("provider_key_id"))
     key_name = str(model.get("api_key_name", "")).strip()
-    if not key_name and not provider_key_id:
-        model_api_key = str(model.get("api_key", "")).strip()
-        for item in _normalized_api_keys(provider):
-            if item["value"] == model_api_key:
-                key_name = item["name"]
-                break
     api_key_item = (
         _api_key_by_id(provider, provider_key_id)
         if provider_key_id
         else _api_key_by_name(provider, key_name)
     )
-    if api_key_item is None and not provider_key_id and not key_name:
-        # A model that names no key follows the provider's default key.  The
-        # model itself stays unbound in the editor (it never claims a key the
-        # user did not choose), so the materialized entry has to resolve that
-        # default here.
-        default_keys = _normalized_api_keys(provider)
-        api_key_item = default_keys[0] if default_keys else None
-    if provider_key_id and api_key_item is None:
-        raise ValueError(
-            f"Provider key for model {model_name or f'#{index + 1}'} is unavailable"
+    api_key = ""
+    resolved_key_name = api_key_item["name"] if api_key_item else ""
+    if api_key_item is None and (key_name or provider_key_id):
+        # The model names a key — or a slot — this provider does not offer.  An
+        # enabled route is refused by name instead of falling back to another
+        # slot: a route that answered with the wrong credential is worse than a
+        # route the pane reports as unfinished.  A disabled route is not served
+        # at all, so its companion entry keeps the reference it had — re-enabling
+        # it asks for that key again rather than silently borrowing another
+        # slot's credential.
+        if enabled:
+            raise ValueError(
+                f"Provider key {key_name or provider_key_id} for model {model_name or f'#{index + 1}'} is unavailable"
+            )
+        api_key_name = key_name
+    elif not key_name and not provider_key_id:
+        # A route that names no key is the pane's own “no key” choice: it answers
+        # with the provider's default credential (the credential the entry
+        # already carries wins, so a hand-written route keeps its own), and it
+        # claims no key — neither a name nor a slot id is written.  What the pane
+        # shows before Apply is then what the next read still shows: the row
+        # stays where the user left it, no slot the user did not pick owns it,
+        # a relay slot never adopts it, and deleting a key never deletes it.
+        keys = _normalized_api_keys(provider)
+        api_key = str(model.get("api_key", "")).strip() or (keys[0]["value"] if keys else "")
+        api_key_name = ""
+        provider_key_id = ""
+        model_info[MENU_KEY_BINDING_KEY] = "unbound"
+        # Reference the key that carries this credential when one does, so a
+        # rotated credential keeps flowing into an unbound route too; a
+        # credential no key carries stays literal.
+        resolved_key_name = next(
+            (item["name"] for item in keys if api_key and item["value"] == api_key),
+            "",
         )
-    api_key = api_key_item["value"] if api_key_item else ""
-    api_key_name = api_key_item["name"] if api_key_item else ""
-    provider_key_id = api_key_item["id"] if api_key_item else provider_key_id
+    else:
+        api_key = api_key_item["value"] if api_key_item else ""
+        api_key_name = api_key_item["name"] if api_key_item else ""
+        provider_key_id = api_key_item["id"] if api_key_item else provider_key_id
     if api_base:
         params["api_base"] = {"__alias__": _make_anchor_name(provider_name, "api_base")} if use_provider_aliases else api_base
     if api_key:
-        params["api_key"] = {"__alias__": _provider_key_anchor(provider_name, api_key_name)} if use_provider_aliases else api_key
+        params["api_key"] = (
+            {"__alias__": _provider_key_anchor(provider_name, resolved_key_name)}
+            if use_provider_aliases and resolved_key_name
+            else api_key
+        )
 
     order_mode = str(model.get("order_mode", "manual")).strip() or "manual"
     if order_mode not in MODEL_ORDER_MODES:

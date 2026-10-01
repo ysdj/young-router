@@ -345,6 +345,54 @@ class CodexConfigTests(unittest.TestCase):
         provider = parsed["model_providers"][codex_config.LITELLM_CODEX_PROVIDER_ID]
         self.assertEqual("OpenAI", provider["name"])
 
+    def test_configured_models_names_the_route_key_and_order(self) -> None:
+        """A surface that lists saved routes can tell two of one public name apart."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(
+                textwrap.dedent(
+                    """
+                    providers:
+                      relay:
+                        api_base: "https://relay.example.test/v1"
+                        api_keys:
+                          - name: alpha
+                            value: "replace-alpha"
+                          - name: beta
+                            value: "replace-beta"
+                    model_list:
+                      - model_name: shared-model
+                        litellm_params:
+                          model: openai/shared-model
+                          api_base: "https://relay.example.test/v1"
+                          api_key: "replace-alpha"
+                          order: 0.3
+                        model_info:
+                          id: a1b2c3d4
+                          provider: relay
+                          api_key_name: alpha
+                      - model_name: shared-model
+                        litellm_params:
+                          model: openai/shared-model
+                          api_base: "https://relay.example.test/v1"
+                          api_key: "replace-beta"
+                          order: 1
+                        model_info:
+                          id: e5f6a7b8
+                          provider: relay
+                          api_key_name: beta
+                    """
+                ).lstrip()
+            )
+            config = codex_config.load_yaml(path)
+
+        rows = codex_config.configured_models(config)
+
+        self.assertEqual(["alpha", "beta"], [row["api_key_name"] for row in rows])
+        self.assertEqual([0.3, 1], [row["order"] for row in rows])
+        self.assertEqual(["a1b2c3d4", "e5f6a7b8"], [row["deployment_id"] for row in rows])
+
     def test_configured_models_exposes_explicit_compaction_support_only(self) -> None:
         """Configured rows carry the boolean opt-in; inference never happens.
 

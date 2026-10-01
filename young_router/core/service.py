@@ -295,10 +295,15 @@ def _relay_binding_projection(state: object) -> list[tuple[str, ...]]:
     resolve: a key that resolves through a station, and a model that points at
     such a key.  Comparing this projection against the applied baseline tells an
     Apply whether it has any relay work to do at all — a draft that only adds an
-    independent model, renames a provider, or edits an order has none, and it
-    must not be dragged into a relay transaction whose backlog (a pending key
+    independent model, renames a provider, or edits a manual order has none, and
+    it must not be dragged into a relay transaction whose backlog (a pending key
     create, an expired session) would otherwise fail an edit that has nothing to
     do with the relay.
+
+    A linked route's own order mode is part of that row: following the
+    multiplier is a value only the station's group states, so the edit that asks
+    for it needs the relay domain to resolve it — the same dependency a new
+    model on that key already carries.
     """
 
     providers = state.get("providers") if isinstance(state, Mapping) else None
@@ -340,9 +345,18 @@ def _relay_binding_projection(state: object) -> list[tuple[str, ...]]:
             for model in models:
                 if not isinstance(model, Mapping):
                     continue
+                # The slot is the route's key, so a route that carries one is
+                # relay-bound only when that slot is the relay key.  Its name is
+                # the weaker identity and decides only for a route that states no
+                # slot, so a renamed or reused name cannot drag a local edit into
+                # the relay transaction (and cannot refuse it for a station
+                # problem the edit has nothing to do with).
                 key_name = str(model.get("api_key_name", ""))
                 key_id = str(model.get("provider_key_id", ""))
-                if key_name not in relay_key_names and key_id not in relay_key_ids:
+                if key_id:
+                    if key_id not in relay_key_ids:
+                        continue
+                elif key_name not in relay_key_names:
                     continue
                 projection.append(
                     (
@@ -351,6 +365,7 @@ def _relay_binding_projection(state: object) -> list[tuple[str, ...]]:
                         str(model.get("model_name", model.get("name", ""))),
                         key_id,
                         key_name,
+                        str(model.get("order_mode", "manual")).strip() or "manual",
                     )
                 )
     return projection

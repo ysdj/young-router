@@ -316,6 +316,69 @@ class RelayAccountsDomainTests(unittest.TestCase):
             )
             self.assertEqual(before + 1, len(list_reads()))
 
+    def test_a_label_stored_without_a_key_id_is_only_repaired_when_it_is_unique(self) -> None:
+        """Two same-named station keys never answer for one another.
+
+        A resource whose stored id came from a label (an older answer without key
+        ids) is repaired by that label while it is unique.  Duplicate labels are
+        legal on the station, and reading "the first one" would materialize
+        another key's credential onto this slot.
+        """
+
+        key_path = "/api/v1/keys?page=1&page_size=100"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake = FakeRelayHTTPClient(
+                {
+                    "/api/v1/user/profile": {"data": {"balance": 8.75}},
+                    key_path: {
+                        "data": {
+                            "items": [
+                                {"id": "11", "name": "alpha", "status": "active", "key": "sk-replace-alpha-one"},
+                                {"id": "12", "name": "alpha", "status": "active", "key": "sk-replace-alpha-two"},
+                            ]
+                        }
+                    },
+                    "/api/v1/channels/available": {
+                        "data": [{"platforms": [{"supported_models": ["model-test"]}]}]
+                    },
+                }
+            )
+            domain = RelayAccountsDomain(root, http_client=fake)
+            account_id = domain.dispatch(
+                "account.add",
+                {"type": "sub2api", "label": "Sub2API", "origin": "https://relay.example.test"},
+            )["accounts"][0]["id"]
+            domain.accept_login_result(
+                account_id,
+                username="person@example.test",
+                access_token="replace-token",
+                remember_password=True,
+            )
+            resources = domain.refresh_resources(account_id)["resources"]
+            self.assertEqual(["sub2api-11", "sub2api-12"], [resource["id"] for resource in resources])
+            domain.apply()
+
+            # An older document named this resource after the station label.
+            state_path = domain.storage_path
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            account = next(item for item in state["accounts"] if item["id"] == account_id)
+            account["resources"][0]["id"] = "sub2api-alpha"
+            account["resources"][0]["name"] = "alpha"
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+
+            reloaded = RelayAccountsDomain(root, http_client=fake)
+            # The resource is known; its key is not, which is a key problem and
+            # not a resource problem — and never one of the two "alpha" keys.
+            with self.assertRaisesRegex(RelayAccountsError, "API key is unavailable"):
+                reloaded.trusted_secret_value("api_key", f"{account_id}:sub2api-alpha")
+
+            # A key the station identifies by its own id still reads normally.
+            self.assertEqual(
+                "sk-replace-alpha-two",
+                reloaded.trusted_secret_value("api_key", f"{account_id}:sub2api-12"),
+            )
+
     def test_type_detection_classifies_public_station_signatures_without_staging(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fake = FakeRelayHTTPClient(
