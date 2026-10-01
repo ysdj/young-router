@@ -8,7 +8,7 @@ import unittest
 from unittest import mock
 
 from young_router.core import CoreIPCClient, CoreIPCServer, CoreStore
-from young_router.core.domains.logs import MAX_VIEW_BYTES, LOG_TABS, LogsDomain
+from young_router.core.domains.logs import MAX_FILTER_CHARS, MAX_VIEW_BYTES, LOG_TABS, LogsDomain, LogsDomainError
 from young_router.core.service import LOG_TABS as CORE_LOG_TABS
 
 
@@ -1557,6 +1557,27 @@ model_list:
             )
 
             self.assertEqual(3, domain.view("recovery")["log"]["line_count"])
+
+    def test_a_filter_is_bounded_by_the_same_unit_the_contract_states(self) -> None:
+        """The contract's 256 and Core's limit are the same number of characters.
+
+        Core counted bytes while the IPC schema counted characters, so a filter
+        of 86 CJK characters passed the contract and was then refused by Core —
+        with a message the pane has no translation for.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "actions.log").write_text("first action\nsecond action\n", encoding="utf-8")
+            domain = LogsDomain(root)
+
+            domain.dispatch("logs.set_filter", {"tab": "actions", "filter": "汉" * MAX_FILTER_CHARS})
+            self.assertEqual(0, domain.view("actions")["log"]["line_count"])
+            domain.dispatch("logs.set_filter", {"tab": "actions", "filter": ""})
+            self.assertEqual(2, domain.view("actions")["log"]["line_count"])
+
+            with self.assertRaises(LogsDomainError):
+                domain.dispatch("logs.set_filter", {"tab": "actions", "filter": "汉" * (MAX_FILTER_CHARS + 1)})
 
     def test_pause_filter_clear_and_resume_are_view_operations(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -62,6 +62,7 @@ struct WinUI3NativeLeafModule {
       std::wstring const& title,
       std::wstring const& message,
       std::wstring const& confirm_label,
+      std::wstring const& cancel_label,
       bool destructive,
       winrt::Microsoft::ReactNative::ReactPromise<bool> const& promise) noexcept;
   void ShowReadOnlyText(

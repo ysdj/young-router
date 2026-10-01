@@ -20,7 +20,7 @@ from young_router.core.domains.relay_accounts import (
     RelayTransportError,
 )
 from young_router.core.protocol import validate_method_result
-from young_router.core.service import CoreError, CoreStore
+from young_router.core.service import CoreError, CoreStore, RevisionConflict
 
 
 class FakeRelayHTTPClient:
@@ -378,6 +378,104 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 "sk-replace-alpha-two",
                 reloaded.trusted_secret_value("api_key", f"{account_id}:sub2api-12"),
             )
+
+    def test_a_station_that_names_keys_by_key_id_still_reads_the_stored_slot(self) -> None:
+        """The stored resource id is derived the same way on both sides.
+
+        The resource list derives an id from ``id`` or ``key_id``, while the
+        read used to compare only ``id``: a station that names its keys with
+        ``key_id`` produced ids this lookup could never match.
+        """
+
+        key_path = "/api/v1/keys?page=1&page_size=100"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake = FakeRelayHTTPClient(
+                {
+                    "/api/v1/user/profile": {"data": {"balance": 8.75}},
+                    key_path: {
+                        "data": {
+                            "items": [
+                                {"key_id": "21", "name": "alpha", "status": "active", "key": "sk-replace-key-id"},
+                                {"key_id": "22", "name": "beta", "status": "active", "key": "sk-replace-other"},
+                            ]
+                        }
+                    },
+                    "/api/v1/channels/available": {
+                        "data": [{"platforms": [{"supported_models": ["model-test"]}]}]
+                    },
+                }
+            )
+            domain = RelayAccountsDomain(root, http_client=fake)
+            account_id = domain.dispatch(
+                "account.add",
+                {"type": "sub2api", "label": "Sub2API", "origin": "https://relay.example.test"},
+            )["accounts"][0]["id"]
+            domain.accept_login_result(
+                account_id,
+                username="person@example.test",
+                access_token="replace-token",
+                remember_password=True,
+            )
+            resources = domain.refresh_resources(account_id)["resources"]
+            self.assertEqual(["sub2api-21", "sub2api-22"], [resource["id"] for resource in resources])
+
+            # The slot's own key answers, and it is not the other key's value.
+            self.assertEqual(
+                "sk-replace-key-id",
+                domain.trusted_secret_value("api_key", f"{account_id}:sub2api-21"),
+            )
+
+    def test_a_lost_key_is_refused_instead_of_adopting_the_only_remaining_one(self) -> None:
+        """A station with one unrelated key does not answer for a lost slot.
+
+        The last-resort fallback returned the only key in the list whenever the
+        stored id and label matched nothing, materializing a credential onto a
+        slot that never held it.
+        """
+
+        key_path = "/api/v1/keys?page=1&page_size=100"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake = FakeRelayHTTPClient(
+                {
+                    "/api/v1/user/profile": {"data": {"balance": 8.75}},
+                    key_path: {
+                        "data": {
+                            "items": [
+                                {"id": "31", "name": "replacement", "status": "active", "key": "sk-replace-unrelated"},
+                            ]
+                        }
+                    },
+                    "/api/v1/channels/available": {
+                        "data": [{"platforms": [{"supported_models": ["model-test"]}]}]
+                    },
+                }
+            )
+            domain = RelayAccountsDomain(root, http_client=fake)
+            account_id = domain.dispatch(
+                "account.add",
+                {"type": "sub2api", "label": "Sub2API", "origin": "https://relay.example.test"},
+            )["accounts"][0]["id"]
+            domain.accept_login_result(
+                account_id,
+                username="person@example.test",
+                access_token="replace-token",
+                remember_password=True,
+            )
+            domain.refresh_resources(account_id)
+            domain.apply()
+
+            # A slot the station no longer carries, with one unrelated key left.
+            state_path = domain.storage_path
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            account = next(item for item in state["accounts"] if item["id"] == account_id)
+            account["resources"] = [{"id": "sub2api-99", "name": "deleted-key", "group_id": "", "enabled": True}]
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+
+            reloaded = RelayAccountsDomain(root, http_client=fake)
+            with self.assertRaisesRegex(RelayAccountsError, "API key is unavailable"):
+                reloaded.trusted_secret_value("api_key", f"{account_id}:sub2api-99")
 
     def test_type_detection_classifies_public_station_signatures_without_staging(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -737,6 +835,84 @@ class RelayAccountsDomainTests(unittest.TestCase):
             self.assertEqual(
                 {"imported", "import_mode", "resource_count", "model_count"},
                 set(imported["action_summary"]),
+            )
+            self.assertTrue(imported["action_summary"]["imported"])
+
+    def test_core_relay_resource_transients_check_the_callers_revision(self) -> None:
+        """A stale refresh or import conflicts instead of being accepted.
+
+        Both actions run outside the ordinary dispatch path, and hard-coding
+        the store's own revision skipped the guard the contract advertises:
+        a window holding an old revision could still stage an import against
+        a draft it never saw.
+        """
+
+        fake = FakeRelayHTTPClient(
+            {
+                "/api/user/models": {"success": True, "data": ["model-a"]},
+                "/api/token/?p=1&size=100": {
+                    "success": True,
+                    "data": {"items": [{"id": 7, "status": 1}]},
+                },
+                "/api/token/7/key": {"success": True, "data": {"key": "replace-relay-key"}},
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            relay = RelayAccountsDomain(root, http_client=fake)
+            account = relay.dispatch(
+                "add",
+                {"type": "newapi", "label": "Relay", "origin": "https://relay.example.test"},
+            )["accounts"][0]
+            providers = ProvidersModelsDomain(root / "config.yaml")
+            core = CoreStore(
+                metadata_path=root / ".litellm-runtime" / "core-state.json",
+                domains=[relay, providers],
+            )
+            core.accept_relay_login(
+                account_id=account["id"],
+                account_type="newapi",
+                label="Relay",
+                origin="https://relay.example.test",
+                username="sample-user",
+                cookie="session=replace-cookie",
+                access_token="replace-dashboard-token",
+            )
+
+            core.dispatch(
+                {"domain": "relay_accounts", "type": "resources.refresh", "payload": {"account_id": account["id"]}},
+                expected_revision=core.revision,
+            )
+            stale = core.revision - 1
+            resources = core.snapshot()["domains"]["relay_accounts"]["accounts"][0]["resources"]
+
+            with self.assertRaises(RevisionConflict):
+                core.dispatch(
+                    {"domain": "relay_accounts", "type": "resources.refresh", "payload": {"account_id": account["id"]}},
+                    expected_revision=stale,
+                )
+            with self.assertRaises(RevisionConflict):
+                core.dispatch(
+                    {
+                        "domain": "relay_accounts",
+                        "type": "resources.import",
+                        "payload": {"account_id": account["id"], "resource_ids": [resources[0]["id"]]},
+                    },
+                    expected_revision=stale,
+                )
+            # The current revision still passes both, so the guard is a
+            # comparison and not a blanket refusal.
+            core.dispatch(
+                {"domain": "relay_accounts", "type": "resources.refresh", "payload": {"account_id": account["id"]}},
+                expected_revision=core.revision,
+            )
+            imported = core.dispatch(
+                {
+                    "domain": "relay_accounts",
+                    "type": "resources.import",
+                    "payload": {"account_id": account["id"], "resource_ids": [resources[0]["id"]]},
+                },
+                expected_revision=core.revision,
             )
             self.assertTrue(imported["action_summary"]["imported"])
 

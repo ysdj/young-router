@@ -108,18 +108,23 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
         }
     }
 
-    @objc func showConfirmation(_ title: String, message: String, confirmLabel: String, destructive: Bool, resolver resolve: @escaping RCTPromiseResolveBlock, rejecter reject: RCTPromiseRejectBlock) {
+    @objc func showConfirmation(_ title: String, message: String, confirmLabel: String, cancelLabel: String, destructive: Bool, resolver resolve: @escaping RCTPromiseResolveBlock, rejecter reject: RCTPromiseRejectBlock) {
         DispatchQueue.main.async {
             // The app's own decision panel, never an alert's modal session: the
             // React host keeps running while the question is on screen, and the
-            // answer that cannot be undone draws destructive.
+            // answer that cannot be undone draws destructive.  The dismissing
+            // answer keeps the caller's own words when the question means more
+            // by 取消 than "no answer" (a move that would be cancelled, not a
+            // question left unanswered), and falls back to the host's localized
+            // 取消 when the caller names nothing.
+            let cancelTitle = cancelLabel.trimmingCharacters(in: .whitespacesAndNewlines)
             self.leaf.presentDecisionPanel(
                 title,
                 message: message,
                 answers: [
                     NativeDecisionAnswer(
                         id: "cancel",
-                        title: self.leaf.localizedText("cancel", fallback: "Cancel"),
+                        title: cancelTitle.isEmpty ? self.leaf.localizedText("cancel", fallback: "Cancel") : cancelTitle,
                         isCancel: true
                     ),
                     NativeDecisionAnswer(

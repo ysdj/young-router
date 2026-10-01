@@ -275,15 +275,16 @@ void WinUI3NativeLeafModule::ShowConfirmation(
     std::wstring const& title,
     std::wstring const& message,
     std::wstring const& confirm_label,
+    std::wstring const& cancel_label,
     bool destructive,
     winrt::Microsoft::ReactNative::ReactPromise<bool> const& promise) noexcept {
   try {
     auto leaf = leaf_;
     auto js_dispatcher = context_.JSDispatcher();
-    context_.UIDispatcher().Post([leaf, title, message, confirm_label, destructive, promise, js_dispatcher] {
+    context_.UIDispatcher().Post([leaf, title, message, confirm_label, cancel_label, destructive, promise, js_dispatcher] {
       bool accepted = false;
       try {
-        accepted = leaf->Confirm(title, message, confirm_label, destructive);
+        accepted = leaf->Confirm(title, message, confirm_label, cancel_label, destructive);
       } catch (...) {
       }
       js_dispatcher.Post([promise, accepted] { promise.Resolve(accepted); });

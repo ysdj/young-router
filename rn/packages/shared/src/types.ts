@@ -405,7 +405,7 @@ export interface IpcParams {
     | { editor_token: string; text: string };
   files: Record<string, never>;
   dispatch: { action: DispatchAction; revision?: number };
-  subscribe: { topics?: string[] };
+  subscribe: { topics?: "snapshot"[] };
   validate: { domain: ConfigDomain; revision?: number };
   apply: ({ domain: ConfigDomain; domains?: never } | { domains: ConfigDomain[]; domain?: never }) & { revision: number; confirmation?: string | string[] };
   reload: { domain?: ConfigDomain; revision?: number };
@@ -464,6 +464,9 @@ export interface IpcResults {
     model_id?: string;
     unreachable?: boolean;
     recommended_surface?: "openai/responses" | "openai/chat" | "anthropic" | null;
+    providers?: { id: string; available: boolean; model_count: number }[];
+    models?: string[];
+    model_count?: number;
     summary?: { available_surfaces: string[]; unavailable_surfaces: string[]; unreachable_surfaces?: string[]; transport?: string; statuses: Record<string, string> };
     degradation?: ProbeDegradationResult;
     surfaces?: { surface: string; available: boolean; status?: string; original_request?: { method: string; url: string; headers: Record<string, string>; body: Record<string, unknown> } }[];
@@ -498,6 +501,14 @@ export interface IpcResponse<M extends IpcMethod = IpcMethod> {
   error?: IpcError;
 }
 
+/**
+ * The event a subscription can ask for.  One topic exists because Core
+ * publishes one event kind: a subscriber that names it is sent those events,
+ * a subscriber that names none is sent every event, and a subscriber that
+ * names an empty list is sent nothing.
+ */
+export type IpcEventTopic = IpcEvent["event"];
+
 export interface IpcEvent {
   protocol_version: typeof IPC_PROTOCOL_VERSION;
   event: "snapshot";
@@ -522,7 +533,7 @@ export interface IpcClient {
   files(): Promise<IpcResults["files"]>;
   stageEditor(editorToken: string, text: string): Promise<IpcResults["editor"]>;
   dispatch(action: DispatchAction, revision?: number): Promise<IpcResults["dispatch"]>;
-  subscribe(listener: (event: IpcEvent) => void, topics?: string[]): () => void;
+  subscribe(listener: (event: IpcEvent) => void, topics?: IpcEventTopic[]): () => void;
   validate(domain: ConfigDomain, revision?: number): Promise<ValidationSummary>;
   apply(domain: ConfigDomain, revision: number, confirmation?: string | string[]): Promise<IpcResults["apply"]>;
   applyDomains(domains: ConfigDomain[], revision: number, confirmation?: string | string[]): Promise<IpcResults["apply"]>;
@@ -746,9 +757,12 @@ export interface NativeLeafAdapter {
    * One question with one primary answer, drawn by the app's own decision
    * surface on both hosts.  `destructive` marks an answer that cannot be
    * undone (删除, 放弃更改), so it draws the way every other destructive answer
-   * in the app draws.
+   * in the app draws.  `cancelLabel` names the answer that dismisses the
+   * question — the host's own 取消 unless the caller's question means more by
+   * it (a move that would be cancelled rather than a question that would be
+   * left unanswered).
    */
-  showConfirmation(options: { title: string; message: string; confirmLabel: string; destructive?: boolean }): Promise<boolean>;
+  showConfirmation(options: { title: string; message: string; confirmLabel: string; cancelLabel?: string; destructive?: boolean }): Promise<boolean>;
   showReadOnlyText(options: { title: string; text: string; closeLabel: string; language: "json" | "toml" | "text"; html: string }): Promise<void>;
   /**
    * Show an official provider login through the platform-owned auth surface.

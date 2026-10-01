@@ -162,6 +162,16 @@ class CoreProtocolTests(unittest.TestCase):
         for method in schema["methods"]:
             self.assertIn(f'| "{method}"', typescript)
         self.assertEqual(len(schema["methods"]), len(schema["request"]["allOf"]))
+        # The request envelope's own method enum is the same vocabulary: a
+        # method that is listed and contracted but missing here would be
+        # rejected by any consumer that validates the published request shape,
+        # even though Core serves it.
+        self.assertEqual(schema["methods"], schema["request"]["properties"]["method"]["enum"])
+        contracted = [
+            clause["if"]["properties"]["method"]["const"]
+            for clause in schema["request"]["allOf"]
+        ]
+        self.assertEqual(schema["methods"], contracted)
         self.assertFalse(schema["$defs"]["applyParams"]["additionalProperties"])
         self.assertIn("domains", schema["$defs"]["applyParams"]["properties"])
         self.assertEqual(
@@ -345,6 +355,14 @@ class CoreProtocolTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(ProtocolError, r"^reload result does not match"):
             validate_method_result("reload", {"revision": 0, "action_summary": {"operation": "fetch_models"}})
+        # The disk map's object-valued `additionalProperties` is what validates
+        # each domain's own record, so a partial record is caught here instead
+        # of reaching the pane as an undefined generation.
+        validate_method_result("disk_state", {"revision": 0, "disk": {"language": {"changed": True, "generation": 3}}})
+        for partial in ({"language": {}}, {"language": {"changed": True}}, {"language": {"changed": True, "generation": 3, "extra": 1}}):
+            with self.subTest(partial=partial):
+                with self.assertRaisesRegex(ProtocolError, r"^disk_state result does not match"):
+                    validate_method_result("disk_state", {"revision": 0, "disk": partial})
 
     def test_snapshot_params_cannot_contain_extra_fields(self) -> None:
         with self.assertRaises(ProtocolError) as raised:
@@ -2023,6 +2041,42 @@ class CoreIPCTests(unittest.TestCase):
         self.assertTrue(ready.wait(2.0))
         self.assertEqual(1, received[-1]["protocol_version"])
         self.assertEqual("snapshot", received[-1]["event"])
+
+    def test_a_subscription_is_sent_only_the_topics_it_asked_for(self) -> None:
+        """A subscription's topics decide which events reach it.
+
+        The field used to be validated and then discarded, so a client that
+        asked for one topic was sent every event.  A topic is the event's own
+        name, an absent list means every event, and an empty list means none.
+        """
+
+        core = CoreStore(domains=[MemoryDomain("language", {"choice": "system"})])
+        server = CoreIPCServer(core)
+        endpoint = server.start()
+        self.addCleanup(server.stop)
+        client = CoreIPCClient(endpoint, server.bootstrap_token)
+        self.addCleanup(client.close)
+        ask = {"action": {"domain": "language", "type": "set", "payload": {"choice": "en"}}}
+
+        asked: list[dict[str, object]] = []
+        asked_ready = threading.Event()
+
+        def on_asked(event: dict[str, object]) -> None:
+            asked.append(event)
+            asked_ready.set()
+
+        unsubscribe = client.subscribe(on_asked, topics=["snapshot"])
+        self.addCleanup(unsubscribe)
+        client.call("dispatch", ask)
+        self.assertTrue(asked_ready.wait(2.0))
+        self.assertEqual("snapshot", asked[-1]["event"])
+
+        nothing: list[dict[str, object]] = []
+        unsubscribe_none = client.subscribe(nothing.append, topics=[])
+        self.addCleanup(unsubscribe_none)
+        client.call("dispatch", {"action": {"domain": "language", "type": "set", "payload": {"choice": "system"}}})
+        time.sleep(0.5)
+        self.assertEqual([], nothing)
 
     def test_authenticated_host_exchanges_file_path_for_opaque_capability(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

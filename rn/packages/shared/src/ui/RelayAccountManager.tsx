@@ -390,8 +390,22 @@ export function ApiKeyCreateDialog({ visible, groups, disabled, onClose, onCreat
   const [name, setName] = useState("");
   const [groupID, setGroupID] = useState("");
   const [enabled, setEnabled] = useState(true);
+  // The form resets when the dialog opens, never while it is up: `groups` is a
+  // freshly built array on every parent render, so an effect keyed on it used
+  // to clear the name the user was typing — and re-check 启用 — whenever the
+  // pane behind it repainted.  A group list that arrives or changes while the
+  // dialog is open only repairs a choice that no longer exists.
+  const opened = useRef(false);
   useEffect(() => {
-    if (!visible) return;
+    if (!visible) {
+      opened.current = false;
+      return;
+    }
+    if (opened.current) {
+      setGroupID((current) => groups.some((group) => group.id === current) ? current : groups[0]?.id ?? "");
+      return;
+    }
+    opened.current = true;
     setName("");
     setGroupID(groups[0]?.id ?? "");
     setEnabled(true);
@@ -1010,7 +1024,10 @@ export function StationAccountsPanel({
     }
     // What the sheet has already handed over.  A save that failed leaves these
     // edits staged in Core, so the next 保存并关闭 stages only what it added on
-    // top instead of writing the same keys twice.
+    // top instead of writing the same keys twice.  The record is kept as each
+    // edit lands — a batch that throws half-way still knows what it staged —
+    // and each update records only the fields that actually reached Core, so a
+    // retry writes exactly the remainder.
     let handedOver: RelayGroupManagerResult | undefined;
     const stageEdits = async (edits: RelayGroupManagerResult): Promise<void> => {
       // The staged edits are reconciled against the loaded account, which is
@@ -1018,36 +1035,59 @@ export function StationAccountsPanel({
       if (pending) current = await pending;
       const previous = handedOver;
       const alreadyCreated = new Set((previous?.creates ?? []).map((create) => `${create.name}\u0000${create.groupID}`));
-      const previousUpdate = new Map((previous?.updates ?? []).map((entry) => [entry.keyID, entry]));
       const alreadyDeleted = new Set(previous?.deletes ?? []);
+      const staged: RelayGroupManagerResult = {
+        autoGrouping: previous?.autoGrouping ?? current.autoGrouping,
+        creates: [...(previous?.creates ?? [])],
+        updates: (previous?.updates ?? []).map((entry) => ({ ...entry })),
+        deletes: [...(previous?.deletes ?? [])],
+      };
+      handedOver = staged;
       // Manual key writes are rejected while auto-grouping owns the layout, so
       // turning it off is staged first and turning it on is staged last.
-      const turningOff = current.autoGrouping && !edits.autoGrouping
-        && (previous === undefined || previous.autoGrouping);
-      if (turningOff) await apiKeyActions?.setAutoGrouping?.(account.id, false);
+      const turningOff = current.autoGrouping && !edits.autoGrouping && staged.autoGrouping;
+      if (turningOff) {
+        await apiKeyActions?.setAutoGrouping?.(account.id, false);
+        staged.autoGrouping = false;
+      }
       for (const create of edits.creates) {
         if (alreadyCreated.has(`${create.name}\u0000${create.groupID}`)) continue;
         await apiKeyActions?.create?.(account.id, { name: create.name, groupID: create.groupID, enabled: true });
+        alreadyCreated.add(`${create.name}\u0000${create.groupID}`);
+        staged.creates.push(create);
       }
       for (const edit of edits.updates) {
         const resource = current.resources.find((item) => item.id === edit.keyID);
         if (!resource) continue;
-        const staged = previousUpdate.get(edit.keyID);
-        const nameChanged = edit.name !== (resource.apiName || resource.name) && (!staged || staged.name !== edit.name);
-        const groupChanged = edit.groupID !== resource.groupID && (!staged || staged.groupID !== edit.groupID);
-        const enabledChanged = edit.enabled !== resource.enabled && (!staged || staged.enabled !== edit.enabled);
-        if (nameChanged) await apiKeyActions?.update?.(account.id, edit.keyID, edit.name);
-        if (groupChanged) await apiKeyActions?.setGroup?.(account.id, edit.keyID, edit.groupID);
-        if (enabledChanged) await apiKeyActions?.setEnabled?.(account.id, edit.keyID, edit.enabled);
+        let stagedEdit = staged.updates.find((entry) => entry.keyID === edit.keyID);
+        if (!stagedEdit) {
+          stagedEdit = { keyID: edit.keyID, name: resource.apiName || resource.name, groupID: resource.groupID, enabled: resource.enabled };
+          staged.updates.push(stagedEdit);
+        }
+        if (edit.name !== (resource.apiName || resource.name) && stagedEdit.name !== edit.name) {
+          await apiKeyActions?.update?.(account.id, edit.keyID, edit.name);
+          stagedEdit.name = edit.name;
+        }
+        if (edit.groupID !== resource.groupID && stagedEdit.groupID !== edit.groupID) {
+          await apiKeyActions?.setGroup?.(account.id, edit.keyID, edit.groupID);
+          stagedEdit.groupID = edit.groupID;
+        }
+        if (edit.enabled !== resource.enabled && stagedEdit.enabled !== edit.enabled) {
+          await apiKeyActions?.setEnabled?.(account.id, edit.keyID, edit.enabled);
+          stagedEdit.enabled = edit.enabled;
+        }
       }
       for (const keyID of edits.deletes) {
         if (alreadyDeleted.has(keyID)) continue;
         await apiKeyActions?.remove?.(account.id, keyID, "detach_disabled");
+        alreadyDeleted.add(keyID);
+        staged.deletes.push(keyID);
       }
-      const turningOn = !current.autoGrouping && edits.autoGrouping
-        && (previous === undefined || !previous.autoGrouping);
-      if (turningOn) await apiKeyActions?.setAutoGrouping?.(account.id, true);
-      handedOver = edits;
+      const turningOn = !current.autoGrouping && edits.autoGrouping && !staged.autoGrouping;
+      if (turningOn) {
+        await apiKeyActions?.setAutoGrouping?.(account.id, true);
+        staged.autoGrouping = true;
+      }
     };
     const answersApplies = Boolean(native.awaitGroupManagerApply && native.finishGroupManagerApply);
     const answerOneApplyRequest = async (): Promise<void> => {

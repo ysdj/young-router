@@ -693,10 +693,15 @@ bool WinUI3NativeLeaf::Confirm(
     std::wstring_view title,
     std::wstring_view message,
     std::wstring_view confirm_label,
+    std::wstring_view cancel_label,
     bool destructive) {
   DecisionAnswer cancel_answer;
   cancel_answer.id = L"cancel";
-  cancel_answer.label = Localized("cancel", L"Cancel");
+  // The dismissing answer keeps the caller's own words when the question means
+  // more by 取消 than "no answer" (a move that would be cancelled, not a
+  // question left unanswered), and falls back to the host's localized 取消
+  // when the caller names nothing.
+  cancel_answer.label = cancel_label.empty() ? Localized("cancel", L"Cancel") : std::wstring(cancel_label);
   cancel_answer.cancel = true;
   DecisionAnswer confirm_answer;
   confirm_answer.id = L"confirm";
@@ -2031,7 +2036,7 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
   });
   close.Click([&](auto const&, auto const&) {
     // Close drops the staged draft, so a sheet that would lose edits asks first.
-    if (has_staged_changes() && !Confirm(labels.discard_title, labels.discard_body, labels.discard_confirm, /*destructive=*/true)) return;
+    if (has_staged_changes() && !Confirm(labels.discard_title, labels.discard_body, labels.discard_confirm, {}, /*destructive=*/true)) return;
     *applied = false;
     dialog.Close();
   });
