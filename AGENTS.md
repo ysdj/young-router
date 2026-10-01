@@ -53,6 +53,14 @@ That strip belongs to a settings pane window only: a child window keeps no statu
 
 ## Known Runtime Failure Modes
 
+### A Reasoning Frame Does Not Claim The Answer Started (2026-10-02)
+
+- 调用 WorkBuddy 时思考会被拆成多个「已深度思考」块，每块只有一小段（`We`、`need respond`、`to user.`）：一次思考被切成一片一个折叠块。
+- Cause: the staged shim states every delta field it knows on every frame, so a reasoning frame arrives as `{"reasoning_content": "We", "content": "", "refusal": "", "tool_calls": [], "extra_fields": null}`.  The worker forwarded the upstream SSE **byte-for-byte** (`readable.pipe(res)`), and a client reads the presence of `content` as "the answer started": it closed the thinking block it had just opened after every fragment.
+- Fix: `young_router/workbuddy_stream.mjs` shapes each streamed line — the empty delta fields (`content`, `refusal`, `reasoning`, `reasoning_content`, `tool_calls`, `function_call`, `extra_fields`) are dropped, and every other frame (the `[DONE]` token, comments, blank frames, non-chat JSON, unparseable data) passes through byte-for-byte.  The worker's streaming path writes through that shaper instead of piping the upstream body.  The module sits beside the worker, so it ships with it; the macOS, Windows, and release packaging paths all assert the file, the node regression test runs inside `pnpm run test`, and `tests/test_core_workbuddy.py` guards the worker's use of it for the plain `./scripts/test.sh` gate.
+- Invariant: a streamed frame says exactly what it carries — an empty field is absent, never an empty value a client has to interpret.
+- Verified with a standalone replay of the worker against the installed package (`node young_router/workbuddy_worker.mjs --port … --entry <staged lib>`): before, every reasoning frame carried `content: ""`; after, a reasoning frame carries only `reasoning_content`, the frame that carries real content keeps both, and the finish frame keeps its `finish_reason` and tool call.  Plus `tests/test_workbuddy_stream.mjs`, `tests/test_core_workbuddy.py`, `pnpm run test`, and `./scripts/test.sh`.
+
 ### A Field States What It Could Not Do (2026-10-02)
 
 - Two controls wrote something other than what the user gave them.

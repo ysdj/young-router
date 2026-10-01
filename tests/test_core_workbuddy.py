@@ -335,6 +335,29 @@ class WorkBuddyProviderTests(unittest.TestCase):
 class WorkBuddyServiceEnvironmentTests(unittest.TestCase):
     """The proxy child resolves the worker loopback from its own environment."""
 
+    def test_the_worker_shapes_every_streamed_delta_before_a_client_sees_it(self) -> None:
+        """A reasoning frame must not claim the answer started.
+
+        The shim states every delta field it knows, so a reasoning frame also
+        carries ``content: ""``; a client reads that as "the answer started" and
+        closes the thinking block it just opened, which turned one thought into
+        one collapsed 深度思考 row per fragment.  The worker therefore passes
+        every streamed line through the shaper, which drops the empty fields and
+        leaves every other frame byte-for-byte.
+        """
+
+        root = Path(__file__).resolve().parents[1]
+        worker = (root / "young_router/workbuddy_worker.mjs").read_text(encoding="utf-8")
+        shaper = (root / "young_router/workbuddy_stream.mjs").read_text(encoding="utf-8")
+        self.assertIn("import { normalizeChatCompletionStreamLine } from './workbuddy_stream.mjs'", worker)
+        self.assertIn("res.write(normalizeChatCompletionStreamLine(buffer.slice(0, newline + 1)))", worker)
+        self.assertIn("if (buffer) res.write(normalizeChatCompletionStreamLine(buffer))", worker)
+        self.assertNotIn("readable.pipe(res)", worker)
+        for field in ("'content'", "'refusal'", "'reasoning_content'", "'tool_calls'", "'function_call'"):
+            self.assertIn(field, shaper)
+        self.assertIn("if (!trimmed.startsWith('data:')) return line", shaper)
+        self.assertIn("if (!data || data === '[DONE]') return line", shaper)
+
     def test_only_a_configured_route_starts_the_worker(self) -> None:
         from young_router.core.operations import CoreServiceController
 

@@ -276,6 +276,10 @@ fi
   echo "The bundled TraceOne identity prompt is missing." >&2
   exit 5
 }
+[[ -f "$CORE/young_router/workbuddy_stream.mjs" ]] || {
+  echo "The macOS build output does not contain young_router/workbuddy_stream.mjs." >&2
+  exit 1
+}
 [[ -f "$CORE/young_router/workbuddy-connect/lib/index.js" ]] || {
   echo "The bundled dsh-workbuddy-connect package is missing." >&2
   exit 5

@@ -408,6 +408,69 @@ def infer_upstream_fallback_surface(value: Any) -> str:
     return "openai/chat"
 
 
+# LiteLLM adapter prefixes this app does not manage.  The first segment of a
+# LiteLLM model string selects the adapter, so `azure/gpt-4o` must not be
+# nested into `openai/azure/gpt-4o`: that changes which provider serves the
+# route.  A model path that merely contains a slash (`meta-llama/Llama-3`) is
+# not an adapter and keeps the app's own prefix.
+LITELLM_ADAPTER_PREFIXES = frozenset(
+    {
+        "ai21",
+        "aleph_alpha",
+        "anyscale",
+        "azure",
+        "baichuan",
+        "baseten",
+        "bedrock",
+        "cerebras",
+        "clarifai",
+        "cloudflare",
+        "cohere",
+        "codestral",
+        "dashscope",
+        "databricks",
+        "deepinfra",
+        "deepseek",
+        "fireworks_ai",
+        "gemini",
+        "github",
+        "groq",
+        "huggingface",
+        "hyperbolic",
+        "lambda_ai",
+        "lm_studio",
+        "minimax",
+        "mistral",
+        "moonshot",
+        "nebius",
+        "nlp_cloud",
+        "novita",
+        "nvidia_nim",
+        "ollama",
+        "ollama_chat",
+        "openrouter",
+        "palm",
+        "perplexity",
+        "petals",
+        "predibase",
+        "qwen",
+        "replicate",
+        "sagemaker",
+        "sambanova",
+        "together_ai",
+        "triton",
+        "vertex_ai",
+        "vertex_ai_beta",
+        "vllm",
+        "volcengine",
+        "voyage",
+        "watsonx",
+        "xai",
+        "zhipuai",
+    }
+)
+
+
 def canonical_litellm_model(value: Any, surface: str, adapter: str | None = None) -> str:
     """Store a LiteLLM adapter prefix derived from the selected upstream surface."""
 
@@ -418,6 +481,11 @@ def canonical_litellm_model(value: Any, surface: str, adapter: str | None = None
         existing_prefix, raw_model = model.split("/", 1)
         if existing_prefix in {"openai", "anthropic", "chatgpt"}:
             model = raw_model.strip()
+        elif existing_prefix in LITELLM_ADAPTER_PREFIXES:
+            # An adapter this app does not manage is part of the route's
+            # identity: keep both segments instead of claiming it as a model
+            # namespace under openai/.
+            return model
     if not model:
         return ""
     if adapter is not None and adapter not in {"openai", "anthropic", "chatgpt"}:

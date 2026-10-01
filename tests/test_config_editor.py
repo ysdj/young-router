@@ -954,6 +954,80 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
         self.assertEqual("false", again["balanced-chat"]["ssl_verify"])
         self.assertTrue(again["balanced-chat"]["ssl_verify_present"])
 
+    def test_a_round_trip_keeps_a_routes_own_adapter_base_and_flag(self) -> None:
+        """Three entry fields the app only reads must still be written back.
+
+        A model-level ``api_base`` override was flattened onto the provider's
+        base, an adapter prefix the app does not manage (``azure/``) was nested
+        into ``openai/azure/…`` (changing which adapter serves the route), and
+        the image-generation capability flag was coerced with ``bool()``, so the
+        string ``"false"`` read as enabled and the first save flipped it on.
+        """
+
+        path = self.write_config(
+            """
+            providers:
+              alpha:
+                api_base: "https://alpha.test/v1"
+                api_keys:
+                  - name: default
+                    value: "sk-alpha"
+              beta:
+                api_base: "https://beta.test/v1"
+                api_keys:
+                  - name: default
+                    value: "sk-beta"
+            model_list:
+              - model_name: overridden
+                litellm_params:
+                  model: openai/vendor-a
+                  api_base: "https://override.test/v1"
+                  api_key: "sk-alpha"
+                model_info:
+                  id: "00000001"
+                  provider: alpha
+              - model_name: azure-route
+                litellm_params:
+                  model: azure/gpt-4o
+                  api_base: "https://azure.test"
+                  api_key: "sk-beta"
+                model_info:
+                  id: "00000002"
+                  provider: beta
+              - model_name: namespaced
+                litellm_params:
+                  model: meta-llama/Llama-3-70b
+                  api_base: "https://beta.test/v1"
+                  api_key: "sk-beta"
+                model_info:
+                  id: "00000003"
+                  provider: beta
+                  supports_responses_image_generation_tool: "false"
+            """
+        )
+
+        payload = config_load.load_config(path)
+        models = {model["model_name"]: model for provider in payload["providers"] for model in provider["models"]}
+        self.assertEqual("https://override.test/v1", models["overridden"]["api_base"])
+        self.assertEqual("azure/gpt-4o", models["azure-route"]["litellm_model"])
+        self.assertFalse(models["namespaced"]["supports_responses_image_generation_tool"])
+
+        config_api.save_config(payload["providers"], path)
+        saved = path.read_text(encoding="utf-8")
+        self.assertIn("https://override.test/v1", saved)
+        self.assertIn("model: azure/gpt-4o", saved)
+        self.assertIn("supports_responses_image_generation_tool: false", saved)
+        # A model path that merely contains a slash is not an adapter: it keeps
+        # the app's own prefix.
+        self.assertIn("model: openai/meta-llama/Llama-3-70b", saved)
+
+        # The second round trip is stable.
+        reloaded = config_load.load_config(path)
+        again = {model["model_name"]: model for provider in reloaded["providers"] for model in provider["models"]}
+        self.assertEqual("https://override.test/v1", again["overridden"]["api_base"])
+        self.assertEqual("azure/gpt-4o", again["azure-route"]["litellm_model"])
+        self.assertFalse(again["namespaced"]["supports_responses_image_generation_tool"])
+
     def test_an_unmanaged_model_info_key_still_round_trips(self) -> None:
         """The app manages the context window only; other keys stay untouched."""
         path = self.write_config(

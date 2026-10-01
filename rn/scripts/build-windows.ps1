@@ -111,6 +111,9 @@ set "RUNTIME_ROOT=%~dp0"
   if (-not (Test-Path (Join-Path $Core "young_router\traceone\prompt.txt"))) {
     throw "The bundled TraceOne identity prompt is missing."
   }
+  if (-not (Test-Path (Join-Path $Core "young_router\workbuddy_stream.mjs"))) {
+    throw "The Windows build output does not contain young_router/workbuddy_stream.mjs."
+  }
   if (-not (Test-Path (Join-Path $Core "young_router\workbuddy-connect\lib\index.js"))) {
     throw "The bundled dsh-workbuddy-connect package is missing."
   }

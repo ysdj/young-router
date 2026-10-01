@@ -315,8 +315,9 @@ def _model_to_editor(
     catalog_mode = _string_value(model_info.get(MENU_RELAY_CATALOG_MODE_KEY)).strip() or "independent"
     effective_order = _menu_order(order, "Route order")
 
-    supports_responses_image_tool = bool(
-        model_info.get("supports_responses_image_generation_tool")
+    supports_responses_image_tool = _bool_value(
+        model_info.get("supports_responses_image_generation_tool"),
+        False,
     )
     supports_responses_image_tool_present = (
         "supports_responses_image_generation_tool" in model_info
