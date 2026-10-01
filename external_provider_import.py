@@ -356,17 +356,19 @@ def _lite_llm_model(value: str, surface: str) -> str:
 
 def _key_records(source: dict[str, Any], fallback_name: str = "default") -> list[dict[str, str]]:
     result: list[dict[str, str]] = []
-    seen_values: set[str] = set()
     seen_names: set[str] = set()
 
     def append(name: Any, value: Any) -> None:
         secret = _usable_secret(value)
         key_name = _label(name) or fallback_name
-        if not secret or key_name in seen_names or secret in seen_values:
+        # One name is one key; one *value* is not.  Two labels over the same
+        # upstream credential are two keys, and dropping the later one deletes a
+        # key the imported document carries (and would re-point its routes at the
+        # first label).
+        if not secret or key_name in seen_names:
             return
         result.append({"name": key_name, "value": secret})
         seen_names.add(key_name)
-        seen_values.add(secret)
 
     raw_keys = source.get("api_keys") or source.get("apiKeys") or source.get("api-keys")
     if isinstance(raw_keys, list):
@@ -460,7 +462,11 @@ class _ProviderDraft:
             return ""
         desired_name = _label(name) or "default"
         for key in self.api_keys:
-            if key["value"] == secret:
+            # The same key stated twice (a provider-level credential repeated by
+            # a route) is reused by its own name.  A different name over the same
+            # credential is a second key, never an alias of the first: the route
+            # that named it must keep answering with a key of its own.
+            if key["name"] == desired_name and key["value"] == secret:
                 return key["name"]
         used_names = {key["name"] for key in self.api_keys}
         key_name = desired_name

@@ -99,6 +99,36 @@ def _provider_issue_label(provider: Mapping[str, Any]) -> str:
     return re.sub(r"[^A-Za-z0-9_-]+", "-", label).strip("-") or "provider"
 
 
+def _key_for_model(keys: Sequence[Mapping[str, Any]], model: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """Resolve one model's key against already-normalized slots.
+
+    ``ProvidersModelsDomain._model_provider_key`` normalizes the provider's key
+    list first; a caller that already holds it (validation) uses this, so the
+    same resolution is not run twice.  The order is the same: the slot id the
+    model carries, the name it carries, and the provider's default for a model
+    that names no key at all.
+    """
+
+    key_id = str(model.get("provider_key_id", "")).strip()
+    if key_id:
+        for item in keys:
+            if str(item.get("id", "")).strip() == key_id:
+                return item
+    key_name = str(model.get("api_key_name", "")).strip()
+    if key_name:
+        for item in keys:
+            if str(item.get("name", "")).strip() == key_name:
+                return item
+        return None
+    if key_id:
+        # The route states a slot the provider does not carry: it asks for that
+        # slot, not for the provider's first one, so nothing resolves here until
+        # the user picks a key again.  Only a route that states nothing at all
+        # follows the provider's default.
+        return None
+    return keys[0] if keys else None
+
+
 def _environment_text(value: object) -> str:
     """Resolve a configured value that may be an ``os.environ/`` reference."""
 
@@ -1366,6 +1396,16 @@ class ProvidersModelsDomain:
         provider: Mapping[str, Any],
         model: Mapping[str, Any],
     ) -> tuple[str, str]:
+        # The slot is the key this route answers with.  A name decides only when
+        # the route states no slot, so a route bound by id is probed with its own
+        # key's credential (and a stale name cannot make the probe measure
+        # another key's material).
+        key_id = str(model.get("provider_key_id", "")).strip()
+        if key_id:
+            for item in cls._provider_api_keys(provider):
+                if str(item.get("id", "")).strip() == key_id:
+                    return cls._provider_credential(provider, item["name"])
+            raise DomainError("The selected provider key is unavailable")
         key_name = str(model.get("api_key_name", "")).strip()
         if key_name:
             return cls._provider_credential(provider, key_name)
@@ -2537,6 +2577,12 @@ class ProvidersModelsDomain:
             for item in keys:
                 if item["name"] == key_name:
                     return item
+            return None
+        if provider_key_id:
+            # A slot the provider no longer carries is not the provider's first
+            # key: resolving it here would rewrite the route's binding onto a
+            # credential its user never chose (and persist that rewrite on the
+            # next save).  It stays unresolved, and the pane marks the row.
             return None
         return keys[0] if keys else None
 
@@ -3872,9 +3918,38 @@ class ProvidersModelsDomain:
                 raise DomainError("Relay import source is invalid")
             relay_source = self._relay_source_filter(raw_source)
             provider_name = str(raw_source.get("provider_name", "")).strip()
-            if not provider_name:
-                provider_name = f"relay-{relay_source['station_id']}"
-            if (
+            # A station is served by the provider bound to it: the wizard names
+            # that provider after the station, while a coordinator's descriptor
+            # carries the neutral `relay-<station_id>` placeholder.  Importing
+            # with the placeholder must join the station's own provider instead
+            # of minting a second one that splits the station's keys and its
+            # routes across two rows.
+            station_id = relay_source["station_id"]
+            station_provider = next(
+                (
+                    str(provider.get("name", "")).strip()
+                    for provider in providers
+                    if isinstance(provider, Mapping)
+                    and str(provider.get("relay_station_id", "")).strip() == station_id
+                ),
+                "",
+            )
+            named_provider_exists = any(
+                isinstance(provider, Mapping)
+                and str(provider.get("name", "")).strip() == provider_name
+                for provider in providers
+            )
+            joins_station_provider = False
+            if station_provider and (not provider_name or not named_provider_exists):
+                provider_name = station_provider
+                joins_station_provider = True
+            elif not provider_name:
+                provider_name = f"relay-{station_id}"
+            # The slug rule guards a name this import would create.  The name of
+            # the provider already bound to the station is the document's own
+            # (station labels carry spaces and non-ASCII), so it is never
+            # re-validated here.
+            if not joins_station_provider and (
                 not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,159}", provider_name)
                 or any(char in provider_name for char in "\x00\r\n")
             ):
@@ -5162,13 +5237,19 @@ class ProvidersModelsDomain:
 
         public_model = str(data.get("public_model", "")).strip()
         route_ids = data.get("route_ids")
+        # A move either keeps the numbers the user typed (they travel with the
+        # routes) or replaces the group with 0..n-1.  The pane asks before it
+        # rewrites a group that carries decimals, because the typed values are
+        # rate multipliers on a station-backed group and integers are simply the
+        # first, second, third route (the first being 0).
+        renumber = bool(data.get("renumber"))
         if not public_model or not isinstance(route_ids, list) or not route_ids:
             raise DomainError("The route order is invalid")
         requested = [str(value).strip() for value in route_ids]
         if any(not value for value in requested) or len(set(requested)) != len(requested):
             raise DomainError("The route order is invalid")
         matched: dict[str, tuple[int, int]] = {}
-        order_values: dict[str, int | float] = {}
+        orders: list[int | float] = []
         for provider_index, provider in enumerate(self._draft["providers"]):
             if not isinstance(provider, Mapping):
                 continue
@@ -5179,27 +5260,51 @@ class ProvidersModelsDomain:
                 if not isinstance(model, Mapping):
                     continue
                 model_name = str(model.get("model_name", "")).strip()
-                route_id = str(model.get("deployment_id", "")).strip() or self._editor_id(model, model=True)
-                if model_name != public_model or not route_id:
+                # A route answers to both identities the pane can hold: the
+                # deployment id the file persists and the editor id the snapshot
+                # carries (the routes table sends the editor id).  One route is
+                # one row either way, so both names map to the same position.
+                identities = [
+                    value
+                    for value in (
+                        str(model.get("deployment_id", "")).strip(),
+                        self._editor_id(model, model=True),
+                    )
+                    if value
+                ]
+                if model_name != public_model or not identities:
                     continue
                 if str(model.get("order_mode", "manual")).strip() == "relay_multiplier":
                     raise DomainError(
                         "Routes that follow a relay multiplier cannot be manually reordered"
                     )
-                matched[route_id] = (provider_index, model_index)
-                order_values[route_id] = self._order_value(
-                    model.get("manual_order", model.get("order", 0)),
-                    label="Manual route order",
+                for route_id in identities:
+                    matched[route_id] = (provider_index, model_index)
+                orders.append(
+                    self._order_value(
+                        model.get("manual_order", model.get("order", 0)),
+                        label="Manual route order",
+                    )
                 )
-        if set(matched) != set(requested):
+        # The request must name this group's routes exactly once each: a row the
+        # pane added, removed, or renamed since its snapshot is a stale order.
+        if len(requested) != len(orders) or any(
+            route_id not in matched for route_id in requested
+        ):
             raise DomainError("The route order changed; refresh and try again")
         changed_providers: dict[int, dict[str, Any]] = {}
         # The order values travel with the routes: a reorder permutes the
         # numbers the user typed (decimals included) instead of renumbering
-        # the group, so a move never rewrites a value it did not touch.
-        existing_orders = sorted(order_values.values())
-        for order, deployment_id in zip(existing_orders, requested):
-            provider_index, model_index = matched[deployment_id]
+        # the group, so a move never rewrites a value it did not touch.  That is
+        # the default; ``renumber`` is the user's answer to the pane's question
+        # and replaces the whole group with 0..n-1 in the requested order — the
+        # app's automatic order starts at 0, so the first route of a renumbered
+        # group sits in the same slot as a freshly created one.
+        existing_orders = (
+            list(range(len(requested))) if renumber else sorted(orders)
+        )
+        for order, route_id in zip(existing_orders, requested):
+            provider_index, model_index = matched[route_id]
             provider = changed_providers.get(provider_index)
             if provider is None:
                 provider = self._copy_provider_for_edit(self._draft["providers"][provider_index])
@@ -5229,6 +5334,64 @@ class ProvidersModelsDomain:
         if limit is None:
             raise DomainError(f"{label} must be a positive integer")
         return limit
+
+    def _delete_public_model(self, data: Mapping[str, Any]) -> None:
+        """Remove every route serving one public model, as one staged action.
+
+        A public model is a group of routes, so deleting the name means deleting
+        the routes that serve it wherever they live — across providers, and
+        including the parked ones in the companion file.  One action keeps that
+        atomic: the pane applies once, and a name that no longer has any route
+        stops being served (the dumper drops it from ``public_model_groups``).
+        Remote station keys are never touched here: the app removes what it owns.
+        """
+
+        public_model = str(data.get("public_model", data.get("name", ""))).strip()
+        if not public_model:
+            raise DomainError("The selected public model is unavailable")
+        providers = self._draft.get("providers")
+        if not isinstance(providers, list):
+            raise DomainError("Provider/model configuration is invalid")
+        deleted = 0
+        for provider_index, provider in enumerate(providers):
+            if not isinstance(provider, Mapping):
+                continue
+            models = provider.get("models")
+            if not isinstance(models, list):
+                continue
+            if not any(
+                isinstance(model, Mapping)
+                and str(model.get("model_name", "")).strip() == public_model
+                for model in models
+            ):
+                continue
+            provider_copy = self._copy_provider_for_edit(provider)
+            copied_models = provider_copy.get("models")
+            if not isinstance(copied_models, list):
+                continue
+            kept: list[Any] = []
+            provider_name = str(provider_copy.get("name", "")).strip()
+            for model in copied_models:
+                if isinstance(model, Mapping) and str(
+                    model.get("model_name", "")
+                ).strip() == public_model:
+                    # A result measured on a route that no longer exists is not
+                    # evidence for anything, so its probe result goes with it.
+                    self._probe_overlay.get(provider_name, {}).pop(
+                        self._probe_model_key(model), None
+                    )
+                    deleted += 1
+                    continue
+                kept.append(model)
+            provider_copy["models"] = kept
+            providers[provider_index] = provider_copy
+        if deleted == 0:
+            raise DomainError("The selected public model is unavailable")
+        self._last_operation = {
+            "operation": "public_model_delete",
+            "public_model": public_model,
+            "deleted_models": deleted,
+        }
 
     def _patch_public_model(self, data: Mapping[str, Any]) -> None:
         """Rename one public model or set the limits every route shares.
@@ -5368,6 +5531,8 @@ class ProvidersModelsDomain:
             self._reorder_route_group(data)
         elif name in {"public_model_patch", "public_models_patch"}:
             self._patch_public_model(data)
+        elif name in {"public_model_delete", "public_models_delete", "delete_public_model"}:
+            self._delete_public_model(data)
         elif name in {"workbuddy_status", "workbuddy_models", "workbuddy_login"}:
             self._workbuddy_operation(name, data)
         elif name in {"provider_auth_start", "provider_auth_cancel", "provider_auth_logout", "provider_auth_status"}:
@@ -5582,7 +5747,7 @@ class ProvidersModelsDomain:
                         # local candidate only; materialization remains the
                         # strict gate that writes the real effective order.
                         model["effective_order"] = self._order_value(
-                            model.get("manual_order", 1),
+                            model.get("manual_order", 0),
                             label="Manual route order",
                         )
                         model["order"] = model["effective_order"]
@@ -5613,8 +5778,7 @@ class ProvidersModelsDomain:
             return {"valid": False, "errors": ["Provider/model configuration is invalid"]}
         return {"valid": True, "errors": []}
 
-    @staticmethod
-    def _entry_issues(providers: object) -> list[dict[str, Any]]:
+    def _entry_issues(self, providers: object) -> list[dict[str, Any]]:
         """Report every staged model that cannot produce a route entry.
 
         The config dumper reports the first unusable entry by its position inside
@@ -5623,6 +5787,7 @@ class ProvidersModelsDomain:
         its provider label and position so the shared pane can point at the row
         instead of only reporting that the draft is invalid.
         """
+
         issues: list[dict[str, Any]] = []
         if not isinstance(providers, list):
             return issues
@@ -5633,6 +5798,10 @@ class ProvidersModelsDomain:
             if not isinstance(models, list):
                 continue
             provider_enabled = bool(provider.get("enabled", True))
+            try:
+                provider_keys = self._provider_api_keys(provider)
+            except DomainError:
+                provider_keys = []
             for index, model in enumerate(models):
                 if not isinstance(model, Mapping):
                     continue
@@ -5662,6 +5831,23 @@ class ProvidersModelsDomain:
                             "path": location,
                             "code": "model_upstream_required",
                             "message": "Model needs an upstream model",
+                            "severity": "error",
+                        }
+                    )
+                elif (
+                    str(model.get("provider_key_id", "")).strip()
+                    or str(model.get("api_key_name", "")).strip()
+                ) and _key_for_model(provider_keys, model) is None:
+                    # The route names a key this provider does not carry (a key
+                    # deleted in another window, a slot a stale fetch named).
+                    # The write refuses it rather than answering with another
+                    # slot's credential, so the row states which key is missing
+                    # instead of the pane failing as a whole.
+                    issues.append(
+                        {
+                            "path": location,
+                            "code": "model_provider_key_missing",
+                            "message": "The selected provider key is unavailable",
                             "severity": "error",
                         }
                     )

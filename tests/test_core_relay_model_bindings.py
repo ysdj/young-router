@@ -424,6 +424,237 @@ class RelayModelBindingTests(unittest.TestCase):
             self.assertEqual([], rematerialized["issues"])
             self.assertNotIn("replace-rematerialized-credential", json.dumps(rematerialized))
 
+    def test_a_route_that_names_no_key_is_not_adopted_by_the_linked_key(self) -> None:
+        """The pane's “no key” choice survives Apply and the relay keeps its own routes.
+
+        An unbound route answers with the provider's default credential, which on
+        a relay-managed provider is the first slot: materialization must not take
+        that coincidence as ownership, and the file must not record the route as
+        bound to a key its user never picked.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            domain = ProvidersModelsDomain(path)
+            source = relay_source(models=["upstream-chat", "other-chat"])
+            domain.stage_relay_import([source])
+            provider = domain.snapshot()["providers"][0]
+            relay_key = next(key for key in provider["key_states"] if key["source"]["kind"] == "relay")
+            domain.dispatch(
+                "model.add",
+                {
+                    "provider_id": provider["id"],
+                    "model": {
+                        "name": "unbound-chat",
+                        "upstream_model": "other-chat",
+                        "enabled": True,
+                        "api_key_name": "",
+                        "provider_key_id": "",
+                    },
+                },
+            )
+
+            materialized = domain.materialize_relay_bindings(
+                {"resources": [{**source, "api_key": "replace-materialized-credential"}]}
+            )
+
+            self.assertEqual([], materialized["issues"])
+            models = {
+                model["model_name"]: model for model in domain.snapshot()["providers"][0]["models"]
+            }
+            unbound = models["unbound-chat"]
+            self.assertEqual("", unbound["api_key_name"])
+            self.assertEqual("", unbound["provider_key_id"])
+            self.assertEqual("independent", unbound["catalog_mode"])
+            self.assertEqual("", unbound["source_model_id"])
+            self.assertNotIn("replace-materialized-credential", json.dumps(domain.snapshot()))
+
+            domain.apply()
+            saved = path.read_text(encoding="utf-8")
+            self.assertIn("x-young-router-key-binding: unbound", saved)
+            # The unbound route's own label carries no key, while the catalog
+            # routes the linked import created keep theirs.
+            self.assertIn(
+                "model=unbound-chat / provider=relay-station-a / "
+                "upstream=openai/other-chat / host=relay.example.test / order=0",
+                saved,
+            )
+
+            reloaded = {
+                model["model_name"]: model
+                for model in ProvidersModelsDomain(path).snapshot()["providers"][0]["models"]
+            }
+            self.assertEqual("", reloaded["unbound-chat"]["api_key_name"])
+            self.assertEqual("", reloaded["unbound-chat"]["provider_key_id"])
+            self.assertEqual(relay_key["id"], next(
+                model["provider_key_id"]
+                for name, model in reloaded.items()
+                if name != "unbound-chat"
+            ))
+
+    def test_a_slot_the_provider_no_longer_carries_never_becomes_the_first_key(self) -> None:
+        """A dangling slot id is the route's own claim, not a request for key #1.
+
+        Reading a document used to resolve a slot id the provider does not carry
+        onto the provider's first key and persist that rewrite, so merely opening
+        the app could move a hand-edited route onto another credential.  The row
+        stays unresolved instead, and validation names it.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(
+                """
+providers:
+  compat:
+    api_base: "https://example.test/v1"
+    api_keys:
+      - name: first
+        value: "replace-first-secret"
+      - name: second
+        value: "replace-second-secret"
+model_list:
+  - model_name: dangling-chat
+    litellm_params:
+      model: openai/dangling-chat
+      api_base: "https://example.test/v1"
+      api_key: "replace-second-secret"
+      order: 1
+    model_info:
+      id: "00000001"
+      provider: compat
+      x-young-router-provider-key-id: provider-slot-00000000000000000000000000000000
+      upstream_url_surface: openai/responses
+      upstream_protocol_mode: fallback
+""",
+                encoding="utf-8",
+            )
+
+            domain = ProvidersModelsDomain(path)
+            model = domain.snapshot()["providers"][0]["models"][0]
+            self.assertEqual(
+                "provider-slot-00000000000000000000000000000000", model["provider_key_id"]
+            )
+            self.assertEqual("", model["api_key_name"])
+            self.assertEqual("independent", model["catalog_mode"])
+            self.assertEqual("", model["source_model_id"])
+            # The row is reported, not repaired: applying would otherwise write a
+            # route whose credential nothing can resolve.
+            self.assertFalse(domain.validate()["valid"])
+            with self.assertRaises(DomainError):
+                domain.apply()
+
+            # Choosing a key again is the way out, and it stays that key.
+            domain.dispatch(
+                "model.patch",
+                {
+                    "provider_id": domain.snapshot()["providers"][0]["id"],
+                    "model_id": model["id"],
+                    "changes": {"api_key_name": "second"},
+                },
+            )
+            rebound = domain.snapshot()["providers"][0]["models"][0]
+            self.assertEqual("second", rebound["api_key_name"])
+            self.assertTrue(domain.validate()["valid"])
+            domain.apply()
+            saved = ProvidersModelsDomain(path).snapshot()["providers"][0]["models"][0]
+            self.assertEqual("second", saved["api_key_name"])
+            self.assertEqual("independent", saved["catalog_mode"])
+
+    def test_a_route_is_probed_with_the_slot_it_names(self) -> None:
+        """A probe measures the credential of the key the route answers with.
+
+        Resolving the probe by the key *name* meant a route bound by slot id (or
+        one whose name had gone stale) was measured against another key's
+        credential, and the stored result then described a route it never tested.
+        """
+
+        provider = {
+            "name": "compat",
+            "api_base": "https://example.test/v1",
+            "api_key": "replace-alice",
+            "api_keys": [
+                {"id": "slot-a", "name": "alice", "value": "replace-alice", "source": {"kind": "independent"}},
+                {"id": "slot-b", "name": "bob", "value": "replace-bob", "source": {"kind": "independent"}},
+            ],
+        }
+        self.assertEqual(
+            ("bob", "replace-bob"),
+            ProvidersModelsDomain._model_credential(
+                provider, {"api_key_name": "alice", "provider_key_id": "slot-b"}
+            ),
+        )
+        self.assertEqual(
+            ("alice", "replace-alice"),
+            ProvidersModelsDomain._model_credential(provider, {"api_key_name": "alice"}),
+        )
+        self.assertEqual(
+            ("bob", "replace-bob"),
+            ProvidersModelsDomain._model_credential(
+                provider, {"api_key_name": "", "provider_key_id": "slot-b"}
+            ),
+        )
+        # A route that states a slot the provider does not carry has nothing to
+        # probe: it is not measured against the provider's default key.
+        with self.assertRaises(DomainError):
+            ProvidersModelsDomain._model_credential(
+                provider,
+                {"provider_key_id": "provider-slot-00000000000000000000000000000000"},
+            )
+
+    def test_a_linked_import_joins_the_provider_the_station_is_bound_to(self) -> None:
+        """One station is one provider, whatever name a descriptor carries.
+
+        The wizard names a station's provider after the station, while the relay
+        coordinator's descriptors carry the neutral `relay-<station_id>`
+        placeholder.  Importing with that placeholder must find the binding
+        instead of creating a second provider that splits the station's keys and
+        routes across two rows.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            domain = ProvidersModelsDomain(Path(directory) / "config.yaml")
+            station_id = "station-a"
+            domain.dispatch(
+                "provider.add",
+                {
+                    "provider": {
+                        "name": "My Relay",
+                        "enabled": True,
+                        "api_base": "https://relay.example.test/v1",
+                        "models": [],
+                    }
+                },
+            )
+            domain.dispatch(
+                "provider.select_relay_station",
+                {
+                    "provider_id": "My Relay",
+                    "source": {
+                        "station_id": station_id,
+                        "name": "My Relay",
+                        "api_base": "https://relay.example.test/v1",
+                    },
+                },
+            )
+
+            domain.stage_relay_import(
+                [
+                    {
+                        **relay_source(station_id=station_id),
+                        "provider_name": f"relay-{station_id}",
+                    }
+                ]
+            )
+
+            providers = domain.snapshot()["providers"]
+            self.assertEqual(["My Relay"], [provider["name"] for provider in providers])
+            provider = providers[0]
+            self.assertEqual(
+                station_id, str(provider.get("relay_station_id", "")).strip()
+            )
+            self.assertEqual(["Relay Key"], [key["name"] for key in provider["key_states"]])
+
     def test_a_key_the_relay_could_not_resolve_is_projected_onto_its_routes(self) -> None:
         """A refused binding names the row it belongs to, not only the outcome.
 

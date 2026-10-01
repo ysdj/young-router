@@ -672,9 +672,16 @@ function modelProviderKeyState(model: UnknownRecord | undefined, provider: Unkno
   // key name the model carries.  A stored id can move (Core re-derives a
   // renamed key's slot when it reads the document back), and matching by id
   // alone left the list under "undefined key" while the editor showed the key.
+  // A name is the weaker identity and only resolves while it is unambiguous: a
+  // station key and a custom key that happen to share a name are two keys, and
+  // one of them is never read as the other.
   const keyStates = providerKeyStates(provider);
-  return keyStates.find((entry) => entry.id === stringValue(model.provider_key_id))
-    ?? keyStates.find((entry) => entry.name === stringValue(model.api_key_name));
+  const keyID = stringValue(model.provider_key_id);
+  const keyName = stringValue(model.api_key_name);
+  const byID = keyStates.find((entry) => entry.id === keyID);
+  if (byID) return byID;
+  const byName = keyStates.filter((entry) => entry.name === keyName && keyName !== "");
+  return byName.length === 1 ? byName[0] : undefined;
 }
 
 function relaySourceName(source: RelaySourceOption | undefined): string {
@@ -3882,6 +3889,11 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     }
   }, [busy, dispatch, providers, relayStations]);
   const pendingModelIds = useRef<{ providerId: string; ids: Set<string> } | undefined>(undefined);
+  // A route ＋ created is selected once the routes list carries it.  The key is
+  // not known until the snapshot arrives a render later, and setting a key the
+  // table does not know would be repaired to the first route — the pane would
+  // then edit the wrong row.
+  const pendingRouteKey = useRef<string | undefined>(undefined);
   // The list owns the selection: an explicitly cleared one (a click below the
   // rows) leaves the panes empty instead of acting on a provider the list no
   // longer highlights, while the first provider still opens the pane on load.
@@ -3919,6 +3931,11 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   // A result is kept with the inputs it was measured on: a route the user has
   // since edited never shows a verdict about the route it replaced.
   const [probeResults, setProbeResults] = useState<Record<string, { inputs: string; result: IpcResults["probe"] }>>({});
+  // The routes whose finding was taken off screen and has not been answered
+  // again.  A press asks the route a new question, and a route the user edits
+  // is no longer the route the finding describes; either way the pane shows
+  // nothing until this pane measures the route it now has.
+  const [droppedProbeResults, setDroppedProbeResults] = useState<Record<string, true>>({});
   const shownChallenge = useRef<Record<string, string>>({});
   const fetchKeyChoices = useMemo(
     () => provider && providerKindSelected !== "openai" && providerKindSelected !== "claude" ? providerKeyChoices(provider, relaySources, providerBaseURL(provider)) : [],
@@ -3945,29 +3962,46 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     const key = modelProbeKey(targetProviderId, targetModelId);
     if (probingModelKeys.current.has(key)) return;
     probingModelKeys.current.add(key);
+    // Asking again takes the previous finding away: it answered the question
+    // this press replaced.  Both copies go — the one this pane measured and
+    // the one Core kept for the route.
+    setProbeResults((current) => withoutRecordEntry(current, key));
+    setDroppedProbeResults((current) => ({ ...current, [key]: true }));
     setProbeActivityRevision((value) => value + 1);
+    let result: IpcResults["probe"];
     try {
-      const result = await ipc.probe(targetProviderId, targetModelId, "providers_models");
-      setProbeResults((current) => ({ ...current, [key]: { inputs, result } }));
+      result = await ipc.probe(targetProviderId, targetModelId, "providers_models");
+    } catch (reason: unknown) {
+      result = { ok: false, protocols: [], detail: errorMessage(reason, translate), provider_id: targetProviderId, model_id: targetModelId };
+    }
+    // The probe is over the moment its answer is in hand: the button reports
+    // this question's progress, so it stands down here instead of staying
+    // disabled through the write the answer goes on to ask for.
+    probingModelKeys.current.delete(key);
+    setProbeActivityRevision((value) => value + 1);
+    setProbeResults((current) => ({ ...current, [key]: { inputs, result } }));
+    setDroppedProbeResults((current) => withoutRecordEntry(current, key));
+    try {
       onSnapshot(await ipc.snapshot());
       const nextSurface = stringValue(result.recommended_surface);
       if (result.ok && isProbeSurface(nextSurface)) await applyProbedSurface(targetProviderId, targetModelId, nextSurface, options);
     } catch (reason: unknown) {
-      setProbeResults((current) => ({
-        ...current,
-        [key]: { inputs, result: { ok: false, protocols: [], detail: errorMessage(reason, translate), provider_id: targetProviderId, model_id: targetModelId } },
-      }));
-    } finally {
-      probingModelKeys.current.delete(key);
-      setProbeActivityRevision((value) => value + 1);
+      onStatus(errorMessage(reason, translate));
     }
   }
-  const modelProbeProps = (targetProviderId: string, targetModelId: string, inputs: string): { probing: boolean; probeResult?: IpcResults["probe"]; probe: () => void } => {
+  const modelProbeProps = (targetProviderId: string, targetModelId: string, inputs: string): { probing: boolean; probeResult?: IpcResults["probe"] | null; probe: () => void } => {
     const key = modelProbeKey(targetProviderId, targetModelId);
     const record = probeResults[key];
+    // The pane's own copy decides what it shows.  No copy leaves the finding
+    // Core kept for the route on screen; a copy measured on other inputs, or
+    // one a press took down, leaves nothing — the route moved on, and Core's
+    // copy describes the route it left behind.
+    const measuredHere = record !== undefined && record.inputs === inputs;
     return {
       probing: probingModelKeys.current.has(key),
-      probeResult: record !== undefined && record.inputs === inputs ? record.result : undefined,
+      probeResult: droppedProbeResults[key] === true || (record !== undefined && !measuredHere)
+        ? null
+        : measuredHere ? record.result : undefined,
       probe: () => probeModel(targetProviderId, targetModelId, inputs),
     };
   };
@@ -4050,13 +4084,18 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       onStatus(translate("providers.fetchFailed", { detail: translate("common.notAvailable") }));
       return;
     }
+    // A relay fetch stages the key slot it listed the models for, and the
+    // answer names it by id.  The rows are filed on that slot, not on its
+    // label: a key is its own slot, and the name a fetch happened to carry is
+    // the weaker identity ("one key is one slot, never one name").
+    const apiKeyID = stringValue(summary.slot_id);
     const keyName = fetchKeyOptions.find((option) => option.value === selectedFetchKey)?.label ?? apiKeyDisplayName(apiKeyName, translate);
     void native.chooseModelsToAdd({ models: candidates, providerName, keyName }).then((selection) => {
       const selectedModels = (selection ?? []).filter((model, index, all) => candidateSet.has(model) && all.indexOf(model) === index);
       if (selectedModels.length === 0) return;
       void dispatch("model.add_many", {
         provider_id: providerId,
-        models: selectedModels.map((upstreamModel) => ({ name: upstreamModel, upstream_model: upstreamModel, api_key_name: apiKeyName, enabled: true, order: 0 })).map((model) => ({
+        models: selectedModels.map((upstreamModel) => ({ name: upstreamModel, upstream_model: upstreamModel, api_key_name: apiKeyName, ...(apiKeyID ? { provider_key_id: apiKeyID } : {}), enabled: true, order: 0 })).map((model) => ({
           ...model,
           ...modelRecordCapabilityChanges(modelCapabilities[model.upstream_model]),
         })),
@@ -4112,11 +4151,16 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     // never served to a client; the user finishes the row and enables it.
     const base = translate("providers.newModel");
     const name = uniquePlaceholderName(models.map((item) => stringValue(item.model_name ?? item.name)), base);
-    // The row inherits the key the user is looking at — the selected model's
-    // key, else the provider's first key — so ＋ files it in a real key group
-    // instead of one the app invents.  A provider with no key yet gets the
-    // keyless draft row, and its inspector asks for the key.
-    const inheritedKey = modelProviderKeyState(model, provider) ?? providerKeyStates(provider)[0];
+    // The row inherits the key the user is working in — the selected model's
+    // key, else the key the pane's own key picker points at, else the
+    // provider's first key — so ＋ files it in a real key group instead of one
+    // the app invents.  The picker is how a key that owns no model yet is
+    // addressed, so ＋ beside a key the user just chose in it must land on that
+    // key rather than on whichever key happens to be first.  A provider with no
+    // key yet gets the keyless draft row, and its inspector asks for the key.
+    const inheritedKey = modelProviderKeyState(model, provider)
+      ?? providerKeyStates(provider).find((key) => key.id === selectedFetchKey)
+      ?? providerKeyStates(provider)[0];
     void dispatch("model.add", { provider_id: providerId, model: { name, upstream_model: name, enabled: false, order: 0, ...(inheritedKey ? { api_key_name: inheritedKey.name, provider_key_id: inheritedKey.id } : {}) } });
   };
   const addProvider = (): void => {
@@ -4254,13 +4298,101 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     if (viewMode !== "routes" || routes.length === 0 || selectedRoute === "" || routes.some((entry) => entry.key === selectedRoute)) return;
     setSelectedRoute(routes[0].key);
   }, [routes, selectedRoute, viewMode]);
+  useEffect(() => {
+    const pending = pendingRouteKey.current;
+    if (!pending || !routes.some((entry) => entry.key === pending)) return;
+    pendingRouteKey.current = undefined;
+    setSelectedPublicModel(undefined);
+    setSelectedRoute(pending);
+  }, [routes]);
+  // The group's own numbers, in list order: a route that follows a relay
+  // multiplier has no typed number of its own, so it never reaches here.
+  const routeOrderValues = activeRouteGroup.map((entry) => modelOrderValue(editorIdentifier(entry.provider), entry.model));
   const moveRoute = (direction: "up" | "down"): void => {
     if (!activeRoute || activeRouteIndex < 0 || modelOrderMode(activeRoute.model) === "relay_multiplier") return;
     const targetIndex = direction === "up" ? activeRouteIndex - 1 : activeRouteIndex + 1;
     if (targetIndex < 0 || targetIndex >= activeRouteGroup.length) return;
     const reordered = [...activeRouteGroup];
     [reordered[activeRouteIndex], reordered[targetIndex]] = [reordered[targetIndex], reordered[activeRouteIndex]];
-    void dispatch("routes.reorder_group", { public_model: activeRoute.publicModel, route_ids: reordered.map((entry) => entry.deploymentID) });
+    const reorder = (renumber: boolean): Promise<unknown> => dispatch("routes.reorder_group", { public_model: activeRoute.publicModel, route_ids: reordered.map((entry) => entry.deploymentID), ...(renumber ? { renumber: true } : {}) });
+    // A move keeps the numbers the group already carries — they travel with the
+    // routes — so a group holding decimals is asked once whether it should
+    // become 1..n instead of being renumbered behind the user's back.  Integers
+    // are already the plain order, so they move without a question.
+    const decimals = routeOrderValues.filter((value) => !Number.isInteger(value));
+    if (decimals.length === 0) {
+      void reorder(false);
+      return;
+    }
+    void native.showConfirmation({
+      title: translate("providers.reorderIntegerTitle"),
+      message: translate("providers.reorderIntegerMessage", { orders: decimals.join("、") }),
+      confirmLabel: translate("providers.reorderIntegerConfirm"),
+    }).then((renumber) => reorder(renumber));
+  };
+  // ＋ adds a route to the group the user is looking at: a draft on the
+  // selected route's provider (else the first one) carrying the group's public
+  // name, so the row appears in this group and the inspector asks for the
+  // upstream model and the key.  A disabled draft never reaches the runtime.
+  const addRoute = (): void => {
+    const publicModel = (selectedPublicModel ?? activeRoute?.publicModel ?? "").trim();
+    const targetProvider = activeRoute?.provider ?? providers[0];
+    if (!targetProvider) return;
+    const targetProviderID = editorIdentifier(targetProvider);
+    const targetModels = asRecords(targetProvider.models).map(modelRecord);
+    const knownModelIds = new Set(targetModels.map(editorIdentifier));
+    pendingModelIds.current = { providerId: targetProviderID, ids: knownModelIds };
+    const name = publicModel || uniquePlaceholderName(targetModels.map((item) => stringValue(item.model_name ?? item.name)), translate("providers.newModel"));
+    // The row inherits the key the user is working in, the way the models pane
+    // does, so ＋ files it in a real key group instead of an invented one.
+    const inheritedKey = (activeRoute && editorIdentifier(activeRoute.provider) === targetProviderID ? modelProviderKeyState(activeRoute.model, targetProvider) : undefined)
+      ?? providerKeyStates(targetProvider).find((key) => key.id === selectedFetchKey)
+      ?? providerKeyStates(targetProvider)[0];
+    void dispatchWithOutcome("model.add", {
+      provider_id: targetProviderID,
+      model: {
+        name,
+        upstream_model: publicModel || "",
+        enabled: false,
+        order: 0,
+        ...(inheritedKey ? { api_key_name: inheritedKey.name, provider_key_id: inheritedKey.id } : {}),
+      },
+    }).then((next) => {
+      if (!next || !publicModel) return;
+      const nextProviders = asRecords(domainState(next, "providers_models").providers).length > 0
+        ? asRecords(domainState(next, "providers_models").providers)
+        : asRecords(next.providers_models?.providers);
+      const nextProvider = nextProviders.find((entry) => editorIdentifier(entry) === targetProviderID);
+      const added = nextProvider ? asRecords(nextProvider.models).map(modelRecord).find((entry) => !knownModelIds.has(editorIdentifier(entry)) && stringValue(entry.model_name ?? entry.name).trim() === name) : undefined;
+      pendingModelIds.current = undefined;
+      if (added) pendingRouteKey.current = `${targetProviderID}:${stringValue(added.editor_id, stringValue(added.deployment_id, identifier(added))).trim()}`;
+    });
+  };
+  // − deletes what the user selected: one route, or — with a public model's own
+  // row selected — every route that serves that name.  The group case is one
+  // Core action, so the group is removed in one apply instead of route by
+  // route, and the confirmation states the count it is about to remove.
+  const confirmDeleteRoute = (): void => {
+    const selectedGroup = selectedPublicModel !== undefined ? routeGroups.find((group) => group.name === selectedPublicModel) : undefined;
+    if (selectedGroup) {
+      void native.showConfirmation({
+        title: translate("providers.deletePublicModel", { model: selectedGroup.name }),
+        message: translate("providers.deletePublicModelMessage", { routes: selectedGroup.entries.length }),
+        confirmLabel: translate("common.delete"),
+        destructive: true,
+      }).then((confirmed) => confirmed ? dispatch("public.model_delete", { public_model: selectedGroup.name }).then(() => { setSelectedPublicModel(undefined); setSelectedRoute(""); }) : undefined);
+      return;
+    }
+    if (!activeRoute) return;
+    const routeProviderID = editorIdentifier(activeRoute.provider);
+    const routeModelID = editorIdentifier(activeRoute.model);
+    const upstream = modelUpstreamDisplay(routeProviderID, activeRoute.model) || activeRoute.publicModel;
+    void native.showConfirmation({
+      title: translate("providers.deleteRoute"),
+      message: translate("providers.deleteRouteMessage", { provider: providerDisplayName(activeRoute.provider), upstream, model: activeRoute.publicModel }),
+      confirmLabel: translate("common.delete"),
+      destructive: true,
+    }).then((confirmed) => confirmed ? dispatch("model.delete", { provider_id: routeProviderID, model_id: routeModelID }).then(() => setSelectedRoute("")) : undefined);
   };
   const confirmDeleteProvider = (): void => {
     if (!provider) return;
@@ -4332,25 +4464,31 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     // to no key yet — the draft ＋ just created on a provider that has none —
     // is listed first *without* a group row: filing it under an invented
     // 未定义密钥 group would present a group the app made up as its route.
+    // One group is one provider key, addressed by its own slot id: a station
+    // key and a custom key that read the same are two keys with two groups,
+    // and a model is filed under the key it names, never under a namesake.
     const rows: Array<{ key: string; cells: string[]; spanning?: boolean }> = [];
     const ungrouped: UnknownRecord[] = [];
-    const grouped = new Map<string, UnknownRecord[]>();
+    const grouped = new Map<string, { label: string; models: UnknownRecord[] }>();
     for (const item of models) {
-      if (!modelProviderKeyState(item, provider ?? {})) {
+      const key = modelProviderKeyState(item, provider ?? {});
+      if (!key) {
         ungrouped.push(item);
         continue;
       }
-      const keyName = modelProviderKeyLabel(item, provider ?? {}, translate, undefined, relaySources);
-      const list = grouped.get(keyName);
-      if (list) list.push(item);
-      else grouped.set(keyName, [item]);
+      const list = grouped.get(key.id);
+      if (list) {
+        list.models.push(item);
+        continue;
+      }
+      grouped.set(key.id, { label: modelProviderKeyLabel(item, provider ?? {}, translate, undefined, relaySources), models: [item] });
     }
     for (const item of ungrouped) {
       rows.push({ key: editorIdentifier(item), cells: [`\t${modelUpstreamDisplay(providerId, item)}`, modelDisplayName(providerId, item), modelOrderText(providerId, item)] });
     }
-    for (const [keyName, list] of grouped) {
-      rows.push({ key: `key:${keyName}`, cells: [keyName], spanning: true });
-      for (const item of list) {
+    for (const [keyID, group] of grouped) {
+      rows.push({ key: `key:${keyID}`, cells: [group.label], spanning: true });
+      for (const item of group.models) {
         rows.push({ key: editorIdentifier(item), cells: [`\t${modelUpstreamDisplay(providerId, item)}`, modelDisplayName(providerId, item), modelOrderText(providerId, item)] });
       }
     }
@@ -4518,7 +4656,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
         <ActionButton title={translate("providers.addWizard")} disabled={busy} style={styles.providerWizardToolbarButton} onPress={onOpenWizard} />
       </View>
       {viewMode === "routes" ? <View style={styles.routeWorkspace}>
-        <TablePane wide style={styles.routeTablePane} title={translate("providers.routes")} actions={<><IconButton label="↑" title={translate("common.moveUp")} disabled={busy || !canMoveRouteUp} onPress={() => moveRoute("up")} /><IconButton label="↓" title={translate("common.moveDown")} disabled={busy || !canMoveRouteDown} onPress={() => moveRoute("down")} /></>}>
+        <TablePane wide style={styles.routeTablePane} title={translate("providers.routes")} actions={<><IconButton label="+" title={translate("providers.newRoute")} disabled={busy || providers.length === 0} onPress={addRoute} />{activeRoute || selectedPublicModel !== undefined ? <IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteRoute} /> : null}<IconButton label="↑" title={translate("common.moveUp")} disabled={busy || !canMoveRouteUp} onPress={() => moveRoute("up")} /><IconButton label="↓" title={translate("common.moveDown")} disabled={busy || !canMoveRouteDown} onPress={() => moveRoute("down")} /></>}>
           <NativeTable columns={[{ label: translate("providers.upstream"), width: 120 }, { label: translate("providers.provider"), width: 96 }, { label: translate("providers.providerKey"), width: 130 }, { label: translate("common.order"), width: 64 }]} rows={routeRows} disabledRowKeys={disabledRouteKeys} alertRowKeys={alertRouteKeys} selectedKey={selectedPublicModel !== undefined ? routePublicModelRowKey(selectedPublicModel) : (selectedRoute ?? "")} compact selectableSpanningRowKeys={selectableRouteGroupKeys} onSelectionChange={(key) => selectRouteTableRow(key)} style={styles.nativeRouteTable} />
         </TablePane>
       </View> : <View style={styles.providerWorkspace}>
@@ -4953,7 +5091,7 @@ function PublicModelInspector({ group, modelContexts, backLabel, busy, translate
   </View>;
 }
 
-function ModelInspector({ providers, providerLabels, provider, providerId, model, modelName, relaySources, native, busy, translate, dispatch, probe, probing, probeResult, modelContexts, bindingIssue, onNameDraftChange, onProviderClick, onProviderChange, onOpenPublicModel, dispatchSnapshot }: { providers: UnknownRecord[]; providerLabels: string[]; provider: UnknownRecord; providerId: string; model: UnknownRecord; modelName: string; relaySources: RelaySourceOption[]; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; probe: () => void; probing: boolean; probeResult?: IpcResults["probe"]; modelContexts?: UnknownRecord; bindingIssue?: UnknownRecord; onNameDraftChange?: (name: string) => void; onProviderClick: () => void; onProviderChange: (providerId: string) => void; onOpenPublicModel?: () => void; dispatchSnapshot: (type: string, payload?: UnknownRecord, domain?: ConfigDomain) => Promise<CoreSnapshot | undefined> }): React.JSX.Element {
+function ModelInspector({ providers, providerLabels, provider, providerId, model, modelName, relaySources, native, busy, translate, dispatch, probe, probing, probeResult, modelContexts, bindingIssue, onNameDraftChange, onProviderClick, onProviderChange, onOpenPublicModel, dispatchSnapshot }: { providers: UnknownRecord[]; providerLabels: string[]; provider: UnknownRecord; providerId: string; model: UnknownRecord; modelName: string; relaySources: RelaySourceOption[]; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; probe: () => void; probing: boolean; probeResult?: IpcResults["probe"] | null; modelContexts?: UnknownRecord; bindingIssue?: UnknownRecord; onNameDraftChange?: (name: string) => void; onProviderClick: () => void; onProviderChange: (providerId: string) => void; onOpenPublicModel?: () => void; dispatchSnapshot: (type: string, payload?: UnknownRecord, domain?: ConfigDomain) => Promise<CoreSnapshot | undefined> }): React.JSX.Element {
   const id = editorIdentifier(model);
   // A service's own catalog states each model's credit rate; the rate is shown
   // beside the route it belongs to, so the picker's `x0.79` stays visible here.
@@ -5246,6 +5384,15 @@ function isProbeSurface(value: string): value is "openai/responses" | "openai/ch
 
 function modelProbeKey(providerId: string, modelId: string): string {
   return `${providerId}\x1f${modelId}`;
+}
+
+/** The map without one entry, unchanged when it never held it: a pane that
+ * drops a finding must not re-create its state on every render. */
+function withoutRecordEntry<T>(record: Record<string, T>, key: string): Record<string, T> {
+  if (record[key] === undefined) return record;
+  const next = { ...record };
+  delete next[key];
+  return next;
 }
 
 /** The inputs one probe result is evidence for: the address it called, the
@@ -6086,23 +6233,36 @@ function AssistantSettingsWorkspace({ busy, native, codexModels, codexModelCatal
   const [designateBusy, setDesignateBusy] = useState(false);
   const designateButtonRef = useRef<HostInstance | null>(null);
   const savedModelGroups = useMemo(() => {
-    const providers = new Map<string, { labels: string[]; selections: UnknownRecord[] }>();
-    const seen = new Set<string>();
-    for (const row of codexModels) {
+    const rows = codexModels.flatMap((row) => {
       const model = stringValue(row.model).trim();
       const provider = stringValue(row.provider).trim();
       const deploymentId = stringValue(row.deployment_id).trim();
-      if (!model || !provider || !deploymentId) continue;
-      const key = `${provider}\u001f${model}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      const entry = providers.get(provider) ?? { labels: [], selections: [] };
-      entry.labels.push(model);
-      entry.selections.push({ model, provider, deployment_id: deploymentId });
-      providers.set(provider, entry);
+      if (!model || !provider || !deploymentId) return [];
+      return [{ model, provider, deploymentId, keyName: stringValue(row.api_key_name).trim() }];
+    });
+    // One route is one menu row: a provider can serve one public name from two
+    // routes (two keys, a fallback ordering), and collapsing them by name
+    // offered only the first — the second could never be designated.  Where a
+    // name is shared, the row says which key it answers with.
+    const shared = new Map<string, number>();
+    for (const row of rows) {
+      const identity = `${row.provider}\u001f${row.model}`;
+      shared.set(identity, (shared.get(identity) ?? 0) + 1);
+    }
+    const providers = new Map<string, { labels: string[]; selections: UnknownRecord[] }>();
+    const seen = new Set<string>();
+    for (const row of rows) {
+      const identity = `${row.provider}\u001f${row.deploymentId}`;
+      if (seen.has(identity)) continue;
+      seen.add(identity);
+      const duplicated = (shared.get(`${row.provider}\u001f${row.model}`) ?? 0) > 1;
+      const entry = providers.get(row.provider) ?? { labels: [], selections: [] };
+      entry.labels.push(duplicated ? `${row.model} · ${row.keyName || translate("providers.undefinedKey")}` : row.model);
+      entry.selections.push({ model: row.model, provider: row.provider, deployment_id: row.deploymentId });
+      providers.set(row.provider, entry);
     }
     return [...providers].map(([provider, entry]) => ({ provider, labels: entry.labels, selections: entry.selections }));
-  }, [codexModels]);
+  }, [codexModels, translate]);
   const savedModelCount = savedModelGroups.reduce((total, group) => total + group.labels.length, 0);
   const designateSavedModel = (selection: UnknownRecord | undefined): void => {
     const chosen = selection ?? undefined;
@@ -6152,8 +6312,14 @@ function AssistantSettingsWorkspace({ busy, native, codexModels, codexModelCatal
     // both sides of the switch, so that pairing identifies the route exactly;
     // a model name on its own is only a fallback for a client this pane does
     // not recognize.
+    const matching = codexModels.filter(matches);
     const saved = codexModels.find((row) => clientProvider !== "" && stringValue(row.provider).trim() === clientProvider && matches(row))
-      ?? codexModels.find(matches);
+      // Without a provider this pane recognizes, the model name alone decides
+      // only while one saved route carries it: two providers can expose the
+      // same upstream tail, and picking the first would put the client on a
+      // route it was never on.  An unresolved target keeps the client's own
+      // spelling and can still be left through the designate menu.
+      ?? (matching.length === 1 ? matching[0] : undefined);
     if (!saved) return undefined;
     const savedProvider = stringValue(saved.provider).trim();
     const mapped = stringValue(saved.model).trim();
@@ -8715,8 +8881,13 @@ function RawEditor({ label, domain, document, language, ipc, translate, showLabe
   </View>;
 }
 
-function modelProbePresentation(model: UnknownRecord, result: IpcResults["probe"] | undefined, translate: Translate): { compact: string; compactSentence: string; tooltip: string; full: string } {  const resultRecord = result as UnknownRecord | undefined;
-  const probe = resultRecord ?? asRecord(model.probe);
+function modelProbePresentation(model: UnknownRecord, result: IpcResults["probe"] | null | undefined, translate: Translate): { compact: string; compactSentence: string; tooltip: string; full: string } {
+  // `null` is the pane saying it has no finding for this route — it was just
+  // asked again, or edited since — so Core's own copy of it is not shown
+  // either.  `undefined` is a pane that has not measured the route: it paints
+  // whatever Core kept.
+  const resultRecord = result === null ? undefined : result as UnknownRecord | undefined;
+  const probe = result === null ? ({} as UnknownRecord) : resultRecord ?? asRecord(model.probe);
   if (Object.keys(probe).length === 0) {
     return { compact: "", compactSentence: "", tooltip: "", full: "" };
   }

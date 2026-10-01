@@ -167,6 +167,56 @@ class PublicModelDomainTests(unittest.TestCase):
                 {"public_model": "gpt-5.6-sol", "changes": {"max_input_tokens": -4}},
             )
 
+    def test_deleting_a_public_model_removes_every_route_that_serves_it(self) -> None:
+        """One name is one group: deleting it deletes its routes, not one of them.
+
+        The routes live on two providers (and a parked route lives in the
+        companion file), so the action has to reach all of them in one staged
+        change — a partial group would leave the name served by a route the user
+        believes is gone.
+        """
+
+        # A third route of the same public model, parked in the companion file.
+        self.domain.dispatch(
+            "model.add",
+            {
+                "provider_id": "primary",
+                "model": {
+                    "name": "gpt-5.6-sol",
+                    "upstream_model": "openai/gpt-5.6-sol",
+                    "enabled": False,
+                    "order": 3,
+                },
+            },
+        )
+        self.domain.apply()
+        before = [model["model_name"] for model in self.models()]
+        self.assertEqual(4, len(before))
+
+        result = self.domain.dispatch("public.model_delete", {"public_model": "gpt-5.6-sol"})
+
+        self.assertEqual(
+            {
+                "operation": "public_model_delete",
+                "public_model": "gpt-5.6-sol",
+                "deleted_models": 3,
+            },
+            result["operation_summary"],
+        )
+        self.assertEqual(["kimi-k3"], [model["model_name"] for model in self.models()])
+        self.assertTrue(self.domain.validate()["valid"])
+
+        self.domain.apply()
+        reloaded = ProvidersModelsDomain(self.path)
+        self.assertEqual(["kimi-k3"], [model["model_name"] for model in reloaded.snapshot()["providers"][0]["models"] + reloaded.snapshot()["providers"][1]["models"]])
+        self.assertNotIn("gpt-5.6-sol", self.path.read_text(encoding="utf-8"))
+
+        # A name no route serves is refused instead of silently doing nothing.
+        with self.assertRaises(DomainError):
+            self.domain.dispatch("public.model_delete", {"public_model": "gpt-5.6-sol"})
+        with self.assertRaises(DomainError):
+            self.domain.dispatch("public.model_delete", {"public_model": ""})
+
     def test_reorder_permutes_the_typed_order_values_including_decimals(self) -> None:
         self.domain.dispatch(
             "routes.reorder_group",
@@ -179,6 +229,78 @@ class PublicModelDomainTests(unittest.TestCase):
         # of being renumbered to whole numbers.
         self.assertEqual(1, self.model("00000002")["manual_order"])
         self.assertEqual(1.5, self.model("00000001")["manual_order"])
+
+    def test_reorder_answers_the_identity_the_routes_table_holds(self) -> None:
+        """The 路由 table sends the editor identity its rows carry.
+
+        A route has two names — the deployment id the file persists and the
+        editor id the snapshot carries — and the pane's own row prefers the
+        editor id.  Reordering used to accept only the deployment id, so every
+        ↑/↓ in a saved group was refused and the pane voided the answer.
+        """
+
+        rows = [
+            model
+            for provider in self.domain.snapshot()["providers"]
+            for model in provider["models"]
+            if model["model_name"] == "gpt-5.6-sol"
+        ]
+        editor_ids = [str(model["editor_id"]).strip() for model in rows]
+        self.assertEqual(2, len(set(editor_ids)))
+        for model in rows:
+            self.assertNotEqual(
+                model["editor_id"],
+                model["deployment_id"],
+                "the two identities must stay distinguishable for this guard",
+            )
+
+        self.domain.dispatch(
+            "routes.reorder_group",
+            {"public_model": "gpt-5.6-sol", "route_ids": list(reversed(editor_ids))},
+        )
+
+        self.assertEqual(1, self.model("00000002")["manual_order"])
+        self.assertEqual(1.5, self.model("00000001")["manual_order"])
+
+        # An identity the group does not carry is still a stale order, and a
+        # request that names fewer routes than the group has is refused too.
+        with self.assertRaises(DomainError):
+            self.domain.dispatch(
+                "routes.reorder_group",
+                {"public_model": "gpt-5.6-sol", "route_ids": ["model-does-not-exist", "00000002"]},
+            )
+        with self.assertRaises(DomainError):
+            self.domain.dispatch(
+                "routes.reorder_group",
+                {"public_model": "gpt-5.6-sol", "route_ids": [editor_ids[0]]},
+            )
+
+    def test_reorder_renumbers_to_integers_when_the_user_asks_for_it(self) -> None:
+        """The pane asks before it replaces a group's typed decimal values.
+
+        Keeping the values is the default (they travel with the routes); the
+        answer "make them integers" has to replace the whole group with 1..n in
+        the requested order, including the routes parked in the companion file.
+        """
+
+        rows = [
+            model
+            for provider in self.domain.snapshot()["providers"]
+            for model in provider["models"]
+            if model["model_name"] == "gpt-5.6-sol"
+        ]
+        order = [str(model["deployment_id"]).strip() for model in rows]
+
+        self.domain.dispatch(
+            "routes.reorder_group",
+            {"public_model": "gpt-5.6-sol", "route_ids": list(reversed(order)), "renumber": True},
+        )
+
+        # The group is 0..n-1 in the new order: the requested first route is 0.
+        self.assertEqual(0, self.model(order[1])["manual_order"])
+        self.assertEqual(1, self.model(order[0])["manual_order"])
+        for deployment_id in order:
+            self.assertIsInstance(self.model(deployment_id)["manual_order"], int)
 
     def test_snapshot_carries_the_registry_default_for_each_public_model(self) -> None:
         contexts = self.domain.snapshot()["model_contexts"]

@@ -9,6 +9,7 @@ from .schema import (
     DEFAULT_API_KEY_NAME,
     DISABLED_MODELS_KEY,
     MENU_API_KEY_NAME_KEY,
+    MENU_KEY_BINDING_KEY,
     MENU_MANUAL_ORDER_KEY,
     MENU_MODEL_ENABLED_KEY,
     MENU_ORDER_MODE_KEY,
@@ -49,6 +50,12 @@ from .schema import (
 CONFIG_DOCUMENT_CONFIG_KEY = "config"
 CONFIG_DOCUMENT_DISABLED_KEY = "disabled"
 CONFIG_DOCUMENT_KEYS = {CONFIG_DOCUMENT_CONFIG_KEY, CONFIG_DOCUMENT_DISABLED_KEY}
+
+def _is_unbound_entry(model_info: dict[str, Any]) -> bool:
+    """Whether one entry records that the route names no key of its own."""
+
+    return str(model_info.get(MENU_KEY_BINDING_KEY, "")).strip() == "unbound"
+
 
 def _provider_to_editor(name: str, value: Any) -> dict[str, Any]:
     provider = _as_dict(value)
@@ -107,12 +114,18 @@ def _provider_api_keys_from_raw(provider_name: str, provider: dict[str, Any]) ->
                 slots_by_name[key_name] = slot
     keys: list[dict[str, Any]] = []
     seen_names: set[str] = set()
-    seen_values: set[str] = set()
+    # One name is one key; one *value* is not.  A slot the user created by hand
+    # and a slot the relay resolved can legitimately hold the same credential
+    # (the same station key pasted once by hand and once linked to its group),
+    # and dropping the later one deletes a real key from the document — the
+    # relay source it carries included, which is how a freshly staged linked
+    # key used to disappear on the next read.  Only a repeated name describes
+    # the same YAML entry twice.
     for index, item in enumerate(_as_list(provider.get("api_keys")), start=1):
         item_dict = _as_dict(item)
         key_name = _string_value(item_dict.get("name")).strip() or f"key-{index}"
         key_value = _string_value(item_dict.get("value"))
-        if not key_value or key_name in seen_names or key_value in seen_values:
+        if not key_value or key_name in seen_names:
             continue
         slot = slots_by_name.get(key_name, {})
         keys.append(
@@ -125,7 +138,6 @@ def _provider_api_keys_from_raw(provider_name: str, provider: dict[str, Any]) ->
             }
         )
         seen_names.add(key_name)
-        seen_values.add(key_value)
     return keys
 
 
@@ -229,19 +241,30 @@ def _model_to_editor(
         provider = provider_by_base.get(api_base, "")
     if not provider and len(known_providers) == 1:
         provider = next(iter(known_providers))
-    if provider and api_key and not api_key_name:
-        for item in provider_keys.get(provider, []):
-            if item.get("value") == api_key:
-                api_key_name = item.get("name", "")
-                break
-    if provider and not provider_key_id:
-        for item in provider_keys.get(provider, []):
-            if api_key_name and item.get("name") == api_key_name:
-                provider_key_id = _string_value(item.get("id")).strip()
-                break
-            if api_key and item.get("value") == api_key:
-                provider_key_id = _string_value(item.get("id")).strip()
-                break
+    # A route whose entry names no key stays unbound.  Its credential is the
+    # provider's default (the entry carries it so the runtime has something to
+    # answer with), and matching that value against the key list would bind the
+    # row to whichever key happens to share it — the same value-as-identity
+    # mistake that moved routes onto the wrong key.  Only a name, or the slot id
+    # a name uniquely resolves to, decides which key a route claims.
+    if provider and not provider_key_id and api_key_name:
+        # A name is a weaker identity, so it resolves the slot id only while one
+        # key carries it.  Never by value: a route that names its key must not
+        # follow whichever key shares its credential.
+        named = [
+            item
+            for item in provider_keys.get(provider, [])
+            if str(item.get("name", "")).strip() == api_key_name
+        ]
+        if len(named) == 1:
+            provider_key_id = _string_value(named[0].get("id")).strip()
+    if _is_unbound_entry(model_info):
+        # The entry records that it names no key: keep it that way.  A legacy
+        # entry that says nothing keeps the historical healing (a credential
+        # that matches one key reads as that key), which is only ever the
+        # reading of a file the pane rewrites with this marker on its next save.
+        api_key_name = ""
+        provider_key_id = ""
 
     litellm_extra = {
         key: _jsonable(value)
@@ -284,7 +307,9 @@ def _model_to_editor(
         for key, value in entry.items()
         if key not in {"model_name", "litellm_params", "model_info"}
     }
-    order = _string_value(params.get("order") if params.get("order") is not None else 1).strip() or "1"
+    # The app's automatic order starts at 0: a value the entry states nowhere
+    # takes the same first slot a new model or a renumbered group uses.
+    order = _string_value(params.get("order") if params.get("order") is not None else 0).strip() or "0"
     manual_order = _string_value(model_info.get(MENU_MANUAL_ORDER_KEY)).strip() or order
     order_mode = _string_value(model_info.get(MENU_ORDER_MODE_KEY)).strip() or "manual"
     catalog_mode = _string_value(model_info.get(MENU_RELAY_CATALOG_MODE_KEY)).strip() or "independent"
@@ -362,18 +387,69 @@ def _append_model_to_provider(
     provider_entry = provider_index[provider]
     if not str(provider_entry.get("api_base", "")).strip():
         provider_entry["api_base"] = str(model.get("api_base", "")).strip()
-    key_name = _ensure_provider_key(
-        provider_entry,
-        str(model.get("api_key", "")).strip(),
-        str(model.get("api_key_name", "")).strip() or _key_name_from_model_name(str(model.get("model_name", ""))),
+    # The document's own binding is the answer whenever the provider carries it:
+    # the slot id the route holds, else the one name it writes.  A route whose
+    # entry records that it names no key stays unbound: the pane keeps showing
+    # the choice the user made instead of healing it onto whichever key happens
+    # to hold the credential the entry carries, and the credential is not
+    # promoted into a key of its own.  Only a route that names a key the
+    # provider does not carry at all — a legacy entry that kept its credential
+    # inline, a provider whose key was removed by hand — falls back to healing by
+    # credential value, because there the value is the only evidence left.  Two
+    # keys that read alike are never one key: a route bound to a linked slot must
+    # not answer with a hand-made slot that happens to hold the same credential.
+    provider_key_rows = [
+        {
+            "id": _string_value(_as_dict(item).get("id")).strip()
+            or _stable_provider_key_id(
+                str(provider_entry.get("name", "")).strip(),
+                _string_value(_as_dict(item).get("name")).strip(),
+            ),
+            "name": _string_value(_as_dict(item).get("name")).strip(),
+        }
+        for item in _as_list(provider_entry.get("api_keys"))
+        if _string_value(_as_dict(item).get("value"))
+    ]
+    model_key_name = str(model.get("api_key_name", "")).strip()
+    model_key_id = _string_value(model.get("provider_key_id")).strip()
+    bound_key = next(
+        (item for item in provider_key_rows if model_key_id and item["id"] == model_key_id),
+        None,
     )
-    if key_name:
-        model["api_key_name"] = key_name
-        for item in _as_list(provider_entry.get("api_keys")):
-            item_dict = _as_dict(item)
-            if _string_value(item_dict.get("name")).strip() == key_name:
-                model["provider_key_id"] = _string_value(item_dict.get("id")).strip()
-                break
+    if bound_key is None and model_key_name:
+        bound_key = next(
+            (item for item in provider_key_rows if item["name"] == model_key_name),
+            None,
+        )
+    if bound_key is not None:
+        model["api_key_name"] = bound_key["name"]
+        model["provider_key_id"] = bound_key["id"]
+        provider_index[provider]["models"].append(model)
+        return
+    unbound_entry = _is_unbound_entry(_as_dict(model.get("model_info_extra")))
+    # Only an entry that brings evidence of its own key is resolved here: a slot
+    # id, a name, or — for a legacy entry that states neither — the credential it
+    # carries.  An entry that states a key this provider does not carry is left
+    # exactly as it is (the pane marks the row; the write refuses it while the
+    # route is enabled), and an entry that states nothing at all names no key —
+    # the pane's own “no key” choice — so a one-key provider never makes it claim
+    # that key by default.  The recorded marker is the same statement, made
+    # explicitly by a file this app wrote.
+    states_a_key = bool(model_key_name or model_key_id)
+    heals_by_value = not states_a_key and bool(str(model.get("api_key", "")).strip())
+    if heals_by_value and not unbound_entry:
+        key_name = _ensure_provider_key(
+            provider_entry,
+            str(model.get("api_key", "")).strip(),
+            model_key_name or _key_name_from_model_name(str(model.get("model_name", ""))),
+        )
+        if key_name:
+            model["api_key_name"] = key_name
+            for item in _as_list(provider_entry.get("api_keys")):
+                item_dict = _as_dict(item)
+                if _string_value(item_dict.get("name")).strip() == key_name:
+                    model["provider_key_id"] = _string_value(item_dict.get("id")).strip()
+                    break
     provider_index[provider]["models"].append(model)
 
 
