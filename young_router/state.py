@@ -118,7 +118,10 @@ def _track_recent_request(record: Mapping[str, Any]) -> Optional[str]:
         if status not in _RECENT_REQUEST_IN_FLIGHT_STATUSES:
             _PENDING_RECENT_REQUESTS.pop(request_id, None)
             return None
-        tracked = _PENDING_RECENT_REQUESTS.get(request_id) or {}
+        # Re-inserting under the same key does not move a dict entry, so the
+        # map is refreshed by popping first: the cap below evicts the *oldest*
+        # entry, and an active stream must not be the one that is dropped.
+        tracked = _PENDING_RECENT_REQUESTS.pop(request_id, None) or {}
         _PENDING_RECENT_REQUESTS[request_id] = {
             "record": dict(record),
             "touched_at": now,
@@ -155,6 +158,10 @@ def _touch_recent_request(
         if entry is None:
             return
         entry["touched_at"] = now
+        # A heartbeat is what says this row is still live, so it moves to the
+        # end of the eviction order (see ``_track_recent_request``).
+        _PENDING_RECENT_REQUESTS.pop(request_id, None)
+        _PENDING_RECENT_REQUESTS[request_id] = entry
         if now - float(entry.get("reported_at") or 0.0) < interval:
             return
         entry["reported_at"] = now

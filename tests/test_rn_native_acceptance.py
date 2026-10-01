@@ -2486,6 +2486,40 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("  RegisterCheckbox(package_builder);", windows)
         self.assertIn("  RegisterSwitch(package_builder);", windows)
 
+    def test_the_hosts_take_a_core_down_without_losing_the_next_one(self) -> None:
+        """Teardown, re-subscribe, and retry survive a replaced Core.
+
+        Three defects in one pass: the Windows bridge cleared a member that
+        does not exist (the class keeps one handler per React root), the macOS
+        bridge recorded its subscribe request only when the generation still
+        matched — leaving no subscription *and* no request, so recovery could
+        never ask again — and a Windows event poll spun at full speed on any
+        non-200 answer.
+        """
+
+        windows_bridge = (WIN_NATIVE / "CoreIPCBridge.cpp").read_text(encoding="utf-8")
+        mac_bridge = (MAC_NATIVE / "CoreIPCBridge.swift").read_text(encoding="utf-8")
+        windows_header = (WIN_NATIVE / "CoreIPCBridge.h").read_text(encoding="utf-8")
+
+        # One handler per root, and a full teardown clears them all.
+        self.assertIn("std::map<int, std::function<void(std::string const&)>> event_handlers_;", windows_header)
+        self.assertIn("event_handlers_.clear();", windows_bridge)
+        self.assertNotIn("event_handler_ = nullptr;", windows_bridge)
+        # The macOS subscribe answer is remembered before the generation guard.
+        subscribe = mac_bridge.split("private func startPollingIfSubscription(", 1)[1].split(
+            "private func poll(", 1
+        )[0]
+        self.assertIn("let live = self.generation == generation", subscribe)
+        self.assertIn("if live {\n            subscriptionID = subscription\n            pollCancelled = false\n        }", subscribe)
+        self.assertLess(
+            subscribe.index("subscriptionRequest = request"),
+            subscribe.index("guard live else { return }"),
+        )
+        # A non-200 event poll waits instead of spinning.
+        poll = windows_bridge.split("void CoreIPCBridge::PollEvents(", 1)[1].split("\n}\n", 1)[0]
+        self.assertIn("std::this_thread::sleep_for(std::chrono::seconds(1));", poll)
+        self.assertNotIn("if (result.status != 200) continue;", poll)
+
     def test_windows_controls_carry_their_hint_and_their_name(self) -> None:
         """A button's hint and a field's name reach the Windows host too.
 

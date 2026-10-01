@@ -889,6 +889,14 @@ class CoreIPCServer:
                     for key, item in self._import_plans.items()
                     if not hmac.compare_digest(item.session_token, token)
                 }
+                # A dead session's event subscriptions go with it.  They were
+                # never swept, so every relaunched host left subscriptions (and
+                # the events queued in them) behind for the process lifetime,
+                # and a poll reusing the id read as a quiet heartbeat.
+                for subscription_id in tuple(session.subscriptions):
+                    subscription = self._subscriptions.get(subscription_id)
+                    if subscription is not None and hmac.compare_digest(subscription.session_token, token):
+                        self._subscriptions.pop(subscription_id, None)
                 return False
             if not hmac.compare_digest(session.token, token):
                 return False
