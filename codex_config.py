@@ -796,6 +796,11 @@ def configured_models(config: dict[str, Any]) -> list[dict[str, Any]]:
                 "model": model,
                 "provider": provider_name,
                 "deployment_id": str(info.get("id") or "").strip(),
+                # The key label and the route order are what tells two routes of
+                # one public model apart where a surface lists saved routes
+                # (the designate menu); neither is credential material.
+                "api_key_name": str(info.get("api_key_name") or "").strip(),
+                "order": params.get("order"),
                 "upstream_model": str(params.get("model") or "").strip(),
                 "api_base": str(params.get("api_base") or provider.get("api_base") or "").strip(),
                 "upstream_url_surface": str(info.get("upstream_url_surface") or "").strip().lower(),

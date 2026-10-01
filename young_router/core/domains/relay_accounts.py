@@ -4283,8 +4283,20 @@ class RelayAccountsDomain:
             wanted_id = resource["id"].removeprefix("sub2api-")
             candidate = next((item for item in candidates if str(item.get("id", "")).strip() == wanted_id), None)
             if candidate is None:
+                # A resource whose stored id was derived from the station's label
+                # (an older answer without key ids) is repaired by that label —
+                # but only while exactly one key carries it.  Duplicate labels are
+                # legal, and guessing between them hands this slot another key's
+                # credential; that key then answers a route it does not belong to.
                 wanted_name = resource["name"]
-                candidate = next((item for item in candidates if _resource_name(item.get("name", item.get("label", item.get("id"))), "") == wanted_name), None)
+                named = [
+                    item
+                    for item in candidates
+                    if _resource_name(item.get("name", item.get("label", item.get("id"))), "")
+                    == wanted_name
+                ]
+                if len(named) == 1:
+                    candidate = named[0]
             if candidate is None and len(candidates) == 1:
                 candidate = candidates[0]
             key = candidate.get("key") if isinstance(candidate, Mapping) else None
