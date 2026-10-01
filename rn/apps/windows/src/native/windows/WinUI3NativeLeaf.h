@@ -226,6 +226,9 @@ class WinUI3NativeLeaf : public std::enable_shared_from_this<WinUI3NativeLeaf> {
   bool status_title_is_bootstrap_ = true;
   std::wstring active_route_;
   HWND window_handle_ = nullptr;
+  // The one window takes its initial size on the first route it opens; every
+  // later open keeps the geometry the user chose.
+  bool window_sized_ = false;
   NOTIFYICONDATAW tray_{};
   bool tray_visible_ = false;
   bool service_running_ = false;

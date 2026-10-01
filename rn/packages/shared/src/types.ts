@@ -587,6 +587,8 @@ export interface NativeLocalization {
   /** Application-menu About item. */
   about: string;
   autoStart: string;
+  /** The status menu's Codex model-catalog switch. */
+  codexModelCatalog: string;
   serviceUnavailable: string;
   serviceStatus: string;
   serviceStarting: string;
@@ -624,6 +626,7 @@ export interface NativeLocalization {
   routeProvidersModels: string;
   routeCodexSettings: string;
   routeClaudeSettings: string;
+  routeGeneralSettings: string;
   routeRuntimeSettings: string;
   routeDataManagement: string;
   routeProviderWizard: string;

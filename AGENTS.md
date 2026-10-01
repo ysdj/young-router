@@ -53,6 +53,18 @@ That strip belongs to a settings pane window only: a child window keeps no statu
 
 ## Known Runtime Failure Modes
 
+### A Host Keeps One Identity And One Default (2026-10-02)
+
+- Six host-level differences, five of them between the two platforms.
+- **macOS's relay sign-in page presented the wrong browser.**  `NativeRelayLoginController` created its `WKWebView` without `customUserAgent` (only the provider-auth controller pinned `RelayBrowserIdentity.userAgent`), while its own probes, dashboard reads, and usage calls set that User-Agent.  A station that binds a session to its IP and `User-Agent` (sub2api's session binding) revoked the session the page had just created, so 登录成功 never landed while the same account worked on Windows.  Fix: the relay page pins the same literal, and `tests/test_browser_identity.py` now asserts that every remote WebView on the host sets it (and that the local read-only viewer does not need to).
+- **Windows' tray left-click opened 常规.**  The default action was "the first enabled `open-` action", and the shared UI lists 常规 first, so the same gesture opened a different pane than macOS's `openNamedRoute("providers-models")`.  Fix: the tray prefers `open-providers-models` and falls back to the first route.
+- **常规 was missing from the macOS status menu's route group.**  `statusMenuOrder` never named `open-general-settings`, so the item landed at the bottom beside 版本/退出 instead of with its panes; the menu also had no fallback title for it before the first Core snapshot.  Fix: the order carries it first, its fallback title comes from the shared `routeGeneralSettings` string, and the localization contract gained that key.
+- **The catalog toggle showed a hard-coded English label.**  `menuFallback` returned the literal "Use LiteLLM models in Codex" until the first snapshot arrived, so a zh-Hans user saw one English item in an otherwise translated menu.  Fix: the label comes from the shared `codexModelCatalog` string.
+- **A warm editor window kept the app in the Dock.**  `prepareFileEditor` registers an ordered-out `file-editor` window, and the activation policy treated any registered window as presented, so closing the settings window left a Dock icon, an app menu, and no window to click.  Fix: a window counts only while it is visible; opening the editor presents it and restores the regular policy.
+- **Windows snapped the window back on every open.**  Every `OpenRoute` re-applied the route's initial content size and restored the window, so a resized or maximized window lost its geometry on the next pane switch or menu action; macOS only applies geometry when it creates a window.  Fix: the host's one window takes the initial size of the route that opened it, once, and only an iconic window is restored.
+- Known limit: Windows has no relay usage-log surface at all — `openRelayLogs` is optional in the bridge, and the shared 在线用量 tab walks the user through a sign-in and then opens nothing there while macOS shows the station's usage window.
+- Verified with `tests/test_browser_identity.py` (every remote WebView pins the identity; confirmed to fail with the relay assignment removed), `tests/test_rn_native_acceptance.py` (`test_both_trays_open_the_same_pane_on_a_left_click`, `test_a_windows_pane_switch_keeps_the_users_window_geometry`, the status-menu/localization and activation-policy assertions), and `./scripts/check-rn.sh`.
+
 ### A Reasoning Frame Does Not Claim The Answer Started (2026-10-02)
 
 - 调用 WorkBuddy 时思考会被拆成多个「已深度思考」块，每块只有一小段（`We`、`need respond`、`to user.`）：一次思考被切成一片一个折叠块。

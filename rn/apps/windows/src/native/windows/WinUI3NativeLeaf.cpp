@@ -510,11 +510,18 @@ void WinUI3NativeLeaf::OpenRoute(std::wstring_view route) {
   }
   if (window_handle_ != nullptr) {
     SetWindowTextW(window_handle_, RouteTitle(route).c_str());
-    const auto frame = FrameTrackSizeForContent(window_handle_, RouteInitialContentSize(route));
-    SetWindowPos(
-        window_handle_, nullptr, 0, 0, frame.x, frame.y,
-        SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER);
-    ShowWindow(window_handle_, SW_RESTORE);
+    if (!window_sized_) {
+      // The host's one window takes the initial size of the route that opened
+      // it, and only then: the geometry after that belongs to the user, so a
+      // pane switch or a menu action must not snap a resized or maximized
+      // window back (macOS only applies geometry when it creates a window).
+      const auto frame = FrameTrackSizeForContent(window_handle_, RouteInitialContentSize(route));
+      SetWindowPos(
+          window_handle_, nullptr, 0, 0, frame.x, frame.y,
+          SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER);
+      window_sized_ = true;
+    }
+    if (IsIconic(window_handle_)) ShowWindow(window_handle_, SW_RESTORE);
     SetForegroundWindow(window_handle_);
   }
 }
@@ -2241,9 +2248,17 @@ void WinUI3NativeLeaf::EnsureTray() {
 }
 
 void WinUI3NativeLeaf::DispatchDefaultTrayAction() {
+  // A left click opens the same pane on both hosts: 供应商与模型.  Taking the
+  // first `open-` action in list order opened 常规 instead, because the shared
+  // UI lists the General pane first.
   auto route = std::find_if(actions_.begin(), actions_.end(), [](auto const& action) {
-    return action.enabled && action.id.rfind(L"open-", 0) == 0;
+    return action.enabled && action.id == L"open-providers-models";
   });
+  if (route == actions_.end()) {
+    route = std::find_if(actions_.begin(), actions_.end(), [](auto const& action) {
+      return action.enabled && action.id.rfind(L"open-", 0) == 0;
+    });
+  }
   if (route == actions_.end()) return;
   DispatchTrayAction(static_cast<size_t>(route - actions_.begin()));
 }
