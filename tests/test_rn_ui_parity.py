@@ -2107,6 +2107,37 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("horizontal_scroller_.Content(table_);", windows_native)
         self.assertIn("table_.MinWidth(TableWidth(props.columnWidths, column_count));", windows_native)
 
+    def test_windows_codegen_declares_every_prop_its_spec_does(self) -> None:
+        """A stale generated header is a C++ build break, not a dropped prop.
+
+        ``WinUIControls.cpp`` reads the props its spec declares through the
+        generated ``Props()`` struct, so the committed codegen output has to
+        carry every prop name.  ``pnpm run codegen:windows:check`` is the
+        authoritative gate; this keeps ``./scripts/test.sh`` from passing over
+        a header that the Windows target cannot compile.
+        """
+
+        import re
+
+        specs = ROOT / "rn/packages/shared/src/ui/windows"
+        codegen = ROOT / "rn/apps/windows/windows/YoungRouter/codegen/react/components/YoungRouter"
+        component_name = re.compile(r'codegenNativeComponent<[^>]*>\(\s*"([^"]+)"\s*,?\s*\)', re.S)
+        checked = 0
+        for spec in sorted(specs.glob("*NativeComponent.ts")):
+            text = spec.read_text(encoding="utf-8")
+            name = component_name.search(text)
+            self.assertIsNotNone(name, f"{spec.name} declares no native component")
+            header = codegen / f"{name.group(1)}.g.h"
+            self.assertTrue(header.is_file(), f"{header.name} is missing from the codegen output")
+            body = re.search(r"interface \w+Props extends ViewProps \{(.*?)\n\}", text, re.S)
+            self.assertIsNotNone(body, f"{spec.name} declares no props interface")
+            props = re.findall(r"^\s{2}([A-Za-z_][A-Za-z0-9_]*)\??:", body.group(1), re.M)
+            header_text = header.read_text(encoding="utf-8")
+            for prop in props:
+                self.assertIn(prop, header_text, f"{header.name} does not carry {prop}")
+            checked += 1
+        self.assertEqual(12, checked)
+
     def test_route_footer_is_replaced_by_immediate_apply(self) -> None:
         # The shared settings shell has no route-level Apply/Close footer; the
         # provider wizard sheet keeps its own explicit Close/Next actions.
