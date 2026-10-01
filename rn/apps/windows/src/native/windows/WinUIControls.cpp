@@ -70,6 +70,7 @@ using winrt::Microsoft::UI::Xaml::Controls::StackPanel;
 using winrt::Microsoft::UI::Xaml::Controls::TextBox;
 using winrt::Microsoft::UI::Xaml::Controls::TextBlock;
 using winrt::Microsoft::UI::Xaml::Controls::ToolTipService;
+using winrt::Microsoft::UI::Xaml::Automation::AutomationProperties;
 using winrt::Microsoft::UI::Xaml::Controls::WebView2;
 using winrt::Microsoft::UI::Xaml::Controls::Primitives::Thumb;
 using winrt::Microsoft::UI::Xaml::Controls::Primitives::ToggleButton;
@@ -80,6 +81,10 @@ using winrt::Microsoft::UI::Xaml::Thickness;
 namespace web = winrt::Microsoft::Web::WebView2::Core;
 
 constexpr double kUIFontSize = 13.0;
+// The shared UI's hierarchy step for a child row under its group header: a
+// leading tab in a cell indents the row by this much.  macOS implements the
+// same step as a tab stop (LiteLLMTableRowIndentWidth).
+constexpr double kTableRowIndentWidth = 16.0;
 // Mirrors the Core's own raw-editor budget (``MAX_EDITOR_DOCUMENT_BYTES`` and
 // ``MAX_MESSAGE_BYTES`` in ``young_router/core/protocol.py``).  One editor
 // frame carries the document plus its baseline, and the page bootstrap embeds
@@ -429,6 +434,25 @@ struct ButtonComponentView final
     }
     button_.IsEnabled(Enabled(props.disabled));
     hyperlink_.IsEnabled(Enabled(props.disabled));
+    // A button's own hint: an icon-only button has no visible words, and a
+    // busy wheel's wording rides its tooltip.  An empty hint falls back to the
+    // title, the way the macOS control already does, so both hosts say the
+    // same thing under the pointer.  The name a screen reader announces is the
+    // same string, because an icon-only button has nothing else to read.
+    auto const toolTip = ToHString(props.toolTip.value_or(""));
+    auto const hint = toolTip.empty() ? ToHString(props.title) : toolTip;
+    auto const label = ToHString(props.accessibilityLabel.value_or(""));
+    if (!hint.empty()) {
+      ToolTipService::SetToolTip(button_, winrt::box_value(hint));
+      ToolTipService::SetToolTip(hyperlink_, winrt::box_value(hint));
+    }
+    if (!label.empty()) {
+      AutomationProperties::SetName(button_, label);
+      AutomationProperties::SetName(hyperlink_, label);
+    } else if (!hint.empty()) {
+      AutomationProperties::SetName(button_, hint);
+      AutomationProperties::SetName(hyperlink_, hint);
+    }
     button_.Visibility(link ? winrt::Microsoft::UI::Xaml::Visibility::Collapsed
                             : winrt::Microsoft::UI::Xaml::Visibility::Visible);
     hyperlink_.Visibility(link ? winrt::Microsoft::UI::Xaml::Visibility::Visible
@@ -801,18 +825,10 @@ struct TableComponentView final
         emitter->onSelectionChange(std::move(event));
       }
     });
-    list_.DoubleTapped([this](auto const&, auto const&) {
-      if (!Props()) return;
-      const auto index = list_.SelectedIndex();
-      if (index < 0 || index >= static_cast<int32_t>(Props()->rowKeys.size())) return;
-      if (IsSpanningKey(Props()->rowKeys[static_cast<size_t>(index)])) return;
-      if (auto emitter = EventEmitter()) {
-        winrt::YoungRouter::Codegen::LiteLLMWinUITableEventEmitter::OnRowDoublePress args;
-        args.index = index;
-        args.key = Props()->rowKeys[static_cast<size_t>(index)];
-        emitter->onRowDoublePress(std::move(args));
-      }
-    });
+    // A row's own double-click opens that row.  The list-level handler used to
+    // read the selection instead, so a double-click on the empty space below
+    // the rows opened whichever row happened to be highlighted; the row carries
+    // its own handler now, and empty space carries none.
 
     Grid::SetRow(header_frame_, 0);
     Grid::SetRow(list_, 1);
@@ -1006,6 +1022,26 @@ struct TableComponentView final
         }
         AddColumns(row, props.columnWidths, column_count);
         const bool spanning = std::find(spanning_row_keys.begin(), spanning_row_keys.end(), props.rowKeys[row_index]) != spanning_row_keys.end();
+        const bool clickable_spanning = spanning && IsClickableSpanningKey(props.rowKeys[row_index]);
+        if (spanning && !clickable_spanning) {
+          // An inert group row keeps the taller section rhythm the macOS table
+          // draws for it (rowHeight + 6); the clickable public-model row keeps
+          // the ordinary height so its selection bar lines up with the route
+          // rows beside it.
+          row.MinHeight(compact_rows ? 28.0 : 34.0);
+        }
+        const int32_t double_press_index = static_cast<int32_t>(row_index);
+        row.DoubleTapped([this, double_press_index](auto const&, auto const&) {
+          if (!Props()) return;
+          if (double_press_index < 0 || double_press_index >= static_cast<int32_t>(Props()->rowKeys.size())) return;
+          if (IsSpanningKey(Props()->rowKeys[static_cast<size_t>(double_press_index)])) return;
+          if (auto emitter = EventEmitter()) {
+            winrt::YoungRouter::Codegen::LiteLLMWinUITableEventEmitter::OnRowDoublePress args;
+            args.index = double_press_index;
+            args.key = Props()->rowKeys[static_cast<size_t>(double_press_index)];
+            emitter->onRowDoublePress(std::move(args));
+          }
+        });
         if (spanning) {
           const auto cell_index = row_index * column_count;
           const auto spanning_text = cell_index < props.cells.size() ? props.cells[cell_index] : std::string{};
@@ -1102,10 +1138,16 @@ struct TableComponentView final
             auto cell = TextBlock{};
             cell.FontSize(rail_row ? kSourceListFontSize : kUIFontSize);
             if (rail_row) cell.FontWeight(winrt::Windows::UI::Text::FontWeights::Medium());
-            cell.Text(ToHString(cell_index < props.cells.size() ? props.cells[cell_index] : ""));
+            // A leading tab is the shared UI's hierarchy step (a child row
+            // under its group header): macOS turns it into a tab stop, so the
+            // plain text control here strips it and indents the cell by the
+            // same width instead of leaving the child flush with its group.
+            const auto cell_text = cell_index < props.cells.size() ? props.cells[cell_index] : std::string{};
+            const bool indented = !cell_text.empty() && cell_text.front() == '\t';
+            cell.Text(ToHString(indented ? cell_text.substr(1) : cell_text));
             if (!cell.Text().empty()) ToolTipService::SetToolTip(cell, winrt::box_value(cell.Text()));
             const double vertical_margin = props.compact.value_or(false) ? 2.0 : 5.0;
-            cell.Margin({8, vertical_margin, 8, vertical_margin});
+            cell.Margin({indented ? kTableRowIndentWidth + 8.0 : 8.0, vertical_margin, 8, vertical_margin});
             cell.TextTrimming(winrt::Microsoft::UI::Xaml::TextTrimming::CharacterEllipsis);
             const auto cell_key = props.rowKeys[row_index] + "\x1f" + std::to_string(column_index);
             const bool secondary = std::find(secondary_cell_keys.begin(), secondary_cell_keys.end(), cell_key) != secondary_cell_keys.end();
@@ -1852,6 +1894,12 @@ struct TextInputComponentView final
     if (disabled_changed) {
       text_box_.IsEnabled(Enabled(props.disabled));
     }
+    // A placeholder is not a name: the shared label names the field for a
+    // screen reader, which otherwise announces a bare edit box.
+    const auto label = ToHString(props.accessibilityLabel.value_or(""));
+    if (!label.empty()) {
+      winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(text_box_, label);
+    }
   }
 
   bool syncing_ = false;
@@ -2357,6 +2405,13 @@ struct SwitchComponentView final
     auto const& props = *Props();
     const bool value_changed = !old_props || old_props->value != props.value;
     const bool disabled_changed = !old_props || old_props->disabled != props.disabled;
+    // The switch draws as a bare box with an “x”: its label is the only words
+    // it has, so the shared `accessibilityLabel` names it for a screen reader
+    // (and the control's own generic name stands when none is set).
+    const auto label = ToHString(props.accessibilityLabel.value_or(""));
+    if (!label.empty()) {
+      winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(toggle_, label);
+    }
     if (value_changed) {
       syncing_ = true;
       value_ = props.value.value_or(false);

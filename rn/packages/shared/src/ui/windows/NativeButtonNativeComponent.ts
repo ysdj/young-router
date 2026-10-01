@@ -11,6 +11,14 @@ export interface NativeButtonProps extends ViewProps {
    * reads "Title ▾" while an ordinary button keeps its leading icon.
    */
   symbolTrailing?: WithDefault<boolean, false>;
+  /**
+   * The control's hover hint and its accessibility name.  An icon-only button
+   * has no visible words, and a busy wheel's wording rides this hint, so an
+   * empty value falls back to the button's own title the way the macOS
+   * control already does.
+   */
+  toolTip?: string;
+  accessibilityLabel?: string;
   disabled?: WithDefault<boolean, false>;
   /**
    * The button's own action is running. The control keeps its title, width,

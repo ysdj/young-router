@@ -31,6 +31,7 @@ struct LiteLLMWinUITextInputProps : winrt::implements<LiteLLMWinUITextInputProps
        secureTextEntry = cloneFromProps->secureTextEntry;
        search = cloneFromProps->search;
        disabled = cloneFromProps->disabled;
+       accessibilityLabel = cloneFromProps->accessibilityLabel;
        keyboardType = cloneFromProps->keyboardType;
        onChangeText = cloneFromProps->onChangeText;
        onBlur = cloneFromProps->onBlur;
@@ -59,6 +60,9 @@ struct LiteLLMWinUITextInputProps : winrt::implements<LiteLLMWinUITextInputProps
 
   REACT_FIELD(disabled)
   std::optional<bool> disabled{};
+
+  REACT_FIELD(accessibilityLabel)
+  std::optional<std::string> accessibilityLabel;
 
   REACT_FIELD(keyboardType)
   std::optional<std::string> keyboardType;

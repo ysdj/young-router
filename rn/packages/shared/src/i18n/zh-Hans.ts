@@ -359,6 +359,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "runtime.outOfRange": "请输入 {min} - {max} 之间的值",
   "runtime.resetToDefault": "恢复默认值",
   "runtime.fixInvalidBeforeClose": "有格式不正确的设置，请修正后再关闭。",
+  "runtime.fixInvalidBeforeLeaving": "有格式不正确的设置，请修正后再离开该面板。",
   "runtime.secretRetained": "现有密钥会保留，直到被替换或清除。",
   "runtime.jsonPlaceholder": "在这里粘贴或输入 JSON；保存时会校验配置。",
   "runtime.jsonDefaultHint": "清除输入框即可恢复内置模板。",
