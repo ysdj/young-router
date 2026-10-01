@@ -21,7 +21,7 @@ type NativeModule = {
   saveFilePicker?: (suggestedName: string) => Promise<string | undefined>;
   showActionMenu?: (title: string, items: string[], anchor: NativeMenuAnchor) => Promise<number | undefined>;
   showGroupedActionMenu?: (title: string, groups: Array<{ title: string; items: string[] }>, anchor: NativeMenuAnchor) => Promise<{ group: number; item: number } | undefined>;
-  showConfirmation?: (title: string, message: string, confirmLabel: string, destructive: boolean) => Promise<boolean>;
+  showConfirmation?: (title: string, message: string, confirmLabel: string, cancelLabel: string, destructive: boolean) => Promise<boolean>;
   showReadOnlyText?: (title: string, text: string, closeLabel: string, language: "json" | "toml" | "text", html: string) => Promise<void>;
   showProviderAuth?: (options: {
     provider: "openai" | "claude";
@@ -152,7 +152,7 @@ const nativeBridge: NativeLeafBridge = {
   saveFilePicker: async (suggestedName) => leaf.saveFilePicker?.(suggestedName),
   showActionMenu: async (title, items, anchor) => leaf.showActionMenu?.(title, items, anchor),
   showGroupedActionMenu: async (title, groups, anchor) => leaf.showGroupedActionMenu?.(title, groups, anchor),
-  showConfirmation: async (title, message, confirmLabel, destructive) => leaf.showConfirmation?.(title, message, confirmLabel, destructive === true) ?? false,
+  showConfirmation: async (title, message, confirmLabel, cancelLabel, destructive) => leaf.showConfirmation?.(title, message, confirmLabel, cancelLabel, destructive === true) ?? false,
   showReadOnlyText: async (title, text, closeLabel, language, html) => {
     if (!leaf.showReadOnlyText) throw new Error("The native code viewer is unavailable.");
     await leaf.showReadOnlyText(title, text, closeLabel, language, html);

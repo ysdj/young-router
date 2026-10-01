@@ -880,5 +880,71 @@ model_list:
             self.assertNotIn("replace-materialized-credential", json.dumps(domain.snapshot()))
 
 
+    def test_one_followed_route_locks_the_whole_groups_hand_ordering(self) -> None:
+        """A group holding a multiplier route cannot be permuted at all.
+
+        The followed route's order is the station's multiplier, not a typed
+        number, so permuting the group's values would either drop that route
+        from the order or invent a number for it.  The pane reads the same
+        snapshot the routes table does, so it reads the lock before it offers
+        ↑/↓ on the group's plain route.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            domain = ProvidersModelsDomain(Path(directory) / "config.yaml")
+            provider_id = domain.dispatch(
+                "provider.add",
+                {
+                    "provider": {
+                        "name": "provider-a",
+                        "enabled": True,
+                        "api_base": "https://relay.example.test/v1",
+                        "api_keys": [{"name": "independent", "value": "sk-independent-fixture"}],
+                        "models": [],
+                    }
+                },
+            )["providers"][0]["id"]
+            followed_id = domain.dispatch(
+                "model.add",
+                {
+                    "provider_id": provider_id,
+                    "model": {"name": "public-chat", "upstream_model": "upstream-chat", "api_key_name": "independent"},
+                },
+            )["providers"][0]["models"][0]["id"]
+            domain.dispatch(
+                "model.select_relay_resource",
+                {"provider_id": provider_id, "model_id": followed_id, "source": relay_source()},
+            )
+            plain_id = domain.dispatch(
+                "model.add",
+                {
+                    "provider_id": provider_id,
+                    "model": {"name": "public-chat", "upstream_model": "upstream-chat-2", "api_key_name": "independent"},
+                },
+            )["providers"][0]["models"][1]["id"]
+            domain.dispatch(
+                "model.patch",
+                {"provider_id": provider_id, "model_id": followed_id, "changes": {"order_mode": "relay_multiplier"}},
+            )
+
+            modes = {
+                str(model["id"]): str(model["order_mode"])
+                for model in domain.snapshot()["providers"][0]["models"]
+            }
+            self.assertEqual("relay_multiplier", modes[followed_id])
+            self.assertEqual("manual", modes[plain_id])
+
+            for renumber in (False, True):
+                with self.assertRaises(DomainError):
+                    domain.dispatch(
+                        "routes.reorder_group",
+                        {
+                            "public_model": "public-chat",
+                            "route_ids": [plain_id, followed_id],
+                            **({"renumber": True} if renumber else {}),
+                        },
+                    )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2078,15 +2078,38 @@ class ProvidersModelsDomain:
         if isinstance(direct, Mapping):
             direct = direct.get("deployment_id", direct.get("model_name", direct.get("id")))
         if isinstance(direct, str):
-            for index, model in enumerate(models):
-                if not isinstance(model, Mapping):
-                    continue
-                if direct in {
-                    str(model.get("deployment_id", "")),
-                    str(model.get("model_name", "")),
-                    self._editor_id(model, model=True),
-                }:
-                    return index
+            direct = direct.strip()
+            if direct:
+                # The identities a document persists decide their own row; a
+                # public name is the weaker identity and answers only while
+                # exactly one route carries it.  A group is by design several
+                # routes under one name, so "the first one" was never an answer
+                # the caller could have meant.
+                matched_id = next(
+                    (
+                        index
+                        for index, model in enumerate(models)
+                        if isinstance(model, Mapping)
+                        and direct in {
+                            str(model.get("deployment_id", "")),
+                            self._editor_id(model, model=True),
+                        }
+                    ),
+                    None,
+                )
+                if matched_id is not None:
+                    return matched_id
+                matched_name = [
+                    index
+                    for index, model in enumerate(models)
+                    if isinstance(model, Mapping) and str(model.get("model_name", "")) == direct
+                ]
+                if len(matched_name) > 1:
+                    raise DomainError(
+                        "Several routes serve this public model; select one by its route id"
+                    )
+                if matched_name:
+                    return matched_name[0]
         raise DomainError("The selected model is unavailable")
 
     @classmethod
@@ -3276,7 +3299,12 @@ class ProvidersModelsDomain:
             pending_token = str(
                 provider.pop("pending_api_key", data.get("pending_api_key", "")) or ""
             ).strip()
-            pending_keys = self._take_pending_provider_keys(pending_token) if pending_token else {}
+            # The staged value is read, not consumed: taking it is destructive,
+            # and a create Core refuses (a duplicate name, a non-custom source,
+            # a malformed key slot) must leave the wizard's token usable for the
+            # retry that follows the fix.  The token is popped once the provider
+            # is actually appended.
+            pending_keys = self._pending_provider_keys.get(pending_token, {}) if pending_token else {}
             if pending_token and not pending_keys:
                 raise DomainError("The staged API key is unavailable")
             # UI-created providers may request a safe key slot before their
@@ -3317,6 +3345,10 @@ class ProvidersModelsDomain:
             self._apply_auth_to_models(provider, auth["kind"])
             providers.append(provider)
             self._register_new_provider(provider)
+            # The token is one-time: the value it filed belongs to the create
+            # that just landed, and to nothing else.
+            if pending_token:
+                self._take_pending_provider_keys(pending_token)
             return
         if action in {"provider_patch", "patch_provider"}:
             index = self._provider_index(data)

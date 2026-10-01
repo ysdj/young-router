@@ -4279,9 +4279,18 @@ class RelayAccountsDomain:
             self._cache_station_keys(account["id"], candidates)
             # Resource IDs are derived from the upstream key ID. Prefer that
             # stable identifier over a display name: duplicate key names are
-            # legal and must not reveal or import the wrong credential.
+            # legal and must not reveal or import the wrong credential.  The
+            # comparison derives the id the same way the resource list did, so
+            # a station that names its keys with ``key_id`` answers here too.
             wanted_id = resource["id"].removeprefix("sub2api-")
-            candidate = next((item for item in candidates if str(item.get("id", "")).strip() == wanted_id), None)
+            candidate = next(
+                (
+                    item
+                    for index, item in enumerate(candidates)
+                    if self._resource_label(item, index, prefix="sub2api")[0].removeprefix("sub2api-") == wanted_id
+                ),
+                None,
+            )
             if candidate is None:
                 # A resource whose stored id was derived from the station's label
                 # (an older answer without key ids) is repaired by that label —
@@ -4297,8 +4306,11 @@ class RelayAccountsDomain:
                 ]
                 if len(named) == 1:
                     candidate = named[0]
-            if candidate is None and len(candidates) == 1:
-                candidate = candidates[0]
+            # No last-resort guess: a station whose only key carries neither the
+            # stored id nor the stored label has lost the key this resource
+            # names, and answering with some other key would materialize a
+            # credential onto a slot that never held it.  The slot is reported
+            # unavailable instead.
             key = candidate.get("key") if isinstance(candidate, Mapping) else None
             if not isinstance(key, str) or not key.strip():
                 raise RelayAccountsError("Relay API key is unavailable")

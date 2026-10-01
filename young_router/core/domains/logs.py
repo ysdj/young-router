@@ -37,7 +37,7 @@ MAX_READ_BYTES = 16 * 1024 * 1024
 MAX_VIEW_BYTES = 3 * 1024 * 1024
 DEFAULT_LINES = 10_000
 MAX_LINES = 100_000
-MAX_FILTER_BYTES = 256
+MAX_FILTER_CHARS = 256
 RECOVERY_HEARTBEAT_TTL_SECONDS = 45.0
 MENU_ACTIONS = frozenset(
     {
@@ -2426,7 +2426,11 @@ class LogsDomain:
             self._discard_clear("recovery")
         elif operation in {"set_filter", "filter"}:
             value = data.get("filter", data.get("query", ""))
-            if not isinstance(value, str) or len(value.encode("utf-8")) > MAX_FILTER_BYTES:
+            # The bound is the same 256 the IPC contract states: a filter is
+            # text, and counting its bytes refused a filter the schema had just
+            # accepted (86 CJK characters) with a message the pane could not
+            # translate.
+            if not isinstance(value, str) or len(value) > MAX_FILTER_CHARS:
                 raise LogsDomainError("Log filter is invalid")
             self._filters[str(tab)] = value.strip()
             self._discard_clear(str(tab))
