@@ -15,6 +15,16 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class SiteCustomizeTests(unittest.TestCase):
     def python(self) -> str:
+        # ``scripts/test.sh`` names the interpreter it selected in
+        # ``LITELLM_TEST_PYTHON``.  The bundled runtime's ``bin/python`` is a
+        # launcher that puts the runtime's own ``site-packages`` on PYTHONPATH
+        # before it execs the real interpreter, so resolving through
+        # ``sys.executable`` (that launcher's child) would leave every probe
+        # subprocess without LiteLLM, uvicorn, or httpx and fail a test that
+        # only ever meant to exercise sitecustomize.
+        selected = os.environ.get("LITELLM_TEST_PYTHON", "").strip()
+        if selected and Path(selected).exists():
+            return selected
         helper = ROOT / ".venv/bin/python"
         return str(helper if helper.exists() else sys.executable)
 
@@ -117,7 +127,12 @@ class SiteCustomizeTests(unittest.TestCase):
             result = self.run_probe(
                 runtime=runtime,
                 template=template,
-                pythonpath_extra=[template],
+                # The template root carries the module, and this runtime does not
+                # put that root on the import path.  The fallback the app adds
+                # for its own ``young_router.`` modules must not reach an
+                # unowned name: LiteLLM cannot import it here, so the
+                # ImportError has to travel out unchanged.
+                pythonpath_extra=[],
                 code=textwrap.dedent(
                     """
                     from litellm.proxy.types_utils.utils import get_instance_fn

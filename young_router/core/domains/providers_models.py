@@ -44,7 +44,12 @@ from ... import workbuddy as workbuddy_module
 from ...browser_identity import browser_request_headers
 from ...api_base import isolated_http_opener, service_root
 from ..persistence import atomic_write_text
-from ..security import REDACT_TEXT, redact, safe_error_message
+from ..security import (
+    REDACT_TEXT,
+    redact,
+    safe_error_message,
+    safe_exception_message,
+)
 from ._shared import (
     DomainError,
     _action_name,
@@ -1815,33 +1820,62 @@ class ProvidersModelsDomain:
         return result
 
     _PROBE_SURFACES: tuple[str, ...] = ("openai/responses", "openai/chat", "anthropic")
-    _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+    # The addresses this deployment serves itself.  A provider created for one
+    # of its own managed services carries the reference Core publishes for that
+    # worker (`os.environ/YOUNG_ROUTER_...`), never a literal URL.
+    _MANAGED_BASE_REFERENCES = frozenset(
+        f"os.environ/{name}" for name in workbuddy_module.API_BASE_ENV.values()
+    )
+
+    @classmethod
+    def _is_managed_service(
+        cls,
+        api_base: str,
+        model: Mapping[str, Any],
+        provider: Mapping[str, Any] | None,
+    ) -> bool:
+        """Whether an address belongs to a service this deployment runs itself."""
+
+        for source in (model, provider):
+            if not isinstance(source, Mapping):
+                continue
+            value = source.get("api_base")
+            if isinstance(value, str) and value.strip() in cls._MANAGED_BASE_REFERENCES:
+                return True
+        root = service_root(api_base)
+        if not isinstance(root, str) or not root:
+            return False
+        published = workbuddy_module.published_environment()
+        for name in workbuddy_module.API_BASE_ENV.values():
+            candidate = str(published.get(name, "")).strip()
+            if candidate and service_root(candidate) == root:
+                return True
+        return False
 
     @classmethod
     def _probe_surfaces(
         cls,
         api_base: str,
         model: Mapping[str, Any],
+        provider: Mapping[str, Any] | None = None,
     ) -> list[str]:
         """Choose the surfaces a probe may test.
 
-        A route served by this deployment's own loopback service exposes
-        exactly the surface the route was mounted on: asking it for the other
-        two protocols measures this app's own routing, not the remote service,
-        so the probe verifies the configured surface alone.
+        A route served by a service this deployment runs itself exposes exactly
+        the surface that service mounts: asking its loopback worker for the
+        other two protocols would measure this app's own plumbing and could
+        recommend a surface the worker never serves, so such a route is
+        verified on its configured surface alone.  Every other address is the
+        user's own upstream - a loopback server the user runs included - and
+        the probe asks it about every protocol it might speak, which is how a
+        local server that only serves Chat Completions is discovered.
         """
 
-        root = service_root(api_base)
-        if isinstance(root, str) and root:
-            try:
-                host = urlsplit(root).hostname or ""
-            except ValueError:
-                host = ""
-            if host in cls._LOOPBACK_HOSTS:
-                configured = str(model.get("upstream_url_surface", "")).strip()
-                if configured in cls._PROBE_SURFACES:
-                    return [configured]
-                return ["openai/chat"]
+        if cls._is_managed_service(api_base, model, provider):
+            configured = str(model.get("upstream_url_surface", "")).strip()
+            if configured in cls._PROBE_SURFACES:
+                return [configured]
+            return ["openai/chat"]
         return list(cls._PROBE_SURFACES)
 
     def _probe_model(
@@ -1857,7 +1891,7 @@ class ProvidersModelsDomain:
         api_base = self._model_api_base(provider, model)
         _key_name, credential = self._model_credential(provider, model)
         model_name = self._wire_model_name(model)
-        surfaces = self._probe_surfaces(api_base, model)
+        surfaces = self._probe_surfaces(api_base, model, provider)
 
         with ThreadPoolExecutor(max_workers=len(surfaces)) as executor:
             surface_futures = {
