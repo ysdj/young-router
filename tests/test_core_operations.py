@@ -871,9 +871,16 @@ class CoreOperationsTests(unittest.TestCase):
                     "PYTHONPATH": str(root),
                 }
             )
+            # The runner's own interpreter when it named one: the bundled
+            # runtime's ``bin/python`` puts the runtime's ``site-packages`` on
+            # PYTHONPATH before it execs the real interpreter, so launching
+            # ``sys.executable`` here would leave the child without LiteLLM and
+            # skip a test that only ever meant to check the callback import.
+            selected = os.environ.get("LITELLM_TEST_PYTHON", "").strip()
+            interpreter = selected if selected and Path(selected).exists() else sys.executable
             completed = subprocess.run(
                 [
-                    sys.executable,
+                    interpreter,
                     "-c",
                     (
                         "from litellm.proxy.types_utils.utils import get_instance_fn; "
