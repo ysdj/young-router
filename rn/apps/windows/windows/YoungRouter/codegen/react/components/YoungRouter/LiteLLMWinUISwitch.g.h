@@ -27,6 +27,7 @@ struct LiteLLMWinUISwitchProps : winrt::implements<LiteLLMWinUISwitchProps, winr
        auto cloneFromProps = cloneFrom.as<LiteLLMWinUISwitchProps>();
        value = cloneFromProps->value;
        disabled = cloneFromProps->disabled;
+       accessibilityLabel = cloneFromProps->accessibilityLabel;
        onValueChange = cloneFromProps->onValueChange;  
      }
   }
@@ -40,6 +41,9 @@ struct LiteLLMWinUISwitchProps : winrt::implements<LiteLLMWinUISwitchProps, winr
 
   REACT_FIELD(disabled)
   std::optional<bool> disabled{};
+
+  REACT_FIELD(accessibilityLabel)
+  std::optional<std::string> accessibilityLabel;
 
    // These fields can be used to determine if JS has registered for this event
   REACT_FIELD(onValueChange)

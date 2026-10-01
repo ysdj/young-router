@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { Platform, PlatformColor, StyleSheet, Text, View } from "react-native";
+import { Platform, PlatformColor, Pressable, StyleSheet, Text, View } from "react-native";
 import type { CoreSnapshot, NativeLeafAdapter, RelayGroupManagerResult } from "../types";
 import { NativeButton, NativeCheckbox, NativePicker, NativeTable, NativeTextField } from "./NativeControls";
 import { usePendingAction } from "./pendingAction";
@@ -414,6 +414,10 @@ export function ApiKeyCreateDialog({ visible, groups, disabled, onClose, onCreat
   const selectedGroup = groupOptions.find((group) => group.id === groupID) ?? groupOptions[0];
   return <RelayDialogLayer visible={visible} onRequestClose={onClose}>
     <View style={styles.dialogBackdrop}>
+      {/* The dimmed area outside the card is the dialog's own dismiss target:
+          clicking it closes the dialog instead of a click being swallowed by
+          the layer.  The card is rendered after this, so it stays on top. */}
+      <Pressable accessible={false} onPress={onClose} style={StyleSheet.absoluteFill} />
       <View style={[styles.decisionDialog, styles.apiKeyCreateDialog]} accessibilityViewIsModal>
         <View style={[styles.dialogHeader, styles.apiKeyDialogHeader]}>
           <View style={styles.apiKeyDialogTitleWrap}>
@@ -493,6 +497,9 @@ export function DependencyPolicyDialog<T extends string>({ visible, title, messa
   const selectedOption = options.find((option) => option.value === value) ?? options[0];
   return <RelayDialogLayer visible={visible} onRequestClose={onClose}>
     <View style={styles.dialogBackdrop}>
+      {/* Same dismiss target as the key dialog: the scrim belongs to the
+          question it dims, and a click on it is an answer. */}
+      <Pressable accessible={false} onPress={onClose} style={StyleSheet.absoluteFill} />
       <View style={styles.decisionDialog} accessibilityViewIsModal>
         <View style={styles.dialogHeader}><Text style={styles.dialogTitle}>{title}</Text><NativeButton title={translate("status.close")} symbol="close" compact disabled={disabled} onPress={onClose} style={styles.dialogClose} /></View>
         <View style={styles.decisionContent}>

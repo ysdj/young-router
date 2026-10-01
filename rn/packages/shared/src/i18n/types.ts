@@ -373,6 +373,7 @@ export type TranslationKey =
   | "runtime.outOfRange"
   | "runtime.resetToDefault"
   | "runtime.fixInvalidBeforeClose"
+  | "runtime.fixInvalidBeforeLeaving"
   | "runtime.secretRetained"
   | "runtime.jsonPlaceholder"
   | "runtime.jsonDefaultHint"
