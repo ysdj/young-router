@@ -66,9 +66,20 @@ FIXTURE_MODULE = textwrap.dedent(
 FIXTURE_BANK = {"schema": "fixture", "models": {"gpt-6-astra": {"family": "gpt"}}}
 
 
-def build_archive(destination: Path, *, module_text: str = FIXTURE_MODULE, prompt: str = "produce 315 integers\n") -> Path:
+def build_archive(
+    destination: Path,
+    *,
+    module_text: str = FIXTURE_MODULE,
+    prompt: str = "produce 315 integers\n",
+    data_files: dict[str, str] | None = None,
+) -> Path:
     """A minimal TraceOne archive with the layout the updater reads."""
 
+    documents = data_files if data_files is not None else {
+        "unified_bank.json": json.dumps(FIXTURE_BANK),
+        "codex_low_v4_adapter_415.json": '{"targets": []}',
+        "codex_low_v4_support_415.json": '{"support": {}}',
+    }
     with tarfile.open(destination, "w:gz") as archive:
         def add(name: str, payload: bytes) -> None:
             info = tarfile.TarInfo(f"TraceOne-{FIXTURE_REVISION}/{name}")
@@ -76,9 +87,8 @@ def build_archive(destination: Path, *, module_text: str = FIXTURE_MODULE, promp
             archive.addfile(info, io.BytesIO(payload))
 
         add("dist/traceone.js", module_text.encode("utf-8"))
-        add("dist/data/unified_bank.json", json.dumps(FIXTURE_BANK).encode("utf-8"))
-        add("dist/data/codex_low_v4_adapter_415.json", b'{"targets": []}')
-        add("dist/data/codex_low_v4_support_415.json", b'{"support": {}}')
+        for name, document in documents.items():
+            add(f"dist/data/{name}", document.encode("utf-8"))
         add("prompts/identity-web-v1.txt", prompt.encode("utf-8"))
     return destination
 
@@ -133,6 +143,76 @@ class TraceOneVendorTests(unittest.TestCase):
         )
         self.assertNotEqual(0, completed.returncode)
         self.assertIn("TARGET_MODELS", completed.stderr + completed.stdout)
+
+    def test_staging_accepts_the_two_document_release_without_a_support_artifact(self) -> None:
+        """The 2026-10 release folded the support statistics into the adapter."""
+
+        module = textwrap.dedent(
+            """
+            export const TARGET_MODELS = ["gpt-6-astra"];
+            export function parseGridResponse(text) { return {}; }
+            export function identifyWithArtifacts(text, artifacts) { return { status: "unknown" }; }
+            const documents = [
+              new URL("./data/unified_bank_v2_16.json", import.meta.url),
+              new URL("./data/codex_low_v8_optimized.json", import.meta.url),
+            ];
+            """
+        ).lstrip()
+        archive = build_archive(
+            Path(self.directory) / "optimized.tar.gz",
+            module_text=module,
+            data_files={
+                "unified_bank_v2_16.json": json.dumps({"schema": "robust-number-fingerprint-bank", "models": {}}),
+                "codex_low_v8_optimized.json": json.dumps(
+                    {
+                        "schema": "traceone-sequence-adapter-v1",
+                        "models": ["gpt-6-astra"],
+                        "support": {"thresholds": [1.0], "calibration_distances": [[0.1]]},
+                    }
+                ),
+                "unrelated_release_notes.json": json.dumps({"schema": "notes"}),
+            },
+        )
+        output = Path(self.directory) / "optimized"
+        completed = subprocess.run(
+            [sys.executable, str(UPDATER), "--output", str(output), "--archive-url", str(archive), "--no-smoke-test"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr + completed.stdout)
+        self.assertTrue((output / "data/unified_bank_v2_16.json").is_file())
+        self.assertTrue((output / "data/codex_low_v8_optimized.json").is_file())
+        # Only the documents the classifier plays a role in, or reads, are staged.
+        self.assertFalse((output / "data/unrelated_release_notes.json").exists())
+
+    def test_staging_fails_when_the_module_reads_a_document_the_archive_lacks(self) -> None:
+        module = textwrap.dedent(
+            """
+            export const TARGET_MODELS = ["gpt-6-astra"];
+            export function parseGridResponse(text) { return {}; }
+            export function identifyWithArtifacts(text, artifacts) { return { status: "unknown" }; }
+            const documents = [new URL("./data/codex_low_v9_optimized.json", import.meta.url)];
+            """
+        ).lstrip()
+        archive = build_archive(
+            Path(self.directory) / "dangling.tar.gz",
+            module_text=module,
+            data_files={
+                "unified_bank_v3_1.json": json.dumps({"schema": "robust-number-fingerprint-bank", "models": {}}),
+                "codex_low_v8_optimized.json": json.dumps(
+                    {"schema": "traceone-sequence-adapter-v1", "models": ["gpt-6-astra"], "support": {}}
+                ),
+            },
+        )
+        completed = subprocess.run(
+            [sys.executable, str(UPDATER), "--output", str(Path(self.directory) / "dangling"), "--archive-url", str(archive), "--no-smoke-test"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(0, completed.returncode)
+        self.assertIn("does not carry", completed.stderr + completed.stdout)
 
     def test_manifest_drives_the_route_lookup(self) -> None:
         output = Path(self.directory) / "staged"

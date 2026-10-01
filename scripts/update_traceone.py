@@ -17,16 +17,21 @@ The staged layout consumed by ``young_router/traceone.py``::
     traceone.js                              dist/traceone.js
     prompt.txt                               prompts/identity-web-v1.txt
     manifest.json                            staging record
-    data/<artifact>.json                     every dist/data/*.json artifact, by
-                                             the role its file name declares
-                                             (bank / adapter / support)
+    data/<artifact>.json                     every dist/data/*.json artifact the
+                                             classifier reads, by the role it
+                                             declares (bank / adapter / support)
 
-The artifact file names are discovered instead of pinned: upstream renames them
+The artifact documents are discovered instead of pinned: upstream renames them
 on classifier revisions (``unified_bank.json`` became ``unified_bank_v2_16.json``,
-``codex_low_v4_adapter_415.json`` became ``codex_low_v7_adapter_791.json``), and a
-build that hard-codes the old spelling would fail on a rename the engine itself
-handles.  Each role has to resolve to exactly one artifact, so a genuinely
-dropped role still fails the build.
+``codex_low_v4_adapter_415.json`` became ``codex_low_v7_adapter_791.json`` and
+then ``codex_low_v8_optimized.json``), and a build that hard-codes the old
+spelling would fail on a rename the engine itself handles.  A document that
+declares its own ``schema`` names its role, and ````bank``/``adapter`` each have to
+resolve to exactly one document — a genuinely dropped role still fails the
+build.  A separate ``support`` document is optional: the 2026-10 release folded
+those statistics into the adapter itself.  Whatever the staged module fetches
+from ``./data/`` is staged with it, so a document the engine reads is never left
+behind by a rename these rules do not know about.
 
 ``TRACEONE_ARCHIVE_URL`` (or ``--archive-url``) points at an explicit archive
 for offline and unit-test fixtures; the same environment variable family is
@@ -64,21 +69,36 @@ DEFAULT_REF = "main"
 DEFAULT_TIMEOUT_SECONDS = 180
 USER_AGENT = "Young-Router/traceone-build"
 
-# The module and the prompt are pinned by path; the classifier artifacts are
-# discovered by the role their file name declares.
+# The module and the prompt are pinned by path; the classifier documents are
+# resolved by the role they declare.  A release whose documents carry their own
+# ``schema`` is named by it (``robust-number-fingerprint-bank``,
+# ``traceone-sequence-adapter-v1``); an older release is resolved by the file
+# name spelling it shipped.
 REQUIRED_DIST_FILES = ("dist/traceone.js",)
 PROMPT_SOURCE = "prompts/identity-web-v1.txt"
 PROMPT_TARGET = "prompt.txt"
 MANIFEST_TARGET = "manifest.json"
 DATA_PREFIX = "dist/data/"
 
-# One artifact per role: ``bank`` carries the reference fingerprints, and
-# ``adapter``/``support`` are the fitted documents that shape the comparison.
+DATA_SCHEMA_ROLES = {
+    "robust-number-fingerprint-bank": "bank",
+    "traceone-sequence-adapter-v1": "adapter",
+}
+
+# ``bank`` carries the reference fingerprints and ``adapter`` the fitted
+# document that shapes the comparison.  The separate ``support`` document is
+# optional: the 2026-10 release folded those statistics into the adapter
+# itself, so a release without one is complete, not broken.
 DATA_ROLE_PATTERNS = {
     "bank": re.compile(r"unified_bank[^/]*\.json$"),
     "adapter": re.compile(r"_adapter_[^/]*\.json$"),
     "support": re.compile(r"_support_[^/]*\.json$"),
 }
+REQUIRED_DATA_ROLES = ("bank", "adapter")
+# The staged module loads its artifacts itself, so the names it fetches are the
+# staged set's authority: a document the engine reads must be staged whether or
+# not its name still matches a role spelling.
+DATA_REFERENCE_PATTERN = re.compile(r"[./]*data/([A-Za-z0-9._-]+\.json)")
 
 TARGET_MODELS_PATTERN = re.compile(r"export const TARGET_MODELS = \[(.*?)\]", re.S)
 STRING_LITERAL_PATTERN = re.compile(r"[\"']([^\"']+)[\"']")
@@ -163,30 +183,68 @@ def extract(archive: bytes) -> dict[str, bytes]:
             members_for_data = sorted(
                 name for name in members if name.endswith(".json") and f"/{DATA_PREFIX}" in name
             )
-            for _role, name in data_roles(members_for_data).items():
+            data_payloads: dict[str, bytes] = {}
+            for name in members_for_data:
                 handle = archive_file.extractfile(members[name])
                 if handle is None:
                     raise SystemExit(f"The TraceOne archive entry is unreadable: {name}")
-                files[staged_data_name(name)] = handle.read()
+                data_payloads[name] = handle.read()
+            module_text = files["dist/traceone.js"].decode("utf-8", errors="replace")
+            for name in sorted(data_roles(data_payloads, module_text).values()):
+                files[staged_data_name(name)] = data_payloads[name]
             return files
     except tarfile.TarError as exc:
         raise SystemExit(f"The TraceOne archive could not be read: {exc}") from exc
 
 
-def data_roles(names: list[str]) -> dict[str, str]:
-    """Resolve each classifier artifact role to exactly one archive member."""
+def artifact_role(name: str, payload: bytes) -> str:
+    """The role one archive data document plays, or an empty string.
+
+    A document that declares its own ``schema`` names its role, so a rename
+    never moves the document out of its role; an older document is recognised
+    by the file name spelling it shipped with.
+    """
+
+    try:
+        document = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        document = None
+    if isinstance(document, dict):
+        schema = document.get("schema")
+        if isinstance(schema, str) and schema in DATA_SCHEMA_ROLES:
+            return DATA_SCHEMA_ROLES[schema]
+    for role, pattern in DATA_ROLE_PATTERNS.items():
+        if pattern.search(name):
+            return role
+    return ""
+
+
+def data_roles(data_payloads: dict[str, bytes], module_text: str = "") -> dict[str, str]:
+    """Resolve each classifier document role to exactly one archive member."""
 
     roles: dict[str, str] = {}
-    for role, pattern in DATA_ROLE_PATTERNS.items():
-        matches = [name for name in names if pattern.search(name)]
-        if not matches:
-            raise SystemExit(f"The TraceOne archive has no {role} artifact under {DATA_PREFIX}")
-        if len(matches) > 1:
+    for name, payload in sorted(data_payloads.items()):
+        role = artifact_role(name, payload)
+        if not role:
+            continue
+        existing = roles.get(role)
+        if existing is not None:
             raise SystemExit(
                 f"The TraceOne archive declares more than one {role} artifact: "
-                + ", ".join(sorted(matches))
+                + ", ".join(sorted({existing, name}))
             )
-        roles[role] = matches[0]
+        roles[role] = name
+    for role in REQUIRED_DATA_ROLES:
+        if role not in roles:
+            raise SystemExit(f"The TraceOne archive has no {role} artifact under {DATA_PREFIX}")
+    staged_names = {name.rsplit("/", 1)[-1]: name for name in data_payloads}
+    for referenced in sorted(set(DATA_REFERENCE_PATTERN.findall(module_text))):
+        name = staged_names.get(referenced)
+        if name is None:
+            raise SystemExit(
+                f"The TraceOne module reads {referenced}, which the archive does not carry"
+            )
+        roles.setdefault(f"data:{referenced}", name)
     return roles
 
 
