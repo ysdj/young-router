@@ -23,6 +23,14 @@ if [[ -n "${LITELLM_TEST_PYTHON:-}" ]]; then
 elif [[ -x "${YOUNG_ROUTER_BUNDLED_TEST_PYTHON:-/Applications/Young Router.app/Contents/Resources/Core/runtime/bin/python}" ]] \
   && "${YOUNG_ROUTER_BUNDLED_TEST_PYTHON:-/Applications/Young Router.app/Contents/Resources/Core/runtime/bin/python}" -c 'import yaml, litellm' >/dev/null 2>&1; then
   TEST_COMMAND=("${YOUNG_ROUTER_BUNDLED_TEST_PYTHON:-/Applications/Young Router.app/Contents/Resources/Core/runtime/bin/python}")
+  # The bundled runtime's ``bin/python`` is a launcher: it puts the runtime's
+  # own ``site-packages`` on PYTHONPATH before it execs the real interpreter,
+  # so a probe that launches ``sys.executable`` (that launcher's child) has no
+  # LiteLLM, uvicorn, or httpx.  Name the interpreter this run selected, the
+  # way an explicitly supplied ``LITELLM_TEST_PYTHON`` already is, so the
+  # probes in tests/test_sitecustomize.py and the relocated-callback test in
+  # tests/test_core_operations.py launch through the same launcher.
+  export LITELLM_TEST_PYTHON="${YOUNG_ROUTER_BUNDLED_TEST_PYTHON:-/Applications/Young Router.app/Contents/Resources/Core/runtime/bin/python}"
 elif command -v uv >/dev/null 2>&1; then
   TEST_COMMAND=(
     uv run --python 3.12
