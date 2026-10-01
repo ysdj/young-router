@@ -1025,7 +1025,7 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
   useEffect(() => {
     if (!isPrimaryHost) return;
     native.setLocalization({
-      appTitle: translate("app.title"), about: translate("status.about"), autoStart: translate("status.autoStart"), serviceUnavailable: translate("error.coreUnavailable"),
+      appTitle: translate("app.title"), about: translate("status.about"), autoStart: translate("status.autoStart"), codexModelCatalog: translate("status.codexModelCatalog"), serviceUnavailable: translate("error.coreUnavailable"),
       serviceStatus: translate("service.status", { status: "{status}" }),
       serviceStarting: translate("service.starting"), serviceRunning: translate("service.running"),
       serviceRunningOnPort: translate("service.runningOnPort", { port: "{port}" }),
@@ -1040,6 +1040,7 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
       reload: translate("status.reload"), closeWindow: translate("status.close"), menuQuit: translate("status.quit"), version: translate("common.version"),
       build: translate("common.build"), ok: translate("common.ok"), invalidText: translate("common.invalidText"),
       routeHome: translate("route.home"), routeProvidersModels: translate("card.providersModels"),
+      routeGeneralSettings: translate("status.general"),
       routeCodexSettings: translate("status.codex"), routeClaudeSettings: translate("card.claudeSettings"),
       routeRuntimeSettings: translate("card.runtimeSettings"),
       routeDataManagement: translate("card.dataManagement"), routeProviderWizard: translate("providers.wizard.title"), routeFileEditor: translate("settings.editFile"), routeLogs: translate("card.logs"),

@@ -106,7 +106,7 @@ private enum NativeRelayOriginPolicy {
     private static let statusMenuOrder = [
         "status", "separator",
         "toggle-autostart", "toggle-codex-model-catalog", "separator",
-        "open-providers-models", "open-runtime-settings", "open-codex-settings", "separator",
+        "open-general-settings", "open-providers-models", "open-runtime-settings", "open-codex-settings", "separator",
         "webdav-status", "open-data-management", "separator",
         "open-logs", "separator",
         "show-version", "quit",
@@ -2331,6 +2331,7 @@ private enum NativeRelayOriginPolicy {
 
     private func menuTitle(for id: String, fallback: String) -> String {
         switch id {
+        case "open-general-settings": return localized("routeGeneralSettings", fallback: fallback)
         case "open-providers-models": return localized("routeProvidersModels", fallback: fallback)
         case "open-runtime-settings": return localized("routeRuntimeSettings", fallback: fallback)
         case "open-codex-settings": return localized("routeCodexSettings", fallback: fallback)
@@ -2344,7 +2345,8 @@ private enum NativeRelayOriginPolicy {
     private func menuFallback(for id: String) -> String? {
         switch id {
         case "toggle-autostart": return localized("autoStart", fallback: "Auto Start at Login")
-        case "toggle-codex-model-catalog": return "Use LiteLLM models in Codex"
+        case "toggle-codex-model-catalog": return localized("codexModelCatalog", fallback: "Use LiteLLM models in Codex")
+        case "open-general-settings": return localized("routeGeneralSettings", fallback: "General")
         case "open-providers-models": return localized("routeProvidersModels", fallback: "Providers & Models")
         case "open-runtime-settings": return localized("routeRuntimeSettings", fallback: "Runtime")
         case "open-codex-settings": return localized("routeCodexSettings", fallback: "External")
@@ -2537,7 +2539,11 @@ private enum NativeRelayOriginPolicy {
     }
 
     private func updateActivationPolicy() {
-        if routeWindows.isEmpty {
+        // A warm window is registered but ordered out: it must not keep the app
+        // in the Dock with nothing on screen after the settings window closes.
+        // A presented window — including a warm one the user just opened — must.
+        let presented = routeWindows.values.contains { $0.isVisible }
+        if !presented {
             NSApp.setActivationPolicy(.accessory)
             return
         }
@@ -5824,6 +5830,12 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
             )
         }
         webView = WKWebView(frame: .zero, configuration: configuration)
+        // The one browser identity this app presents.  A station can bind a
+        // session to its IP and User-Agent (sub2api's session binding), so the
+        // page that creates the session must send the same identity as every
+        // later probe, dashboard read, and usage call — otherwise the session
+        // it established is revoked on the first request this app makes.
+        webView.customUserAgent = RelayBrowserIdentity.userAgent
         panel = embeddedWindow == nil ? NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: 900, height: 700),
             styleMask: [.titled, .closable, .resizable],
