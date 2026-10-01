@@ -37,6 +37,8 @@ import { pathToFileURL } from 'node:url'
 import { dirname, join, resolve } from 'node:path'
 import { Readable } from 'node:stream'
 
+import { normalizeChatCompletionStreamLine } from './workbuddy_stream.mjs'
+
 const REQUEST_BODY_LIMIT = 64 * 1024 * 1024
 
 function parseArguments(argv) {
@@ -329,12 +331,25 @@ class VariantRuntime {
         Connection: 'keep-alive',
         'X-Accel-Buffering': 'no',
       })
-      await new Promise((resolvePipe, rejectPipe) => {
-        const readable = Readable.fromWeb(upstream.body)
-        readable.on('error', rejectPipe)
-        readable.on('end', resolvePipe)
-        readable.pipe(res)
-      })
+      // The shim states every delta field it knows, including empty ones, and a
+      // reasoning frame therefore carries ``content: ""``.  A client reads that
+      // as "the answer started" and closes the thinking block it just opened,
+      // so one fragment became one collapsed 深度思考 row; the shaper drops the
+      // empty fields and leaves every other frame byte-for-byte.
+      const decoder = new TextDecoder()
+      let buffer = ''
+      for await (const chunk of Readable.fromWeb(upstream.body)) {
+        buffer += decoder.decode(chunk, { stream: true })
+        let newline = buffer.indexOf('\n')
+        while (newline !== -1) {
+          res.write(normalizeChatCompletionStreamLine(buffer.slice(0, newline + 1)))
+          buffer = buffer.slice(newline + 1)
+          newline = buffer.indexOf('\n')
+        }
+      }
+      buffer += decoder.decode()
+      if (buffer) res.write(normalizeChatCompletionStreamLine(buffer))
+      res.end()
       return
     }
     let model = ''
