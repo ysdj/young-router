@@ -4830,6 +4830,37 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # A tab switch starts from that tab's own filter.
         self.assertIn("filterDirty.current = false;\n  }, [selected]);", logs)
 
+    def test_a_non_numeric_order_stays_in_the_field_instead_of_becoming_zero(self) -> None:
+        """The model inspector's 顺序 field validates like every number field.
+
+        A draft that was not a number used to be committed as 0 (first slot),
+        silently reordering the group; the shared TextField now takes a
+        commit-time validator and draws the message in its own row.
+        """
+
+        self.assertIn("validate?: (next: string) => string | undefined; style?: StyleProp<ViewStyle> }): React.JSX.Element", self.ui)
+        self.assertIn("const field = usePendingTextField(value, onCommit, label, onDraftChange, validate);", self.ui)
+        self.assertIn('{field.error !== undefined ? <Text style={[styles.fieldError, hintStyle]} accessibilityLiveRegion="polite">{field.error}</Text> : null}', self.ui)
+        self.assertIn("field.error !== undefined && styles.inputInvalid", self.ui)
+        inspector = self.ui.split("function ModelInspector(", 1)[1].split("function HelpTip(", 1)[0]
+        self.assertIn("validate={(nextOrder) => {", inspector)
+        self.assertIn('const trimmed = nextOrder.trim();\n          return trimmed === "" || Number.isFinite(Number(trimmed)) ? undefined : translate("runtime.invalidNumber");', inspector)
+        self.assertIn("const parsed = Number(nextOrder.trim());", inspector)
+
+    def test_a_login_item_the_host_refused_hands_cores_preference_back(self) -> None:
+        """Launch-at-login is two-sided; a failed host side is rolled back.
+
+        Core records the preference and the host registers the login item.  A
+        host that refused the registration used to leave Core claiming an
+        autostart the system would never perform; the pane now dispatches the
+        opposite preference, exactly as the status menu's own toggle does.
+        """
+
+        general = self.ui.split("function GeneralWorkspace(", 1)[1].split("\nfunction ", 1)[0]
+        self.assertIn("await native.setLaunchAtLogin(enabled);", general)
+        self.assertIn("await dispatchServiceAction(enabled ? \"service.autostart_disable\" : \"service.autostart_enable\");", general)
+        self.assertIn("throw hostReason;", general)
+
     def test_provider_table_columns_fit_the_fixed_provider_pane(self) -> None:
         self.assertIn('"providers.modelCount": "Count"', self.en)
         self.assertIn('"providers.modelCount": "模型数"', self.zh)
