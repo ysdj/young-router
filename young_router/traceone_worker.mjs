@@ -37,34 +37,60 @@ function readRequest(raw) {
 }
 
 /**
- * Load the three classifier artifacts by the role their file name declares.
+ * Load the classifier documents the staged module reads.
  *
- * The names carry the classifier revision (`unified_bank_v2_16.json`,
- * `codex_low_v7_adapter_791.json`), so pinning them here would break on every
- * upstream revision the engine itself handles.  A role that is missing or
- * ambiguous is an error: the caller must not silently classify with the wrong
- * document.
+ * A document that declares its own `schema` names its role, so a rename never
+ * moves it out of its role; an older document is recognised by the file name
+ * spelling it shipped with.  `bank` and `adapter` are required and each has to
+ * resolve to exactly one document.  A separate `support` document is optional:
+ * the 2026-10 release folded those statistics into the adapter itself, so the
+ * engine is complete without one.
  */
 async function readArtifacts(directory) {
   const dataDirectory = path.join(directory, "data");
   const names = (await readdir(dataDirectory)).filter((name) => name.endsWith(".json"));
-  const role = (pattern) => {
-    const matches = names.filter((name) => pattern.test(name));
-    if (matches.length !== 1) {
-      throw new Error(`expected exactly one ${pattern} artifact, found ${matches.length}`);
+  const documents = await Promise.all(
+    names.map(async (name) => {
+      const text = await readFile(path.join(dataDirectory, name), "utf8");
+      let schema = "";
+      try {
+        const parsed = JSON.parse(text);
+        if (parsed && typeof parsed === "object" && typeof parsed.schema === "string") {
+          schema = parsed.schema;
+        }
+      } catch {
+        schema = "";
+      }
+      return { name, text, schema };
+    }),
+  );
+  const roleOf = (document) => {
+    if (document.schema === "robust-number-fingerprint-bank") return "bank";
+    if (document.schema === "traceone-sequence-adapter-v1") return "adapter";
+    if (/unified_bank[^/]*\.json$/.test(document.name)) return "bank";
+    if (/_adapter_[^/]*\.json$/.test(document.name)) return "adapter";
+    if (/_support_[^/]*\.json$/.test(document.name)) return "support";
+    return "";
+  };
+  const role = (wanted, required) => {
+    const matches = documents.filter((document) => roleOf(document) === wanted);
+    if (matches.length > 1) {
+      throw new Error(`expected exactly one ${wanted} document, found ${matches.length}`);
+    }
+    if (matches.length === 0) {
+      if (required) throw new Error(`expected exactly one ${wanted} document, found 0`);
+      return null;
     }
     return matches[0];
   };
-  const bankName = role(/unified_bank[^/]*\.json$/);
-  const adapterName = role(/_adapter_[^/]*\.json$/);
-  const supportName = role(/_support_[^/]*\.json$/);
-  const read = (name) => readFile(path.join(dataDirectory, name), "utf8");
-  const [bank, adapter, support] = await Promise.all([
-    read(bankName),
-    read(adapterName),
-    read(supportName),
-  ]);
-  return { bank: JSON.parse(bank), adapter: JSON.parse(adapter), support: JSON.parse(support) };
+  const bank = role("bank", true);
+  const adapter = role("adapter", true);
+  const support = role("support", false);
+  return {
+    bank: JSON.parse(bank.text),
+    adapter: JSON.parse(adapter.text),
+    ...(support ? { support: JSON.parse(support.text) } : {}),
+  };
 }
 
 let requestId = null;
