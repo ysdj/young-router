@@ -424,7 +424,13 @@ def _entry_from_editor(
         api_key = api_key_item["value"] if api_key_item else ""
         api_key_name = api_key_item["name"] if api_key_item else ""
         provider_key_id = api_key_item["id"] if api_key_item else provider_key_id
-    if api_base:
+    # A route that states its own base keeps it: the provider's base is what a
+    # route without one inherits, and flattening an override onto it pointed the
+    # route at a different host than the file named.
+    model_api_base = normalize_configured_api_base(model.get("api_base", ""))
+    if model_api_base and model_api_base != api_base:
+        params["api_base"] = model_api_base
+    elif api_base:
         params["api_base"] = {"__alias__": _make_anchor_name(provider_name, "api_base")} if use_provider_aliases else api_base
     if api_key:
         params["api_key"] = (

@@ -23,6 +23,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from config_editor_core.schema import (
+    LITELLM_ADAPTER_PREFIXES,
     MENU_PROVIDER_AUTH_KEY,
     MENU_PROVIDER_SOURCE_KEY,
     MENU_RELAY_KEYS_KEY,
@@ -539,6 +540,11 @@ class ProvidersModelsDomain:
             existing_prefix, raw_name = name.split("/", 1)
             if existing_prefix in {"openai", "anthropic", "chatgpt"}:
                 name = raw_name.strip()
+            elif existing_prefix in LITELLM_ADAPTER_PREFIXES:
+                # An adapter this app does not manage stays exactly as the file
+                # states it; nesting it under openai/ would change which
+                # provider serves the route.
+                return name
         if not name:
             return ""
         prefix = cls._upstream_model_prefix(model, provider)
