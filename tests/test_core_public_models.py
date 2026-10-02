@@ -79,6 +79,58 @@ class PublicModelDomainTests(unittest.TestCase):
             if model["deployment_id"] == deployment_id
         )
 
+    def test_a_new_provider_and_model_default_to_enabled(self) -> None:
+        """A create that states no enabled flag is live, not parked.
+
+        The panes rely on this: ＋新建供应商 / ＋新建模型 send the new row
+        without an enabled flag (or with `enabled: true`), and a create that
+        came out disabled would need a second press before the row could serve.
+        """
+
+        created = self.domain.dispatch(
+            "provider.add",
+            {"provider": {"name": "Fresh Provider", "models": []}},
+        )
+        provider = next(
+            entry for entry in created["providers"] if entry["name"] == "Fresh Provider"
+        )
+        self.assertTrue(provider["enabled"])
+        provider_id = str(provider["id"])
+
+        added = self.domain.dispatch(
+            "model.add",
+            {
+                "provider_id": provider_id,
+                "model": {"name": "fresh-model", "upstream_model": "fresh-model", "order": 0},
+            },
+        )
+        model = next(
+            entry
+            for entry in added["providers"][-1]["models"]
+            if entry["model_name"] == "fresh-model"
+        )
+        self.assertTrue(model["enabled"])
+        self.assertTrue(model["model_enabled"])
+        # An explicitly parked row stays parked.
+        parked = self.domain.dispatch(
+            "model.add",
+            {
+                "provider_id": provider_id,
+                "model": {
+                    "name": "parked-model",
+                    "upstream_model": "parked-model",
+                    "enabled": False,
+                    "order": 1,
+                },
+            },
+        )
+        parked_model = next(
+            entry
+            for entry in parked["providers"][-1]["models"]
+            if entry["model_name"] == "parked-model"
+        )
+        self.assertFalse(parked_model["enabled"])
+
     def test_public_model_patch_writes_the_context_of_every_group_route(self) -> None:
         snapshot = self.domain.dispatch(
             "public.model_patch",
