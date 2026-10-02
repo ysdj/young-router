@@ -4176,13 +4176,12 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     if (!provider) return;
     const knownModelIds = new Set(models.map(editorIdentifier));
     pendingModelIds.current = { providerId, ids: knownModelIds };
-    // A new model is a draft, the way a new record is a draft in every
-    // create-then-configure surface: it is created **disabled** and carries the
-    // localized placeholder name (and that name as its upstream route), so
-    // pressing ＋ never raises a validation failure the user has to read — an
-    // entry whose key and names are not filled in yet is simply not live.  A
-    // disabled model never reaches the runtime model list, so the placeholder is
-    // never served to a client; the user finishes the row and enables it.
+    // A new model starts **enabled**: the user asked for rows to be live
+    // without a second press, and the placeholder name (carried as its own
+    // upstream route) keeps the document valid while the user fills it in —
+    // pressing ＋ never raises a validation failure.  The pane marks the row
+    // (`modelNeedsAttention`) and its inspector states what is left, so a
+    // placeholder name is never mistaken for a finished route.
     const base = translate("providers.newModel");
     const name = uniquePlaceholderName(models.map((item) => stringValue(item.model_name ?? item.name)), base);
     // The row inherits the key the user is working in — the selected model's
@@ -4195,7 +4194,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     const inheritedKey = modelProviderKeyState(model, provider)
       ?? providerKeyStates(provider).find((key) => key.id === selectedFetchKey)
       ?? providerKeyStates(provider)[0];
-    void dispatch("model.add", { provider_id: providerId, model: { name, upstream_model: name, enabled: false, order: 0, ...(inheritedKey ? { api_key_name: inheritedKey.name, provider_key_id: inheritedKey.id } : {}) } });
+    void dispatch("model.add", { provider_id: providerId, model: { name, upstream_model: name, enabled: true, order: 0, ...(inheritedKey ? { api_key_name: inheritedKey.name, provider_key_id: inheritedKey.id } : {}) } });
   };
   const addProvider = (): void => {
     // The pane commits every edit, so a new provider is valid the moment it
@@ -4207,7 +4206,9 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     pendingProviderIds.current = new Set(providers.map(editorIdentifier));
     setSelectedModel(undefined);
     setProviderSourceModel(undefined);
-    void dispatch("provider.add", { provider: { name, models: [] } });
+    // A new provider starts enabled the way a new model does: it carries no
+    // model yet, so it contributes no deployment until the user adds one.
+    void dispatch("provider.add", { provider: { name, models: [], enabled: true } });
   };
   const duplicateModel = (): void => {
     if (!model) return;
@@ -4564,15 +4565,15 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     });
   }, [bindingIssues]);
   const alertModelKeys = useMemo(
-    () => models.filter((item) => modelNeedsAttention(item) || Boolean(bindingIssueFor(item))).map(editorIdentifier),
-    [bindingIssueFor, models],
+    () => models.filter((item) => modelNeedsAttention(item, translate) || Boolean(bindingIssueFor(item))).map(editorIdentifier),
+    [bindingIssueFor, models, translate],
   );
   const alertProviderKeys = useMemo(
     () => providers.filter((item) => {
       if (bindingIssues.some((issue) => stringValue(issue.provider) === editorIdentifier(item))) return true;
-      return asRecords(item.models).some((model) => modelNeedsAttention(model) || Boolean(bindingIssueFor(model)));
+      return asRecords(item.models).some((model) => modelNeedsAttention(model, translate) || Boolean(bindingIssueFor(model)));
     }).map(editorIdentifier),
-    [bindingIssueFor, bindingIssues, providers],
+    [bindingIssueFor, bindingIssues, providers, translate],
   );
   const routeRows = useMemo(() => {
     const rows: Array<{ key: string; cells: string[]; spanning?: boolean }> = [];
@@ -5488,10 +5489,15 @@ function isDraftModel(model: UnknownRecord, translate: Translate): boolean {
   return name === translate("providers.newModel") || name.startsWith(`${translate("providers.newModel")} `);
 }
 
-function modelNeedsAttention(model: UnknownRecord): boolean {
+// A row the pane marks: an enabled route that cannot materialize (no name or
+// no upstream), or a freshly created row that still carries the placeholder
+// name — it is enabled, so the pane says it is not finished rather than
+// letting the placeholder read as a real public model.
+function modelNeedsAttention(model: UnknownRecord, translate: Translate): boolean {
   if (!booleanValue(model.model_enabled, booleanValue(model.enabled, true))) return false;
   const name = stringValue(model.model_name).trim() || stringValue(model.name).trim();
   if (!name) return true;
+  if (isDraftModel(model, translate)) return true;
   return !(stringValue(model.litellm_model).trim() || stringValue(model.upstream_model).trim());
 }
 

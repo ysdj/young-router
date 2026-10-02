@@ -163,24 +163,25 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has("    quiet = false,\n  ): Promise<void> => {\n    const publishResult = (next: string | undefined): void => {\n      if (quiet) return;")
         self.assert_ui_has("true, undefined, options?.quiet === true);")
 
-    def test_a_new_model_is_a_draft_and_a_relay_block_is_not_the_edits_fault(self) -> None:
+    def test_a_new_model_is_marked_until_finished_and_a_relay_block_is_not_the_edits_fault(self) -> None:
         """Standards for create-then-configure: a new row is a draft.
 
         Inline validation must not fire for a record the user has not finished
         (SAP draft handling; NN/g's error guidelines), and an error must name
-        the thing that actually refused the write.  ＋ therefore creates a
-        disabled draft — never served, never reported as a validation failure —
-        and a relay that is not ready states its own cause instead of blaming
-        the edit.
+        the thing that actually refused the write.  ＋ therefore creates a live
+        row that carries the placeholder name — never a validation failure, and
+        marked until it is finished — and a relay that is not ready states its
+        own cause instead of blaming the edit.
         """
-        # ＋ creates a disabled draft row that carries the placeholder name and
+        # ＋ creates an enabled row that carries the placeholder name and
         # inherits the key the user is working in, so it lands in a real key
-        # group instead of one the app invents.
+        # group instead of one the app invents — and the pane marks it until
+        # the placeholder is replaced (`modelNeedsAttention`).
         self.assert_ui_has('const inheritedKey = modelProviderKeyState(model, provider)')
         self.assert_ui_has('?? providerKeyStates(provider).find((key) => key.id === selectedFetchKey)')
         self.assert_ui_has('...(inheritedKey ? { api_key_name: inheritedKey.name, provider_key_id: inheritedKey.id } : {})')
         self.assert_ui_has('model: {')
-        self.assert_ui_has('enabled: false, order: 0,')
+        self.assert_ui_has('enabled: true, order: 0,')
         self.assert_ui_has('const name = uniquePlaceholderName(models.map((item) => stringValue(item.model_name ?? item.name)), base);')
         # The list draws a group row only for a key the model actually belongs
         # to; a keyless draft is listed without an invented 未定义密钥 group.
@@ -197,13 +198,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_not_has('rows.push({ key: `key:${keyName}`, cells: [keyName], spanning: true });')
         self.assert_ui_has('const byName = keyStates.filter((entry) => entry.name === keyName && keyName !== "");')
         self.assert_ui_has('return byName.length === 1 ? byName[0] : undefined;')
-        # The draft states what is left where its own fields are.
+        # The new row states what is left where its own fields are, and says
+        # that it is already live (a create is enabled).
         self.assert_ui_has("function isDraftModel(model: UnknownRecord, translate: Translate): boolean {")
         self.assert_ui_has('<Text style={styles.fieldHint}>{translate(selectedProviderKey ? "providers.draftModelHint" : "providers.draftModelKeylessHint")}</Text>')
-        self.assertIn('"providers.draftModelKeylessHint": "尚未启用：填写公开模型名、上游模型，并选择密钥，然后勾选“启用”，客户端才会看到它。"', self.zh)
-        self.assertIn('"providers.draftModelHint": "尚未启用：填写公开模型名与上游模型，然后勾选“启用”，客户端才会看到它。"', self.zh)
-        self.assertIn('"providers.draftModelHint": "Not enabled yet: fill in the public name and the upstream model, then check Enable for clients to see it."', self.en)
-        self.assertIn('"providers.draftModelKeylessHint": "Not enabled yet: fill in the public name, the upstream model, and a key, then check Enable for clients to see it."', self.en)
+        self.assertIn('"providers.draftModelKeylessHint": "新建的模型默认启用：请填写公开模型名与上游模型，并选择密钥。"', self.zh)
+        self.assertIn('"providers.draftModelHint": "新建的模型默认启用：请填写公开模型名与上游模型，客户端即可使用它。"', self.zh)
+        self.assertIn('"providers.draftModelHint": "A new model starts enabled: fill in the public name and the upstream model for clients to use it."', self.en)
+        self.assertIn('"providers.draftModelKeylessHint": "A new model starts enabled: fill in the public name and the upstream model, and choose a key."', self.en)
         # Core names the domain that refused: a relay that is not ready is not
         # the user's edit failing validation.
         self.assertIn('provider_model_invalid: "error.validationFailed",', self.ui)
@@ -894,9 +896,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # with a validation error nobody can act on.
         self.assert_ui_has('const base = translate("providers.newModel");')
         self.assert_ui_has('const name = uniquePlaceholderName(models.map((item) => stringValue(item.model_name ?? item.name)), base);')
-        # ＋ creates a draft: disabled, so an unfinished new row is never an
-        # error and the placeholder never reaches the served model list.
-        self.assert_ui_has('model: { name, upstream_model: name, enabled: false, order: 0, ...(inheritedKey ?')
+        # ＋ creates the row enabled, so the user does not have to enable what
+        # they just made; the placeholder name is what the pane marks.
+        self.assert_ui_has('model: { name, upstream_model: name, enabled: true, order: 0, ...(inheritedKey ?')
         self.assert_ui_has('models: selectedModels.map((upstreamModel) => ({ name: upstreamModel, upstream_model: upstreamModel, api_key_name: apiKeyName, ...(apiKeyID ? { provider_key_id: apiKeyID } : {}), enabled: true, order: 0 }))')
         self.assert_ui_has('value={String(displayedOrder)}')
         self.assert_ui_has('label={translate("providers.order")}')
@@ -4445,7 +4447,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('recorder(materialized.get("issues") if isinstance(materialized, Mapping) else ())', service)
         self.assertIn("const bindingIssues = asRecords(state.binding_issues);", self.ui)
         self.assertIn("const bindingIssueFor = useCallback((model: UnknownRecord): UnknownRecord | undefined => {", self.ui)
-        self.assertIn("() => models.filter((item) => modelNeedsAttention(item) || Boolean(bindingIssueFor(item))).map(editorIdentifier),", self.ui)
+        self.assertIn("() => models.filter((item) => modelNeedsAttention(item, translate) || Boolean(bindingIssueFor(item))).map(editorIdentifier),", self.ui)
         self.assertIn("alertRowKeys={alertRouteKeys}", self.ui)
         self.assertIn('<Text style={styles.fieldHint}>{bindingIssueText}</Text>', self.ui)
         # A relay key is a row in the provider's key table too, and the reason
@@ -4847,6 +4849,24 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('const trimmed = nextOrder.trim();\n          return trimmed === "" || Number.isFinite(Number(trimmed)) ? undefined : translate("runtime.invalidNumber");', inspector)
         self.assertIn("const parsed = Number(nextOrder.trim());", inspector)
 
+    def test_a_new_provider_and_model_start_enabled(self) -> None:
+        """＋新建供应商 / ＋新建模型 create live rows, not parked drafts.
+
+        The create payloads state `enabled: true` (a create with no flag is
+        enabled in Core too), and the pane marks a row that still carries the
+        placeholder name so a live placeholder never reads as a finished route.
+        """
+
+        workspace = self.ui.split("function ProviderWorkspace(", 1)[1].split("function ProviderKeysPanel(", 1)[0]
+        self.assertIn('void dispatch("provider.add", { provider: { name, models: [], enabled: true } });', workspace)
+        self.assertIn('model: { name, upstream_model: name, enabled: true, order: 0,', workspace)
+        self.assertNotIn('enabled: false, order: 0', workspace)
+        self.assertIn("if (isDraftModel(model, translate)) return true;", self.ui)
+        self.assertIn("(item) => modelNeedsAttention(item, translate) || Boolean(bindingIssueFor(item))", self.ui)
+        self.assertIn("asRecords(item.models).some((model) => modelNeedsAttention(model, translate) || Boolean(bindingIssueFor(model)))", self.ui)
+        for locale in (self.zh, self.en):
+            self.assertIn('"providers.draftModelHint"', locale)
+
     def test_a_login_item_the_host_refused_hands_cores_preference_back(self) -> None:
         """Launch-at-login is two-sided; a failed host side is rolled back.
 
@@ -5204,11 +5224,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
         # The row that needs the name is marked in place, so the pane points at
         # the entry instead of asking the user to hunt for it.
-        self.assertIn("function modelNeedsAttention(model: UnknownRecord): boolean {", self.ui)
+        self.assertIn("function modelNeedsAttention(model: UnknownRecord, translate: Translate): boolean {", self.ui)
         self.assertIn(
-            "() => models.filter((item) => modelNeedsAttention(item) || Boolean(bindingIssueFor(item))).map(editorIdentifier),",
+            "() => models.filter((item) => modelNeedsAttention(item, translate) || Boolean(bindingIssueFor(item))).map(editorIdentifier),",
             self.ui,
         )
+        # A freshly created row is enabled and still carries the placeholder
+        # name: the pane marks it until the user replaces the name.
+        self.assertIn("if (isDraftModel(model, translate)) return true;", self.ui)
         self.assertIn("alertRowKeys={alertModelKeys}", self.ui)
         self.assertIn("alertRowKeys={alertProviderKeys}", self.ui)
 
@@ -5341,7 +5364,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('const addProvider = (): void => {', self.ui)
         self.assertIn('const base = translate("providers.newProvider");', self.ui)
         self.assertIn('const name = uniquePlaceholderName(providers.map((item) => providerDisplayName(item)), base);', self.ui)
-        self.assertIn('void dispatch("provider.add", { provider: { name, models: [] } });', self.ui)
+        self.assertIn('void dispatch("provider.add", { provider: { name, models: [], enabled: true } });', self.ui)
         self.assertIn('const pendingProviderIds = useRef<Set<string> | undefined>(undefined);', self.ui)
         self.assertIn(
             '<ActionButton title={translate("providers.addWizard")} disabled={busy} style={styles.providerWizardToolbarButton} onPress={onOpenWizard} />',
