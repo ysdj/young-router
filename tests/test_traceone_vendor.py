@@ -15,7 +15,7 @@ import textwrap
 import unittest
 from unittest import mock
 
-from young_router import traceone
+from young_router.adapters import traceone
 
 
 ROOT = Path(__file__).resolve().parents[1]

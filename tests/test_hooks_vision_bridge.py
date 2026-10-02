@@ -20,7 +20,7 @@ class HookDshVisionRouterTests(HookTestCase):
 
     def test_dsh_quick_options_override_matching_json_fields(self) -> None:
         hooks, _ = load_hook_module()
-        from young_router import dsh_vision_router as router
+        from young_router.adapters import dsh_vision_router as router
 
         self._clear_dsh_runtime_overrides()
         self.set_env(
@@ -68,7 +68,7 @@ class HookDshVisionRouterTests(HookTestCase):
 
     def test_dsh_json_http_provider_options_are_materialized_without_secrets(self) -> None:
         hooks, _ = load_hook_module()
-        from young_router import dsh_vision_router as router
+        from young_router.adapters import dsh_vision_router as router
 
         self._clear_dsh_runtime_overrides()
         self.set_env(
@@ -115,7 +115,7 @@ class HookDshVisionRouterTests(HookTestCase):
     def test_local_ollama_disables_reasoning_while_lm_studio_stays_unset(self) -> None:
         """Upstream 2.2.1 spends the local Ollama budget on visible text."""
 
-        from young_router import dsh_vision_router as router
+        from young_router.adapters import dsh_vision_router as router
 
         self._clear_dsh_runtime_overrides()
         self.set_env(
@@ -145,7 +145,7 @@ class HookDshVisionRouterTests(HookTestCase):
         self.assertNotIn("reasoning_effort", router._chat_completion_payload("data:image/png;base64,cG5n"))
 
     def test_an_explicit_provider_reasoning_effort_passes_through(self) -> None:
-        from young_router import dsh_vision_router as router
+        from young_router.adapters import dsh_vision_router as router
 
         self._clear_dsh_runtime_overrides()
         self.set_env(
@@ -175,7 +175,7 @@ class HookDshVisionRouterTests(HookTestCase):
         )
 
     def test_explicit_auto_quick_backend_does_not_restore_retired_provider(self) -> None:
-        from young_router import dsh_vision_router as router
+        from young_router.adapters import dsh_vision_router as router
 
         self._clear_dsh_runtime_overrides()
         self.set_env("YOUNG_ROUTER_DSH_VISION_ROUTER_BACKEND", "auto")

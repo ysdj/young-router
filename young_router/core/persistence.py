@@ -3,29 +3,58 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 import stat
-import tempfile
 from collections.abc import Mapping
 from typing import Any
 
+from .. import atomic_io as _atomic_io
+from ..atomic_io import (
+    PRIVATE_MODE,
+    REASON_INSPECT,
+    REASON_INVALID,
+    REASON_NOT_REGULAR,
+    REASON_PARENT,
+    REASON_PERMISSIONS,
+    REASON_SYMLINK,
+    REASON_TOO_LARGE,
+    REASON_WRITE,
+)
+
 
 MAX_PERSISTED_BYTES = 16 * 1024 * 1024
-PRIVATE_MODE = 0o600
 
 
 class PersistenceError(ValueError):
     """A filesystem failure safe to report to the UI."""
 
 
-def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, value in pairs:
-        if key in result:
-            raise PersistenceError("Core state contains a duplicate JSON key")
-        result[key] = value
-    return result
+# One sentence per failed step, so the shared writer still speaks Core's own
+# vocabulary when it refuses a write.
+_WRITE_ERROR_MESSAGES = {
+    REASON_INVALID: "Core state exceeds the size limit",
+    REASON_TOO_LARGE: "Core state exceeds the size limit",
+    REASON_INSPECT: "Core state could not be inspected",
+    REASON_SYMLINK: "Core state path must be a regular file",
+    REASON_NOT_REGULAR: "Core state path must be a regular file",
+    REASON_PARENT: "Core state directory could not be prepared",
+    REASON_WRITE: "Core state could not be written",
+    REASON_PERMISSIONS: "Core state permissions could not be secured",
+}
+
+
+def _write_error(reason: str) -> Exception:
+    return PersistenceError(_WRITE_ERROR_MESSAGES.get(reason, "Core state could not be written"))
+
+
+from .. import json_input as _json_input
+
+
+# One duplicate key is refused the same way everywhere; the message stays
+# Core's own.
+_reject_duplicate_keys = _json_input.duplicate_key_hook(
+    lambda key: PersistenceError("Core state contains a duplicate JSON key")
+)
 
 
 def _reject_constant(_: str) -> object:
@@ -43,69 +72,17 @@ def _assert_regular_target(path: Path) -> None:
         raise PersistenceError("Core state path must be a regular file")
 
 
-def _ensure_parent(path: Path) -> None:
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    except OSError:
-        raise PersistenceError("Core state directory could not be prepared") from None
-
-
-def _fsync_directory(path: Path) -> None:
-    try:
-        descriptor = os.open(path, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(descriptor)
-    except OSError:
-        pass
-    finally:
-        os.close(descriptor)
-
-
 def atomic_write_bytes(path: Path | str, data: bytes, *, mode: int = PRIVATE_MODE) -> None:
     """Replace ``path`` atomically without following a final symlink."""
 
-    target = Path(path).expanduser()
-    if not isinstance(data, (bytes, bytearray)) or len(data) > MAX_PERSISTED_BYTES:
-        raise PersistenceError("Core state exceeds the size limit")
-    _assert_regular_target(target)
-    _ensure_parent(target)
-    temporary: str | None = None
-    descriptor: int | None = None
-    try:
-        descriptor, temporary = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
-        os.fchmod(descriptor, mode)
-        with os.fdopen(descriptor, "wb") as handle:
-            descriptor = None
-            handle.write(bytes(data))
-            handle.flush()
-            os.fsync(handle.fileno())
-        # Recheck immediately before replacing so a concurrent caller cannot
-        # swap the destination for a symlink after the first lstat.
-        _assert_regular_target(target)
-        os.replace(temporary, target)
-        temporary = None
-        try:
-            os.chmod(target, mode)
-        except OSError:
-            raise PersistenceError("Core state permissions could not be secured") from None
-        _fsync_directory(target.parent)
-    except PersistenceError:
-        raise
-    except OSError:
-        raise PersistenceError("Core state could not be written") from None
-    finally:
-        if descriptor is not None:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
-        if temporary:
-            try:
-                os.unlink(temporary)
-            except FileNotFoundError:
-                pass
+    _atomic_io.atomic_write_bytes(
+        path,
+        data,
+        mode=mode,
+        parent_mode=0o700,
+        max_bytes=MAX_PERSISTED_BYTES,
+        error=_write_error,
+    )
 
 
 def atomic_write_text(path: Path | str, text: str, *, mode: int = PRIVATE_MODE) -> None:

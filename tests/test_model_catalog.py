@@ -39,7 +39,7 @@ class ModelCatalogTests(unittest.TestCase):
         self.assertEqual("6", setting["default"])
 
     def test_runtime_schema_defaults_match_proxy_defaults(self) -> None:
-        from young_router import base as base_module
+        from young_router.proxy import base as base_module
         from young_router.log_rotation import DEFAULT_LOG_BACKUP_SEGMENTS
 
         defaults_by_key = {

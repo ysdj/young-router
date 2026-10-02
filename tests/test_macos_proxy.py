@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-from young_router import macos_proxy
+from young_router.proxy import macos_proxy
 
 
 class MacOSProxyLauncherTests(unittest.TestCase):
@@ -92,7 +92,7 @@ class MacOSProxyLauncherTests(unittest.TestCase):
 
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.dict(
             sys.modules,
-            {"young_router.state": state_module, "young_router.base": base_module},
+            {"young_router.proxy.state": state_module, "young_router.proxy.base": base_module},
         ), mock.patch.object(
             multiprocessing, "set_forkserver_preload", create=True
         ) as set_preload, mock.patch.object(

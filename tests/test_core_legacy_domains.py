@@ -18,13 +18,13 @@ from unittest import mock
 from young_router.core.domains import DomainError
 from young_router.core.domains.codex import CodexSettingsDomain
 from young_router.core.domains.providers_models import ProvidersModelsDomain
-from young_router import traceone
+from young_router.adapters import traceone
 from young_router.core.domains.relay_accounts import RelayAccountsDomain
 from young_router.core.domains.runtime import RuntimeSettingsDomain
 from young_router.core.domains.webdav import WebDAVSettingsDomain
 from young_router.core.model_catalog import catalog_is_current
 from young_router.core.service import CoreError, CoreStore
-from runtime_settings_io import RuntimeSettingSpec
+from young_router.core.runtime_settings_io import RuntimeSettingSpec
 
 
 PROVIDER_CONFIG = """
@@ -2296,7 +2296,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
             self.assertTrue(raw["config_exists"])
             self.assertTrue(raw["auth_file_exists"])
 
-    @mock.patch("codex_config._local_exposed_models", return_value=(["default-chat"], True))
+    @mock.patch("young_router.core.codex_config._local_exposed_models", return_value=(["default-chat"], True))
     def test_live_catalog_refresh_does_not_make_a_noop_editor_stage_dirty(self, _live_models) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2341,7 +2341,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
             self.assertTrue(applied["config_exists"])
             self.assertTrue(applied["auth_file_exists"])
 
-    @mock.patch("codex_config._local_exposed_models", return_value=(['default-chat'], True))
+    @mock.patch("young_router.core.codex_config._local_exposed_models", return_value=(['default-chat'], True))
     def test_menu_catalog_toggle_preserves_staged_codex_edits_and_tracks_public_models(self, _live_models) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2392,7 +2392,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
             self.assertEqual("disabled", disabled_catalog["change_reason"])
 
     @mock.patch(
-        "codex_config._local_exposed_models",
+        "young_router.core.codex_config._local_exposed_models",
         return_value=(['default-chat', 'second-chat', 'third-chat'], True),
     )
     def test_model_catalog_uses_every_litellm_exposed_model(self, _live_models) -> None:
@@ -2460,7 +2460,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
             return endpoint["result"]
 
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "codex_config._local_exposed_models",
+            "young_router.core.codex_config._local_exposed_models",
             side_effect=exposed_models,
         ):
             root = Path(directory)
@@ -2499,7 +2499,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
             return endpoint["result"]
 
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "codex_config._local_exposed_models",
+            "young_router.core.codex_config._local_exposed_models",
             side_effect=exposed_models,
         ):
             root = Path(directory)
@@ -2536,7 +2536,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
             catalog = json.loads((home / "model-catalog.json").read_text(encoding="utf-8"))
             self.assertEqual([], catalog["models"])
 
-    @mock.patch("codex_config._local_exposed_models", return_value=(["default-chat"], True))
+    @mock.patch("young_router.core.codex_config._local_exposed_models", return_value=(["default-chat"], True))
     def test_catalog_metadata_repair_does_not_request_codex_restart(self, _live_models) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2569,7 +2569,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
             self.assertIsNone(snapshot["change_reason"])
             self.assertTrue(catalog_is_current(catalog_path, ["default-chat"], registry=codex._context_registry))
 
-    @mock.patch("codex_config._local_exposed_models", return_value=(["default-chat"], True))
+    @mock.patch("young_router.core.codex_config._local_exposed_models", return_value=(["default-chat"], True))
     def test_missing_catalog_repair_does_not_request_codex_restart(self, _live_models) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2601,7 +2601,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
 
     def test_catalog_priority_reorder_does_not_request_codex_restart(self) -> None:
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "codex_config._local_exposed_models",
+            "young_router.core.codex_config._local_exposed_models",
             return_value=(["model-a", "model-b"], True),
         ), mock.patch(
             "young_router.core.model_catalog.load_native_catalog",
@@ -2671,7 +2671,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
             return list(live_models["names"]), True
 
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "codex_config._local_exposed_models",
+            "young_router.core.codex_config._local_exposed_models",
             side_effect=exposed_models,
         ), mock.patch(
             "young_router.core.model_catalog.load_native_catalog",
@@ -2845,8 +2845,10 @@ class RuntimeSettingsDomainTests(unittest.TestCase):
             (package / "runtime_settings_schema.py").write_bytes(
                 (source_root / "young_router/core/runtime_settings_schema.py").read_bytes()
             )
-            module_path = root / "runtime_settings_io.py"
-            module_path.write_bytes((source_root / "runtime_settings_io.py").read_bytes())
+            module_path = package / "young_router.core.runtime_settings_io.py"
+            module_path.write_bytes(
+                (source_root / "young_router/core/runtime_settings_io.py").read_bytes()
+            )
             spec = importlib.util.spec_from_file_location("bundled_runtime_settings_io", module_path)
             self.assertIsNotNone(spec)
             self.assertIsNotNone(spec.loader if spec is not None else None)
@@ -2976,7 +2978,7 @@ class RuntimeSettingsDomainTests(unittest.TestCase):
             self.assertNotIn("LITELLM_CONFIG_WATCH", saved)
 
     def test_retired_shell_service_settings_load_once_and_are_removed_on_apply(self) -> None:
-        from runtime_settings_io import RETIRED_PERSISTED_SETTINGS
+        from young_router.core.runtime_settings_io import RETIRED_PERSISTED_SETTINGS
 
         retired = (
             "LITELLM_MAX_REQUESTS_BEFORE_RESTART",
@@ -3141,8 +3143,8 @@ class WebDAVSettingsDomainTests(unittest.TestCase):
             status = root / "webdav-sync-status.json"
             domain = WebDAVSettingsDomain(root / "webdav.json", enabled_path=root / "enabled", status_path=status)
             domain.dispatch("patch", {"url": "https://example.test/webdav/", "remote_name": "config.json"})
-            with mock.patch("webdav.core.WebDAVClient.head", return_value=(200, {})), mock.patch(
-                "webdav.core.WebDAVClient.try_mkcol"
+            with mock.patch("young_router.webdav.core.WebDAVClient.head", return_value=(200, {})), mock.patch(
+                "young_router.webdav.core.WebDAVClient.try_mkcol"
             ):
                 result = domain.probe()
 

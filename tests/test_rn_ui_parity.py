@@ -5444,11 +5444,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # so the draft keeps working at runtime — and the write records the
         # route's own “no key” choice, so reading the file back cannot turn that
         # credential into a claim on the key that happens to carry it.
-        dumper = (ROOT / "config_editor_core/dump.py").read_text(encoding="utf-8")
+        dumper = (ROOT / "young_router/config/dump.py").read_text(encoding="utf-8")
         self.assertIn("elif not key_name and not provider_key_id:", dumper)
         self.assertIn('api_key = str(model.get("api_key", "")).strip() or (keys[0]["value"] if keys else "")', dumper)
         self.assertIn('model_info[MENU_KEY_BINDING_KEY] = "unbound"', dumper)
-        loader = (ROOT / "config_editor_core/load.py").read_text(encoding="utf-8")
+        loader = (ROOT / "young_router/config/load.py").read_text(encoding="utf-8")
         self.assertIn("def _is_unbound_entry(model_info: dict[str, Any]) -> bool:", loader)
         self.assertIn("if _is_unbound_entry(model_info):", loader)
 
@@ -5531,7 +5531,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn(r'`${row.model} · ${row.keyName || translate("providers.undefinedKey")}`', self.ui)
         self.assertIn("?? (matching.length === 1 ? matching[0] : undefined);", self.ui)
         self.assertIn("const matching = codexModels.filter(matches);", self.ui)
-        core = (ROOT / "codex_config.py").read_text(encoding="utf-8")
+        core = (ROOT / "young_router/core/codex_config.py").read_text(encoding="utf-8")
         self.assertIn('"api_key_name": str(info.get("api_key_name") or "").strip(),', core)
         self.assertIn('"order": params.get("order"),', core)
 

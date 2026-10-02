@@ -54,21 +54,11 @@ try {
 
   Remove-Item -LiteralPath $Core -Recurse -Force -ErrorAction SilentlyContinue
   New-Item -ItemType Directory -Path $Core | Out-Null
-  foreach ($Name in @(
-      "codex_config.py",
-      "configuration_package.py",
-      "external_provider_import.py",
-      "remote_usage_logs.py",
-      "runtime_settings_io.py",
-      "sitecustomize.py")) {
-    Copy-CoreSource (Join-Path $ProjectRoot $Name) (Join-Path $Core $Name)
-  }
-  foreach ($Name in @("young_router", "config_editor_core", "webdav")) {
-    Copy-CoreSource (Join-Path $ProjectRoot $Name) (Join-Path $Core $Name)
-  }
-  Copy-CoreSource $PiPackage (Join-Path $Core "young_router\pi-web-access")
-  Copy-CoreSource $TraceOneWork (Join-Path $Core "young_router\traceone")
-  Copy-CoreSource $WorkBuddyConnectWork (Join-Path $Core "young_router\workbuddy-connect")
+  Copy-CoreSource (Join-Path $ProjectRoot "sitecustomize.py") (Join-Path $Core "sitecustomize.py")
+  Copy-CoreSource (Join-Path $ProjectRoot "young_router") (Join-Path $Core "young_router")
+  Copy-CoreSource $PiPackage (Join-Path $Core "young_router\adapters\pi-web-access")
+  Copy-CoreSource $TraceOneWork (Join-Path $Core "young_router\adapters\traceone")
+  Copy-CoreSource $WorkBuddyConnectWork (Join-Path $Core "young_router\adapters\workbuddy-connect")
   Get-ChildItem -LiteralPath $Core -Recurse -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force
   Get-ChildItem -LiteralPath $Core -Recurse -File -Include "*.pyc", "*.pyo" | Remove-Item -Force
 
@@ -102,19 +92,19 @@ set "RUNTIME_ROOT=%~dp0"
 '@
   Set-Content -LiteralPath (Join-Path $RuntimeBin "litellm.cmd") -Value $LiteLLMCommand -Encoding ascii
   Copy-Item -LiteralPath (Join-Path $ProjectRoot "LITELLM_VERSION") -Destination (Join-Path $Core "runtime\LITELLM_VERSION") -Force
-  if (-not (Test-Path (Join-Path $Core "young_router\pi-web-access\index.ts"))) {
+  if (-not (Test-Path (Join-Path $Core "young_router\adapters\pi-web-access\index.ts"))) {
     throw "The bundled pi-web-access package is missing."
   }
-  if (-not (Test-Path (Join-Path $Core "young_router\traceone\traceone.js"))) {
+  if (-not (Test-Path (Join-Path $Core "young_router\adapters\traceone\traceone.js"))) {
     throw "The bundled TraceOne degradation engine is missing."
   }
-  if (-not (Test-Path (Join-Path $Core "young_router\traceone\prompt.txt"))) {
+  if (-not (Test-Path (Join-Path $Core "young_router\adapters\traceone\prompt.txt"))) {
     throw "The bundled TraceOne identity prompt is missing."
   }
-  if (-not (Test-Path (Join-Path $Core "young_router\workbuddy_stream.mjs"))) {
-    throw "The Windows build output does not contain young_router/workbuddy_stream.mjs."
+  if (-not (Test-Path (Join-Path $Core "young_router\adapters\workbuddy_stream.mjs"))) {
+    throw "The Windows build output does not contain young_router/adapters/workbuddy_stream.mjs."
   }
-  if (-not (Test-Path (Join-Path $Core "young_router\workbuddy-connect\lib\index.js"))) {
+  if (-not (Test-Path (Join-Path $Core "young_router\adapters\workbuddy-connect\lib\index.js"))) {
     throw "The bundled dsh-workbuddy-connect package is missing."
   }
   if (-not (Test-Path (Join-Path $RuntimeBin "node.exe"))) {
@@ -122,8 +112,8 @@ set "RUNTIME_ROOT=%~dp0"
   }
   $PiSmokeConfig = Join-Path $PiWork "smoke-config"
   "" | & (Join-Path $RuntimeBin "node.exe") `
-    (Join-Path $Core "young_router\pi_web_access_worker.mjs") `
-    --entry (Join-Path $Core "young_router\pi-web-access\index.ts") `
+    (Join-Path $Core "young_router\adapters\pi_web_access_worker.mjs") `
+    --entry (Join-Path $Core "young_router\adapters\pi-web-access\index.ts") `
     --config-dir $PiSmokeConfig
   if ($LASTEXITCODE -ne 0) {
     throw "The bundled pi-web-access worker could not load its staged SDK."
@@ -134,7 +124,7 @@ set "RUNTIME_ROOT=%~dp0"
   $PreviousProxyProcess = $env:YOUNG_ROUTER_PROXY_PROCESS
   try {
     $env:PYTHONPATH = $Core
-    & $Python -c "import litellm.proxy.proxy_server, young_router.core, codex_config, config_editor_core, configuration_package, external_provider_import, webdav.core"
+    & $Python -c "import litellm.proxy.proxy_server, young_router.core, young_router.core.codex_config, young_router.config, young_router.core.configuration_package, young_router.core.external_provider_import, young_router.core.remote_usage_logs, young_router.core.runtime_settings_io, young_router.webdav.core"
     if ($LASTEXITCODE -ne 0) { throw "Bundled Windows Core import smoke test failed." }
     & (Join-Path $RuntimeBin "litellm.cmd") --help | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "Bundled Windows LiteLLM launcher smoke test failed." }
@@ -184,8 +174,8 @@ set "RUNTIME_ROOT=%~dp0"
   if (-not (Test-Path (Join-Path $BundledBin "node.exe"))) {
     throw "The Windows build output does not contain Core/runtime/bin/node.exe."
   }
-  if (-not (Test-Path (Join-Path $BundledCore "young_router\pi-web-access\index.ts"))) {
-    throw "The Windows build output does not contain young_router/pi-web-access/index.ts."
+  if (-not (Test-Path (Join-Path $BundledCore "young_router\adapters\pi-web-access\index.ts"))) {
+    throw "The Windows build output does not contain young_router/adapters/pi-web-access/index.ts."
   }
   if (-not (Test-Path $BundledVersion) -or (Get-Content -Raw $BundledVersion).Trim() -ne $LiteLLMVersion) {
     throw "The Windows build output does not contain the pinned LiteLLM release lock."

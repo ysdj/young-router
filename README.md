@@ -75,6 +75,12 @@ Editable config: `~/.young-router/config.yaml` (sanitized example: [`config.exam
 
 </details>
 
+## Repository layout
+
+- The project and its distribution are named **young-router**; the Python import package is **young_router** (hyphens are not valid Python identifiers). `pyproject.toml` states that mapping, the package discovery, and the console entry points (`young-router-core`, `young-router-config`, `young-router-webdav`, …).
+- `young_router/` is the one Python package: `core/` (Core IPC, domains, and the Core-owned document modules such as `codex_config.py` and `runtime_settings_io.py`), `proxy/` (LiteLLM data plane: hook, patches, routing, streaming, responses surfaces, state, trace), `adapters/` (bundled third-party worker adapters and their scripts), `config/` (configuration schema/editor), `webdav/` (sync client), and the shared modules at its root (`callbacks.py`, `browser_identity.py`, `api_base.py`, atomic/JSON helpers). `sitecustomize.py` is the one startup shim the build copies to the Core root.
+- `rn/` is the React Native workspace (`apps/macos`, `apps/windows`, `packages/shared`), `scripts/` the build/release/update tooling, and `tests/` the Python suites. `./scripts/test.sh` runs the full suite; `pnpm run check:macos` inside `rn/` runs the UI contract and type checks.
+
 ## License
 
 MIT License. See [LICENSE](./LICENSE).
@@ -157,6 +163,12 @@ Windows（Developer PowerShell，需要 Windows App SDK 与 VS C++ 桌面工作�
 - **开发：** 贡献者指南见 [`AGENTS.md`](./AGENTS.md)；聚焦测试位于 `tests/`，共享 UI 在 `rn/` 下运行 `pnpm exec tsc --noEmit`。`scripts/version.py` 负责同步版本与 Cask；构建时会自动将 `LITELLM_VERSION` 推进到最新稳定版，并打包匹配的 pi-web-access 与 Node.js 22 运行时。
 
 </details>
+
+## 目录结构
+
+- 项目（及发行名）为 **young-router**，Python 导入包为 **young_router**（连字符不是合法的 Python 标识符）；`pyproject.toml` 声明了这一对应关系、包发现与命令行入口（`young-router-core`、`young-router-config`、`young-router-webdav` 等）。
+- `young_router/` 是唯一的 Python 包：`core/`（Core IPC、各领域模块与 Core 自有的文档模块，如 `codex_config.py`、`runtime_settings_io.py`）、`proxy/`（LiteLLM 数据面：hook、patches、routing、streaming、responses 各层、状态与 trace）、`adapters/`（内置第三方 worker 适配器与脚本）、`config/`（配置 schema 与读写）、`webdav/`（同步客户端），以及包根部的共享模块（`callbacks.py`、`browser_identity.py`、`api_base.py`、原子写/JSON 工具）。`sitecustomize.py` 是唯一在包外的启动垫片，构建时按同名复制到 Core 根目录。
+- `rn/` 是 React Native 工作区（`apps/macos`、`apps/windows`、`packages/shared`），`scripts/` 是构建/发布/更新脚本，`tests/` 是 Python 测试。`./scripts/test.sh` 运行完整测试；`rn/` 下 `pnpm run check:macos` 运行 UI 契约与类型检查。
 
 ## 许可证
 

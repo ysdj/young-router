@@ -22,19 +22,13 @@ from ._shared import (
     _same_file,
 )
 
+from ...dsh_config_keys import (
+    DSH_VISION_ROUTER_CONFIG_KEY as _DSH_VISION_ROUTER_CONFIG_KEY,
+    DSH_VISION_ROUTER_LOCAL_QUICK_KEYS as _DSH_VISION_ROUTER_LOCAL_QUICK_KEYS,
+    DSH_VISION_ROUTER_QUICK_KEYS as _DSH_VISION_ROUTER_QUICK_KEYS,
+)
 
-_DSH_VISION_ROUTER_CONFIG_KEY = "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON"
-_DSH_VISION_ROUTER_QUICK_KEYS = {
-    "YOUNG_ROUTER_DSH_VISION_ROUTER_ENABLED": "enabled",
-    "YOUNG_ROUTER_DSH_VISION_ROUTER_BACKEND": "backend",
-    "YOUNG_ROUTER_DSH_VISION_ROUTER_FREE_FALLBACK": "freeFallback",
-    "YOUNG_ROUTER_DSH_VISION_ROUTER_TIMEOUT_SECONDS": "timeoutSeconds",
-    "YOUNG_ROUTER_DSH_VISION_ROUTER_MAX_TOKENS": "maxTokens",
-}
-_DSH_VISION_ROUTER_LOCAL_QUICK_KEYS = {
-    "YOUNG_ROUTER_DSH_VISION_ROUTER_LOCAL_OLLAMA_ENABLED": "localOllama",
-    "YOUNG_ROUTER_DSH_VISION_ROUTER_LOCAL_LM_STUDIO_ENABLED": "localLmStudio",
-}
+
 _DSH_VISION_ROUTER_ALL_QUICK_KEYS = tuple(
     (*_DSH_VISION_ROUTER_QUICK_KEYS, *_DSH_VISION_ROUTER_LOCAL_QUICK_KEYS)
 )
@@ -144,12 +138,12 @@ class RuntimeSettingsDomain:
 
     @staticmethod
     def _defaults(specs: Mapping[str, Any]) -> dict[str, str]:
-        from runtime_settings_io import normalize_payload_value
+        from ..runtime_settings_io import normalize_payload_value
 
         return {key: normalize_payload_value(spec, spec.default) for key, spec in specs.items()}
 
     def _load(self) -> tuple[dict[str, Any], dict[str, str], bytes | None]:
-        from runtime_settings_io import load_specs, read_settings_file
+        from ..runtime_settings_io import load_specs, read_settings_file
 
         from ..runtime_settings_schema import runtime_settings_metadata
 
@@ -263,7 +257,7 @@ class RuntimeSettingsDomain:
         return copy.deepcopy(self._draft_values)
 
     def _validate_values(self, values: Mapping[str, object]) -> dict[str, str]:
-        from runtime_settings_io import validate_values
+        from ..runtime_settings_io import validate_values
 
         try:
             return validate_values(dict(values), self.specs)
@@ -293,7 +287,7 @@ class RuntimeSettingsDomain:
                 draft[key] = item
         if quick_updates:
             payload = _dsh_json_payload(draft.get(_DSH_VISION_ROUTER_CONFIG_KEY, ""))
-            from runtime_settings_io import normalize_payload_value
+            from ..runtime_settings_io import normalize_payload_value
 
             for key, item in quick_updates.items():
                 legacy_inherit = item == "inherit" or (
@@ -383,7 +377,7 @@ class RuntimeSettingsDomain:
             with tempfile.TemporaryDirectory(prefix="litellm-core-runtime-validate-") as directory:
                 path = Path(directory) / "runtime-settings.env"
                 atomic_write_text(path, source)
-                from runtime_settings_io import read_settings_file
+                from ..runtime_settings_io import read_settings_file
 
                 values = read_settings_file(path, self.specs)
         except Exception as exc:
@@ -460,7 +454,7 @@ class RuntimeSettingsDomain:
 
     @staticmethod
     def _stored_value(spec: Any, value: str) -> str:
-        from runtime_settings_io import stored_value
+        from ..runtime_settings_io import stored_value
 
         try:
             return stored_value(spec, value)
@@ -468,7 +462,7 @@ class RuntimeSettingsDomain:
             raise DomainError("Runtime settings are invalid") from None
 
     def _encoded_draft(self) -> str:
-        from runtime_settings_io import RUNTIME_SETTINGS_HEADER
+        from ..runtime_settings_io import RUNTIME_SETTINGS_HEADER
 
         normalized = self._validate_values(self._draft_values)
         defaults = self._defaults(self.specs)

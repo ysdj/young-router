@@ -24,7 +24,7 @@ from young_router.core.domains.webdav import WebDAVSettingsDomain
 from young_router.core.domains._shared import DomainError
 from young_router.core.operations import CoreServiceController
 
-from webdav import core as webdav_core  # noqa: E402
+from young_router.webdav import core as webdav_core  # noqa: E402
 from young_router.core.persistence import PersistenceError
 
 
@@ -137,7 +137,7 @@ class CoreOperationsTests(unittest.TestCase):
                 controller.start()
 
             command = popen.call_args.args[0]
-            self.assertEqual([controller.python, "-m", "young_router.macos_proxy"], command[:3])
+            self.assertEqual([controller.python, "-m", "young_router.proxy.macos_proxy"], command[:3])
             workers_index = command.index("--workers")
             self.assertEqual("16", command[workers_index + 1])
             self.assertNotIn("--run_gunicorn", command)
@@ -489,8 +489,8 @@ class CoreOperationsTests(unittest.TestCase):
                 service_handlers={"status": lambda _operation: {"state": "stopped", "webdav": controller._webdav_summary()}},
             )
 
-            with mock.patch("webdav.core.WebDAVClient.head", return_value=(200, {})), mock.patch(
-                "webdav.core.WebDAVClient.try_mkcol"
+            with mock.patch("young_router.webdav.core.WebDAVClient.head", return_value=(200, {})), mock.patch(
+                "young_router.webdav.core.WebDAVClient.try_mkcol"
             ):
                 core.probe(domain="webdav")
 
@@ -746,7 +746,7 @@ class CoreOperationsTests(unittest.TestCase):
             self.assertEqual(str(controller.paths.recovery), environment["YOUNG_ROUTER_ROUTE_RECOVERY_STATE_FILE"])
             self.assertEqual(str(controller.paths.cooldowns), environment["YOUNG_ROUTER_DEPLOYMENT_COOLDOWN_FILE"])
             self.assertEqual(
-                "young_router.search_endpoint:register",
+                "young_router.proxy.search_endpoint:register",
                 environment["LITELLM_WORKER_STARTUP_HOOKS"],
             )
             self.assertEqual(str(core_root), environment["LITELLM_TEMPLATE_ROOT"])
@@ -1235,8 +1235,8 @@ class CoreOperationsTests(unittest.TestCase):
             webdav = self._configured_webdav_domain(root, config)
             core = CoreStore(domains=[providers, relay, webdav])
 
-            with mock.patch("webdav.core.WebDAVClient", return_value=object()), mock.patch(
-                "webdav.operations.push_bundle",
+            with mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()), mock.patch(
+                "young_router.webdav.operations.push_bundle",
                 return_value=(32, {"files": []}),
             ) as pushed:
                 result = core.dispatch(
@@ -1346,10 +1346,10 @@ class CoreOperationsTests(unittest.TestCase):
             self.assertEqual(45, webdav.draft_state()["settings"]["sync_interval_minutes"])
 
             pushed: list[object] = []
-            with mock.patch("webdav.core.WebDAVClient", return_value=object()), mock.patch(
-                "webdav.operations.read_remote_manifest",
+            with mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()), mock.patch(
+                "young_router.webdav.operations.read_remote_manifest",
                 return_value=None,
-            ), mock.patch("webdav.operations.push_bundle", side_effect=lambda *args, **kwargs: pushed.append(args)):
+            ), mock.patch("young_router.webdav.operations.push_bundle", side_effect=lambda *args, **kwargs: pushed.append(args)):
                 core.run_automatic_webdav_sync()
 
             self.assertEqual(1, len(pushed))
@@ -1428,14 +1428,14 @@ class CoreOperationsTests(unittest.TestCase):
 
             pushed: list[str] = []
 
-            with mock.patch("webdav.core.WebDAVClient", return_value=object()), mock.patch(
-                "webdav.operations.read_remote_manifest",
+            with mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()), mock.patch(
+                "young_router.webdav.operations.read_remote_manifest",
                 side_effect=webdav_core.SyncError(
                     "WebDAV sync bundle was not created by this Young Router version",
                     webdav_core.INCOMPATIBLE_BUNDLE_CODE,
                 ),
-            ), mock.patch("webdav.operations.archive_remote_bundle", side_effect=archive), mock.patch(
-                "webdav.operations.push_bundle",
+            ), mock.patch("young_router.webdav.operations.archive_remote_bundle", side_effect=archive), mock.patch(
+                "young_router.webdav.operations.push_bundle",
                 side_effect=lambda *args, **kwargs: pushed.append(str(args[4] if len(args) > 4 else "push")),
             ):
                 result = core.dispatch(
@@ -1516,8 +1516,8 @@ class CoreOperationsTests(unittest.TestCase):
             webdav = self._configured_webdav_domain(root, config)
             core = CoreStore(domains=[providers, relay, webdav])
 
-            with mock.patch("webdav.core.WebDAVClient", return_value=object()), mock.patch(
-                "webdav.operations.push_bundle",
+            with mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()), mock.patch(
+                "young_router.webdav.operations.push_bundle",
                 side_effect=RuntimeError("replace-webdav-password /private/config.yaml"),
             ), self.assertRaises(Exception) as raised:
                 core.dispatch(

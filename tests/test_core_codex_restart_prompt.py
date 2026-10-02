@@ -77,7 +77,7 @@ class CodexRestartPromptTests(unittest.TestCase):
 
     def test_acknowledged_catalog_signature_does_not_queue_same_prompt_again(self) -> None:
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "codex_config._local_exposed_models",
+            "young_router.core.codex_config._local_exposed_models",
             return_value=(["public-a"], True),
         ), mock.patch(
             "young_router.core.model_catalog.load_native_catalog",
@@ -109,7 +109,7 @@ class CodexRestartPromptTests(unittest.TestCase):
 
     def test_new_public_model_signature_still_queues_prompt_after_deferral(self) -> None:
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "codex_config._local_exposed_models",
+            "young_router.core.codex_config._local_exposed_models",
             return_value=(["public-a"], True),
         ), mock.patch(
             "young_router.core.model_catalog.load_native_catalog",
@@ -145,7 +145,7 @@ class CodexRestartPromptTests(unittest.TestCase):
             return endpoint["models"], True
 
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "codex_config._local_exposed_models",
+            "young_router.core.codex_config._local_exposed_models",
             side_effect=exposed_models,
         ), mock.patch(
             "young_router.core.model_catalog.load_native_catalog",
@@ -180,7 +180,7 @@ class CodexRestartPromptTests(unittest.TestCase):
             return endpoint["models"], True
 
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "codex_config._local_exposed_models",
+            "young_router.core.codex_config._local_exposed_models",
             side_effect=exposed_models,
         ), mock.patch(
             "young_router.core.model_catalog.load_native_catalog",
@@ -215,7 +215,7 @@ class CodexRestartPromptTests(unittest.TestCase):
             return endpoint["models"], True
 
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "codex_config._local_exposed_models",
+            "young_router.core.codex_config._local_exposed_models",
             side_effect=exposed_models,
         ), mock.patch(
             "young_router.core.model_catalog.load_native_catalog",
@@ -254,7 +254,7 @@ class CodexRestartPromptTests(unittest.TestCase):
             return endpoint["models"], True
 
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "codex_config._local_exposed_models",
+            "young_router.core.codex_config._local_exposed_models",
             side_effect=exposed_models,
         ), mock.patch(
             "young_router.core.model_catalog.load_native_catalog",
@@ -296,7 +296,7 @@ class CodexRestartPromptTests(unittest.TestCase):
             return endpoint["models"], True
 
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "codex_config._local_exposed_models",
+            "young_router.core.codex_config._local_exposed_models",
             side_effect=exposed_models,
         ), mock.patch(
             "young_router.core.model_catalog.load_native_catalog",
@@ -345,7 +345,7 @@ class CodexRestartPromptTests(unittest.TestCase):
             return endpoint["models"], True
 
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "codex_config._local_exposed_models",
+            "young_router.core.codex_config._local_exposed_models",
             side_effect=exposed_models,
         ), mock.patch(
             "young_router.core.model_catalog.load_native_catalog",
@@ -391,7 +391,7 @@ class CodexRestartPromptTests(unittest.TestCase):
             return endpoint["models"], True
 
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "codex_config._local_exposed_models",
+            "young_router.core.codex_config._local_exposed_models",
             side_effect=exposed_models,
         ), mock.patch(
             "young_router.core.model_catalog.load_native_catalog",
@@ -437,7 +437,7 @@ class CodexRestartPromptTests(unittest.TestCase):
             return endpoint["models"], True
 
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "codex_config._local_exposed_models",
+            "young_router.core.codex_config._local_exposed_models",
             side_effect=exposed_models,
         ), mock.patch(
             "young_router.core.model_catalog.load_native_catalog",

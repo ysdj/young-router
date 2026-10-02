@@ -33,7 +33,7 @@ elif [[ -x "${YOUNG_ROUTER_BUNDLED_TEST_PYTHON:-/Applications/Young Router.app/C
   export LITELLM_TEST_PYTHON="${YOUNG_ROUTER_BUNDLED_TEST_PYTHON:-/Applications/Young Router.app/Contents/Resources/Core/runtime/bin/python}"
 elif command -v uv >/dev/null 2>&1; then
   TEST_COMMAND=(
-    uv run --python 3.12
+    uv run --no-project --python 3.12
     --with "litellm[proxy]==$(tr -d '[:space:]' < LITELLM_VERSION)"
     --with "fastapi==0.140.3"
     --with PyYAML

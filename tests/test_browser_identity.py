@@ -33,12 +33,12 @@ WINDOWS_NATIVE = ROOT / "rn/apps/windows/src/native/windows/WindowsRelayLogin.cp
 
 # Shipped request code (the app itself, not build tooling and not tests).
 SHIPPED_REQUEST_FILES = (
-    "codex_config.py",
-    "remote_usage_logs.py",
-    "webdav/core.py",
+    "young_router/core/codex_config.py",
+    "young_router/core/remote_usage_logs.py",
+    "young_router/webdav/core.py",
     "young_router/browser_identity.py",
-    "young_router/dsh_vision_router.py",
-    "young_router/responses_request.py",
+    "young_router/adapters/dsh_vision_router.py",
+    "young_router/proxy/responses_request.py",
     "young_router/core/model_contexts.py",
     "young_router/core/operations.py",
     "young_router/core/domains/providers_models.py",
@@ -130,9 +130,9 @@ class BrowserIdentityLiteralTests(unittest.TestCase):
 
     def test_shipped_request_code_uses_the_shared_identity(self) -> None:
         self.assertIn("browser_request_headers()", _read(ROOT / "young_router/core/domains/relay_accounts.py"))
-        self.assertIn("browser_request_headers()", _read(ROOT / "remote_usage_logs.py"))
-        self.assertIn("browser_request_headers(", _read(ROOT / "webdav/core.py"))
-        self.assertIn("browser_request_headers()", _read(ROOT / "codex_config.py"))
+        self.assertIn("browser_request_headers()", _read(ROOT / "young_router/core/remote_usage_logs.py"))
+        self.assertIn("browser_request_headers(", _read(ROOT / "young_router/webdav/core.py"))
+        self.assertIn("browser_request_headers()", _read(ROOT / "young_router/core/codex_config.py"))
 
     def test_loopback_only_clients_are_the_documented_exception(self) -> None:
         for relative in LOOPBACK_ONLY_MARKERS:
@@ -227,7 +227,7 @@ class DataPlaneUserAgentTests(unittest.TestCase):
     """The data plane forwards a client UA and never our own."""
 
     def setUp(self) -> None:
-        from young_router import responses_request
+        from young_router.proxy import responses_request
 
         self.responses_request = responses_request
 
@@ -276,7 +276,7 @@ class DataPlaneUserAgentTests(unittest.TestCase):
         )
 
     def test_hook_chain_runs_the_owned_user_agent_step(self) -> None:
-        hook_source = _read(ROOT / "young_router" / "hook.py")
+        hook_source = _read(ROOT / "young_router" / "proxy" / "hook.py")
         self.assertIn(
             "            _responses_request_module._with_incoming_user_agent_header,\n"
             "            _responses_request_module._with_owned_user_agent_header,\n",

@@ -15,9 +15,9 @@ from urllib.error import HTTPError
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from webdav import commands as webdav_commands  # noqa: E402
-from webdav import core as webdav_core  # noqa: E402
-from webdav import operations as webdav_operations  # noqa: E402
+from young_router.webdav import commands as webdav_commands  # noqa: E402
+from young_router.webdav import core as webdav_core  # noqa: E402
+from young_router.webdav import operations as webdav_operations  # noqa: E402
 
 
 class WebDAVRemoteRenameTests(unittest.TestCase):
@@ -269,11 +269,11 @@ class WebDAVSyncBundleTests(unittest.TestCase):
             status_path = Path(temp_dir) / "webdav-sync-status.json"
             args = type("Args", (), {"command": "probe", "status": status_path})()
 
-            with patch("webdav.commands.command_probe", return_value=0):
+            with patch("young_router.webdav.commands.command_probe", return_value=0):
                 self.assertEqual(0, webdav_commands._run_recorded_command(args))
             success = json.loads(status_path.read_text(encoding="utf-8"))
 
-            with patch("webdav.commands.command_probe", side_effect=webdav_core.SyncError("failed")):
+            with patch("young_router.webdav.commands.command_probe", side_effect=webdav_core.SyncError("failed")):
                 with self.assertRaises(webdav_core.SyncError):
                     webdav_commands._run_recorded_command(args)
             failure = json.loads(status_path.read_text(encoding="utf-8"))
@@ -853,8 +853,8 @@ class WebDAVSyncBundleTests(unittest.TestCase):
 
         settings = webdav_core.Settings(url="https://example.com/dav/resource/", remote_name="config.json")
 
-        with patch("webdav.commands.load_settings", return_value=settings), \
-            patch("webdav.commands.WebDAVClient", FakeClient), \
+        with patch("young_router.webdav.commands.load_settings", return_value=settings), \
+            patch("young_router.webdav.commands.WebDAVClient", FakeClient), \
             patch("sys.stdout", new_callable=io.StringIO) as stdout:
             exit_code = webdav_commands.command_probe(Args())
 
@@ -876,7 +876,7 @@ class WebDAVSyncBundleTests(unittest.TestCase):
         )
 
         with patch("urllib.request.urlopen", side_effect=checkpoint) as urlopen, \
-            patch("webdav.core._webdav_request_retry_attempts", return_value=1), \
+            patch("young_router.webdav.core._webdav_request_retry_attempts", return_value=1), \
             patch.object(client, "_curl_request", return_value=(200, {}, b"ok")) as curl_request:
             status, _headers, body = client.request("GET", "https://example.com/dav/resource/file.json")
 
@@ -900,8 +900,8 @@ class WebDAVSyncBundleTests(unittest.TestCase):
                 {"stdout": b"200", "stderr": b"maximum file size exceeded", "returncode": 63},
             )()
 
-        with patch("webdav.core._curl_binary", return_value="/usr/bin/curl"), \
-            patch("webdav.core.subprocess.run", side_effect=fake_run):
+        with patch("young_router.webdav.core._curl_binary", return_value="/usr/bin/curl"), \
+            patch("young_router.webdav.core.subprocess.run", side_effect=fake_run):
             with self.assertRaisesRegex(webdav_core.SyncError, "4-byte limit"):
                 client._curl_request(
                     "GET",
@@ -945,9 +945,9 @@ class WebDAVSyncBundleTests(unittest.TestCase):
             )()
 
         with patch("urllib.request.urlopen", side_effect=checkpoint), \
-            patch("webdav.core._webdav_request_retry_attempts", return_value=1), \
-            patch("webdav.core._curl_binary", return_value="/usr/bin/curl"), \
-            patch("webdav.core.subprocess.run", side_effect=fake_run):
+            patch("young_router.webdav.core._webdav_request_retry_attempts", return_value=1), \
+            patch("young_router.webdav.core._curl_binary", return_value="/usr/bin/curl"), \
+            patch("young_router.webdav.core.subprocess.run", side_effect=fake_run):
             with self.assertRaisesRegex(webdav_core.SyncError, "4-byte limit"):
                 client.request("GET", url, response_max_bytes=4)
 
