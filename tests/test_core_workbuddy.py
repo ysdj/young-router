@@ -14,7 +14,7 @@ import unittest
 from unittest import mock
 import unittest.mock
 
-from young_router import workbuddy
+from young_router.adapters import workbuddy
 from young_router.core.domains import DomainError
 from young_router.core.domains.providers_models import ProvidersModelsDomain
 from young_router.core.provider_auth import ProviderAuthManager
@@ -347,8 +347,8 @@ class WorkBuddyServiceEnvironmentTests(unittest.TestCase):
         """
 
         root = Path(__file__).resolve().parents[1]
-        worker = (root / "young_router/workbuddy_worker.mjs").read_text(encoding="utf-8")
-        shaper = (root / "young_router/workbuddy_stream.mjs").read_text(encoding="utf-8")
+        worker = (root / "young_router/adapters/workbuddy_worker.mjs").read_text(encoding="utf-8")
+        shaper = (root / "young_router/adapters/workbuddy_stream.mjs").read_text(encoding="utf-8")
         self.assertIn("import { normalizeChatCompletionStreamLine } from './workbuddy_stream.mjs'", worker)
         self.assertIn("res.write(normalizeChatCompletionStreamLine(buffer.slice(0, newline + 1)))", worker)
         self.assertIn("if (buffer) res.write(normalizeChatCompletionStreamLine(buffer))", worker)
@@ -408,7 +408,7 @@ class WorkBuddyModuleTests(unittest.TestCase):
 
         import os
 
-        from young_router import workbuddy as workbuddy_module
+        from young_router.adapters import workbuddy as workbuddy_module
         from young_router.core.domains.providers_models import ProvidersModelsDomain as D
 
         names = [
@@ -434,7 +434,7 @@ class WorkBuddyModuleTests(unittest.TestCase):
 
         import os
 
-        from young_router import workbuddy as workbuddy_module
+        from young_router.adapters import workbuddy as workbuddy_module
         from young_router.core.domains.providers_models import ProvidersModelsDomain as D
 
         name = workbuddy_module.API_BASE_ENV["workbuddy"]
@@ -455,7 +455,7 @@ class WorkBuddyModuleTests(unittest.TestCase):
     def test_a_managed_route_is_probed_on_its_own_surface(self) -> None:
         """The worker mounts one surface, so that is the one a probe tests."""
 
-        from young_router import workbuddy as workbuddy_module
+        from young_router.adapters import workbuddy as workbuddy_module
         from young_router.core.domains.providers_models import ProvidersModelsDomain as D
 
         reference = workbuddy_module.api_base_reference("workbuddy")
@@ -491,7 +491,7 @@ class WorkBuddyModuleTests(unittest.TestCase):
 
         import os
 
-        from young_router import workbuddy as workbuddy_module
+        from young_router.adapters import workbuddy as workbuddy_module
 
         saved = {name: os.environ.get(name) for name in workbuddy_module.API_BASE_ENV.values()}
 

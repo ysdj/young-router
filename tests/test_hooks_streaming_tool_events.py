@@ -431,7 +431,7 @@ class HookStreamingToolEventTests(HookTestCase):
         original_completed_payload = (
             streaming_module._ResponsesStreamCompletionState.completed_payload
         )
-        web_search_bridge_module = importlib.import_module("young_router.responses_web_search_bridge")
+        web_search_bridge_module = importlib.import_module("young_router.proxy.responses_web_search_bridge")
         original_resolve = (
             web_search_bridge_module._resolve_web_search_function_calls_stream_rounds
         )

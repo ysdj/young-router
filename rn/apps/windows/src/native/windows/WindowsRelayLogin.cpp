@@ -535,7 +535,7 @@ std::string CookieHeader(std::map<std::string, std::string> const& values) {
 std::map<std::string, std::string> ParseCookieHeader(std::string const& header);
 
 // The one browser identity every request of ours presents.  The literals are
-// mirrored by `young_router/browser_identity.py` (asserted by
+// mirrored by `src/young_router/browser_identity.py` (asserted by
 // `tests/test_browser_identity.py`): the app never exposes a User-Agent of its
 // own, and a relay that binds a browser session to its IP and User-Agent
 // fingerprint keeps one account on one fingerprint.  The embedded sign-in page

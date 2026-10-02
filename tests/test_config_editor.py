@@ -15,9 +15,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from config_editor_core import api as config_api  # noqa: E402
-from config_editor_core import load as config_load  # noqa: E402
-from config_editor_core import schema as config_schema  # noqa: E402
+from young_router.config import api as config_api  # noqa: E402
+from young_router.config import load as config_load  # noqa: E402
+from young_router.config import schema as config_schema  # noqa: E402
 
 
 class ConfigEditorProviderKeyTests(unittest.TestCase):
@@ -44,11 +44,11 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
             """
             import sys
 
-            from config_editor_core.api import main
+            from young_router.config.api import main
 
             sys.argv = ["config_editor.py", "load", "--config", sys.argv[1]]
             exit_code = main()
-            if "config_editor_core.dump" in sys.modules:
+            if "young_router.config.dump" in sys.modules:
                 raise SystemExit("load imported the save-only dump module")
             if any(name == "litellm" or name.startswith("litellm.") for name in sys.modules):
                 raise SystemExit("load imported LiteLLM")

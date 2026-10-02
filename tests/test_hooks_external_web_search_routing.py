@@ -286,7 +286,7 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
         hooks, _ = load_hook_module()
         calls = []
         web_search_bridge_module = importlib.import_module(
-            "young_router.responses_web_search_bridge"
+            "young_router.proxy.responses_web_search_bridge"
         )
         original_run_actions = web_search_bridge_module._external_web_search_run_actions
         run_actions_called = False
@@ -351,7 +351,7 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
         hooks, _ = load_hook_module()
         calls = []
         web_search_bridge_module = importlib.import_module(
-            "young_router.responses_web_search_bridge"
+            "young_router.proxy.responses_web_search_bridge"
         )
         original_run_actions = web_search_bridge_module._external_web_search_run_actions
         run_actions_called = False
@@ -409,7 +409,7 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
     async def test_external_web_search_sanitized_auth_balance_failure_is_not_direct_fallback(self) -> None:
         hooks, _ = load_hook_module()
         web_search_bridge_module = importlib.import_module(
-            "young_router.responses_web_search_bridge"
+            "young_router.proxy.responses_web_search_bridge"
         )
         original_run_actions = web_search_bridge_module._external_web_search_run_actions
         run_actions_called = False

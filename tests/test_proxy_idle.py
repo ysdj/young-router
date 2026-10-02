@@ -12,7 +12,7 @@ from unittest import mock
 import uvicorn.server
 from uvicorn.supervisors import multiprocess as uvicorn_multiprocess
 
-from young_router import proxy_idle
+from young_router.proxy import proxy_idle
 
 
 class _FakeServerState:

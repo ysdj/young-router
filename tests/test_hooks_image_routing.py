@@ -8,7 +8,7 @@ from hook_test_utils import *
 
 class HookImageRoutingTests(HookTestCase):
     def test_image_generation_module_contains_only_imggen_behavior(self) -> None:
-        tree = ast.parse((ROOT / "young_router" / "image_generation.py").read_text(encoding="utf-8"))
+        tree = ast.parse((ROOT / "young_router" / "proxy" / "image_generation.py").read_text(encoding="utf-8"))
         definitions = [
             node.name
             for node in tree.body

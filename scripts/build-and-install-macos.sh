@@ -170,7 +170,7 @@ proxy_port_for_app() {
     [[ -n "$process_pid" ]] || continue
     command=$(ps -p "$process_pid" -o command= 2>/dev/null || true)
     if [[ "$command" != *"run_server()"* \
-      && "$command" != *" -m young_router.macos_proxy "* ]]; then
+      && "$command" != *" -m young_router.proxy.macos_proxy "* ]]; then
       continue
     fi
     port=$(awk '{ for (field = 1; field < NF; field += 1) if ($field == "--port") { print $(field + 1); exit } }' <<<"$command")
@@ -359,10 +359,10 @@ test -x "$STAGED_APP/Contents/Resources/Core/runtime/bin/python"
 test -x "$STAGED_APP/Contents/Resources/Core/runtime/bin/litellm"
 test -x "$STAGED_APP/Contents/Resources/Core/runtime/bin/node"
 test -x "$STAGED_APP/Contents/Resources/Core/bin/vision_ocr"
-test -f "$STAGED_APP/Contents/Resources/Core/young_router/pi-web-access/index.ts"
-test -f "$STAGED_APP/Contents/Resources/Core/young_router/traceone/traceone.js"
-test -f "$STAGED_APP/Contents/Resources/Core/young_router/traceone/prompt.txt"
-test -f "$STAGED_APP/Contents/Resources/Core/young_router/workbuddy-connect/lib/index.js"
+test -f "$STAGED_APP/Contents/Resources/Core/young_router/adapters/pi-web-access/index.ts"
+test -f "$STAGED_APP/Contents/Resources/Core/young_router/adapters/traceone/traceone.js"
+test -f "$STAGED_APP/Contents/Resources/Core/young_router/adapters/traceone/prompt.txt"
+test -f "$STAGED_APP/Contents/Resources/Core/young_router/adapters/workbuddy-connect/lib/index.js"
 plutil -lint "$STAGED_APP/Contents/Info.plist" >/dev/null
 codesign --verify --deep --strict --verbose=2 "$STAGED_APP"
 printf '%s\n' "Young Router: staged bundle verified"

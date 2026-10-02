@@ -20,29 +20,30 @@ VALID_IMAGE_RESULT = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42m
 _STUB_MARKER_ATTR = "_young_router_hook_test_stub"
 _STUB_ROOT_ATTR = "_young_router_hook_test_stub_root"
 HOOK_MODULE_NAMES = (
-    "base",
+    "proxy.base",
     "api_base",
-    "request_context",
-    "reasoning",
-    "codex_fast_tier",
-    "trace",
+    "proxy.request_context",
+    "proxy.reasoning",
+    "proxy.codex_fast_tier",
+    "proxy.trace",
     "log_rotation",
-    "state",
-    "routing",
-    "responses_tools",
-    "responses_surfaces",
-    "responses_web_search_bridge",
-    "responses_output",
-    "image_inputs",
-    "responses_request",
-    "responses_execution",
-    "patches",
-    "tools",
-    "image_generation",
-    "dsh_vision_router",
-    "streaming",
-    "pi_web_access",
-    "hook",
+    "proxy.state",
+    "proxy.routing",
+    "proxy.responses_tools",
+    "proxy.responses_surfaces",
+    "proxy.responses_web_search_bridge",
+    "proxy.responses_output",
+    "proxy.image_inputs",
+    "proxy.responses_request",
+    "proxy.responses_execution",
+    "proxy.patches",
+    "proxy.tools",
+    "proxy.image_generation",
+    "adapters.dsh_vision_router",
+    "proxy.streaming_recovery",
+    "proxy.streaming",
+    "adapters.pi_web_access",
+    "proxy.hook",
 )
 
 
@@ -111,6 +112,17 @@ def load_hook_module():
     hook_module_names = {"young_router.callbacks", *(f"young_router.{name}" for name in HOOK_MODULE_NAMES)}
     for name in hook_module_names:
         sys.modules.pop(name, None)
+        # Popping ``sys.modules`` leaves the parent package's attribute in
+        # place, and ``from . import routing`` answers from that stale
+        # attribute instead of importing the fresh module.  Drop the
+        # attribute too, so every re-import really re-executes the module.
+        parent_name, _, child = name.rpartition(".")
+        parent = sys.modules.get(parent_name)
+        if parent is not None:
+            try:
+                delattr(parent, child)
+            except AttributeError:
+                pass
 
     litellm = types.ModuleType("litellm")
 

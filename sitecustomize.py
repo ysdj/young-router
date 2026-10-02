@@ -381,13 +381,13 @@ def _install_uvicorn_websocket_frame_limit_patch() -> None:
     then closes the connection with code 1009 before the request reaches
     the pipeline and Codex reports ``websocket closed by server before
     response.completed`` followed by its reconnect ladder.  The installer
-    lives in ``young_router.base`` so both this early hook (interpreter
+    lives in ``young_router.proxy.base`` so both this early hook (interpreter
     startup, covering the LiteLLM CLI launch path) and the callback-time
-    ``young_router.patches.install_all`` share one implementation.
+    ``young_router.proxy.patches.install_all`` share one implementation.
     """
 
     def _patch(uvicorn_module: Any) -> None:
-        from young_router.base import _install_websocket_frame_limit_patch
+        from young_router.proxy.base import _install_websocket_frame_limit_patch
 
         _install_websocket_frame_limit_patch()
 
@@ -399,14 +399,14 @@ def _install_proxy_idle_patches() -> None:
 
     The supervisor and all sixteen workers run uvicorn's ten-hertz serve loop
     while the router is idle, and the supervisor health-checks every worker
-    twice a second.  The installer lives in ``young_router.proxy_idle`` so this
+    twice a second.  The installer lives in ``young_router.proxy.proxy_idle`` so this
     early hook (interpreter startup, covering the ``macos_proxy`` launch path)
-    and the callback-time ``young_router.patches.install_all`` share one
+    and the callback-time ``young_router.proxy.patches.install_all`` share one
     implementation.
     """
 
     def _patch(_uvicorn_module: Any) -> None:
-        from young_router.proxy_idle import install_proxy_idle_patches
+        from young_router.proxy.proxy_idle import install_proxy_idle_patches
 
         install_proxy_idle_patches()
 

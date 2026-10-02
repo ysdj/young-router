@@ -37,7 +37,7 @@ class WebDAVSettingsDomain:
         config_path: Path | str | None = None,
         state_path: Path | str | None = None,
     ):
-        from webdav import core as webdav_core
+        from ...webdav import core as webdav_core
 
         self.settings_path = Path(settings_path).expanduser() if settings_path else webdav_core.default_settings_file()
         self.enabled_path = Path(enabled_path).expanduser() if enabled_path else _default_webdav_enabled_path(self.settings_path)
@@ -78,7 +78,7 @@ class WebDAVSettingsDomain:
         return True
 
     def _load(self) -> tuple[dict[str, Any], bool, bytes | None]:
-        from webdav import core as webdav_core
+        from ...webdav import core as webdav_core
 
         try:
             baseline = _file_bytes(self.settings_path)
@@ -91,7 +91,7 @@ class WebDAVSettingsDomain:
         return self._settings_raw(settings), enabled, baseline
 
     def _settings(self, raw: Mapping[str, Any] | None = None) -> Any:
-        from webdav import core as webdav_core
+        from ...webdav import core as webdav_core
 
         try:
             return webdav_core._settings_from_raw(dict(raw or self._draft_settings))
@@ -144,7 +144,7 @@ class WebDAVSettingsDomain:
     def _last_result(self) -> dict[str, Any] | None:
         """The status file's last run: action, outcome, and when it checked."""
 
-        from webdav import core as webdav_core
+        from ...webdav import core as webdav_core
 
         try:
             status = webdav_core.read_status_file(self.status_path)
@@ -161,7 +161,7 @@ class WebDAVSettingsDomain:
         }
 
     def _last_sync(self) -> dict[str, str] | None:
-        from webdav import core as webdav_core
+        from ...webdav import core as webdav_core
 
         try:
             state = webdav_core.load_sync_state(self.state_path)
@@ -289,7 +289,7 @@ class WebDAVSettingsDomain:
             raise DomainError("WebDAV enablement state could not be saved") from None
 
     def apply(self, payload: object | None = None) -> dict[str, Any]:
-        from webdav import core as webdav_core
+        from ...webdav import core as webdav_core
 
         if payload is not None:
             data = _mapping(payload)
@@ -369,7 +369,7 @@ class WebDAVSettingsDomain:
         self.revision += 1
 
     def probe(self, _payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
-        from webdav import core as webdav_core
+        from ...webdav import core as webdav_core
 
         try:
             settings = self._settings()

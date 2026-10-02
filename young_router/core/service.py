@@ -869,7 +869,7 @@ class CoreStore:
         from .domains.webdav import WebDAVSettingsDomain
         from .operations import CoreServiceController
         from .provider_auth import ProviderAuthManager
-        from ..workbuddy import WorkBuddyRuntime
+        from ..adapters.workbuddy import WorkBuddyRuntime
 
         controller = CoreServiceController(runtime_root)
         provider_auth = ProviderAuthManager(runtime_root)
@@ -950,7 +950,7 @@ class CoreStore:
         try:
             relay_path = None
             if config_path is not None:
-                from webdav import core as webdav_core
+                from ..webdav import core as webdav_core
 
                 relay_path = webdav_core.relay_accounts_path(Path(config_path).expanduser())
             adapters.append(RelayAccountsDomain(runtime_root, storage_path=relay_path))
@@ -2321,7 +2321,7 @@ class CoreStore:
         so nothing has to be pushed at it when the settings change.
         """
 
-        from webdav import core as webdav_core
+        from ..webdav import core as webdav_core
 
         idle = {"enabled": False, "configured": False, "sync_interval_minutes": 0, "last_sync_at": None}
         webdav = self._domains.get("webdav")
@@ -2428,8 +2428,8 @@ class CoreStore:
         """
 
         sections = self._webdav_sync_sections(payload)
-        from webdav import core as webdav_core
-        from webdav import operations as webdav_operations
+        from ..webdav import core as webdav_core
+        from ..webdav import operations as webdav_operations
 
         with self._lock:
             self._refresh_external_disk_state()
@@ -4201,7 +4201,7 @@ class CoreStore:
             # All other supported JSON/TOML/YAML/SQL shapes are existing
             # provider/model imports. Detection happens only after the native
             # picker has returned the file; no checkbox hint influences it.
-            import external_provider_import
+            from . import external_provider_import
 
             imported = external_provider_import.import_explicit(path)
             providers = imported.get("providers") if isinstance(imported, Mapping) else None

@@ -121,11 +121,11 @@ def local_proxy_endpoint() -> tuple[str, str]:
     and the configured LiteLLM master key (falling back to the built-in one).
     """
 
-    import codex_config
+    from .. import codex_config
 
     port = codex_config.DEFAULT_PORT
     try:
-        from runtime_settings_io import load_specs, read_settings_file
+        from ..runtime_settings_io import load_specs, read_settings_file
 
         values = read_settings_file(_default_runtime_settings_path(), load_specs())
         candidate = str(values.get("LITELLM_PORT", "")).strip()

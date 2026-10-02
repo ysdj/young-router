@@ -151,7 +151,7 @@ class WebDAVSyncScheduler:
         return float(minutes) * 60.0
 
     def _due_in(self, interval: float, last_sync_at: object) -> float:
-        from webdav import core as webdav_core
+        from ..webdav import core as webdav_core
 
         now = self._clock()
         last = webdav_core.timestamp_epoch(last_sync_at)

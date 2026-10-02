@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "young-router"
+description = "Local AI gateway desktop app: Core IPC, LiteLLM data plane, and bundled worker adapters."
+readme = "README.md"
+requires-python = ">=3.11"
+dynamic = ["version"]
+
+[tool.setuptools.dynamic]
+version = { file = ["VERSION"] }
+
+[tool.setuptools.packages.find]
+include = ["young_router*"]
+
+[tool.setuptools.package-data]
+"young_router.adapters" = ["*.mjs"]
+
+[project.scripts]
+young-router-core = "young_router.core.__main__:run"
+young-router-config = "young_router.config.api:main"
+young-router-webdav = "young_router.webdav.commands:main"
+young-router-codex-config = "young_router.core.codex_config:main"
+young-router-provider-import = "young_router.core.external_provider_import:main"
+young-router-config-package = "young_router.core.configuration_package:main"
+young-router-usage-logs = "young_router.core.remote_usage_logs:main"

@@ -47,7 +47,7 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn('start_installed_app "$OLD_PIDS"', installer)
         self.assertIn('curl --fail --silent --show-error --max-time 1', installer)
         self.assertIn('health/liveliness', installer)
-        self.assertIn(' -m young_router.macos_proxy ', installer)
+        self.assertIn(' -m young_router.proxy.macos_proxy ', installer)
         self.assertIn('stable_checks >= REQUIRED_HEALTH_CHECKS', installer)
         self.assertIn('restore_previous_app', installer)
         self.assertIn("copy_tree()", installer)
@@ -249,7 +249,7 @@ class ReactNativeReleaseTests(unittest.TestCase):
         ):
             self.assertIn(assignment, script)
         self.assertIn("vendor/react-native-macos-0.85/packages/react-native/cli.js", script)
-        self.assertIn("runtime_settings_io.py", script)
+        self.assertIn("young_router", script)
         self.assertIn("sitecustomize.py", script)
         self.assertIn("VisionOCR.swift", script)
         self.assertIn("$CORE/bin/vision_ocr", script)
@@ -287,7 +287,7 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn('copy_tree "$APP" "$STAGED_OUTPUT"', script)
         self.assertNotIn('service/runtime_settings.sh', script)
 
-        runtime_io = (ROOT / "runtime_settings_io.py").read_text(encoding="utf-8")
+        runtime_io = (ROOT / "young_router/core/runtime_settings_io.py").read_text(encoding="utf-8")
         runtime_schema = (ROOT / "young_router/core/runtime_settings_schema.py").read_text(encoding="utf-8")
         self.assertIn("runtime_settings_metadata", runtime_io)
         self.assertNotIn(' / "service" / ', runtime_io)

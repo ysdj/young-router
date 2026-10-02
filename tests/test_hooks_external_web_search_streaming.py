@@ -709,7 +709,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
     async def test_streaming_native_web_search_completed_payload_message_is_terminal(self) -> None:
         hooks, _ = load_hook_module()
         hook = hooks.YoungRouterHook()
-        streaming_module = importlib.import_module("young_router.streaming")
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
         original_route_recovery_poll = streaming_module._stream_route_recovery_poll
         recovery_requests = []
 
@@ -810,7 +810,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
     async def test_streaming_native_web_search_closes_after_completed_even_if_upstream_continues(self) -> None:
         hooks, _ = load_hook_module()
         hook = hooks.YoungRouterHook()
-        streaming_module = importlib.import_module("young_router.streaming")
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
         original_route_recovery_poll = streaming_module._stream_route_recovery_poll
         recovery_requests = []
 
@@ -1340,9 +1340,9 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
         hooks, _ = load_hook_module()
         hook = hooks.YoungRouterHook()
         original_run_action = hooks._external_web_search_run_action
-        web_search_bridge_module = importlib.import_module("young_router.responses_web_search_bridge")
+        web_search_bridge_module = importlib.import_module("young_router.proxy.responses_web_search_bridge")
         original_bridge_run_action = web_search_bridge_module._external_web_search_run_action
-        streaming_module = importlib.import_module("young_router.streaming")
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
         original_route_recovery_poll = streaming_module._stream_route_recovery_poll
 
         async def fake_run_action(action, page_cache, page_fetch_tasks):
@@ -1516,9 +1516,9 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
         hooks, _ = load_hook_module()
         hook = hooks.YoungRouterHook()
         original_run_action = hooks._external_web_search_run_action
-        web_search_bridge_module = importlib.import_module("young_router.responses_web_search_bridge")
+        web_search_bridge_module = importlib.import_module("young_router.proxy.responses_web_search_bridge")
         original_bridge_run_action = web_search_bridge_module._external_web_search_run_action
-        streaming_module = importlib.import_module("young_router.streaming")
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
         original_route_recovery_poll = streaming_module._stream_route_recovery_poll
 
         async def fake_run_action(action, page_cache, page_fetch_tasks):
@@ -1658,9 +1658,9 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
         hooks, _ = load_hook_module()
         hook = hooks.YoungRouterHook()
         original_run_action = hooks._external_web_search_run_action
-        web_search_bridge_module = importlib.import_module("young_router.responses_web_search_bridge")
+        web_search_bridge_module = importlib.import_module("young_router.proxy.responses_web_search_bridge")
         original_bridge_run_action = web_search_bridge_module._external_web_search_run_action
-        streaming_module = importlib.import_module("young_router.streaming")
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
         original_route_recovery_poll = streaming_module._stream_route_recovery_poll
 
         async def fake_run_action(action, page_cache, page_fetch_tasks):
@@ -1810,9 +1810,9 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
         hooks, _ = load_hook_module()
         hook = hooks.YoungRouterHook()
         original_run_action = hooks._external_web_search_run_action
-        web_search_bridge_module = importlib.import_module("young_router.responses_web_search_bridge")
+        web_search_bridge_module = importlib.import_module("young_router.proxy.responses_web_search_bridge")
         original_bridge_run_action = web_search_bridge_module._external_web_search_run_action
-        streaming_module = importlib.import_module("young_router.streaming")
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
         original_route_recovery_poll = streaming_module._stream_route_recovery_poll
 
         executed_queries = []
@@ -1959,9 +1959,9 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
         hooks, _ = load_hook_module()
         hook = hooks.YoungRouterHook()
         original_run_action = hooks._external_web_search_run_action
-        web_search_bridge_module = importlib.import_module("young_router.responses_web_search_bridge")
+        web_search_bridge_module = importlib.import_module("young_router.proxy.responses_web_search_bridge")
         original_bridge_run_action = web_search_bridge_module._external_web_search_run_action
-        streaming_module = importlib.import_module("young_router.streaming")
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
         original_route_recovery_poll = streaming_module._stream_route_recovery_poll
 
         executed_queries = []
@@ -2113,9 +2113,9 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
         hooks, _ = load_hook_module()
         hook = hooks.YoungRouterHook()
         original_run_action = hooks._external_web_search_run_action
-        web_search_bridge_module = importlib.import_module("young_router.responses_web_search_bridge")
+        web_search_bridge_module = importlib.import_module("young_router.proxy.responses_web_search_bridge")
         original_bridge_run_action = web_search_bridge_module._external_web_search_run_action
-        streaming_module = importlib.import_module("young_router.streaming")
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
         original_route_recovery_poll = streaming_module._stream_route_recovery_poll
 
         async def fake_run_action(action, page_cache, page_fetch_tasks):
@@ -2293,9 +2293,9 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
         hooks, _ = load_hook_module()
         hook = hooks.YoungRouterHook()
         original_run_action = hooks._external_web_search_run_action
-        web_search_bridge_module = importlib.import_module("young_router.responses_web_search_bridge")
+        web_search_bridge_module = importlib.import_module("young_router.proxy.responses_web_search_bridge")
         original_bridge_run_action = web_search_bridge_module._external_web_search_run_action
-        streaming_module = importlib.import_module("young_router.streaming")
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
         original_route_recovery_poll = streaming_module._stream_route_recovery_poll
         original_keepalive_seconds = streaming_module._ROUTE_RECOVERY_SSE_KEEPALIVE_SECONDS
         streaming_module._ROUTE_RECOVERY_SSE_KEEPALIVE_SECONDS = 0.0005
@@ -2473,9 +2473,9 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
         hooks, _ = load_hook_module()
         hook = hooks.YoungRouterHook()
         original_run_action = hooks._external_web_search_run_action
-        web_search_bridge_module = importlib.import_module("young_router.responses_web_search_bridge")
+        web_search_bridge_module = importlib.import_module("young_router.proxy.responses_web_search_bridge")
         original_bridge_run_action = web_search_bridge_module._external_web_search_run_action
-        streaming_module = importlib.import_module("young_router.streaming")
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
         original_route_recovery_poll = streaming_module._stream_route_recovery_poll
 
         async def fake_run_action(action, page_cache, page_fetch_tasks):
@@ -2593,7 +2593,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
     async def test_streaming_external_web_search_partial_answer_504_fails_without_retry(self) -> None:
         hooks, _ = load_hook_module()
         hook = hooks.YoungRouterHook()
-        streaming_module = importlib.import_module("young_router.streaming")
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
         original_route_recovery_poll = streaming_module._stream_route_recovery_poll
         recovery_requests = []
 
@@ -2660,7 +2660,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
         hooks, _ = load_hook_module()
         hook = hooks.YoungRouterHook()
         original_run_action = hooks._external_web_search_run_action
-        streaming_module = importlib.import_module("young_router.streaming")
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
         original_route_recovery_poll = streaming_module._stream_route_recovery_poll
 
         async def fake_run_action(action, page_cache, page_fetch_tasks):
@@ -2848,7 +2848,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
         hooks, _ = load_hook_module()
         hook = hooks.YoungRouterHook()
         original_run_action = hooks._external_web_search_run_action
-        streaming_module = importlib.import_module("young_router.streaming")
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
         original_route_recovery_poll = streaming_module._stream_route_recovery_poll
 
         async def fake_run_action(action, page_cache, page_fetch_tasks):
@@ -2972,7 +2972,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
         hooks, _ = load_hook_module()
         hook = hooks.YoungRouterHook()
         original_run_action = hooks._external_web_search_run_action
-        streaming_module = importlib.import_module("young_router.streaming")
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
         original_route_recovery_poll = streaming_module._stream_route_recovery_poll
 
         async def fake_run_action(action, page_cache, page_fetch_tasks):
@@ -3090,7 +3090,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
         hooks, _ = load_hook_module()
         hook = hooks.YoungRouterHook()
         original_run_action = hooks._external_web_search_run_action
-        streaming_module = importlib.import_module("young_router.streaming")
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
         original_route_recovery_poll = streaming_module._stream_route_recovery_poll
 
         async def fake_run_action(action, page_cache, page_fetch_tasks):
@@ -3481,7 +3481,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
         hooks, _ = load_hook_module()
         hook = hooks.YoungRouterHook()
         original_run_action = hooks._external_web_search_run_action
-        streaming_module = importlib.import_module("young_router.streaming")
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
         original_route_recovery_poll = streaming_module._stream_route_recovery_poll
         run_action_called = False
         recovery_requests = []

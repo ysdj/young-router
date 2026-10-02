@@ -150,8 +150,8 @@ class HookRouteRecoveryTests(HookTestCase):
         )
 
         hooks, _proxy_server = load_hook_module()
-        streaming_module = sys.modules["young_router.streaming"]
-        state_module = sys.modules["young_router.state"]
+        streaming_module = sys.modules["young_router.proxy.streaming"]
+        state_module = sys.modules["young_router.proxy.state"]
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "route-recovery-state.json"
             self.set_env("YOUNG_ROUTER_ROUTE_RECOVERY_STATE_FILE", str(state_path))
@@ -887,7 +887,7 @@ class HookRouteRecoveryTests(HookTestCase):
 
     async def test_network_route_recovery_ignores_configured_poll_deadline(self) -> None:
         hooks, _proxy_server = load_hook_module()
-        streaming_module = sys.modules["young_router.streaming"]
+        streaming_module = sys.modules["young_router.proxy.streaming"]
         original_attempt = streaming_module._stream_route_recovery_poll_attempt
         original_keepalive_min_delay = (
             hooks._ROUTE_RECOVERY_SSE_KEEPALIVE_MIN_DELAY_SECONDS
@@ -951,8 +951,8 @@ class HookRouteRecoveryTests(HookTestCase):
 
     async def test_network_stream_fallback_never_raises_client_reconnect(self) -> None:
         hooks, _proxy_server = load_hook_module()
-        streaming_module = sys.modules["young_router.streaming"]
-        routing_module = sys.modules["young_router.routing"]
+        streaming_module = sys.modules["young_router.proxy.streaming"]
+        routing_module = sys.modules["young_router.proxy.routing"]
         original_fallback = streaming_module._stream_streaming_error_fallback
         original_recovery = streaming_module._stream_route_recovery_poll
         original_disconnect = routing_module._raise_retryable_stream_disconnect
@@ -1966,7 +1966,7 @@ class HookRouteRecoveryTests(HookTestCase):
 
     async def test_route_recovery_stops_replaying_original_web_search_after_attempt_starts_search(self) -> None:
         hooks, _proxy_server = load_hook_module()
-        streaming_module = importlib.import_module("young_router.streaming")
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
         original_attempt = streaming_module._stream_route_recovery_poll_attempt
         attempts = []
         self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "1")
@@ -2014,7 +2014,7 @@ class HookRouteRecoveryTests(HookTestCase):
 
     async def test_route_recovery_continues_with_web_search_recovery_payload_after_attempt_timeout(self) -> None:
         hooks, _proxy_server = load_hook_module()
-        streaming_module = importlib.import_module("young_router.streaming")
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
         original_attempt = streaming_module._stream_route_recovery_poll_attempt
         attempts = []
         self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "1")
@@ -2484,7 +2484,7 @@ class HookRouteRecoveryTests(HookTestCase):
 
     async def test_route_recovery_poll_normalizes_completed_usage_for_codex(self) -> None:
         hooks, _proxy_server = load_hook_module()
-        streaming_module = sys.modules["young_router.streaming"]
+        streaming_module = sys.modules["young_router.proxy.streaming"]
         original_attempt = streaming_module._stream_route_recovery_poll_attempt
 
         class GatewayTimeout(Exception):

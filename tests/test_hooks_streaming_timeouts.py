@@ -60,7 +60,7 @@ class HookStreamingTimeoutTests(HookTestCase):
 
     async def test_structured_compaction_uses_compaction_budget_after_first_event(self) -> None:
         hooks, _ = load_hook_module()
-        routing_module = importlib.import_module("young_router.routing")
+        routing_module = importlib.import_module("young_router.proxy.routing")
         previous_compaction_timeout = (
             routing_module._CODEX_COMPACTION_STREAM_START_TIMEOUT_DEFAULT_SECONDS
         )
@@ -127,7 +127,7 @@ class HookStreamingTimeoutTests(HookTestCase):
 
     async def test_structured_compaction_waits_longer_for_first_stream_chunk(self) -> None:
         hooks, _ = load_hook_module()
-        routing_module = importlib.import_module("young_router.routing")
+        routing_module = importlib.import_module("young_router.proxy.routing")
         previous_compaction_timeout = (
             routing_module._CODEX_COMPACTION_STREAM_START_TIMEOUT_DEFAULT_SECONDS
         )

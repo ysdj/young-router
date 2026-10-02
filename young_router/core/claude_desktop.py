@@ -16,11 +16,12 @@ import pathlib
 import re
 import stat
 import sys
-import tempfile
 import uuid
 from collections.abc import Callable, Mapping
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
+
+from ..atomic_io import atomic_write_text
 
 
 CONFIG_LIBRARY_ENV = "CLAUDE_DESKTOP_CONFIG_LIBRARY"
@@ -92,35 +93,12 @@ def _current_bytes(path: pathlib.Path) -> bytes | None:
         raise ClaudeDesktopConfigError("Claude Desktop configuration changed on disk; reload and try again") from None
 
 
+def _write_error(_reason: str) -> Exception:
+    return ClaudeDesktopConfigError("Claude Desktop configuration could not be saved")
+
+
 def _atomic_write(path: pathlib.Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    try:
-        os.chmod(path.parent, 0o700)
-    except OSError:
-        pass
-    temporary: str | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            delete=False,
-        ) as handle:
-            temporary = handle.name
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, path)
-        os.chmod(path, 0o600)
-    except OSError:
-        if temporary is not None:
-            try:
-                os.unlink(temporary)
-            except OSError:
-                pass
-        raise ClaudeDesktopConfigError("Claude Desktop configuration could not be saved") from None
+    atomic_write_text(path, text, parent_mode=0o700, error=_write_error)
 
 
 def _is_http_url(value: str) -> bool:

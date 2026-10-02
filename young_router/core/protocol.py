@@ -547,13 +547,11 @@ def decode_message(raw: bytes | str) -> dict[str, Any]:
     return _mapping(payload, "message")
 
 
-def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ProtocolError("invalid_message", "IPC message contains a duplicate key")
-        result[key] = value
-    return result
+from .. import json_input as _json_input
+
+_reject_duplicate_keys = _json_input.duplicate_key_hook(
+    lambda key: ProtocolError("invalid_message", "IPC message contains a duplicate key")
+)
 
 
 def _reject_json_constant(_: str) -> object:

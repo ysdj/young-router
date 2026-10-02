@@ -165,26 +165,15 @@ fi
 CORE="$APP/Contents/Resources/Core"
 rm -rf "$CORE"
 mkdir -p "$CORE"
-for file in \
-  codex_config.py \
-  configuration_package.py \
-  external_provider_import.py \
-  remote_usage_logs.py \
-  runtime_settings_io.py \
-  sitecustomize.py
-do
-  cp "$PROJECT_ROOT/$file" "$CORE/$file"
-done
-for directory in young_router config_editor_core webdav; do
-  rsync -a \
-    --exclude '__pycache__/' \
-    --exclude '*.pyc' \
-    --exclude '*.pyo' \
-    "$PROJECT_ROOT/$directory/" "$CORE/$directory/"
-done
-copy_tree "$PI_WEB_ACCESS_PACKAGE_WORK" "$CORE/young_router/pi-web-access"
-copy_tree "$TRACEONE_WORK" "$CORE/young_router/traceone"
-copy_tree "$WORKBUDDY_CONNECT_WORK" "$CORE/young_router/workbuddy-connect"
+cp "$PROJECT_ROOT/sitecustomize.py" "$CORE/sitecustomize.py"
+rsync -a \
+  --exclude '__pycache__/' \
+  --exclude '*.pyc' \
+  --exclude '*.pyo' \
+  "$PROJECT_ROOT/young_router/" "$CORE/young_router/"
+copy_tree "$PI_WEB_ACCESS_PACKAGE_WORK" "$CORE/young_router/adapters/pi-web-access"
+copy_tree "$TRACEONE_WORK" "$CORE/young_router/adapters/traceone"
+copy_tree "$WORKBUDDY_CONNECT_WORK" "$CORE/young_router/adapters/workbuddy-connect"
 
 if [[ -n "$RUNTIME_SOURCE" ]]; then
   if [[ ! -d "$RUNTIME_SOURCE/python" \
@@ -264,27 +253,27 @@ fi
   echo "Bundled Core launcher is missing." >&2
   exit 5
 }
-[[ -f "$CORE/young_router/pi-web-access/index.ts" ]] || {
+[[ -f "$CORE/young_router/adapters/pi-web-access/index.ts" ]] || {
   echo "The bundled pi-web-access package is missing." >&2
   exit 5
 }
-[[ -f "$CORE/young_router/traceone/traceone.js" ]] || {
+[[ -f "$CORE/young_router/adapters/traceone/traceone.js" ]] || {
   echo "The bundled TraceOne degradation engine is missing." >&2
   exit 5
 }
-[[ -f "$CORE/young_router/traceone/prompt.txt" ]] || {
+[[ -f "$CORE/young_router/adapters/traceone/prompt.txt" ]] || {
   echo "The bundled TraceOne identity prompt is missing." >&2
   exit 5
 }
-[[ -f "$CORE/young_router/workbuddy_stream.mjs" ]] || {
-  echo "The macOS build output does not contain young_router/workbuddy_stream.mjs." >&2
+[[ -f "$CORE/young_router/adapters/workbuddy_stream.mjs" ]] || {
+  echo "The macOS build output does not contain young_router/adapters/workbuddy_stream.mjs." >&2
   exit 1
 }
-[[ -f "$CORE/young_router/workbuddy-connect/lib/index.js" ]] || {
+[[ -f "$CORE/young_router/adapters/workbuddy-connect/lib/index.js" ]] || {
   echo "The bundled dsh-workbuddy-connect package is missing." >&2
   exit 5
 }
-[[ -f "$CORE/config_editor_core/api.py" ]] || {
+[[ -f "$CORE/young_router/config/api.py" ]] || {
   echo "Bundled Core dependencies are incomplete." >&2
   exit 5
 }
@@ -302,8 +291,8 @@ fi
 }
 PI_WEB_ACCESS_SMOKE_CONFIG="$RUNTIME_WORK/pi-web-access-smoke-config"
 if ! printf '' | "$CORE/runtime/bin/node" \
-  "$CORE/young_router/pi_web_access_worker.mjs" \
-  --entry "$CORE/young_router/pi-web-access/index.ts" \
+  "$CORE/young_router/adapters/pi_web_access_worker.mjs" \
+  --entry "$CORE/young_router/adapters/pi-web-access/index.ts" \
   --config-dir "$PI_WEB_ACCESS_SMOKE_CONFIG"; then
   echo "The bundled pi-web-access worker could not load its staged SDK." >&2
   exit 5
@@ -311,7 +300,7 @@ fi
 # A staged classifier that cannot load would turn every deep test into an
 # inconclusive result, so the bundle verifies one real attribution first.
 if ! printf '%s\n' '{"id":"bundle-smoke","text":"[[1]]"}' | "$CORE/runtime/bin/node" \
-  "$CORE/young_router/traceone_worker.mjs" --dir "$CORE/young_router/traceone" \
+  "$CORE/young_router/adapters/traceone_worker.mjs" --dir "$CORE/young_router/adapters/traceone" \
   | grep -q '"id":"bundle-smoke"'; then
   echo "The bundled TraceOne worker could not run the staged classifier." >&2
   exit 5
@@ -373,7 +362,7 @@ assert run_server is not None and BaseApplication is not None and UvicornWorker 
   exit 5
 }
 
-PYTHONDONTWRITEBYTECODE=0 PYTHONPATH="$CORE" "$CORE/runtime/bin/python" -c 'import litellm.proxy.proxy_server, young_router.core, young_router.core.__main__, young_router.macos_proxy, codex_config, config_editor_core, configuration_package, external_provider_import, webdav.core'
+PYTHONDONTWRITEBYTECODE=0 PYTHONPATH="$CORE" "$CORE/runtime/bin/python" -c 'import litellm.proxy.proxy_server, young_router.core, young_router.core.__main__, young_router.proxy.macos_proxy, young_router.core.codex_config, young_router.config, young_router.core.configuration_package, young_router.core.external_provider_import, young_router.webdav.core'
 PYTHONDONTWRITEBYTECODE=1 "$CORE/runtime/bin/litellm" --help >/dev/null
 PORTABLE_SMOKE="$RUNTIME_WORK/portable-core"
 copy_tree "$CORE" "$PORTABLE_SMOKE"

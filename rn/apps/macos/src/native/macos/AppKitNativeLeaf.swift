@@ -2713,7 +2713,7 @@ private enum NativeRelayOriginPolicy {
 }
 
 /// The one browser identity every request of ours presents.  The literal is
-/// mirrored by `young_router/browser_identity.py` and asserted by
+/// mirrored by `src/young_router/browser_identity.py` and asserted by
 /// `tests/test_browser_identity.py`: the app never exposes a User-Agent of its
 /// own, and a relay that binds a browser session to its IP and User-Agent
 /// fingerprint keeps one account on one fingerprint.

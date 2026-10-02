@@ -22,7 +22,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 from urllib.parse import urlsplit
 
-from config_editor_core.schema import (
+from ...config.schema import (
     LITELLM_ADAPTER_PREFIXES,
     MENU_PROVIDER_AUTH_KEY,
     MENU_PROVIDER_SOURCE_KEY,
@@ -30,6 +30,10 @@ from config_editor_core.schema import (
     MENU_RELAY_KEYS_VERSION,
     MODEL_ORDER_MODES,
     PUBLIC_MODEL_CONTEXT_KEY,
+    RESPONSES_COMPACTION_CAPABILITY_ALIASES,
+    WEB_SEARCH_CAPABILITY_ALIASES,
+    WEB_SEARCH_CAPABILITY_CONTAINERS,
+    WEB_SEARCH_CAPABILITY_LISTS,
     _menu_order,
     _positive_int,
     _provider_key_id,
@@ -40,9 +44,10 @@ from config_editor_core.schema import (
     infer_upstream_fallback_surface,
 )
 
-from ... import traceone
-from ... import workbuddy as workbuddy_module
+from ...adapters import traceone
+from ...adapters import workbuddy as workbuddy_module
 from ...browser_identity import browser_request_headers
+from ...values import explicit_bool
 from ...api_base import isolated_http_opener, service_root
 from ..persistence import atomic_write_text
 from ..security import (
@@ -161,7 +166,7 @@ def _environment_reference(name: str) -> str:
 
 
 class ProvidersModelsDomain:
-    """Staged providers/models editing through ``config_editor_core``."""
+    """Staged providers/models editing through ``young_router.config``."""
 
     name = "providers_models"
     _MODEL_LIST_PROTOCOL = "openai-models-v1"
@@ -222,47 +227,13 @@ class ProvidersModelsDomain:
     # A wizard that never finishes must not accumulate credentials for the
     # life of the process; the oldest token goes when a newer one arrives.
     _MAX_PENDING_PROVIDER_KEYS = 4
-    _WEB_SEARCH_CAPABILITY_ALIASES = {
-        "supports_responses_web_search": "supports_responses_web_search",
-        "supports_web_search": "supports_web_search",
-        "supports_web_search_tool": "supports_web_search",
-        "has_web_search_tool": "supports_web_search",
-        "has_web_search": "supports_web_search",
-        "web_search": "supports_web_search",
-        "supportsResponsesWebSearch": "supports_responses_web_search",
-        "supportsWebSearch": "supports_web_search",
-        "supportsWebSearchTool": "supports_web_search",
-        "hasWebSearchTool": "supports_web_search",
-        "hasWebSearch": "supports_web_search",
-        "webSearch": "supports_web_search",
-    }
+    _WEB_SEARCH_CAPABILITY_ALIASES = WEB_SEARCH_CAPABILITY_ALIASES.copy()
     # Explicit per-model opt-in for encrypted remote Responses compaction. A
     # unified alias maps onto the canonical field; nothing may infer this
     # capability from a provider name, model name, or gpt version.
-    _RESPONSES_COMPACTION_CAPABILITY_ALIASES = {
-        "supports_responses_compaction": "supports_responses_compaction",
-        "supports_compaction": "supports_responses_compaction",
-    }
-    _WEB_SEARCH_CAPABILITY_CONTAINERS = (
-        "capabilities",
-        "supported_capabilities",
-        "model_info",
-        "metadata",
-        "extra",
-        "model_info_extra",
-        "features",
-        "tools",
-    )
-    _WEB_SEARCH_CAPABILITY_LISTS = (
-        "supported_tools",
-        "supported_features",
-        "supported_parameters",
-        "available_tools",
-        "features",
-        "capabilities",
-        "supported_capabilities",
-        "tools",
-    )
+    _RESPONSES_COMPACTION_CAPABILITY_ALIASES = RESPONSES_COMPACTION_CAPABILITY_ALIASES.copy()
+    _WEB_SEARCH_CAPABILITY_CONTAINERS = WEB_SEARCH_CAPABILITY_CONTAINERS
+    _WEB_SEARCH_CAPABILITY_LISTS = WEB_SEARCH_CAPABILITY_LISTS
     _WEB_SEARCH_CAPABILITY_MARKERS = {
         "web_search",
         "web_search_preview",
@@ -317,7 +288,7 @@ class ProvidersModelsDomain:
         """The WorkBuddy worker owner; created on demand for a bare domain."""
 
         if self.workbuddy is None:
-            from ...workbuddy import WorkBuddyRuntime
+            from ...adapters.workbuddy import WorkBuddyRuntime
 
             self.workbuddy = WorkBuddyRuntime(self.config_path.parent)
         return self.workbuddy
@@ -333,7 +304,7 @@ class ProvidersModelsDomain:
         return {"config": "providers: {}\n\nmodel_list: []\n", "disabled": None}
 
     def _load(self) -> dict[str, Any]:
-        from config_editor_core import load as config_load
+        from ...config import load as config_load
 
         try:
             payload = config_load.load_config(self.config_path)
@@ -880,7 +851,7 @@ class ProvidersModelsDomain:
             self.__dict__.pop("_last_operation", None)
 
     def _replace_draft(self, providers: object, document: object | None = None) -> None:
-        from config_editor_core.load import load_config_document, normalize_config_document
+        from ...config.load import load_config_document, normalize_config_document
 
         if not isinstance(providers, list):
             raise DomainError("Providers must be an array")
@@ -897,7 +868,7 @@ class ProvidersModelsDomain:
         self._probe_overlay.clear()
 
     def _set_raw(self, data: Mapping[str, Any]) -> None:
-        from config_editor_core.load import load_config_document, normalize_config_document
+        from ...config.load import load_config_document, normalize_config_document
 
         document = data.get("document")
         if document is None:
@@ -923,7 +894,7 @@ class ProvidersModelsDomain:
         if not isinstance(source, str) or not source:
             raise DomainError("Select a provider configuration file")
         try:
-            import external_provider_import
+            from .. import external_provider_import
 
             self._stage_import_result(external_provider_import.import_explicit(Path(source)))
         except DomainError:
@@ -944,7 +915,7 @@ class ProvidersModelsDomain:
 
     def _import_codex_current(self) -> None:
         try:
-            import external_provider_import
+            from .. import external_provider_import
 
             self._stage_import_result(external_provider_import.import_codex_current())
         except DomainError:
@@ -954,7 +925,7 @@ class ProvidersModelsDomain:
 
     def _import_claude_current(self) -> None:
         try:
-            import external_provider_import
+            from .. import external_provider_import
 
             self._stage_import_result(external_provider_import.import_claude_current())
         except DomainError:
@@ -964,7 +935,7 @@ class ProvidersModelsDomain:
 
     def _import_link(self, link: str) -> None:
         try:
-            import external_provider_import
+            from .. import external_provider_import
 
             self._stage_import_result(external_provider_import.import_link(link))
         except DomainError:
@@ -1049,20 +1020,6 @@ class ProvidersModelsDomain:
         catalog = cls._model_catalog(payload)
         return catalog[0] if catalog is not None else None
 
-    @staticmethod
-    def _explicit_boolean(value: object) -> bool | None:
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return bool(value)
-        if isinstance(value, str):
-            normalized = value.strip().lower()
-            if normalized in {"1", "true", "yes", "on", "enabled"}:
-                return True
-            if normalized in {"0", "false", "no", "off", "disabled"}:
-                return False
-        return None
-
     @classmethod
     def _model_responses_compaction_capabilities(
         cls,
@@ -1085,7 +1042,7 @@ class ProvidersModelsDomain:
             for key in cls._RESPONSES_COMPACTION_CAPABILITY_ALIASES:
                 if key not in container:
                     continue
-                parsed = cls._explicit_boolean(container.get(key))
+                parsed = explicit_bool(container.get(key))
                 if parsed is not None:
                     capabilities.setdefault(
                         cls._RESPONSES_COMPACTION_CAPABILITY_ALIASES[key],
@@ -1118,7 +1075,7 @@ class ProvidersModelsDomain:
             for source_key, target_key in cls._WEB_SEARCH_CAPABILITY_ALIASES.items():
                 if source_key not in container:
                     continue
-                parsed = cls._explicit_boolean(container.get(source_key))
+                parsed = explicit_bool(container.get(source_key))
                 if parsed is not None:
                     # Prefer a canonical/top-level declaration over aliases
                     # or nested copies when a gateway repeats the field.
@@ -1535,7 +1492,7 @@ class ProvidersModelsDomain:
             except ValueError:
                 pass
         try:
-            from runtime_settings_io import load_specs, read_settings_file
+            from ..runtime_settings_io import load_specs, read_settings_file
 
             values = read_settings_file(_default_runtime_settings_path(), load_specs())
             configured = str(values.get(cls._MODEL_PROBE_TIMEOUT_SETTING_KEY, "")).strip()
@@ -5737,7 +5694,7 @@ class ProvidersModelsDomain:
         *,
         allow_unmaterialized_relay_keys: bool = False,
     ) -> dict[str, Any]:
-        from config_editor_core import api as config_api
+        from ...config import api as config_api
 
         document = self._draft.get("document")
         providers = self._draft.get("providers")
@@ -5841,7 +5798,7 @@ class ProvidersModelsDomain:
         except DomainError:
             raise
         except ValueError as error:
-            # ``config_editor_core.dump`` names the first unusable entry
+            # ``young_router.config.dump`` names the first unusable entry
             # ("Model #3 is enabled but has no model_name").  Keep that detail
             # instead of replacing it with an opaque failure.
             detail = safe_error_message(str(error)) or "Provider/model configuration is invalid"
@@ -5966,7 +5923,7 @@ class ProvidersModelsDomain:
         return self._validate()
 
     def apply(self, payload: object | None = None) -> dict[str, Any]:
-        from config_editor_core import api as config_api
+        from ...config import api as config_api
 
         if payload is not None:
             data = _mapping(payload)
@@ -5991,7 +5948,7 @@ class ProvidersModelsDomain:
         return {"applied": True, **self.snapshot()}
 
     def _current_disk_revision(self) -> object:
-        from config_editor_core.schema import _config_revision
+        from ...config.schema import _config_revision
 
         try:
             return copy.deepcopy(_config_revision(self.config_path))

@@ -30,6 +30,11 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from ..browser_identity import browser_request_headers
+from ..dsh_config_keys import (
+    DSH_VISION_ROUTER_CONFIG_KEY as _DSH_VISION_ROUTER_CONFIG_KEY,
+    DSH_VISION_ROUTER_LOCAL_QUICK_KEYS as _DSH_VISION_ROUTER_LOCAL_QUICK_KEYS,
+    DSH_VISION_ROUTER_QUICK_KEYS as _DSH_VISION_ROUTER_QUICK_KEYS,
+)
 from .persistence import (
     PersistenceError,
     atomic_write_bytes,
@@ -65,18 +70,6 @@ _RUNTIME_SETTINGS_PROCESS_AUTHORITATIVE_KEYS = frozenset(
     }
 )
 _PI_WEB_ACCESS_CONFIG_KEY = "YOUNG_ROUTER_PI_WEB_ACCESS_CONFIG_JSON"
-_DSH_VISION_ROUTER_CONFIG_KEY = "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON"
-_DSH_VISION_ROUTER_QUICK_KEYS = {
-    "YOUNG_ROUTER_DSH_VISION_ROUTER_ENABLED": "enabled",
-    "YOUNG_ROUTER_DSH_VISION_ROUTER_BACKEND": "backend",
-    "YOUNG_ROUTER_DSH_VISION_ROUTER_FREE_FALLBACK": "freeFallback",
-    "YOUNG_ROUTER_DSH_VISION_ROUTER_TIMEOUT_SECONDS": "timeoutSeconds",
-    "YOUNG_ROUTER_DSH_VISION_ROUTER_MAX_TOKENS": "maxTokens",
-}
-_DSH_VISION_ROUTER_LOCAL_QUICK_KEYS = {
-    "YOUNG_ROUTER_DSH_VISION_ROUTER_LOCAL_OLLAMA_ENABLED": "localOllama",
-    "YOUNG_ROUTER_DSH_VISION_ROUTER_LOCAL_LM_STUDIO_ENABLED": "localLmStudio",
-}
 
 
 @dataclass(frozen=True)
@@ -500,7 +493,7 @@ class CoreServiceController:
 
         try:
             source = read_text(self.paths.settings)
-            from runtime_settings_io import (
+            from .runtime_settings_io import (
                 load_specs,
                 normalize_payload_value,
                 read_configured_settings_file,
@@ -654,7 +647,7 @@ class CoreServiceController:
         core_root = Path(__file__).resolve().parents[2]
         python_path = [str(core_root)]
         bundled_node = core_root / "runtime" / "bin" / ("node.exe" if os.name == "nt" else "node")
-        bundled_pi_entry = core_root / "young_router" / "pi-web-access" / "index.ts"
+        bundled_pi_entry = core_root / "young_router" / "adapters" / "pi-web-access" / "index.ts"
         if bundled_node.is_file():
             env["YOUNG_ROUTER_PI_WEB_ACCESS_NODE"] = str(bundled_node)
         if bundled_pi_entry.is_file():
@@ -670,7 +663,7 @@ class CoreServiceController:
         env["YOUNG_ROUTER_TIMESTAMP_OUTPUT"] = "1"
         env["YOUNG_ROUTER_SERVICE_LOG"] = str(self.paths.root / "server.log")
         env["LITELLM_WORKER_STARTUP_HOOKS"] = (
-            "young_router.search_endpoint:register"
+            "young_router.proxy.search_endpoint:register"
         )
         # The packaged LiteLLM already ships its model catalog.  Never make
         # each of the sixteen macOS worker starts wait on a best-effort
@@ -835,7 +828,7 @@ class CoreServiceController:
     def _stage_runtime_config(self) -> None:
         if not self.paths.config.exists():
             raise RuntimeError("Provider/model configuration is unavailable")
-        from config_editor_core.schema import _load_yaml
+        from ..config.schema import _load_yaml
 
         try:
             document = _load_yaml(self.paths.config)
@@ -984,7 +977,7 @@ class CoreServiceController:
             command = [
                 self.python,
                 "-m",
-                "young_router.macos_proxy",
+                "young_router.proxy.macos_proxy",
                 "--config",
                 str(self.paths.runtime_config),
                 "--host",
@@ -1159,7 +1152,7 @@ class ConfigurationPackageAdapter:
         return tuple(translated)
 
     def export(self, *, sections: Sequence[str], destination: Path) -> tuple[str, ...]:
-        import configuration_package
+        from . import configuration_package
 
         translated = self._package_sections(sections)
         return configuration_package.export_package(
@@ -1170,7 +1163,7 @@ class ConfigurationPackageAdapter:
         )
 
     def load(self, source: Path) -> dict[str, Any]:
-        import configuration_package
+        from . import configuration_package
 
         return configuration_package.import_package(source)
 
@@ -1194,7 +1187,7 @@ class OnlineUsageReader:
         self.config_path = config_path
 
     def refresh(self) -> list[str]:
-        import remote_usage_logs
+        from . import remote_usage_logs
 
         try:
             text = remote_usage_logs.render(self.config_path, 5.0)

@@ -6,9 +6,10 @@ import json
 import os
 import pathlib
 import stat
-import tempfile
 from collections.abc import Mapping
 from typing import Any, Callable
+
+from ...atomic_io import atomic_write_text
 
 
 DOMAIN_NAME = "language"
@@ -180,31 +181,12 @@ def create_translator(choice: str | None = "system", system_locale: str | None =
     return translate
 
 
+def _write_error(_reason: str) -> Exception:
+    return LanguageSettingsError("Language preference could not be saved")
+
+
 def _atomic_write(path: pathlib.Path, value: str) -> None:
-    try:
-        try:
-            details = path.lstat()
-        except FileNotFoundError:
-            details = None
-        if details is not None and (stat.S_ISLNK(details.st_mode) or not stat.S_ISREG(details.st_mode)):
-            raise LanguageSettingsError("Language preference could not be saved")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-        try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                handle.write(value)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.chmod(temporary, 0o600)
-            os.replace(temporary, path)
-            os.chmod(path, 0o600)
-        finally:
-            try:
-                os.unlink(temporary)
-            except FileNotFoundError:
-                pass
-    except OSError:
-        raise LanguageSettingsError("Language preference could not be saved") from None
+    atomic_write_text(path, value, error=_write_error)
 
 
 class LanguageSettingsDomain:

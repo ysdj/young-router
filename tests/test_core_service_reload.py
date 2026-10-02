@@ -180,7 +180,7 @@ class CoreServiceReloadTests(unittest.TestCase):
                 return {"state": "running"}
 
             with mock.patch(
-                "codex_config._local_exposed_models",
+                "young_router.core.codex_config._local_exposed_models",
                 side_effect=exposed_models,
             ), mock.patch(
                 "young_router.core.model_catalog.load_native_catalog",

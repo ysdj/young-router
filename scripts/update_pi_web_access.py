@@ -20,24 +20,32 @@ matching command-line options exist for offline/unit-test fixtures.
 from __future__ import annotations
 
 import argparse
-import http.client
 import io
 import json
 import os
 from pathlib import Path
 import platform
 import re
-import shutil
 import stat
-import subprocess
 import sys
 import tarfile
 import tempfile
-import time
-import urllib.error
-import urllib.request
 import zipfile
 from typing import Any, Iterable
+
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+from update_common import (
+    UpdateError,
+    find_npm,
+    flatten_npm_package,
+    package_metadata,
+    request_bytes,
+    request_json,
+    run_npm_install,
+)
 
 
 PACKAGE_NAME = "pi-web-access"
@@ -67,7 +75,6 @@ SELF_USER_AGENT_ASSIGNMENT_RE = re.compile(
     r'''(?i)(\bUSER_AGENT\s*=\s*)(["'])([^"']*(?:pi-web-access|young[ _-]?router)[^"']*)\2'''
 )
 STAGED_USER_AGENT_SUFFIXES = (".js", ".mjs", ".cjs", ".ts")
-PACKAGE_VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
 NODE_VERSION_PATTERN = re.compile(r"^v22\.[0-9]+\.[0-9]+$")
 FALLBACK_PI_PEERS = (
     "@earendil-works/pi-ai",
@@ -77,50 +84,21 @@ FALLBACK_PI_PEERS = (
 )
 
 
-class UpdateError(RuntimeError):
-    """A build dependency could not be resolved or staged."""
-
-
 def _request_bytes(url: str, *, timeout: int = DEFAULT_TIMEOUT_SECONDS) -> bytes:
-    request = urllib.request.Request(url, headers={"Accept": "*/*", "User-Agent": USER_AGENT})
-    last_error: Exception | None = None
-    for attempt in range(3):
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                return response.read()
-        except (http.client.IncompleteRead, OSError, urllib.error.URLError, TimeoutError) as exc:
-            last_error = exc
-            if attempt == 2:
-                break
-            time.sleep(0.5 * (attempt + 1))
-    raise UpdateError(f"Could not download {url}: {last_error}") from last_error
+    return request_bytes(url, timeout=timeout, user_agent=USER_AGENT)
 
 
 def _request_json(url: str) -> Any:
-    raw = _request_bytes(url)
-    try:
-        return json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise UpdateError(f"Downloaded metadata from {url} is not valid JSON") from exc
+    return request_json(url, timeout=DEFAULT_TIMEOUT_SECONDS, user_agent=USER_AGENT)
 
 
 def _package_metadata(registry_url: str) -> tuple[str, str, dict[str, Any]]:
-    payload = _request_json(registry_url)
-    if not isinstance(payload, dict):
-        raise UpdateError("npm registry returned an invalid pi-web-access metadata object")
-    dist_tags = payload.get("dist-tags")
-    latest = dist_tags.get("latest") if isinstance(dist_tags, dict) else None
-    if not isinstance(latest, str) or not PACKAGE_VERSION_PATTERN.fullmatch(latest):
-        raise UpdateError("npm registry did not return a stable pi-web-access latest version")
-    versions = payload.get("versions")
-    version_payload = versions.get(latest) if isinstance(versions, dict) else None
-    if not isinstance(version_payload, dict):
-        raise UpdateError(f"npm registry metadata is missing pi-web-access {latest}")
-    dist = version_payload.get("dist")
-    tarball = dist.get("tarball") if isinstance(dist, dict) else None
-    if not isinstance(tarball, str) or not tarball.strip():
-        raise UpdateError(f"npm registry metadata is missing the pi-web-access {latest} tarball")
-    return latest, tarball.strip(), version_payload
+    return package_metadata(
+        registry_url,
+        package_name=PACKAGE_NAME,
+        timeout=DEFAULT_TIMEOUT_SECONDS,
+        user_agent=USER_AGENT,
+    )
 
 
 def _peer_specs(version_payload: dict[str, Any]) -> list[str]:
@@ -137,18 +115,7 @@ def _peer_specs(version_payload: dict[str, Any]) -> list[str]:
 
 
 def _find_executable(name: str) -> str:
-    configured = os.environ.get(name, "").strip()
-    if configured:
-        path = Path(configured)
-        if path.is_file():
-            return str(path)
-        raise UpdateError(f"Configured {name} does not point to an executable: {configured}")
-    candidates = ["npm.cmd", "npm"] if os.name == "nt" else ["npm"]
-    for candidate in candidates:
-        resolved = shutil.which(candidate)
-        if resolved:
-            return resolved
-    raise UpdateError("npm is required to install pi-web-access and its Pi peer packages")
+    return find_npm(name, purpose="install pi-web-access and its Pi peer packages")
 
 
 def _run_npm_install(
@@ -157,52 +124,14 @@ def _run_npm_install(
     package_tarball: Path,
     peer_names: Iterable[str],
 ) -> None:
-    npm_root.mkdir(parents=True, exist_ok=True)
-    command = [
+    run_npm_install(
         npm,
-        "install",
-        "--prefix",
-        str(npm_root),
-        "--no-save",
-        "--no-package-lock",
-        "--ignore-scripts",
-        "--omit=dev",
-        "--fund=false",
-        "--audit=false",
-        str(package_tarball),
-        *peer_names,
-    ]
-    env = os.environ.copy()
-    # npm's cache is still allowed, but metadata was resolved above and the
-    # package tarball itself is always downloaded by this helper.
-    env.setdefault("NPM_CONFIG_UPDATE_NOTIFIER", "false")
-    use_shell = os.name == "nt" and npm.lower().endswith((".cmd", ".bat"))
-    try:
-        result = subprocess.run(
-            command,
-            env=env,
-            text=True,
-            capture_output=True,
-            timeout=DEFAULT_TIMEOUT_SECONDS * 2,
-            check=False,
-            shell=use_shell,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise UpdateError(f"npm could not install pi-web-access: {exc}") from exc
-    if result.returncode != 0:
-        details = (result.stderr or result.stdout or "").strip()
-        if len(details) > 2000:
-            details = details[-2000:]
-        raise UpdateError(
-            "npm could not install pi-web-access and its Pi peers"
-            + (f": {details}" if details else "")
-        )
-
-
-def _copy_tree(source: Path, destination: Path) -> None:
-    if not source.is_dir():
-        raise UpdateError(f"Expected package directory is missing: {source}")
-    shutil.copytree(source, destination, symlinks=True)
+        npm_root,
+        package_tarball,
+        peer_names,
+        package_name=PACKAGE_NAME,
+        timeout=DEFAULT_TIMEOUT_SECONDS,
+    )
 
 
 def _browser_user_agent() -> str:
@@ -254,52 +183,18 @@ def _normalize_staged_user_agents(package_root: Path) -> int:
     return rewritten
 
 
+def _post_stage_package(root: Path) -> None:
+    _normalize_staged_user_agents(root)
+
+
 def _flatten_package(npm_root: Path, destination: Path) -> str:
-    package_root = npm_root / "node_modules" / PACKAGE_NAME
-    dependencies_root = npm_root / "node_modules"
-    package_json = package_root / "package.json"
-    entry = package_root / "index.ts"
-    if not package_json.is_file() or not entry.is_file():
-        raise UpdateError("Installed pi-web-access package is missing package.json or index.ts")
-
-    package_payload = destination.parent / f".{destination.name}.staged"
-    if package_payload.exists():
-        shutil.rmtree(package_payload)
-    _copy_tree(package_root, package_payload)
-
-    # A published package may ship a nested ``node_modules`` of its own (npm
-    # installs a dependency there when the flat tree carries another version of
-    # it, as upstream did with ``undici``).  That copy is the one the package's
-    # own code resolved against, so it stays exactly as published and the peer
-    # closure the worker needs is merged beside it — never over it.
-    dependency_payload = package_payload / "node_modules"
-    dependency_payload.mkdir(exist_ok=True)
-    for child in dependencies_root.iterdir():
-        if child.name in {PACKAGE_NAME, ".bin"}:
-            continue
-        target = dependency_payload / child.name
-        if target.exists() or target.is_symlink():
-            continue
-        if child.is_symlink():
-            target.symlink_to(os.readlink(child))
-        elif child.is_dir():
-            shutil.copytree(child, target, symlinks=True)
-        else:
-            shutil.copy2(child, target)
-
-    version_data = json.loads(package_json.read_text(encoding="utf-8"))
-    version = version_data.get("version") if isinstance(version_data, dict) else None
-    if not isinstance(version, str) or not PACKAGE_VERSION_PATTERN.fullmatch(version):
-        raise UpdateError("Installed pi-web-access package has an invalid version")
-
-    _normalize_staged_user_agents(package_payload)
-
-    if destination.exists():
-        if not destination.is_dir():
-            raise UpdateError(f"pi-web-access output is not a directory: {destination}")
-        shutil.rmtree(destination)
-    package_payload.rename(destination)
-    return version
+    return flatten_npm_package(
+        npm_root,
+        destination,
+        package_name=PACKAGE_NAME,
+        required_files=("package.json", "index.ts"),
+        post_stage=_post_stage_package,
+    )
 
 
 def _node_target() -> tuple[str, str, str]:
@@ -445,7 +340,7 @@ def update(
 
 def parse_arguments(arguments: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", required=True, help="Core/young_router/pi-web-access destination")
+    parser.add_argument("--output", required=True, help="Core/young_router/adapters/pi-web-access destination")
     parser.add_argument("--node-output", help="Directory receiving node or node.exe")
     parser.add_argument("--node-source", help="Existing Node 22 executable or distribution directory")
     parser.add_argument("--registry-url", default=PACKAGE_REGISTRY_URL)

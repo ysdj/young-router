@@ -12,7 +12,7 @@ committed as a lock: the staged directory is written into the build's Core
 bundle, and ``manifest.json`` records which revision and which target routes
 were staged.
 
-The staged layout consumed by ``young_router/traceone.py``::
+The staged layout consumed by ``young_router/adapters/traceone.py``::
 
     traceone.js                              dist/traceone.js
     prompt.txt                               prompts/identity-web-v1.txt
@@ -377,7 +377,7 @@ def write_manifest(
 def smoke_test(output: Path, node: str | None = None) -> None:
     """Run the staged module once so a broken adaptation fails the build."""
 
-    worker = Path(__file__).resolve().parents[1] / "young_router" / "traceone_worker.mjs"
+    worker = Path(__file__).resolve().parents[1] / "young_router" / "adapters" / "traceone_worker.mjs"
     if not worker.is_file():
         raise SystemExit(f"The TraceOne worker is missing: {worker}")
     executable = node or os.environ.get("YOUNG_ROUTER_TRACEONE_NODE", "").strip() or shutil.which("node")
@@ -414,7 +414,7 @@ def smoke_test(output: Path, node: str | None = None) -> None:
 
 def parse_arguments(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Stage the latest TraceOne for an artifact build")
-    parser.add_argument("--output", required=True, help="directory to stage into (the Core's young_router/traceone)")
+    parser.add_argument("--output", required=True, help="directory to stage into (the Core's young_router/adapters/traceone)")
     parser.add_argument("--ref", default=os.environ.get(REF_ENV, "").strip() or DEFAULT_REF, help="upstream git ref (default: main)")
     parser.add_argument("--archive-url", default="", help=f"explicit archive URL or path (default: ${ARCHIVE_URL_ENV})")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS, help="download timeout in seconds")

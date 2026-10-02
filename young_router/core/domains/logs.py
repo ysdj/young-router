@@ -310,7 +310,7 @@ def _configured_deployments(config_path: Path) -> dict[str, dict[str, str]]:
 
 
 def _load_configured_deployments(config_path: Path) -> dict[str, dict[str, str]]:
-    from config_editor_core import load as config_load
+    from ...config import load as config_load
 
     try:
         document = config_load.config_document_from_path(config_path)
@@ -1805,7 +1805,7 @@ class LogsDomain:
             return
         self._runtime_settings_signature = signature
         try:
-            from runtime_settings_io import load_specs, read_settings_file
+            from ..runtime_settings_io import load_specs, read_settings_file
 
             values = read_settings_file(self.runtime_settings_path, load_specs())
             configured = int(values.get("YOUNG_ROUTER_LOG_VIEW_LIMIT", DEFAULT_LINES))

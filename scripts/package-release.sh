@@ -65,11 +65,13 @@ test -x "$CORE/runtime/bin/litellm"
 test -x "$CORE/runtime/bin/node"
 test -x "$CORE/bin/vision_ocr"
 test -f "$CORE/young_router/core/__main__.py"
-test -f "$CORE/young_router/pi-web-access/index.ts"
-test -f "$CORE/young_router/traceone/traceone.js"
-test -f "$CORE/young_router/traceone/prompt.txt"
-test -f "$CORE/young_router/workbuddy_stream.mjs"
-test -f "$CORE/young_router/workbuddy-connect/lib/index.js"
+test -f "$CORE/young_router/config/api.py"
+test -f "$CORE/young_router/webdav/core.py"
+test -f "$CORE/young_router/adapters/pi-web-access/index.ts"
+test -f "$CORE/young_router/adapters/traceone/traceone.js"
+test -f "$CORE/young_router/adapters/traceone/prompt.txt"
+test -f "$CORE/young_router/adapters/workbuddy_stream.mjs"
+test -f "$CORE/young_router/adapters/workbuddy-connect/lib/index.js"
 test -f "$CORE/sitecustomize.py"
 plutil -lint "$APP/Contents/Info.plist"
 test "$(plutil -extract CFBundleShortVersionString raw "$APP/Contents/Info.plist")" = "$VERSION"
@@ -79,7 +81,7 @@ test "$(plutil -extract CFBundleVersion raw "$APP/Contents/Info.plist")" = "$BUI
 export LITELLM_LOCAL_MODEL_COST_MAP=true
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$CORE" \
   "$CORE/runtime/bin/python" -c \
-  'import litellm.proxy.proxy_server, young_router.core, codex_config, config_editor_core, configuration_package, webdav.core'
+  'import litellm.proxy.proxy_server, young_router.core, young_router.core.codex_config, young_router.config, young_router.core.configuration_package, young_router.core.external_provider_import, young_router.core.remote_usage_logs, young_router.core.runtime_settings_io, young_router.webdav.core'
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$CORE" \
   "$CORE/runtime/bin/python" -m young_router.core --help >/dev/null
 PYTHONDONTWRITEBYTECODE=1 "$CORE/runtime/bin/litellm" --help >/dev/null

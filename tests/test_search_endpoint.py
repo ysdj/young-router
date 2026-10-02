@@ -13,7 +13,7 @@ class SearchEndpointTests(unittest.TestCase):
     def _module():
         # Import lazily so unittest discovery does not preload the real LiteLLM
         # web-search classes before the callback tests install their stubs.
-        return importlib.import_module("young_router.search_endpoint")
+        return importlib.import_module("young_router.proxy.search_endpoint")
 
     def test_commands_to_actions_supports_queries_literal_urls_and_refs(self) -> None:
         search_endpoint = self._module()
