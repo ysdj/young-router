@@ -12,7 +12,6 @@ from urllib.parse import urlencode
 
 
 ROOT = Path(__file__).resolve().parents[1]
-IMPORTER = ROOT / "external_provider_import.py"
 
 
 class ExternalProviderImportTests(unittest.TestCase):
@@ -31,7 +30,7 @@ class ExternalProviderImportTests(unittest.TestCase):
         if env:
             process_env.update(env)
         return subprocess.run(
-            [sys.executable, str(IMPORTER), *arguments],
+            [sys.executable, "-m", "young_router.core.external_provider_import", *arguments],
             cwd=ROOT,
             text=True,
             capture_output=True,

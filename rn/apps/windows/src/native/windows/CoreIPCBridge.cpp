@@ -18,7 +18,7 @@
 namespace YoungRouter {
 namespace {
 
-// Mirrors the Core's ``MAX_MESSAGE_BYTES`` (``young_router/core/protocol.py``).
+// Mirrors the Core's ``MAX_MESSAGE_BYTES`` (``src/young_router/core/protocol.py``).
 // One raw-editor read answers with the document plus its baseline, so the
 // frame budget covers two of the Core's own editor documents; the managed
 // Codex catalog alone is past 2 MB.
@@ -171,10 +171,10 @@ bool HasRequiredCoreFiles(std::wstring const& core_directory) {
   std::error_code error;
   std::vector<fs::path> required{
       fs::path(core_directory) / L"young_router" / L"core" / L"__main__.py",
-      fs::path(core_directory) / L"config_editor_core" / L"api.py",
-      fs::path(core_directory) / L"webdav" / L"core.py",
-      fs::path(core_directory) / L"codex_config.py",
-      fs::path(core_directory) / L"runtime_settings_io.py",
+      fs::path(core_directory) / L"young_router" / L"config" / L"api.py",
+      fs::path(core_directory) / L"young_router" / L"webdav" / L"core.py",
+      fs::path(core_directory) / L"young_router" / L"core" / L"codex_config.py",
+      fs::path(core_directory) / L"young_router" / L"core" / L"runtime_settings_io.py",
       fs::path(core_directory) / L"sitecustomize.py",
       fs::path(core_directory) / L"runtime" / L"bin" / L"litellm.cmd",
   };

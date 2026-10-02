@@ -20,6 +20,7 @@ import urllib.request
 from urllib.parse import urlparse
 
 from ..browser_identity import browser_request_headers
+from ..values import positive_int as _positive_int
 from .persistence import PersistenceError, atomic_write_json, read_json
 
 
@@ -196,7 +197,7 @@ def gpt_family_model_name(value: object) -> bool:
     The digit after the ``gpt-`` prefix keeps this narrow: ``gpt-5.6-sol``
     and ``gpt-4.1`` match, while image families such as ``gpt-image-2`` do
     not. Keep this aligned with ``_codex_gpt_family_model_name`` in
-    ``young_router.responses_request``, which owns the request-time rule.
+    ``young_router.proxy.responses_request``, which owns the request-time rule.
     """
 
     if not isinstance(value, str):
@@ -209,19 +210,6 @@ def _api_base_host(value: object) -> str:
         return ""
     parsed = urlparse(value.strip())
     return (parsed.hostname or "").strip().casefold()
-
-
-def _positive_int(value: object) -> int | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value if value > 0 else None
-    if isinstance(value, float) and value.is_integer() and value > 0:
-        return int(value)
-    if isinstance(value, str) and value.strip().isdigit():
-        parsed = int(value.strip())
-        return parsed if parsed > 0 else None
-    return None
 
 
 def _record_from_payload(value: object, *, source: str, priority: int) -> dict[str, Any] | None:
@@ -659,7 +647,7 @@ class ModelContextRegistry:
             return self._runtime_values_cache
         resolved: tuple[int, int] | None = None
         try:
-            from runtime_settings_io import load_specs, read_settings_file
+            from .runtime_settings_io import load_specs, read_settings_file
 
             values = read_settings_file(self.runtime_settings_path, load_specs())
             unknown = int(values.get("YOUNG_ROUTER_UNKNOWN_MODEL_CONTEXT_WINDOW", unknown))
@@ -695,7 +683,7 @@ class ModelContextRegistry:
         index: dict[str, list[dict[str, Any]]] = {}
         try:
             text = self.runtime_config_path.read_text(encoding="utf-8")
-            from config_editor_core.schema import safe_load_yaml_text
+            from ..config.schema import safe_load_yaml_text
 
             data = safe_load_yaml_text(text, self.runtime_config_path.name)
         except Exception:

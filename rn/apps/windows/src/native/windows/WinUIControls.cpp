@@ -86,7 +86,7 @@ constexpr double kUIFontSize = 13.0;
 // same step as a tab stop (LiteLLMTableRowIndentWidth).
 constexpr double kTableRowIndentWidth = 16.0;
 // Mirrors the Core's own raw-editor budget (``MAX_EDITOR_DOCUMENT_BYTES`` and
-// ``MAX_MESSAGE_BYTES`` in ``young_router/core/protocol.py``).  One editor
+// ``MAX_MESSAGE_BYTES`` in ``src/young_router/core/protocol.py``).  One editor
 // frame carries the document plus its baseline, and the page bootstrap embeds
 // both, so the message budget has to cover two documents.  The managed Codex
 // catalog this app writes is already past 2 MB, so a smaller gate refused a

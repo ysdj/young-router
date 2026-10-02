@@ -9,6 +9,9 @@ config.disabled-models.yaml*
 *.db
 *.sqlite
 __pycache__/
+*.egg-info/
+build/
+dist/
 *.pyc
 .DS_Store
 .pytest_cache/
@@ -24,4 +27,4 @@ young.router.proxy.runtime.plist
 *audit*.png
 output/
 # Staged build output (scripts/update_traceone.py); never committed.
-young_router/traceone/
+src/young_router/adapters/traceone/

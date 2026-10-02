@@ -1444,7 +1444,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
     async def test_external_web_search_stream_empty_continuation_does_not_route_recover(self) -> None:
         hooks, _ = load_hook_module()
         original_run_action = hooks._external_web_search_run_action
-        streaming_module = importlib.import_module("young_router.streaming")
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
         original_route_recovery_poll = streaming_module._stream_route_recovery_poll
         route_recovery_calls = []
 
@@ -2514,10 +2514,10 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
     async def test_external_web_search_stream_prepares_continuation_recovery_before_continuation_task(self) -> None:
         hooks, _ = load_hook_module()
         original_run_action = hooks._external_web_search_run_action
-        bridge_module = importlib.import_module("young_router.responses_web_search_bridge")
+        bridge_module = importlib.import_module("young_router.proxy.responses_web_search_bridge")
         original_bridge_run_action = bridge_module._external_web_search_run_action
         original_continue = bridge_module._external_web_search_continue_or_synthesize
-        streaming_module = importlib.import_module("young_router.streaming")
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
         original_route_recovery_poll = streaming_module._stream_route_recovery_poll
 
         executed_actions = []

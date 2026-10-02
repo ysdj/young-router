@@ -8,7 +8,7 @@ from hook_test_utils import *
 class HookStreamingFailoverTests(HookTestCase):
     async def test_chat_route_exhaustion_propagates_error_instead_of_cancellation(self) -> None:
         hooks, _proxy_server = load_hook_module()
-        streaming_module = sys.modules["young_router.streaming"]
+        streaming_module = sys.modules["young_router.proxy.streaming"]
         original_fallback = streaming_module._stream_streaming_error_fallback
         self.addCleanup(
             setattr,
@@ -943,7 +943,7 @@ class HookStreamingFailoverTests(HookTestCase):
 
     async def test_structured_compaction_uses_longer_stream_start_deadline(self) -> None:
         hooks, _proxy_server = load_hook_module()
-        routing_module = importlib.import_module("young_router.routing")
+        routing_module = importlib.import_module("young_router.proxy.routing")
         previous_compaction_timeout = (
             routing_module._CODEX_COMPACTION_STREAM_START_TIMEOUT_DEFAULT_SECONDS
         )
@@ -2240,7 +2240,7 @@ class HookStreamingFailoverTests(HookTestCase):
         hook = hooks.YoungRouterHook()
         self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "0.004")
         self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
-        streaming_module = importlib.import_module("young_router.streaming")
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
         original_route_recovery_poll = streaming_module._stream_route_recovery_poll
         recovery_requests = []
 

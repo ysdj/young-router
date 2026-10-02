@@ -219,7 +219,7 @@ class CodexSettingsDomain:
 
         if self.runtime_settings_path is None:
             return ""
-        from runtime_settings_io import load_specs, read_settings_file
+        from ..runtime_settings_io import load_specs, read_settings_file
 
         try:
             values = read_settings_file(self.runtime_settings_path, load_specs())
@@ -238,7 +238,7 @@ class CodexSettingsDomain:
         self._catalog_base_profile_pin = slug
         if self.runtime_settings_path is None:
             return
-        from runtime_settings_io import load_specs, read_settings_file, write_settings_file
+        from ..runtime_settings_io import load_specs, read_settings_file, write_settings_file
 
         try:
             specs = load_specs()
@@ -343,7 +343,7 @@ class CodexSettingsDomain:
         return native_models
 
     def _load_editor(self) -> dict[str, Any]:
-        import codex_config
+        from .. import codex_config
 
         try:
             with _codex_environment(self.runtime_config_path, self.codex_home):
@@ -476,7 +476,7 @@ class CodexSettingsDomain:
         write so an external edit made since the last reload is preserved.
         """
 
-        import codex_config
+        from .. import codex_config
 
         if self._catalog_pointer_repairing:
             return False
@@ -821,7 +821,7 @@ class CodexSettingsDomain:
         }
 
     def _sync(self, config_text: str, auth_text: str, patch: object | None = None) -> dict[str, Any]:
-        import codex_config
+        from .. import codex_config
 
         payload: dict[str, Any] = {"config_text": config_text, "auth_text": auth_text}
         if patch is not None:
@@ -853,7 +853,7 @@ class CodexSettingsDomain:
         API" action — and the client's own provider identity never changes.
         """
 
-        import codex_config
+        from .. import codex_config
 
         model = str(data.get("model") or "").strip()
         provider = str(data.get("provider") or "").strip()
@@ -1015,7 +1015,7 @@ class CodexSettingsDomain:
         return {"valid": not bool(errors), "errors": list(errors) if isinstance(errors, list) else ["Codex settings are invalid"]}
 
     def apply(self, payload: object | None = None) -> dict[str, Any]:
-        import codex_config
+        from .. import codex_config
 
         if payload is not None:
             data = _mapping(payload)
@@ -1095,7 +1095,7 @@ class CodexSettingsDomain:
 
         if not isinstance(enabled, bool):
             raise DomainError("The Codex model catalog switch is invalid")
-        import codex_config
+        from .. import codex_config
 
         current = self._load_editor()
         if (current.get("config_text"), current.get("auth_text")) != self._baseline:
@@ -1340,7 +1340,7 @@ class CodexSettingsDomain:
     def _write_documents(self, documents: Mapping[str, Any]) -> None:
         """Write one pair of editor documents to the client's configuration."""
 
-        import codex_config
+        from .. import codex_config
 
         try:
             with _codex_environment(self.runtime_config_path, self.codex_home):

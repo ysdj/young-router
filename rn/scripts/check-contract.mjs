@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
@@ -192,4 +193,11 @@ for (const route of requiredRoutes) {
 for (const forbidden of ["sk-", "ANTHROPIC_AUTH_TOKEN", "/Users/", "config.yaml", "settings.json"]) {
   if (types.includes(forbidden) || ipc.includes(forbidden)) fail(`sensitive/config value leaked into shared contract: ${forbidden}`);
 }
+// The native component specs are generated from ui/nativeSpecs/; a stale pair
+// is a contract break the same way a diverged IPC type is.
+execFileSync(
+  process.execPath,
+  [path.join(root, "scripts/gen-native-specs.mjs"), "--check"],
+  { stdio: "inherit" },
+);
 console.log(`RN contract OK (IPC v${coreSchema.protocol_version}; ${methods.length} schema-checked methods; ${requiredRoutes.length} routes)`);

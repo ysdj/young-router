@@ -15,12 +15,12 @@ import math
 import os
 import pathlib
 import stat
-import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Callable
 from urllib.parse import parse_qsl, urlsplit
 
+from ...atomic_io import atomic_write_text
 from ..claude_desktop import (
     ClaudeDesktopConfig,
     ClaudeDesktopConfigError,
@@ -584,42 +584,12 @@ def _current_bytes(path: pathlib.Path) -> bytes | None:
         raise ClaudeSettingsError("Claude Settings could not be saved") from None
 
 
+def _write_error(_reason: str) -> Exception:
+    return ClaudeSettingsError("Claude Settings could not be saved")
+
+
 def _atomic_write(path: pathlib.Path, text: str) -> None:
-    try:
-        try:
-            details = path.lstat()
-        except FileNotFoundError:
-            details = None
-        if details is not None and (stat.S_ISLNK(details.st_mode) or not stat.S_ISREG(details.st_mode)):
-            raise ClaudeSettingsError("Claude Settings could not be saved")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-        try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                handle.write(text)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.chmod(temporary, 0o600)
-            os.replace(temporary, path)
-            os.chmod(path, 0o600)
-            try:
-                directory_fd = os.open(path.parent, os.O_RDONLY)
-            except OSError:
-                directory_fd = None
-            if directory_fd is not None:
-                try:
-                    os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
-        finally:
-            try:
-                os.unlink(temporary)
-            except FileNotFoundError:
-                pass
-    except ClaudeSettingsError:
-        raise
-    except OSError:
-        raise ClaudeSettingsError("Claude Settings could not be saved") from None
+    atomic_write_text(path, text, error=_write_error)
 
 
 def default_settings_path() -> pathlib.Path:

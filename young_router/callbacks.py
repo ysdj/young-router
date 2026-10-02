@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from .hook import YoungRouterHook
-from .patches import install_all
+from .proxy.hook import YoungRouterHook
+from .proxy.patches import install_all
 
 install_all()
 

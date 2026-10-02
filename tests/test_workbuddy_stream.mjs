@@ -13,7 +13,7 @@ import { dirname, resolve } from "node:path";
 import {
   normalizeChatCompletionChunk,
   normalizeChatCompletionStreamLine,
-} from "../young_router/workbuddy_stream.mjs";
+} from "../young_router/adapters/workbuddy_stream.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -59,7 +59,7 @@ for (const passthrough of [
 }
 
 // The worker routes its streaming pass-through through the shaper.
-const worker = readFileSync(resolve(here, "../young_router/workbuddy_worker.mjs"), "utf8");
+const worker = readFileSync(resolve(here, "../young_router/adapters/workbuddy_worker.mjs"), "utf8");
 assert.match(worker, /import \{ normalizeChatCompletionStreamLine \} from ['"]\.\/workbuddy_stream\.mjs['"]/);
 assert.match(worker, /res\.write\(normalizeChatCompletionStreamLine\(buffer\.slice\(0, newline \+ 1\)\)\)/);
 assert.match(worker, /if \(buffer\) res\.write\(normalizeChatCompletionStreamLine\(buffer\)\)/);

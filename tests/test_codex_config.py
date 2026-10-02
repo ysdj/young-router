@@ -13,11 +13,10 @@ import urllib.error
 from unittest import mock
 from pathlib import Path
 
-import codex_config
+from young_router.core import codex_config
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CODEX_CONFIG = ROOT / "codex_config.py"
 
 
 class CodexConfigTests(unittest.TestCase):
@@ -485,7 +484,7 @@ class CodexConfigTests(unittest.TestCase):
             }
         )
         return subprocess.run(
-            [sys.executable, str(CODEX_CONFIG), *arguments],
+            [sys.executable, "-m", "young_router.core.codex_config", *arguments],
             cwd=ROOT,
             env=environment,
             text=True,
@@ -1127,7 +1126,7 @@ class CodexConfigTests(unittest.TestCase):
             self.assertNotIn("outside", result.stderr)
 
     def test_editor_apply_rolls_back_auth_when_config_commit_fails(self) -> None:
-        import codex_config
+        from young_router.core import codex_config
 
         with tempfile.TemporaryDirectory() as directory:
             temp = Path(directory)
