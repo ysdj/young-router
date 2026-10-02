@@ -53,6 +53,14 @@ That strip belongs to a settings pane window only: a child window keeps no statu
 
 ## Known Runtime Failure Modes
 
+### A New Row Is Live Until It Says Otherwise (2026-10-02)
+
+- ＋新建供应商 / ＋新建模型 used to create the row **disabled** (a draft the user had to enable by hand after filling it in).  The product rule is the opposite now: a row the user just created is enabled.
+- Fix: `provider.add` carries `enabled: true`, `model.add` carries `enabled: true` (Core's own default for a create that states no flag is enabled, and a test pins that), and the pane keeps the placeholder name as the row's public name and upstream so the document stays valid while the user edits it.
+- The row is not silently passed off as finished: `modelNeedsAttention` also answers a placeholder-named model, so the freshly created row draws in the pane's warning ink until the placeholder is replaced, and its inspector states what is left (`providers.draftModelHint` / `providers.draftModelKeylessHint`, reworded from "尚未启用…" to "新建的模型默认启用…").
+- Deliberate difference: the routes pane's ＋ still creates a **disabled** route.  A new route joins the public-model group on screen, and enabling a row whose upstream is still the group's own name would put a placeholder into that group's live order (it takes slot 0, so it would be tried first and fail over on every request).  A model create starts a *new* group instead, which is why it can be live from the first press.
+- Verified with `tests/test_core_public_models.py` (`test_a_new_provider_and_model_default_to_enabled`) and `tests/test_rn_ui_parity.py` (`test_a_new_provider_and_model_start_enabled`, plus the updated create-then-configure and zero-order guards).
+
 ### A Host Keeps One Identity And One Default (2026-10-02)
 
 - Six host-level differences, five of them between the two platforms.
@@ -630,6 +638,7 @@ A second pass over the same family as the credential-identity fix: six places st
 
 - Keep all project-owned automated test source files directly under `tests/`; package scripts may invoke them from there, but do not scatter tests under source, script, `work/`, or `tmp/` directories.
 - Do not retain repository-root `work/` or `tmp/` directories. Ephemeral probes and build scratch data must use a system temporary directory created for that run and remove it when the run finishes.
+- Preview verification output is disposable and never lives in the worktree beyond its round: a preview bundle that must not replace the installed app goes to the isolated `YOUNG_ROUTER_MACOS_OUTPUT` temporary directory above, and screenshots, full-test logs, and copied `.app` bundles are deleted when the verification ends. `.preview-verify/` is gitignored, not a storage area — it once grew to 6.7 GB of July preview bundles nobody read, so it is removed, not accumulated.
 - Prefer `rg` for source searches. Run the focused TypeScript and Python checks that exercise the changed behavior directly from the configured project runtime.
 - Do not make `scripts/test.sh`, `scripts/check-rn.sh`, a full build, or a release package an ordinary approval gate. Those scripts may perform broader packaging or state checks that are not needed for a scoped change.
 - For desktop UI work, a successful build, process launch, deep link, or accessibility-tree read does **not** count as visual verification. Call a UI state visually verified only after capturing the target app window and inspecting the rendered image.
@@ -705,7 +714,7 @@ A second pass over the same family as the credential-identity fix: six places st
 
 ## Public Repository Hygiene
 
-- Do not commit runtime directories, virtual environments, package installs, generated app bundles, logs, screenshots containing real data, local traces, or WebDAV settings.
+- Do not commit runtime directories, virtual environments, package installs, generated app bundles, logs, screenshots containing real data, local traces, or WebDAV settings. The same things do not belong in the working tree uncontrolled either: keep them in system temporary storage or delete them when the run they served ends.
 - Before every commit or push, inspect untracked files and the staged diff for credentials, private endpoints, provider/model names, request or task IDs, local paths, and copied configuration. Replace real values with neutral fixtures.
 - Re-run the sensitive-data check against the staged diff before pushing. Tests passing does not replace this review.
 - Use the intended public or noreply Git identity for public remotes.
