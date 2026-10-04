@@ -164,6 +164,7 @@ class RuntimePaths:
     owner: Path
     port: Path
     autostart: Path
+    launch_background: Path
     webdav_enabled: Path
     webdav_status: Path
     webdav_sync_state: Path
@@ -184,6 +185,12 @@ class RuntimePaths:
             owner=Path(os.environ.get("LITELLM_NATIVE_OWNER_FILE", runtime / "litellm.owner")).expanduser(),
             port=Path(os.environ.get("YOUNG_ROUTER_PORT_FILE", runtime / "litellm.port")).expanduser(),
             autostart=Path(os.environ.get("LITELLM_AUTOSTART_STATE_FILE", runtime / "autostart.enabled")).expanduser(),
+            launch_background=Path(
+                os.environ.get(
+                    "YOUNG_ROUTER_LAUNCH_BACKGROUND_STATE_FILE",
+                    runtime / "launch-background.enabled",
+                )
+            ).expanduser(),
             webdav_enabled=Path(os.environ.get("LITELLM_WEBDAV_SYNC_ENABLED_FILE", runtime / "webdav-sync.enabled")).expanduser(),
             webdav_status=Path(os.environ.get("LITELLM_WEBDAV_SYNC_STATUS_FILE", runtime / "webdav-sync-status.json")).expanduser(),
             webdav_sync_state=Path(os.environ.get("LITELLM_WEBDAV_SYNC_STATE", runtime / "webdav-sync-state.json")).expanduser(),
@@ -889,7 +896,11 @@ class CoreServiceController:
             state = "unknown"
         else:
             state = "stopped"
-        result: dict[str, Any] = {"state": state, "auto_start_state": self.autostart_status()}
+        result: dict[str, Any] = {
+            "state": state,
+            "auto_start_state": self.autostart_status(),
+            "launch_background_state": self.launch_background_status(),
+        }
         if pid is not None:
             result["pid"] = pid
         if state == "running":
@@ -913,6 +924,12 @@ class CoreServiceController:
             "autostart_enable": self.autostart_enable,
             "autostart_disable": self.autostart_disable,
             "autostart_status": lambda: {"auto_start_state": self.autostart_status(), **self.status(force=True)},
+            "launch_background_enable": self.launch_background_enable,
+            "launch_background_disable": self.launch_background_disable,
+            "launch_background_status": lambda: {
+                "launch_background_state": self.launch_background_status(),
+                **self.status(force=True),
+            },
         }
         method = methods.get(normalized)
         if method is None:
@@ -1082,6 +1099,9 @@ class CoreServiceController:
         # Platform native hosts own the actual login-item registration. Core
         # persists only its protected preference and reports its real state.
         atomic_write_text(self.paths.autostart, "1\n")
+        # The preference reaches every window through ``status``, so a cached
+        # read must not keep answering the value from before this write.
+        self._invalidate_status_cache()
         return {"auto_start_state": self.autostart_status()}
 
     def autostart_disable(self) -> dict[str, Any]:
@@ -1091,10 +1111,42 @@ class CoreServiceController:
             pass
         except OSError as exc:
             raise RuntimeError("Auto start preference could not be updated") from exc
+        self._invalidate_status_cache()
         return {"auto_start_state": self.autostart_status()}
 
     def autostart_status(self) -> str:
         return "enabled" if self.paths.autostart.is_file() else "disabled"
+
+    def launch_background_enable(self) -> dict[str, Any]:
+        """Keep every launch in the background: no window, no Dock presence.
+
+        The preference is a launch-time promise, not a live window state, so it
+        is recorded as a marker file beside the login-item flag and answered to
+        the host through the ordinary service status projection.  A missing
+        marker is the default: a launch presents the providers-and-models
+        window.
+        """
+
+        atomic_write_text(self.paths.launch_background, "1\n")
+        # The preference reaches every window through ``status``, so a cached
+        # read must not keep answering the value from before this write.
+        self._invalidate_status_cache()
+        return {"launch_background_state": self.launch_background_status()}
+
+    def launch_background_disable(self) -> dict[str, Any]:
+        """Return to the default launch: a launch presents its window."""
+
+        try:
+            self.paths.launch_background.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise RuntimeError("Background launch preference could not be updated") from exc
+        self._invalidate_status_cache()
+        return {"launch_background_state": self.launch_background_status()}
+
+    def launch_background_status(self) -> str:
+        return "enabled" if self.paths.launch_background.is_file() else "disabled"
 
     def _recovery_summary(self) -> dict[str, Any]:
         try:

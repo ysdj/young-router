@@ -798,6 +798,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('stringValue(model.provider_key_id, stringValue(model.api_key_name)),')
         self.assert_ui_has('stringValue(model.upstream_protocol_mode, "fallback"),')
         self.assert_ui_has('setProbeResults((current) => ({ ...current, [key]: { inputs, result } }));')
+        # The probe's own recommended-surface write is not an edit by the user:
+        # the finding is re-keyed on the route that write produced, so a newly
+        # added model does not hide the verdict the press just measured.
+        self.assert_ui_has('const applied = await applyProbedSurface(targetProviderId, targetModelId, nextSurface, options);')
+        self.assert_ui_has('setProbeResults((current) => current[key] ? { ...current, [key]: { inputs: nextInputs, result } } : current);')
         self.assert_ui_has('const measuredHere = record !== undefined && record.inputs === inputs;')
         self.assert_ui_has('probeResult: droppedProbeResults[key] === true || (record !== undefined && !measuredHere)')
         self.assert_ui_has('const resultRecord = result === null ? undefined : result as UnknownRecord | undefined;')
@@ -954,13 +959,18 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has("providerLeftColumn: { flex: 1, minWidth: 0, minHeight: 0, gap: 6 }")
         self.assert_ui_has("providerListPane: { width: 140, minWidth: 140, maxWidth: 140")
         self.assert_ui_has('columns={[{ label: translate("providers.provider"), width: 132 }]}')
-        # The upstream-model, public-model, and order columns keep their combined
-        # 280 pt: the scroller floats over the list (no gutter), the order column
-        # fits its header and values, and a narrower pane still squeezes only the
-        # trailing column.
-        self.assert_ui_has('columns={[{ label: translate("providers.upstream"), width: 120 }, { label: translate("providers.publicModel"), width: 100 }, { label: translate("common.order"), width: 60 }]}')
+        # The model list is upstream model plus public model and nothing else,
+        # and the two columns keep the table's combined 280 pt (the scroller
+        # floats over the list with no gutter, and the wider public-model column
+        # is the one that reads a whole name).  顺序 stays out of it: a model's
+        # order orders the routes that share its public name, and these rows are
+        # grouped by key, so the column compared numbers from sequences that
+        # have nothing to do with each other.
+        self.assert_ui_has('columns={[{ label: translate("providers.upstream"), width: 120 }, { label: translate("providers.publicModel"), width: 160 }]}')
+        self.assertNotIn('label: translate("common.order"), width: 60', self.ui)
+        self.assertNotIn("modelOrderText(providerId, item)", self.ui)
         self.assert_ui_has('rows.push({ key: `key:${keyID}`, cells: [group.label], spanning: true });')
-        self.assert_ui_has('rows.push({ key: editorIdentifier(item), cells: [`\\t${modelUpstreamDisplay(providerId, item)}`, modelDisplayName(providerId, item), modelOrderText(providerId, item)] });')
+        self.assert_ui_has('rows.push({ key: editorIdentifier(item), cells: [`\\t${modelUpstreamDisplay(providerId, item)}`, modelDisplayName(providerId, item)] });')
         self.assert_ui_has('columns={variant === "inline"')
         self.assert_ui_has('cellHorizontalPadding={6}')
         self.assert_ui_has('firstColumnHorizontalPadding={0}')
@@ -1043,13 +1053,27 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('placeholder={contextHint}', inspector)
         self.assertNotIn('hint={contextHint}', inspector)
         self.assertNotIn("max_output_tokens", inspector)
-        # Arriving from a model detail keeps a breadcrumb back to that model.
+        # Arriving from a model detail keeps a link back to that model, and the
+        # header is the provider editor's own shape: the title takes the row and
+        # the link sits on the trailing edge.  A route count beside the title is
+        # gone for good — it restated the rows the table already lists and took
+        # the width the title needs (the pane's own record rendered as its first
+        # character) — and the link states its action in two words with the
+        # model it returns to in its tooltip, because the full sentence as a
+        # label took the same width.
         self.assertIn('backLabel && onBackToModel', inspector)
-        self.assertIn('translate("providers.backToModel", { model: backLabel })', inspector)
-        # The return link sits on the trailing edge of the provider editor's own
-        # header shape, after the title and the route count.
-        self.assertLess(inspector.index('providerEditorHeading}>{group.name}'), inspector.index('providers.backToModel'))
+        self.assertIn('title={translate("providers.backToModelShort")}', inspector)
+        self.assertIn('toolTip={translate("providers.backToModel", { model: backLabel })}', inspector)
+        self.assertIn('<View style={styles.providerEditorHeader}>', inspector)
+        self.assertIn('<Text numberOfLines={1} style={styles.providerEditorHeading}>{group.name}</Text>', inspector)
+        self.assertLess(inspector.index('providerEditorHeading}>{group.name}'), inspector.index('providers.backToModelShort'))
         self.assertIn('style={styles.providerReturnToModel} /> : null}', inspector)
+        self.assertNotIn('title={translate("providers.backToModel", { model: backLabel })}', inspector)
+        self.assertNotIn("publicModelRouteCount", inspector)
+        self.assertNotIn("publicModelRouteCount", self.ui)
+        self.assertNotIn("publicModelRouteCount", self.zh)
+        self.assertNotIn("publicModelRouteCount", self.en)
+        self.assertNotIn("breadcrumbProvider}>{translate(\"providers.routes\")", inspector)
 
         # The model detail shows the resolved context window and links to its
         # public model, and its routes-view breadcrumb walks back through it.
@@ -1061,10 +1085,15 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # model is not a segment of its own (the pane's 上游模型 field states it).
         self.assertIn('<NativeButton title={displayLabel(modelName, translate("providers.unnamedModel"))} link disabled={busy || !publicModelName} onPress={() => onOpenPublicModel?.()} style={styles.breadcrumbProvider} />', model_detail)
         self.assertNotIn('tooltip={upstreamName} style={styles.inspectorHeading}', model_detail)
-        # The navigation is a real button (设置), never a link-dressed one.
+        # The navigation is a real button (设置), never a link-dressed one, and
+        # 设置 opens the very group the routes table lists: the pane is keyed by
+        # the display name the drafts project, not by the raw field value a
+        # rename left behind.
         self.assertIn('title={translate("providers.publicModelSettings")} compact disabled=', model_detail)
         self.assertNotIn('title={translate("providers.publicModelSettings")} link', model_detail)
         self.assertIn('setViewMode("routes"); selectRouteTableRow(routePublicModelRowKey(publicModel));', self.ui)
+        self.assertIn('const publicModel = modelDisplayName(providerId, model).trim();', self.ui)
+        self.assertIn('const publicModel = activeRoute.publicModel.trim();', self.ui)
         self.assert_ui_has('dispatchSnapshot={dispatchWithOutcome} modelContexts={modelContexts} bindingIssue={bindingIssueFor(')
         # Both entrances to the public-model pane record their origin, and the
         # recorded route is what the breadcrumb returns to.
@@ -1565,8 +1594,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('settingsDetail: { minWidth: 0, flex: 1, paddingTop: SETTINGS_TITLEBAR_INSET }', self.ui)
         self.assertIn('settingsDetailBody: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }', self.ui)
         self.assertIn('settingsSidebarTitle: { color: systemColors.label, fontSize: SOURCE_LIST_FONT_SIZE, fontWeight: "600" }', self.ui)
-        self.assertIn('settingsSidebarDivider: { height: 1, flexShrink: 0, marginHorizontal: 12, backgroundColor: systemColors.separator }', self.ui)
-        self.assertIn('settingsPaneTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600" }', self.ui)
+        # The sidebar divider runs into the sidebar's border and the pane's own
+        # divider lands on the same line: one window-wide header boundary, not
+        # two offset hairlines that appear as artifacts over a dark backdrop.
+        self.assertIn('settingsSidebarDivider: { height: 1, flexShrink: 0, backgroundColor: systemColors.separator }', self.ui)
+        self.assertIn('const SETTINGS_HEADER_CONTENT_HEIGHT = 20;', self.ui)
+        self.assertIn('settingsSidebarAppIcon: { width: SETTINGS_HEADER_CONTENT_HEIGHT, height: SETTINGS_HEADER_CONTENT_HEIGHT, borderRadius: 4 }', self.ui)
+        self.assertIn('settingsPaneTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600", lineHeight: SETTINGS_HEADER_CONTENT_HEIGHT }', self.ui)
         self.assertIn('settingsSidebarList: { flex: 1, minHeight: 0 }', self.ui)
         shell = self.ui.split("function SettingsShell(", 1)[1].split("function RouteSurface(", 1)[0]
         self.assertIn('sourceList', shell)
@@ -1839,6 +1873,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("_tableView.headerView = nil;", mac_native)
         self.assertIn("_scrollView.drawsBackground = NO;", mac_native)
         self.assertNotIn("_scrollView.drawsBackground = !sourceList;", mac_native)
+        # Fabric only reports a *change* of the source-list flag, so a view it
+        # just created for this table would never receive the chrome that owns
+        # that rule: the strip AppKit reserves for the persistent scroller is
+        # painted white over the row under the knob until the chrome lands.
+        self.assertIn("if (sourceListChanged || !_appliedSourceListChrome) {", mac_native)
+        self.assertIn("_appliedSourceListChrome = YES;", mac_native)
         # The shell and the runtime rail coordinate their selection through the
         # JS selectedKey props, so the source-list chrome must keep empty
         # per-table selection representable.
@@ -2125,8 +2165,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # table scrolls horizontally for it.
         self.assertNotIn("laidOutColumnWidths[index] = MAX(laidOutColumnWidths[index], _measuredColumnWidths[index]);", mac_native)
         self.assertIn("LiteLLMTableMeasuredRowLimit", mac_native)
-        self.assertIn("const CGFloat availableColumnWidth = NSWidth(visibleBounds);", mac_native)
-        self.assertIn("MAX(NSWidth(visibleBounds), laidOutContentWidth)", mac_native)
+        self.assertIn("const CGFloat availableColumnWidth = NSWidth(_scrollView.bounds);", mac_native)
+        self.assertIn("MAX(NSWidth(_scrollView.bounds), laidOutContentWidth)", mac_native)
         self.assertIn("std::max(88.0, static_cast<double>(widths[index]))", windows_native)
         self.assertIn("ScrollBarVisibility::Auto", windows_native)
         self.assertIn("horizontal_scroller_.Content(table_);", windows_native)
@@ -3255,6 +3295,39 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("addRelayAccountToVendor", editor)
         self.assertIn("{vendorBaseURL && !providerService(provider) ?", editor)
 
+    def test_a_providers_own_fields_share_the_enable_rows_group(self) -> None:
+        """No provider draws a rule between its 启用 row and its own fields.
+
+        The editor's one section rule sits above 启用, and a group that is
+        genuinely another surface — the keys, the service's account, the
+        stations linked to the provider — opens its own rule.  A service
+        provider states the same identity fields a custom provider does (name,
+        type, address), so it shares that borderless container; drawing them in
+        the account section's own style put a line straight under 启用, which no
+        other provider has.
+        """
+
+        editor = self.ui.split("function ProviderEditor(", 1)[1].split("function CodexWorkspace(", 1)[0]
+        # The service's identity block is the one that follows the enable row.
+        self.assertIn('<View style={styles.providerEnabledRow}>', editor)
+        identity = editor.split("{service ? <View", 1)[1].split("</View> : null}", 1)[0]
+        self.assertIn("styles.providerSourceFields", identity)
+        self.assertNotIn("styles.officialAccountSection", identity)
+        self.assertIn('label={translate("providers.providerName")}', identity)
+        self.assertIn('label={translate("providers.wizard.providerType")}', identity)
+        self.assertIn("{SERVICE_BASE_URLS[service]}", identity)
+        self.assertLess(editor.index("styles.providerEnabledRow"), editor.index("{service ? <View"))
+        # The provider's own fields container is the custom provider's: one
+        # container, so the two shapes cannot drift apart again.
+        source_fields = self.ui.split("return <View style={styles.providerSourceFields}>", 1)[1].split("</View>", 1)[0]
+        self.assertIn('label={translate("providers.providerName")} labelWidth={88}', source_fields)
+        # The account surface keeps its rule, as the keys and the stations do.
+        self.assertIn("{isOfficialAccount ? <View style={styles.officialAccountSection}>", editor)
+        self.assertIn("providerAccountsHeader", editor)
+        self.assertIn("<ProviderKeysPanel", editor)
+        self.assert_ui_has("officialAccountSection: { minWidth: 0, gap: 5, paddingTop: 6, borderTopWidth: 1, borderTopColor: systemColors.separator }")
+        self.assert_ui_has("providerSourceFields: { minWidth: 0, gap: 4 }")
+
     def test_provider_inspector_keeps_the_compact_provider_form_and_return_link(self) -> None:
         """The provider editor uses compact, consistently aligned rows and a source-model return link."""
         for marker in (
@@ -3407,7 +3480,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('await relay.commit("station.remove", { id: stationBeingRemoved.id, dependency_policy: "detach" });')
         self.assert_ui_has('translate("providers.deleteRelayProviderBody", {')
         self.assertIn('"providers.type.relay": "中转站"', self.zh)
-        self.assertIn('"providers.type.openai": "GPT"', self.zh)
+        # 供应商类型 names the service, not one of its model families: the
+        # OpenAI entry reads OpenAI, the name the wizard's own provider takes.
+        self.assertIn('"providers.type.openai": "OpenAI"', self.zh)
+        self.assertIn('"providers.type.openai": "OpenAI"', self.en)
+        self.assertNotIn('"providers.type.openai": "GPT"', self.zh)
+        self.assertNotIn('"providers.type.openai": "GPT"', self.en)
         self.assertIn('"providers.type.claude": "Claude"', self.zh)
         self.assertIn('"providers.type.apiKey": "API 密钥"', self.zh)
         self.assertIn('"providers.type.relay": "Relay station"', self.en)
@@ -3559,6 +3637,32 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('if (!actionDomain && targetDomain !== null) return Promise.reject(new Error("A settings domain is required"));', dispatch)
         self.assertIn("const action = actionDomain === undefined ? { type, payload } : { domain: actionDomain, type, payload };", dispatch)
 
+    def test_background_launch_switch_ships_every_locale(self) -> None:
+        """A new settings row is one label and one explanation, in every locale.
+
+        The General pane's 启动 section is the only place a launch promise is
+        stated, so a missing translation would leave the switch reading as a
+        raw key in one language. The label stays a short non-sentence
+        (ASCII colon-free), and the explanation is a full sentence in each
+        locale, the same shape the autostart hint beside it already uses.
+        """
+
+        types = (ROOT / "rn/packages/shared/src/i18n/types.ts").read_text(encoding="utf-8")
+        english = (ROOT / "rn/packages/shared/src/i18n/en.ts").read_text(encoding="utf-8")
+        chinese = (ROOT / "rn/packages/shared/src/i18n/zh-Hans.ts").read_text(encoding="utf-8")
+        for name in ("general.runInBackground", "general.runInBackgroundHint"):
+            self.assertIn(f'| "{name}"', types)
+            self.assertIn(f'"{name}":', english)
+            self.assertIn(f'"{name}":', chinese)
+        self.assertIn('"general.runInBackground": "启动后在后台运行"', chinese)
+        self.assertIn('"general.runInBackground": "Run in background at startup"', english)
+        # The explanation names both sides of the switch, so a user reading
+        # only the hint knows what turning it off returns to.
+        self.assertIn("每次启动都不显示窗口", chinese)
+        self.assertIn("启动会直接打开供应商与模型", chinese)
+        self.assertIn("every launch shows no window", english)
+        self.assertIn("a launch opens Providers & Models directly", english)
+
     def test_general_pane_offers_a_start_control_and_launch_start_retries(self) -> None:
         """A launch-time start that lost its race stays recoverable.
 
@@ -3580,6 +3684,51 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # The strip names the action that landed; the 服务 row already states the
         # state, so the same word is never printed twice on one screen.
         self.assertIn('onStatus(translate(serviceRestart ? "service.restarted" : "service.started"));', general)
+
+    def test_background_launch_is_a_promise_the_general_pane_keeps_and_the_launch_honors(self) -> None:
+        """启动后在后台运行 is off by default, so a launch presents its window.
+
+        The app is menu-bar first, so a launch that shows nothing is silent
+        about whether the router is even alive. The switch is therefore off by
+        default (no marker file, the snapshot's answer is disabled) and a
+        launch without the marker opens 供应商与模型; only an explicit promise
+        keeps the launch behind the menu bar, on both hosts, through the shared
+        "home" term that already means "hide the shell".
+        """
+
+        general = self.ui.split("function GeneralWorkspace", 1)[1].split("function RuntimeWorkspace", 1)[0]
+        # The switch reads the same projected preference the launch reads, and
+        # an absent answer is the default (a launch presents its window).
+        self.assertIn('const backgroundEnabled = snapshot?.service.launch_background_state === "enabled";', general)
+        self.assertIn("const backgroundValue = requestedBackground ?? backgroundEnabled;", general)
+        self.assertIn("const [requestedBackground, setRequestedBackground] = useState<boolean>();", general)
+        # A rejected dispatch hands the switch back to what Core kept, the same
+        # contract the autostart switch keeps.
+        self.assertIn("setRequestedBackground(undefined);", general)
+        self.assertIn('await dispatchServiceAction(enabled ? "service.launch_background_enable" : "service.launch_background_disable");', general)
+        self.assertIn('onStatus(translate("common.saved"));', general)
+        self.assertIn("onStatus(errorMessage(reason, translate));", general)
+        self.assertIn('<Text style={styles.generalRowLabel}>{translate("general.runInBackground")}</Text>', general)
+        self.assertIn("<NativeToggle value={backgroundValue}", general)
+        # The preference is stored before anything moves on screen: a promise
+        # the host acts on must never outlive a failed Core write.
+        self.assertIn("await dispatchServiceAction(", general)
+        # Turning it on takes effect at once — the window the user is looking
+        # at is the one a background launch would not have shown.
+        self.assertIn('native.window.focus("home");', general)
+        self.assertNotIn('native.window.open("providers-models")', general)
+        # The launch itself is a one-shot decision, and a host that already has
+        # a route to show has presented the launch on its own.
+        self.assertIn("const launchPresented = useRef(false);", self.ui)
+        self.assertIn("if (!isPrimaryHost || !snapshot || launchPresented.current) return;", self.ui)
+        self.assertIn("if (routeRequest && routeRequest !== \"home\") return;", self.ui)
+        self.assertIn('if (snapshot.service.launch_background_state === "enabled") {', self.ui)
+        self.assertIn('native.window.open("providers-models");\n    native.window.focus("providers-models");', self.ui)
+        # A service preference write is absolute Core state, never a staged
+        # draft, so it rebases the shared revision like launch-at-login does.
+        retryable = self.ui.split("function isRevisionRetryableAction(type: string): boolean", 1)[1].split("\n}", 1)[0]
+        self.assertIn('normalized === "service_launch_background_enable"', retryable)
+        self.assertIn('normalized === "service_launch_background_disable"', retryable)
         self.assertIn("onStatus(errorMessage(reason, translate));", general)
         for locale in (self.zh, self.en):
             self.assertIn('"service.started"', locale)
@@ -4892,7 +5041,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('"providers.keyValue": "密钥值"', self.zh)
         self.assert_ui_has('columns={[{ label: translate("providers.provider"), width: 132 }]}')
         self.assert_ui_has('providerListPane: { width: 140, minWidth: 140, maxWidth: 140')
-        self.assert_ui_has('columns={[{ label: translate("providers.upstream"), width: 120 }, { label: translate("providers.publicModel"), width: 100 }, { label: translate("common.order"), width: 60 }]}')
+        # The providers side's model list is the upstream model and its public
+        # model: it carries no 顺序 column, because that number orders one
+        # public model's routes while these rows are grouped by provider key.
+        self.assert_ui_has('columns={[{ label: translate("providers.upstream"), width: 120 }, { label: translate("providers.publicModel"), width: 160 }]}')
         self.assertIn('"providers.upstream": "上游模型"', self.zh)
         self.assertIn('"providers.upstream": "Upstream"', self.en)
         self.assertIn('"providers.publicModel": "公开模型"', self.zh)

@@ -666,6 +666,17 @@ _UPSTREAM_BALANCE_ERROR_MARKERS = (
     "insufficient quota",
     "额度不足",
     "余额不足",
+    # A station that states the failed pre-deduction and the remaining credit
+    # ("预扣费额度失败, 用户剩余额度: ...") never says "额度不足", so its
+    # out-of-credit route stayed classified as a request error and was never
+    # cooled down: every request kept selecting it first and the group had no
+    # candidate left when the fallback route was unavailable.
+    "预扣费额度失败",
+    "扣费额度失败",
+    "用户剩余额度",
+    "剩余额度不足",
+    "无可用额度",
+    "额度已用完",
 )
 _UPSTREAM_TEMPORARY_ERROR_MARKERS = (
     "high demand",

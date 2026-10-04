@@ -41,6 +41,31 @@ assert.equal(normalizeChatCompletionChunk(contentOnly), false);
 const toolFrame = { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { name: "x", arguments: "{}" } }], function_call: { name: "y", arguments: "{}" } } }] };
 assert.equal(normalizeChatCompletionChunk(toolFrame), false);
 
+// The shim's content-free legacy mirror is dropped: LiteLLM's stream-chunk
+// builder reads any present function_call as a legacy call and fails on the
+// dict shape, so the frame must state nothing about a call it does not carry.
+const emptyLegacyMirror = { choices: [{ index: 0, delta: { function_call: { name: "", arguments: "" }, tool_calls: [{ index: 0, function: { name: "x", arguments: "{}" } }] } }] };
+assert.equal(normalizeChatCompletionChunk(emptyLegacyMirror), true);
+assert.deepEqual(Object.keys(emptyLegacyMirror.choices[0].delta), ["tool_calls"]);
+
+// A legacy call that names a function or streams arguments is real: kept.
+for (const legacy of [
+  { name: "", arguments: "{\"city\":\"X\"}" },
+  { name: "get_weather", arguments: "" },
+  { name: null, arguments: "more" },
+]) {
+  const frame = { choices: [{ index: 0, delta: { function_call: { ...legacy } } }] };
+  assert.equal(normalizeChatCompletionChunk(frame), false, JSON.stringify(legacy));
+  assert.deepEqual(frame.choices[0].delta.function_call, legacy, JSON.stringify(legacy));
+}
+
+// The exact upstream mirror (name and arguments empty) drops on the wire too.
+const mirrorLine = 'data: {"choices":[{"index":0,"delta":{"role":"assistant","function_call":{"name":"","arguments":""}},"finish_reason":"stop"}]}\n';
+assert.deepEqual(
+  Object.keys(JSON.parse(normalizeChatCompletionStreamLine(mirrorLine).slice("data: ".length)).choices[0].delta).sort(),
+  ["role"],
+);
+
 // A whole SSE line keeps its framing, and everything that is not a chat chunk
 // passes through byte-for-byte.
 const frame = 'data: {"choices":[{"index":0,"delta":{"reasoning_content":"We","content":"","tool_calls":[]}}]}\n';
@@ -66,4 +91,4 @@ assert.match(worker, /if \(buffer\) res\.write\(normalizeChatCompletionStreamLin
 // ...and does not pipe the raw stream to the client any more.
 assert.doesNotMatch(worker, /readable\.pipe\(res\)/);
 
-console.log("WorkBuddy stream shaping regression tests OK (empty delta fields dropped, other frames untouched)");
+console.log("WorkBuddy stream shaping regression tests OK (empty delta fields and the content-free legacy function_call dropped, other frames untouched)");
