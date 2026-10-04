@@ -10,9 +10,13 @@
  *
  * The worker therefore drops the empty fields from each chat delta, so a frame
  * says exactly what it carries -- the shape every client already handles for a
- * reasoning stream.  Token frames (``data: [DONE]``), comments, blank frames,
- * JSON bodies for other routes, and any unparseable frame are passed through
- * byte-for-byte.
+ * reasoning stream.  The same rule covers the shim's content-free legacy
+ * ``function_call`` mirror (``{name: "", arguments: ""}``): a present
+ * ``function_call`` reads as a legacy call to LiteLLM's stream-chunk builder,
+ * which fails building the logged response for a dict-shaped delta and reports
+ * an upstream route failure on a stream the upstream actually answered.  Token
+ * frames (``data: [DONE]``), comments, blank frames, JSON bodies for other
+ * routes, and any unparseable frame are passed through byte-for-byte.
  *
  * @module young_router/workbuddy_stream
  */
@@ -38,6 +42,26 @@ function isEmptyFieldValue(value) {
 }
 
 /**
+ * Whether a legacy ``function_call`` states nothing at all.
+ *
+ * The shim mirrors every tool call as the retired
+ * ``function_call: {name: "", arguments: ""}`` shape, so the field is present
+ * on frames that carry no function call — the tool call itself rides
+ * ``tool_calls``.  A frame that names a function or carries arguments is kept
+ * exactly as sent; only the content-free mirror is dropped, because LiteLLM's
+ * stream-chunk builder treats any present ``function_call`` as a legacy call
+ * and fails on the dict shape (`'dict' object has no attribute 'name'`), which
+ * surfaces as an upstream route failure even though the upstream answered.
+ */
+function isEmptyLegacyFunctionCall(value) {
+  if (value === null || value === undefined) return false
+  if (typeof value !== 'object' || Array.isArray(value)) return false
+  const name = value.name
+  const args = value.arguments
+  return isEmptyFieldValue(name) && (args === undefined || isEmptyFieldValue(args))
+}
+
+/**
  * Drop the empty delta fields from one Chat Completions chunk.
  *
  * Returns whether the payload changed; `role`, `finish_reason`, `usage`, ids,
@@ -51,7 +75,10 @@ export function normalizeChatCompletionChunk(payload) {
     if (!delta || typeof delta !== 'object') continue
     for (const field of EMPTY_DELTA_FIELDS) {
       if (!(field in delta)) continue
-      if (!isEmptyFieldValue(delta[field])) continue
+      const empty = field === 'function_call'
+        ? isEmptyLegacyFunctionCall(delta[field])
+        : isEmptyFieldValue(delta[field])
+      if (!empty) continue
       delete delta[field]
       changed = true
     }

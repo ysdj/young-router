@@ -127,6 +127,12 @@ export interface ServiceStatus {
   pid?: number;
   port?: number;
   auto_start_state?: "enabled" | "disabled";
+  /**
+   * Whether every launch stays in the background (menu bar and proxy only).
+   * Unset means the default: a launch presents the providers-and-models
+   * window, and the General pane's 启动后在后台运行 switch is off.
+   */
+  launch_background_state?: "enabled" | "disabled";
   route_recovery?: {
     recovering?: number;
     cooldown?: number;

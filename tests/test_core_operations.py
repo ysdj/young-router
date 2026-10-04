@@ -200,6 +200,7 @@ class CoreOperationsTests(unittest.TestCase):
                 "pid": 123,
                 "port": 49173,
                 "auto_start_state": "enabled",
+                "launch_background_state": "enabled",
                 "route_recovery": {"recovering": 1},
             }
 
@@ -211,6 +212,7 @@ class CoreOperationsTests(unittest.TestCase):
         self.assertEqual("running", service["state"])
         self.assertEqual(49173, service["port"])
         self.assertEqual("enabled", service["auto_start_state"])
+        self.assertEqual("enabled", service["launch_background_state"])
         self.assertEqual(1, service["route_recovery"]["recovering"])
 
     def test_recovery_summary_counts_only_live_recoveries_and_cooldowns(self) -> None:
@@ -371,6 +373,31 @@ class CoreOperationsTests(unittest.TestCase):
 
         controller.reset_transient_routing_state.assert_called_once_with()
 
+    def test_default_core_dispatches_the_background_launch_preference(self) -> None:
+        """The General switch's action has to reach a real controller.
+
+        A preference the store does not wire fails as an unavailable operation
+        the first time a user touches the switch, so the registration is part
+        of the contract rather than an implementation detail.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            core = CoreStore.with_default_domains(runtime_root=directory)
+            controller = CoreServiceController(directory)
+
+            # A service dispatch answers with the revision; the promise is read
+            # back from the controller the store wired the operation to, the
+            # same real answer the General switch's switch shows.
+            self.assertEqual("disabled", controller.launch_background_status())
+            core.dispatch({"type": "service.launch_background_enable"})
+            self.assertEqual("enabled", controller.launch_background_status())
+            self.assertTrue(controller.paths.launch_background.is_file())
+            core.dispatch({"type": "service.launch_background_status"})
+            self.assertEqual("enabled", controller.launch_background_status())
+            core.dispatch({"type": "service.launch_background_disable"})
+            self.assertEqual("disabled", controller.launch_background_status())
+            self.assertFalse(controller.paths.launch_background.exists())
+
     def test_default_core_exposes_a_non_running_service_for_diagnostics(self) -> None:
         with mock.patch("young_router.core.operations.CoreServiceController") as controller_type:
             controller = controller_type.return_value
@@ -394,6 +421,52 @@ class CoreOperationsTests(unittest.TestCase):
             self.assertEqual(0o600, controller.paths.autostart.stat().st_mode & 0o777)
             controller.autostart_disable()
             self.assertEqual("disabled", controller.autostart_status())
+
+    def test_launch_background_preference_defaults_off_and_round_trips(self) -> None:
+        """A launch presents its window unless the user asked for background.
+
+        The preference is a promise about the next launch, so it has to survive
+        a Core restart, be answered through the same public service projection
+        the switch reads, and never be written anywhere the router config
+        describes routes.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            controller = CoreServiceController(directory)
+            with mock.patch.object(controller, "_health", return_value=False):
+                # The default is a window, so the marker is absent, not an
+                # explicit "off" file that would have to be cleaned up.
+                self.assertEqual("disabled", controller.launch_background_status())
+                self.assertFalse(controller.paths.launch_background.exists())
+                self.assertEqual("disabled", controller.status()["launch_background_state"])
+                self.assertEqual({"launch_background_state": "enabled"}, controller.launch_background_enable())
+                self.assertTrue(controller.paths.launch_background.is_file())
+                self.assertEqual(0o600, controller.paths.launch_background.stat().st_mode & 0o777)
+                self.assertEqual("enabled", controller.status()["launch_background_state"])
+                # A second enable is the same answer, not an error.
+                self.assertEqual("enabled", controller.dispatch("launch_background_enable")["launch_background_state"])
+                self.assertEqual("enabled", controller.dispatch("launch_background_status")["launch_background_state"])
+                # Disabling an absent marker is the default state again.
+                self.assertEqual({"launch_background_state": "disabled"}, controller.dispatch("launch_background_disable"))
+                self.assertEqual({"launch_background_state": "disabled"}, controller.launch_background_disable())
+                self.assertFalse(controller.paths.launch_background.exists())
+            # The marker lives beside the login-item flag, never in the config
+            # that describes the routes themselves.
+            self.assertEqual("launch-background.enabled", controller.paths.launch_background.name)
+            self.assertNotEqual(controller.paths.config, controller.paths.launch_background)
+
+    def test_launch_background_state_file_location_is_overridable(self) -> None:
+        """A packaged launch reads the same promise the Core wrote."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            override = Path(directory) / "custom-background.enabled"
+            with mock.patch.dict(
+                os.environ, {"YOUNG_ROUTER_LAUNCH_BACKGROUND_STATE_FILE": str(override)}
+            ):
+                controller = CoreServiceController(Path(directory) / "root")
+                controller.launch_background_enable()
+
+            self.assertTrue(override.is_file())
 
     def test_snapshot_status_reuses_recent_probe_but_health_forces_refresh(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

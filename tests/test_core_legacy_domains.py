@@ -495,6 +495,79 @@ class ProvidersModelsDomainTests(unittest.TestCase):
                 reloaded_models["fetched-two"]["model_info_extra"],
             )
 
+    def test_a_live_create_stays_before_the_parked_rows_across_apply(self) -> None:
+        """A row the user just made must not move when the document is written.
+
+        ``save_config`` writes one provider's live models to ``model_list`` and
+        its parked ones to the disabled companion, and the read-back appends
+        every live entry before every parked one.  A live \uff0b create that was
+        simply appended therefore hopped over that provider's parked rows on the
+        first Apply; the staged order is the written order now.
+        """
+
+        source = textwrap.dedent(
+            """
+            providers:
+              primary:
+                api_base: "https://example.test/v1"
+                api_keys:
+                  - name: default
+                    value: "replace-me-secret"
+            model_list:
+              - model_name: live-one
+                litellm_params:
+                  model: openai/live-one
+                  api_base: "https://example.test/v1"
+                  api_key: "replace-me-secret"
+                model_info:
+                  id: "000000a1"
+                  provider: primary
+              - model_name: parked-one
+                litellm_params:
+                  model: openai/parked-one
+                  api_base: "https://example.test/v1"
+                  api_key: "replace-me-secret"
+                model_info:
+                  id: "000000a2"
+                  provider: primary
+                  x-young-router-model-enabled: false
+            litellm_settings:
+              public_model_groups: [live-one]
+            """
+        ).lstrip()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(source, encoding="utf-8")
+            domain = ProvidersModelsDomain(path)
+            provider_id = domain.snapshot()["providers"][0]["editor_id"]
+            self.assertEqual(
+                ["live-one", "parked-one"],
+                [model["model_name"] for model in domain.export(include_sensitive=True)["providers"][0]["models"]],
+            )
+
+            domain.dispatch(
+                "model.add",
+                {
+                    "provider_id": provider_id,
+                    "model": {"name": "live-two", "upstream_model": "live-two", "api_key_name": "default"},
+                },
+            )
+            staged = [
+                model["model_name"]
+                for model in domain.export(include_sensitive=True)["providers"][0]["models"]
+            ]
+            self.assertEqual(["live-one", "live-two", "parked-one"], staged)
+
+            domain.apply()
+            reloaded = [
+                model["model_name"]
+                for model in ProvidersModelsDomain(path).export(include_sensitive=True)["providers"][0]["models"]
+            ]
+            self.assertEqual(staged, reloaded)
+            companion = (path.parent / "config.disabled-models.yaml").read_text(encoding="utf-8")
+            self.assertIn("parked-one", companion)
+            self.assertNotIn("live-two", companion)
+
     def test_new_model_uses_public_name_as_upstream_when_route_is_blank(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.yaml"

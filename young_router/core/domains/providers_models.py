@@ -165,6 +165,22 @@ def _environment_reference(name: str) -> str:
     return str(workbuddy_module.published_environment().get(name, "")).strip()
 
 
+def _model_is_live(provider: Mapping[str, Any], model: Mapping[str, Any]) -> bool:
+    """Whether a model reaches the runtime list, exactly as the dumper decides.
+
+    ``config.api.save_config`` writes one provider's live models to
+    ``model_list`` and its parked ones to the disabled companion, and the read
+    side appends every live entry before every parked one.  The staged draft
+    must already state that order: a row \uff0b created while the provider and
+    the row are on is live, so appending it after the parked rows made it hop
+    over them on the first Apply, the moment the document was written.
+    """
+
+    provider_enabled = provider.get("enabled") is not False
+    model_enabled = model.get("model_enabled", model.get("enabled", True)) is not False
+    return provider_enabled and model_enabled
+
+
 class ProvidersModelsDomain:
     """Staged providers/models editing through ``young_router.config``."""
 
@@ -3056,7 +3072,7 @@ class ProvidersModelsDomain:
                 {"api_key", "api_keys", "token", "access_token", "credential", "credential_ref"}
             ):
                 raise DomainError("Service provider model credentials must use native secure input")
-            models.append(self._new_model(provider, raw_model, used_deployment_ids))
+            self._append_model_row(provider, models, self._new_model(provider, raw_model, used_deployment_ids))
         self._apply_auth_to_models(provider, kind)
         self._register_new_provider(provider)
         self._draft["providers"].append(provider)
@@ -3565,6 +3581,34 @@ class ProvidersModelsDomain:
             **({"user_code": str(result["user_code"])} if result.get("user_code") else {}),
             **({"redirect_uri": str(result["redirect_uri"])} if result.get("redirect_uri") else {}),
         }
+
+    def _append_model_row(
+        self,
+        provider: Mapping[str, Any],
+        models: list[Any],
+        model: Mapping[str, Any],
+    ) -> None:
+        """Append a model row where the document's read-back will keep it.
+
+        The dumper writes one provider's live models to ``model_list`` and its
+        parked ones to the disabled companion, and the read side puts every live
+        entry before every parked one.  A live row appended after parked rows
+        therefore jumped on the next Apply; the staged draft states the written
+        order from the start.
+        """
+
+        if not _model_is_live(provider, model):
+            models.append(model)
+            return
+        insert_at = next(
+            (
+                index
+                for index, item in enumerate(models)
+                if isinstance(item, Mapping) and not _model_is_live(provider, item)
+            ),
+            len(models),
+        )
+        models.insert(insert_at, model)
 
     def _new_model(
         self,
@@ -4102,7 +4146,7 @@ class ProvidersModelsDomain:
                             and str(candidate.get("deployment_id", "")).strip()
                         },
                     )
-                    models.append(model)
+                    self._append_model_row(provider, models, model)
                     imported_models += 1
                 else:
                     existing.update(
@@ -4935,7 +4979,7 @@ class ProvidersModelsDomain:
                         "binding_health": {"status": "linked"},
                     }
                 )
-                models.append(model)
+                self._append_model_row(target_provider, models, model)
                 result["rebound_models"] += 1
 
         for provider in working:
@@ -5046,7 +5090,7 @@ class ProvidersModelsDomain:
                 }
             )
             self._normalize_model_binding(destination_provider, model)
-            destination_models.append(model)
+            self._append_model_row(destination_provider, destination_models, model)
             destination_provider_name = str(destination_provider.get("name", "")).strip()
             source_probe = self._probe_overlay.get(source_provider_name, {}).pop(probe_key, None)
             if source_probe is not None:
@@ -5093,7 +5137,7 @@ class ProvidersModelsDomain:
                 and str(candidate.get("deployment_id", "")).strip()
             }
             for value in values:
-                models.append(self._new_model(provider, value, used_deployment_ids))
+                self._append_model_row(provider, models, self._new_model(provider, value, used_deployment_ids))
             auth_kind = self._provider_auth_state(provider)["kind"]
             if auth_kind != "api_key":
                 # A model added to an account-backed provider inherits the

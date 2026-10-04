@@ -89,6 +89,19 @@ class HookRoutingTests(HookTestCase):
         self.assertEqual(hooks._recovery_policy_for_exception(start_timeout), "recovery_cooldown")
         self.assertEqual(hooks._recovery_policy_for_exception(idle_timeout), "recovery")
         self.assertEqual(hooks._recovery_policy_for_exception(request_error), "error")
+        # A station wording the same failure as a failed pre-deduction with the
+        # remaining credit is still a balance failure: it must cool the route
+        # down instead of keeping the empty route first in every request.
+        station_balance = RuntimeError(
+            "OpenAIException - 预扣费额度失败, 用户剩余额度: ¥0.03, 需要预扣费额度: ¥0.05"
+        )
+        station_balance.status_code = 403
+        self.assertEqual(hooks._recovery_policy_for_exception(station_balance), "recovery_cooldown")
+        self.assertEqual(hooks._recovery_diagnostic(station_balance)["kind"], "billing")
+        rejected = RuntimeError("OpenAIException - permission denied")
+        rejected.status_code = 403
+        self.assertEqual(hooks._recovery_policy_for_exception(rejected), "error")
+        self.assertEqual(hooks._recovery_diagnostic(rejected)["kind"], "authentication")
         self.assertFalse(hooks._should_count_deployment_failure_for_cooldown(network))
         self.assertFalse(hooks._should_count_deployment_failure_for_cooldown(rate_limit))
         self.assertTrue(hooks._should_count_deployment_failure_for_cooldown(start_timeout))

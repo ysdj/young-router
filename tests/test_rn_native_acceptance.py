@@ -594,6 +594,43 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertNotIn("ToggleLaunchAtLogin", windows)
         self.assertIn("setLaunchAtLogin?: (enabled: boolean) => Promise<boolean>", platform)
 
+    def test_background_launch_uses_the_shared_home_term_on_both_hosts(self) -> None:
+        """A background launch has to leave nothing on screen on either host.
+
+        macOS has no launch window to hide — its primary React host is already
+        ordered out — so it only has to keep the settings window closed. Windows
+        creates the host window before the preference is known, so its hide path
+        has to exist and has to be the one the launch already uses for home.
+        Sharing the "home" term keeps one decision in the shared layer instead
+        of a platform-specific launch branch.
+        """
+
+        ui = (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
+        mac = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
+        windows = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
+        bridge = (SHARED / "platform/nativeBridge.ts").read_text(encoding="utf-8")
+
+        # The launch decides once, from the first snapshot that answers.
+        self.assertIn("const launchPresented = useRef(false);", ui)
+        self.assertIn('if (snapshot.service.launch_background_state === "enabled") {', ui)
+        # Both branches speak the same shared term the app already uses to leave
+        # the settings shell; neither adds a platform-specific launch surface.
+        self.assertIn('native.window.focus("home");', ui)
+        self.assertIn('native.window.open("providers-models");', ui)
+        self.assertNotIn("launchBackground", mac)
+        self.assertNotIn("launchBackground", windows)
+        self.assertIn("focus: (route) => bridge.focusWindow(route),", bridge)
+        # macOS: focusing home hides the React host and closes the settings
+        # window, and the menu bar is the only thing left on screen.
+        self.assertIn('guard route != "home" else {', mac)
+        self.assertIn("hideHostWindow()", mac)
+        self.assertIn('if let settingsKey = settingsWindowKey() {', mac)
+        # Windows: the one host window hides instead of being torn down, so the
+        # mounted React tree keeps its state.
+        self.assertIn('if (route == L"home") {', windows)
+        self.assertIn("ShowWindow(window_handle_, SW_HIDE)", windows)
+        self.assertNotIn("ShowWindow(window_handle_, SW_DESTROY)", windows)
+
     def test_macos_codex_catalog_toggle_uses_a_separate_non_modal_restart_confirmation(self) -> None:
         ui = (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
         leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
@@ -2255,17 +2292,28 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("scrollView.horizontalScroller.hidden = NO;", controls)
         self.assertIn("scrollView.verticalScroller.hidden = NO;", controls)
         # The scroller the app keeps on screen is its own translucent capsule in
-        # the legacy slot, and the legacy gutter is removed by floating the clip
-        # view over the full width with the scroller on top of the trailing edge.
+        # the legacy slot, and the legacy gutter is removed by zeroing the
+        # width AppKit reserves for it and floating the capsule over the
+        # content's trailing edge instead.
         self.assertIn("static void InstallPersistentScrollers(NSScrollView *scrollView, BOOL horizontal, BOOL vertical)", controls)
         self.assertIn(
             "scrollView.horizontalScroller = [[LiteLLMPersistentScroller alloc] initWithFrame:NSZeroRect];",
             controls,
         )
         self.assertIn("void FloatPersistentScrollerOverContent(NSScrollView *scrollView)", controls)
-        self.assertIn("frame.origin.x = NSMaxX(bounds) - verticalStrip;", controls)
+        self.assertIn("const CGFloat strip = MAX(11, NSWidth(frame));", controls)
+        self.assertIn("frame.origin.x = NSMaxX(bounds) - strip;", controls)
+        self.assertIn("frame.size.width = strip;", controls)
         self.assertIn("const NSRect clipFrame = NSMakeRect(NSMinX(bounds), NSMinY(bounds), NSWidth(bounds), NSHeight(bounds));", controls)
         self.assertIn("FloatPersistentScrollerOverContent(scrollView);", controls)
+        # The capsule itself measures zero, so the gutter AppKit reserves for a
+        # legacy scroller is zero: the table, its columns, its header, and the
+        # selection bar of the row under it keep the pane's full width.
+        mac_leaf_capsule = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
+        self.assertIn(
+            "public override class func scrollerWidth(for controlSize: NSControl.ControlSize, scrollerStyle: NSScroller.Style) -> CGFloat {",
+            mac_leaf_capsule,
+        )
         # AppKit leaves the scroller view it supersedes in the scroll view's view
         # tree, and that leftover draws its own full-length knob next to the live
         # capsule - a second bar on the table's trailing edge.  Every tiling pass
@@ -2282,6 +2330,12 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("FloatPersistentScrollerOverContent(self);", controls)
         mac_leaf_scrollers = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
         self.assertIn("func floatOverContent()", mac_leaf_scrollers)
+        # The scroller floats over the content, so the capsule is the only thing
+        # its frame may paint: the legacy slot, bezel, and arrow ends AppKit
+        # would draw are backgrounds over the row under the knob.
+        self.assertIn("public override func draw(_ dirtyRect: NSRect) {", mac_leaf_scrollers)
+        self.assertIn("public override func drawKnobSlot(in slotRect: NSRect, highlight flag: Bool) {", mac_leaf_scrollers)
+        self.assertIn("final class LiteLLMPersistentScroller: NSScroller", mac_leaf_scrollers)
         self.assertIn("[self installPersistentTableScrollers];", controls)
         self.assertIn("_scrollView.horizontalScrollElasticity = NSScrollElasticityNone", controls)
         self.assertIn("_scrollView.verticalScrollElasticity = NSScrollElasticityNone", controls)
@@ -2346,10 +2400,26 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertNotIn("_dataSignature", controls)
         self.assertNotIn("nextDataSignature", controls)
         self.assertIn("- (void)updateScrollerVisibility", controls)
-        # The floating scroller strip must not expose the scroll view's
-        # background beside the header (the white notch above the knob).
-        self.assertIn("const CGFloat headerWidth = NSWidth(visibleBounds);", controls)
+        # The floating scroller strip must not expose the scroll view's (or the
+        # header's own) background beside the header or over the first row's
+        # top, so every tiling pass keeps the header as wide as the content it
+        # labels — AppKit re-tiles the header on its own, at the pre-float width
+        # the legacy gutter implies.
+        self.assertIn("void WidenTableHeaderOverVisibleWidth(NSScrollView *scrollView)", controls)
+        self.assertIn("const CGFloat headerWidth = NSWidth(scrollView.bounds);", controls)
+        # The clip view AppKit draws the header through stops the header's own
+        # chrome at the gutter, so it is widened with the view it clips.
+        self.assertIn("NSView *headerClip = header.superview;", controls)
+        self.assertIn("clipFrame.size.width = headerWidth;", controls)
         self.assertIn("headerFrame.size.width = headerWidth;", controls)
+        self.assertIn("WidenTableHeaderOverVisibleWidth(self);", controls)
+        self.assertIn("WidenTableHeaderOverVisibleWidth(_scrollView);", controls)
+        # The gutter AppKit reserves for the persistent scroller narrows the clip
+        # view, and with it the table, its columns, and its header: the fitting
+        # pass removes it before it measures the viewport, and measures that
+        # viewport from the scroll view's own width.
+        self.assertIn("FloatPersistentScrollerOverContent(_scrollView);", controls)
+        self.assertIn("const CGFloat viewportWidth = NSWidth(_scrollView.bounds);", controls)
         self.assertIn("const CGFloat headerHeight = _tableView.headerView == nil ? 0 : NSHeight(_tableView.headerView.frame);", controls)
         self.assertIn("const CGFloat dataViewportHeight = MAX(0, NSHeight(_scrollView.contentView.bounds) - headerHeight);", controls)
         self.assertIn("const NSInteger rowCount = _tableView.numberOfRows;", controls)
@@ -2361,7 +2431,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("if (newViewProps.scrollTrailingColumnOverflow) {\n      [self updateColumnMinimumWidths];", controls)
         self.assertIn("const CGFloat textWidth = ceil([value sizeWithAttributes:@{NSFontAttributeName: TableCellFont()}].width)", controls)
         self.assertIn("MIN(_requestedColumnWidths[index], minimumWidths[index])", controls)
-        self.assertIn("const CGFloat availableColumnWidth = NSWidth(visibleBounds);", controls)
+        self.assertIn("const CGFloat availableColumnWidth = NSWidth(_scrollView.bounds);", controls)
         self.assertIn("const auto minimumContentWidth = [&]()", controls)
         self.assertIn("const BOOL needsHorizontalScroller = minimumContentWidth() > availableColumnWidth + 0.5 ||", controls)
         self.assertIn("preferredContentWidth > availableColumnWidth + 0.5", controls)

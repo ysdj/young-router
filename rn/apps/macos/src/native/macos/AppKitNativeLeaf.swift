@@ -4352,8 +4352,38 @@ public final class LiteLLMPersistentScroller: NSScroller {
     private static let idleKnobAlpha: CGFloat = 0.35
     private static let pressedKnobAlpha: CGFloat = 0.5
 
+    /// This capsule is an overlay scroller: it floats over the content's
+    /// trailing edge and AppKit must not reserve a legacy gutter for it.  That
+    /// gutter is what narrowed a table's clip view (and with it the table's own
+    /// frame, its columns, its header, and the selection bar of the row under
+    /// it) by one scroller width, leaving a bare strip beside the trailing
+    /// edge.  AppKit refuses the overlay style to any scroller class that does
+    /// not declare this, which is why the app used to keep the legacy style and
+    /// fight the gutter from every tiling pass.
+    public override class var isCompatibleWithOverlayScrollers: Bool { true }
+
+    /// AppKit sizes the legacy gutter it reserves for a scroller from this
+    /// measurement.  The app floats this capsule over the content instead, so
+    /// the gutter has to be zero: it narrowed the clip view, and with it every
+    /// table's own frame, its columns, its header, and the selection bar of the
+    /// row under it — which left a bare strip beside the content's trailing edge
+    /// and a notch in the first row.  The floats that place the capsule give its
+    /// frame the strip width it needs to draw.
+    public override class func scrollerWidth(for controlSize: NSControl.ControlSize, scrollerStyle: NSScroller.Style) -> CGFloat {
+        0
+    }
+
     public override func drawKnobSlot(in slotRect: NSRect, highlight flag: Bool) {
         // Deliberately empty: no track is drawn over the content.
+    }
+
+    /// Nothing but the capsule: the app floats this scroller over the content's
+    /// trailing edge, so every other part of a legacy scroller's chrome — the
+    /// slot, the bezel, the arrow ends AppKit would still draw around the knob —
+    /// is a background painted over the row (or the header) underneath it, which
+    /// is the white block that shows beside a table's trailing edge.
+    public override func draw(_ dirtyRect: NSRect) {
+        drawKnob()
     }
 
     public override func drawKnob() {
@@ -4380,10 +4410,10 @@ extension NSScrollView {
     /// Draw the scrollers this scroll view keeps visible with
     /// `LiteLLMPersistentScroller` instead of AppKit's opaque legacy bar, unhide
     /// them (AppKit leaves a scroller it hid while idle hidden until the next
-    /// scroll event), and float them over the content instead of the gutter
-    /// AppKit tiles for a legacy scroller.  AppKit rebuilds a scroller whenever
-    /// a scroller flag flips back on, so callers run this from their layout
-    /// path.
+    /// scroll event), and float them over the content's trailing edge.  The
+    /// capsule's own `scrollerWidth` is zero, so the legacy style reserves no
+    /// gutter for it.  AppKit rebuilds a scroller whenever a scroller flag flips
+    /// back on, so callers run this from their layout path.
     func usePersistentScrollers(horizontal: Bool, vertical: Bool) {
         if horizontal, hasHorizontalScroller, !(horizontalScroller is LiteLLMPersistentScroller) {
             horizontalScroller = LiteLLMPersistentScroller(frame: .zero)
@@ -4402,24 +4432,25 @@ extension NSScrollView {
         floatOverContent()
     }
 
-    /// Let the clip view span the full scroll view and place the legacy
-    /// scrollers over the content's trailing edges: AppKit's legacy tiling
-    /// reserved a gutter for them, which took 15 pt off the list.
+    /// Place the capsule over the content's trailing edge: AppKit's legacy
+    /// tiling would put it in a gutter, which the capsule's zero `scrollerWidth`
+    /// already keeps from narrowing the content.  Give the capsule the strip it
+    /// draws in, since AppKit sizes its frame from that same zero width.
     func floatOverContent() {
         guard scrollerStyle == .legacy else { return }
         let bounds = self.bounds
-        var verticalStrip: CGFloat = 0
         if hasVerticalScroller, let scroller = verticalScroller {
-            verticalStrip = max(11, scroller.frame.width)
+            let strip = max(11, scroller.frame.width)
             var frame = scroller.frame
-            frame.origin.x = bounds.maxX - verticalStrip
+            frame.origin.x = bounds.maxX - strip
+            frame.size.width = strip
             scroller.frame = frame
         }
-        var horizontalStrip: CGFloat = 0
         if hasHorizontalScroller, let scroller = horizontalScroller {
-            horizontalStrip = max(11, scroller.frame.height)
+            let strip = max(11, scroller.frame.height)
             var frame = scroller.frame
-            frame.origin.y = isFlipped ? bounds.maxY - horizontalStrip : bounds.minY
+            frame.origin.y = isFlipped ? bounds.maxY - strip : bounds.minY
+            frame.size.height = strip
             scroller.frame = frame
         }
         let clipFrame = NSRect(x: bounds.minX, y: bounds.minY,
