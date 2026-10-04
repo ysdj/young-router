@@ -290,6 +290,10 @@ class ProvidersModelsDomain:
         # linked route, and the pane must point at it instead of only stating
         # that the change is not in effect.
         self._binding_issues: list[dict[str, str]] = []
+        # What the last live WorkBuddy read observed, per variant.  A snapshot
+        # projects this instead of calling the worker: see
+        # `_workbuddy_projection_status`.
+        self._workbuddy_observed: dict[str, dict[str, Any]] = {}
         self.revision = 0
         self.reload()
 
@@ -308,6 +312,18 @@ class ProvidersModelsDomain:
 
             self.workbuddy = WorkBuddyRuntime(self.config_path.parent)
         return self.workbuddy
+
+    def _workbuddy_remember(self, document: Mapping[str, Any]) -> None:
+        """Record what one live WorkBuddy read reported, per variant."""
+
+        providers = document.get("providers")
+        if not isinstance(providers, Mapping):
+            return
+        for provider_id, entry in providers.items():
+            if provider_id not in workbuddy_module.WORKBUDDY_PROVIDERS or not isinstance(entry, Mapping):
+                continue
+            auth = {"kind": workbuddy_module.PROVIDER_TO_AUTH_KIND.get(str(provider_id), "")}
+            self._workbuddy_observe(auth, entry)
 
     @staticmethod
     def _empty_document() -> dict[str, str | None]:
@@ -726,6 +742,9 @@ class ProvidersModelsDomain:
             "auth_kind": provider_auth["kind"],
             "auth_status": self._provider_auth_status(provider, provider_auth),
             "auth_configured": self._provider_auth_configured(provider, provider_auth),
+            # The last state a live read observed, so a projection can show the
+            # account and its credit without paying for another worker call.
+            "auth_observed": self._workbuddy_observed_account(provider_auth),
             "auth_active": self._provider_auth_active(provider_auth),
             "api_base": REDACT_TEXT(str(provider.get("api_base", ""))),
             "api_key_configured": configured_key,
@@ -2154,6 +2173,9 @@ class ProvidersModelsDomain:
             document = self._workbuddy().models(provider_id, refresh=True)
         except Exception:
             raise DomainError("The WorkBuddy model list is unavailable") from None
+        # Adding the account just answered the account question, so the state
+        # the worker reported becomes what later projections project.
+        self._workbuddy_remember({"providers": {provider_id: document.get("status")}})
         if document.get("available") is not True:
             raise DomainError(
                 "Sign in to the WorkBuddy desktop app before adding this account"
@@ -2208,6 +2230,9 @@ class ProvidersModelsDomain:
             if action == "workbuddy_status":
                 document = runtime.status(refresh=bool(data.get("refresh")))
                 providers = document.get("providers")
+                # The pane asked the account question directly, so what came
+                # back becomes the state every later projection reports.
+                self._workbuddy_remember(document)
                 self._last_operation = {
                     "operation": action,
                     "available": document.get("available") is True,
@@ -2218,6 +2243,9 @@ class ProvidersModelsDomain:
             document = runtime.models(provider_id, refresh=bool(data.get("refresh", True)))
         except Exception:
             raise DomainError("The WorkBuddy integration is unavailable") from None
+        # A catalog read answers the account question too, and the worker's own
+        # status rides that response.
+        self._workbuddy_remember({"providers": {provider_id: document.get("status")}})
         self._last_operation = {
             "operation": action,
             "provider": provider_id,
@@ -2226,7 +2254,13 @@ class ProvidersModelsDomain:
         }
 
     def _workbuddy_login_status(self, auth: Mapping[str, Any]) -> dict[str, Any]:
-        """The worker's account record for one WorkBuddy login provider."""
+        """The worker's account record for one WorkBuddy login provider.
+
+        This is a live read: it may start the worker, read the desktop app's
+        credential and ask the upstream for the account's credit.  A snapshot
+        must never pay for it — see :meth:`_workbuddy_projection_status` for
+        the value a projection projects instead.
+        """
 
         try:
             provider = workbuddy_module.AUTH_KIND_TO_PROVIDER[str(auth.get("kind", ""))]
@@ -2238,10 +2272,84 @@ class ProvidersModelsDomain:
             return {}
         return dict(entry) if isinstance(entry, Mapping) else {}
 
-    def _provider_auth_configured(self, provider: Mapping[str, Any], auth: Mapping[str, Any]) -> bool:
+    def _workbuddy_projection_status(
+        self, auth: Mapping[str, Any], *, allow_live: bool
+    ) -> tuple[str, bool]:
+        """Resolve ``(auth_status, configured)`` for a WorkBuddy login.
+
+        ``allow_live`` is true only for an action that actually answered the
+        account question — the explicit ``workbuddy_status`` read, a sign-in,
+        or a create.  Every other caller is a *projection*: the provider table,
+        ``provider.patch``, a validation, a draft compare.  Those run on the
+        path that serves ``CoreStore.snapshot()``, and the store holds its
+        lock for the whole call, so one cold worker (a 45 s start, an upstream
+        catalog and credit read) froze every window, and that window's own
+        writes queued behind it and could not even report the wait that was
+        holding it.  A projection therefore reports the last observed state
+        instead of reaching for the worker, so one pane's account read can
+        never disable the rest of the app.
+        """
+
+        if allow_live:
+            entry = self._workbuddy_login_status(auth)
+            self._workbuddy_observe(auth, entry)
+            return self._workbuddy_auth_status(str(entry.get("state", ""))), str(entry.get("state", "")) == "signed-in"
+        provider_id = workbuddy_module.AUTH_KIND_TO_PROVIDER.get(str(auth.get("kind", "")))
+        if provider_id is None:
+            return "", False
+        observed = self._workbuddy_observed.get(provider_id, {})
+        state = str(observed.get("state", ""))
+        return self._workbuddy_auth_status(state), state == "signed-in"
+
+    @staticmethod
+    def _workbuddy_auth_status(state: str) -> str:
+        """The worker's own vocabulary, mapped onto the auth status set.
+
+        The desktop app reports ``signed-in``/``signed-out``; the IPC contract
+        reports ``signed_in``/``signed_out``.  The mapping is this domain's
+        alone so both spellings resolve to one value everywhere it is read.
+        """
+
+        normalized = state.replace("-", "_").strip()
+        if normalized in {"signed_in", "signed_out", "authorizing", "expired", "error", "unsupported"}:
+            return normalized
+        return ""
+
+    def _workbuddy_observed_account(self, auth: Mapping[str, Any]) -> dict[str, Any]:
+        """The secret-free account facts a live read last observed."""
+
+        provider_id = workbuddy_module.AUTH_KIND_TO_PROVIDER.get(str(auth.get("kind", "")))
+        if provider_id is None:
+            return {}
+        observed = self._workbuddy_observed.get(provider_id)
+        return copy.deepcopy(observed) if isinstance(observed, Mapping) else {}
+
+    def _workbuddy_observe(self, auth: Mapping[str, Any], entry: Mapping[str, Any]) -> None:
+        """Remember what a live WorkBuddy read just reported."""
+
+        provider_id = workbuddy_module.AUTH_KIND_TO_PROVIDER.get(str(auth.get("kind", "")))
+        if provider_id is None or not isinstance(entry, Mapping):
+            return
+        state = str(entry.get("state", ""))
+        if not state:
+            return
+        self._workbuddy_observed[provider_id] = {
+            "state": state,
+            "nickname": str(entry.get("nickname", "")),
+            "domain": str(entry.get("domain", "")),
+            "credits": dict(entry.get("credits", {})) if isinstance(entry.get("credits"), Mapping) else {},
+            "observed_at": time.time(),
+        }
+
+    def _provider_auth_configured(
+        self, provider: Mapping[str, Any], auth: Mapping[str, Any], *, allow_live: bool = False
+    ) -> bool:
         if auth.get("kind") in workbuddy_module.WORKBUDDY_AUTH_KINDS:
-            return str(self._workbuddy_login_status(auth).get("state", "")) == "signed-in"
+            return self._workbuddy_projection_status(auth, allow_live=allow_live)[1]
         if auth.get("kind") in {"openai_login", "claude_login"}:
+            # The OpenAI status is a local file read plus a token-expiry check,
+            # so a projection may take it.  Claude's device login is answered
+            # from in-memory state and falls through to a local record read.
             credential_ref = str(auth.get("credential_ref", "")).strip()
             if not credential_ref:
                 return False
@@ -2254,20 +2362,16 @@ class ProvidersModelsDomain:
         _name, value = self._provider_credential(provider)
         return bool(value)
 
-    def _provider_auth_status(self, provider: Mapping[str, Any], auth: Mapping[str, Any]) -> str:
+    def _provider_auth_status(
+        self, provider: Mapping[str, Any], auth: Mapping[str, Any], *, allow_live: bool = False
+    ) -> str:
         kind = str(auth.get("kind", "api_key"))
         if kind in workbuddy_module.WORKBUDDY_AUTH_KINDS:
             # The credential belongs to the desktop app, so there is no login
             # this app can start or end: only its observed state is reported.
-            entry = self._workbuddy_login_status(auth)
-            state = str(entry.get("state", ""))
-            if state == "signed-in":
-                return "signed_in"
-            if state == "signed-out":
-                return "signed_out"
-            if state == "error":
-                return "error"
-            return "unsupported" if not workbuddy_module.available() else "signed_out"
+            return self._workbuddy_projection_status(auth, allow_live=allow_live)[0] or (
+                "signed_out" if workbuddy_module.available() else "unsupported"
+            )
         if kind in {"openai_login", "claude_login"}:
             credential_ref = str(auth.get("credential_ref", "")).strip()
             if not credential_ref:
@@ -3080,8 +3184,12 @@ class ProvidersModelsDomain:
             "operation": "service_provider_add",
             "provider_id": self._safe_provider(provider, len(self._draft["providers"]) - 1)["id"],
             "auth_kind": kind,
+            # Creating the entry just read the account live (the catalog import
+            # above, or the signed-in check that refuses a signed-out app), so
+            # this summary states the answer to the question the pane asked
+            # rather than a projection that has not observed anything yet.
             "auth_status": self._provider_auth_status(
-                provider, self._provider_auth_state(provider)
+                provider, self._provider_auth_state(provider), allow_live=True
             ),
         }
 

@@ -320,6 +320,75 @@ class WorkBuddyProviderTests(unittest.TestCase):
                 self.assertEqual(model["api_base"], workbuddy.api_base_reference("workbuddy-ai"))
                 self.assertEqual(model["api_key_name"], workbuddy.API_KEY_NAME)
 
+    def test_a_snapshot_never_calls_the_live_worker(self) -> None:
+        """A projection must not pay for a WorkBuddy account read.
+
+        ``CoreStore.snapshot()`` holds the store lock for its whole call, and
+        the provider table is projected on it, so a cold worker (a 45 s start,
+        a desktop credential read, an upstream catalog and credit fetch) froze
+        every window in the app — and a write could not even reach Core to say
+        so.  A snapshot therefore reports the last state a live read observed.
+        """
+
+        runtime = StubRuntime()
+        directory, domain, _config = self._domain(runtime)
+        with directory:
+            domain.dispatch("service_provider.add", {"kind": "workbuddy_login", "models": []})
+            # The create is the one place that legitimately asks the worker.
+            self.assertTrue(runtime.calls)
+            before = len(runtime.calls)
+            for _ in range(3):
+                provider = domain.snapshot()["providers"][0]
+                self.assertEqual(provider["auth_status"], "signed_in")
+                self.assertEqual(provider["auth_observed"]["nickname"], "Example User")
+            self.assertEqual(len(runtime.calls), before)
+
+    def test_a_wizard_created_entry_takes_its_state_from_the_create(self) -> None:
+        """Nothing has observed the account yet, so nothing may guess it."""
+
+        directory, domain, _config = self._domain()
+        with directory:
+            summary = domain.dispatch(
+                "service_provider.add",
+                {"kind": "workbuddy_login", "name": "WorkBuddy", "models": []},
+            )["operation_summary"]
+            self.assertEqual(summary["auth_status"], "signed_in")
+            self.assertEqual(domain.snapshot()["providers"][0]["auth_status"], "signed_in")
+
+    def test_a_snapshot_states_nothing_it_has_not_observed(self) -> None:
+        """A signed-out projection is not a stale success."""
+
+        runtime = StubRuntime(state="signed-out")
+        directory, domain, _config = self._domain(runtime)
+        with directory:
+            domain.dispatch("workbuddy_status", {"refresh": True})
+            self.assertEqual(domain.snapshot()["providers"], [])
+
+    def test_a_read_that_never_observed_the_worker_stays_unstated(self) -> None:
+        """With no live read, Core says nothing rather than guessing."""
+
+        class Unreachable(StubRuntime):
+            def provider_status(self, provider: str) -> dict[str, object]:
+                raise workbuddy.WorkBuddyUnavailable("the worker did not answer")
+
+            def status(self, *, refresh: bool = False) -> dict[str, object]:
+                raise workbuddy.WorkBuddyUnavailable("the worker did not answer")
+
+        directory, domain, _config = self._domain(Unreachable())
+        with directory:
+            domain.dispatch("service_provider.add", {"kind": "workbuddy_login", "models": []})
+            # A replacement Core, a rollback, or a worker that has never been
+            # reached: nothing has observed the account, so the projection says
+            # so rather than inventing a success or reaching for the worker.
+            domain._workbuddy_observed.clear()
+            safe = domain.snapshot()["providers"][0]
+            # An answer nobody observed is never reported as a success, and it
+            # never reaches for the worker to invent one.
+            self.assertNotEqual(safe["auth_status"], "signed_in")
+            self.assertIs(safe["auth_configured"], False)
+            self.assertEqual(safe["auth_observed"], {})
+            self.assertIn(safe["auth_status"], {"signed_out", "unsupported"})
+
     def test_the_login_action_opens_the_desktop_app(self) -> None:
         runtime = StubRuntime()
         directory, domain, _config = self._domain(runtime)
