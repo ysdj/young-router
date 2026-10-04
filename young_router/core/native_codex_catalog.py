@@ -17,6 +17,12 @@ from typing import Any
 NATIVE_CATALOG_TIMEOUT_SECONDS = 2.0
 NATIVE_CATALOG_MAX_BYTES = 16 * 1024 * 1024
 _NATIVE_CATALOG_COMMAND = ("debug", "models", "--bundled")
+# Current ChatGPT/Codex clients ship the CLI as a ``codex-cli`` package inside
+# the app's Resources directory and name the executable in its manifest; the
+# historic layout kept the binary directly at ``Resources/codex``.
+_CODEX_CLI_PACKAGE_DIR_NAME = "codex-cli"
+_CODEX_CLI_PACKAGE_FILE_NAME = "codex-package.json"
+_CODEX_CLI_DEFAULT_ENTRYPOINT = "bin/codex"
 
 _CACHE_LOCK = threading.RLock()
 _CATALOG_CACHE: dict[tuple[str, int, int], tuple[dict[str, Any], ...]] = {}
@@ -46,6 +52,40 @@ def _append_candidate(result: list[Path], seen: set[str], value: object) -> None
     result.append(path)
 
 
+def _codex_cli_package_entrypoint(package_dir: Path) -> str:
+    """The executable the ``codex-cli`` package names, or its documented one.
+
+    The manifest is read so a further packaging change keeps working without
+    this repository naming a new path; a missing, unreadable, or malformed
+    manifest falls back to the entry point the package has always declared.
+    """
+
+    try:
+        payload = json.loads(
+            (package_dir / _CODEX_CLI_PACKAGE_FILE_NAME).read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return _CODEX_CLI_DEFAULT_ENTRYPOINT
+    entrypoint = payload.get("entrypoint") if isinstance(payload, Mapping) else None
+    if not isinstance(entrypoint, str) or not entrypoint.strip():
+        return _CODEX_CLI_DEFAULT_ENTRYPOINT
+    candidate = entrypoint.strip()
+    # The manifest names a path inside its own package; never follow one out.
+    if candidate.startswith("/") or ".." in Path(candidate).parts:
+        return _CODEX_CLI_DEFAULT_ENTRYPOINT
+    return candidate
+
+
+def codex_app_cli_candidates(resources_dir: Path) -> tuple[Path, ...]:
+    """Bundled Codex CLI paths one app layout can hold, in probe order."""
+
+    package_dir = resources_dir / _CODEX_CLI_PACKAGE_DIR_NAME
+    return (
+        resources_dir / "codex",
+        package_dir / _codex_cli_package_entrypoint(package_dir),
+    )
+
+
 def native_codex_executable_candidates() -> tuple[Path, ...]:
     """Return bounded, platform-aware candidates for the native Codex CLI."""
 
@@ -65,7 +105,10 @@ def native_codex_executable_candidates() -> tuple[Path, ...]:
     if sys.platform == "darwin":
         for root in (Path("/Applications"), Path.home() / "Applications"):
             for app in ("ChatGPT.app", "Codex.app"):
-                _append_candidate(result, seen, root / app / "Contents" / "Resources" / "codex")
+                for candidate in codex_app_cli_candidates(
+                    root / app / "Contents" / "Resources"
+                ):
+                    _append_candidate(result, seen, candidate)
     elif os.name == "nt":
         roots = [
             os.environ.get("LOCALAPPDATA", ""),

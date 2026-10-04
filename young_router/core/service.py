@@ -966,6 +966,9 @@ class CoreStore:
             "autostart_enable",
             "autostart_disable",
             "autostart_status",
+            "launch_background_enable",
+            "launch_background_disable",
+            "launch_background_status",
         )
         service_handlers = {operation: controller.dispatch for operation in operations}
         initial_service = controller.status()
@@ -3065,7 +3068,13 @@ class CoreStore:
         if state not in SERVICE_STATES:
             state = "unknown"
         service: dict[str, Any] = {"state": state}
-        for key in ("detail", "auto_start_state", "route_recovery", "webdav"):
+        for key in (
+            "detail",
+            "auto_start_state",
+            "launch_background_state",
+            "route_recovery",
+            "webdav",
+        ):
             value = result.get(key)
             if value is not None:
                 service[key] = _safe_public(value)

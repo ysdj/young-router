@@ -355,6 +355,13 @@ class WorkBuddyServiceEnvironmentTests(unittest.TestCase):
         self.assertNotIn("readable.pipe(res)", worker)
         for field in ("'content'", "'refusal'", "'reasoning_content'", "'tool_calls'", "'function_call'"):
             self.assertIn(field, shaper)
+        # The content-free legacy function_call mirror is dropped too: LiteLLM's
+        # stream-chunk builder reads any present function_call as a legacy call
+        # and fails on the dict shape, so an empty mirror used to turn an
+        # answered stream into an upstream route failure.
+        self.assertIn("function isEmptyLegacyFunctionCall(value)", shaper)
+        self.assertIn("field === 'function_call'", shaper)
+        self.assertIn("return isEmptyFieldValue(name) && (args === undefined || isEmptyFieldValue(args))", shaper)
         self.assertIn("if (!trimmed.startsWith('data:')) return line", shaper)
         self.assertIn("if (!data || data === '[DONE]') return line", shaper)
 

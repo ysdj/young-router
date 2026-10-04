@@ -808,6 +808,8 @@ BOOL TableScrollViewCanConsume(NSScrollView *scrollView, NSEvent *event, BOOL ac
 BOOL ForwardWheelToParent(NSView *view, NSEvent *event);
 void FloatPersistentScrollerOverContent(NSScrollView *scrollView);
 void DiscardStaleScrollerSubviews(NSScrollView *scrollView);
+void ReassertPersistentScrollerPlacement(NSScrollView *scrollView);
+void WidenTableHeaderOverVisibleWidth(NSScrollView *scrollView);
 
 
 @interface LiteLLMTableScrollView : NSScrollView
@@ -839,6 +841,13 @@ void DiscardStaleScrollerSubviews(NSScrollView *scrollView);
   }
   DiscardStaleScrollerSubviews(self);
   FloatPersistentScrollerOverContent(self);
+  // AppKit's own tiling can size the capsule back to the zero width its class
+  // measures and drop it out of the view tree: every pass re-attaches it.
+  ReassertPersistentScrollerPlacement(self);
+  // Floating the scroller leaves the header to AppKit's own tiling, which still
+  // measures the pre-float width: re-assert the header's width here, the one
+  // place every tiling pass reaches, not only from the React layout path.
+  WidenTableHeaderOverVisibleWidth(self);
 }
 
 - (void)scrollWheel:(NSEvent *)event
@@ -1270,26 +1279,28 @@ void FloatPersistentScrollerOverContent(NSScrollView *scrollView)
   NSClipView *clipView = scrollView.contentView;
   if (clipView == nil) return;
   const NSRect bounds = scrollView.bounds;
-  CGFloat verticalStrip = 0;
+  // The capsule's own `scrollerWidth` is zero, so the legacy style AppKit tiles
+  // reserves no gutter for it; AppKit may still size its frame to that zero
+  // width.  Give it the strip it draws in, at the content's trailing edge — over
+  // the rows, exactly where AppKit would have put a gutter bar.
   if (scrollView.hasVerticalScroller && scrollView.verticalScroller != nil) {
-    verticalStrip = MAX(11, NSWidth(scrollView.verticalScroller.frame));
     NSRect frame = scrollView.verticalScroller.frame;
-    frame.origin.x = NSMaxX(bounds) - verticalStrip;
+    const CGFloat strip = MAX(11, NSWidth(frame));
+    frame.origin.x = NSMaxX(bounds) - strip;
+    frame.size.width = strip;
     scrollView.verticalScroller.frame = frame;
   }
-  CGFloat horizontalStrip = 0;
   if (scrollView.hasHorizontalScroller && scrollView.horizontalScroller != nil) {
-    horizontalStrip = MAX(11, NSHeight(scrollView.horizontalScroller.frame));
     NSRect frame = scrollView.horizontalScroller.frame;
-    frame.origin.y = scrollView.isFlipped ? NSMaxY(bounds) - horizontalStrip : NSMinY(bounds);
+    const CGFloat strip = MAX(11, NSHeight(frame));
+    frame.origin.y = scrollView.isFlipped ? NSMaxY(bounds) - strip : NSMinY(bounds);
+    frame.size.height = strip;
     scrollView.horizontalScroller.frame = frame;
   }
   const NSRect clipFrame = NSMakeRect(NSMinX(bounds), NSMinY(bounds), NSWidth(bounds), NSHeight(bounds));
   if (!NSEqualRects(clipView.frame, clipFrame)) {
     clipView.frame = clipFrame;
   }
-  (void)verticalStrip;
-  (void)horizontalStrip;
 }
 
 void DiscardStaleScrollerSubviews(NSScrollView *scrollView)
@@ -1305,6 +1316,68 @@ void DiscardStaleScrollerSubviews(NSScrollView *scrollView)
     if (subview == scrollView.verticalScroller || subview == scrollView.horizontalScroller) continue;
     [subview removeFromSuperview];
   }
+}
+
+// The capsule has to survive AppKit's own tiling pass.  AppKit sizes a legacy
+// scroller from the width its class measures - which is zero for the app's
+// capsule, so the gutter the style would reserve for it is zero too - and a
+// tiling pass it runs on its own (a scroll, a flag flip) can size the frame
+// back to that zero and drop the view out of the tree.  Every tiling pass has
+// to put the capsule back on its strip, at the content's trailing edge.
+void ReassertPersistentScrollerPlacement(NSScrollView *scrollView)
+{
+  if (scrollView == nil) return;
+  if (scrollView.hasHorizontalScroller &&
+      [scrollView.horizontalScroller isKindOfClass:LiteLLMPersistentScroller.class]) {
+    if (scrollView.horizontalScroller.superview != scrollView) {
+      [scrollView addSubview:scrollView.horizontalScroller];
+    }
+    scrollView.horizontalScroller.hidden = NO;
+    scrollView.horizontalScroller.alphaValue = 1;
+  }
+  if (scrollView.hasVerticalScroller &&
+      [scrollView.verticalScroller isKindOfClass:LiteLLMPersistentScroller.class]) {
+    if (scrollView.verticalScroller.superview != scrollView) {
+      [scrollView addSubview:scrollView.verticalScroller];
+    }
+    scrollView.verticalScroller.hidden = NO;
+    scrollView.verticalScroller.alphaValue = 1;
+  }
+  DiscardStaleScrollerSubviews(scrollView);
+  FloatPersistentScrollerOverContent(scrollView);
+}
+
+// AppKit tiles a table's header to the width it computes for the scroll view,
+// and that measurement still counts the legacy gutter the app's persistent
+// scroller would need.  The scroller is floated over the content instead (see
+// `FloatPersistentScrollerOverContent`), so the strip it no longer takes is
+// left uncovered by the header: the strip showed the scroll view's background
+// beside the header's trailing edge and, because the header's own chrome ends
+// there, a notch in the first row's top under the knob.  AppKit re-tiles on its
+// own (a scroller flag, a focus change, a column resize), so the width belongs
+// to every tiling pass: keep the header — and the clip view AppKit draws it
+// through, which is what actually clipped that strip — as wide as the content
+// it labels.
+void WidenTableHeaderOverVisibleWidth(NSScrollView *scrollView)
+{
+  if (scrollView == nil || ![scrollView.documentView isKindOfClass:NSTableView.class]) return;
+  NSView *header = ((NSTableView *)scrollView.documentView).headerView;
+  if (header == nil) return;
+  const CGFloat headerWidth = NSWidth(scrollView.bounds);
+  // The header's own clip view is the one that stops the header's drawing at
+  // the gutter: widen it with the view it clips, or the widened header is drawn
+  // clipped again and the strip stays bare.
+  NSView *headerClip = header.superview;
+  if (headerClip != nil && ![headerClip isKindOfClass:NSScrollView.class] &&
+      fabs(NSWidth(headerClip.frame) - headerWidth) > 0.5) {
+    NSRect clipFrame = headerClip.frame;
+    clipFrame.size.width = headerWidth;
+    headerClip.frame = clipFrame;
+  }
+  NSRect headerFrame = header.frame;
+  if (fabs(NSWidth(headerFrame) - headerWidth) <= 0.5) return;
+  headerFrame.size.width = headerWidth;
+  header.frame = headerFrame;
 }
 
 static void InstallPersistentScrollers(NSScrollView *scrollView, BOOL horizontal, BOOL vertical)
@@ -1323,15 +1396,11 @@ static void InstallPersistentScrollers(NSScrollView *scrollView, BOOL horizontal
   if (installed) {
     [scrollView tile];
   }
-  if (horizontal && scrollView.hasHorizontalScroller) {
-    scrollView.horizontalScroller.hidden = NO;
-    scrollView.horizontalScroller.alphaValue = 1;
-  }
-  if (vertical && scrollView.hasVerticalScroller) {
-    scrollView.verticalScroller.hidden = NO;
-    scrollView.verticalScroller.alphaValue = 1;
-  }
-  FloatPersistentScrollerOverContent(scrollView);
+  // AppKit rebuilds the scroller views it manages and may size the app's capsule
+  // back to the zero width its class measures (that zero width is what keeps the
+  // legacy gutter from existing), and it may drop the capsule out of the view
+  // tree.  Every tiling pass re-attaches it and gives it its strip back.
+  ReassertPersistentScrollerPlacement(scrollView);
 }
 
 @interface LiteLLMNavigationLinkButton : LiteLLMTabButton
@@ -2108,8 +2177,7 @@ static void LiteLLMScrollViewTile(NSScrollView *scrollView, SEL _cmd)
       (scrollView.hasVerticalScroller && [scrollView.verticalScroller isKindOfClass:LiteLLMPersistentScroller.class]) ||
       (scrollView.hasHorizontalScroller && [scrollView.horizontalScroller isKindOfClass:LiteLLMPersistentScroller.class]);
   if (carriesCapsule) {
-    DiscardStaleScrollerSubviews(scrollView);
-    FloatPersistentScrollerOverContent(scrollView);
+    ReassertPersistentScrollerPlacement(scrollView);
   }
 }
 
@@ -2722,6 +2790,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   std::vector<CGFloat> _requestedColumnWidths;
   std::vector<bool> _userResizedColumns;
   BOOL _hasLoadedData;
+  BOOL _appliedSourceListChrome;
 }
 
 + (ComponentDescriptorProvider)componentDescriptorProvider
@@ -2826,7 +2895,13 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
 
   _tableView.usesAlternatingRowBackgroundColors = newViewProps.alternatingRows;
   _frameView.framed = !newViewProps.borderless;
-  if (sourceListChanged) {
+  if (sourceListChanged || !_appliedSourceListChrome) {
+    // A view Fabric creates for this table never sees a source-list change, so
+    // the chrome has to be applied once even when the flag does not move: the
+    // strip AppKit still reserves for the persistent scroller stays unpainted
+    // only because this pass turns the scroll view's own background off, and
+    // without it that paint lands on the row under the knob as a white block
+    // beside the table's trailing edge.
     [self applySourceListChrome:newViewProps.sourceList];
   }
   if (compactChanged || sourceListChanged) {
@@ -3021,6 +3096,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
 
 - (void)applySourceListChrome:(BOOL)sourceList
 {
+  _appliedSourceListChrome = YES;
   _tableView.style = sourceList ? NSTableViewStyleSourceList : NSTableViewStylePlain;
   _tableView.selectionHighlightStyle = sourceList
       ? NSTableViewSelectionHighlightStyleSourceList
@@ -3117,8 +3193,11 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
 - (BOOL)applyPersistentTableScrollerChrome
 {
   const BOOL usesScrollers = _scrollView.hasHorizontalScroller || _scrollView.hasVerticalScroller;
-  // The app's own capsule scroller can only be drawn with the legacy style;
-  // FloatPersistentScrollerOverContent keeps that style from taking a gutter.
+  // The app's own capsule scroller draws the platform overlay look with the
+  // legacy style (a custom NSScroller subclass cannot be tiled as an overlay
+  // scroller), and its own `scrollerWidth` is zero, so the legacy style reserves
+  // no gutter for it: FloatPersistentScrollerOverContent places the capsule over
+  // the content's trailing edge.
   const NSScrollerStyle scrollerStyle = usesScrollers ? NSScrollerStyleLegacy : NSScrollerStyleOverlay;
   const BOOL autohidesScrollers = !usesScrollers;
   const BOOL chromeChanged =
@@ -3186,8 +3265,16 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   };
 
   for (NSUInteger index = 0; index < 6; index++) {
+    // AppKit's legacy tiling reserves a gutter for the scroller it just
+    // installed and narrows the clip view with it, so the table and its header
+    // stop one scroller-width short and the strip beside them is bare.  The
+    // scroller floats over the content, so the gutter is removed in the pass
+    // that measures the viewport, and the viewport is measured from the scroll
+    // view (the width the content actually shows through) rather than from the
+    // clip view AppKit may just have narrowed.
+    FloatPersistentScrollerOverContent(_scrollView);
     const NSRect visibleBounds = _scrollView.contentView.bounds;
-    const CGFloat availableColumnWidth = NSWidth(visibleBounds);
+    const CGFloat availableColumnWidth = NSWidth(_scrollView.bounds);
     const CGFloat preferredContentWidth = requestedContentWidth() + trailingOverflowWidth();
     const BOOL needsHorizontalScroller = minimumContentWidth() > availableColumnWidth + 0.5 ||
         ((viewProps.preserveColumnWidths || viewProps.scrollTrailingColumnOverflow || hasUserColumnResize()) &&
@@ -3208,6 +3295,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
     break;
   }
   [self installPersistentTableScrollers];
+  FloatPersistentScrollerOverContent(_scrollView);
 
   const NSRect visibleBounds = _scrollView.contentView.bounds;
   std::vector<CGFloat> laidOutColumnWidths = _requestedColumnWidths;
@@ -3223,7 +3311,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
     contentWidth += laidOutColumnWidths[index];
   }
   if (!_scrollView.hasHorizontalScroller && !laidOutColumnWidths.empty()) {
-    const CGFloat viewportWidth = NSWidth(visibleBounds);
+    const CGFloat viewportWidth = NSWidth(_scrollView.bounds);
     if (contentWidth < viewportWidth) {
       laidOutColumnWidths.back() += viewportWidth - contentWidth;
     } else if (contentWidth > viewportWidth) {
@@ -3260,7 +3348,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   _tableView.acceptsHorizontalScroll = needsHorizontalScroller;
 
   const NSSize documentSize = NSMakeSize(
-      MAX(NSWidth(visibleBounds), laidOutContentWidth),
+      MAX(NSWidth(_scrollView.bounds), laidOutContentWidth),
       MAX(dataViewportHeight, rowsHeight));
   if (!NSEqualSizes(_tableView.frame.size, documentSize)) {
     _tableView.frame = NSMakeRect(0, 0, documentSize.width, documentSize.height);
@@ -3272,16 +3360,10 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   // legitimately sit inside the header strip, and re-parking it here undid the
   // first wheel notch over a table whose overflow is only a few points.
   if (_tableView.headerView != nil) {
-    // The scroller floats over the clip view, so AppKit tiled the header once
-    // for the pre-float width and left an uncovered strip beside it: the scroll
-    // view's white background showed through as a notch above the floating knob.
-    // Keep the header exactly as wide as the content it labels.
-    NSRect headerFrame = _tableView.headerView.frame;
-    const CGFloat headerWidth = NSWidth(visibleBounds);
-    if (fabs(NSWidth(headerFrame) - headerWidth) > 0.5) {
-      headerFrame.size.width = headerWidth;
-      _tableView.headerView.frame = headerFrame;
-    }
+    // The scroller floats over the clip view, so AppKit leaves the header's
+    // width at the pre-float measurement and the strip beside it uncovered.
+    // The tiling pass keeps the header as wide as the content it labels.
+    WidenTableHeaderOverVisibleWidth(_scrollView);
     const CGFloat restingOrigin = -NSHeight(_tableView.headerView.frame);
     const CGFloat originY = NSMinY(_clipView.bounds);
     if (fabs(originY) < 0.5) {
