@@ -48,6 +48,32 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn(marker, self.ui, marker)
 
     @staticmethod
+    def call_arguments(source: str, start: int) -> list[str]:
+        """The top-level arguments of the call whose `(` is at `start`."""
+
+        arguments: list[str] = []
+        current: list[str] = []
+        depth = 0
+        for character in source[start + 1:]:
+            if character in "([{":
+                depth += 1
+                current.append(character)
+                continue
+            if character in ")]}":
+                if depth == 0:
+                    arguments.append("".join(current).strip())
+                    return arguments
+                depth -= 1
+                current.append(character)
+                continue
+            if character == "," and depth == 0:
+                arguments.append("".join(current).strip())
+                current = []
+                continue
+            current.append(character)
+        return arguments
+
+    @staticmethod
     def jsx_tags(source: str, name: str) -> list[str]:
         """Every `<Name …>` opening tag, arrow-function `>` included."""
         tags: list[str] = []
@@ -1594,11 +1620,27 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('settingsDetail: { minWidth: 0, flex: 1, paddingTop: SETTINGS_TITLEBAR_INSET }', self.ui)
         self.assertIn('settingsDetailBody: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }', self.ui)
         self.assertIn('settingsSidebarTitle: { color: systemColors.label, fontSize: SOURCE_LIST_FONT_SIZE, fontWeight: "600" }', self.ui)
-        # The sidebar divider runs into the sidebar's border and the pane's own
-        # divider lands on the same line: one window-wide header boundary, not
-        # two offset hairlines that appear as artifacts over a dark backdrop.
-        self.assertIn('settingsSidebarDivider: { height: 1, flexShrink: 0, backgroundColor: systemColors.separator }', self.ui)
+        # The header band carries no rule of its own.  The sidebar and the
+        # pane used to each draw a hairline under their title, so the window
+        # showed two lines that read as artifacts rather than as structure;
+        # the only boundaries left are the sidebar's own right border and the
+        # panes' content edges.
+        self.assertNotIn('settingsSidebarDivider', self.ui)
+        self.assertNotIn('settingsPaneDivider', self.ui)
+        # The two column rules are the same rule: a sidebar divider and a rail
+        # divider that both read as hairlines over a dark backdrop.  The
+        # columns are told apart by their spacing, not by a drawn edge.
+        self.assertIn('settingsSidebar: { width: 200, flexShrink: 0, minHeight: 0 }', self.ui)
+        self.assertIn('settingsRail: { width: SETTINGS_RAIL_WIDTH, flexShrink: 0, minHeight: 0, paddingTop: 6 }', self.ui)
         self.assertIn('const SETTINGS_HEADER_CONTENT_HEIGHT = 20;', self.ui)
+        # Every table states that it draws no frame, so the native table's own
+        # 1 px box cannot reappear as a column rule somewhere the shared
+        # styles do not reach.
+        self.assertEqual(
+            self.ui.count("<NativeTable"),
+            self.ui.count("framed={false}"),
+            "every NativeTable must opt out of the native frame",
+        )
         self.assertIn('settingsSidebarAppIcon: { width: SETTINGS_HEADER_CONTENT_HEIGHT, height: SETTINGS_HEADER_CONTENT_HEIGHT, borderRadius: 4 }', self.ui)
         self.assertIn('settingsPaneTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600", lineHeight: SETTINGS_HEADER_CONTENT_HEIGHT }', self.ui)
         self.assertIn('settingsSidebarList: { flex: 1, minHeight: 0 }', self.ui)
@@ -2038,7 +2080,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("const SETTINGS_RAIL_WIDTH = 156;", self.ui)
         self.assertIn("const SETTINGS_RAIL_COLUMN_WIDTH = 148;", self.ui)
         self.assertIn(
-            "settingsRail: { width: SETTINGS_RAIL_WIDTH, flexShrink: 0, minHeight: 0, paddingTop: 6, borderRightWidth: 1, borderRightColor: systemColors.separator }",
+            "settingsRail: { width: SETTINGS_RAIL_WIDTH, flexShrink: 0, minHeight: 0, paddingTop: 6 }",
             self.ui,
         )
         self.assertIn("settingsRailList: { flex: 1, minHeight: 0 },", self.ui)
@@ -3361,13 +3403,88 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('"providers.wizard.duplicateName": "供应商名称已存在，请输入其他名称。"', self.zh)
         self.assertIn('"providers.wizard.duplicateName": "A provider with this name already exists. Enter a different name."', self.en)
 
+    def test_a_live_read_never_holds_the_pane_wide_wait(self) -> None:
+        """A read of external state must never disable the window it read from.
+
+        The pane-wide wait is acquired *before* a `dispatch` enqueues, so a
+        buffered queue headed by a slow live read produced a window that could
+        neither use its controls nor name the wait that was disabling them.
+        Live reads therefore run on their own lane and every one of them asks
+        for the wait to stay off.
+        """
+
+        for marker in (
+            "const TRANSIENT_READ_ACTIONS: ReadonlySet<string> = new Set([",
+            '"workbuddy_status",',
+            '"workbuddy_models",',
+            '"workbuddy_login",',
+            '"service_provider_auth_status",',
+            '"provider_auth_status",',
+            "function isTransientReadAction(type: string): boolean {",
+            "const transient = isTransientReadAction(type);",
+            "? issue()\n      : dispatchQueue.current.catch(() => undefined).then(issue);",
+            "if (!transient) dispatchQueue.current = queued.then(() => undefined, () => undefined);",
+        ):
+            self.assert_ui_has(marker)
+
+        # Every live read names the wait as somebody else's: `keepControlsEnabled`
+        # is the fourth argument of both `dispatchWithOutcome` and the
+        # `dispatchSnapshot` alias the model inspector takes.
+        reads = (
+            "workbuddy_status",
+            "workbuddy_models",
+            "workbuddy_login",
+            "service_provider.auth_status",
+            "provider_auth_status",
+        )
+        live_reads = 0
+        for index, line in enumerate(self.ui.splitlines()):
+            for helper in ("dispatchWithOutcome(", "dispatchSnapshot("):
+                if helper not in line or not any(f'"{action}"' in line for action in reads):
+                    continue
+                live_reads += 1
+                arguments = self.call_arguments(line, line.index(helper) + len(helper) - 1)
+                self.assertGreaterEqual(
+                    len(arguments), 4,
+                    f"line {index + 1} dispatches a live read without keepControlsEnabled: {line.strip()}",
+                )
+                self.assertEqual(
+                    arguments[3], "true",
+                    f"line {index + 1} lets a live read hold the pane-wide wait: {line.strip()}",
+                )
+        # The account read, the catalog read (twice: the pane's cache and the
+        # inspector's rate), the desktop-app hand-off, and both authorization
+        # polls are all covered.
+        self.assertGreaterEqual(live_reads, 6)
+
+    def test_a_snapshot_projects_the_account_without_reading_it(self) -> None:
+        """Core answers the account question only where it was asked."""
+
+        domain_source = (ROOT / "young_router/core/domains/providers_models.py").read_text(encoding="utf-8")
+        for marker in (
+            "def _workbuddy_projection_status(",
+            "def _workbuddy_observed_account(",
+            "def _workbuddy_observe(",
+            "self._workbuddy_observed[provider_id] = {",
+            '"auth_observed": self._workbuddy_observed_account(provider_auth),',
+            # The three live answers, and nothing else.
+            "self._workbuddy_remember(document)",
+            'self._workbuddy_remember({"providers": {provider_id: document.get("status")}})',
+            "provider, self._provider_auth_state(provider), allow_live=True",
+        ):
+            self.assertIn(marker, domain_source, marker)
+        # A projection reaches for the worker only when it is allowed to.
+        projection = domain_source.split("def _workbuddy_projection_status(", 1)[1].split("def _workbuddy_auth_status(", 1)[0]
+        self.assertEqual(projection.count("self._workbuddy_login_status(auth)"), 1)
+        self.assertIn("if allow_live:", projection)
+
     def test_workbuddy_provider_types_borrow_the_desktop_app_sign_in(self) -> None:
         """WorkBuddy keeps its sign-in and its model catalog in its own app."""
         for marker in (
             'type WizardType = "api" | "openai" | "claude" | "workbuddy" | "workbuddyAI";',
             'const isWorkBuddyType = providerType === "workbuddy" || providerType === "workbuddyAI";',
             'const workbuddyAuthKind: ServiceProviderKind = providerType === "workbuddyAI" ? "workbuddy_ai_login" : "workbuddy_login";',
-            'dispatchWithOutcome("workbuddy_status", { refresh });',
+            'dispatchWithOutcome("workbuddy_status", { refresh }, "providers_models", true);',
             # The wizard creates only the service entry, and 完成 is what
             # creates it; the account and its models are linked in the
             # provider's own service-links section.
@@ -3417,7 +3534,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '{(!isLogin || isWorkBuddyAccount) && !station ? <View style={styles.providerAccountsHeader}>',
             'providerKindSelected !== "openai" && providerKindSelected !== "claude"',
             # An unread account is handed to the desktop app, then confirmed.
-            'const workbuddySignedIn = stringValue(workbuddyAccount?.state) === "signed-in";',
+            'const workbuddySignedIn = stringValue(workbuddyAccount?.state) === "signed-in"',
+            '|| stringValue(asRecord(provider.auth_observed).state) === "signed-in";',
             'await dispatchWithOutcome("workbuddy_login", { provider: providerKey }, "providers_models", true);',
             'title: translate("providers.wizard.workbuddyLoginTitle"),',
             # Reading the account never disables the rest of the pane, and the
