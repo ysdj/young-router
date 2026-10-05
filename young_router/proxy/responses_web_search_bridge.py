@@ -2825,6 +2825,22 @@ _EXTERNAL_WEB_SEARCH_CONTINUATION_STREAM_TIMEOUT_SECONDS = 300.0
 # and it discarded the evidence already collected.  It needs the same budget as
 # the continuation.
 _EXTERNAL_WEB_SEARCH_SYNTHESIS_STREAM_TIMEOUT_SECONDS = 300.0
+# Wall-clock ceiling for one hidden non-streaming chat turn.
+#
+# ``_EXTERNAL_WEB_SEARCH_SYNTHESIS_STREAM_TIMEOUT_SECONDS`` is a *gap* budget:
+# it was written for a streaming turn, to bound the silence between chunks.  A
+# non-streaming ``acompletion`` has no chunks, so the same number becomes a cap
+# on the whole generation.  The synthesis is the call that writes the entire
+# final answer from the accumulated evidence, and it is the heaviest turn the
+# bridge makes; measured on the same ~7k-character input it took 177s and 256s,
+# and runs exceeded 300s and were cut off mid-answer.  A slow synthesis is
+# therefore indistinguishable from a stalled one at that ceiling.
+#
+# Bound the generation by its own ceiling instead, generous enough for a long
+# report on a slow reasoning route, and still finite so a genuinely stuck
+# synthesis cannot hold the turn open forever.  This is the same trade the
+# continuation budget already makes for its own turns.
+_EXTERNAL_WEB_SEARCH_CHAT_SUB_CALL_MAX_SECONDS = 900.0
 # Upper bound for the shared route-recovery poll when it is driven by a hidden
 # bridge investigation turn (see _external_web_search_bounded_recovery_kwargs).
 # Also capped at five minutes so the client sees a visible failure instead of
@@ -3944,6 +3960,15 @@ async def _external_web_search_await_chat_sub_call(
     used to be.  The budget the bridge already states for this turn is the
     only one that can end it, so apply it here as well.
 
+    That budget is a *gap* budget -- it was written to bound the silence
+    between chunks on a streaming turn.  On a non-streaming call there are no
+    chunks, so ``wait_for`` bounds the whole generation as wall-clock.  The
+    synthesis writes the entire final answer, and on a reasoning upstream it
+    legitimately needs several minutes for that one call: measured 177s and
+    256s for the same 7k-character input, with runs exceeding 300s.  Bound
+    the generation by its own generous ceiling instead, so a slow-but-working
+    synthesis is never mistaken for a stalled one.
+
     The bridge's own SSE keepalives keep the *client* alive while this runs;
     they do not bound the sub-call, exactly as they do not bound the
     streaming turns.  ``asyncio.TimeoutError`` is converted to the router's own
@@ -3978,22 +4003,18 @@ async def _external_web_search_await_chat_sub_call(
 def _external_web_search_chat_sub_call_timeout_seconds(
     payload: dict[str, Any],
 ) -> Optional[float]:
-    """The budget this hidden chat turn states for itself, if any."""
+    """The wall-clock ceiling for this hidden non-streaming chat turn.
 
-    for key in (
-        "stream_idle_timeout_seconds",
-        "stream_start_timeout_seconds",
-    ):
-        value = payload.get(key)
-        if value is None:
-            continue
-        try:
-            seconds = float(value)
-        except (TypeError, ValueError):
-            continue
-        if seconds > 0:
-            return seconds
-    return None
+    A non-streaming call has no chunks, so the turn's declared *gap* budget
+    cannot be enforced against it: applying it would cap the whole generation
+    at a number chosen to bound inter-chunk silence.  Use the turn's own
+    dedicated ceiling, so a synthesis that is merely slow still finishes.
+    """
+
+    ceiling = _EXTERNAL_WEB_SEARCH_CHAT_SUB_CALL_MAX_SECONDS
+    if ceiling <= 0:
+        return None
+    return ceiling
 
 
 async def _external_web_search_chat_synthesis_response(
