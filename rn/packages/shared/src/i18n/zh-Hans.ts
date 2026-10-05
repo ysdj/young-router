@@ -547,9 +547,14 @@ export const zhHans: Record<TranslationKey, string> = {
   "providers.keyOrderColumn": "密钥名 / 顺序",
   "providers.order": "顺序",
   "providers.publicModelTitle": "公开模型",
-  "providers.contextWindow": "上下文",
-  "providers.publicModelDefaultHint": "留空使用默认值 {value}",
-  "providers.publicModelSettings": "设置",
+  // The label names the client the number reaches, not the limit it imposes: the
+  // value is a declaration the managed catalog hands to Codex, which compacts
+  // at 95% of it.  Calling it plain 上下文 next to a route table read as a
+  // proxy-side ceiling the proxy never enforces, so the label keeps Codex in it.
+  "providers.contextWindow": "Codex 上下文",
+  "providers.publicModelDefaultHint": "留空默认 {value}",
+  "providers.contextWindowHelpTitle": "Codex 压缩窗口是什么",
+  "providers.contextWindowHelp": "告知启用了模型目录的 Codex 这个模型能吃多少对话，超出后它自行压缩。这不是代理的限制：请求本身不受限，只是 Codex 会提前开始压缩。填写会覆盖上游元数据的最大窗口与有效百分比。",
   "providers.followMultiplier": "跟随倍率",
   "providers.addWizard": "添加向导...",
   "providers.wizard.title": "配置供应商",
