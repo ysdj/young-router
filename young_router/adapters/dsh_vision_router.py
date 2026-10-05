@@ -1,16 +1,25 @@
-"""dsh-vision-router compatible fallback for Young Router.
+"""The dsh-vision-router fallback, driven by the staged upstream package.
 
-The upstream project is a Node/Cordis plugin and cannot be imported into the
-Python LiteLLM process.  This module keeps its portable part: an ordered
-vision-provider chain (local OpenAI-compatible backends, configured HTTP
-providers, and the optional anonymous OVH chain).  It is deliberately a
-fallback adapter: the selected LiteLLM deployment remains the source of the
-answer, and this module is entered only after that deployment rejects image
-input.
+Upstream (https://github.com/ysr666/dsh-vision-router) is a Node module and
+cannot be imported into the Python LiteLLM process, so
+``scripts/update_dsh_vision_router.py`` stages its npm ``latest`` release into
+the Core bundle and ``dsh_vision_worker.mjs`` calls it through the bundled
+Node.js runtime — the same arrangement as the ``pi-web-access``, TraceOne, and
+WorkBuddy bridges.  The provider chain this module routes through is therefore
+the one upstream computes: a release that changes the free OVH models, their
+order, or the local Ollama/LM Studio shapes changes what Core routes to without
+a change in this repository.
 
-Mirror reviewed against upstream dsh-vision-router 2.2.2; re-check the latest
-upstream release and adapt this module before artifact builds (AGENTS.md,
-Runtime And Compatibility).
+The constants further down are the degrade path, not the source of truth.  They
+are the chain last reviewed against upstream (3.0.1) and answer only when the
+staged package is missing or the worker cannot run, so a desktop that lost its
+Node runtime still gets a vision fallback instead of a hard failure.  Every
+artifact build stages the current upstream release and proves the worker loads
+it, so the degrade path is not what ships.
+
+This module is deliberately a fallback adapter: the selected LiteLLM
+deployment remains the source of the answer, and this module is entered only
+after that deployment rejects image input.
 """
 
 from __future__ import annotations
@@ -37,6 +46,7 @@ from ..proxy import responses_request as _responses_request_module
 from ..proxy import trace as _trace_module
 from ..proxy.base import _exception_text
 from ..browser_identity import browser_request_headers
+from . import dsh_vision_upstream as _upstream
 
 _DSH_VISION_ROUTER_CONFIG_ENV = "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON"
 _DSH_VISION_ROUTER_ENABLED_ENV = "YOUNG_ROUTER_DSH_VISION_ROUTER_ENABLED"
@@ -103,6 +113,11 @@ _DEFAULT_HTTP_PROVIDERS = (
     ("ovh", "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1", "Mistral-Small-3.2-24B-Instruct-2506"),
     ("ovh", "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1", "Qwen3.5-9B"),
 )
+# The degrade chain above was last reviewed against this upstream release.  It
+# is documentation and a fallback, never the routing source; the staged package
+# is.  Keep the two in step by re-reading the chain here when a release changes
+# it, so a degraded desktop is no further behind than one release.
+MIRRORED_UPSTREAM_VERSION = "3.0.1"
 _LOCAL_OLLAMA_BASE_URL = "http://127.0.0.1:11434/v1"
 _LOCAL_OLLAMA_MODEL = "qwen2.5vl"
 _LOCAL_LM_STUDIO_BASE_URL = "http://localhost:1234/v1"
@@ -480,11 +495,63 @@ def _append_provider_if_new(providers: list[dict[str, Any]], item: Optional[dict
     providers.append(item)
 
 
+def _upstream_provider_chain() -> Optional[list[dict[str, Any]]]:
+    """The chain the staged upstream package computes, or None to degrade.
+
+    Upstream owns the free OVH models, their order, and the local provider
+    shapes, so its answer replaces the reviewed constants below whenever the
+    staged package is reachable.  None means the bridge could not be asked, and
+    the caller keeps the fallback chain rather than routing nothing.
+    """
+
+    if not _upstream.available():
+        return None
+    try:
+        chain = _upstream.provider_chain(_upstream_config_document())
+    except Exception:
+        # The bridge is an enhancement over a chain that already exists here.
+        # A worker failure must never be the reason a vision request dies.
+        return None
+    return chain
+
+
+def _upstream_config_document() -> dict[str, Any]:
+    """The router's configuration in the shape the upstream functions read.
+
+    The local enable flags are resolved here rather than left to the worker:
+    they are quick controls the operator can flip in the environment, and
+    upstream only ever sees the JSON document.  A flag left unresolved here
+    would make the worker's chain disagree with what this module believes is
+    enabled, and the router would route to a local provider it never offered.
+    """
+
+    config = _router_config()
+    local_ollama = config.get("localOllama") if isinstance(config.get("localOllama"), dict) else {}
+    local_lm_studio = (
+        config.get("localLmStudio") if isinstance(config.get("localLmStudio"), dict) else {}
+    )
+    if _router_local_enabled(config, "localOllama", _DSH_VISION_ROUTER_LOCAL_OLLAMA_ENABLED_ENV):
+        local_ollama = {**local_ollama, "enabled": True}
+    if _router_local_enabled(config, "localLmStudio", _DSH_VISION_ROUTER_LOCAL_LM_STUDIO_ENABLED_ENV):
+        local_lm_studio = {**local_lm_studio, "enabled": True}
+    return {
+        "backend": _router_backend(),
+        "freeFallback": _router_free_fallback(config),
+        "httpProviders": config.get("httpProviders") if isinstance(config.get("httpProviders"), list) else [],
+        "providers": config.get("providers") if isinstance(config.get("providers"), list) else [],
+        "localOllama": local_ollama,
+        "localLmStudio": local_lm_studio,
+    }
+
+
 def _configured_provider_chain() -> list[dict[str, Any]]:
     config = _router_config()
     backend = _router_backend()
     if backend == _BACKEND_OFF:
         return []
+    upstream_chain = _upstream_provider_chain()
+    if upstream_chain is not None:
+        return [item for item in upstream_chain if isinstance(item, dict)]
     local_providers: list[dict[str, Any]] = []
 
     if backend != _BACKEND_API:

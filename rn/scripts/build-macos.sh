@@ -80,12 +80,43 @@ PI_WEB_ACCESS_NODE_WORK="$RUNTIME_WORK/node"
 # WorkBuddy access is driven through the published third-party package, so
 # every artifact build re-resolves its latest release instead of shipping a
 # stale protocol copy.
+# The vision fallback routes through the staged upstream package rather than a
+# copy of its chain, so it joins the same re-check: every artifact build
+# resolves the current release instead of shipping a mirror of whichever
+# version was reviewed last.
+#
+# These integrations reach four unrelated upstreams and none of them reads
+# another's output, so they resolve together instead of one after another. Run
+# serially the package installs cost about a minute of nearly all network wait
+# that a second process would spend idle; together they cost as long as the
+# slowest one. Every script still runs on every build, so the mandatory
+# re-check against upstream is unchanged — only its wall clock is.
 WORKBUDDY_CONNECT_WORK="$RUNTIME_WORK/workbuddy-connect"
-"${PI_WEB_ACCESS_UPDATE_COMMAND[@]}" "$PROJECT_ROOT/scripts/update_workbuddy_connect.py" \
-  --output "$WORKBUDDY_CONNECT_WORK"
 TRACEONE_WORK="$RUNTIME_WORK/traceone"
+DSH_VISION_ROUTER_WORK="$RUNTIME_WORK/dsh-vision-router"
+# Each job is started in this shell, not inside a command substitution: a
+# substitution runs in a subshell, so a job it launches is not a child of the
+# shell that has to wait for it and its output would corrupt the captured pid.
+STAGING_PIDS=()
+"${PI_WEB_ACCESS_UPDATE_COMMAND[@]}" "$PROJECT_ROOT/scripts/update_workbuddy_connect.py" \
+  --output "$WORKBUDDY_CONNECT_WORK" &
+STAGING_PIDS+=("$!")
 "${PI_WEB_ACCESS_UPDATE_COMMAND[@]}" "$PROJECT_ROOT/scripts/update_traceone.py" \
-  --output "$TRACEONE_WORK"
+  --output "$TRACEONE_WORK" &
+STAGING_PIDS+=("$!")
+"${PI_WEB_ACCESS_UPDATE_COMMAND[@]}" "$PROJECT_ROOT/scripts/update_dsh_vision_router.py" \
+  --output "$DSH_VISION_ROUTER_WORK" &
+STAGING_PIDS+=("$!")
+# Wait for every job before reporting, so one unavailable upstream is named as
+# itself instead of surfacing later as an unrelated missing-file check.
+STAGING_FAILED=0
+for staging_pid in "${STAGING_PIDS[@]}"; do
+  wait "$staging_pid" || STAGING_FAILED=1
+done
+if [[ "$STAGING_FAILED" == "1" ]]; then
+  echo "Staging a third-party integration from its latest upstream release failed; no artifact was produced." >&2
+  exit 1
+fi
 
 export RCT_USE_RN_DEP=0
 export RCT_USE_PREBUILT_RNCORE=0
@@ -174,6 +205,7 @@ rsync -a \
 copy_tree "$PI_WEB_ACCESS_PACKAGE_WORK" "$CORE/young_router/adapters/pi-web-access"
 copy_tree "$TRACEONE_WORK" "$CORE/young_router/adapters/traceone"
 copy_tree "$WORKBUDDY_CONNECT_WORK" "$CORE/young_router/adapters/workbuddy-connect"
+copy_tree "$DSH_VISION_ROUTER_WORK" "$CORE/young_router/adapters/dsh-vision-router"
 
 if [[ -n "$RUNTIME_SOURCE" ]]; then
   if [[ ! -d "$RUNTIME_SOURCE/python" \
@@ -273,6 +305,10 @@ fi
   echo "The bundled dsh-workbuddy-connect package is missing." >&2
   exit 5
 }
+[[ -f "$CORE/young_router/adapters/dsh-vision-router/lib/core-primitives.js" ]] || {
+  echo "The bundled dsh-vision-router package is missing." >&2
+  exit 5
+}
 [[ -f "$CORE/young_router/config/api.py" ]] || {
   echo "Bundled Core dependencies are incomplete." >&2
   exit 5
@@ -295,6 +331,31 @@ if ! printf '' | "$CORE/runtime/bin/node" \
   --entry "$CORE/young_router/adapters/pi-web-access/index.ts" \
   --config-dir "$PI_WEB_ACCESS_SMOKE_CONFIG"; then
   echo "The bundled pi-web-access worker could not load its staged SDK." >&2
+  exit 5
+fi
+# The vision fallback is entered only after a model has already rejected the
+# image, so a chain that cannot be built would cost the answer rather than the
+# request. The bundle therefore asks the staged package for its chain once: a
+# worker that cannot import it is a build failure, not a runtime degrade.
+VISION_SMOKE_OUTPUT="$(printf '%s\n' '{"config":{"backend":"auto","freeFallback":true}}' \
+  | "$CORE/runtime/bin/node" "$CORE/young_router/adapters/dsh_vision_worker.mjs" 2>/dev/null || true)"
+if ! printf '%s' "$VISION_SMOKE_OUTPUT" | grep -q '"source":"upstream"' \
+  || ! printf '%s' "$VISION_SMOKE_OUTPUT" | grep -q '"model":'; then
+  echo "The bundled dsh-vision-router worker could not load its staged package." >&2
+  exit 5
+fi
+# WorkBuddy ships the desktop credential format and both model catalogs, so a
+# release that renames one of its published exports would break the provider at
+# request time rather than at build time. The bundle proves the staged package
+# still offers the surface the worker imports.
+if ! "$CORE/runtime/bin/node" --input-type=module -e "
+import(process.argv[1]).then((m) => {
+  const required = ['WorkBuddyCredentialStore', 'WorkBuddyUpstreamClient', 'WorkBuddyCatalog', 'createWorkBuddyShim', 'WORKBUDDY_VARIANTS']
+  const missing = required.filter((name) => m[name] === undefined)
+  if (missing.length > 0) { process.stderr.write('missing: ' + missing.join(', ') + '\n'); process.exit(1) }
+}).catch((e) => { process.stderr.write(String((e && e.message) || e) + '\n'); process.exit(1) })
+" "$CORE/young_router/adapters/workbuddy-connect/lib/index.js"; then
+  echo "The bundled dsh-workbuddy-connect package no longer exports the surface the worker uses." >&2
   exit 5
 fi
 # A staged classifier that cannot load would turn every deep test into an

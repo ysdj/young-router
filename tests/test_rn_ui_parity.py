@@ -1631,7 +1631,21 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # divider that both read as hairlines over a dark backdrop.  The
         # columns are told apart by their spacing, not by a drawn edge.
         self.assertIn('settingsSidebar: { width: 200, flexShrink: 0, minHeight: 0 }', self.ui)
-        self.assertIn('settingsRail: { width: SETTINGS_RAIL_WIDTH, flexShrink: 0, minHeight: 0, paddingTop: 6 }', self.ui)
+        # The rail's own column rule is a sibling divider, not the list
+        # container's border: the native frame view's 1 pt box sits inside the
+        # rail, so a bordered column read as both a boxed list and a doubled
+        # edge. The rail clips its own children and draws that one hairline.
+        self.assertIn(
+            'settingsRail: { width: SETTINGS_RAIL_WIDTH, flexShrink: 0, minHeight: 0, '
+            'paddingTop: 6, overflow: "hidden" }',
+            self.ui,
+        )
+        self.assertIn('<View style={styles.settingsRailDivider} />', self.ui)
+        self.assertIn(
+            "settingsRailDivider: { position: \"absolute\", top: 0, bottom: 0, right: 0, "
+            "width: 1, backgroundColor: systemColors.separator }",
+            self.ui,
+        )
         self.assertIn('const SETTINGS_HEADER_CONTENT_HEIGHT = 20;', self.ui)
         # Every table states that it draws no frame, so the native table's own
         # 1 px box cannot reappear as a column rule somewhere the shared
@@ -2080,7 +2094,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("const SETTINGS_RAIL_WIDTH = 156;", self.ui)
         self.assertIn("const SETTINGS_RAIL_COLUMN_WIDTH = 148;", self.ui)
         self.assertIn(
-            "settingsRail: { width: SETTINGS_RAIL_WIDTH, flexShrink: 0, minHeight: 0, paddingTop: 6 }",
+            "settingsRail: { width: SETTINGS_RAIL_WIDTH, flexShrink: 0, minHeight: 0, "
+            "paddingTop: 6, overflow: \"hidden\" }",
             self.ui,
         )
         self.assertIn("settingsRailList: { flex: 1, minHeight: 0 },", self.ui)
