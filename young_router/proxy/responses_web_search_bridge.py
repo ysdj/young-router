@@ -2816,6 +2816,15 @@ _EXTERNAL_WEB_SEARCH_CONTINUATION_SECTION_MAX_CHARS = 20000
 # upstream chunks.  Bounded to five minutes so a genuinely stuck single
 # continuation cannot stall the turn indefinitely.
 _EXTERNAL_WEB_SEARCH_CONTINUATION_STREAM_TIMEOUT_SECONDS = 300.0
+# The synthesis turn carries the same hidden-bridge status as a continuation
+# turn: it is the router's own follow-up, never an interactive client turn, and
+# it is the call the bridge falls back to precisely when a continuation came
+# back empty or invalid.  It inherits the interactive budgets when no dedicated
+# ones are stated, so a reasoning model writing the final answer out of a large
+# evidence block was aborted at 120s -- indistinguishable from a stalled route,
+# and it discarded the evidence already collected.  It needs the same budget as
+# the continuation.
+_EXTERNAL_WEB_SEARCH_SYNTHESIS_STREAM_TIMEOUT_SECONDS = 300.0
 # Upper bound for the shared route-recovery poll when it is driven by a hidden
 # bridge investigation turn (see _external_web_search_bounded_recovery_kwargs).
 # Also capped at five minutes so the client sees a visible failure instead of
@@ -3554,6 +3563,36 @@ def _external_web_search_requires_initial_lookup(
     )
 
 
+def _external_web_search_chat_payload_with_bridge_stream_budgets(
+    payload: dict[str, Any],
+    call_kwargs: dict[str, Any],
+) -> None:
+    """Carry a hidden bridge turn's own stream budgets onto its chat payload.
+
+    Both chat payloads are rebuilt key by key for a non-streaming
+    ``acompletion`` rather than splatted, so an explicit
+    ``stream_idle_timeout_seconds`` / ``stream_start_timeout_seconds`` on the
+    bridge's own kwargs was dropped here.  The sub-call then inherited whatever
+    the session's interactive budget happened to be -- the 120s stall/start
+    defaults -- which is the budget the bridge already decided was too small
+    for exactly this turn.  A chat-only route therefore aborted its own
+    synthesis at 120s, and because the turn had already emitted visible output
+    the whole turn died instead of the answer being replayed.
+
+    Only the two explicit budgets travel; the rest of the chat wire shape stays
+    hand-built.  ``None`` keeps the caller's existing meaning of "no explicit
+    budget", so a turn that never stated one still resolves the global default.
+    """
+
+    for key in (
+        "stream_idle_timeout_seconds",
+        "stream_start_timeout_seconds",
+    ):
+        value = call_kwargs.get(key)
+        if value is not None:
+            payload[key] = value
+
+
 def _external_web_search_chat_tool_payload(
     call_kwargs: dict[str, Any],
     request_kwargs: Optional[dict],
@@ -3658,6 +3697,11 @@ def _external_web_search_chat_tool_payload(
         if value is not None:
             payload[key] = copy.deepcopy(value)
 
+    _external_web_search_chat_payload_with_bridge_stream_budgets(
+        payload,
+        call_kwargs,
+    )
+
     if "litellm_metadata" not in payload:
         metadata = _request_context_module._request_metadata_dict(
             request_kwargs,
@@ -3709,6 +3753,11 @@ def _external_web_search_chat_synthesis_payload(
         value = call_kwargs.get(key)
         if value is not None:
             payload[key] = copy.deepcopy(value)
+
+    _external_web_search_chat_payload_with_bridge_stream_budgets(
+        payload,
+        call_kwargs,
+    )
 
     if "litellm_metadata" not in payload:
         metadata = _request_context_module._request_metadata_dict(
@@ -3878,6 +3927,75 @@ def _external_web_search_chat_completion_to_response(
     )
 
 
+async def _external_web_search_await_chat_sub_call(
+    acompletion: Any,
+    payload: dict[str, Any],
+    call_kwargs: dict[str, Any],
+    *,
+    phase: str,
+) -> Any:
+    """Await one hidden bridge chat turn under that turn's own budget.
+
+    A chat-only route reaches the model through a non-streaming
+    ``acompletion``, so no chunk ever arrives and the local idle watchdog
+    never observes the turn at all: without a bound here the sub-call could
+    hang indefinitely, and with the 120s interactive budget inherited by the
+    rebuilt payload it was aborted exactly as often as the streaming route
+    used to be.  The budget the bridge already states for this turn is the
+    only one that can end it, so apply it here as well.
+
+    The bridge's own SSE keepalives keep the *client* alive while this runs;
+    they do not bound the sub-call, exactly as they do not bound the
+    streaming turns.  ``asyncio.TimeoutError`` is converted to the router's own
+    stream-timeout shape so the surrounding recovery, cooldown and failover
+    policy classifies it as the timeout it is.
+    """
+
+    timeout_seconds = _external_web_search_chat_sub_call_timeout_seconds(payload)
+    if timeout_seconds is None or timeout_seconds <= 0:
+        return await acompletion(**payload)
+    try:
+        return await asyncio.wait_for(acompletion(**payload), timeout=timeout_seconds)
+    except asyncio.TimeoutError as exc:
+        timeout = _streaming_module._stream_idle_timeout_exception(
+            payload,
+            idle_seconds=timeout_seconds,
+            saw_chunk=False,
+        )
+        _trace_module._route_trace(
+            "external_web_search_bridge_chat_sub_call_timeout",
+            activity="upstream_model",
+            request_id=_routing_module._trace_request_id(payload),
+            model_group=_responses_execution_module._request_model_group(payload),
+            deployment_id=_routing_module._deployment_id_from_request(payload),
+            phase=phase,
+            timeout_seconds=timeout_seconds,
+            exception=_routing_module._trace_exception(timeout),
+        )
+        raise timeout from exc
+
+
+def _external_web_search_chat_sub_call_timeout_seconds(
+    payload: dict[str, Any],
+) -> Optional[float]:
+    """The budget this hidden chat turn states for itself, if any."""
+
+    for key in (
+        "stream_idle_timeout_seconds",
+        "stream_start_timeout_seconds",
+    ):
+        value = payload.get(key)
+        if value is None:
+            continue
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError):
+            continue
+        if seconds > 0:
+            return seconds
+    return None
+
+
 async def _external_web_search_chat_synthesis_response(
     call_kwargs: dict[str, Any],
     request_kwargs: Optional[dict],
@@ -3912,7 +4030,12 @@ async def _external_web_search_chat_synthesis_response(
             method_name="acompletion",
         ),
     )
-    chat_response = await acompletion(**payload)
+    chat_response = await _external_web_search_await_chat_sub_call(
+        acompletion,
+        payload,
+        call_kwargs,
+        phase="synthesis",
+    )
     response = _external_web_search_chat_completion_to_response(
         chat_response,
         call_kwargs,
@@ -3991,7 +4114,12 @@ async def _external_web_search_chat_tool_response(
         selected_deployment_box
     )
     try:
-        chat_response = await acompletion(**payload)
+        chat_response = await _external_web_search_await_chat_sub_call(
+            acompletion,
+            payload,
+            call_kwargs,
+            phase=phase,
+        )
         if _external_web_search_has_malformed_function_call(chat_response):
             retry_payload = copy.deepcopy(payload)
             messages = retry_payload.get("messages")
@@ -4021,7 +4149,12 @@ async def _external_web_search_chat_tool_response(
                 route_key=_routing_module._deployment_route_key_from_request(call_kwargs),
                 phase=phase,
             )
-            chat_response = await acompletion(**retry_payload)
+            chat_response = await _external_web_search_await_chat_sub_call(
+                acompletion,
+                retry_payload,
+                call_kwargs,
+                phase=phase,
+            )
 
         progress_reason = _external_web_search_chat_progress_preamble_reason(
             chat_response
@@ -4059,7 +4192,12 @@ async def _external_web_search_chat_tool_response(
                 phase=phase,
                 invalid_reason=progress_reason,
             )
-            chat_response = await acompletion(**retry_payload)
+            chat_response = await _external_web_search_await_chat_sub_call(
+                acompletion,
+                retry_payload,
+                call_kwargs,
+                phase=phase,
+            )
     finally:
         _routing_module._apply_current_selected_deployment_to_request(
             call_kwargs,
@@ -5110,6 +5248,13 @@ def _external_web_search_synthesis_kwargs(
         _EXTERNAL_WEB_SEARCH_SYNTHESIS_OUTPUT_TOKENS,
     )
     synthesis_kwargs["stream"] = False
+    # A hidden bridge turn, budgeted like the continuation it replaces.
+    synthesis_kwargs["stream_idle_timeout_seconds"] = (
+        _EXTERNAL_WEB_SEARCH_SYNTHESIS_STREAM_TIMEOUT_SECONDS
+    )
+    synthesis_kwargs["stream_start_timeout_seconds"] = (
+        _EXTERNAL_WEB_SEARCH_SYNTHESIS_STREAM_TIMEOUT_SECONDS
+    )
     return _responses_execution_module._normalize_external_web_search_router_kwargs(
         synthesis_kwargs,
         request_kwargs,

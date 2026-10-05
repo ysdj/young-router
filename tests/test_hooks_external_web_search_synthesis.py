@@ -992,16 +992,181 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
         self.assertIn("External web_search compatibility bridge synthesis mode", payload["messages"][0]["content"])
         self.assertIn("Retrieved evidence", payload["messages"][1]["content"])
 
-        def assert_no_timeout_keys(value):
+        # Only the two dedicated bridge budgets may travel, and they must be
+        # the ones the synthesis stated.  The chat payload is rebuilt key by
+        # key for a non-streaming acompletion, so a budget that does not
+        # survive the rebuild silently reverts this hidden turn to the
+        # interactive budget it was already found too small for.
+        self.assertEqual(
+            payload.get("stream_idle_timeout_seconds"),
+            hooks._EXTERNAL_WEB_SEARCH_SYNTHESIS_STREAM_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(
+            payload.get("stream_start_timeout_seconds"),
+            hooks._EXTERNAL_WEB_SEARCH_SYNTHESIS_STREAM_TIMEOUT_SECONDS,
+        )
+
+        def assert_only_bridge_budget_keys(value):
             if isinstance(value, dict):
                 for key, child in value.items():
-                    self.assertNotIn("timeout", str(key).lower())
-                    assert_no_timeout_keys(child)
+                    lowered = str(key).lower()
+                    if "timeout" in lowered:
+                        self.assertIn(
+                            lowered,
+                            {
+                                "stream_idle_timeout_seconds",
+                                "stream_start_timeout_seconds",
+                            },
+                        )
+                    assert_only_bridge_budget_keys(child)
             elif isinstance(value, list):
                 for child in value:
-                    assert_no_timeout_keys(child)
+                    assert_only_bridge_budget_keys(child)
 
-        assert_no_timeout_keys(payload)
+        assert_only_bridge_budget_keys(payload)
+
+    async def test_a_stalled_chat_synthesis_ends_at_its_own_budget(self) -> None:
+        """A chat-only synthesis that never answers must not hang the turn.
+
+        A chat route reaches the model through a non-streaming acompletion, so
+        no chunk ever arrives and the idle watchdog never observes the turn at
+        all.  The budget the synthesis states for itself is the only thing that
+        can end that sub-call, so it has to bound this path too -- otherwise a
+        stalled synthesis holds the whole turn open indefinitely.
+        """
+
+        hooks, proxy_server = load_hook_module()
+        bridge = hooks._responses_web_search_bridge_module
+        chat_request = {
+            "model": "openai/vendor-chat",
+            "input": "Use web_search.",
+            "model_info": {
+                "upstream_url_surface": "openai/chat",
+                "supported_upstream_url_surfaces": ["openai/chat"],
+            },
+            "litellm_metadata": {},
+        }
+        synthesis_kwargs = bridge._external_web_search_synthesis_kwargs(
+            chat_request,
+            "Web search results for query: test\nURL: https://example.test/one",
+        )
+        # Keep the test fast; the real budget is 300s.
+        synthesis_kwargs["stream_idle_timeout_seconds"] = 0.05
+        synthesis_kwargs["stream_start_timeout_seconds"] = 0.05
+
+        class StalledRouter:
+            async def acompletion(self, **_kwargs):
+                await asyncio.sleep(60)
+
+        proxy_server.llm_router = StalledRouter()
+
+        with self.assertRaises(Exception) as caught:
+            await hooks._external_web_search_chat_synthesis_response(
+                synthesis_kwargs,
+                chat_request,
+            )
+
+        failure = caught.exception
+        self.assertEqual(getattr(failure, "status_code", None), 504)
+        self.assertEqual(
+            getattr(failure, "body", {}).get("reason"),
+            "stream_idle_timeout",
+        )
+        self.assertEqual(
+            getattr(failure, "body", {}).get("idle_seconds"),
+            0.05,
+        )
+
+    async def test_the_chat_sub_call_budget_is_the_one_the_bridge_stated(self) -> None:
+        """The bound is the turn's own budget, and it beats the global default.
+
+        The dedicated budget exists because 300s was found necessary; a bound
+        clamped back to the 120s interactive default would reintroduce the
+        exact failure the budget was added for.
+        """
+
+        hooks, _ = load_hook_module()
+        bridge = hooks._responses_web_search_bridge_module
+
+        request_kwargs = {
+            "model": "openai/vendor-chat",
+            "input": "Use web_search.",
+            "model_info": {
+                "upstream_url_surface": "openai/chat",
+                "supported_upstream_url_surfaces": ["openai/chat"],
+            },
+            "litellm_metadata": {},
+        }
+        search_results = (
+            "Web search results for query: test\nURL: https://example.test/one"
+        )
+
+        synthesis_payload = bridge._external_web_search_chat_synthesis_payload(
+            bridge._external_web_search_synthesis_kwargs(
+                request_kwargs,
+                search_results,
+            ),
+            request_kwargs,
+        )
+        synthesis_budget = bridge._external_web_search_chat_sub_call_timeout_seconds(
+            synthesis_payload
+        )
+        self.assertEqual(
+            synthesis_budget,
+            hooks._EXTERNAL_WEB_SEARCH_SYNTHESIS_STREAM_TIMEOUT_SECONDS,
+        )
+        self.assertGreater(
+            synthesis_budget,
+            hooks._stream_idle_timeout_seconds_for_request(request_kwargs),
+        )
+
+        continuation_payload = bridge._external_web_search_chat_tool_payload(
+            bridge._external_web_search_continuation_kwargs(
+                request_kwargs,
+                search_results=search_results,
+                queries=["test"],
+                round_number=1,
+            ),
+            request_kwargs,
+            phase="continuation",
+        )
+        self.assertEqual(
+            bridge._external_web_search_chat_sub_call_timeout_seconds(
+                continuation_payload
+            ),
+            hooks._EXTERNAL_WEB_SEARCH_CONTINUATION_STREAM_TIMEOUT_SECONDS,
+        )
+
+    async def test_a_chat_sub_call_without_a_stated_budget_is_not_bounded(self) -> None:
+        """No stated budget keeps the caller's existing meaning of none."""
+
+        hooks, _ = load_hook_module()
+        bridge = hooks._responses_web_search_bridge_module
+
+        self.assertIsNone(
+            bridge._external_web_search_chat_sub_call_timeout_seconds(
+                {"model": "openai/vendor-chat", "stream": False}
+            )
+        )
+        # An explicit zero keeps its existing meaning of "no local cap".
+        self.assertIsNone(
+            bridge._external_web_search_chat_sub_call_timeout_seconds(
+                {
+                    "model": "openai/vendor-chat",
+                    "stream_idle_timeout_seconds": 0.0,
+                    "stream_start_timeout_seconds": 0.0,
+                }
+            )
+        )
+        # A malformed value is ignored rather than raising out of the call.
+        self.assertIsNone(
+            bridge._external_web_search_chat_sub_call_timeout_seconds(
+                {
+                    "model": "openai/vendor-chat",
+                    "stream_idle_timeout_seconds": "not-a-number",
+                }
+            )
+        )
 
     async def test_external_web_search_chat_synthesis_reads_nonstandard_chat_content(self) -> None:
         hooks, proxy_server = load_hook_module()
