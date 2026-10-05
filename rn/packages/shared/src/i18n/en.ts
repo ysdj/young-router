@@ -547,9 +547,14 @@ export const en: Record<TranslationKey, string> = {
   "providers.keyOrderColumn": "Key / Order",
   "providers.order": "Order",
   "providers.publicModelTitle": "Public model",
-  "providers.contextWindow": "Context",
-  "providers.publicModelDefaultHint": "Empty uses the default {value}",
-  "providers.publicModelSettings": "Settings",
+  // The label names the client the number reaches, not the limit it imposes: the
+  // value is a declaration the managed catalog hands to Codex, which compacts
+  // at 95% of it.  Calling it plain "Context" next to a route table read as a
+  // proxy-side ceiling the proxy never enforces, so the label keeps Codex in it.
+  "providers.contextWindow": "Codex context",
+  "providers.publicModelDefaultHint": "Default {value}",
+  "providers.contextWindowHelpTitle": "What the Codex compaction window is",
+  "providers.contextWindowHelp": "Tells a Codex client with the model catalog enabled how much conversation this model can hold, and it compacts on its own past that. This is not a proxy limit: requests are not capped, Codex simply compacts earlier. A value here also overrides the upstream metadata's maximum window and effective percentage.",
   "providers.followMultiplier": "Follow multiplier",
   "providers.addWizard": "Add with wizard",
   "providers.wizard.title": "Configure provider",

@@ -763,9 +763,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'const selectMode = (upstream_protocol_mode: string): void => {',
             'const selectProtocol = (upstream_url_surface: string): void => {',
             # The mark rides the picker's own row, after the control, and the
-            # label column keeps its standard width.
+            # label column is the model detail's own (MODEL_INSPECTOR_LABEL_WIDTH).
             'accessory?: React.ReactNode',
-            'labelWidth={60} allowShrink value={protocol}',
+            'labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} allowShrink value={protocol}',
             'controlWidth === undefined ? null : { width: controlWidth, flex: 0 }]} />{accessory ?? null}</View>',
             # Anywhere else clicks the sheet drawn under the mark and its panel,
             # so the tip closes on the next click outside itself.
@@ -1002,8 +1002,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('firstColumnHorizontalPadding={0}')
         self.assert_ui_has('label={translate("providers.keyName")}')
         self.assert_ui_has('NativeSecretField labelVisible={false} plainText autoCommit label={translate("providers.keyValue")}')
-        self.assert_ui_has('label={translate("providers.provider")} labelWidth={60} allowShrink')
-        self.assert_ui_has('label={translate("providers.protocolMode")} labelWidth={60} allowShrink')
+        self.assert_ui_has('label={translate("providers.provider")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} allowShrink')
+        self.assert_ui_has('label={translate("providers.protocolMode")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} allowShrink')
         self.assert_ui_has('pickerShrink: { minWidth: 0 }')
         self.assert_ui_has('allowShrink && styles.pickerShrink')
         self.assertNotIn('providerKeyGrid:', self.ui)
@@ -1066,18 +1066,23 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('setSelectedRoute("");', select_public)
 
         inspector = self.ui.split("function PublicModelInspector(", 1)[1].split("function ModelInspector(", 1)[0]
-        # One surface owns the rename and the context window; the route order
-        # list lives in the routes table, not here.
+        # One surface owns the rename and states the context window; the route
+        # order list lives in the routes table, not here.
         self.assertIn('dispatchSnapshot("public.model_patch", { public_model: group.name, changes: { name: renamed } })', inspector)
-        self.assertIn('dispatch("public.model_patch", { public_model: group.name, changes: { max_input_tokens: next.trim() } })', inspector)
         self.assertIn('translate("providers.contextWindow")', inspector)
         self.assertNotIn("routes.reorder_group", inspector)
         self.assertNotIn("publicModelRouteRow", inspector)
         self.assertNotIn("styles.publicModelRoutes", inspector)
-        # The context field states the registry fallback in its placeholder,
-        # never as a second line under the field.
-        self.assertIn('placeholder={contextHint}', inspector)
+        # The window is stated, not edited, here.  It is a declaration the
+        # managed catalog hands to Codex, it enforces nothing in the proxy, and
+        # an input box beside a route table read as a proxy ceiling the proxy
+        # never applies.  The per-model editor is the model detail's own row,
+        # so this pane must never carry the commit again.
+        self.assertIn('publicModelTokensText(resolvedContext, translate)', inspector)
+        self.assertNotIn("max_input_tokens: next.trim()", inspector)
+        self.assertNotIn('placeholder={contextHint}', inspector)
         self.assertNotIn('hint={contextHint}', inspector)
+        self.assertNotIn("contextWindowHelp", inspector)
         self.assertNotIn("max_output_tokens", inspector)
         # Arriving from a model detail keeps a link back to that model, and the
         # header is the provider editor's own shape: the title takes the row and
@@ -1101,11 +1106,25 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn("publicModelRouteCount", self.en)
         self.assertNotIn("breadcrumbProvider}>{translate(\"providers.routes\")", inspector)
 
-        # The model detail shows the resolved context window and links to its
-        # public model, and its routes-view breadcrumb walks back through it.
+        # The model detail edits the window: the number is a per-model escape
+        # hatch for a registry that resolved a route wrong, so it lives with
+        # the model it corrects, and it states in a help mark that it reaches
+        # Codex rather than capping the proxy.
         model_detail = self.ui.split("function ModelInspector(", 1)[1].split("// The protocol-mode sentence is a tip", 1)[0]
         self.assertIn('publicModelCustomLimit(providers, publicModelName, "max_input_tokens")', model_detail)
-        self.assertIn('publicModelTokensText(windowContext, translate)', model_detail)
+        self.assertIn('dispatch("public.model_patch", { public_model: publicModelName, changes: { max_input_tokens: next.trim() } })', model_detail)
+        self.assertIn('placeholder={windowHint}', model_detail)
+        self.assertIn('text={translate("providers.contextWindowHelp")}', model_detail)
+        self.assertIn('title={translate("providers.contextWindowHelpTitle")}', model_detail)
+        # The help mark rides the same grid level as PickerField's, so a field
+        # carrying one and a picker carrying one draw the same control column.
+        self.assertIn('accessory={<HelpTip open={windowTipOpen} text={translate("providers.contextWindowHelp")}', model_detail)
+        self.assertNotIn('modelWindowField', model_detail)
+        self.assertNotIn('hint={windowHint}', model_detail)
+        # It is the pane's last row, below 协议方式: a per-model escape hatch for
+        # a route the registry resolved wrong is not part of how the route is
+        # called, so it must not split the calling fields apart.
+        self.assertLess(model_detail.index("<ProtocolPicker "), model_detail.index("providers.contextWindowHelpTitle"))
         self.assertIn('onOpenPublicModel', model_detail)
         # The breadcrumb's public-model segment is the navigation; the upstream
         # model is not a segment of its own (the pane's 上游模型 field states it).
@@ -1114,9 +1133,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # The navigation is a real button (设置), never a link-dressed one, and
         # 设置 opens the very group the routes table lists: the pane is keyed by
         # the display name the drafts project, not by the raw field value a
-        # rename left behind.
-        self.assertIn('title={translate("providers.publicModelSettings")} compact disabled=', model_detail)
-        self.assertNotIn('title={translate("providers.publicModelSettings")} link', model_detail)
+        # rename left behind.  The window itself is edited here, so the row
+        # carries no navigation button of its own.
+        self.assertNotIn('title={translate("providers.publicModelSettings")}', model_detail)
         self.assertIn('setViewMode("routes"); selectRouteTableRow(routePublicModelRowKey(publicModel));', self.ui)
         self.assertIn('const publicModel = modelDisplayName(providerId, model).trim();', self.ui)
         self.assertIn('const publicModel = activeRoute.publicModel.trim();', self.ui)
@@ -1627,14 +1646,16 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # panes' content edges.
         self.assertNotIn('settingsSidebarDivider', self.ui)
         self.assertNotIn('settingsPaneDivider', self.ui)
-        # The two column rules are the same rule: a sidebar divider and a rail
-        # divider that both read as hairlines over a dark backdrop.  The
-        # columns are told apart by their spacing, not by a drawn edge.
-        self.assertIn('settingsSidebar: { width: 200, flexShrink: 0, minHeight: 0 }', self.ui)
-        # The rail's own column rule is a sibling divider, not the list
-        # container's border: the native frame view's 1 pt box sits inside the
-        # rail, so a bordered column read as both a boxed list and a doubled
-        # edge. The rail clips its own children and draws that one hairline.
+        # The sidebar's right edge is one of the window's column rules: the
+        # header band carries no rule of its own, so this column edge and the
+        # rail's own divider are what tell the three columns apart.
+        self.assertIn(
+            'settingsSidebar: { width: 200, flexShrink: 0, minHeight: 0, '
+            'borderRightWidth: 1, borderRightColor: systemColors.separator }',
+            self.ui,
+        )
+        # The rail's column rule is a sibling divider, so it stays whole where
+        # the list reaches past the list container's own edge.
         self.assertIn(
             'settingsRail: { width: SETTINGS_RAIL_WIDTH, flexShrink: 0, minHeight: 0, '
             'paddingTop: 6, overflow: "hidden" }',
@@ -1647,14 +1668,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.ui,
         )
         self.assertIn('const SETTINGS_HEADER_CONTENT_HEIGHT = 20;', self.ui)
-        # Every table states that it draws no frame, so the native table's own
-        # 1 px box cannot reappear as a column rule somewhere the shared
-        # styles do not reach.
-        self.assertEqual(
-            self.ui.count("<NativeTable"),
-            self.ui.count("framed={false}"),
-            "every NativeTable must opt out of the native frame",
-        )
+        # No table opts out of the native frame: a bordered list is how the user
+        # sees where a list ends, so dropping the 1 pt box on every table left
+        # the provider and model lists, the keys list, the log table, the rail,
+        # and the sidebar unbounded against the window background.
+        self.assertNotIn("framed={false}", self.ui)
+        self.assertEqual(7, self.ui.count("<NativeTable"))
         self.assertIn('settingsSidebarAppIcon: { width: SETTINGS_HEADER_CONTENT_HEIGHT, height: SETTINGS_HEADER_CONTENT_HEIGHT, borderRadius: 4 }', self.ui)
         self.assertIn('settingsPaneTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600", lineHeight: SETTINGS_HEADER_CONTENT_HEIGHT }', self.ui)
         self.assertIn('settingsSidebarList: { flex: 1, minHeight: 0 }', self.ui)
@@ -3410,7 +3429,29 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'formRowControl: { flex: 1, minWidth: 0, gap: 3',
         ):
             self.assert_ui_has(marker)
-        self.assert_ui_has('label={translate("providers.publicModel")} labelWidth={60}')
+        self.assert_ui_has('label={translate("providers.publicModel")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} value={group.name} disabled={busy}')
+        # The model detail draws every row's label from one column of its own,
+        # sized by its longest rendered label (Codex 上下文, 80.9 pt at 13 pt)
+        # plus COLUMN_GAP.  The old 60 pt column wrapped that label mid-word, and
+        # the shared 112 pt column left the controls short of the room the fixed
+        # 290 pt pane was built to give them.
+        self.assert_ui_not_has('labelWidth={60}')
+        self.assert_ui_not_has('modelStatusLabel')
+        self.assert_ui_has('const MODEL_INSPECTOR_LABEL_WIDTH = 89;')
+        self.assert_ui_has('modelInspectorLabel: { width: MODEL_INSPECTOR_LABEL_WIDTH, flexShrink: 0')
+        # Every row in the pane joins that column — a row that falls back to
+        # formRowLabel's 112 steps out of it and reads as broken alignment.
+        for label in ("publicModel", "provider", "providerKey", "upstream", "order"):
+            self.assert_ui_has(f'label={{translate("providers.{label}")}} labelWidth={{MODEL_INSPECTOR_LABEL_WIDTH}}')
+        self.assert_ui_has('<TextField label={translate("providers.order")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} controlWidth={64}')
+        self.assert_ui_has('<PickerField label={translate("providers.protocolMode")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} allowShrink')
+        for label in ("modelRate",):
+            self.assert_ui_has(f'<Text numberOfLines={{1}} style={{styles.modelInspectorLabel}}>{{translate("providers.{label}")}}</Text>')
+        # TextField grows the same accessory slot PickerField already had, so a
+        # row with a help mark is not a row with a nested control column.
+        self.assert_ui_has('accessory?: React.ReactNode')
+        self.assert_ui_has('{accessory ?? null}{suffix ?')
+        self.assert_ui_not_has('modelWindowLabel')
         self.assert_ui_has('inspectorBody: { gap: 4 }')
         self.assert_ui_has('protocolSettings: { gap: 4 }')
         self.assert_ui_has('helpTipAnchor: { position: "relative", zIndex: 2 }')
@@ -3540,7 +3581,6 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # Every label column in the pane is the shared one, so a rate row
             # lines up with the fields beside it.
             'providerAuthStatusLabel: { width: 88, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE }',
-            'modelStatusLabel: { width: 60 }',
             'serviceRate.trim() || translate("common.none")',
             # One association block is labelled by the provider's service, its
             # right-hand control follows the sign-in state, and an account-backed
@@ -5122,7 +5162,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         commit-time validator and draws the message in its own row.
         """
 
-        self.assertIn("validate?: (next: string) => string | undefined; style?: StyleProp<ViewStyle> }): React.JSX.Element", self.ui)
+        self.assertIn("validate?: (next: string) => string | undefined; /** A control that belongs to this row beside the field, such as its help mark. It rides the same grid level as PickerField's, so a field with an accessory and a picker with one draw the same column. */ accessory?: React.ReactNode; style?: StyleProp<ViewStyle> }): React.JSX.Element", self.ui)
         self.assertIn("const field = usePendingTextField(value, onCommit, label, onDraftChange, validate);", self.ui)
         self.assertIn('{field.error !== undefined ? <Text style={[styles.fieldError, hintStyle]} accessibilityLiveRegion="polite">{field.error}</Text> : null}', self.ui)
         self.assertIn("field.error !== undefined && styles.inputInvalid", self.ui)
