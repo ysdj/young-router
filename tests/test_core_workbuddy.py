@@ -8,8 +8,11 @@ the answer.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
+import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 import unittest.mock
@@ -632,6 +635,250 @@ class WorkBuddyModuleTests(unittest.TestCase):
         with unittest.mock.patch.object(workbuddy, "available", return_value=False):
             self.assertFalse(runtime.ensure_started())
             self.assertEqual(runtime.environment(), {})
+
+
+# The staged worker's own product knowledge is a Node process this Core owns,
+# so a lifecycle test drives a real subprocess instead of a stub: the stand-in
+# binds one loopback port, announces itself exactly as the worker does, and is
+# killed the way a worker that the upstream sidecar ends dies.
+_FAKE_WORKER = '''\
+import json
+import os
+import signal
+import socket
+import sys
+import threading
+import time
+
+arguments = sys.argv[1:]
+options = dict(zip(arguments[0::2], arguments[1::2]))
+port = int(options.get("--port") or 0)
+root = options.get("--root") or "."
+lifetime = float(os.environ.get("FAKE_WORKER_LIFETIME", "3600"))
+crlf = bytes((13, 10))
+
+listener = socket.socket()
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.bind(("127.0.0.1", port))
+listener.listen(8)
+bound = listener.getsockname()[1]
+with open(os.path.join(root, "starts.log"), "a", encoding="utf-8") as handle:
+    handle.write(f"{bound}\\n")
+
+
+def serve():
+    while True:
+        connection, _ = listener.accept()
+        try:
+            request = connection.recv(65536)
+            body = json.dumps({"ready": True, "request": request.splitlines()[:1]}).encode("utf-8")
+            connection.sendall(crlf.join([
+                b"HTTP/1.1 200 OK",
+                b"Content-Type: application/json",
+                b"Content-Length: " + str(len(body)).encode("ascii"),
+                b"",
+                body,
+            ]))
+        except OSError:
+            pass
+        finally:
+            connection.close()
+
+
+threading.Thread(target=serve, daemon=True).start()
+print(json.dumps({"ready": True, "port": bound, "providers": ["workbuddy", "workbuddy-ai"]}), flush=True)
+signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
+time.sleep(lifetime)
+'''
+
+
+class WorkBuddyWorkerLifecycleTests(unittest.TestCase):
+    """A worker that dies on its own is Core's to replace, not the user's.
+
+    The running proxy resolved its WorkBuddy base URL from its own environment
+    when it launched, and nothing on the request path asks Core for a worker, so
+    a worker that the upstream sidecar ends would otherwise leave every
+    WorkBuddy route (DeepSeek's included) failing with a connection error for
+    as long as the app runs - and a pane read would be the only cure.
+    """
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.worker = self.root / "fake_worker.py"
+        self.worker.write_text(_FAKE_WORKER, encoding="utf-8")
+        self.saved_environment = {
+            name: os.environ.get(name)
+            for name in (*workbuddy.API_BASE_ENV.values(), *workbuddy.API_KEY_ENV.values())
+        }
+        self.addCleanup(self._restore_environment)
+        for patcher in (
+            mock.patch.object(workbuddy, "available", lambda: True),
+            mock.patch.object(workbuddy, "staged_root", lambda: self.root / "staged"),
+            mock.patch.object(workbuddy, "worker_path", lambda: self.worker),
+            mock.patch.object(workbuddy, "node_command", lambda: sys.executable),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _restore_environment(self) -> None:
+        for name, value in self.saved_environment.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+    def _runtime(self) -> workbuddy.WorkBuddyRuntime:
+        runtime = workbuddy.WorkBuddyRuntime(self.root)
+        self.addCleanup(runtime.stop)
+        return runtime
+
+    def _starts(self) -> int:
+        log = self.root / ".litellm-runtime" / "workbuddy" / "starts.log"
+        if not log.is_file():
+            return 0
+        return len(log.read_text(encoding="utf-8").splitlines())
+
+    def _wait_for(self, predicate) -> bool:
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.02)
+        return False
+
+    def test_a_worker_that_settled_before_it_died_is_replaced_at_once(self) -> None:
+        settled = mock.patch.object(workbuddy, "_WORKBUDDY_SETTLED_SECONDS", 0.0)
+        settled.start()
+        self.addCleanup(settled.stop)
+        runtime = self._runtime()
+        self.assertTrue(runtime.ensure_started())
+        first = runtime._process
+        port = runtime._port
+        self.assertIsNotNone(first)
+        self.assertGreater(port, 0)
+
+        first.kill()
+
+        self.assertTrue(self._wait_for(lambda: runtime._process not in (None, first)))
+        # The proxy child keeps calling the address it launched with, so the
+        # replacement has to serve that one - not a fresh port nobody knows.
+        self.assertEqual(runtime._port, port)
+        self.assertEqual(
+            runtime.environment_values()[workbuddy.API_BASE_ENV[workbuddy.WORKBUDDY_PROVIDER]],
+            f"http://127.0.0.1:{port}/workbuddy/v1",
+        )
+        self.assertEqual(self._starts(), 2)
+        replacement = runtime._process
+        self.assertIsNotNone(replacement)
+        self.assertIsNone(replacement.poll())
+
+    def test_a_released_worker_is_not_resurrected_by_its_supervision(self) -> None:
+        runtime = self._runtime()
+        self.assertTrue(runtime.ensure_started())
+        first = runtime._process
+        self.assertIsNotNone(first)
+
+        # Releasing the worker (every WorkBuddy route went away) must end its
+        # supervision too: a credential-holding process is never left behind.
+        runtime.stop()
+
+        self.assertTrue(self._wait_for(lambda: first.poll() is not None))
+        time.sleep(0.5)
+        self.assertIsNone(runtime._process)
+        self.assertEqual(runtime.environment(), {})
+        self.assertEqual(self._starts(), 1)
+
+    def test_a_failed_start_keeps_the_address_the_proxy_was_given(self) -> None:
+        runtime = self._runtime()
+        self.assertTrue(runtime.ensure_started())
+        port = runtime._port
+        self.assertGreater(port, 0)
+
+        # A start that produces no worker - a Node it cannot reach, a worker
+        # that never announces itself - must not send the next attempt to a
+        # port nobody was told about.
+        with mock.patch.object(runtime, "_spawn", lambda *_: None):
+            self.assertFalse(runtime._start())
+
+        self.assertEqual(runtime._port, port)
+        self.assertEqual(
+            runtime.environment_values()[workbuddy.API_BASE_ENV[workbuddy.WORKBUDDY_PROVIDER]],
+            f"http://127.0.0.1:{port}/workbuddy/v1",
+        )
+
+    def test_one_failed_start_does_not_end_the_supervision(self) -> None:
+        delays = (0.0, 0.05, 0.05)
+        runtime = self._runtime()
+        self.assertTrue(runtime.ensure_started())
+        first = runtime._process
+        port = runtime._port
+        self.assertIsNotNone(first)
+        spawn = runtime._spawn
+        attempts = {"count": 0}
+
+        def flaky(node: str, worker: Path, target: int):
+            attempts["count"] += 1
+            # Both attempts of one restart fail, the way a spawn can fail
+            # under load; the next step has to try again on the same address.
+            return None if attempts["count"] <= 2 else spawn(node, worker, target)
+
+        with mock.patch.object(workbuddy, "_WORKBUDDY_RESTART_DELAYS_SECONDS", delays), mock.patch.object(
+            runtime, "_spawn", flaky
+        ):
+            first.kill()
+            self.assertTrue(self._wait_for(lambda: runtime._process not in (None, first)))
+
+        self.assertGreater(attempts["count"], 2)
+        self.assertEqual(runtime._port, port)
+        replacement = runtime._process
+        self.assertIsNotNone(replacement)
+        self.assertIsNone(replacement.poll())
+
+    def test_a_demand_read_refills_the_supervision_budget(self) -> None:
+        delays = (0.0, 0.05, 0.05)
+        for patcher in (
+            mock.patch.dict(os.environ, {"FAKE_WORKER_LIFETIME": "0.05"}),
+            mock.patch.object(workbuddy, "_WORKBUDDY_RESTART_DELAYS_SECONDS", delays),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        runtime = self._runtime()
+
+        runtime.ensure_started()
+        self.assertTrue(self._wait_for(lambda: runtime._restart_step >= len(delays)))
+        spent = self._starts()
+        time.sleep(0.3)
+        self.assertEqual(self._starts(), spent)
+
+        # A read the user's own pane made starts over with the whole budget,
+        # so the worker it asks for is supervised too.
+        self.assertTrue(runtime.ensure_started())
+        self.assertTrue(self._wait_for(lambda: self._starts() > spent + 1))
+
+    def test_a_worker_that_keeps_dying_young_does_not_spin(self) -> None:
+        delays = (0.0, 0.05, 0.05)
+        for patcher in (
+            mock.patch.dict(os.environ, {"FAKE_WORKER_LIFETIME": "0.05"}),
+            mock.patch.object(workbuddy, "_WORKBUDDY_RESTART_DELAYS_SECONDS", delays),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        runtime = self._runtime()
+
+        runtime.ensure_started()
+        # One demand start, then one supervised restart per delay step but the
+        # last: the budget runs out on the final young death.
+        expected = 1 + len(delays) - 1
+        self.assertTrue(self._wait_for(lambda: self._starts() >= expected))
+        settled = self._starts()
+        self.assertLessEqual(settled, 1 + len(delays))
+        # The steps run out and the demand path owns the next attempt: no
+        # restart storm while the integration stays broken.
+        time.sleep(0.5)
+        self.assertEqual(self._starts(), settled)
+        self.assertIsNone(runtime._process)
 
 
 if __name__ == "__main__":

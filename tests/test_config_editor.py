@@ -9,6 +9,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+import unittest.mock
 from pathlib import Path
 
 
@@ -2244,6 +2245,82 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
                 target_payload["revision"],
                 imported["document"],
             )
+
+
+class YamlTextParseReuseTests(unittest.TestCase):
+    """One settings action must not re-parse the same document ten times.
+
+    A key deletion validated, wrote, and re-read the same 40 KB config, and
+    every one of those steps walked the whole document from the text.  The
+    scan is now shared by the hash of the text, so a repeated text is answered
+    with a value the very same parse produced.
+    """
+
+    def test_the_same_text_is_parsed_once(self) -> None:
+        text = textwrap.dedent(
+            """
+            providers:
+              primary:
+                api_base: "https://example.test/v1"
+                api_keys:
+                  - name: default
+                    value: "sk-replace-me-secret"
+            model_list:
+              - model_name: default-chat
+                model_info:
+                  id: "00000071"
+                litellm_params:
+                  model: openai/default-chat
+                  api_base: "https://example.test/v1"
+                  api_key: "sk-replace-me-secret"
+            litellm_settings:
+              callbacks: ["young_router.callbacks.image_generation_routing_hook"]
+            """
+        ).lstrip()
+        parses = 0
+        real_safe_load = config_schema.yaml.safe_load
+
+        def counting_safe_load(document: str, *args: object, **kwargs: object) -> object:
+            nonlocal parses
+            parses += 1
+            return real_safe_load(document, *args, **kwargs)
+
+        with unittest.mock.patch.object(config_schema.yaml, "safe_load", counting_safe_load):
+            first = config_schema.load_yaml_text(text, Path("config.yaml"))
+            # A second copy of the same document, as the commit path builds it.
+            second = config_schema.load_yaml_text(str(text), Path("config.yaml"))
+        self.assertEqual(1, parses)
+        self.assertEqual(first, second)
+        # The caller owns its mapping: mutating one may not reach the next
+        # reader, which is served from the parse this one already produced.
+        first["model_list"].clear()
+        third = config_schema.load_yaml_text(text, Path("config.yaml"))
+        self.assertEqual(1, len(third["model_list"]))
+        self.assertEqual(1, parses)
+
+    def test_a_different_document_is_never_answered_from_the_cache(self) -> None:
+        first = textwrap.dedent(
+            """
+            providers:
+              primary:
+                api_base: "https://example.test/v1"
+                api_keys:
+                  - name: default
+                    value: "sk-replace-me-secret"
+            model_list: []
+            """
+        ).lstrip()
+        second = first.replace("default", "secondary")
+        loaded_first = config_schema.load_yaml_text(first, Path("config.yaml"))
+        loaded_second = config_schema.load_yaml_text(second, Path("config.yaml"))
+        self.assertEqual("default", loaded_first["providers"]["primary"]["api_keys"][0]["name"])
+        self.assertEqual("secondary", loaded_second["providers"]["primary"]["api_keys"][0]["name"])
+
+    def test_a_structurally_unsafe_document_still_fails_every_time(self) -> None:
+        bomb = "a: &a [*a]\n"
+        for _ in range(3):
+            with self.assertRaises(ValueError):
+                config_schema.load_yaml_text(bomb, Path("config.yaml"))
 
 
 if __name__ == "__main__":

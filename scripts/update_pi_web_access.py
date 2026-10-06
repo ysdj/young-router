@@ -39,12 +39,12 @@ if str(_SCRIPT_DIR) not in sys.path:
 
 from update_common import (
     UpdateError,
-    find_npm,
+    download_bytes,
+    find_package_manager,
     flatten_npm_package,
     package_metadata,
-    request_bytes,
     request_json,
-    run_npm_install,
+    run_package_manager_install,
 )
 
 
@@ -85,7 +85,14 @@ FALLBACK_PI_PEERS = (
 
 
 def _request_bytes(url: str, *, timeout: int = DEFAULT_TIMEOUT_SECONDS) -> bytes:
-    return request_bytes(url, timeout=timeout, user_agent=USER_AGENT)
+    """Download one staged file over the staging run's pooled connection.
+
+    This script fetches two large files from two origins (the release index and
+    the Node tarball) plus the package tarball, so the handshake it saves per
+    request is several seconds of the build's wall clock.
+    """
+
+    return download_bytes(url, timeout=timeout, user_agent=USER_AGENT)
 
 
 def _request_json(url: str) -> Any:
@@ -115,17 +122,30 @@ def _peer_specs(version_payload: dict[str, Any]) -> list[str]:
 
 
 def _find_executable(name: str) -> str:
-    return find_npm(name, purpose="install pi-web-access and its Pi peer packages")
+    """The package manager this staging run installs with.
+
+    pnpm is preferred for the same reason the vision router prefers it: it
+    resolves the same registry graph an order of magnitude faster and its
+    hoisted linker produces a smaller flat tree, which this staging step then
+    copies and signs in every build.  npm stays the fallback so a machine
+    without pnpm still builds.
+    """
+
+    return find_package_manager(
+        name, purpose=f"install {PACKAGE_NAME} and its Pi peer packages"
+    )
 
 
-def _run_npm_install(
-    npm: str,
+def _install_package(
+    manager: str,
+    manager_env: dict[str, str],
     npm_root: Path,
     package_tarball: Path,
     peer_names: Iterable[str],
 ) -> None:
-    run_npm_install(
-        npm,
+    run_package_manager_install(
+        manager,
+        manager_env,
         npm_root,
         package_tarball,
         peer_names,
@@ -315,17 +335,22 @@ def update(
     output = output.expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     latest, tarball_url, version_payload = _package_metadata(registry_url)
-    npm = _find_executable("LITELLM_NPM_BIN")
+    manager, manager_env = _find_executable("LITELLM_NPM_BIN")
 
     with tempfile.TemporaryDirectory(prefix="young-router-pi-web-access-") as directory:
         work = Path(directory)
         package_tarball = work / "pi-web-access.tgz"
         package_tarball.write_bytes(_request_bytes(tarball_url))
         npm_root = work / "npm"
-        _run_npm_install(npm, npm_root, package_tarball, _peer_specs(version_payload))
+        _install_package(
+            manager, manager_env, npm_root, package_tarball, _peer_specs(version_payload)
+        )
         package_version = _flatten_package(npm_root, output)
         if package_version != latest:
-            raise UpdateError(f"npm installed pi-web-access {package_version}, expected latest {latest}")
+            raise UpdateError(
+                f"The package manager installed {PACKAGE_NAME} {package_version}, "
+                f"expected latest {latest}"
+            )
 
     node_version: str | None = None
     if node_output is not None:

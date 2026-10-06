@@ -445,6 +445,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # Immediate apply: the shell watches the staged domains and applies
             # them after the debounce instead of rendering an Apply button.
             'const autoApplyKey = shell && actionSnapshot && !immediateApplyBlocked',
+            # A revision is not an edit: only a domain Core still reports as
+            # dirty earns the debounced Apply, so an external read that bumped
+            # the revision cannot collect a second commit of the user's own.
+            'const dirty = domains.filter((name) => actionSnapshot.drafts[name]?.dirty === true);',
+            'return dirty.length === 0 ? "" : `${dirty.join(",")}@${actionSnapshot.revision}`;',
             'if (busy || hasPendingFieldEdits()) return;',
             'setResult(translate("common.saving"));',
             'void apply({ message: "common.saved", keepControlsEnabled: true });',
@@ -498,6 +503,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('const sameDomains = currentDomains.length === domains.length', apply_body)
         self.assertIn('const sameDiskState = domains.every((name) => (', apply_body)
         self.assertIn('result = await applyOnce(current.revision);', apply_body)
+        # A conflict whose rebase finds nothing left staged is the pane's own
+        # background Apply having already committed the edit. The user asked
+        # for a write that exists, so it is reported applied instead of failing
+        # with a message about a change made outside the window.
+        self.assertIn('if (!sameDomains || !sameDiskState) throw reason;', apply_body)
+        self.assertIn('if (currentDomains.length === 0) {', apply_body)
+        self.assertIn('status: "applied", domains: [...domains]', apply_body)
+        self.assertNotIn('appliedRevision.current', self.ui)
 
     def test_compatibility_claude_route_reuses_the_combined_native_window(self) -> None:
         routes = (ROOT / "rn/packages/shared/src/routes.ts").read_text(encoding="utf-8")
@@ -653,7 +666,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         ):
             self.assert_ui_has(marker)
         # Only the availability finding may ever change stored routing; a
-        # fingerprint mismatch is reported and nothing else.
+        # failed check is reported and nothing else.
         self.assertNotIn('degradation.status === "mismatch") ', self.ui)
         for marker in (
             'const unreachableCount = surfaces.filter((surface) => surface.status === "network_error").length;',
@@ -671,19 +684,19 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '"providers.probeAvailabilityCount": "{available}/{total} 可用"',
             '"providers.probeSummaryUnavailable": "不可用"',
             '"providers.probeSummaryUnreachable": "上游未响应"',
-            '"providers.degradationMatched": "未降智"',
-            '"providers.degradationMatchedDetail": "未降智（指纹与 {target} 一致）"',
-            '"providers.degradationMismatch": "疑似降智"',
-            '"providers.degradationMismatchDetail": "降智：指纹更像 {label}（目标 {target}）"',
-            '"providers.degradationUnknown": "指纹存疑"',
+            '"providers.degradationMatched": "未掺假"',
+            '"providers.degradationMatchedDetail": "核验通过（{target} 的真伪指纹一致）"',
+            '"providers.degradationMismatch": "疑似掺假"',
+            '"providers.degradationMismatchDetail": "核验未通过：{target} 的响应更像 {label}"',
+            '"providers.degradationUnknown": "核验存疑"',
             '"providers.degradationUnreachable": "上游未响应"',
         ):
             self.assertIn(marker, self.zh)
         # The result line carries the finding itself: a "总结:" label would only
         # eat the width the pane needs for the whole short result.
         self.assertNotIn("总结", self.zh)
-        self.assertIn('"providers.degradationMatched": "Not degraded"', self.en)
-        self.assertIn('"providers.degradationMismatch": "Looks degraded"', self.en)
+        self.assertIn('"providers.degradationMatched": "Not diluted"', self.en)
+        self.assertIn('"providers.degradationMismatch": "Looks diluted"', self.en)
         self.assertIn('"providers.probeSummaryUnreachable": "Upstream did not answer"', self.en)
         self.assertIn('"providers.probeResultPrefix": "Result:"', self.en)
         self.assertIn('"providers.probeAvailabilityCount": "{available}/{total} available"', self.en)
@@ -702,9 +715,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         for marker in (
             '"providers.probe": "探测"',
             '"providers.deepTest": "深测"',
-            '"providers.deepTestHint": "先验可用性，再比对降智指纹（TraceOne）"',
-            '"providers.degradationUnavailable": "深测不可用"',
-            '"providers.degradationError": "深测失败"',
+            '"providers.deepTestHint": "先验可用性，再跑 veridrop quick 真伪核验"',
+            '"providers.degradationUnavailable": "核验不可用"',
+            '"providers.degradationError": "核验失败"',
         ):
             self.assertIn(marker, self.zh)
         for marker in (
@@ -1642,18 +1655,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # The header band carries no rule of its own.  The sidebar and the
         # pane used to each draw a hairline under their title, so the window
         # showed two lines that read as artifacts rather than as structure;
-        # the only boundaries left are the sidebar's own right border and the
-        # panes' content edges.
+        # the sidebar's material boundary is its own edge, so no column rule
+        # is left over it either.
         self.assertNotIn('settingsSidebarDivider', self.ui)
         self.assertNotIn('settingsPaneDivider', self.ui)
-        # The sidebar's right edge is one of the window's column rules: the
-        # header band carries no rule of its own, so this column edge and the
-        # rail's own divider are what tell the three columns apart.
-        self.assertIn(
-            'settingsSidebar: { width: 200, flexShrink: 0, minHeight: 0, '
-            'borderRightWidth: 1, borderRightColor: systemColors.separator }',
-            self.ui,
-        )
+        # The sidebar draws no column rule: its vibrant material already ends
+        # at the edge, and the rule read as a line floating over it.  The
+        # rail's own divider is what still tells a second column apart.
+        self.assertIn('settingsSidebar: { width: 200, flexShrink: 0, minHeight: 0 }', self.ui)
         # The rail's column rule is a sibling divider, so it stays whole where
         # the list reaches past the list container's own edge.
         self.assertIn(
@@ -1667,18 +1676,32 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "width: 1, backgroundColor: systemColors.separator }",
             self.ui,
         )
+        # The rail draws that one divider and the list inside it draws no frame.
+        # A box around a column that already owns a right edge put a hairline
+        # under the pane title and another above the status strip, and both
+        # belonged to no row: the rail is a column of the pane, not a content
+        # list floating in it.  Counting the prop lines themselves keeps a
+        # comment that names the prop out of the count.
+        self.assertEqual(2, len([line for line in self.ui.splitlines() if line.strip() == "framed={false}"]))
+        rail_source = self.ui.split("function SettingsRail(", 1)[1].split("\nfunction ", 1)[0]
+        self.assertIn("framed={false}", rail_source)
         self.assertIn('const SETTINGS_HEADER_CONTENT_HEIGHT = 20;', self.ui)
-        # No table opts out of the native frame: a bordered list is how the user
-        # sees where a list ends, so dropping the 1 pt box on every table left
-        # the provider and model lists, the keys list, the log table, the rail,
-        # and the sidebar unbounded against the window background.
-        self.assertNotIn("framed={false}", self.ui)
+        # Every content list keeps its native frame: a bordered list is how the
+        # user sees where a list ends, so dropping the 1 pt box left the
+        # provider and model lists, the keys list and the log table unbounded
+        # against the window background.  The two columns that are not content
+        # lists opt out: the sidebar's own source list sits on the vibrant
+        # sidebar material, and the rail is a column of its pane bounded by the
+        # one right divider it draws itself.  A box around either one drew a top
+        # and a bottom rule that belonged to no row plus a right edge doubling
+        # an edge that already exists, so the opt-out exists exactly twice.
         self.assertEqual(7, self.ui.count("<NativeTable"))
         self.assertIn('settingsSidebarAppIcon: { width: SETTINGS_HEADER_CONTENT_HEIGHT, height: SETTINGS_HEADER_CONTENT_HEIGHT, borderRadius: 4 }', self.ui)
         self.assertIn('settingsPaneTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600", lineHeight: SETTINGS_HEADER_CONTENT_HEIGHT }', self.ui)
         self.assertIn('settingsSidebarList: { flex: 1, minHeight: 0 }', self.ui)
         shell = self.ui.split("function SettingsShell(", 1)[1].split("function RouteSurface(", 1)[0]
         self.assertIn('sourceList', shell)
+        self.assertIn('framed={false}', shell)
         self.assertIn('selectedKey={pane}', shell)
         self.assertIn('rowSymbols={paneSymbols}', shell)
         self.assertIn('onSelectionChange={selectPane}', shell)
@@ -2651,6 +2674,16 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # needs no caption, width, or striping of its own.
         self.assertNotIn("externalSettingsRailTitle", self.ui)
         self.assertIn("settingsRailDetailHeader", self.ui)
+        # The detail header band carries no rule of its own.  It is a title
+        # over content, and the 1 pt rule it drew under itself ran the full
+        # detail width like a section divider over nothing; the header keeps
+        # its own height, ink and window background.
+        self.assertIn(
+            'settingsRailDetailHeader: { minHeight: 50, flexShrink: 0, flexDirection: "row", '
+            'alignItems: "center", gap: 12, paddingHorizontal: 14, paddingVertical: 8, '
+            'backgroundColor: systemColors.window }',
+            self.ui,
+        )
         self.assertIn('horizontal={false}', self.ui)
         self.assertIn('showsHorizontalScrollIndicator={false}', self.ui)
 
@@ -2784,7 +2817,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         schema = (ROOT / "young_router/core/runtime_settings_schema.py").read_text(encoding="utf-8")
         localized = (ROOT / "rn/packages/shared/src/i18n/runtimeSettingsI18n.ts").read_text(encoding="utf-8")
         keys = re.findall(r"'key': '([^']+)'", schema)
-        self.assertEqual(65, len(keys))
+        self.assertEqual(66, len(keys))
         self.assertEqual(len(keys), len(set(keys)))
         for key in keys:
             self.assertIn(f"  {key}: {{ label:", localized)
@@ -3476,10 +3509,15 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '"workbuddy_login",',
             '"service_provider_auth_status",',
             '"provider_auth_status",',
-            "function isTransientReadAction(type: string): boolean {",
-            "const transient = isTransientReadAction(type);",
+            # Reads that stage nothing share one identity, so a slow relay
+            # refresh or model fetch also stays off the queue of edits.
+            "const NON_STAGING_ACTIONS: ReadonlySet<string> = new Set([",
+            '"provider_fetch_models",',
+            '"provider_fetch_relay_resource_models",',
+            "function isNonStagingAction(type: string): boolean {",
+            "const unbuffered = isNonStagingAction(type);",
             "? issue()\n      : dispatchQueue.current.catch(() => undefined).then(issue);",
-            "if (!transient) dispatchQueue.current = queued.then(() => undefined, () => undefined);",
+            "if (!unbuffered) dispatchQueue.current = queued.then(() => undefined, () => undefined);",
         ):
             self.assert_ui_has(marker)
 
@@ -3615,6 +3653,48 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('"providers.wizard.workbuddySignInRequired": "请先在 WorkBuddy 桌面 App 中登录。"', self.zh)
         self.assertIn('"providers.serviceLinks": "服务商关联"', self.zh)
         self.assertIn('"providers.wizard.pathCustomKey": "自定义 API 密钥"', self.zh)
+
+    def test_a_workbuddy_entry_states_the_account_and_its_credit(self) -> None:
+        """Opening a WorkBuddy provider shows the积分, not just the account.
+
+        The worker fills ``credits`` only on a read that asked for it, so the
+        block's mount read has to be the credit-carrying one: a plain account
+        read answers the sign-in question alone, and the pane then showed an
+        account row and no credit row however many times it was opened.  The
+        credit is a row of its own while signed in, an unstated credit is
+        never rendered as a zero, and the record Core last observed supplies
+        both facts until the block's own read lands.
+        """
+
+        for marker in (
+            # The mount read asks for the credit document, and the retry after
+            # a cold worker answers "not signed in" asks again.
+            'void loadWorkBuddyAccount(true).then((account) => {',
+            'if (account && stringValue(account.state) !== "signed-in") void loadWorkBuddyAccount(true);',
+            # Both facts come from the live read with the observed record under
+            # it, so the whole block is filled in from its first paint.
+            'const workbuddyObserved = asRecord(provider.auth_observed);',
+            'const workbuddyFacts = workbuddyAccountFacts(asRecord(workbuddyAccount), workbuddyObserved);',
+            'function workbuddyAccountFacts(live: UnknownRecord, observed: UnknownRecord): UnknownRecord {',
+            'if (!workbuddyCreditsStated(live) && workbuddyCreditsStated(observed)) merged.credits = observed.credits;',
+            'function workbuddyCreditsStated(account: UnknownRecord | undefined): boolean {',
+            # The credit row is unconditional for a signed-in account: the read
+            # states a number, the wait, or that no read produced one.
+            '{workbuddySignedIn ? <View style={styles.officialStatusRow}>',
+            '<Text style={styles.providerAuthStatusLabel}>{translate("providers.wizard.workbuddyCredits")}</Text>',
+            '<Text numberOfLines={1} style={styles.providerAuthStatusValue}>{workbuddyCreditsText(workbuddyFacts, translate) || progressText(workbuddyStatusBusy, translate) || translate("providers.workbuddyCreditUnavailable")}</Text>',
+            'translate("providers.workbuddyCreditUnavailable")',
+        ):
+            self.assert_ui_has(marker)
+        # An unstated credit is never a conditional row that simply vanishes,
+        # and the credit helper never invents a zero for a missing record.
+        self.assert_ui_not_has('{workbuddyCreditsText(workbuddyAccount, translate) ? <View style={styles.officialStatusRow}>')
+        self.assert_ui_not_has('workbuddyCreditsRead')
+        self.assert_ui_has('return typeof total === "number" && Number.isFinite(total) ? String(total) : "";')
+        for text in (self.en, self.zh):
+            self.assertIn('"providers.workbuddyCreditUnavailable":', text)
+        translation_keys = (ROOT / "rn/packages/shared/src/i18n/types.ts").read_text(encoding="utf-8")
+        self.assertIn('| "providers.workbuddyCreditUnavailable"', translation_keys)
 
     def test_unified_provider_workspace_lists_every_provider_kind(self) -> None:
         """服务商管理 is integrated: the provider table shows all kinds."""
@@ -4186,29 +4266,57 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # restore that fails leaves the account signed out and never opens the
         # login page on its own (去登录 / + ask for it).  The quiet resource
         # refresh still runs: a locally known key is local data, and Core reads
-        # the station through a remembered session when it has one.
+        # the station through a remembered session when it has one.  The probe
+        # is a station round trip, so it reports in the resources lane: every
+        # mount re-checks a saved session, and re-entering the pane must not
+        # paint a verified account as 登录中 while that check runs.
         self.assertIn("const attemptedAccounts = useRef(new Set<string>());", relay)
         self.assertIn("attemptedAccounts.current.add(account.id);", relay)
         self.assertNotIn("if (!(await restoreSavedSession(account))) return;", relay)
         self.assertIn("await restoreSavedSession(account);", relay)
         self.assertIn("await refreshAccountResources(account, { silent: true });", relay)
         self.assertNotIn("const canAutoLogin =", relay)
+        # ...and a session the runtime's re-check window still covers skips the
+        # probe entirely: entering the pane twice within the window must not
+        # re-authenticate or re-read a station whose observation is seconds old.
+        self.assertIn("const observed = account.loginObservedSecondsAgo;", relay)
+        self.assertIn("&& observed < sessionRecheckSeconds;", relay)
+        self.assertIn("if (!fresh) {", relay)
+        self.assertIn("sessionRecheckSeconds?: number;", relay)
+        self.assertIn("export function relaySessionRecheckSeconds(snapshot?: CoreSnapshot): number | undefined {", relay)
+        self.assertIn("sessionRecheckSeconds={relaySessionRecheckSeconds(snapshotForCleanups)}", self.ui)
+        runtime_schema = (ROOT / "young_router/core/runtime_settings_schema.py").read_text(encoding="utf-8")
+        self.assertIn("YOUNG_ROUTER_RELAY_SESSION_RECHECK_SECONDS", runtime_schema)
+        self.assertIn("DEFAULT_SESSION_RECHECK_SECONDS = 60.0", (ROOT / "young_router/core/domains/relay_accounts.py").read_text(encoding="utf-8"))
         # Station connection details stay editable through staged updates.
         self.assertIn("const stageStationUpdate = async (overrides: StationDraft = {}): Promise<void> => {", relay)
         self.assertIn('await commit("station.update", { id: station.id, name, origin, type });', relay)
         self.assertIn("translate(\"relay.stationUpdateStaged\")", relay)
         # One login state drives the status column and both account actions:
-        # 登录中 while the sign-in is in flight, otherwise 已登录 / 未登录 (the
-        # expired and not-yet-probed cases read as 未登录 and keep the brown
-        # alert row). 去登录 only appears while signed out and is never
-        # disabled; 分组管理 shows the station's locally known keys, so it is
-        # never gated on the login state that the keys outlive.
+        # 登录中 while a sign-in this pane started is in flight, otherwise
+        # 已登录 / 未登录 (the expired and not-yet-probed cases read as 未登录
+        # and keep the brown alert row). 去登录 only appears while signed out and
+        # is never disabled; 分组管理 shows the station's locally known keys, so
+        # it is never gated on the login state that the keys outlive.
         self.assertIn('const relayLoginState = (account: RelayAccount): "signed_in" | "signing_in" | "signed_out" => {', relay)
         self.assertIn('if (loading[account.id]?.session) return "signing_in";', relay)
         self.assertIn('return effectiveLoginStatus(account) === "signed_in" ? "signed_in" : "signed_out";', relay)
+        # 登录中 is drawn from the session lane alone: 去登录 owns that lane, while
+        # the silent mount probe reports in the resources lane it shares with the
+        # key-list read, so a routine session check never repaints the login row.
+        self.assertIn('updateLoading(account.id, "resources", true);', relay)
+        self.assertIn('updateLoading(account.id, "session", true);', relay)
         self.assertIn('translate(`relay.status.${relayLoginState(account)}`)', relay)
         self.assertIn('const selectedLoginState = selected ? relayLoginState(selected) : "signed_out";', relay)
         self.assertIn('{selectedLoginState === "signed_out" ? <NativeButton title={translate("relay.goLogin")} compact busy={pendingAction === "login"} disabled={controlsBusy && pendingAction !== "login"} onPress={() => { void loginSelected(); }} /> : null}', relay)
+        # 刷新资源 is the control the relay messages already name ("请点击刷新
+        # 资源"); it is a forced station round trip with its own progress, so the
+        # message a user reads points at a button that exists on the same row.
+        self.assertIn('title={translate("relay.refreshResources")} symbol="refresh" compact busy={pendingAction === "refresh"}', relay)
+        self.assertIn('const refreshSelected = async (): Promise<void> => {', relay)
+        self.assertIn('await refreshAccountResources({ id: account.id }, { force: true });', relay)
+        for locale, copy in ((self.zh, '刷新资源'), (self.en, 'Refresh Resources')):
+            self.assertIn(f'"relay.refreshResources": "{copy}"', locale)
         # 去登录 opens the login page at once: the silent session probe must not
         # delay the sheet the user explicitly asked for.
         login_selected = relay.split("const loginSelected = async (): Promise<void> => {", 1)[1].split("const removeSelected", 1)[0]

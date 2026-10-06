@@ -421,6 +421,21 @@ def _normalize_sse_response_completed_chunk(
     )
 
 
+class _InvalidToolCallArgumentsError(RuntimeError):
+    """An upstream streamed a tool call whose arguments are not a JSON object.
+
+    This is the request's own protocol defect, not a route failure: the
+    arguments arrived and are unparseable, so no other deployment would have
+    answered differently.  It carries its own type so terminal-event
+    classification states the real cause instead of reporting the shape as an
+    ``upstream_route_failure`` and inviting a route cooldown for it.
+    """
+
+
+def _is_invalid_tool_call_arguments_error(exception: Exception) -> bool:
+    return isinstance(exception, _InvalidToolCallArgumentsError)
+
+
 def _function_call_arguments_valid(value: Any) -> bool:
     normalized, valid = _responses_request_module._codex_normalized_function_arguments(
         value,
@@ -468,7 +483,7 @@ def _responses_stream_chunk_for_delivery(
         if invalid_reason is not None:
             return _synthesized_failed_response_event(
                 request_data or {},
-                RuntimeError(invalid_reason),
+                _InvalidToolCallArgumentsError(invalid_reason),
             )
         _image_generation_module._normalize_image_generation_result_status(chunk)
         _normalize_response_completed_event_usage(
@@ -516,7 +531,7 @@ def _responses_stream_chunk_for_delivery(
         if invalid_reason is not None:
             return _synthesized_failed_response_event(
                 request_data or {},
-                RuntimeError(invalid_reason),
+                _InvalidToolCallArgumentsError(invalid_reason),
             )
         _image_generation_module._normalize_image_generation_result_status(json_chunk)
         _normalize_response_completed_event_usage(
@@ -1370,6 +1385,16 @@ def _synthesized_failed_response_event(
         )
         error_type = "invalid_request_error"
         error_code = "image_generation_tool_unavailable"
+    elif _is_invalid_tool_call_arguments_error(exception):
+        # The upstream answered, but the tool call it streamed cannot be run.
+        # Naming the real cause keeps this deterministic failure out of the
+        # route cooldown and recovery poll it does not belong to.
+        message = (
+            "The upstream streamed a tool call whose arguments are not a valid "
+            "JSON object, so the call could not be run. Retry the turn."
+        )
+        error_type = "invalid_request_error"
+        error_code = "upstream_tool_call_arguments_invalid"
     else:
         message = "The upstream model route failed before a final assistant response was available."
         error_type = "server_error"
@@ -3172,6 +3197,11 @@ class _ResponsesStreamCompletionState:
         self.arguments_by_item_id: dict[str, str] = {}
         self.argument_parts_by_item_id: dict[str, list[str]] = {}
         self.finished_argument_item_ids: set[str] = set()
+        # The call's own alias groups.  An item states both its ``id`` and its
+        # ``call_id`` while the argument events name only one of them, so the
+        # relation has to be remembered where it is declared or the call's
+        # accumulated arguments stay under whichever key the events used.
+        self._identity_aliases: dict[str, set[str]] = {}
         self.synthetic_text = ""
         self.synthetic_done_text: Optional[str] = None
         self.model = (
@@ -3244,8 +3274,15 @@ class _ResponsesStreamCompletionState:
             existing_args = json_item.get("arguments")
             if existing_args is None:
                 existing_args = json_item.get("input")
+            # One call owns two identity keys: the item's ``id`` and its
+            # ``call_id``.  A bridge may state the streamed arguments under
+            # either, so the accumulated value is read and written through
+            # every key this item answers to; a mirror that states the same
+            # call under the other key is the same call, not a second one.
+            identity_keys = self._identity_keys_for_item(json_item, item_id)
+            accumulated = self._valid_arguments_for_keys(identity_keys)
             if argument_parts:
-                self.arguments_by_item_id[item_id] = "".join(argument_parts)
+                accumulated = "".join(argument_parts)
             elif (
                 item_id not in self.finished_argument_item_ids
                 and existing_args is not None
@@ -3257,9 +3294,11 @@ class _ResponsesStreamCompletionState:
                         empty_is_object=True,
                     )
                 )
-                self.arguments_by_item_id[item_id] = (
-                    normalized_args if valid and normalized_args is not None else None
-                )
+                if valid and normalized_args is not None:
+                    accumulated = normalized_args
+            if accumulated is not None:
+                for identity_key in identity_keys:
+                    self.arguments_by_item_id[identity_key] = accumulated
 
         if chunk_type == "response.output_item.done":
             self.output_by_index[index] = _apply_stream_function_arguments(
@@ -3272,20 +3311,77 @@ class _ResponsesStreamCompletionState:
                 json_item.setdefault("arguments", "")
             self.pending_by_index[index] = json_item
 
+    def _identity_keys_for_item(self, json_item: dict[str, Any], item_id: str) -> list[str]:
+        """Every key this call answers to, its own ``id`` first.
+
+        ``_stream_output_item_identity_keys`` already answers this for a tool
+        call; the leading ``item_id`` keeps a non-tool item's one key.  The
+        declared keys are then unified so an argument event that names one of
+        them reaches the value the call owns.
+        """
+        declared = _stream_output_item_identity_keys(json_item)
+        if not declared:
+            declared = [item_id]
+        elif item_id not in declared:
+            declared.insert(0, item_id)
+        return self._remember_identity_aliases(declared)
+
+    def _remember_identity_aliases(self, keys: list[str]) -> list[str]:
+        """Unify one call's declared keys and return the whole alias group."""
+        group = {key for key in keys if isinstance(key, str) and key}
+        for key in list(group):
+            group |= self._identity_aliases.get(key, set())
+        for key in group:
+            self._identity_aliases[key] = group
+        ordered = [key for key in keys if key in group]
+        ordered.extend(sorted(group - set(ordered)))
+        return ordered
+
+    def _alias_identity_keys(self, keys: list[str]) -> list[str]:
+        """Expand keys with whatever alias group this stream declared."""
+        expanded: list[str] = []
+        for key in keys:
+            if key and key not in expanded:
+                expanded.append(key)
+        for key in list(keys):
+            for alias in sorted(self._identity_aliases.get(key, ())):
+                if alias and alias not in expanded:
+                    expanded.append(alias)
+        return expanded
+
+    def _valid_arguments_for_keys(self, identity_keys: list[str]) -> Optional[str]:
+        for identity_key in identity_keys:
+            value = self.arguments_by_item_id.get(identity_key)
+            if isinstance(value, str):
+                return value
+        return None
+
     def _remember_function_arguments(self, dumped: dict[str, Any], chunk_type: str) -> None:
         item_id = _stream_function_arguments_key(dumped)
         if not item_id:
             return
+        # The event's own key and the call's sibling key, because a bridge may
+        # state the item by ``id`` and these events by ``call_id``; a value the
+        # stream delivered is the same value under either name.
+        identity_keys = [item_id]
+        for key_name in ("item_id", "call_id", "id"):
+            value = dumped.get(key_name)
+            if isinstance(value, str) and value and value not in identity_keys:
+                identity_keys.append(value)
+        identity_keys = self._alias_identity_keys(identity_keys)
         if chunk_type.endswith(".delta"):
             delta = dumped.get("delta")
             if isinstance(delta, str):
-                self.argument_parts_by_item_id.setdefault(item_id, []).append(delta)
+                for identity_key in identity_keys:
+                    self.argument_parts_by_item_id.setdefault(identity_key, []).append(delta)
             return
         arguments = dumped.get("arguments")
         if not isinstance(arguments, str):
-            parts = self.argument_parts_by_item_id.get(item_id)
-            if isinstance(parts, list):
-                arguments = "".join(parts)
+            for identity_key in identity_keys:
+                parts = self.argument_parts_by_item_id.get(identity_key)
+                if isinstance(parts, list):
+                    arguments = "".join(parts)
+                    break
         if isinstance(arguments, str):
             normalized_args, valid = (
                 _responses_request_module._codex_normalized_function_arguments(
@@ -3293,10 +3389,16 @@ class _ResponsesStreamCompletionState:
                     empty_is_object=True,
                 )
             )
-            self.arguments_by_item_id[item_id] = (
-                normalized_args if valid and normalized_args is not None else None
-            )
-            self.finished_argument_item_ids.add(item_id)
+            # Only a usable value is recorded, and only a usable value marks
+            # the call finished.  A malformed value used to be stored as
+            # ``None``, which then shadowed the call's other identity key and
+            # made an already-streamed valid value look absent; an unusable
+            # mirror states nothing, so it must not erase what the stream
+            # delivered nor claim the call is done before a usable value did.
+            if valid and normalized_args is not None:
+                for identity_key in identity_keys:
+                    self.arguments_by_item_id[identity_key] = normalized_args
+                    self.finished_argument_item_ids.add(identity_key)
 
     def _append_synthetic_text(self, text: str) -> None:
         self.synthetic_text = (self.synthetic_text + text)[-_STREAM_SYNTHETIC_TEXT_MAX_CHARS:]
@@ -3754,6 +3856,7 @@ async def _yield_guarded_original_stream(
     pending_tool_items: dict[str, tuple[int, dict[str, Any]]] = {}
     completed_output_items: dict[int, dict[str, Any]] = {}
     internal_bridge_item_ids: set[str] = set()
+    client_open_tool_output_indexes: set[int] = set()
     completion_state = _ResponsesStreamCompletionState(request_data)
     saw_image_generation_activity = False
     saw_web_search_call_activity = False
@@ -3836,8 +3939,90 @@ async def _yield_guarded_original_stream(
             return payload
         return None
 
+    def has_client_visible_unclosed_tool_call() -> bool:
+        """Whether a tool call already shown to the client is still open.
+
+        A Responses client holds a tool call open from its
+        ``response.output_item.added`` until the matching
+        ``response.output_item.done``.  Handing the stream to the bridge
+        restarts the output indexes at 0 and closes only the items the bridge
+        itself creates, so abandoning an open call leaves the client holding a
+        tool call it can never finish.  The model emits parallel calls routinely
+        (an ``Agent`` beside the ``web_search``), and the search call's own
+        ``arguments.done`` is the trigger, so its sibling is already visible --
+        and still streaming -- by then.  The takeover waits for the upstream to
+        close it instead of truncating a call the client asked for.
+        """
+        return bool(client_open_tool_output_indexes)
+
+    def unclosed_client_visible_tool_completion_events() -> list[_JSONStreamEvent]:
+        """Close a client-visible tool call the bridge is about to abandon.
+
+        Reached only when the upstream ended without closing a call the client
+        already saw.  The closing event states the arguments the upstream
+        actually streamed, so the client never runs a tool call with arguments
+        the model never wrote.
+        """
+        events: list[_JSONStreamEvent] = []
+        for item_id, (output_index, item) in sorted(
+            pending_tool_items.items(), key=lambda entry: entry[1][0]
+        ):
+            if item_id in internal_bridge_item_ids:
+                continue
+            done_item = _apply_stream_function_arguments(
+                copy.deepcopy(item),
+                completion_state.arguments_by_item_id,
+            )
+            done_item["status"] = "completed"
+            done_event: dict[str, Any] = {
+                "type": "response.output_item.done",
+                "output_index": output_index,
+                "item": done_item,
+            }
+            if completion_state.model:
+                done_event["model"] = completion_state.model
+            events.append(_json_stream_event(done_event))
+        return events
+
+    def remember_client_tool_call_exposure(chunk: Any) -> None:
+        """Track which tool calls the client was actually told about.
+
+        A Responses client opens a tool call on ``response.output_item.added`` and
+        closes it on ``response.output_item.done``; the bridge takeover replays
+        neither for items the router consumed.  The router's own pending map is
+        not enough: a synthesized or replayed item can be closed in that map
+        without the client ever having seen the opening event.
+        """
+        dumped = _stream_chunk_dump(chunk)
+        if not isinstance(dumped, dict):
+            return
+        chunk_type = _stream_chunk_type(dumped)
+        if chunk_type not in {"response.output_item.added", "response.output_item.done"}:
+            return
+        item = dumped.get("item")
+        if not _stream_output_item_is_tool_call(
+            _responses_web_search_bridge_module._response_item_get(item, "type")
+        ):
+            return
+        output_index = dumped.get("output_index")
+        if not isinstance(output_index, int):
+            return
+        if chunk_type == "response.output_item.added":
+            client_open_tool_output_indexes.add(output_index)
+        else:
+            client_open_tool_output_indexes.discard(output_index)
+
+    def deliver_client_chunk(chunk: Any) -> Any:
+        remember_client_tool_call_exposure(chunk)
+        return _responses_stream_chunk_for_delivery(
+            completion_state.chunk_for_delivery(chunk, request_data),
+            request_data,
+        )
+
     def bridge_payload_for_chunk(chunk: Any) -> Optional[dict[str, Any]]:
         if not should_consume_bridge_calls():
+            return None
+        if has_client_visible_unclosed_tool_call():
             return None
         if _responses_web_search_bridge_module._has_web_search_actions_for_request(chunk, request_data):
             return completion_state.completed_payload(request_data)
@@ -4571,6 +4756,9 @@ async def _yield_guarded_original_stream(
         visible_output_seen = visible_output_seen or _stream_chunk_has_visible_output(chunk)
         bridge_payload = bridge_payload_for_chunk(chunk)
         if bridge_payload is not None:
+            for closed_chunk in unclosed_client_visible_tool_completion_events():
+                remember(closed_chunk)
+                yield closed_chunk
             async for resolved_chunk in yield_resolved_bridge_stream(chunk, bridge_payload):
                 yield resolved_chunk
             return
@@ -4595,6 +4783,7 @@ async def _yield_guarded_original_stream(
                 pending_tool_items,
             ):
                 remember(synthetic_chunk)
+                remember_client_tool_call_exposure(synthetic_chunk)
                 yield synthetic_chunk
             if missing_answer_after_web_search():
                 async for recovered_chunk in yield_recovered_search_tool_answer(
@@ -4605,10 +4794,7 @@ async def _yield_guarded_original_stream(
             if should_suppress_internal_bridge_chunk(chunk):
                 await _close_async_iterator_safely(response)
                 return
-            yield _responses_stream_chunk_for_delivery(
-                completion_state.chunk_for_delivery(chunk, request_data),
-                request_data,
-            )
+            yield deliver_client_chunk(chunk)
             await _close_async_iterator_safely(response)
             return
         elif _responses_stream_chunk_is_incomplete_terminal(chunk):
@@ -4663,10 +4849,7 @@ async def _yield_guarded_original_stream(
             )
         if should_suppress_internal_bridge_chunk(chunk):
             continue
-        yield _responses_stream_chunk_for_delivery(
-            completion_state.chunk_for_delivery(chunk, request_data),
-            request_data,
-        )
+        yield deliver_client_chunk(chunk)
 
     try:
         async for chunk in _stream_with_idle_timeout(
@@ -4722,6 +4905,9 @@ async def _yield_guarded_original_stream(
             visible_output_seen = visible_output_seen or _stream_chunk_has_visible_output(chunk)
             bridge_payload = bridge_payload_for_chunk(chunk)
             if bridge_payload is not None:
+                for closed_chunk in unclosed_client_visible_tool_completion_events():
+                    remember(closed_chunk)
+                    yield closed_chunk
                 async for resolved_chunk in yield_resolved_bridge_stream(chunk, bridge_payload):
                     yield resolved_chunk
                 return
@@ -4752,10 +4938,7 @@ async def _yield_guarded_original_stream(
                 if should_suppress_internal_bridge_chunk(chunk):
                     await _close_async_iterator_safely(response)
                     return
-                yield _responses_stream_chunk_for_delivery(
-                    completion_state.chunk_for_delivery(chunk, request_data),
-                    request_data,
-                )
+                yield deliver_client_chunk(chunk)
                 await _close_async_iterator_safely(response)
                 return
             elif _responses_stream_chunk_is_incomplete_terminal(chunk):
@@ -4810,10 +4993,7 @@ async def _yield_guarded_original_stream(
                 )
             if should_suppress_internal_bridge_chunk(chunk):
                 continue
-            yield _responses_stream_chunk_for_delivery(
-                completion_state.chunk_for_delivery(chunk, request_data),
-                request_data,
-            )
+            yield deliver_client_chunk(chunk)
     except Exception as exc:
         if saw_image_generation_activity:
             completed = completed_image_generation_terminal_event(
@@ -4853,6 +5033,9 @@ async def _yield_guarded_original_stream(
     if not saw_responses_completed:
         bridge_payload = bridge_payload_from_state(require_finished_arguments=True)
         if bridge_payload is not None:
+            for closed_chunk in unclosed_client_visible_tool_completion_events():
+                remember(closed_chunk)
+                yield closed_chunk
             async for resolved_chunk in yield_resolved_bridge_stream(
                 bridge_payload,
                 bridge_payload,
@@ -4884,6 +5067,7 @@ async def _yield_guarded_original_stream(
             completion_state.model,
         ):
             remember(synthetic_chunk)
+            remember_client_tool_call_exposure(synthetic_chunk)
             yield synthetic_chunk
         return
 

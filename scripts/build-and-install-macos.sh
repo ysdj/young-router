@@ -360,17 +360,38 @@ test -x "$STAGED_APP/Contents/Resources/Core/runtime/bin/litellm"
 test -x "$STAGED_APP/Contents/Resources/Core/runtime/bin/node"
 test -x "$STAGED_APP/Contents/Resources/Core/bin/vision_ocr"
 test -f "$STAGED_APP/Contents/Resources/Core/young_router/adapters/pi-web-access/index.ts"
-test -f "$STAGED_APP/Contents/Resources/Core/young_router/adapters/traceone/traceone.js"
-test -f "$STAGED_APP/Contents/Resources/Core/young_router/adapters/traceone/prompt.txt"
+test -f "$STAGED_APP/Contents/Resources/Core/young_router/adapters/veridrop/src/relay_detector/cli.py"
+test -f "$STAGED_APP/Contents/Resources/Core/young_router/adapters/veridrop/LICENSE"
 test -f "$STAGED_APP/Contents/Resources/Core/young_router/adapters/workbuddy-connect/lib/index.js"
 plutil -lint "$STAGED_APP/Contents/Info.plist" >/dev/null
 codesign --verify --deep --strict --verbose=2 "$STAGED_APP"
 printf '%s\n' "Young Router: staged bundle verified"
 
+# The staging directory and the install destination are normally on the same
+# volume, and a same-volume rename moves the verified bundle in constant time
+# where `ditto`'s byte copy of about a gigabyte costs several seconds of the
+# build.  Renaming preserves every nested signature and extended attribute
+# exactly as `ditto` does, because nothing about the files themselves changes;
+# the copy remains the fallback for a cross-volume destination, where rename
+# is impossible.
+stage_verified_bundle() {
+  local destination_device source_device
+  source_device="$(stat -f %d "$STAGE_ROOT" 2>/dev/null || echo "")"
+  destination_device="$(stat -f %d "$(dirname "$INSTALL_STAGE")" 2>/dev/null || echo "")"
+  if [[ -n "$source_device" && "$source_device" == "$destination_device" ]] \
+    && mv "$STAGED_APP" "$INSTALL_STAGE" 2>/dev/null; then
+    return 0
+  fi
+  copy_tree "$STAGED_APP" "$INSTALL_STAGE"
+}
+
 INSTALL_STAGE="$(dirname "$DESTINATION")/.YoungRouter.install.$$.app"
 PREVIOUS_APP="$(dirname "$DESTINATION")/.YoungRouter.previous.$$.app"
 rm -rf "$INSTALL_STAGE" "$PREVIOUS_APP"
-copy_tree "$STAGED_APP" "$INSTALL_STAGE"
+stage_verified_bundle
+# The bytes here are the ones just verified in the staging path, moved rather
+# than rewritten, so this pass confirms the moved bundle kept its signatures
+# instead of re-deriving them from an unchanged tree.
 codesign --verify --deep --strict --verbose=2 "$INSTALL_STAGE"
 
 # Keep the installed service available while the verified replacement takes

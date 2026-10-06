@@ -43,37 +43,66 @@ NON_SECRET_TOKEN_COUNTER_KEYS = frozenset(
 )
 PATH_KEY_MARKERS = ("path", "directory", "dirname", "filename", "file", "cwd", "root")
 SENSITIVE_QUERY_MARKERS = ("key", "token", "secret", "password", "passwd", "credential", "auth")
+# A path value only needs the absolute-path rule when it really carries one.
+_ABSOLUTE_PATH_IN_TEXT = re.compile(r"(?<![A-Za-z0-9:/])/(?:[^\s/:]+/)+[^\s]+")
+_URL_IN_TEXT = re.compile(r"https?://[^\s,;]+")
+# The credential forms REDACT_TEXT masks whatever key they appear under.
+_TEXT_CREDENTIAL_PREFIX = re.compile(r"(?i)\b(?:bearer\s+)?(?:sk|key|token)-[A-Za-z0-9._~-]{8,}\b")
+_TEXT_BEARER = re.compile(r"(?i)\b(?:bearer\s+)[A-Za-z0-9._~-]{8,}\b")
 
 
 def _key_text(key: object) -> str:
     return str(key).strip().lower().replace("-", "_")
 
 
+# Key classification answers the same question for the same key name on every
+# snapshot, and a snapshot asks it once per field.  Remembering the answer for
+# the names a projection actually uses keeps its per-key tuple scans off the
+# repeated path.
+_KEY_CLASSIFICATION_LIMIT = 4096
+_key_classification_cache: "dict[str, tuple[bool, bool]]" = {}
+
+
+def _key_classification(text: str) -> tuple[bool, bool]:
+    """Whether one normalized key name names a secret and an absolute path."""
+
+    cached = _key_classification_cache.get(text)
+    if cached is not None:
+        return cached
+    secret = (
+        False
+        if text in {
+            "key_name",
+            "key_names",
+            "api_key_name",
+            "api_key_names",
+            "key_id",
+            "key_ids",
+            "credential_store",
+            "remember_password",
+            "password_saved",
+        }
+        or text.endswith(("_configured", "_present", "_exists"))
+        else any(marker == text or marker in text for marker in SECRET_KEY_MARKERS)
+    )
+    path = any(marker == text or text.endswith(f"_{marker}") for marker in PATH_KEY_MARKERS)
+    if len(_key_classification_cache) >= _KEY_CLASSIFICATION_LIMIT:
+        _key_classification_cache.clear()
+    _key_classification_cache[text] = (secret, path)
+    return secret, path
+
+
 def is_secret_key(key: object) -> bool:
-    text = _key_text(key)
     # `key_name` / `key_id` are labels, not the credential itself.
     # Presence metadata is deliberately safe to expose as a boolean.  Do not
     # turn fields such as ``token_configured`` into the string marker
     # ``configured``; the shared snapshot contract uses those fields to show
     # whether a credential exists without carrying its value.
-    if text in {
-        "key_name",
-        "key_names",
-        "api_key_name",
-        "api_key_names",
-        "key_id",
-        "key_ids",
-        "credential_store",
-        "remember_password",
-        "password_saved",
-    } or text.endswith(("_configured", "_present", "_exists")):
-        return False
-    return any(marker == text or marker in text for marker in SECRET_KEY_MARKERS)
+    return _key_classification(_key_text(key))[0]
 
 
 def is_path_key(key: object) -> bool:
-    text = _key_text(key)
-    return any(marker == text or text.endswith(f"_{marker}") for marker in PATH_KEY_MARKERS)
+    return _key_classification(_key_text(key))[1]
 
 
 def redact(value: object, *, known_secrets: Sequence[str] = (), _key: object = "") -> object:
@@ -85,36 +114,64 @@ def redact(value: object, *, known_secrets: Sequence[str] = (), _key: object = "
     """
 
     normalized_key = _key_text(_key)
-    if (
-        normalized_key in NON_SECRET_TOKEN_COUNTER_KEYS
-        and isinstance(value, (int, float))
-        and not isinstance(value, bool)
-    ):
-        return copy.deepcopy(value)
-    if is_secret_key(_key):
-        if value in (None, "", False):
-            return value
-        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-            return [REDACTED] if value else []
-        return REDACTED
-    if is_path_key(_key):
-        if value in (None, "", False):
-            return value
-        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-            return [REDACTED] if value else []
-        return REDACTED
+    if normalized_key and normalized_key not in NON_SECRET_TOKEN_COUNTER_KEYS:
+        secret_key, path_key = _key_classification(normalized_key)
+        if secret_key or path_key:
+            if value in (None, "", False):
+                return value
+            if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+                return [REDACTED] if value else []
+            return REDACTED
 
     secret_values = {item for item in known_secrets if isinstance(item, str) and item}
     if isinstance(value, str):
-        return REDACT_TEXT(value, secret_values=secret_values)
+        # A snapshot runs this over every string it exposes.  REDACT_TEXT
+        # normally returns such a value untouched, so the cheap test answers
+        # that case directly; anything it cannot prove unchanged takes the
+        # original path.
+        if _plain_string_is_safe(value, secret_values):
+            return value
+        return REDACT_TEXT(value, secret_values=set(secret_values))
     if isinstance(value, Mapping):
         return {
-            str(key): redact(item, known_secrets=tuple(secret_values), _key=key)
+            str(key): redact(item, known_secrets=known_secrets, _key=key)
             for key, item in value.items()
         }
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        return [redact(item, known_secrets=tuple(secret_values)) for item in value]
+        return [redact(item, known_secrets=known_secrets) for item in value]
     return copy.deepcopy(value)
+
+
+def _plain_string_is_safe(value: str, secret_values: set[str]) -> bool:
+    """The bounded proof that REDACT_TEXT leaves this string as it is.
+
+    Every rule REDACT_TEXT applies fires only on a shape one of its own
+    patterns matches, so probing with those same patterns is the same decision
+    without the rewrite, the per-rule substitution, and the whitespace join.
+    Each pattern also needs a literal its own alternatives contain, so the
+    probe runs at all only for a string that carries one — which is what keeps
+    a snapshot's thousands of plain identifiers off the matcher.
+    """
+
+    if not value:
+        return True
+    if secret_values and any(secret in value for secret in secret_values):
+        return False
+    for character in value:
+        if character.isspace() or not character.isascii():
+            # Whitespace is joined; a non-ASCII value still has to prove it.
+            return False
+    if "-" in value and _TEXT_CREDENTIAL_PREFIX.search(value):
+        return False
+    # A bearer credential needs a space to separate its two words, and the
+    # whitespace scan above already refuses every string that has one.
+    if "http" in value and _URL_IN_TEXT.search(value):
+        return False
+    if "/" in value and _ABSOLUTE_PATH_IN_TEXT.search(value):
+        return False
+    if ("=" in value or ":" in value) and _TEXT_KEY_VALUE.search(value):
+        return False
+    return True
 
 
 def REDACT_TEXT(value: str, *, secret_values: set[str] | None = None) -> str:
@@ -126,8 +183,8 @@ def REDACT_TEXT(value: str, *, secret_values: set[str] | None = None) -> str:
             text = text.replace(secret, REDACTED)
     # Provider keys frequently use the OpenAI-looking ``sk-`` prefix.  Keep
     # this generic and bounded; never echo the original token in a traceback.
-    text = re.sub(r"(?i)\b(?:bearer\s+)?(?:sk|key|token)-[A-Za-z0-9._~-]{8,}\b", REDACTED, text)
-    text = re.sub(r"(?i)\b(?:bearer\s+)[A-Za-z0-9._~-]{8,}\b", "Bearer " + REDACTED, text)
+    text = _TEXT_CREDENTIAL_PREFIX.sub(REDACTED, text)
+    text = _TEXT_BEARER.sub("Bearer " + REDACTED, text)
     text = _redact_url_text(text)
     text = _redact_key_value_text(text)
     # Absolute paths are private even when no secret is present.  Preserve a
@@ -135,7 +192,12 @@ def REDACT_TEXT(value: str, *, secret_values: set[str] | None = None) -> str:
     # A slash immediately following ``:`` or another slash belongs to a URL,
     # not a local absolute path. URLs have already had credentials and
     # sensitive query values removed by ``_redact_url_text`` above.
-    text = re.sub(r"(?<![A-Za-z0-9:/])/(?:[^\s/:]+/){1,}[^\s]+", "<private-path>", text)
+    #
+    # Both rules below are searched first: a snapshot runs this over every
+    # string it exposes, provider URLs and API bases included, and the
+    # patterns only ever fire on text that actually looks like one.
+    if _ABSOLUTE_PATH_IN_TEXT.search(text):
+        text = _ABSOLUTE_PATH_IN_TEXT.sub("<private-path>", text)
     text = " ".join(text.split())
     return text[:512]
 
@@ -195,7 +257,7 @@ def _redact_url_text(value: str) -> str:
             query.append((key, item))
         return urlunsplit((parsed.scheme, host, parsed.path, urlencode(query), parsed.fragment))
 
-    return re.sub(r"https?://[^\s,;]+", replace, value)
+    return re.sub(_URL_IN_TEXT, replace, value)
 
 
 def safe_error_message(message: object, *, known_secrets: Sequence[str] = ()) -> str:

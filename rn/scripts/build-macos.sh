@@ -74,9 +74,9 @@ PI_WEB_ACCESS_NODE_WORK="$RUNTIME_WORK/node"
 "${PI_WEB_ACCESS_UPDATE_COMMAND[@]}" "$PROJECT_ROOT/scripts/update_pi_web_access.py" \
   --output "$PI_WEB_ACCESS_PACKAGE_WORK" \
   --node-output "$PI_WEB_ACCESS_NODE_WORK"
-# The degradation deep test runs the latest upstream TraceOne, so every
+# The authenticity deep test runs the latest upstream Veridrop, so every
 # artifact build re-checks its default branch instead of packaging a stale
-# classifier copy.
+# copy of the scan program.
 # WorkBuddy access is driven through the published third-party package, so
 # every artifact build re-resolves its latest release instead of shipping a
 # stale protocol copy.
@@ -92,7 +92,7 @@ PI_WEB_ACCESS_NODE_WORK="$RUNTIME_WORK/node"
 # slowest one. Every script still runs on every build, so the mandatory
 # re-check against upstream is unchanged — only its wall clock is.
 WORKBUDDY_CONNECT_WORK="$RUNTIME_WORK/workbuddy-connect"
-TRACEONE_WORK="$RUNTIME_WORK/traceone"
+VERIDROP_WORK="$RUNTIME_WORK/veridrop"
 DSH_VISION_ROUTER_WORK="$RUNTIME_WORK/dsh-vision-router"
 # Each job is started in this shell, not inside a command substitution: a
 # substitution runs in a subshell, so a job it launches is not a child of the
@@ -101,8 +101,8 @@ STAGING_PIDS=()
 "${PI_WEB_ACCESS_UPDATE_COMMAND[@]}" "$PROJECT_ROOT/scripts/update_workbuddy_connect.py" \
   --output "$WORKBUDDY_CONNECT_WORK" &
 STAGING_PIDS+=("$!")
-"${PI_WEB_ACCESS_UPDATE_COMMAND[@]}" "$PROJECT_ROOT/scripts/update_traceone.py" \
-  --output "$TRACEONE_WORK" &
+"${PI_WEB_ACCESS_UPDATE_COMMAND[@]}" "$PROJECT_ROOT/scripts/update_veridrop.py" \
+  --output "$VERIDROP_WORK" &
 STAGING_PIDS+=("$!")
 "${PI_WEB_ACCESS_UPDATE_COMMAND[@]}" "$PROJECT_ROOT/scripts/update_dsh_vision_router.py" \
   --output "$DSH_VISION_ROUTER_WORK" &
@@ -203,7 +203,7 @@ rsync -a \
   --exclude '*.pyo' \
   "$PROJECT_ROOT/young_router/" "$CORE/young_router/"
 copy_tree "$PI_WEB_ACCESS_PACKAGE_WORK" "$CORE/young_router/adapters/pi-web-access"
-copy_tree "$TRACEONE_WORK" "$CORE/young_router/adapters/traceone"
+copy_tree "$VERIDROP_WORK" "$CORE/young_router/adapters/veridrop"
 copy_tree "$WORKBUDDY_CONNECT_WORK" "$CORE/young_router/adapters/workbuddy-connect"
 copy_tree "$DSH_VISION_ROUTER_WORK" "$CORE/young_router/adapters/dsh-vision-router"
 
@@ -252,6 +252,18 @@ cp "$PROJECT_ROOT/LITELLM_VERSION" "$CORE/runtime/LITELLM_VERSION"
 mkdir -p "$CORE/runtime/bin"
 copy_tree "$PI_WEB_ACCESS_NODE_WORK" "$CORE/runtime/bin"
 
+# The staged scan program is imported into the Core's own interpreter, so what
+# it imports and the bundled runtime does not already carry is added to that
+# runtime here - and only that: a dependency the runtime already has is never
+# upgraded under the release's own pins.
+"$CORE/runtime/python/bin/python3.12" "$PROJECT_ROOT/scripts/update_veridrop.py" \
+  --output "$VERIDROP_WORK" \
+  --install-deps "$CORE/runtime/site-packages" \
+  --python "$CORE/runtime/python/bin/python3.12" || {
+  echo "Could not complete the bundled Veridrop dependencies." >&2
+  exit 5
+}
+
 VISION_HELPER_SOURCE="$APP_ROOT/src/native/macos/VisionOCR.swift"
 VISION_HELPER="$CORE/bin/vision_ocr"
 mkdir -p "$CORE/bin"
@@ -289,12 +301,12 @@ fi
   echo "The bundled pi-web-access package is missing." >&2
   exit 5
 }
-[[ -f "$CORE/young_router/adapters/traceone/traceone.js" ]] || {
-  echo "The bundled TraceOne degradation engine is missing." >&2
+[[ -f "$CORE/young_router/adapters/veridrop/src/relay_detector/cli.py" ]] || {
+  echo "The bundled Veridrop scan program is missing." >&2
   exit 5
 }
-[[ -f "$CORE/young_router/adapters/traceone/prompt.txt" ]] || {
-  echo "The bundled TraceOne identity prompt is missing." >&2
+[[ -f "$CORE/young_router/adapters/veridrop/LICENSE" ]] || {
+  echo "The bundled Veridrop license text is missing." >&2
   exit 5
 }
 [[ -f "$CORE/young_router/adapters/workbuddy_stream.mjs" ]] || {
@@ -358,14 +370,29 @@ import(process.argv[1]).then((m) => {
   echo "The bundled dsh-workbuddy-connect package no longer exports the surface the worker uses." >&2
   exit 5
 fi
-# A staged classifier that cannot load would turn every deep test into an
-# inconclusive result, so the bundle verifies one real attribution first.
-if ! printf '%s\n' '{"id":"bundle-smoke","text":"[[1]]"}' | "$CORE/runtime/bin/node" \
-  "$CORE/young_router/adapters/traceone_worker.mjs" --dir "$CORE/young_router/adapters/traceone" \
-  | grep -q '"id":"bundle-smoke"'; then
-  echo "The bundled TraceOne worker could not run the staged classifier." >&2
+# The staged program is imported into the Core's own interpreter, so the bundle
+# proves that import - and the dependency set the runtime was completed with -
+# before the app is installed: a module that cannot be imported here would
+# otherwise surface as a failed deep test long after the build.
+if ! VERIDROP_SMOKE_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 "$CORE/runtime/bin/python" -c "
+import sys
+sys.path.insert(0, '$CORE/young_router/adapters/veridrop/src')
+import relay_detector.cli
+import relay_detector.protocols.anthropic
+import relay_detector.protocols.openai
+import relay_detector.protocols.gemini
+print('young-router-veridrop-import-ok')
+" 2>&1)"; then
+  echo "The bundled Veridrop program could not be imported: $VERIDROP_SMOKE_OUTPUT" >&2
   exit 5
 fi
+case "$VERIDROP_SMOKE_OUTPUT" in
+  *young-router-veridrop-import-ok*) ;;
+  *)
+    echo "The bundled Veridrop import smoke test printed no confirmation." >&2
+    exit 5
+    ;;
+esac
 [[ "$(tr -d '[:space:]' < "$CORE/runtime/LITELLM_VERSION")" == "$(tr -d '[:space:]' < "$PROJECT_ROOT/LITELLM_VERSION")" ]] || {
   echo "The bundled Core runtime does not contain the pinned LiteLLM release lock." >&2
   exit 5

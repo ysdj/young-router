@@ -9,7 +9,8 @@ the published package on every artifact build.  This module owns only what the
 gateway needs around it:
 
 * one long-lived Node worker per Core process, started on a loopback port with
-  an inbound bearer this process generates, and
+  an inbound bearer this process generates, supervised for as long as this
+  Core runs, and
 * the two environment references the managed LiteLLM child resolves
   (``YOUNG_ROUTER_WORKBUDDY_BASE`` / ``..._AI_BASE`` and the matching keys) so
   no port or token ever reaches ``config.yaml``.
@@ -76,6 +77,12 @@ _WORKBUDDY_WORKER_ENV = "YOUNG_ROUTER_WORKBUDDY_WORKER"
 _WORKBUDDY_START_TIMEOUT_SECONDS = 45.0
 _WORKBUDDY_STATUS_TIMEOUT_SECONDS = 20.0
 _WORKBUDDY_MODELS_TIMEOUT_SECONDS = 90.0
+# A worker that served for at least this long died a casualty, not a defect:
+# it is replaced on the spot.  One that dies younger is restarted on the next
+# delay step instead, and one that keeps dying young is left to the demand
+# path (a pane read, the next proxy launch) after the steps run out.
+_WORKBUDDY_SETTLED_SECONDS = 60.0
+_WORKBUDDY_RESTART_DELAYS_SECONDS = (0.0, 0.5, 2.0, 5.0, 15.0)
 
 
 class WorkBuddyUnavailable(RuntimeError):
@@ -166,6 +173,12 @@ class WorkBuddyRuntime:
         self.root = base / ".litellm-runtime" / "workbuddy"
         self._lock = threading.RLock()
         self._process: subprocess.Popen[bytes] | None = None
+        # Set while this runtime wants no worker at all: a released runtime
+        # must not have one resurrected by the supervision of the worker it
+        # just stopped.
+        self._released = threading.Event()
+        self._restart_step = 0
+        self._started_at = 0.0
         self._port = 0
         self._token = ""
         self._environment: dict[str, str] = {}
@@ -216,6 +229,11 @@ class WorkBuddyRuntime:
         with self._lock:
             if self._healthy():
                 return True
+            # A worker asked for by name - a pane read, a probe, the next
+            # proxy launch - gets the full restart budget again: the steps
+            # below bound what supervision does on its own, never what the
+            # user's own read asks for.
+            self._restart_step = 0
             started = self._start()
             if started:
                 # Core-side probes and model-list reads resolve the same
@@ -234,6 +252,9 @@ class WorkBuddyRuntime:
         # replacement Core or a restarted worker has to reclaim.
         remembered = self._port
         self._stop_locked()
+        # A worker is wanted again: the release the teardown just signalled
+        # must not end this generation's supervision.
+        self._released.clear()
         if not available():
             return False
         node = node_command()
@@ -248,12 +269,97 @@ class WorkBuddyRuntime:
         if ready is None:
             ready = self._spawn(node, worker, 0)
         if ready is None:
+            # A start that produced no worker leaves the address a running
+            # proxy resolved exactly where it was.  Forgetting it would send
+            # the next attempt to a port nobody was told about - a live worker
+            # behind a proxy still calling a dead one, which is worse than the
+            # failure it replaced.
+            self._port = remembered
+            self._environment = self._proxy_environment() if remembered else {}
+            self._publish_environ_locked()
             return False
         self._port = int(ready.get("port") or 0)
         self._environment = self._proxy_environment()
         self._status_cache = None
+        self._started_at = time.monotonic()
         self._persist_state()
+        # The fragment this process hands out is the address the worker it just
+        # started serves, so Core-side reads resolve what the proxy child does.
+        self._publish_environ_locked()
+        self._watch_locked(self._process)
         return self._port > 0
+
+    def _watch_locked(self, process: subprocess.Popen[bytes] | None) -> None:
+        """Supervise one worker for as long as this runtime owns it."""
+
+        if process is None:
+            return
+        threading.Thread(
+            target=self._supervise,
+            args=(process,),
+            name="young-router-workbuddy-supervisor",
+            daemon=True,
+        ).start()
+
+    def _supervise(self, process: subprocess.Popen[bytes] | None) -> None:
+        """Replace a worker that exited without this runtime asking it to.
+
+        A worker the upstream sidecar decides to end takes every WorkBuddy
+        route with it: the running proxy resolved its loopback base URL from
+        its own environment when it launched and cannot learn another one, and
+        nothing on the request path ever asks Core for a worker - the table
+        projects the last observed account instead.  Every such route then
+        reads as a temporary upstream failure for as long as the app runs.
+
+        One thread per worker blocks on the process itself, so an idle runtime
+        costs nothing and a death is repaired on the remembered port the proxy
+        is already calling.  The delay steps bound a worker that keeps dying
+        young - a broken integration, not a casualty - and a start that
+        produced no worker at all is its own kind of young death, so one
+        transient failure never ends the supervision that owes the proxy a
+        listener.
+        """
+
+        while True:
+            if process is not None:
+                process.wait()
+                with self._lock:
+                    if self._process is not process:
+                        # This runtime stopped or replaced the worker itself;
+                        # its own teardown decided what happens next.
+                        return
+                    self._process = None
+                    # The exit was not this runtime's doing, but the pipe it
+                    # read the readiness line through is still open.
+                    self._stop_process(process)
+                    settled = time.monotonic() - self._started_at >= _WORKBUDDY_SETTLED_SECONDS
+            else:
+                settled = False
+            with self._lock:
+                if self._released.is_set():
+                    return
+                if settled:
+                    # A worker that served for a while is a casualty: replace
+                    # it at once and forget any earlier young death.
+                    self._restart_step = 0
+                else:
+                    self._restart_step = min(
+                        self._restart_step + 1, len(_WORKBUDDY_RESTART_DELAYS_SECONDS)
+                    )
+                step = self._restart_step
+            if step >= len(_WORKBUDDY_RESTART_DELAYS_SECONDS):
+                return
+            delay = _WORKBUDDY_RESTART_DELAYS_SECONDS[step]
+            if delay and self._released.wait(delay):
+                return
+            with self._lock:
+                if self._released.is_set() or self._process is not None:
+                    return
+                try:
+                    started = self._start() and self._process is not None
+                except Exception:
+                    started = False
+                process = self._process if started else None
 
     def _spawn(self, node: str, worker: Path, port: int) -> dict[str, Any] | None:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -339,8 +445,16 @@ class WorkBuddyRuntime:
     def stop(self) -> None:
         with self._lock:
             self._stop_locked()
+            # A released runtime starts over: the worker started after this one
+            # gets the full restart budget again.
+            self._restart_step = 0
 
     def _stop_locked(self) -> None:
+        # This runtime wants no worker until the next ``_start``: the release is
+        # what stops the supervision of the worker being stopped here from
+        # replacing it, and what ends a restart that is still waiting out its
+        # delay step.
+        self._released.set()
         process, self._process = self._process, None
         self._port = 0
         self._environment = {}
@@ -354,22 +468,31 @@ class WorkBuddyRuntime:
 
     @staticmethod
     def _stop_process(process: subprocess.Popen[bytes]) -> None:
-        if process.poll() is not None:
-            return
-        # The worker shares Core's process group, so signals address its pid:
-        # a group signal would reach this process and everything beside it.
         try:
-            process.terminate()
-        except OSError:
-            return
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline and process.poll() is None:
-            time.sleep(0.05)
-        if process.poll() is None:
-            try:
-                process.kill()
-            except OSError:
-                pass
+            if process.poll() is None:
+                # The worker shares Core's process group, so signals address
+                # its pid: a group signal would reach this process and
+                # everything beside it.
+                try:
+                    process.terminate()
+                except OSError:
+                    return
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline and process.poll() is None:
+                    time.sleep(0.05)
+                if process.poll() is None:
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+        finally:
+            # Reading the readiness line opened this pipe; a replaced worker
+            # would otherwise leave one descriptor per generation behind.
+            if process.stdout is not None:
+                try:
+                    process.stdout.close()
+                except OSError:
+                    pass
 
     # -- control surface --------------------------------------------------
 

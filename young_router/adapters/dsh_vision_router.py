@@ -4,7 +4,7 @@ Upstream (https://github.com/ysr666/dsh-vision-router) is a Node module and
 cannot be imported into the Python LiteLLM process, so
 ``scripts/update_dsh_vision_router.py`` stages its npm ``latest`` release into
 the Core bundle and ``dsh_vision_worker.mjs`` calls it through the bundled
-Node.js runtime — the same arrangement as the ``pi-web-access``, TraceOne, and
+Node.js runtime — the same arrangement as the ``pi-web-access``, Veridrop, and
 WorkBuddy bridges.  The provider chain this module routes through is therefore
 the one upstream computes: a release that changes the free OVH models, their
 order, or the local Ollama/LM Studio shapes changes what Core routes to without

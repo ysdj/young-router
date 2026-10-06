@@ -16,14 +16,16 @@ from __future__ import annotations
 import http.client
 import json
 import os
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Callable, Iterable, Iterator
 
@@ -35,6 +37,39 @@ PACKAGE_VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.
 
 class UpdateError(RuntimeError):
     """A build dependency could not be resolved or staged."""
+
+
+#: One pooled HTTPS connection per thread, reused across a staging script's
+#: downloads.  A run that fetches a release index and then a tarball pays one
+#: DNS lookup and one TLS handshake instead of one of each per file, which on
+#: this build machine is several seconds of wall clock per skipped handshake.
+#: Thread-local keeps the parallel staging jobs from sharing one socket, and a
+#: connection that a server retired is simply replaced on the next request.
+_DOWNLOAD_CONNECTIONS: threading.local = threading.local()
+
+
+def _open_connection(origin: str, timeout: int) -> http.client.HTTPSConnection:
+    """The one place a staged download opens a connection.
+
+    Kept as its own function so a test can substitute a local server without
+    rebinding ``http.client.HTTPSConnection``: that name is resolved by CPython
+    itself while connecting, so patching it would redirect the standard library
+    rather than this module.
+    """
+
+    return http.client.HTTPSConnection(origin, timeout=timeout)
+
+
+def _pooled_connection(origin: str, timeout: int) -> http.client.HTTPSConnection:
+    connections = getattr(_DOWNLOAD_CONNECTIONS, "connections", None)
+    if connections is None:
+        connections = {}
+        _DOWNLOAD_CONNECTIONS.connections = connections
+    connection = connections.get(origin)
+    if connection is None:
+        connection = _open_connection(origin, timeout)
+        connections[origin] = connection
+    return connection
 
 
 def request_bytes(url: str, *, timeout: int, user_agent: str) -> bytes:
@@ -54,8 +89,51 @@ def request_bytes(url: str, *, timeout: int, user_agent: str) -> bytes:
     raise UpdateError(f"Could not download {url}: {last_error}") from last_error
 
 
+def download_bytes(url: str, *, timeout: int, user_agent: str) -> bytes:
+    """Download ``url`` over the pooled connection, falling back to urllib.
+
+    The connection is reused for the rest of the staging run, so a run that
+    fetches an index and then a tarball does one TLS handshake rather than two.
+    ``Connection: keep-alive`` is deliberately not sent: HTTP/1.1 defaults to
+    persistent, which is what makes the reuse possible, and the header would
+    only be a redundant thing for the origin to parse.
+
+    Every connection is established with its own ``connect()`` before being
+    cached, so a request that fails mid-flight leaves no half-open socket to
+    reuse: the failure falls back to ``request_bytes``' own fresh-connection
+    retry ladder below, which is also the path for a non-HTTPS URL.
+    """
+
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or not parsed.netloc:
+        return request_bytes(url, timeout=timeout, user_agent=user_agent)
+    origin = parsed.netloc
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    headers = {"Accept": "*/*", "User-Agent": user_agent}
+    try:
+        connection = _pooled_connection(origin, timeout)
+        connection.request("GET", path, headers=headers)
+        response = connection.getresponse()
+        if response.status != 200:
+            # A 3xx must go back through urllib: the pooled connection does not
+            # follow redirects, and silently returning an error body would be
+            # worse than the second handshake.
+            with suppress(Exception):
+                connection.close()
+            return request_bytes(url, timeout=timeout, user_agent=user_agent)
+        return response.read()
+    except (http.client.HTTPException, OSError, TimeoutError):
+        # A pooled connection a server retired is replaced, not re-requested
+        # on: the caller gets urllib's full retry ladder on a fresh socket.
+        with suppress(Exception):
+            connection.close()
+        return request_bytes(url, timeout=timeout, user_agent=user_agent)
+
+
 def request_json(url: str, *, timeout: int, user_agent: str) -> Any:
-    raw = request_bytes(url, timeout=timeout, user_agent=user_agent)
+    raw = download_bytes(url, timeout=timeout, user_agent=user_agent)
     try:
         return json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -368,6 +446,7 @@ __all__ = [
     "PACKAGE_VERSION_PATTERN",
     "UpdateError",
     "copy_tree",
+    "download_bytes",
     "find_npm",
     "find_package_manager",
     "flatten_npm_package",

@@ -101,6 +101,7 @@ const zh: Record<string, RuntimeCopy> = {
   LITELLM_PORT: { label: "本地端口", help: "LiteLLM 代理的本地 HTTP 端口。修改后会更新健康检查，且需要重启服务。" },
   LITELLM_NUM_WORKERS: { label: "工作进程数", help: "macOS 使用 Uvicorn 工作进程以保证本地 Responses 流稳定；其他主机可使用设定的进程数。" },
   LITELLM_HEALTH_WAIT_SECONDS: { label: "健康检查等待", help: "启动或重启时等待健康检查地址的最长时间；超过后刚启动的进程会被回收。" },
+  YOUNG_ROUTER_RELAY_SESSION_RECHECK_SECONDS: { label: "中转站登录复核窗口", help: "同一次登录观察在该时间内会直接回答后续的登录检查。每次进入供应商详情都会复核账号的站点会话，而每次复核都是一次站点往返；在此窗口内会沿用刚验证过的会话，因此重新进入面板不会重新登录、不重读站点，也不会刷新登录状态。设为 0 则每次进入都重新复核。" },
 };
 
 const options: Record<string, Record<string, string>> = {

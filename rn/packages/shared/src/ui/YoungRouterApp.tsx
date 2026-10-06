@@ -19,6 +19,7 @@ import {
   providedKeyRows,
   type ProvidedKeyRow,
   pendingCredentialCleanups,
+  relaySessionRecheckSeconds,
   StationAccountsPanel,
   stationDisplayName,
   stationOriginKey,
@@ -252,8 +253,11 @@ function officialStatusLabel(status: ProviderAuthStatus, translate: Translate): 
  * The WorkBuddy account's remaining credit, as the desktop app reports it.
  *
  * The value is the upstream's own number of credits, not a currency: the
- * wizard shows it beside the account so a signed-in-but-out-of-credit account
- * is visible before models are added.
+ * account block shows it beside the account so a signed-in-but-out-of-credit
+ * account is visible before a request fails on it.  A read that did not ask
+ * for the credit document carries no ``credits`` field at all, and the empty
+ * string it produces here means exactly that — see
+ * {@link workbuddyAccountFacts} for how the block reports it.
  */
 function workbuddyCreditsText(account: UnknownRecord | undefined, translate: Translate): string {
   const credits = asRecord(account?.credits);
@@ -261,6 +265,42 @@ function workbuddyCreditsText(account: UnknownRecord | undefined, translate: Tra
   const total = credits.total;
   return typeof total === "number" && Number.isFinite(total) ? String(total) : "";
 }
+
+/**
+ * Whether a record states a remaining credit at all.
+ *
+ * The worker fills ``credits`` only on a read that asked for it; a plain
+ * account read answers the sign-in question alone and answers ``null``.  The
+ * pane therefore tells “no credit was stated” apart from “the credit is
+ * zero”, and the two must never render as the same number.
+ *
+ * The check never renders, so it does not take a translator: an unlimited
+ * account states a credit the same way a counted one does.
+ */
+function workbuddyCreditsStated(account: UnknownRecord | undefined): boolean {
+  const credits = asRecord(account?.credits);
+  if (credits.unlimited === true) return true;
+  const total = credits.total;
+  return typeof total === "number" && Number.isFinite(total);
+}
+
+/**
+ * The account facts one WorkBuddy block states.
+ *
+ * The block's own live read is authoritative for what it answered, and the
+ * record Core last observed fills in the rest.  That matters for the credit
+ * in particular: a live read whose upstream call failed comes back signed in
+ * with no credit at all, and blanking a credit the pane was already showing
+ * (or the projection carries) would replace a stated number with a wait.  So
+ * an unstated credit keeps the observed one, and only when neither states a
+ * credit does the block report that no read produced one.
+ */
+function workbuddyAccountFacts(live: UnknownRecord, observed: UnknownRecord): UnknownRecord {
+  const merged: UnknownRecord = { ...observed, ...live };
+  if (!workbuddyCreditsStated(live) && workbuddyCreditsStated(observed)) merged.credits = observed.credits;
+  return merged;
+}
+
 
 /** One model's credit multiplier, as the catalog spells it (e.g. `x0.29`). */
 function workbuddyModelRate(model: UnknownRecord, translate: Translate): string {
@@ -394,8 +434,8 @@ const SETTINGS_TITLEBAR_INSET = Platform.OS === "macos" ? 32 : 0;
 // One header band, one height: the sidebar's app icon and the pane's own
 // title are set to the same height so the two headers align.  Neither header
 // draws a hairline of its own — the window states its structure with the box
-// around each list and the sidebar's own right edge, never with a rule that
-// crosses the header band (see the settings column edges).
+// around each content list and the two columns' own right edges, never with a
+// rule that crosses a header band.
 const SETTINGS_HEADER_CONTENT_HEIGHT = 20;
 const COLUMN_GAP = 8;
 /**
@@ -835,8 +875,38 @@ const TRANSIENT_READ_ACTIONS: ReadonlySet<string> = new Set([
   "provider_auth_status",
 ]);
 
-function isTransientReadAction(type: string): boolean {
-  return TRANSIENT_READ_ACTIONS.has(type.replace(/[.-]/g, "_").toLowerCase());
+/**
+ * Actions whose answer is a read of external state rather than a staged edit:
+ * the key list a station reported, an official-account authorization poll, a
+ * live model fetch.  They change no draft, but each one still advances Core's
+ * shared revision, so the shell's debounced Apply cannot key itself on the
+ * revision alone — every such read looks like a pending local edit and
+ * collects a fresh Core Apply a fraction of a second after the user's own
+ * commit already applied.  Retry semantics are unaffected: the retryable set
+ * below already covers all of them because it is broader.
+ */
+const NON_STAGING_ACTIONS: ReadonlySet<string> = new Set([
+  ...TRANSIENT_READ_ACTIONS,
+  "provider_fetch_models",
+  "providers_fetch_models",
+  "fetch_models",
+  "provider_fetch_relay_resource_models",
+  "provider_select_relay_station",
+  "provider_auth_start",
+  "provider_auth_cancel",
+  "provider_auth_logout",
+  "service_provider_auth_start",
+  "service_provider_auth_cancel",
+  "service_provider_auth_logout",
+  "service_provider_add",
+  "service_add_provider",
+  "provider_probe",
+  "probe",
+  "reset_transient_routing_state",
+]);
+
+function isNonStagingAction(type: string): boolean {
+  return NON_STAGING_ACTIONS.has(type.replace(/[.-]/g, "_").toLowerCase());
 }
 
 function isRevisionRetryableAction(type: string): boolean {
@@ -1527,6 +1597,14 @@ function SettingsShell({ route, windowRoute, snapshot, ipc, native, translate, l
         striped={false}
         compact={false}
         sourceList
+        // The sidebar draws no list frame.  A source list on a vibrant
+        // sidebar material is bounded by the material itself, so the 1 pt
+        // box only read as three lines floating over it: the top and bottom
+        // rules that did not belong to any row, and a right edge drawn
+        // where the column already ends.  The rail is the one other list
+        // without a frame, for the reason its own component states; every
+        // content list keeps its box.
+        framed={false}
         rowSymbols={paneSymbols}
         rowSymbolColors={paneSymbolColors}
         rowImageNames={paneImageNames}
@@ -1560,9 +1638,9 @@ function SettingsShell({ route, windowRoute, snapshot, ipc, native, translate, l
  * platform's own in-pane rows sit under its sidebar rows (a macOS sidebar row
  * measures 32 pt, a single-line row inside a pane about 28 pt).  A source list
  * draws no box of its own either: the rail is already bounded by its one right
- * divider, so the list it renders stays borderless, and its selection capsule
- * keeps the platform's inset on both ends — the same rhythm the sidebar's own
- * rows are drawn with.
+ * divider, so the list it renders stays borderless (`framed={false}`), and its
+ * selection capsule keeps the platform's inset on both ends — the same rhythm
+ * the sidebar's own rows are drawn with.
  */
 const SETTINGS_RAIL_WIDTH = 156;
 const SETTINGS_RAIL_COLUMN_WIDTH = 148;
@@ -1591,9 +1669,12 @@ function SettingsRail({ rows, selectedKey, onSelectionChange }: {
   selectedKey: string;
   onSelectionChange: (key: string) => void;
 }): React.JSX.Element {
-  // The rail draws its one divider, and the list inside it keeps the native
-  // frame: a bordered table is how the user knows where a list ends, so the
-  // rail is the one column that shows a list box as well as a right edge.
+  // The rail draws its one divider and the list inside it draws no box: the
+  // rail is a column of the pane, not a list floating in content, so a frame's
+  // top and bottom rules belonged to no row and its right edge doubled the
+  // divider that already states where the column ends.  A source list carries
+  // its own selection capsule and row rhythm, which is what tells the rows
+  // apart; the rail's single right divider is its only rule.
   return <View style={styles.settingsRail}>
     <NativeTable
       columns={[{ label: "", width: SETTINGS_RAIL_COLUMN_WIDTH }]}
@@ -1602,6 +1683,7 @@ function SettingsRail({ rows, selectedKey, onSelectionChange }: {
       striped={false}
       compact
       sourceList
+      framed={false}
       cellHorizontalPadding={8}
       firstColumnHorizontalPadding={8}
       onSelectionChange={onSelectionChange}
@@ -1615,8 +1697,10 @@ function SettingsRail({ rows, selectedKey, onSelectionChange }: {
  * The detail header of a split settings pane — the selected rail row's name,
  * its one-line hint when the pane has one, and the pane's own controls on the
  * trailing edge. External clients and runtime settings render this one surface,
- * so the third column keeps one header height, one type step, and one divider
- * across panes instead of each pane drawing its own header band.
+ * so the third column keeps one header height and one type step across panes
+ * instead of each pane drawing its own header band. The band carries no rule
+ * of its own: the header is a title over content, not a bordered section, and
+ * the rule under it read as an artifact across the full detail width.
  */
 function SettingsDetailHeader({ title, hint, actions }: { title: string; hint?: string; actions?: React.ReactNode }): React.JSX.Element {
   return <View style={styles.settingsRailDetailHeader}>
@@ -1873,11 +1957,15 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
       revision.current = staged.revision;
       return staged;
     };
-    const transient = isTransientReadAction(type);
-    const queued = transient
+    // A read that stages nothing must not hold — or be held by — the queue of
+    // edits: a relay refresh, a model fetch, and an authorization poll all
+    // wait on an external service, and the user's next edit belongs in front
+    // of them, not behind them.  Everything else keeps the buffered order.
+    const unbuffered = isNonStagingAction(type);
+    const queued = unbuffered
       ? issue()
       : dispatchQueue.current.catch(() => undefined).then(issue);
-    if (!transient) dispatchQueue.current = queued.then(() => undefined, () => undefined);
+    if (!unbuffered) dispatchQueue.current = queued.then(() => undefined, () => undefined);
     return queued;
   };
   // The General pane's service actions share the buffered queue, the live route
@@ -2198,7 +2286,16 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
         revision.current = current.revision;
         latestSnapshot.current = current;
         onSnapshot(current);
-        result = await applyOnce(current.revision);
+        // The domains this Apply named are no longer staged at the newer
+        // revision: the write it was racing already committed them, so the
+        // outcome the user asked for exists. Report that instead of failing
+        // the commit — a window whose own background Apply finished first is
+        // the ordinary case here, not a change made outside the window.
+        if (currentDomains.length === 0) {
+          result = { revision: current.revision, applied: true, status: "applied", domains: [...domains], completed_operations: 0, pending_operations: 0, issues: [] };
+        } else {
+          result = await applyOnce(current.revision);
+        }
       }
       if (domains.includes("codex") || domains.includes("claude") || domains.includes("clients")) {
         setSettingsRawBaselineToken((current) => current + 1);
@@ -2219,12 +2316,24 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
   // coalesces a burst of toggles into one Core apply. A failed apply keeps its
   // draft dirty but is not retried until the next edit changes the revision,
   // so a validation error cannot turn into an apply loop.
+  // A revision is not an edit.  The debounced Apply below therefore keys on
+  // what Core reports as *staged* — a draft that differs from its applied
+  // baseline — and never on the shared revision alone.  Core also advances
+  // that revision for work that stages nothing (a relay refresh, a live model
+  // fetch, an authorization poll), and treating such a read as a pending edit
+  // collected a second, empty Apply a fraction of a second after the user's
+  // own commit; that Apply raced whatever had just written and reported the
+  // user's work back as "settings changed outside this window".  The revision
+  // still namespaces the key, so one draft cannot apply twice and a failed
+  // apply stays failed until the revision moves.
   const autoAppliedKey = useRef("");
   const immediateApplyBlocked = useImmediateApplyBlocked();
   const autoApplyKey = shell && actionSnapshot && !immediateApplyBlocked
     ? (() => {
       const domains = stagedDomainsForRoute(actionSnapshot);
-      return domains.length === 0 ? "" : `${domains.join(",")}@${actionSnapshot.revision}`;
+      if (domains.length === 0) return "";
+      const dirty = domains.filter((name) => actionSnapshot.drafts[name]?.dirty === true);
+      return dirty.length === 0 ? "" : `${dirty.join(",")}@${actionSnapshot.revision}`;
     })()
     : "";
   useEffect(() => {
@@ -5857,10 +5966,14 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
   const model = asRecords(provider.models)[0];
   const modelNameText = model ? stringValue(model.display_name, stringValue(model.name, stringValue(model.upstream_model, translate("common.notAvailable")))) : translate("common.notAvailable");
   useEffect(() => {
-    // Opening a WorkBuddy entry reads its desktop-app account and credit once;
-    // the section's own 刷新 button re-reads them on demand.
+    // Opening a WorkBuddy entry reads the desktop-app account *and* its
+    // remaining credit, so the block states both without a click: a plain
+    // account read answers the sign-in question alone and comes back with no
+    // ``credits`` record at all, which rendered as an account row and no积分
+    // row however many times the pane was opened.  The section's own 刷新
+    // button re-reads both on demand.
     if (!workbuddyProviderIDFor(kind)) return;
-    void loadWorkBuddyAccount(false).then((account) => {
+    void loadWorkBuddyAccount(true).then((account) => {
       // A worker that was just started can answer its first read before it has
       // the desktop credential in hand; re-read once so the block never states
       // a stale “not signed in”.
@@ -5938,6 +6051,14 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
       setWorkbuddyStatusBusy(false);
     }
   };
+  // The account facts this block states: its own live read when that has
+  // answered, and the record Core last observed underneath it.  A projection
+  // carries the same secret-free facts (nickname, domain, credit), so a pane
+  // that opened before its own read landed already states the account and its
+  // credit instead of half a block; see {@link workbuddyAccountFacts} for why
+  // an unstated credit keeps the observed one.
+  const workbuddyObserved = asRecord(provider.auth_observed);
+  const workbuddyFacts = workbuddyAccountFacts(asRecord(workbuddyAccount), workbuddyObserved);
   const workbuddySignedIn = stringValue(workbuddyAccount?.state) === "signed-in"
     // Until this block has read the account itself, the sign-in state is the
     // one Core last observed rather than a guess: the block may be showing a
@@ -6177,6 +6298,7 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
       native={native}
       language={language}
       cleanups={pendingCredentialCleanups(snapshotForCleanups)}
+      sessionRecheckSeconds={relaySessionRecheckSeconds(snapshotForCleanups)}
       busy={busy}
       translate={translate}
       commit={relay.commit}
@@ -6205,13 +6327,17 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
       {isWorkBuddyAccount ? <>
         <View style={styles.officialStatusRow}>
           <Text style={styles.providerAuthStatusLabel}>{translate("providers.workbuddyAccount")}</Text>
-          <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{stringValue(workbuddyAccount?.state) === "signed-in"
-            ? [stringValue(workbuddyAccount?.nickname), stringValue(workbuddyAccount?.domain)].filter(Boolean).join(" · ")
+          <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{stringValue(workbuddyFacts.state) === "signed-in"
+            ? [stringValue(workbuddyFacts.nickname), stringValue(workbuddyFacts.domain)].filter(Boolean).join(" · ") || translate("common.notAvailable")
             : progressText(workbuddyStatusBusy, translate) ?? translate("providers.wizard.workbuddySignInRequired", { name: workbuddyAppName(kind, translate) })}</Text>
         </View>
-        {workbuddyCreditsText(workbuddyAccount, translate) ? <View style={styles.officialStatusRow}>
+        {/* The credit is a row of its own for every signed-in account, and it
+            says which of the three things it is: the remaining credit the
+            upstream reported, the wait while this block reads it, or that no
+            read produced one.  A missing read is never rendered as a zero. */}
+        {workbuddySignedIn ? <View style={styles.officialStatusRow}>
           <Text style={styles.providerAuthStatusLabel}>{translate("providers.wizard.workbuddyCredits")}</Text>
-          <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{workbuddyCreditsText(workbuddyAccount, translate)}</Text>
+          <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{workbuddyCreditsText(workbuddyFacts, translate) || progressText(workbuddyStatusBusy, translate) || translate("providers.workbuddyCreditUnavailable")}</Text>
         </View> : null}
       </> : null}
       {providerService(provider) && !isWorkBuddyAccount ? <Text style={styles.keysHint}>{translate("providers.serviceKeyHint")}</Text> : null}
@@ -9659,7 +9785,7 @@ const styles = StyleSheet.create({
   menuBarHost: { flex: 1 }, error: { margin: 20, color: systemColors.red, fontSize: UI_FONT_SIZE },
   windowSurface: { flex: 1, position: "relative", backgroundColor: systemColors.window }, windowContent: { flexGrow: 1, paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, gap: 8 }, windowContentFixed: { flex: 1, minHeight: 0 }, fileEditorRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providersContent: { paddingBottom: 6, gap: 6 }, providerWizardRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providerWizardSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, logsContent: { paddingHorizontal: 12, paddingTop: 8, paddingBottom: 0 }, runtimeContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, dataManagementContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, assistantSettingsContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, windowTitleBlock: { paddingHorizontal: 20, paddingTop: 12, paddingBottom: 3, gap: 3 }, windowTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
   // Settings window: a native source-list sidebar next to the active pane.
-  settingsShell: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row" }, settingsSidebar: { width: 200, flexShrink: 0, minHeight: 0, borderRightWidth: 1, borderRightColor: systemColors.separator }, settingsSidebarHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 16, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarAppIcon: { width: SETTINGS_HEADER_CONTENT_HEIGHT, height: SETTINGS_HEADER_CONTENT_HEIGHT, borderRadius: 4 }, settingsSidebarTitle: { color: systemColors.label, fontSize: SOURCE_LIST_FONT_SIZE, fontWeight: "600" }, settingsSidebarSpacer: { flex: 1, minHeight: 8 }, settingsSidebarList: { flex: 1, minHeight: 0 }, settingsRail: { width: SETTINGS_RAIL_WIDTH, flexShrink: 0, minHeight: 0, paddingTop: 6, overflow: "hidden" }, settingsRailList: { flex: 1, minHeight: 0 }, settingsRailDivider: { position: "absolute", top: 0, bottom: 0, right: 0, width: 1, backgroundColor: systemColors.separator }, settingsRailDetail: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsRailDetailHeader: { minHeight: 50, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 14, paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: systemColors.separator, backgroundColor: systemColors.window }, settingsRailDetailTitleBlock: { flex: 1, minWidth: 0, gap: 2 }, settingsRailDetailActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, settingsRailDetailTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, settingsRailDetailHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16 }, settingsDetail: { minWidth: 0, flex: 1, paddingTop: SETTINGS_TITLEBAR_INSET }, settingsDetailBody: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsDetailBodyBare: { backgroundColor: "transparent" }, settingsDetailPane: { flex: 1, minWidth: 0 }, settingsPaneHeader: { flexShrink: 0, paddingHorizontal: 20, paddingTop: 10, paddingBottom: 8 }, settingsPaneTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600", lineHeight: SETTINGS_HEADER_CONTENT_HEIGHT },  routeStatusBar: { minHeight: 24, flexShrink: 0, justifyContent: "center", paddingHorizontal: 16, paddingVertical: 4, borderTopWidth: 1, borderTopColor: systemColors.separator }, routeStatusText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE },
+  settingsShell: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row" }, settingsSidebar: { width: 200, flexShrink: 0, minHeight: 0 }, settingsSidebarHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 16, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarAppIcon: { width: SETTINGS_HEADER_CONTENT_HEIGHT, height: SETTINGS_HEADER_CONTENT_HEIGHT, borderRadius: 4 }, settingsSidebarTitle: { color: systemColors.label, fontSize: SOURCE_LIST_FONT_SIZE, fontWeight: "600" }, settingsSidebarSpacer: { flex: 1, minHeight: 8 }, settingsSidebarList: { flex: 1, minHeight: 0 }, settingsRail: { width: SETTINGS_RAIL_WIDTH, flexShrink: 0, minHeight: 0, paddingTop: 6, overflow: "hidden" }, settingsRailList: { flex: 1, minHeight: 0 }, settingsRailDivider: { position: "absolute", top: 0, bottom: 0, right: 0, width: 1, backgroundColor: systemColors.separator }, settingsRailDetail: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsRailDetailHeader: { minHeight: 50, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 14, paddingVertical: 8, backgroundColor: systemColors.window }, settingsRailDetailTitleBlock: { flex: 1, minWidth: 0, gap: 2 }, settingsRailDetailActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, settingsRailDetailTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, settingsRailDetailHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16 }, settingsDetail: { minWidth: 0, flex: 1, paddingTop: SETTINGS_TITLEBAR_INSET }, settingsDetailBody: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsDetailBodyBare: { backgroundColor: "transparent" }, settingsDetailPane: { flex: 1, minWidth: 0 }, settingsPaneHeader: { flexShrink: 0, paddingHorizontal: 20, paddingTop: 10, paddingBottom: 8 }, settingsPaneTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600", lineHeight: SETTINGS_HEADER_CONTENT_HEIGHT },  routeStatusBar: { minHeight: 24, flexShrink: 0, justifyContent: "center", paddingHorizontal: 16, paddingVertical: 4, borderTopWidth: 1, borderTopColor: systemColors.separator }, routeStatusText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE },
   generalScroll: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, generalContent: { paddingTop: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, paddingBottom: 16, gap: 18 }, generalSection: { gap: 4 }, generalSectionTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, generalRow: { ...SETTINGS_FIELD_ROW_INDENTED }, generalRowLabel: { ...SETTINGS_FIELD_LABEL }, generalRowValue: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, generalToggle: { ...SETTINGS_FIELD_SWITCH_SLOT }, generalHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }, generalHelpText: { ...SETTINGS_FIELD_HELP_TEXT }, generalServiceAction: { minWidth: 96 }, providerToolbar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardToolbarButton: { minWidth: 104 }, toolbarSpacer: { flex: 1 }, windowTabs: { width: 224, height: 24 },
   providerWizardSetupContent: { flex: 1, minHeight: 0, justifyContent: "flex-start", alignItems: "center", paddingHorizontal: 24, paddingTop: 18, paddingBottom: 12 }, providerWizardSetupSurface: { width: "100%", maxWidth: 520, minWidth: 0, gap: 12 }, providerWizardSetupSurfaceModel: { flex: 1, minHeight: 0 }, providerWizardSignInPanel: { width: "100%", minHeight: 160, justifyContent: "center", gap: 8, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 7, backgroundColor: systemColors.control, paddingHorizontal: 16, paddingVertical: 18 }, providerWizardAuthRow: { minHeight: 30, flexDirection: "row", alignItems: "center", gap: 8 }, providerWizardAuthStatus: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
   providerMiddlePane: { flex: 1, minWidth: 0, gap: 6 },

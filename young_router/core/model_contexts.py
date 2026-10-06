@@ -11,6 +11,7 @@ records privately for the next run.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import re
 import time
 from pathlib import Path
@@ -331,6 +332,12 @@ def _merge_records(target: dict[str, dict[str, Any]], incoming: Mapping[str, Map
         target[model_id] = merged
 
 
+def _route_index_text_digest(text: str) -> str:
+    """A cheap content identity for the provider config's route index."""
+
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def _candidate_ids(value: str) -> list[str]:
     raw = value.strip().casefold()
     if not raw:
@@ -373,21 +380,85 @@ def _context_window_policy(record: Mapping[str, Any]) -> tuple[int, int, int]:
     return context, maximum, percent
 
 
+def _suffix_match_keys(records: Mapping[str, Mapping[str, Any]], candidates: Sequence[str]) -> set[str]:
+    """The record keys that end with one of the candidates.
+
+    The decision is the same comparison the plain scan made: the key's last
+    path segment equals a candidate, or the key ends with ``/<candidate>``.
+    Every key that can satisfy either test has a last segment equal to a
+    candidate or to a candidate's own last segment, so the run only looks at
+    those keys instead of at every record.  The record's own tail index is
+    reused when the mapping carries one, because a snapshot resolves the same
+    hundreds of records once per public model.
+    """
+
+    if isinstance(records, RecordLookupIndex):
+        return _suffix_match_keys_from_tails(records.record_tail_index(), candidates)
+    grouped: dict[str, list[str]] = {}
+    for key in records:
+        grouped.setdefault(key.rsplit("/", 1)[-1], []).append(key)
+    return _suffix_match_keys_from_tails(
+        {tail: tuple(keys) for tail, keys in grouped.items()}, candidates
+    )
+
+
+def _suffix_match_keys_from_tails(
+    tails: Mapping[str, Sequence[str]], candidates: Sequence[str]
+) -> set[str]:
+    """The keys ending with a candidate, given keys grouped by their tail."""
+
+    matched: set[str] = set()
+    for candidate in candidates:
+        # The key's own tail names the candidate.
+        matched.update(tails.get(candidate, ()))
+        # The candidate is a path suffix of the key; a multi-segment candidate
+        # keeps the same tail, so the same group answers this test.
+        for key in tails.get(candidate.rsplit("/", 1)[-1], ()):
+            if key.endswith(f"/{candidate}"):
+                matched.add(key)
+    return matched
+
+
+class RecordLookupIndex(dict):
+    """The record map plus a tail index `_lookup` reuses across calls.
+
+    Subclassing the mapping keeps every existing reader and writer of
+    ``registry._records`` working, while the index is rebuilt whenever the
+    records themselves are replaced.
+    """
+
+    tail_index: dict[str, tuple[str, ...]] | None = None
+
+    def record_tail_index(self) -> dict[str, tuple[str, ...]]:
+        if self.tail_index is None:
+            grouped: dict[str, list[str]] = {}
+            for key in self:
+                grouped.setdefault(key.rsplit("/", 1)[-1], []).append(key)
+            self.tail_index = {tail: tuple(keys) for tail, keys in grouped.items()}
+        return self.tail_index
+
+    def invalidate_tail_index(self) -> None:
+        self.tail_index = None
+
+
 def _lookup(records: Mapping[str, Mapping[str, Any]], model_id: str) -> dict[str, Any] | None:
+    candidates = _candidate_ids(model_id)
+    if not candidates:
+        return None
     direct_matches: list[tuple[int, int, dict[str, Any]]] = []
-    for index, candidate in enumerate(_candidate_ids(model_id)):
+    for index, candidate in enumerate(candidates):
         direct = records.get(candidate)
         if isinstance(direct, Mapping):
             direct_matches.append((_positive_int(direct.get("priority")) or 0, -index, dict(direct)))
     direct_match = max(direct_matches, key=lambda item: (item[0], item[1])) if direct_matches else None
+    suffix_keys = _suffix_match_keys(records, candidates)
+    # Walk the records in their own order so the selected record for a tie is
+    # the same one the ordered scan used to produce.
     suffix_matches: list[tuple[int, dict[str, Any]]] = []
-    candidates = set(_candidate_ids(model_id))
     for key, value in records.items():
-        if not isinstance(value, Mapping):
+        if key not in suffix_keys or not isinstance(value, Mapping):
             continue
-        tail = key.rsplit("/", 1)[-1]
-        if tail in candidates or any(key.endswith(f"/{candidate}") for candidate in candidates):
-            suffix_matches.append((_positive_int(value.get("priority")) or 0, dict(value)))
+        suffix_matches.append((_positive_int(value.get("priority")) or 0, dict(value)))
     if suffix_matches:
         top_priority = max(item[0] for item in suffix_matches)
         if direct_match is not None:
@@ -525,13 +596,18 @@ class ModelContextRegistry:
         self.refresh_enabled = bool(runtime_settings_path) if refresh_enabled is None else bool(refresh_enabled)
         self._fetcher = fetcher or self._fetch_json
         self._clock = clock or time.time
-        self._records: dict[str, dict[str, Any]] = {}
+        self._records: dict[str, dict[str, Any]] = RecordLookupIndex()
+        # The record keys grouped by their last path segment, for `_lookup`.
+        self._record_tail_index: dict[str, tuple[str, ...]] = {}
         self._cache_loaded = False
         # Every catalog entry resolves the same runtime configuration (route
         # deployments, model ids, search capability).  Parsing that document
         # once per file generation replaces the per-model re-reads that made a
         # single catalog build parse a 33 KB YAML three dozen times.
         self._route_index_key: tuple[int, int] | None = None
+        # The contents digest the cached index was built from.  An unchanged
+        # mtime is only evidence of an unchanged file when the digest agrees.
+        self._route_index_digest: str | None = None
         self._route_index_cache: dict[str, list[dict[str, Any]]] = {}
         self._cache_fetched_at: float | None = None
         self._last_refresh_attempt: float | None = None
@@ -601,7 +677,7 @@ class ModelContextRegistry:
         if self._cache_loaded:
             return
         self._cache_loaded = True
-        self._records = {key: dict(value) for key, value in _BUNDLED_RECORDS.items()}
+        self._records = RecordLookupIndex({key: dict(value) for key, value in _BUNDLED_RECORDS.items()})
         if self.cache_path is None:
             return
         payload = self._read_cache()
@@ -611,6 +687,7 @@ class ModelContextRegistry:
         cached = payload.get("records")
         if not isinstance(cached, Mapping):
             return
+        self._records.invalidate_tail_index()
         cache_has_pi_profiles = any(
             isinstance(record, Mapping) and record.get("source") == _PI_SOURCE
             for record in cached.values()
@@ -668,21 +745,36 @@ class ModelContextRegistry:
 
         The index is keyed by the configuration file's (mtime, size) so an
         edited file is picked up immediately while repeated lookups inside one
-        catalog build reuse a single parse.
+        catalog build reuse a single parse.  The window between Core's own
+        write of that file and this reader's ``stat`` can be shorter than the
+        filesystem's timestamp resolution, which would leave the key unchanged
+        for a file that did change; a file small enough to digest therefore
+        keys on its contents, and reading it here costs a fraction of the walk
+        the cached index saves.
         """
 
         if self.runtime_config_path is None:
             return {}
+        text: str | None = None
+        digest: str | None = None
         try:
             details = self.runtime_config_path.stat()
             key: tuple[int, int] | None = (details.st_mtime_ns, details.st_size)
         except OSError:
             key = None
         if key is not None and key == self._route_index_key:
-            return self._route_index_cache
+            try:
+                text = self.runtime_config_path.read_text(encoding="utf-8")
+                digest = _route_index_text_digest(text)
+            except OSError:
+                text = None
+                digest = None
+            if digest is None or digest == self._route_index_digest:
+                return self._route_index_cache
         index: dict[str, list[dict[str, Any]]] = {}
         try:
-            text = self.runtime_config_path.read_text(encoding="utf-8")
+            if text is None:
+                text = self.runtime_config_path.read_text(encoding="utf-8")
             from ..config.schema import safe_load_yaml_text
 
             data = safe_load_yaml_text(text, self.runtime_config_path.name)
@@ -698,6 +790,9 @@ class ModelContextRegistry:
                 if name:
                     index.setdefault(name, []).append(dict(deployment))
         self._route_index_key = key
+        self._route_index_digest = digest if digest is not None else (
+            _route_index_text_digest(text) if isinstance(text, str) else None
+        )
         self._route_index_cache = index
         return index
 
@@ -799,6 +894,7 @@ class ModelContextRegistry:
                 continue
             if incoming:
                 _merge_records(self._records, incoming)
+                self._records.invalidate_tail_index()
                 refreshed = True
         if not refreshed:
             return False

@@ -1502,6 +1502,209 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 fake.requests,
             )
 
+    def test_a_proven_session_is_not_signed_out_by_the_hosts_own_probe(self) -> None:
+        """A routine session check must not rewrite a verified login.
+
+        The account pane asks the host to restore a saved session on every
+        mount, and the host's restore answers from the same session store Core
+        already holds.  When that probe failed (a native round trip that timed
+        out, a station that answered a public endpoint differently) the account
+        was recorded as signed out — even though Core still held the verified
+        session, and the row then reported 未登录 until the next authenticated
+        read silently repaired it.
+
+        The two observations are kept apart now: a probe cannot sign out a
+        session Core can still use, while a station that actually rejected its
+        own session is still recorded, and an account with no session at all is
+        still signed out by the probe.
+        """
+
+        responses = {
+            "/api/user/models": {"success": True, "data": ["chat-a"]},
+            "/api/token/?p=1&size=100": {
+                "success": True,
+                "data": {"items": [{"id": 7, "status": 1, "key": "masked"}]},
+            },
+        }
+        fake = FakeRelayHTTPClient(responses)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            relay = RelayAccountsDomain(root, http_client=fake)
+            account = relay.dispatch(
+                "add",
+                {"type": "newapi", "label": "Relay", "origin": "https://relay.example.test"},
+            )["accounts"][0]
+            providers = ProvidersModelsDomain(root / "config.yaml")
+            core = CoreStore(
+                metadata_path=root / ".litellm-runtime" / "core-state.json",
+                domains=[relay, providers],
+            )
+            core.accept_relay_login(
+                account_id=account["id"],
+                account_type="newapi",
+                label="Relay",
+                origin="https://relay.example.test",
+                username="sample-user",
+                cookie="session=replace-cookie",
+            )
+            core.refresh_relay_resources(account["id"], revision=core.revision)
+
+            # The host's probe answers signed_out while Core still holds the
+            # verified session.  That is an observation about the probe, not
+            # about the login, so the row stays signed in.
+            result = core.restore_relay_session(
+                account_id=account["id"],
+                account_type="newapi",
+                label="Relay",
+                origin="https://relay.example.test",
+                login_status="signed_out",
+            )
+
+            self.assertEqual("signed_in", result["login_status"])
+            account_snapshot = core.snapshot()["domains"]["relay_accounts"]["accounts"][0]
+            self.assertEqual("signed_in", account_snapshot["login_status"])
+            self.assertTrue(relay.secret_present("session", account["id"]))
+            # The probe states nothing about the station's keys either.
+            self.assertEqual(["newapi-7"], [item["id"] for item in account_snapshot["resources"]])
+            self.assertEqual("ready", account_snapshot["resource_status"])
+
+            # A station that actually rejected its own session is still the
+            # freshest fact about it, and retires the stored session.
+            result = core.restore_relay_session(
+                account_id=account["id"],
+                account_type="newapi",
+                label="Relay",
+                origin="https://relay.example.test",
+                login_status="expired",
+            )
+            self.assertEqual("expired", result["login_status"])
+            self.assertFalse(relay.secret_present("session", account["id"]))
+
+            # Nothing is held for an account that reaches Core without a
+            # session: a signed-out probe still reads as signed out.
+            bare = relay.dispatch(
+                "add",
+                {"type": "newapi", "label": "Bare", "origin": "https://bare.example.test"},
+            )["accounts"][-1]
+            result = core.restore_relay_session(
+                account_id=bare["id"],
+                account_type="newapi",
+                label="Bare",
+                origin="https://bare.example.test",
+                login_status="signed_out",
+            )
+            self.assertEqual("signed_out", result["login_status"])
+
+    def test_a_fresh_login_observation_answers_the_panes_own_recheck(self) -> None:
+        """One station round trip answers every check inside the window.
+
+        The account pane re-checks its station session on every mount, so
+        without a window each entry re-probed the site.  Core keeps the
+        observation instead: a session it still holds and observed inside the
+        window answers the next check, and a session it cannot vouch for (a
+        restart, an expired one, or an account with no session) always gets a
+        real probe.  The window is a runtime threshold, and 0 turns the
+        short-circuit off.
+        """
+
+        responses = {
+            "/api/user/models": {"success": True, "data": ["chat-a"]},
+            "/api/token/?p=1&size=100": {
+                "success": True,
+                "data": {"items": [{"id": 7, "status": 1, "key": "masked"}]},
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = root / "runtime-settings.env"
+            domain = RelayAccountsDomain(root, http_client=FakeRelayHTTPClient(responses))
+            account_id = domain.dispatch(
+                "add",
+                {"type": "newapi", "label": "Relay", "origin": "https://relay.example.test"},
+            )["accounts"][0]["id"]
+
+            # Nothing observed yet: a check is not reused.
+            self.assertFalse(domain.session_check_is_recent(account_id))
+            # The pane reads the window from the relay projection, so both sides
+            # apply one number.
+            self.assertIsInstance(domain.snapshot()["session_recheck_seconds"], float)
+
+            domain.accept_login_result(account_id, username="sample-user", cookie="session=replace-cookie")
+
+            self.assertTrue(domain.session_check_is_recent(account_id))
+            account = domain.snapshot()["accounts"][0]
+            # The pane ages the observation itself, so it can decide before it
+            # asks the host for anything.
+            self.assertIsInstance(account["login_observed_seconds_ago"], float)
+            self.assertLess(account["login_observed_seconds_ago"], 5.0)
+
+            # A recorded rejection is a fresh observation too, and it retires
+            # the session the window was describing.
+            domain.set_login_status(account_id, "expired")
+            self.assertFalse(domain.session_check_is_recent(account_id))
+
+            # A window of 0 re-checks on every mount by definition.
+            domain.accept_login_result(account_id, username="sample-user", cookie="session=replace-cookie")
+            settings.write_text(
+                "YOUNG_ROUTER_RELAY_SESSION_RECHECK_SECONDS=0\n",
+                encoding="utf-8",
+            )
+            with mock.patch("young_router.core.domains._shared._default_runtime_settings_path", return_value=settings):
+                self.assertFalse(domain.session_check_is_recent(account_id))
+                settings.write_text(
+                    "YOUNG_ROUTER_RELAY_SESSION_RECHECK_SECONDS=600\n",
+                    encoding="utf-8",
+                )
+                self.assertTrue(domain.session_check_is_recent(account_id))
+
+            # A stored observation older than the window is probed again.
+            domain.apply()
+            stored = root / ".litellm-runtime" / "relay-accounts.json"
+            aged = json.loads(stored.read_text(encoding="utf-8"))
+            aged["accounts"][0]["login_observed_at"] = "2000-01-01T00:00:00Z"
+            stored.write_text(json.dumps(aged), encoding="utf-8")
+            domain.reload()
+            with mock.patch("young_router.core.domains._shared._default_runtime_settings_path", return_value=settings):
+                self.assertFalse(domain.session_check_is_recent(account_id))
+
+    def test_a_session_window_does_not_survive_a_core_restart(self) -> None:
+        """A fresh Core never inherits the window: it holds no session then.
+
+        The re-check window is about a login *this* Core verified.  A restart
+        re-reads the document, which drops the persisted ``signed_in`` claim to
+        ``unknown``, so the first mount after a restart always probes the
+        station for real instead of answering from a stamp on disk.
+        """
+
+        responses = {
+            "/api/user/models": {"success": True, "data": ["chat-a"]},
+            "/api/token/?p=1&size=100": {
+                "success": True,
+                "data": {"items": [{"id": 7, "status": 1, "key": "masked"}]},
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original = RelayAccountsDomain(root, http_client=FakeRelayHTTPClient(responses))
+            account_id = original.dispatch(
+                "add",
+                {"type": "newapi", "label": "Relay", "origin": "https://relay.example.test"},
+            )["accounts"][0]["id"]
+            original.accept_login_result(
+                account_id,
+                username="sample-user",
+                cookie="session=replace-cookie",
+                remember_password=True,
+            )
+            self.assertTrue(original.session_check_is_recent(account_id))
+            original.apply()
+
+            reloaded = RelayAccountsDomain(root, http_client=FakeRelayHTTPClient(responses))
+            account = reloaded.snapshot()["accounts"][0]
+            self.assertEqual("unknown", account["login_status"])
+            self.assertIsNone(account["login_observed_seconds_ago"])
+            self.assertFalse(reloaded.session_check_is_recent(account_id))
+
     def test_core_records_expired_native_session_without_retaining_secrets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1531,7 +1734,14 @@ class RelayAccountsDomainTests(unittest.TestCase):
             self.assertFalse(snapshot["drafts"]["providers_models"]["dirty"])
 
     def test_core_keeps_cached_relay_keys_when_a_session_check_fails(self) -> None:
-        """A signed-out session must not hide the station's cached API keys."""
+        """A session check never hides the station's cached API keys.
+
+        The observation it carries is reconciled against the session Core
+        holds (see ``settle_login_status``), so the key facts below hold for
+        both of that reconciliation's outcomes: whichever login state the
+        account ends up with, the verified key list and its ready resource
+        state are untouched, and local keys keep loading.
+        """
 
         responses = {
             "/api/user/models": {"success": True, "data": ["chat-a"]},
@@ -1566,15 +1776,53 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 login_status="signed_out",
             )
 
-            self.assertEqual("signed_out", result["login_status"])
+            self.assertIn(result["login_status"], {"signed_in", "signed_out"})
+            # The probe's own observation, whatever it settled on, is the only
+            # thing it may change: it never downgrades or hides the verified key
+            # list, so local keys keep loading.
+            self.assertTrue(domain.secret_present("session", account_id))
             account = core.snapshot()["domains"]["relay_accounts"]["accounts"][0]
             self.assertEqual(
                 [resource["id"] for resource in resources],
                 [item["id"] for item in account["resources"]],
             )
-            # The login observation is recorded on its own: it never downgrades
-            # or hides the verified key list, so local keys keep loading.
             self.assertEqual("ready", account["resource_status"])
+            self.assertEqual("none", account["resource_error"])
+
+    def test_a_session_check_without_a_locally_held_session_still_signs_out(self) -> None:
+        """A probe is authority over an account Core has no session for.
+
+        Reconciliation holds a verified session against the host's own probe;
+        an account Core cannot authenticate with is exactly the case the
+        signed-out observation is for, and it must still be recorded.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            domain = RelayAccountsDomain(root)
+            account = domain.dispatch(
+                "add",
+                {"type": "newapi", "label": "Relay", "origin": "https://relay.example.test"},
+            )["accounts"][0]
+            providers = ProvidersModelsDomain(root / "config.yaml")
+            core = CoreStore(
+                metadata_path=root / ".litellm-runtime" / "core-state.json",
+                domains=[domain, providers],
+            )
+
+            result = core.restore_relay_session(
+                account_id=account["id"],
+                account_type="newapi",
+                label="Relay",
+                origin="https://relay.example.test",
+                login_status="signed_out",
+            )
+
+            self.assertEqual("signed_out", result["login_status"])
+            self.assertEqual(
+                "signed_out",
+                core.snapshot()["domains"]["relay_accounts"]["accounts"][0]["login_status"],
+            )
             self.assertEqual("none", account["resource_error"])
 
     def test_local_relay_keys_stay_loadable_and_refreshable_while_signed_out(self) -> None:
