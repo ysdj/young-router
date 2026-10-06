@@ -4551,6 +4551,8 @@ def _trace_exception(exception: Exception) -> dict[str, Any]:
         reason = "terminal-prompt-or-policy"
     elif _is_image_generation_tool_runtime_fallback_error(exception):
         reason = "image-generation-tool-runtime-fallback"
+    elif _streaming_module._is_invalid_tool_call_arguments_error(exception):
+        reason = "upstream-tool-call-arguments-invalid"
     elif _is_upstream_deployment_failover_error(exception):
         reason = "upstream-auth-or-balance"
     elif _is_upstream_gateway_bad_request_error(exception):

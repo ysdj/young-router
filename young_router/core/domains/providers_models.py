@@ -44,7 +44,7 @@ from ...config.schema import (
     infer_upstream_fallback_surface,
 )
 
-from ...adapters import traceone
+from ...adapters import veridrop
 from ...adapters import workbuddy as workbuddy_module
 from ...browser_identity import browser_request_headers
 from ...values import explicit_bool
@@ -224,16 +224,13 @@ class ProvidersModelsDomain:
             "upstream_protocol_mode",
         }
     )
-    # The degradation deep test asks one model for a full 315-integer answer,
-    # so it needs its own budget: a reasoning model legitimately takes longer
-    # than the six-second availability probe, and a truncated answer would be
-    # reported as an inconclusive fingerprint instead of a slow model.
-    # The deep test asks one reasoning model for 315 integers: measured 86s and
-    # 147s on a healthy relay, so the ceiling leaves room for a loaded edge.
+    # The deep test runs the staged Veridrop quick suite as its own process.
+    # That program bounds itself (quick mode carries a 60-second overall
+    # budget), so this ceiling is only a backstop: it still outlasts a loaded
+    # edge that stretches the suite's own round trips, and it stays well above
+    # the availability probe's budget so a slow scan never reads as silence.
     _DEGRADATION_PROBE_TIMEOUT_SECONDS = 300.0
     _DEGRADATION_PROBE_TIMEOUT_ENV = "YOUNG_ROUTER_DEGRADATION_PROBE_TIMEOUT_SECONDS"
-    _MAX_DEGRADATION_PROBE_BYTES = 512 * 1024
-    _DEGRADATION_SURFACE = "openai/responses"
     _API_KEY_TARGET_SEPARATOR = "\x1f"
     # The provider wizard stages the key it is about to give a provider it has
     # not created yet, so one secret target names the wizard's own token
@@ -1605,136 +1602,46 @@ class ProvidersModelsDomain:
                 pass
         return cls._DEGRADATION_PROBE_TIMEOUT_SECONDS
 
-    def _responses_surface_for(self, model: Mapping[str, Any]) -> str:
-        """The surface this route answers with when it speaks Responses at all.
+    def _degradation_requirements(self, protocol: str) -> str:
+        """The surface a route must answer on for one protocol's probe.
 
-        Mirrors the probe's preference order: a fixed route uses its configured
-        surface, a fallback route prefers the surface inferred from the model
-        name and only then the configured one.
+        The quick suite speaks one protocol per run, so a route that serves
+        only another surface has nothing for it to measure. The Gemini protocol
+        has no surface in this app's probe matrix, so it carries no
+        precondition and the staged program reports what the address answers.
         """
 
-        configured = str(model.get("upstream_url_surface", "")).strip()
-        mode = str(model.get("upstream_protocol_mode", "fallback")).strip().lower()
-        inferred = infer_upstream_fallback_surface(self._wire_model_name(model))
-        candidates = (configured,) if mode == "fixed" else (inferred, configured)
-        return self._DEGRADATION_SURFACE if self._DEGRADATION_SURFACE in candidates else ""
+        return {"anthropic": "anthropic", "openai": "openai/chat"}.get(protocol, "")
 
-    def _deep_probe_plan(self, model: Mapping[str, Any]) -> dict[str, Any]:
+    def _deep_probe_plan(
+        self, model: Mapping[str, Any], surfaces: Sequence[str] | None = None
+    ) -> dict[str, Any]:
         """Describe what the model detail pane's deep test will actually run.
 
-        A degradation fingerprint only means something for the routes the
-        staged TraceOne engine can attribute, and only the Responses surface of
-        such a route carries the Codex-shaped answer the fingerprints were
-        measured on.  Every other model keeps the plain availability probe, so
-        the pane's button can name the action before it runs.
+        The staged Veridrop program only carries tables for the models it can
+        probe, and each run speaks one protocol on one surface, so a deep test
+        means something only where the route's own model is one of those and the
+        route answers on that protocol's surface. The pane's projection asks
+        without a probe - there the supported model is the whole answer, and a
+        route that turns out not to answer on that surface reports its own
+        skipped finding - while a running probe passes the surfaces it tested
+        so the scan is not started against a route that cannot carry it.
         """
 
         wire_name = self._wire_model_name(model)
         public_name = str(model.get("model_name", "")).strip()
-        target = traceone.route_target(wire_name, public_name)
-        surface = self._responses_surface_for(model)
-        includes = bool(target) and surface == self._DEGRADATION_SURFACE
+        found = veridrop.target(wire_name, public_name)
+        target = str(found.get("model", "")) if isinstance(found, Mapping) else ""
+        protocol = str(found.get("protocol", "")) if isinstance(found, Mapping) else ""
+        surface = self._degradation_requirements(protocol)
+        reachable = surfaces is None or not surface or surface in surfaces
+        includes = bool(target) and reachable
         return {
             "includes_degradation": includes,
             "target": target if includes else None,
+            "protocol": protocol if includes else "",
             "surface": surface if includes else "",
         }
-
-    @staticmethod
-    def _probe_answer_text(payload: Mapping[str, Any] | None) -> str:
-        """Extract the model's answer from a Responses or chat completion body."""
-
-        if not isinstance(payload, Mapping):
-            return ""
-        text = payload.get("output_text")
-        if isinstance(text, str) and text.strip():
-            return text.strip()
-        chunks: list[str] = []
-        output = payload.get("output")
-        if isinstance(output, Sequence) and not isinstance(output, (str, bytes, bytearray)):
-            for item in output:
-                if not isinstance(item, Mapping):
-                    continue
-                content = item.get("content")
-                if not isinstance(content, Sequence) or isinstance(content, (str, bytes, bytearray)):
-                    continue
-                for part in content:
-                    if isinstance(part, Mapping) and isinstance(part.get("text"), str):
-                        chunks.append(part["text"])
-        if chunks:
-            return "\n".join(chunks).strip()
-        choices = payload.get("choices")
-        if isinstance(choices, Sequence) and not isinstance(choices, (str, bytes, bytearray)):
-            for choice in choices:
-                if not isinstance(choice, Mapping):
-                    continue
-                message = choice.get("message")
-                if isinstance(message, Mapping) and isinstance(message.get("content"), str):
-                    chunks.append(message["content"])
-        return "\n".join(chunks).strip()
-
-    def _degradation_request(
-        self,
-        *,
-        api_base: str,
-        credential: str,
-        model_name: str,
-        prompt: str,
-    ) -> tuple[str, str]:
-        """Send the frozen identity prompt and return (answer, status)."""
-
-        root = service_root(api_base)
-        endpoint = f"{root}/v1/responses" if isinstance(root, str) and root else ""
-        if not endpoint or not credential or not model_name:
-            return "", "invalid_config"
-        payload = {
-            "model": model_name,
-            "input": prompt,
-            "stream": False,
-            "store": False,
-        }
-        request = urllib.request.Request(
-            endpoint,
-            data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
-            headers={
-                **browser_request_headers(),
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {credential}",
-            },
-            method="POST",
-        )
-        for attempt in range(self._MODEL_PROBE_ATTEMPTS):
-            try:
-                with isolated_http_opener().open(
-                    request, timeout=self._degradation_timeout_seconds()
-                ) as response:
-                    status = getattr(response, "status", None)
-                    if status is None:
-                        status = response.getcode()
-                    body = response.read(self._MAX_DEGRADATION_PROBE_BYTES + 1)
-                break
-            except urllib.error.HTTPError as exc:
-                return "", self._probe_status_for_http_code(exc.code)
-            except Exception as exc:
-                # The long fingerprint request pays the same first-connection
-                # edge reset as the availability probe and follows the same
-                # retry rule.
-                failure = self._probe_failure_status(exc)
-                if attempt + 1 >= self._MODEL_PROBE_ATTEMPTS or not self._probe_transport_retryable(exc):
-                    return "", failure
-                time.sleep(self._MODEL_PROBE_RETRY_DELAY_SECONDS)
-        if not isinstance(status, int) or not 200 <= status < 300 or len(body) > self._MAX_DEGRADATION_PROBE_BYTES:
-            return "", "http_error"
-        try:
-            decoded = json.loads(body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            return "", "invalid_response"
-        if isinstance(decoded, Mapping) and isinstance(decoded.get("error"), Mapping) and not decoded.get("output"):
-            return "", "http_error"
-        text = self._probe_answer_text(decoded if isinstance(decoded, Mapping) else None)
-        if not text:
-            return "", "invalid_response"
-        return text, "ok"
 
     def _degradation_probe(
         self,
@@ -1745,76 +1652,116 @@ class ProvidersModelsDomain:
         model_name: str,
         surface_status: str,
     ) -> dict[str, Any]:
-        """Run TraceOne once against this route and report the attribution."""
+        """Run Veridrop's quick suite once against this route and report it."""
 
         checked_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         planned_target = plan.get("target")
         target = planned_target if isinstance(planned_target, str) and planned_target else None
-        engine = traceone.engine()
+        planned_protocol = plan.get("protocol")
+        protocol = planned_protocol if isinstance(planned_protocol, str) else ""
+        required_surface = str(plan.get("surface", ""))
+        engine = veridrop.engine()
         result: dict[str, Any] = {
             "status": "skipped",
             "target": target,
+            "protocol": protocol,
             "label": None,
+            "verdict": "",
+            "score": None,
             "cause": "",
-            "detail": "This model is not a route the degradation engine can attribute",
+            "detail": "This model is not one the staged scan program can probe",
             "checked_at": checked_at,
             "engine": engine,
-            "numbers": 0,
+            "detectors": [],
+            "brands": [],
         }
         if not plan.get("includes_degradation"):
             return result
-        if surface_status != "ok":
-            # The route already failed its tiny Responses probe, so a longer
-            # fingerprint request cannot tell the user anything new. The failure
-            # keeps its own name: rejected, silent, or a definitive rejection.
+        if required_surface and surface_status != "ok":
+            # The route already failed its tiny surface probe, so a longer scan
+            # cannot tell the user anything new. The failure keeps its own name:
+            # rejected, silent, or a definitive rejection.
             result["status"] = (
                 "unreachable" if surface_status in {"refused", "timeout", "network_error"} else "error"
             )
             result["cause"] = surface_status
             result["detail"] = (
-                f"The {self._DEGRADATION_SURFACE} surface did not answer the availability probe ({surface_status})"
+                f"The {required_surface} surface did not answer the availability probe ({surface_status})"
             )
             return result
-        result["detail"] = "The degradation engine is not staged in this build"
         result["status"] = "unavailable"
+        result["detail"] = "The scan program is not staged in this build"
         if not engine.get("available"):
             return result
+        root = service_root(api_base)
+        if not isinstance(root, str) or not root:
+            result["status"] = "error"
+            result["detail"] = "The route address cannot be resolved for a scan"
+            return result
         try:
-            prompt = traceone.prompt_text()
-        except traceone.TraceOneUnavailable as exc:
+            decision = veridrop.run_quick(
+                base_url=root,
+                api_key=credential,
+                model=model_name,
+                protocol=protocol,
+                timeout_seconds=self._degradation_timeout_seconds(),
+            )
+        except veridrop.VeridropUnavailable as exc:
             result["detail"] = safe_exception_message(exc)
             return result
-        answer, status = self._degradation_request(
-            api_base=api_base,
-            credential=credential,
-            model_name=model_name,
-            prompt=prompt,
-        )
-        if not answer:
-            result["detail"] = f"The {self._DEGRADATION_SURFACE} deep-test request failed ({status})"
-            result["status"] = "unreachable" if status in {"refused", "timeout", "network_error"} else "error"
-            result["cause"] = status
-            return result
-        try:
-            decision = traceone.identify(answer)
-        except (traceone.TraceOneUnavailable, RuntimeError, ValueError) as exc:
+        except (RuntimeError, ValueError) as exc:
             result["detail"] = safe_exception_message(exc)
             result["status"] = "error"
             return result
-        label = traceone.normalize_route_name(decision.get("label")) or ""
-        numbers = int(decision.get("numbers") or 0)
+        result["verdict"] = str(decision.get("verdict") or "")
+        result["score"] = decision.get("score")
+        detectors = decision.get("detectors")
+        result["detectors"] = [
+            {
+                "name": str(item.get("name", "")),
+                "status": str(item.get("status", "")),
+                "score": item.get("score"),
+            }
+            for item in detectors
+            if isinstance(item, Mapping)
+        ][:16] if isinstance(detectors, Sequence) and not isinstance(detectors, (str, bytes)) else []
+        brands = decision.get("brands")
+        result["brands"] = [str(brand) for brand in brands][:8] if isinstance(brands, Sequence) and not isinstance(brands, (str, bytes)) else []
+        identity = decision.get("identity")
+        label = ", ".join(result["brands"])
+        if not label and isinstance(identity, str):
+            label = identity.strip().splitlines()[0][:80] if identity.strip() else ""
         result["label"] = label or None
-        result["numbers"] = numbers
-        if decision.get("status") != "identified" or not label:
-            result["status"] = "unknown"
-            result["detail"] = "The answer could not be attributed to any known route"
-            return result
-        if label == target:
+        summary = str(decision.get("summary") or "").strip()
+        score = decision.get("score")
+        score_text = (
+            f"{float(score):.0f}/100"
+            if isinstance(score, (int, float)) and not isinstance(score, bool)
+            else ""
+        )
+        suffix = f" ({score_text})" if score_text else ""
+        failed = decision.get("failed")
+        failed_names = ", ".join(str(name) for name in failed) if isinstance(failed, Sequence) and not isinstance(failed, (str, bytes)) else ""
+        verdict = result["verdict"]
+        if verdict == "passed":
             result["status"] = "matched"
-            result["detail"] = f"Fingerprint matches the requested route {target}"
-        else:
+        elif verdict == "failed":
             result["status"] = "mismatch"
-            result["detail"] = f"Fingerprint matches {label} instead of the requested route {target}"
+        else:
+            result["status"] = "unknown"
+        # What failed and what the answer looked like are the two facts a user
+        # acts on, so both ride in the finding's own sentence.
+        findings: list[str] = []
+        if failed_names:
+            findings.append(f"failed {failed_names}")
+        if result["label"] and verdict != "passed":
+            findings.append(f"answered like {result['label']}")
+        outcome_text = {"passed": "passed", "failed": "failed"}.get(verdict, "was inconclusive")
+        result["detail"] = (
+            f"The quick suite {outcome_text}{suffix}"
+            + (f" ({'; '.join(findings)})" if findings else "")
+            + (f": {summary}" if summary else "")
+        )
         return result
 
     _PROBE_SURFACES: tuple[str, ...] = ("openai/responses", "openai/chat", "anthropic")
@@ -1971,12 +1918,19 @@ class ProvidersModelsDomain:
             "statuses": statuses,
         }
         checked_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        deep_probe = self._deep_probe_plan(model, surfaces)
+        # Only the surface the planned scan speaks gates it: a route that never
+        # answered there has nothing for the quick suite to measure, and the
+        # other surfaces' statuses say nothing about that protocol.
+        required_surface = str(deep_probe.get("surface", ""))
         degradation = self._degradation_probe(
-            plan=self._deep_probe_plan(model),
+            plan=deep_probe,
             api_base=api_base,
             credential=credential,
             model_name=model_name,
-            surface_status=str(surface_results.get(self._DEGRADATION_SURFACE, {}).get("status", "unavailable")),
+            surface_status=str(
+                surface_results.get(required_surface, {}).get("status", "unavailable")
+            ),
         )
         probe_overlay = {
             "available": recommended is not None,

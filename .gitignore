@@ -26,5 +26,5 @@ Young Router.app/
 young.router.proxy.runtime.plist
 *audit*.png
 output/
-# Staged build output (scripts/update_traceone.py); never committed.
-src/young_router/adapters/traceone/
+# Staged build output (scripts/update_veridrop.py); never committed.
+young_router/adapters/veridrop/

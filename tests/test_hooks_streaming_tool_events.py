@@ -2114,3 +2114,208 @@ class HookStreamingToolEventTests(HookTestCase):
         self.assertTrue(hooks._should_retry_same_deployment_before_fallback(error))
         self.assertFalse(hasattr(error, "excluded_deployment_ids"))
         self.assertEqual(error.num_retries, 0)
+
+    async def test_guarded_stream_closes_a_sibling_tool_call_the_bridge_abandons(self) -> None:
+        """A parallel tool call must not stay open across the bridge takeover.
+
+        A Responses client opens a tool call on ``response.output_item.added`` and
+        closes it on ``response.output_item.done``.  The bridge takeover replays
+        neither for a call the router did not consume, so a ``web_search`` emitted
+        beside another tool call used to leave that sibling open for the rest of
+        the stream and the client ended the turn holding a tool call it could
+        never finish.
+        """
+        hooks, _ = load_hook_module()
+        web_search_bridge_module = hooks._responses_web_search_bridge_module
+
+        request_data = {
+            "model": "space-bunny",
+            "input": "research the topic",
+            "stream": True,
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "web_search",
+                    "description": "search the web",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "queries": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            }
+                        },
+                    },
+                },
+                {
+                    "type": "function",
+                    "name": "Agent",
+                    "description": "delegate to a subagent",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"description": {"type": "string"}},
+                    },
+                },
+            ],
+            "litellm_metadata": {
+                hooks._WEB_SEARCH_EXTERNAL_BRIDGE_KEY: True,
+            },
+        }
+
+        def function_call(item_id: str, name: str, arguments: str, status: str) -> dict:
+            return {
+                "type": "function_call",
+                "id": item_id,
+                "call_id": item_id,
+                "name": name,
+                "arguments": arguments,
+                "status": status,
+            }
+
+        search_call = function_call(
+            "call_search", "web_search", '{"queries":["topic"]}', "completed"
+        )
+        sibling_call = function_call(
+            "call_sibling", "Agent", '{"description":"Research topic"}', "completed"
+        )
+
+        async def upstream_stream():
+            yield jsonable_stream_chunk(
+                {
+                    "type": "response.created",
+                    "response": {
+                        "id": "resp_1",
+                        "object": "response",
+                        "status": "in_progress",
+                        "output": [],
+                    },
+                }
+            )
+            # The client learns about both calls before either is closed: a
+            # model that emits parallel calls opens every item first.
+            for output_index, item in enumerate((search_call, sibling_call)):
+                yield jsonable_stream_chunk(
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": output_index,
+                        "item": function_call(
+                            item["id"], item["name"], "", "in_progress"
+                        ),
+                    }
+                )
+            for output_index, item in enumerate((search_call, sibling_call)):
+                yield jsonable_stream_chunk(
+                    {
+                        "type": "response.function_call_arguments.done",
+                        "item_id": item["id"],
+                        "output_index": output_index,
+                        "arguments": item["arguments"],
+                    }
+                )
+            for output_index, item in enumerate((search_call, sibling_call)):
+                yield jsonable_stream_chunk(
+                    {
+                        "type": "response.output_item.done",
+                        "output_index": output_index,
+                        "item": item,
+                    }
+                )
+            yield jsonable_stream_chunk(
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_1",
+                        "object": "response",
+                        "status": "completed",
+                        "output": [search_call, sibling_call],
+                    },
+                }
+            )
+
+        async def continue_or_synthesize(**_kwargs):
+            return {
+                "id": "resp_2",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "id": "msg_2",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [
+                            {"type": "output_text", "text": "final", "annotations": []}
+                        ],
+                    }
+                ],
+            }
+
+        async def finalize(response, *_args, **_kwargs):
+            return response
+
+        async def run_action(action, *_args, **_kwargs):
+            return ("evidence\n\n", ["https://example.test/one"], dict(action))
+
+        originals = (
+            web_search_bridge_module._external_web_search_continue_or_synthesize,
+            web_search_bridge_module._external_web_search_finalize_response,
+            web_search_bridge_module._external_web_search_run_action,
+        )
+        web_search_bridge_module._external_web_search_continue_or_synthesize = (
+            continue_or_synthesize
+        )
+        web_search_bridge_module._external_web_search_finalize_response = finalize
+        web_search_bridge_module._external_web_search_run_action = run_action
+        self.addCleanup(
+            setattr,
+            web_search_bridge_module,
+            "_external_web_search_continue_or_synthesize",
+            originals[0],
+        )
+        self.addCleanup(
+            setattr,
+            web_search_bridge_module,
+            "_external_web_search_finalize_response",
+            originals[1],
+        )
+        self.addCleanup(
+            setattr, web_search_bridge_module, "_external_web_search_run_action", originals[2]
+        )
+
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks._yield_guarded_original_stream(
+                [], upstream_stream(), request_data
+            )
+        ]
+
+        added_indexes = {
+            chunk["output_index"]
+            for chunk in chunks
+            if chunk.get("type") == "response.output_item.added"
+            and (chunk.get("item") or {}).get("type") == "function_call"
+        }
+        done_items = {
+            chunk["output_index"]: chunk["item"]
+            for chunk in chunks
+            if chunk.get("type") == "response.output_item.done"
+            and (chunk.get("item") or {}).get("type") == "function_call"
+        }
+        # Every tool call the client was told about is closed again.
+        self.assertTrue(added_indexes)
+        self.assertEqual(added_indexes - set(done_items), set())
+        # The sibling keeps the arguments the upstream actually streamed, so the
+        # client never runs a call the model did not write.
+        sibling_done = done_items[1]
+        self.assertEqual(sibling_done["name"], "Agent")
+        self.assertEqual(
+            sibling_done["arguments"], '{"description":"Research topic"}'
+        )
+        # The search still ran: the bridge produced its own search item and the
+        # final answer, so deferring the takeover cost no evidence.
+        search_names = [
+            (chunk.get("item") or {}).get("type")
+            for chunk in chunks
+            if chunk.get("type") == "response.output_item.done"
+        ]
+        self.assertIn("web_search_call", search_names)
+        self.assertEqual(chunks[-1]["type"], "response.completed")

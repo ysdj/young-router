@@ -1591,7 +1591,13 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("NativeCheckbox", relay_ui)
         self.assertNotIn('title={translate("relay.importSelected")}', relay_ui)
         self.assertIn("const attemptedAccounts = useRef(new Set<string>());", relay_ui)
-        self.assertNotIn('symbol="refresh"', relay_ui)
+        # The retired manual re-login control is gone: the quiet mount restore
+        # answers the session question, so no button re-runs it.  The one
+        # refresh control the pane carries is 刷新资源 — the affordance every
+        # relay message already names ("请点击刷新资源") and which used to have
+        # no control at all.
+        self.assertNotIn('onPress={() => { if (!isAccountLoading(selected.id)) void refreshLoginState(selected); }}', relay_ui)
+        self.assertIn('title={translate("relay.refreshResources")} symbol="refresh"', relay_ui)
         self.assertNotIn('translate("relay.status.signed_out")', relay_ui)
 
         self.assertIn("import WebKit", mac_leaf)

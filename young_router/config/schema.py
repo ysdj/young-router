@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -8,10 +9,16 @@ import os
 import pathlib
 import re
 import sys
+import threading
+from collections import OrderedDict
 from typing import Any
 
 try:
     import yaml
+    # The bound walk over a document is a pure read of its events; the C
+    # scanner answers it several times faster than the pure-Python one, and a
+    # snapshot validates the same configuration text repeatedly.
+    _YAML_EVENT_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
 except Exception as exc:  # pragma: no cover - exercised by menu error path
     print(f"PyYAML is required to edit config.yaml: {exc}", file=sys.stderr)
     sys.exit(1)
@@ -160,7 +167,12 @@ def _validate_yaml_event_limits(text: str) -> None:
                 document_cost, cost, YAML_MAX_EXPANDED_NODES
             )
 
-    for event in yaml.parse(text):
+    # The bound walk only reads events, so it can use the same C parser the
+    # load below does: the document is scanned once here and once there
+    # instead of once in pure Python and once in C.  The two loaders produce
+    # the same events for every document either accepts, and the guard's own
+    # decisions are taken from the events alone.
+    for event in yaml.parse(text, Loader=_YAML_EVENT_LOADER):
         if isinstance(event, (yaml.events.MappingStartEvent, yaml.events.SequenceStartEvent)):
             if len(frames) + 1 > YAML_MAX_NESTING_DEPTH:
                 raise _YamlStructureLimitExceeded
@@ -797,9 +809,7 @@ def safe_load_yaml_text(text: str, source_name: str) -> Any:
     """Load YAML with bounded aliases and structure, without schema validation."""
 
     try:
-        _validate_yaml_event_limits(text)
-        data = yaml.safe_load(text)
-        _validate_loaded_yaml_limits(data)
+        data = _yaml_text_parse(text)
     except _YamlStructureLimitExceeded:
         raise ValueError(f"{source_name} exceeds safe YAML structure limits") from None
     except yaml.YAMLError:
@@ -807,10 +817,53 @@ def safe_load_yaml_text(text: str, source_name: str) -> Any:
     return data
 
 
+# A document is parsed by hash of its text, and the same text arrives several
+# times inside one user action: a staged plan asks whether its own candidate is
+# valid, the commit writes that candidate through the same validator, and the
+# reload after the write reads the file back.  Together with the structure
+# guard above and the schema pass below, that was ten full scans of one 40 KB
+# file for a single deleted key.  The text is therefore parsed once and the
+# scan is kept for the few documents a settings action actually touches.
+#
+# The cache is keyed by a digest of the text alone, so it can only ever return
+# a value a share of the work above produced from the same text.  The value it
+# hands out is deep-copied: every caller of this function may own — and the
+# config editor, the dumper, and the loader all do own — the mapping they
+# receive, and none of them may see another caller's mutation.
+_YAML_TEXT_PARSE_LIMIT = 8
+_yaml_text_parsed: "OrderedDict[str, Any]" = OrderedDict()
+_yaml_text_parsed_lock = threading.Lock()
+
+
+def _yaml_text_parse(text: str) -> Any:
+    """Parse one YAML text, reusing the parse of the very same document."""
+
+    key = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    with _yaml_text_parsed_lock:
+        cached = _yaml_text_parsed.get(key)
+        if cached is not None:
+            _yaml_text_parsed.move_to_end(key)
+            return copy.deepcopy(cached)
+    _validate_yaml_event_limits(text)
+    data = yaml.safe_load(text)
+    _validate_loaded_yaml_limits(data)
+    with _yaml_text_parsed_lock:
+        _yaml_text_parsed[key] = data
+        while len(_yaml_text_parsed) > _YAML_TEXT_PARSE_LIMIT:
+            _yaml_text_parsed.popitem(last=False)
+    return copy.deepcopy(data)
+
+
 def load_yaml_text(text: str, path: pathlib.Path) -> dict[str, Any]:
-    data = safe_load_yaml_text(text, path.name)
+    name = path.name
+    try:
+        data = _yaml_text_parse(text)
+    except _YamlStructureLimitExceeded:
+        raise ValueError(f"{name} exceeds safe YAML structure limits") from None
+    except yaml.YAMLError:
+        raise ValueError(f"{name} is not valid YAML") from None
     if not isinstance(data, dict):
-        raise ValueError(f"{path.name} must be a YAML mapping")
+        raise ValueError(f"{name} must be a YAML mapping")
     _validate_current_schema(data, path)
     return data
 

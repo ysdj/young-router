@@ -1,6 +1,6 @@
 """Resolve the Node.js executable the bundled worker adapters run on.
 
-TraceOne and WorkBuddy each ship a Node shim beside their staged package, and
+dsh-vision-router and WorkBuddy each ship a Node shim beside their staged package, and
 both resolve the interpreter the same way: an explicit environment override,
 the runtime bundled with the installed app, then ``PATH``.  Keeping that
 resolution here means one adapter cannot drift from the other.

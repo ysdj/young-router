@@ -18,7 +18,7 @@ from unittest import mock
 from young_router.core.domains import DomainError
 from young_router.core.domains.codex import CodexSettingsDomain
 from young_router.core.domains.providers_models import ProvidersModelsDomain
-from young_router.adapters import traceone
+from young_router.adapters import veridrop
 from young_router.core.domains.relay_accounts import RelayAccountsDomain
 from young_router.core.domains.runtime import RuntimeSettingsDomain
 from young_router.core.domains.webdav import WebDAVSettingsDomain
@@ -56,11 +56,12 @@ future_top_level:
 """
 
 
-DEEP_TEST_PROMPT = "Using only the current language model, produce 315 separate first-instinct choices of an integer from 1 through 355 inclusive."
+DEEP_TEST_MODEL = "claude-opus-4-8"
+DEEP_TEST_PROTOCOL = "anthropic"
 
 
-def deep_test_config(model_name: str = "gpt-6-astra", surface: str = "openai/responses", *, protocol_mode: str = "") -> str:
-    """The provider fixture renamed to a TraceOne route, on a chosen surface."""
+def deep_test_config(model_name: str = DEEP_TEST_MODEL, surface: str = "anthropic", *, protocol_mode: str = "") -> str:
+    """The provider fixture renamed to a model the staged scan program carries."""
 
     config = textwrap.dedent(PROVIDER_CONFIG).lstrip().replace("default-chat", model_name)
     if surface != "openai/responses":
@@ -75,16 +76,37 @@ def deep_test_config(model_name: str = "gpt-6-astra", surface: str = "openai/res
 
 
 @contextlib.contextmanager
-def degradation_engine(*, answer: dict[str, object]):
-    """Patch the TraceOne adapter so a test never needs the staged engine."""
+def degradation_engine(
+    *,
+    decision: dict[str, object] | None = None,
+    supported: bool = True,
+    engine: dict[str, object] | None = None,
+    error: BaseException | None = None,
+    model: str = DEEP_TEST_MODEL,
+    protocol: str = DEEP_TEST_PROTOCOL,
+):
+    """Patch the Veridrop adapter so a test never needs the staged program."""
 
-    def identify(_text: str, **_kwargs: object) -> dict[str, object]:
-        return dict(answer)
+    resolved_engine = engine or {
+        "name": "Veridrop",
+        "source": "test",
+        "license": "AGPL-3.0-or-later",
+        "revision": "test",
+        "staged_at": "",
+        "mode": "quick",
+        "available": True,
+    }
+    resolved_target = {"model": model, "protocol": protocol} if supported else None
 
-    with mock.patch.object(traceone, "engine", return_value={"name": "TraceOne", "source": "test", "revision": "test", "staged_at": "", "available": True}), mock.patch.object(
-        traceone, "prompt_text", return_value=DEEP_TEST_PROMPT
-    ), mock.patch.object(traceone, "identify", side_effect=identify):
-        yield
+    def run_quick(**_kwargs: object) -> dict[str, object]:
+        if error is not None:
+            raise error
+        return dict(decision or {})
+
+    with mock.patch.object(veridrop, "target", return_value=resolved_target), mock.patch.object(
+        veridrop, "engine", return_value=resolved_engine
+    ), mock.patch.object(veridrop, "run_quick", side_effect=run_quick) as staged:
+        yield staged
 
 
 
@@ -1568,24 +1590,14 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             domain.dispatch("provider.clear_key", {"provider_id": "primary"})
             self.assertIsNone(stored_probe())
 
-    def test_model_deep_test_sends_the_frozen_prompt_to_a_responses_route(self) -> None:
-        deep_requests: list[dict[str, object]] = []
+    def test_model_deep_test_probes_a_supported_route_with_the_staged_program(self) -> None:
+        """A supported route is handed to the staged quick suite, not prompted here."""
 
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self) -> None:  # noqa: N802 - stdlib handler hook
                 length = int(self.headers.get("Content-Length", "0"))
-                payload = json.loads(self.rfile.read(length).decode("utf-8"))
-                if self.path == "/v1/responses":
-                    if len(str(payload.get("input", ""))) > 100:
-                        deep_requests.append(payload)
-                        body = {
-                            "id": "resp-deep",
-                            "model": payload.get("model"),
-                            "output": [{"type": "message", "content": [{"type": "output_text", "text": "[[1]]"}]}],
-                        }
-                    else:
-                        body = {"id": "resp-probe", "output": []}
-                elif self.path == "/v1/messages":
+                self.rfile.read(length)
+                if self.path == "/v1/messages":
                     body = {"content": [{"type": "text", "text": "OK"}]}
                 else:
                     body = {"choices": [{"message": {"role": "assistant", "content": "OK"}}]}
@@ -1612,34 +1624,50 @@ class ProvidersModelsDomainTests(unittest.TestCase):
                 path.write_text(config, encoding="utf-8")
                 domain = ProvidersModelsDomain(path)
                 core = CoreStore(domains=[domain])
-                with degradation_engine(answer={"status": "identified", "label": "gpt-6-astra", "numbers": 315}):
+                with degradation_engine(
+                    decision={
+                        "verdict": "passed",
+                        "score": 92.0,
+                        "summary": "All detectors passed",
+                        "detectors": [{"name": "identity", "status": "pass", "score": 100.0}],
+                    }
+                ) as staged:
                     result = core.probe(
                         {"provider_id": "primary", "model_id": "00000071"},
                         domain="providers_models",
                     )
-                model = core.snapshot()["domains"]["providers_models"]["providers"][0]["models"][0]
+                    model = core.snapshot()["domains"]["providers_models"]["providers"][0]["models"][0]
         finally:
             server.shutdown()
             server.server_close()
             thread.join(timeout=2)
 
-        self.assertEqual(1, len(deep_requests))
-        self.assertEqual("gpt-6-astra", deep_requests[0]["model"])
-        self.assertEqual(DEEP_TEST_PROMPT, deep_requests[0]["input"])
+        arguments = staged.call_args.kwargs
+        self.assertEqual(f"http://127.0.0.1:{port}", arguments["base_url"])
+        self.assertEqual("replace-me-secret", arguments["api_key"])
+        self.assertEqual(DEEP_TEST_MODEL, arguments["model"])
+        self.assertEqual(DEEP_TEST_PROTOCOL, arguments["protocol"])
         self.assertEqual("matched", result["degradation"]["status"])
-        self.assertEqual("gpt-6-astra", result["degradation"]["target"])
-        self.assertEqual("gpt-6-astra", result["degradation"]["label"])
-        self.assertEqual("TraceOne", result["degradation"]["engine"]["name"])
+        self.assertEqual(DEEP_TEST_MODEL, result["degradation"]["target"])
+        self.assertEqual("anthropic", result["degradation"]["protocol"])
+        self.assertEqual("passed", result["degradation"]["verdict"])
+        self.assertEqual(92.0, result["degradation"]["score"])
+        self.assertEqual("Veridrop", result["degradation"]["engine"]["name"])
         self.assertTrue(result["degradation"]["engine"]["available"])
         self.assertEqual("matched", model["probe"]["degradation"]["status"])
         self.assertEqual(
-            {"includes_degradation": True, "target": "gpt-6-astra", "surface": "openai/responses"},
+            {
+                "includes_degradation": True,
+                "target": DEEP_TEST_MODEL,
+                "protocol": "anthropic",
+                "surface": "anthropic",
+            },
             model["deep_probe"],
         )
         self.assertTrue(model["model_enabled"])
         self.assertNotIn("replace-me-secret", json.dumps(result))
 
-    def test_model_deep_test_keeps_a_mismatched_model_enabled(self) -> None:
+    def test_model_deep_test_keeps_a_diluted_model_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.yaml"
             path.write_text(deep_test_config(), encoding="utf-8")
@@ -1649,12 +1677,15 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             def surface_probe(*, surface: str, **_kwargs: object) -> dict[str, object]:
                 return {"surface": surface, "available": True, "status": "ok"}
 
-            def deep_request(**_kwargs: object) -> tuple[str, str]:
-                return "[[1]]", "ok"
-
-            with mock.patch.object(ProvidersModelsDomain, "_surface_probe", side_effect=surface_probe), mock.patch.object(
-                ProvidersModelsDomain, "_degradation_request", side_effect=deep_request
-            ), degradation_engine(answer={"status": "identified", "label": "gpt-5.6-luna", "numbers": 315}):
+            with mock.patch.object(ProvidersModelsDomain, "_surface_probe", side_effect=surface_probe), degradation_engine(
+                decision={
+                    "verdict": "failed",
+                    "score": 31.0,
+                    "summary": "Identity answered as another brand",
+                    "brands": ["Amazon Q"],
+                    "detectors": [{"name": "identity", "status": "fail", "score": 0.0}],
+                }
+            ):
                 result = core.probe(
                     {"provider_id": "primary", "model_id": "00000071"},
                     domain="providers_models",
@@ -1663,23 +1694,30 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             model = snapshot["domains"]["providers_models"]["providers"][0]["models"][0]
 
         self.assertEqual("mismatch", result["degradation"]["status"])
-        self.assertEqual("gpt-5.6-luna", result["degradation"]["label"])
-        self.assertIn("gpt-5.6-luna", result["degradation"]["detail"])
-        # A fingerprint mismatch is a finding, never a routing decision: the
-        # model keeps its enable checkbox and the draft stays clean.
+        self.assertEqual("failed", result["degradation"]["verdict"])
+        self.assertEqual("Amazon Q", result["degradation"]["label"])
+        self.assertIn("Amazon Q", result["degradation"]["detail"])
+        self.assertIn("31/100", result["degradation"]["detail"])
+        # A failed check is a finding, never a routing decision: the model keeps
+        # its enable checkbox and the draft stays clean.
         self.assertTrue(model["model_enabled"])
         self.assertTrue(model["enabled"])
         self.assertEqual("mismatch", model["probe"]["degradation"]["status"])
         self.assertFalse(snapshot["drafts"]["providers_models"]["dirty"])
 
-    def test_a_degradation_engine_failure_is_a_finding_not_a_python_error(self) -> None:
-        """A missing prompt or a failed attribution reports its own cause."""
+    def test_a_staged_program_failure_is_a_finding_not_a_python_error(self) -> None:
+        """An unstaged program or a failed run reports its own cause."""
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.yaml"
             path.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
             domain = ProvidersModelsDomain(path)
-            plan = {"includes_degradation": True, "target": "gpt-6-astra", "surface": "openai/responses"}
+            plan = {
+                "includes_degradation": True,
+                "target": DEEP_TEST_MODEL,
+                "protocol": DEEP_TEST_PROTOCOL,
+                "surface": "anthropic",
+            }
             arguments = {
                 "plan": plan,
                 "api_base": "https://example.test/v1",
@@ -1688,39 +1726,34 @@ class ProvidersModelsDomainTests(unittest.TestCase):
                 "surface_status": "ok",
             }
             with mock.patch.object(
-                traceone,
+                veridrop, "engine", return_value={"name": "Veridrop", "available": False, "revision": ""}
+            ):
+                unstaged = domain._degradation_probe(**arguments)
+            with mock.patch.object(
+                veridrop,
                 "engine",
-                return_value={"name": "TraceOne", "source": "test", "revision": "test", "staged_at": "", "available": True},
+                return_value={"name": "Veridrop", "available": True, "revision": "test"},
             ), mock.patch.object(
-                traceone,
-                "prompt_text",
-                side_effect=traceone.TraceOneUnavailable("TraceOne prompt is missing"),
+                veridrop,
+                "run_quick",
+                side_effect=veridrop.VeridropUnavailable("Veridrop is not staged"),
             ):
                 missing = domain._degradation_probe(**arguments)
             with mock.patch.object(
-                traceone,
+                veridrop,
                 "engine",
-                return_value={"name": "TraceOne", "source": "test", "revision": "test", "staged_at": "", "available": True},
-            ), mock.patch.object(
-                traceone,
-                "prompt_text",
-                return_value=DEEP_TEST_PROMPT,
-            ), mock.patch.object(
-                domain,
-                "_degradation_request",
-                return_value=("[[1]]", "ok"),
-            ), mock.patch.object(
-                traceone,
-                "identify",
-                side_effect=RuntimeError("engine exploded"),
-            ):
+                return_value={"name": "Veridrop", "available": True, "revision": "test"},
+            ), mock.patch.object(veridrop, "run_quick", side_effect=RuntimeError("program exploded")):
                 broken = domain._degradation_probe(**arguments)
 
+        self.assertEqual("unavailable", unstaged["status"])
+        # The finding still names the route it was about.
+        self.assertEqual(DEEP_TEST_MODEL, unstaged["target"])
         self.assertEqual("unavailable", missing["status"])
-        self.assertIn("TraceOne prompt is missing", missing["detail"])
+        self.assertIn("Veridrop is not staged", missing["detail"])
         self.assertEqual("error", broken["status"])
-        self.assertIn("engine exploded", broken["detail"])
-        self.assertNotIn("replace-me-secret", json.dumps(missing) + json.dumps(broken))
+        self.assertIn("program exploded", broken["detail"])
+        self.assertNotIn("replace-me-secret", json.dumps(unstaged) + json.dumps(missing) + json.dumps(broken))
 
     def test_model_probe_does_not_retry_a_slow_surface(self) -> None:
         """A read timeout is the verdict; only a dropped connection is retried."""
@@ -1783,8 +1816,7 @@ class ProvidersModelsDomainTests(unittest.TestCase):
                 path = Path(directory) / "config.yaml"
                 path.write_text(textwrap.dedent(config).lstrip(), encoding="utf-8")
                 domain = ProvidersModelsDomain(path)
-                with mock.patch.object(ProvidersModelsDomain, "_degradation_request", return_value=("", "refused")):
-                    result = domain.probe({"provider_id": "primary", "model_id": "00000071"})
+                result = domain.probe({"provider_id": "primary", "model_id": "00000071"})
         finally:
             server.shutdown()
             server.server_close()
@@ -1936,29 +1968,24 @@ class ProvidersModelsDomainTests(unittest.TestCase):
         )
         self.assertEqual(1, len([path for path in set(attempts) if attempts.count(path) == 2]))
 
-    def test_model_deep_test_skips_the_fingerprint_when_responses_never_answered(self) -> None:
+    def test_model_deep_test_skips_the_scan_when_the_surface_never_answered(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.yaml"
             path.write_text(deep_test_config(), encoding="utf-8")
             domain = ProvidersModelsDomain(path)
-            deep_calls: list[object] = []
 
             def surface_probe(*, surface: str, **_kwargs: object) -> dict[str, object]:
                 return {"surface": surface, "available": False, "status": "network_error"}
 
-            def deep_request(**_kwargs: object) -> tuple[str, str]:
-                deep_calls.append(object())
-                return "[[1]]", "ok"
-
-            with mock.patch.object(ProvidersModelsDomain, "_surface_probe", side_effect=surface_probe), mock.patch.object(
-                ProvidersModelsDomain, "_degradation_request", side_effect=deep_request
-            ):
+            with mock.patch.object(ProvidersModelsDomain, "_surface_probe", side_effect=surface_probe), degradation_engine(
+                decision={"verdict": "passed", "score": 100.0}
+            ) as staged:
                 result = domain.probe({"provider_id": "primary", "model_id": "00000071"})
 
+        # The route already failed its tiny surface probe, so the longer scan
+        # never runs.
+        self.assertEqual([], staged.call_args_list)
         self.assertFalse(result["ok"])
-        self.assertEqual([], deep_calls)
-        # A transport failure is a reachability finding, never a fingerprint or
-        # availability verdict.
         self.assertTrue(result["unreachable"])
         self.assertEqual([], result["summary"]["available_surfaces"])
         self.assertEqual(
@@ -1970,61 +1997,34 @@ class ProvidersModelsDomainTests(unittest.TestCase):
         self.assertEqual("network_error", result["degradation"]["cause"])
         self.assertIn("did not answer", result["degradation"]["detail"])
 
-    def test_model_deep_test_skips_degradation_for_other_protocols_and_names(self) -> None:
-        for label, config in (
-            ("fixed chat route", deep_test_config(surface="openai/chat", protocol_mode="fixed")),
-            ("unmatched name", deep_test_config(model_name="default-chat")),
-        ):
-            with self.subTest(label=label):
-                with tempfile.TemporaryDirectory() as directory:
-                    path = Path(directory) / "config.yaml"
-                    path.write_text(config, encoding="utf-8")
-                    domain = ProvidersModelsDomain(path)
-                    core = CoreStore(domains=[domain])
-                    deep_calls: list[object] = []
-
-                    def deep_request(**_kwargs: object) -> tuple[str, str]:
-                        deep_calls.append(object())
-                        return "[[1]]", "ok"
-
-                    def surface_probe(*, surface: str, **_kwargs: object) -> dict[str, object]:
-                        return {"surface": surface, "available": True, "status": "ok"}
-
-                    with mock.patch.object(ProvidersModelsDomain, "_surface_probe", side_effect=surface_probe), mock.patch.object(
-                        ProvidersModelsDomain, "_degradation_request", side_effect=deep_request
-                    ):
-                        result = core.probe(
-                            {"provider_id": "primary", "model_id": "00000071"},
-                            domain="providers_models",
-                        )
-                    model = core.snapshot()["domains"]["providers_models"]["providers"][0]["models"][0]
-
-                self.assertEqual([], deep_calls)
-                self.assertEqual("skipped", result["degradation"]["status"])
-                self.assertIsNone(result["degradation"]["target"])
-                self.assertEqual(
-                    {"includes_degradation": False, "target": None, "surface": ""},
-                    model["deep_probe"],
-                )
-                self.assertTrue(model["model_enabled"])
-
-    def test_model_deep_test_reports_an_unstaged_engine(self) -> None:
+    def test_model_deep_test_skips_a_model_the_staged_program_does_not_carry(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.yaml"
-            path.write_text(deep_test_config(), encoding="utf-8")
+            path.write_text(deep_test_config(model_name="gpt-6-astra"), encoding="utf-8")
             domain = ProvidersModelsDomain(path)
+            core = CoreStore(domains=[domain])
 
             def surface_probe(*, surface: str, **_kwargs: object) -> dict[str, object]:
                 return {"surface": surface, "available": True, "status": "ok"}
 
-            with mock.patch.object(ProvidersModelsDomain, "_surface_probe", side_effect=surface_probe), mock.patch.object(
-                traceone, "engine", return_value={"name": "TraceOne", "available": False, "revision": ""}
-            ):
-                result = domain.probe({"provider_id": "primary", "model_id": "00000071"})
+            with mock.patch.object(ProvidersModelsDomain, "_surface_probe", side_effect=surface_probe), degradation_engine(
+                supported=False
+            ) as staged:
+                result = core.probe(
+                    {"provider_id": "primary", "model_id": "00000071"},
+                    domain="providers_models",
+                )
+            model = core.snapshot()["domains"]["providers_models"]["providers"][0]["models"][0]
 
-        self.assertTrue(result["ok"])
-        self.assertEqual("unavailable", result["degradation"]["status"])
-        self.assertEqual("gpt-6-astra", result["degradation"]["target"])
+        self.assertEqual([], staged.call_args_list)
+        self.assertEqual("skipped", result["degradation"]["status"])
+        self.assertIsNone(result["degradation"]["target"])
+        self.assertEqual(
+            {"includes_degradation": False, "target": None, "protocol": "", "surface": ""},
+            model["deep_probe"],
+        )
+        self.assertTrue(model["model_enabled"])
+
 
     def test_model_probes_are_independent_and_do_not_lock_provider_edits(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

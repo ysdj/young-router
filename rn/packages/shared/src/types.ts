@@ -277,21 +277,31 @@ export type ProbeDegradationStatus =
 export interface ProbeDegradationEngine {
   name: string;
   source?: string;
+  license?: string;
   revision?: string;
   staged_at?: string;
+  mode?: string;
+  targets?: string[];
   available?: boolean;
 }
 
-/** TraceOne fingerprint result for the route behind one requested model name. */
+/** Veridrop quick-mode result for the route behind one requested model name. */
 export interface ProbeDegradationResult {
   status: ProbeDegradationStatus | string;
   target?: string | null;
+  protocol?: string;
+  /** Brands or self-reported identity the upstream answer carried. */
   label?: string | null;
+  /** The upstream verdict: passed, marginal, or failed. */
+  verdict?: string;
+  score?: number | null;
+  /** Non-Anthropic brands the identity probe found in the answer. */
+  brands?: string[];
+  detectors?: Array<{ name: string; status: string; score?: number | null }>;
   /** Raw request status behind an unreachable or failed deep test. */
   cause?: string;
   detail?: string;
   checked_at?: string;
-  numbers?: number;
   engine?: ProbeDegradationEngine;
 }
 
@@ -299,6 +309,7 @@ export interface ProbeDegradationResult {
 export interface ModelDeepProbePlan {
   includes_degradation: boolean;
   target?: string | null;
+  protocol?: string;
   surface?: string;
 }
 

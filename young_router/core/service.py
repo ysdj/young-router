@@ -2030,11 +2030,15 @@ class CoreStore:
             status_setter = getattr(relay, "set_login_status", None) if relay is not None else None
             session_restorer = getattr(relay, "restore_saved_session", None) if relay is not None else None
             password_restorer = getattr(relay, "restore_saved_password", None) if relay is not None else None
+            status_settler = getattr(relay, "settle_login_status", None) if relay is not None else None
+            session_check_is_recent = getattr(relay, "session_check_is_recent", None) if relay is not None else None
             if (
                 not callable(accepter)
                 or not callable(status_setter)
                 or not callable(session_restorer)
                 or not callable(password_restorer)
+                or not callable(status_settler)
+                or not callable(session_check_is_recent)
             ):
                 raise CoreError("relay_restore_failed", "Relay account is unavailable")
             relay_was_dirty = bool(self._drafts.get("relay_accounts", {}).get("dirty"))
@@ -2065,19 +2069,31 @@ class CoreStore:
                         preserve_resources=True,
                     )
                 elif login_status in {"signed_out", "expired"} and matching.get("remember_password") is True:
+                    # A session this Core already holds and observed inside its
+                    # re-check window answers the check with that observation:
+                    # the site is not asked to re-authenticate a login it
+                    # proved moments ago, so re-entering the pane inside the
+                    # window costs no station round trip at all.
                     public = None
-                    if login_status == "signed_out":
-                        try:
-                            public = session_restorer(str(account_id))
-                        except Exception:
-                            public = None
+                    if not session_check_is_recent(str(account_id)):
+                        if login_status == "signed_out":
+                            try:
+                                public = session_restorer(str(account_id))
+                            except Exception:
+                                public = None
+                        if public is None:
+                            try:
+                                public = password_restorer(str(account_id))
+                            except Exception:
+                                public = status_setter(str(account_id), str(login_status))
                     if public is None:
-                        try:
-                            public = password_restorer(str(account_id))
-                        except Exception:
-                            public = status_setter(str(account_id), str(login_status))
+                        public = status_settler(str(account_id), str(login_status))
                 elif login_status in {"signed_out", "expired"}:
-                    public = status_setter(str(account_id), str(login_status))
+                    # A host observation of an account that holds no session,
+                    # and every explicit ``expired``, are recorded as they are;
+                    # the session Core already holds is reconciled against it in
+                    # ``settle_login_status``.
+                    public = status_settler(str(account_id), str(login_status))
                 else:
                     raise CoreError("relay_restore_failed", "Relay login status is invalid")
                 self._revision += 1

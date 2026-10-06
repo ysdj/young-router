@@ -43,6 +43,12 @@ export type RelayAccount = {
   stationName: string;
   username: string;
   loginStatus: string;
+  /**
+   * How long ago Core's login observation for this account was made, or null
+   * when it cannot say.  The pane compares it with the station's re-check
+   * window before it asks for another station round trip.
+   */
+  loginObservedSecondsAgo: number | null;
   rememberPassword: boolean;
   passwordSaved: boolean;
   autoGrouping: boolean;
@@ -177,6 +183,7 @@ export function accountsFromSnapshot(snapshot?: CoreSnapshot): RelayAccount[] {
       stationName: text(item.station_name) || text(item.station_label),
       username: text(item.username),
       loginStatus: text(item.login_status) || "unknown",
+      loginObservedSecondsAgo: typeof item.login_observed_seconds_ago === "number" && Number.isFinite(item.login_observed_seconds_ago) ? item.login_observed_seconds_ago : null,
       rememberPassword: item.remember_password === true,
       passwordSaved: item.password_saved === true,
       autoGrouping: item.auto_grouping === true,
@@ -334,6 +341,20 @@ type PendingCredentialCleanup = {
   label: string;
   kind: "credentials";
 };
+
+/**
+ * How long Core's login observation answers a later check for, in seconds.
+ *
+ * Core publishes one window for the whole relay domain and every panel applies
+ * the same number, so the account pane can skip a station round trip the window
+ * already covers instead of probing a session it verified moments ago.
+ */
+export function relaySessionRecheckSeconds(snapshot?: CoreSnapshot): number | undefined {
+  const domain = record(snapshot?.domains.relay_accounts);
+  const state = Object.keys(record(domain.state)).length > 0 ? record(domain.state) : domain;
+  const value = state.session_recheck_seconds;
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
 
 /** Secret-free cleanup tombstones Core keeps until native storage confirms the erase. */
 export function pendingCredentialCleanups(snapshot?: CoreSnapshot): PendingCredentialCleanup[] {
@@ -513,6 +534,15 @@ export function DependencyPolicyDialog<T extends string>({ visible, title, messa
   </RelayDialogLayer>;
 }
 
+/**
+ * The lanes one account's work is reported in.
+ *
+ * ``session`` is a sign-in the user started (去登录, or the ＋ account flow):
+ * that wait owns the login column's 登录中.  ``resources`` is the station round
+ * trip lane — a silent session restore and the key-list read are the same wait
+ * on the same station, so they share it, and neither repaints a login state the
+ * pane is about to agree with.
+ */
 type AccountLoading = { session: boolean; resources: boolean };
 
 /**
@@ -533,6 +563,7 @@ export function StationAccountsPanel({
   detectType,
   language,
   cleanups,
+  sessionRecheckSeconds,
   stationDraft: stationDraftProp,
   onStationDraftChange,
   onStageStationUpdate,
@@ -545,6 +576,12 @@ export function StationAccountsPanel({
   native: NativeLeafAdapter;
   language: "system" | "en" | "zh-Hans";
   cleanups?: PendingCredentialCleanup[];
+  /**
+   * How long Core's login observation answers a later check for.  The pane
+   * applies it before asking the host to probe, so re-entering within the
+   * window costs no station round trip.
+   */
+  sessionRecheckSeconds?: number;
   busy: boolean;
   translate: Translate;
   commit: RelayCommit;
@@ -579,7 +616,7 @@ export function StationAccountsPanel({
   const [formBusy, setFormBusy] = useState(false);
   // Which account action is running: the button that started one keeps its own
   // inline spinner instead of graying out.
-  const [pendingAction, runPendingAction] = usePendingAction<"cleanup" | "add" | "login" | "remove">();
+  const [pendingAction, runPendingAction] = usePendingAction<"cleanup" | "add" | "login" | "remove" | "refresh">();
   const [removal, setRemoval] = useState<{ account: RelayAccount }>();
   const [removalPolicy, setRemovalPolicy] = useState<LocalDependencyPolicy>("detach");
   // What a sign-in may save is asked by the native login flow after the
@@ -616,8 +653,11 @@ export function StationAccountsPanel({
     return "unknown";
   };
   // The status column and both account actions read this one state: 已登录,
-  // 登录中 while this account's sign-in is in flight, and 未登录 for every
-  // other case (signed out, expired, not probed yet).
+  // 登录中 while a sign-in this pane started is in flight, and 未登录 for every
+  // other case (signed out, expired, not probed yet).  Only the session lane
+  // says 登录中: a silent mount probe is a station round trip (the resources
+  // lane), not a sign-in, and it must not repaint the row it is about to agree
+  // with every time the pane opens.
   const relayLoginState = (account: RelayAccount): "signed_in" | "signing_in" | "signed_out" => {
     if (loading[account.id]?.session) return "signing_in";
     return effectiveLoginStatus(account) === "signed_in" ? "signed_in" : "signed_out";
@@ -691,7 +731,12 @@ export function StationAccountsPanel({
     }
   };
   const restoreSavedSession = async (account: RelayAccount): Promise<boolean> => {
-    updateLoading(account.id, "session", true);
+    // A silent mount probe is stated by nothing: it is a station round trip
+    // (the resources lane, which it shares with the key-list read it precedes),
+    // never a sign-in.  The login column keeps showing what the pane already
+    // knows while it runs, so re-entering the pane does not flicker a verified
+    // account through 登录中.
+    updateLoading(account.id, "resources", true);
     try {
       const result = await native.restoreRelaySession({
         accountId: account.id,
@@ -714,7 +759,7 @@ export function StationAccountsPanel({
       markLocalSignedIn(account.id, false);
       return false;
     } finally {
-      updateLoading(account.id, "session", false);
+      updateLoading(account.id, "resources", false);
     }
   };
   const loginAccount = async (account: AddedRelayAccount): Promise<boolean> => {
@@ -765,22 +810,38 @@ export function StationAccountsPanel({
   // fresh login state and resources without a manual refresh click.  A restore
   // that fails never opens the login page on its own: the account reads 未登录
   // and keeps its cached keys until the user presses 去登录 (or +).
+  //
+  // The mount is not a reason to re-authenticate: Core answers with the
+  // observation it already has while that observation is inside the station's
+  // re-check window (运行时 adjusts it), so stepping into the pane and back
+  // within the window costs no station round trip and never repaints the login
+  // state.  Only a session the window no longer covers is probed again.
   const attemptedAccounts = useRef(new Set<string>());
   useEffect(() => {
     if (busy) return;
     for (const account of stationAccounts) {
       if (attemptedAccounts.current.has(account.id) || isAccountLoading(account.id)) continue;
       attemptedAccounts.current.add(account.id);
+      const observed = account.loginObservedSecondsAgo;
+      const fresh = account.loginStatus === "signed_in"
+        && observed !== null
+        && typeof sessionRecheckSeconds === "number"
+        && sessionRecheckSeconds > 0
+        && observed < sessionRecheckSeconds;
       void (async () => {
         // Opening the station is the probe: restore the login, then refresh the
         // key list.  The refresh runs even when the session check failed — a
         // locally known key is local data, and Core still reads the station
-        // through an explicitly remembered session when it has one.
-        await restoreSavedSession(account);
+        // through an explicitly remembered session when it has one.  A session
+        // the window already covers skips the probe entirely, and the pane goes
+        // straight to the key list it actually came to show.
+        if (!fresh) {
+          await restoreSavedSession(account);
+        }
         await refreshAccountResources(account, { silent: true });
       })();
     }
-  }, [busy, stationAccounts]);
+  }, [busy, sessionRecheckSeconds, stationAccounts]);
   // The add flow never reserves an account slot. The webview login runs
   // first (its own modal window over the workspace); Core creates the account
   // shell only when sign-in actually succeeds (pending_account), so a
@@ -823,6 +884,24 @@ export function StationAccountsPanel({
   // the wait the user must not sit through), while the native login window
   // restores the remembered browser session itself and closes again when that
   // session still works.
+  // 刷新资源 is the control every relay message already names: a session that
+  // cannot read the station is reported with 「请点击刷新资源」, so the row that
+  // states it carries the button that performs it.  It is a forced station
+  // round trip, so it reports its own progress and its own result.
+  const refreshSelected = async (): Promise<void> => {
+    if (!selected) return;
+    if (pendingAction === "refresh") return;
+    const account = selected;
+    await runPendingAction("refresh", async () => {
+      setFormBusy(true);
+      try {
+        const status = await refreshAccountResources({ id: account.id }, { force: true });
+        publish(translate(status === "ready" ? "relay.loginComplete" : "relay.resourcesUnavailable"));
+      } finally {
+        setFormBusy(false);
+      }
+    });
+  };
   const loginSelected = async (): Promise<void> => {
     if (!selected) return;
     if (effectiveLoginStatus(selected) === "signed_in") return;
@@ -1208,6 +1287,7 @@ export function StationAccountsPanel({
         {selectedLoginState === "signed_out" ? <NativeButton title={translate("relay.goLogin")} compact busy={pendingAction === "login"} disabled={controlsBusy && pendingAction !== "login"} onPress={() => { void loginSelected(); }} /> : null}
       </View>
       <View style={styles.accountActionsRow}>
+        <NativeButton title={translate("relay.refreshResources")} symbol="refresh" compact busy={pendingAction === "refresh"} disabled={controlsBusy && pendingAction !== "refresh"} onPress={() => { void refreshSelected(); }} />
         <NativeButton title={translate("relay.groupManager")} compact disabled={controlsBusy || !native.showGroupManager} onPress={() => { void openGroupManager(); }} />
       </View>
     </View> : null}

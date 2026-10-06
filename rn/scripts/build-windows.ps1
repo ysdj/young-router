@@ -11,7 +11,7 @@ if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP)) {
 $PiWork = Join-Path ([System.IO.Path]::GetTempPath()) ("young-router-pi-web-access-" + [guid]::NewGuid().ToString("N"))
 $PiPackage = Join-Path $PiWork "package"
 $PiNode = Join-Path $PiWork "node"
-$TraceOneWork = Join-Path ([System.IO.Path]::GetTempPath()) ("young-router-traceone-" + [guid]::NewGuid().ToString("N"))
+$VeridropWork = Join-Path ([System.IO.Path]::GetTempPath()) ("young-router-veridrop-" + [guid]::NewGuid().ToString("N"))
 $WorkBuddyConnectWork = Join-Path ([System.IO.Path]::GetTempPath()) ("young-router-workbuddy-connect-" + [guid]::NewGuid().ToString("N"))
 $DshVisionRouterWork = Join-Path ([System.IO.Path]::GetTempPath()) ("young-router-dsh-vision-router-" + [guid]::NewGuid().ToString("N"))
 
@@ -36,12 +36,12 @@ try {
     --output $PiPackage `
     --node-output $PiNode
   if ($LASTEXITCODE -ne 0) { throw "Could not update pi-web-access and the bundled Node.js runtime." }
-  # The degradation deep test runs the latest upstream TraceOne, so every
+  # The authenticity deep test runs the latest upstream Veridrop, so every
   # artifact build re-checks its default branch instead of packaging a stale
-  # classifier copy.
-  $TraceOneUpdater = Join-Path $ProjectRoot "scripts\update_traceone.py"
-  & uv run --no-project --python 3.12 $TraceOneUpdater --output $TraceOneWork
-  if ($LASTEXITCODE -ne 0) { throw "Could not update the bundled TraceOne degradation engine." }
+  # copy of the scan program.
+  $VeridropUpdater = Join-Path $ProjectRoot "scripts\update_veridrop.py"
+  & uv run --no-project --python 3.12 $VeridropUpdater --output $VeridropWork
+  if ($LASTEXITCODE -ne 0) { throw "Could not update the bundled Veridrop scan program." }
   # WorkBuddy access is driven through the published third-party package, so
   # every artifact build re-resolves its latest release.
   $WorkBuddyConnectUpdater = Join-Path $ProjectRoot "scripts\update_workbuddy_connect.py"
@@ -63,7 +63,7 @@ try {
   Copy-CoreSource (Join-Path $ProjectRoot "sitecustomize.py") (Join-Path $Core "sitecustomize.py")
   Copy-CoreSource (Join-Path $ProjectRoot "young_router") (Join-Path $Core "young_router")
   Copy-CoreSource $PiPackage (Join-Path $Core "young_router\adapters\pi-web-access")
-  Copy-CoreSource $TraceOneWork (Join-Path $Core "young_router\adapters\traceone")
+  Copy-CoreSource $VeridropWork (Join-Path $Core "young_router\adapters\veridrop")
   Copy-CoreSource $WorkBuddyConnectWork (Join-Path $Core "young_router\adapters\workbuddy-connect")
   Copy-CoreSource $DshVisionRouterWork (Join-Path $Core "young_router\adapters\dsh-vision-router")
   Get-ChildItem -LiteralPath $Core -Recurse -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force
@@ -85,6 +85,14 @@ try {
   $LiteLLMVersion = (Get-Content -Raw (Join-Path $ProjectRoot "LITELLM_VERSION")).Trim()
   uv pip install --python (Join-Path $RuntimeBin "python.exe") `
     "litellm[proxy]==$LiteLLMVersion" "fastapi==0.140.3" PyYAML Pillow
+  # The staged scan program is imported into the Core's own interpreter, so what
+  # it imports and the bundled runtime does not already carry is added to that
+  # runtime here - and only that: a dependency the runtime already has is never
+  # upgraded under the release's own pins.
+  $VeridropDeps = & (Join-Path $RuntimeBin "python.exe") (Join-Path $ProjectRoot "scripts\update_veridrop.py") `
+    --output $VeridropWork --install-deps (Join-Path $RuntimeBin "Lib\site-packages") `
+    --python (Join-Path $RuntimeBin "python.exe") 2>&1
+  if ($LASTEXITCODE -ne 0) { throw "Could not complete the bundled Veridrop dependencies: $VeridropDeps" }
   Copy-Item -LiteralPath (Join-Path $PiNode "node.exe") -Destination $RuntimeBin -Force
   $GeneratedScripts = Join-Path $RuntimeBin "Scripts"
   if (Test-Path $GeneratedScripts) {
@@ -102,11 +110,27 @@ set "RUNTIME_ROOT=%~dp0"
   if (-not (Test-Path (Join-Path $Core "young_router\adapters\pi-web-access\index.ts"))) {
     throw "The bundled pi-web-access package is missing."
   }
-  if (-not (Test-Path (Join-Path $Core "young_router\adapters\traceone\traceone.js"))) {
-    throw "The bundled TraceOne degradation engine is missing."
+  if (-not (Test-Path (Join-Path $Core "young_router\adapters\veridrop\src\relay_detector\cli.py"))) {
+    throw "The bundled Veridrop scan program is missing."
   }
-  if (-not (Test-Path (Join-Path $Core "young_router\adapters\traceone\prompt.txt"))) {
-    throw "The bundled TraceOne identity prompt is missing."
+  if (-not (Test-Path (Join-Path $Core "young_router\adapters\veridrop\LICENSE"))) {
+    throw "The bundled Veridrop license text is missing."
+  }
+  # The staged program is imported into the Core's own interpreter, so the
+  # bundle proves that import - and the dependency set the runtime was
+  # completed with - before the app is packaged.
+  $VeridropRoot = Join-Path $Core "young_router\adapters\veridrop"
+  $VeridropImport = & (Join-Path $RuntimeBin "python.exe") -c @"
+import sys
+sys.path.insert(0, r'$VeridropRoot\src')
+import relay_detector.cli
+import relay_detector.protocols.anthropic
+import relay_detector.protocols.openai
+import relay_detector.protocols.gemini
+print('young-router-veridrop-import-ok')
+"@ 2>&1
+  if ($LASTEXITCODE -ne 0 -or ($VeridropImport -join "`n") -notmatch "young-router-veridrop-import-ok") {
+    throw "The bundled Veridrop program could not be imported: $VeridropImport"
   }
   if (-not (Test-Path (Join-Path $Core "young_router\adapters\workbuddy_stream.mjs"))) {
     throw "The Windows build output does not contain young_router/adapters/workbuddy_stream.mjs."

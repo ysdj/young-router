@@ -1317,3 +1317,167 @@ class HookStreamingResponseEventTests(HookTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HookStreamingToolCallArgumentsTests(HookTestCase):
+    """Delivery guards for a tool call's arguments and its identity."""
+
+    def request_data(self) -> dict:
+        return {
+            "call_type": "aresponses",
+            "model": "default-chat",
+            "stream": True,
+            "input": "run a command",
+        }
+
+    async def test_unparseable_arguments_state_their_own_cause(self) -> None:
+        """A tool call nobody can run belongs to the request, not to a route.
+
+        This shape used to be reported as ``upstream_route_failure``, which
+        reads as a server-side route outage: it invited a deployment cooldown
+        and the long recovery poll for a stream whose parameters had already
+        arrived and could not be parsed.  The code and message now name the
+        real cause so terminal classification can keep it deterministic.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        delivered = hooks._responses_stream_chunk_for_delivery(
+            {
+                "type": "response.function_call_arguments.done",
+                "output_index": 0,
+                "item_id": "call_bad",
+                "arguments": '{"edits": [{"newText": "x", "oldText',
+            },
+            self.request_data(),
+        )
+
+        self.assertEqual(delivered["type"], "response.failed")
+        error = delivered["response"]["error"]
+        self.assertEqual(error["code"], "upstream_tool_call_arguments_invalid")
+        self.assertEqual(error["type"], "invalid_request_error")
+        self.assertIn("not a valid JSON object", error["message"])
+        json.dumps(delivered)
+
+    async def test_invalid_arguments_error_is_recognized_by_the_delivery_path(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+
+        self.assertTrue(
+            hooks._is_invalid_tool_call_arguments_error(
+                hooks._InvalidToolCallArgumentsError("unparseable")
+            )
+        )
+        self.assertFalse(
+            hooks._is_invalid_tool_call_arguments_error(RuntimeError("route failed"))
+        )
+
+    async def test_streamed_arguments_survive_an_unusable_mirror(self) -> None:
+        """One call owns two identity keys and no mirror may erase them.
+
+        A bridge states the same call by ``id`` on the item and by ``call_id``
+        on the argument events, and a closing mirror may repeat arguments this
+        stream already delivered in a shape no parser accepts.  Recording that
+        unusable value as the call's arguments discarded the valid value the
+        client had already been sent, and the terminal mirror then looked
+        unparseable and failed a turn whose tool call was complete.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        valid = '{"edits": [{"newText": "x"}]}'
+        state = hooks._ResponsesStreamCompletionState(self.request_data())
+
+        chunks = []
+        for event in (
+            {"type": "response.created", "response": {"id": "resp_1"}},
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "edit",
+                    "arguments": "",
+                },
+            },
+            {
+                "type": "response.function_call_arguments.done",
+                "output_index": 0,
+                "item_id": "call_1",
+                "call_id": "call_1",
+                "arguments": valid,
+            },
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "edit",
+                    "arguments": '{"edits": [{"newText": "x"',
+                },
+            },
+        ):
+            state.remember(event)
+            chunks.append(
+                hooks._responses_stream_chunk_for_delivery(
+                    state.chunk_for_delivery(event, self.request_data()),
+                    self.request_data(),
+                )
+            )
+
+        for chunk in chunks:
+            self.assertNotEqual(
+                chunk.get("type"),
+                "response.failed",
+                f"a valid streamed tool call was failed: {chunk}",
+            )
+        done = chunks[-1]
+        self.assertEqual(done["type"], "response.output_item.done")
+        self.assertEqual(json.loads(done["item"]["arguments"]), json.loads(valid))
+
+    async def test_a_malformed_mirror_does_not_erase_the_other_identity_key(self) -> None:
+        """An unusable value states nothing; it never overwrites a valid one."""
+
+        hooks, _proxy_server = load_hook_module()
+        valid = '{"edits": [{"newText": "x"}]}'
+        state = hooks._ResponsesStreamCompletionState(self.request_data())
+
+        state.remember(
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "edit",
+                    "arguments": "",
+                },
+            }
+        )
+        state.remember(
+            {
+                "type": "response.function_call_arguments.done",
+                "output_index": 0,
+                "item_id": "fc_1",
+                "arguments": valid,
+            }
+        )
+        state.remember(
+            {
+                "type": "response.function_call_arguments.done",
+                "output_index": 0,
+                "item_id": "fc_1",
+                "arguments": '{"edits": [',
+            }
+        )
+
+        self.assertEqual(
+            json.loads(state.arguments_by_item_id["fc_1"]),
+            json.loads(valid),
+        )
+        self.assertEqual(
+            json.loads(state.arguments_by_item_id["call_1"]),
+            json.loads(valid),
+        )

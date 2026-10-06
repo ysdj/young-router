@@ -144,6 +144,23 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def _observed_seconds_ago(value: object) -> float | None:
+    """How long ago one stored observation was made, or None if it cannot say.
+
+    The account pane's own re-check window reads the same value, so both sides
+    agree on what "just observed" means.
+    """
+
+    observed = _updated_at(value)
+    if not observed:
+        return None
+    try:
+        timestamp = datetime.fromisoformat(observed.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return (datetime.now(timezone.utc) - timestamp).total_seconds()
+
+
 def _updated_at(value: object) -> str:
     if not isinstance(value, str) or not value.strip():
         return ""
@@ -509,6 +526,11 @@ def _private_account(raw: Mapping[str, Any]) -> dict[str, Any]:
         "session": session,
         "balance": _balance(raw.get("balance")),
         "last_updated_at": _updated_at(raw.get("last_updated_at")),
+        # When the login itself was last observed, which is what the pane's
+        # re-check window measures.  It is deliberately not ``last_updated_at``:
+        # a resource read records its own time there, and a failed one must not
+        # renew a login observation it never made.
+        "login_observed_at": _updated_at(raw.get("login_observed_at")),
         "resource_status": resource_status,
         "resource_error": resource_error,
         "resources": _safe_resources(raw.get("resources", [])),
@@ -544,6 +566,12 @@ def _public_account(account: Mapping[str, Any]) -> dict[str, Any]:
         "password_saved": bool(account.get("password")),
         "balance": _balance(account.get("balance")),
         "last_updated_at": str(account.get("last_updated_at", "")),
+        # A login observation ages in the pane's own clock, so the re-check
+        # window is applied before a station round trip is even considered.
+        # Only the outcomes that are a statement about the login refresh it: a
+        # resource read that failed says nothing about the session and must not
+        # make an old probe look fresh.
+        "login_observed_seconds_ago": _observed_seconds_ago(account.get("login_observed_at")),
         "resource_status": str(account.get("resource_status", "idle")),
         "resource_error": str(account.get("resource_error", "none")),
         "resources": copy.deepcopy(account.get("resources", [])),
@@ -554,6 +582,9 @@ def _public_account(account: Mapping[str, Any]) -> dict[str, Any]:
 def _stored_account(account: Mapping[str, Any]) -> dict[str, Any]:
     stored = _public_account(account)
     stored.pop("password_saved", None)
+    # The pane's own age of the observation is derived on every projection; the
+    # document keeps the stamp it is derived from.
+    stored.pop("login_observed_seconds_ago", None)
     stored["password"] = str(account.get("password", ""))
     stored["session"] = copy.deepcopy(account.get("session", {}))
     return stored
@@ -1448,6 +1479,11 @@ class RelayAccountsDomain:
             "pending_operations": pending_operations,
             "pending_operation_count": len(pending_operations),
             "pending_operation_summary": self._pending_operation_summary(),
+            # The window one login observation answers later checks for.  The
+            # account pane reads it (with each account's own observation age)
+            # to decide whether entering the pane needs a station round trip at
+            # all, so both sides apply one number.
+            "session_recheck_seconds": self._session_recheck_seconds(),
             "last_action": copy.deepcopy(self._last_action),
         }
 
@@ -2919,7 +2955,8 @@ class RelayAccountsDomain:
         }
         account["username"] = username
         account["login_status"] = "signed_in"
-        account["last_updated_at"] = _utc_now_iso()
+        account["login_observed_at"] = _utc_now_iso()
+        account["last_updated_at"] = account["login_observed_at"]
         account["resource_status"] = "idle"
         account["resource_error"] = "none"
         account["resources"] = []
@@ -3057,11 +3094,15 @@ class RelayAccountsDomain:
             secrets["refresh_token"] = _text(refresh_token, "Relay refresh token", limit=32768)
         if remember_password is not None:
             account["remember_password"] = remember_password is True
+        observed_at = _utc_now_iso()
         account.update(
             {
                 "username": username_value,
                 "login_status": "signed_in",
-                "last_updated_at": _utc_now_iso(),
+                # The login itself was just proven, which is the fact the pane's
+                # re-check window measures.
+                "login_observed_at": observed_at,
+                "last_updated_at": observed_at,
                 "resource_status": "idle",
                 "resource_error": "none",
             }
@@ -3081,6 +3122,34 @@ class RelayAccountsDomain:
         self._persist()
         self.revision += 1
         return _public_account(self._accounts[index])
+
+    def settle_login_status(self, account_id: str, status: str) -> dict[str, Any]:
+        """Record one host session observation, or hold one that is already proven.
+
+        The pane asks the host to restore a saved session every time it mounts,
+        and each mount used to republish the pre-probe observation: the row
+        flicked to 登录中 and then back through whatever the station answered,
+        even when the host asked two seconds earlier.  A session Core already
+        holds and has just used is not an open question.
+
+        Two observations are therefore kept instead of overwritten:
+
+        * ``expired`` is always recorded -- a station that rejected its own
+          session is the freshest fact about it.
+        * ``signed_out`` is recorded only while the account holds no session
+          Core can still use.  A live session is not signed out just because
+          the host's probe said so; that probe is unauthenticated, and the
+          station's own answer to an authenticated read is what retires a
+          session (see :meth:`_refresh_resources_once`).
+
+        Both outcomes stay secret-free, so this never retains credentials.
+        """
+
+        index = self._index(account_id)
+        account = self._accounts[index]
+        if status == "signed_out" and self._has_session_credentials(account):
+            return _public_account(account)
+        return self.set_login_status(account_id, status)
 
     def restore_saved_session(self, account_id: str) -> dict[str, Any] | None:
         """Verify and activate an explicitly remembered browser session."""
@@ -3113,7 +3182,8 @@ class RelayAccountsDomain:
             return None
         self._session_secrets[account_id] = secrets
         account["login_status"] = "signed_in"
-        account["last_updated_at"] = _utc_now_iso()
+        account["login_observed_at"] = _utc_now_iso()
+        account["last_updated_at"] = account["login_observed_at"]
         account["resource_status"] = "idle"
         account["resource_error"] = "none"
         self._accounts[index] = _private_account(account)
@@ -3169,7 +3239,8 @@ class RelayAccountsDomain:
         index = self._index(account_id)
         account = copy.deepcopy(self._accounts[index])
         account["login_status"] = status
-        account["last_updated_at"] = _utc_now_iso()
+        account["login_observed_at"] = _utc_now_iso()
+        account["last_updated_at"] = account["login_observed_at"]
         # A session check says nothing about the station's API keys.  The
         # result is recorded as the account's login observation only: the last
         # verified key list and its resource state stay exactly as they were,
@@ -3183,6 +3254,59 @@ class RelayAccountsDomain:
         self._persist()
         self.revision += 1
         return _public_account(self._accounts[index])
+
+    # One login observation answers later checks of the same account for this
+    # long.  A check is a station round trip, and every mount of the account
+    # pane runs one, so without a window each entry re-authenticated and
+    # re-read the site.  The pane applies the window before it asks the host to
+    # probe; Core applies the same number to its own answer below, so an
+    # observation that arrives anyway still cannot rewrite a fresh one.
+    DEFAULT_SESSION_RECHECK_SECONDS = 60.0
+    SESSION_RECHECK_KEY = "YOUNG_ROUTER_RELAY_SESSION_RECHECK_SECONDS"
+
+    def _session_recheck_seconds(self) -> float:
+        """The configured window, read from the runtime settings file.
+
+        Read per check rather than cached so a change applies on the next
+        mount, and a settings file that cannot be read leaves the default in
+        place instead of failing a session check.
+        """
+
+        from ._shared import _default_runtime_settings_path
+
+        try:
+            from ..runtime_settings_io import load_specs, read_settings_file
+
+            values = read_settings_file(_default_runtime_settings_path(), load_specs())
+            raw = str(values.get(self.SESSION_RECHECK_KEY, "")).strip()
+            seconds = float(raw) if raw else self.DEFAULT_SESSION_RECHECK_SECONDS
+        except Exception:
+            seconds = self.DEFAULT_SESSION_RECHECK_SECONDS
+        if not math.isfinite(seconds) or seconds < 0:
+            return self.DEFAULT_SESSION_RECHECK_SECONDS
+        return seconds
+
+    def session_check_is_recent(self, account_id: str) -> bool:
+        """Whether this account's login observation is still inside its window.
+
+        The observation is the account's own ``last_updated_at``, which every
+        login outcome (a sign-in, a restored session, a rejected one) already
+        refreshes.  Only a session Core still holds counts, so a restart, a
+        reload, or a recorded ``expired`` always answers a check with a real
+        probe.
+        """
+
+        window = self._session_recheck_seconds()
+        if window <= 0:
+            return False
+        index = self._index(account_id)
+        account = self._accounts[index]
+        if account.get("login_status") != "signed_in":
+            return False
+        if not self._has_session_credentials(account):
+            return False
+        age = _observed_seconds_ago(account.get("login_observed_at"))
+        return age is not None and age < window
 
     @staticmethod
     def _session_headers(secrets: object) -> dict[str, str]:
