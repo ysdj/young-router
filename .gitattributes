@@ -1,9 +1,12 @@
+# Every checkout gets the line ending git stored, never the one the host
+# prefers. Text here is read by tools that match on "\n" (the RN shared
+# contract check reads types.ts and asserts on multi-line literals) and by
+# tools that must hash identical bytes on every host, and a Windows runner's
+# core.autocrlf=true otherwise rewrites every file it checks out.
+* text=auto eol=lf
+
 # Keep Windows project sources byte-stable across macOS, Linux, and Windows.
 rn/NuGet.config text eol=lf
-rn/apps/windows/windows/** text eol=lf
-rn/apps/windows/windows/**/*.png binary
-rn/apps/windows/windows/**/*.ico binary
-rn/apps/windows/windows/**/*.rc binary
 
 # The RN Windows generator owns this output, including its emitted spacing.
 rn/apps/windows/windows/YoungRouter/codegen/** whitespace=-trailing-space

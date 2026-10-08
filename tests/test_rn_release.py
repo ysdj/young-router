@@ -499,6 +499,43 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn(platform_entry, entry)
         self.assertLess(entry.index(initialize_core), entry.index(platform_entry))
 
+    def test_every_checkout_uses_the_stored_line_endings(self) -> None:
+        # The shared contract check reads ``types.ts`` and asserts on a
+        # multi-line literal, so a host that rewrites line endings on checkout
+        # turns a passing check into a failing one. A Windows runner checks out
+        # with ``core.autocrlf=true``, and without an ``eol`` rule every text
+        # file it writes back carries CRLF. One rule covers the whole tree so
+        # no future file has to remember to opt in.
+        attributes = (ROOT / ".gitattributes").read_text(encoding="utf-8")
+
+        self.assertIn("* text=auto eol=lf", attributes)
+
+    def test_the_react_native_cli_is_a_declared_workspace_dependency(self) -> None:
+        # ``use_native_modules!`` runs the community CLI from the host app's
+        # own directory to discover native modules. The CLI is only an optional
+        # peer of ``react-native``, and pnpm keeps an optional peer private to
+        # its store entry, so nothing provides it after a clean install and
+        # ``pod install`` fails at the Podfile's ``use_native_modules!`` with
+        # "Invalid `Podfile` file: exit.". The macOS autolinking path also
+        # resolves ``cli-platform-ios`` from the same directory to build the
+        # ``macos`` project entry, so both are declared here rather than
+        # relying on a stale ``node_modules`` tree.
+        package = json.loads((ROOT / "rn/package.json").read_text(encoding="utf-8"))
+        dev_dependencies = package["devDependencies"]
+
+        self.assertEqual(dev_dependencies["@react-native-community/cli"], "20.0.0")
+        self.assertEqual(
+            dev_dependencies["@react-native-community/cli-platform-ios"], "20.0.0"
+        )
+        lockfile = (ROOT / "rn/pnpm-lock.yaml").read_text(encoding="utf-8")
+        self.assertIn("'@react-native-community/cli':", lockfile)
+        self.assertIn("'@react-native-community/cli-platform-ios':", lockfile)
+        # The installer must not patch the autolinking itself: the failure was
+        # a missing declaration, and a Podfile that carried its own config
+        # command would hide the next missing one.
+        podfile = (ROOT / "rn/apps/macos/macos/Podfile").read_text(encoding="utf-8")
+        self.assertIn("use_native_modules!", podfile)
+
 
 if __name__ == "__main__":
     unittest.main()
