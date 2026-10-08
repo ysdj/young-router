@@ -252,6 +252,12 @@ def _verify_staged_chain(npm_root: Path) -> dict[str, Any]:
 
     node = os.environ.get("YOUNG_ROUTER_NODE_BIN", "").strip() or _find_node()
     entry = npm_root / "node_modules" / PACKAGE_NAME / "lib" / "core-primitives.js"
+    # ``import()`` resolves a specifier, not a filesystem path, so a raw
+    # Windows path is rejected outright: "Only URLs with a scheme in: file,
+    # data, and node are supported by the default ESM loader. On Windows,
+    # absolute paths must be valid file:// URLs." Passing the URL form works
+    # on every host, because a POSIX path is already a valid specifier.
+    entry_url = entry.resolve().as_uri()
     script = (
         "import(process.argv[1]).then((m) => {"
         "  const config = { freeFallback: true, httpProviders: [], providers: [] };"
@@ -265,7 +271,7 @@ def _verify_staged_chain(npm_root: Path) -> dict[str, Any]:
     )
     try:
         result = subprocess.run(
-            [node, "--input-type=module", "-e", script, str(entry)],
+            [node, "--input-type=module", "-e", script, entry_url],
             capture_output=True,
             text=True,
             timeout=DEFAULT_TIMEOUT_SECONDS,

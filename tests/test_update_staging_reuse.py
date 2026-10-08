@@ -32,6 +32,7 @@ if str(SCRIPTS) not in sys.path:
 update_common = importlib.import_module("update_common")
 pi_web_access = importlib.import_module("update_pi_web_access")
 workbuddy_connect = importlib.import_module("update_workbuddy_connect")
+dsh_vision_router = importlib.import_module("update_dsh_vision_router")
 
 
 PACKAGE = "dsh-workbuddy-connect"
@@ -244,6 +245,68 @@ class NpmPeerSpecTransportTests(unittest.TestCase):
             (self.directory / "npm" / "package.json").read_text(encoding="utf-8")
         )
         self.assertEqual(manifest["dependencies"]["@deepseek-ai/cordis"], "^4.0.2")
+
+
+class StagedEntrySpecifierTests(unittest.TestCase):
+    """A staged ESM entry is imported by URL, not by filesystem path.
+
+    ``_verify_staged_chain`` proves the peer closure, the environment shim, and
+    the private entry path all resolve by running the entry once.  It used to
+    hand Node the path as ``str(entry)``, which Node accepts on macOS and Linux
+    because a POSIX path is already a valid specifier.  On Windows the same
+    call ends the build:
+
+        Only URLs with a scheme in: file, data, and node are supported by the
+        default ESM loader. On Windows, absolute paths must be valid file://
+        URLs. Received protocol 'c:'
+
+    The URL form is the one both hosts accept, so this holds the boundary that
+    the argument is a URL and that the path it names is still the real entry.
+    """
+
+    def setUp(self) -> None:
+        self.root = Path(tempfile.mkdtemp(prefix="young-router-entry-test-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.root, ignore_errors=True))
+        self.entry = (
+            self.root / "node_modules" / dsh_vision_router.PACKAGE_NAME / "lib" / "core-primitives.js"
+        )
+        self.entry.parent.mkdir(parents=True, exist_ok=True)
+        self.entry.write_text("export const marker = 1;\n", encoding="utf-8")
+
+    def recorded_argument(self) -> tuple[list[str], str]:
+        """Run the verifier against a stub Node and return the argv it received."""
+
+        captured: list[list[str]] = []
+
+        def fake_run(command, **kwargs):
+            captured.append(list(command))
+            return mock.Mock(returncode=0, stdout='{"free": []}', stderr="")
+
+        # ``subprocess`` is imported inside the function, so the patch goes on
+        # the real module rather than a name on this one.
+        with mock.patch("subprocess.run", fake_run):
+            dsh_vision_router._verify_staged_chain(self.root)
+        self.assertEqual(len(captured), 1, "one verification run")
+        command = captured[0]
+        return command, command[-1]
+
+    def test_the_entry_reaches_node_as_a_file_url(self) -> None:
+        _command, argument = self.recorded_argument()
+
+        self.assertTrue(
+            argument.startswith("file://"),
+            f"a raw path breaks the Windows ESM loader: {argument}",
+        )
+        # The URL has to name the entry this call is verifying, or the check
+        # proves something about the wrong file.
+        self.assertEqual(Path(argument.removeprefix("file://")), self.entry.resolve())
+
+    def test_the_import_specifier_is_not_a_bare_windows_path(self) -> None:
+        # ``D:\...`` is the shape Node rejects; a drive letter can never be the
+        # scheme of the argument this call passes.
+        _command, argument = self.recorded_argument()
+
+        self.assertNotRegex(argument, r"^[A-Za-z]:[\\/]", argument)
 
 
 class PiWebAccessReuseTests(unittest.TestCase):
