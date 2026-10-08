@@ -32,7 +32,6 @@ type NativeModule = {
     title: string;
     closeLabel: string;
   }) => Promise<void>;
-  showCodexRestartConfirmation?: (title: string, message: string, restartLabel: string, laterLabel: string) => Promise<"restart" | "later" | undefined>;
   chooseModelsToAdd?: (models: string[], providerName: string, keyName: string) => Promise<string[] | undefined>;
   showGroupManager?: (options: {
     title: string;
@@ -62,7 +61,8 @@ type NativeModule = {
   copySecret?: (domain: "providers_models" | "relay_accounts", field: "api_key", target: string) => Promise<boolean>;
   relayLogin?: (options: {
     accountId: string;
-    type: "newapi" | "sub2api";
+    /** "" settles the station family from the page's own answer. */
+    type: "newapi" | "sub2api" | "";
     label: string;
     origin: string;
     language: LanguagePreference;
@@ -88,7 +88,6 @@ type NativeModule = {
   setLocalization?: (strings: NativeLocalization) => void;
   systemLocale?: () => string;
   setLaunchAtLogin?: (enabled: boolean) => Promise<boolean>;
-  restartCodex?: () => Promise<boolean>;
   showVersion?: () => void;
   versionInfo?: () => Promise<{ app: string; litellm: string; icon?: string }>;
   openExternalURL?: (url: string) => void;
@@ -160,7 +159,6 @@ const nativeBridge: NativeLeafBridge = {
   showProviderAuth: leaf.showProviderAuth
     ? async (options) => { await leaf.showProviderAuth!(options); }
     : undefined,
-  showCodexRestartConfirmation: async (title, message, restartLabel, laterLabel) => leaf.showCodexRestartConfirmation?.(title, message, restartLabel, laterLabel),
   chooseModelsToAdd: async (models, providerName, keyName) => leaf.chooseModelsToAdd?.(models, providerName, keyName),
   showGroupManager: async (options) => leaf.showGroupManager?.(options),
   awaitGroupManagerApply: leaf.awaitGroupManagerApply ? () => leaf.awaitGroupManagerApply!() : undefined,
@@ -189,7 +187,6 @@ const nativeBridge: NativeLeafBridge = {
     if (!leaf.setLaunchAtLogin) throw new Error("The native login-item control is unavailable.");
     if (!await leaf.setLaunchAtLogin(enabled)) throw new Error("The system could not update the login item.");
   },
-  restartCodex: async () => leaf.restartCodex?.() ?? false,
   showVersion: () => call("showVersion"),
   versionInfo: leaf.versionInfo ? () => leaf.versionInfo!() : undefined,
   openExternalURL: (url) => call("openExternalURL", url),

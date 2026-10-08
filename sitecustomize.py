@@ -394,6 +394,26 @@ def _install_uvicorn_websocket_frame_limit_patch() -> None:
     _patch_after_import("uvicorn", _patch)
 
 
+def _install_uvicorn_shutdown_marker_patch() -> None:
+    """Record uvicorn's teardown before any Config exists.
+
+    uvicorn closes every accepted connection at the start of ``Server.shutdown``
+    and only afterwards waits for the in-flight requests, so a turn that is
+    still streaming when the app is replaced always loses its response body.
+    The installer lives in ``young_router.proxy.base`` so both this early hook
+    (interpreter startup, covering the ``macos_proxy`` launch path) and the
+    callback-time ``young_router.proxy.patches.install_all`` share one
+    implementation.
+    """
+
+    def _patch(uvicorn_module: Any) -> None:
+        from young_router.proxy.base import _install_uvicorn_shutdown_marker_patch
+
+        _install_uvicorn_shutdown_marker_patch()
+
+    _patch_after_import("uvicorn", _patch)
+
+
 def _install_proxy_idle_patches() -> None:
     """Stop the proxy's idle loops from waking the machine ten times a second.
 
@@ -480,4 +500,5 @@ if os.environ.get("YOUNG_ROUTER_PROXY_PROCESS") == "1":
     _install_litellm_optional_database_error_patch()
     _install_litellm_openai_image_edit_usage_patch()
     _install_uvicorn_websocket_frame_limit_patch()
+    _install_uvicorn_shutdown_marker_patch()
     _install_proxy_idle_patches()

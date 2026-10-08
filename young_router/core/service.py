@@ -31,7 +31,7 @@ from typing import Any, Protocol, runtime_checkable
 from .log_tabs import LOG_TABS
 from .persistence import AtomicJSONStore, PersistenceError, atomic_write_bytes, atomic_write_json, read_bytes, read_json
 from .protocol import MAX_EDITOR_DOCUMENT_BYTES, PROTOCOL_VERSION, ProtocolError, make_event
-from .security import REDACTED, redact, safe_exception_message, safe_error_message
+from .security import REDACTED, _key_text, redact, safe_exception_message, safe_error_message
 
 
 CORE_METADATA_VERSION = 1
@@ -258,7 +258,7 @@ def _safe_public(value: object) -> object:
     if isinstance(value, Mapping):
         result: dict[str, Any] = {}
         for key, item in value.items():
-            key_text = str(key).strip().lower().replace("-", "_")
+            key_text = _key_text(key)
             # Raw editor text and complete documents are available only through
             # an explicit trusted editor operation, never in ``snapshot``.
             if key_text in {
@@ -285,6 +285,12 @@ def _safe_public(value: object) -> object:
         return [_safe_public(item) for item in value]
     if isinstance(value, tuple):
         return [_safe_public(item) for item in value]
+    # Every mapping and sequence above was rebuilt, and ``redact`` returned a
+    # scalar leaf verbatim in this projection.  An immutable scalar therefore
+    # needs no copy; anything else (a set, an arbitrary object) still does, so
+    # the snapshot can never hand a caller Core's own mutable state.
+    if value is None or value is True or value is False or type(value) is int or type(value) is float or type(value) is str:
+        return value
     return copy.deepcopy(value)
 
 
@@ -1800,6 +1806,7 @@ class CoreStore:
         access_token: object = "",
         refresh_token: object = "",
         password: object = "",
+        user_id: object = "",
         station_id: object = None,
         station_name: object = None,
         station_type: object = None,
@@ -1813,6 +1820,11 @@ class CoreStore:
         absent value keeps the account's stored preference; a boolean applies
         the choice, so a previously saved password can be retired from the
         same prompt.
+
+        ``user_id`` is the station's own account id captured with this session;
+        a New API fork requires it as the ``New-Api-User`` header on every later
+        dashboard read, so the login that proves the session is where it is
+        recorded.
         """
 
         remember_choice = remember_password if isinstance(remember_password, bool) else None
@@ -1903,6 +1915,7 @@ class CoreStore:
                     access_token=str(access_token) if isinstance(access_token, str) else "",
                     refresh_token=str(refresh_token) if isinstance(refresh_token, str) else "",
                     password=str(password) if isinstance(password, str) else "",
+                    user_id=user_id,
                     remember_password=remember_choice,
                 )
                 # Login is the durable browser-session boundary. Resource
@@ -2012,6 +2025,7 @@ class CoreStore:
         cookie: object = "",
         access_token: object = "",
         refresh_token: object = "",
+        user_id: object = "",
     ) -> dict[str, Any]:
         """Restore or update one locally validated native relay session.
 
@@ -2019,6 +2033,10 @@ class CoreStore:
         modifies the provider/model draft. It is used after a Core restart to
         repopulate the process-local relay session from the per-account native
         credential store, or to persist an explicit expired/signed-out result.
+
+        ``user_id`` is the station's own account id, which the host carries
+        beside the session because a New API fork requires it as the
+        ``New-Api-User`` header on every dashboard read.
         """
 
         known_secrets = tuple(
@@ -2066,6 +2084,7 @@ class CoreStore:
                         cookie=str(cookie) if isinstance(cookie, str) else "",
                         access_token=str(access_token) if isinstance(access_token, str) else "",
                         refresh_token=str(refresh_token) if isinstance(refresh_token, str) else "",
+                        user_id=user_id,
                         preserve_resources=True,
                     )
                 elif login_status in {"signed_out", "expired"} and matching.get("remember_password") is True:
@@ -2913,6 +2932,13 @@ class CoreStore:
                     if isinstance(safe_result, Mapping):
                         self._last_actions[name] = dict(safe_result)
                         summary = safe_result.get("operation_summary")
+                        # The operation a live read answers with.  Every action
+                        # that produces a summary names itself in it, so the
+                        # map covers the whole vocabulary rather than a subset:
+                        # a name that is missing here silently drops the
+                        # action-scoped summary, and a caller that asked for a
+                        # catalog then reads the shared slot another window's
+                        # read has already replaced.
                         expected_operation = {
                             "fetch_models": "fetch_models",
                             "providers_fetch_models": "fetch_models",
@@ -2928,6 +2954,9 @@ class CoreStore:
                             "service_provider_auth_cancel": "service_provider_auth_cancel",
                             "service_provider_auth_logout": "service_provider_auth_logout",
                             "service_provider_auth_status": "service_provider_auth_status",
+                            "workbuddy_status": "workbuddy_status",
+                            "workbuddy_models": "workbuddy_models",
+                            "workbuddy_login": "workbuddy_login",
                         }.get(normalized_action)
                         if (
                             name == "providers_models"

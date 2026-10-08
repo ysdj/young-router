@@ -46,7 +46,10 @@ from update_common import (
     find_package_manager,
     flatten_npm_package,
     package_metadata,
+    record_staged_release,
+    release_integrity,
     request_bytes,
+    reused_staged_release,
     run_package_manager_install,
 )
 
@@ -297,10 +300,35 @@ def _find_node() -> str:
     return node
 
 
+def _staged_shim_is_present(output: Path) -> bool:
+    """Does the staged tree still carry the stub npm cannot resolve?
+
+    The stub is written into the install tree before it is flattened, so it
+    travels with the package like every other dependency.  A tree missing it
+    would fail every vision fallback at request time, so its absence sends the
+    release back through a fresh install rather than being reused.
+    """
+
+    return (output / "node_modules" / ENVIRONMENT_SHIM_PACKAGE / ENVIRONMENT_SHIM_ENTRY).is_file()
+
+
 def update(output: Path, *, registry_url: str) -> str:
     output = output.expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     latest, tarball_url, _version_payload = _package_metadata(registry_url)
+    integrity = release_integrity(_version_payload)
+    # The release was resolved above on this build; this only skips installing
+    # the identical one again.  The staged chain was proved importable when it
+    # was staged, and the build proves it again on the assembled bundle.
+    if reused_staged_release(
+        output,
+        package_name=PACKAGE_NAME,
+        version=latest,
+        integrity=integrity,
+        required_files=REQUIRED_PACKAGE_FILES,
+        required_peer_dirs=REQUIRED_PEER_PACKAGES,
+    ) and _staged_shim_is_present(output):
+        return latest
     manager, manager_env = find_package_manager(
         "DSH_VISION_ROUTER_PACKAGE_MANAGER_BIN", purpose=f"stage {PACKAGE_NAME}"
     )
@@ -330,6 +358,9 @@ def update(output: Path, *, registry_url: str) -> str:
         )
     if package_version != latest:
         raise UpdateError(f"The package manager installed {PACKAGE_NAME} {package_version}, expected {latest}")
+    record_staged_release(
+        output, package_name=PACKAGE_NAME, version=latest, integrity=integrity
+    )
     return package_version
 
 

@@ -12,6 +12,21 @@ private let nativeUIFontSize: CGFloat = 13
 /// titles with (`windowTitle`: `UI_FONT_SIZE`, weight 600), so a window reads the
 /// same whether its heading comes from React or from the native leaf.
 private let nativeHeadingFont = NSFont.systemFont(ofSize: nativeUIFontSize, weight: .semibold)
+/// The one hint step, mirroring the shared UI's `UI_TIP_FONT_SIZE` (12) with the
+/// line height it draws a help tip at (`helpTipText`: lineHeight 15).  An
+/// explanation reads a half step below the control it belongs to, and the popup
+/// that carries it is sized from this font rather than a second literal.
+private let nativeTipFontSize: CGFloat = 12
+private let nativeTipLineHeight: CGFloat = 15
+/// One help tip's own metrics, mirroring the shared `HelpTip` popup
+/// (`helpTipPopup`): a 208 pt body, 8 pt across and 6 pt down, a 1 pt separator
+/// border at a 6 pt radius, and the popup 22 pt above its mark.  A native sheet
+/// and a shared pane therefore state a hint in the same shape.
+private let nativeTipWidth: CGFloat = 208
+private let nativeTipInsetX: CGFloat = 8
+private let nativeTipInsetY: CGFloat = 6
+private let nativeTipCornerRadius: CGFloat = 6
+private let nativeTipAnchorGap: CGFloat = 22
 /// The one inset every native child window keeps from its own edges — its
 /// heading, its body, and its footer — matching the inset the shared UI gives a
 /// route window (`windowContent`: 16), so a child surface reads the same
@@ -158,9 +173,6 @@ private enum NativeRelayOriginPolicy {
     /// and the title-bar close button carry, the answers it offers, and the
     /// completion it settles exactly once. See ``presentDecisionPanel(_:)``.
     private var decisionPanels: [ObjectIdentifier: DecisionPanelState] = [:]
-    /// The catalog restart question, so a second request settles the one on
-    /// screen instead of stacking two identical panels over the app.
-    private var codexRestartPanel: NSPanel?
     private var childPanels: [ChildPanel] = []
     /// The model chooser on screen: its window, the controller that answers its
     /// controls, and the completion the pending JS promise waits on. AppKit
@@ -171,6 +183,12 @@ private enum NativeRelayOriginPolicy {
     /// button, which leaves the parent locked.
     private var openModelChooser: ModelChooser?
     private var groupManagerPanel: NSPanel?
+    /// The explainer popup a question mark opened, and the monitor that dismisses
+    /// it.  Only one is ever on screen: opening another closes the first, and a
+    /// click outside (or Escape) closes it without touching the control it
+    /// explains.
+    private var tipPanel: NSPanel?
+    private var tipDismissMonitor: Any?
     private var groupManagerCompletionBlock: ((NativeGroupManagerResult?) -> Void)?
     private var groupManagerController: NativeGroupManagerController?
     /// The 保存并关闭 a caller has not answered yet, and the caller waiting for
@@ -760,6 +778,152 @@ private enum NativeRelayOriginPolicy {
 
     // MARK: - Decision panels
 
+    /// Show one explanation beside the control it belongs to, and dismiss it on
+    /// the next click anywhere else or on Escape.
+    ///
+    /// The popup is a hint, never a decision surface — an alert would ask the
+    /// user to answer a sentence.  Its geometry matches the shared UI's
+    /// ``HelpTip`` (a 208 pt body, 8 pt inset, 6 pt radius), so a native sheet
+    /// and a shared pane state a hint the same way.  Nil when there is nothing
+    /// to say or nothing to anchor to.
+    @discardableResult
+    func presentTip(_ text: String, beside anchor: NSView?) -> NSPanel? {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.presentTip(text, beside: anchor)
+            }
+            return nil
+        }
+        dismissTip()
+        guard let anchor, let anchorWindow = anchor.window,
+              !text.isEmpty, text.utf8.count <= 2_048 else { return nil }
+        let tipFont = NSFont.systemFont(ofSize: nativeTipFontSize, weight: .regular)
+        let textWidth = nativeTipWidth - nativeTipInsetX * 2
+        // The canonical 15 pt line height is applied to the text itself rather
+        // than only assumed when measuring: the shared tip's `lineHeight: 15`
+        // is a property of the drawn sentence, and a field measured one way and
+        // drawn another is what silently clips its own last line.  One
+        // attributed string is built, measured, and handed to the field, so the
+        // height can never disagree with what is rendered.
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.minimumLineHeight = nativeTipLineHeight
+        paragraph.maximumLineHeight = nativeTipLineHeight
+        paragraph.lineBreakMode = .byWordWrapping
+        let attributed = NSAttributedString(
+            string: text,
+            attributes: [
+                .font: tipFont,
+                .foregroundColor: NSColor.secondaryLabelColor,
+                .paragraphStyle: paragraph,
+            ]
+        )
+        let measured = attributed.boundingRect(
+            with: NSSize(width: textWidth, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading]
+        )
+        // Round up to whole points so an antiparallel fragment box can never
+        // truncate the final line by a fraction.
+        let textHeight = max(nativeTipLineHeight, ceil(measured.height))
+        let bodyHeight = textHeight + nativeTipInsetY * 2
+        let panel = NativeTipPanel(
+            contentRect: NSRect(x: 0, y: 0, width: nativeTipWidth, height: bodyHeight),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        configureImmediatePresentation(panel)
+        panel.isReleasedWhenClosed = false
+        panel.isFloatingPanel = true
+        panel.hidesOnDeactivate = false
+        panel.backgroundColor = .clear
+        panel.isOpaque = false
+        panel.hasShadow = true
+        panel.level = .floating
+        // A non-activating panel: the mark that opened it keeps focus, so the
+        // tip never steals the keyboard from the sheet underneath it.
+        panel.becomesKeyOnlyIfNeeded = true
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        // The body and its text are separate views: the layer paints the popup
+        // itself, while a wrapping label draws the sentence inside it.
+        let body = NSView(frame: NSRect(x: 0, y: 0, width: nativeTipWidth, height: bodyHeight))
+        body.wantsLayer = true
+        body.layer?.cornerRadius = nativeTipCornerRadius
+        body.layer?.borderWidth = 1
+        body.layer?.borderColor = NSColor.separatorColor.cgColor
+        body.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
+        // The popup's shadow is the one the shared tip declares (radius 8,
+        // opacity 0.18, 2 pt down): a window shadow would spread wider and read
+        // heavier than the hint drawn by React.
+        body.layer?.shadowColor = NSColor.black.cgColor
+        body.layer?.shadowOpacity = 0.18
+        body.layer?.shadowRadius = 8
+        body.layer?.shadowOffset = CGSize(width: 0, height: -2)
+        body.layer?.masksToBounds = false
+        // The view draws the same attributed string the height was measured
+        // from, so a tip can never cut off its own last words.
+        let tipText = NativeTipTextView(text: attributed)
+        tipText.frame = NSRect(x: nativeTipInsetX, y: nativeTipInsetY, width: textWidth, height: textHeight)
+        body.addSubview(tipText)
+        panel.contentView = body
+        // Anchored above the mark, sharing the mark's trailing edge, so it opens
+        // beside the control the way the shared help tip does.  The shared tip
+        // positions its popup 22 pt above the *anchor's* bottom edge, and the
+        // anchor is exactly the mark's own 16 pt box — so the gap is measured
+        // from the mark's bottom, not from the top of its glyph.  The popup is
+        // clamped to the window it explains: a mark near the left edge would
+        // otherwise push the sentence off the sheet and leave it over the
+        // workspace behind it.
+        let anchorFrame = anchor.convert(anchor.bounds, to: nil)
+        let screenFrame = anchorWindow.convertToScreen(anchorFrame)
+        let windowFrame = anchorWindow.frame
+        let preferredX = screenFrame.maxX - nativeTipWidth
+        let clampedX = min(
+            max(preferredX, windowFrame.minX + nativeTipInsetX),
+            windowFrame.maxX - nativeTipWidth - nativeTipInsetX
+        )
+        panel.setFrameOrigin(NSPoint(x: clampedX, y: screenFrame.minY + nativeTipAnchorGap))
+        anchorWindow.addChildWindow(panel, ordered: .above)
+        panel.orderFront(nil)
+        tipPanel = panel
+        // Any click that is not inside the popup dismisses it, and Escape does
+        // too: a tip is the app's transient surface and never a modal question.
+        tipDismissMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .keyDown]) { [weak self] event in
+            guard let self, let panel = self.tipPanel else { return event }
+            if event.type == .keyDown {
+                guard event.keyCode == 53 else { return event }
+                self.dismissTip()
+                return nil
+            }
+            let point = event.window?.convertPoint(toScreen: event.locationInWindow) ?? event.locationInWindow
+            guard panel.frame.contains(point) else {
+                self.dismissTip()
+                return event
+            }
+            return event
+        }
+        return panel
+    }
+
+    /// Close the explainer popup, if one is up.  Called by every dismissal path
+    /// and before another tip opens, so only one is ever on screen.
+    func dismissTip() {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in self?.dismissTip() }
+            return
+        }
+        if let monitor = tipDismissMonitor {
+            NSEvent.removeMonitor(monitor)
+            tipDismissMonitor = nil
+        }
+        if let panel = tipPanel {
+            tipPanel = nil
+            // orderOut sends no windowWillClose, so the popup is settled here
+            // rather than by a delegate callback that never arrives.
+            panel.parent?.removeChildWindow(panel)
+            panel.orderOut(nil)
+        }
+    }
+
     /// One question the app puts to the user: 删除供应商, 放弃更改, the catalog
     /// restart notice, the version acknowledgement, one secret field.  Every
     /// question this app asks is this panel, so one question is drawn and
@@ -1133,36 +1297,8 @@ private enum NativeRelayOriginPolicy {
     /// and the window that asked going away all come through here.
     private func finishDecisionPanel(_ panel: NSWindow, answer: String) {
         guard let state = decisionPanels.removeValue(forKey: ObjectIdentifier(panel)) else { return }
-        if codexRestartPanel === panel { codexRestartPanel = nil }
         endChildPanel(panel)
         state.completion(answer)
-    }
-
-    /// The catalog restart question: the same decision panel, asked by Core
-    /// rather than by something the user just did, so it floats over the app
-    /// without locking the window the user is working in.
-    func showCodexRestartConfirmation(
-        title: String,
-        message: String,
-        restartLabel: String,
-        laterLabel: String,
-        completion: @escaping (String) -> Void
-    ) {
-        // One question at a time: a second request answers the panel on screen
-        // with "later" instead of stacking two identical windows over the app.
-        if let previous = codexRestartPanel, decisionPanels[ObjectIdentifier(previous)] != nil {
-            finishDecisionPanel(previous, answer: "later")
-        }
-        codexRestartPanel = presentDecisionPanel(
-            title,
-            message: message,
-            answers: [
-                NativeDecisionAnswer(id: "later", title: laterLabel, isCancel: true),
-                NativeDecisionAnswer(id: "restart", title: restartLabel, isDefault: true),
-            ],
-            locksParent: false,
-            completion: completion
-        )
     }
 
     /// Native child window of the provider workspace: the station's API keys
@@ -1258,6 +1394,10 @@ private enum NativeRelayOriginPolicy {
     /// the workspace window going away underneath it.
     private func finishGroupManager() {
         guard let panel = groupManagerPanel else { return }
+        // An explainer the sheet opened belongs to the sheet: the popup is a
+        // child window, so it must go with the window it was opened from
+        // instead of outliving it over the workspace.
+        dismissTip()
         groupManagerPanel = nil
         panel.delegate = nil
         let result = groupManagerController?.resultOnEnd()
@@ -1602,7 +1742,11 @@ private enum NativeRelayOriginPolicy {
             return
         }
         guard accountID.range(of: #"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$"#, options: .regularExpression) != nil,
-              ["newapi", "sub2api"].contains(type),
+              // "" and "auto" let the flow settle the station family from the
+              // answer one of the page's own probes returns, so the sign-in
+              // window opens at once instead of waiting on a pair of network
+              // probes that ask the same questions before it can appear.
+              ["newapi", "sub2api", "", "auto"].contains(type),
               label.utf8.count <= 160,
               origin.utf8.count <= 2_048,
               let originURL = URL(string: origin),
@@ -1783,7 +1927,8 @@ private enum NativeRelayOriginPolicy {
                 origin: canonicalOrigin.absoluteString,
                 cookie: probe.cookie,
                 accessToken: probe.accessToken,
-                refreshToken: probe.refreshToken
+                refreshToken: probe.refreshToken,
+                userID: probe.userID
             )
             NativeRelaySessionMemoryStore.writeSession(refreshedSession, accountID: accountID)
             return try? CoreIPCBridge.shared.restoreRelaySession(
@@ -1795,7 +1940,8 @@ private enum NativeRelayOriginPolicy {
                 username: probe.username,
                 cookie: probe.cookie,
                 accessToken: probe.accessToken,
-                refreshToken: probe.refreshToken
+                refreshToken: probe.refreshToken,
+                userID: probe.userID
             )
         case .expired:
             return try? CoreIPCBridge.shared.restoreRelaySession(
@@ -2096,32 +2242,6 @@ private enum NativeRelayOriginPolicy {
             return true
         } catch {
             return false
-        }
-    }
-
-    func restartCodex() -> Bool {
-        guard let applicationURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.openai.codex") else {
-            return false
-        }
-        NSRunningApplication.runningApplications(withBundleIdentifier: "com.openai.codex").forEach { application in
-            application.forceTerminate()
-        }
-        launchCodex(applicationURL, attemptsRemaining: 20)
-        return true
-    }
-
-    private func launchCodex(_ applicationURL: URL, attemptsRemaining: Int) {
-        let running = NSRunningApplication.runningApplications(withBundleIdentifier: "com.openai.codex")
-        guard running.isEmpty || attemptsRemaining == 0 else {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
-                self?.launchCodex(applicationURL, attemptsRemaining: attemptsRemaining - 1)
-            }
-            return
-        }
-        DispatchQueue.main.async {
-            let configuration = NSWorkspace.OpenConfiguration()
-            configuration.activates = true
-            NSWorkspace.shared.openApplication(at: applicationURL, configuration: configuration)
         }
     }
 
@@ -2815,6 +2935,47 @@ final class NativeDecisionPanel: NSPanel {
     }
 }
 
+/// The anchored explanation a question mark opens beside its control.
+///
+/// The rest of the app states a hint this way — a small bordered popup beside
+/// the mark, dismissed by clicking anywhere else — and this window keeps that
+/// shape rather than answering with an alert, which would be a decision surface
+/// for something that is only a sentence.  It never becomes key: the control it
+/// explains keeps focus, and a click outside closes it through the mouse
+/// monitor the presenter installs.
+final class NativeTipPanel: NSPanel {
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+}
+
+/// The text of one help tip, drawn straight from the string it was measured
+/// with.
+///
+/// A help tip is the one surface whose whole content is a sentence, so it must
+/// never clip its own last words.  An `NSTextField` laid out through its cell
+/// wraps at whatever width the cell decides and clips what does not fit, which
+/// is how a tip measured at the popup's width can still cut off its final
+/// character; drawing the attributed string into the view's own bounds uses the
+/// same layout the measurement used, so the two cannot disagree.
+final class NativeTipTextView: NSView {
+    private let text: NSAttributedString
+
+    init(text: NSAttributedString) {
+        self.text = text
+        super.init(frame: .zero)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("NativeTipTextView is created in code") }
+
+    override var isFlipped: Bool { true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        text.draw(with: bounds, options: [.usesLineFragmentOrigin, .usesFontLeading])
+    }
+}
+
 private final class NeutralDefaultButton: NSButton {
     override func draw(_ dirtyRect: NSRect) {
         guard keyEquivalent == "\r", window?.defaultButtonCell === cell else {
@@ -2865,9 +3026,14 @@ private final class NativeModelsListView: NSScrollView {
         drawsBackground = false
         borderType = .noBorder
         hasVerticalScroller = true
+        // The shared table's own rule: a list that fits keeps the overlay
+        // scroller AppKit fades away, while a list that overflows keeps the
+        // app's translucent capsule so the user can see there is more to read.
+        // Pinning overlay+autohide made an overflowing model list look complete
+        // when the rest of it was below the fold.  ``layout()`` applies it from
+        // the real document height, because the overflow is only known once the
+        // text has been laid out.
         autohidesScrollers = true
-        // Overlay: the scroller floats over the list instead of reserving a
-        // gutter, so rows keep the full list width.
         scrollerStyle = .overlay
         textView.isEditable = false
         textView.isSelectable = true
@@ -2920,6 +3086,23 @@ private final class NativeModelsListView: NSScrollView {
         super.layout()
         usePersistentScrollers(horizontal: false, vertical: true)
         if abs(textView.frame.width - contentSize.width) > 0.5 { refitDocument() }
+        // One scroller policy for the whole app, decided by whether the list
+        // actually overflows: a short list fades its overlay scroller out, and a
+        // list taller than its frame keeps the persistent capsule instead.
+        applyOverflowScrollerPolicy()
+    }
+
+    /// Keep the app's capsule scroller exactly while this list overflows.
+    private func applyOverflowScrollerPolicy() {
+        let overflows = textView.frame.height > contentView.bounds.height + 0.5
+        let style: NSScroller.Style = overflows ? .legacy : .overlay
+        if scrollerStyle != style || autohidesScrollers != !overflows {
+            scrollerStyle = style
+            autohidesScrollers = !overflows
+            tile()
+        }
+        guard overflows else { return }
+        usePersistentScrollers(horizontal: false, vertical: true)
     }
 }
 
@@ -3124,6 +3307,8 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
     private weak var copyButton: NSButton?
 
     private weak var toggle: NSButton?
+    /// The question mark beside 自动分组, which states what the switch does.
+    private weak var autoGroupingHelpButton: NSButton?
     private weak var closeButton: NSButton?
     /// The window's own result line, beside its footer buttons: a child
     /// surface states its own save and its own failure there, and the window
@@ -3144,6 +3329,9 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
     /// the auto-grouping switch, a staged create, update, or delete.
     private var applyButton: NSButton?
     private var stagedDeleteCount = 0
+    /// The rows as they stood before the switch staged the automatic layout, so
+    /// turning it back off restores exactly what the sheet opened on.
+    private var autoGroupingBaselineRows: [KeyRow]?
 
     private var autoGroupingOn: Bool {
         (toggle?.state ?? (initialAutoGrouping ? .on : .off)) == .on
@@ -3518,6 +3706,19 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         toggle.font = NSFont.systemFont(ofSize: nativeUIFontSize)
         toggle.state = initialAutoGrouping ? .on : .off
         self.toggle = toggle
+        // The switch owns the station's whole key layout, so the question mark
+        // beside it states what it does before it is turned on.  It is an
+        // accessory of the switch rather than a control of its own: it reads
+        // after the checkbox on the same baseline and carries the help mark the
+        // window's own footer row can show.
+        let helpButton = NSButton(title: "", target: self, action: #selector(showAutoGroupingHelp(_:)))
+        helpButton.isBordered = false
+        helpButton.image = NSImage(systemSymbolName: "questionmark.circle", accessibilityDescription: label("autoGroupingLabel"))
+        helpButton.imagePosition = .imageOnly
+        helpButton.contentTintColor = .secondaryLabelColor
+        helpButton.toolTip = label("autoGroupingHelp")
+        helpButton.setAccessibilityLabel(label("autoGroupingLabel"))
+        self.autoGroupingHelpButton = helpButton
         let closeButton = NSButton(title: label("closeLabel"), target: self, action: #selector(closePanel(_:)))
         closeButton.bezelStyle = .rounded
         closeButton.font = NSFont.systemFont(ofSize: nativeUIFontSize)
@@ -3545,7 +3746,7 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         self.footerStatusField = footerStatus
         self.closeButton = closeButton
 
-        [titleLabel, accountField, listTitle, loadingSpinner, addButton, removeButton, listFrame, enabledCheckbox, nameLabel, nameField, groupFieldLabel, groupPopUp, multiplierLabel, multiplierField, valueLabel, valueField, copyButton, modelsTitle, modelsList, toggle, footerStatus, closeButton, applyButton].forEach {
+        [titleLabel, accountField, listTitle, loadingSpinner, addButton, removeButton, listFrame, enabledCheckbox, nameLabel, nameField, groupFieldLabel, groupPopUp, multiplierLabel, multiplierField, valueLabel, valueField, copyButton, modelsTitle, modelsList, toggle, helpButton, footerStatus, closeButton, applyButton].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
             content.addSubview($0)
         }
@@ -3636,9 +3837,15 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
             modelsList.bottomAnchor.constraint(lessThanOrEqualTo: toggle.topAnchor, constant: -14),
             toggle.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
             toggle.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -nativePanelInset),
+            // The help mark rides the switch's own trailing edge, so the footer
+            // row reads as one control and its explanation.
+            helpButton.leadingAnchor.constraint(equalTo: toggle.trailingAnchor, constant: 4),
+            helpButton.centerYAnchor.constraint(equalTo: toggle.centerYAnchor),
+            helpButton.widthAnchor.constraint(equalToConstant: 16),
+            helpButton.heightAnchor.constraint(equalToConstant: 16),
             // The result line takes the free space between the switch and the
             // buttons; the buttons keep the trailing edge they had.
-            footerStatus.leadingAnchor.constraint(equalTo: toggle.trailingAnchor, constant: 12),
+            footerStatus.leadingAnchor.constraint(greaterThanOrEqualTo: helpButton.trailingAnchor, constant: 12),
             footerStatus.trailingAnchor.constraint(lessThanOrEqualTo: closeButton.leadingAnchor, constant: -8),
             footerStatus.centerYAnchor.constraint(equalTo: toggle.centerYAnchor),
             applyButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -nativePanelInset),
@@ -3677,6 +3884,9 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         self.rows = rows
         self.currentGroupNames = NativeGroupManagerController.groupNames(groups)
         self.initialAutoGrouping = autoGrouping
+        // The rows are the station's own again, so a baseline captured from an
+        // earlier toggle would restore a list that no longer exists.
+        autoGroupingBaselineRows = nil
         accountField?.stringValue = accountLabel
         toggle?.state = autoGrouping ? .on : .off
         stagedDeleteCount = 0
@@ -4114,15 +4324,111 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
     }
 
     @objc private func toggleAutoGrouping(_ sender: NSButton) {
-        // Leaving the switch off restores the staged deletes the automatic
-        // layout had marked, so the list never shows them while it is on.
-        if sender.state == .on, stagedDeleteCount > 0 {
-            for index in rows.indices where rows[index].deleted { rows[index].deleted = false }
-            stagedDeleteCount = 0
-            table?.reloadData()
-        }
+        stageAutoGroupingLayout(sender.state == .on)
         loadDetail()
         refreshApplyButton()
+    }
+
+    /// Stage the automatic layout in the window itself.
+    ///
+    /// 自动分组 is one key per group, named exactly after its group, and the list
+    /// has to say so the moment the switch is turned on: the names the user
+    /// reads *are* the feature, so a checked switch that still listed the old
+    /// key names looked like it had done nothing at all.
+    ///
+    /// The layout is Core's own alignment rule, applied to the rows on screen:
+    /// for each group in the picker's order the first key carrying it is kept
+    /// and renamed to the group's name, every later key in that group is staged
+    /// for deletion, a key whose group the station no longer offers is staged
+    /// for deletion too, and a group that no key names gets a draft row named
+    /// after it — so every group ends with exactly one key of its own name.
+    ///
+    /// Two rows are deliberately left alone.  A draft is the user's own edit,
+    /// never the switch's.  A row the user already staged for deletion stays
+    /// deleted, and its group is *not* given a replacement: Core waits for
+    /// Apply rather than creating a second key beside one it is retiring.
+    ///
+    /// Turning the switch off restores the rows the sheet opened on, the way
+    /// Core restores its own pre-toggle baseline.
+    private func stageAutoGroupingLayout(_ enabled: Bool) {
+        guard let table else { return }
+        if enabled {
+            if autoGroupingBaselineRows == nil { autoGroupingBaselineRows = rows }
+            var keptGroupIDs = Set<String>()
+            var presentGroupIDs = Set<String>()
+            for row in rows where !row.isDraft && !row.groupID.isEmpty {
+                presentGroupIDs.insert(row.groupID)
+            }
+            var staged: [KeyRow] = []
+            for row in rows {
+                if row.isDraft {
+                    staged.append(row)
+                    continue
+                }
+                if row.deleted {
+                    // The user's own deletion is theirs to keep.
+                    staged.append(row)
+                    continue
+                }
+                guard let group = groups.first(where: { $0.id == row.groupID }) else {
+                    var candidate = row
+                    candidate.deleted = true
+                    staged.append(candidate)
+                    continue
+                }
+                guard !keptGroupIDs.contains(group.id) else {
+                    // A group owns one key: every later one is retired.
+                    var candidate = row
+                    candidate.deleted = true
+                    staged.append(candidate)
+                    continue
+                }
+                keptGroupIDs.insert(group.id)
+                var candidate = row
+                candidate.name = group.name
+                candidate.enabled = true
+                staged.append(candidate)
+            }
+            for group in groups where !keptGroupIDs.contains(group.id) && !presentGroupIDs.contains(group.id) {
+                staged.append(
+                    KeyRow(
+                        id: "draft-\(group.id)-\(UUID().uuidString)",
+                        name: group.name,
+                        groupID: group.id,
+                        groupLabel: group.name,
+                        multiplier: group.rate,
+                        hint: "",
+                        modelNames: [],
+                        originalName: group.name,
+                        originalGroupID: group.id,
+                        originalEnabled: true,
+                        enabled: true,
+                        deleted: false,
+                        isDraft: true
+                    )
+                )
+            }
+            rows = staged
+        } else if let baseline = autoGroupingBaselineRows {
+            rows = baseline
+            autoGroupingBaselineRows = nil
+        }
+        stagedDeleteCount = rows.filter { !$0.isDraft && $0.deleted }.count
+        table.reloadData()
+    }
+
+    /// The question mark beside 自动分组: the switch relayouts the station's own
+    /// keys, so the mark states what it does before the user commits to it.  It
+    /// opens the app's own hint beside the mark, not an alert: an explanation is
+    /// a sentence, not a question to answer.
+    @objc private func showAutoGroupingHelp(_ sender: NSButton) {
+        let text = label("autoGroupingHelp")
+        guard !text.isEmpty else { return }
+        if AppKitNativeLeaf.shared.presentTip(text, beside: sender) == nil {
+            // A tip that cannot be drawn still states its words: the mark's
+            // tooltip is the same sentence, so the help is never silence.
+            return
+        }
     }
 
     /// Close discards the draft, so a window that would lose edits asks first;
@@ -5719,12 +6025,21 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     """
 
     private struct Probe {
+        /// The station family this probe belongs to, so one flow can settle the
+        /// family from whichever probe answers instead of being told in advance.
+        let family: String
         let path: String
         let usernamePaths: [[String]]
     }
 
     private let accountID: String
+    /// The account type shared only when the caller already knew it; ``auto``
+    /// means "find out from what the station answers".  Resolved by the first
+    /// probe that succeeds, because every use of the family — the dashboard
+    /// probes, the ``New-Api-User`` header, the saved account type, and the
+    /// usage-log path — happens after the page has already signed the user in.
     private let type: String
+    private var resolvedType: String?
     private let label: String
     private let originURL: URL
     private let language: String
@@ -5763,6 +6078,12 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     private var didLoadInitialPage = false
     private var didProbeRestoredSession = false
     private var pageReadinessProbe: DispatchWorkItem?
+    /// How many readiness reads have run for the current navigation.  The probe
+    /// is bounded so the cover can never outlive a page that is drawing: a
+    /// station that renders nothing at all still gets the page uncovered, where
+    /// the user can see it and reload, instead of a spinner over blank space.
+    private var pageReadinessAttempts = 0
+    private static let pageReadinessMaxAttempts = 60
     private var loginFormRevealProbe: DispatchWorkItem?
     private var loginFormRevealAttempts = 0
     private var didRevealLoginField = false
@@ -5934,7 +6255,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
 
     private var loginURL: URL {
         if mode == .logs {
-            return relayURL(path: type == "newapi" ? "usage-logs" : "usage") ?? originURL
+            return relayURL(path: (resolvedType ?? type) == "newapi" ? "usage-logs" : "usage") ?? originURL
         }
         // Both relay families expose the sign-in form at /login; landing
         // there skips the marketing home page and its separate 登录 link.
@@ -6260,6 +6581,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
           const accessToken = \(jsonLiteral(session.accessToken));
           const refreshToken = \(jsonLiteral(session.refreshToken));
           const username = \(jsonLiteral(presetUsername ?? ""));
+          const userID = \(jsonLiteral(session.userID));
           if (accessToken) {
             localStorage.setItem('auth_token', accessToken);
             localStorage.setItem('access_token', accessToken);
@@ -6268,6 +6590,10 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
               const user = current && typeof current === 'object' && !Array.isArray(current) ? current : {};
               user.token = accessToken;
               if (username && !user.username) user.username = username;
+              // The record the page itself rewrites is kept coherent with the
+              // stored session, so the next capture reads the same account id
+              // the dashboard reads already send.
+              if (userID) user.id = Number(userID);
               localStorage.setItem('user', JSON.stringify(user));
             } catch {}
           }
@@ -6502,12 +6828,22 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     }
 
     private var probes: [Probe] {
-        type == "newapi"
-            ? [
-                Probe(path: "api/user/self", usernamePaths: [["data", "username"], ["data", "email"]]),
-                Probe(path: "api/user/auth/refresh", usernamePaths: [["data", "user", "username"], ["data", "user", "email"]]),
-              ]
-            : [Probe(path: "api/v1/auth/me", usernamePaths: [["data", "email"], ["data", "username"], ["email"], ["username"]])]
+        let newapi = [
+            Probe(family: "newapi", path: "api/user/self", usernamePaths: [["data", "username"], ["data", "email"]]),
+            Probe(family: "newapi", path: "api/user/auth/refresh", usernamePaths: [["data", "user", "username"], ["data", "user", "email"]]),
+        ]
+        let sub2api = [
+            Probe(family: "sub2api", path: "api/v1/auth/me", usernamePaths: [["data", "email"], ["data", "username"], ["email"], ["username"]]),
+        ]
+        switch type {
+        case "newapi": return newapi
+        case "sub2api": return sub2api
+        // Unknown family: the window opens straight away and the family is
+        // settled here, from the station's own answer, instead of making the
+        // user watch a spinner while two network probes run before the browser
+        // even appears.
+        default: return newapi + sub2api
+        }
     }
 
     private func probe(index: Int, cookieHeader: String?, attempt: NativeRelayLoginAttempt, automatically: Bool = false) {
@@ -6542,9 +6878,13 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         }
         // New API forks that require the account header reject the request
         // without it; the id comes from the page's own session record, so it
-        // always matches the account the token belongs to.
-        if type == "newapi", let capturedUserID, !capturedUserID.isEmpty {
-            request.setValue(capturedUserID, forHTTPHeaderField: "New-Api-User")
+        // always matches the account the token belongs to.  A station never
+        // states one in a way the header accepts, so nothing is sent.  The
+        // header belongs to the New API family, so it follows the family this
+        // probe belongs to when the caller did not name one.
+        let probeUserID = capturedUserID ?? restoredSession?.userID
+        if probe.family == "newapi" || type == "newapi", let probeUserID, !probeUserID.isEmpty {
+            request.setValue(probeUserID, forHTTPHeaderField: "New-Api-User")
         }
         session.dataTask(with: request) { [weak self, weak attempt] data, response, _ in
             guard let self, let attempt, attempt.isActive() else { return }
@@ -6560,22 +6900,33 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
             let detectedUsername = self.firstString(in: object, paths: probe.usernamePaths)
             let detectedAccessToken = self.firstString(in: object, paths: [["data", "access_token"], ["access_token"]])
             let detectedRefreshToken = self.firstString(in: object, paths: [["data", "refresh_token"], ["refresh_token"]])
+            // The dashboard answer names the account it belongs to, which is the
+            // value a New API fork compares its own header against.  Reading it
+            // here keeps the stored id in agreement with the session that just
+            // answered, instead of trusting a stale page capture forever.
+            let detectedUserID = self.stationUserID(in: object)
             let acceptedCookie = self.cookieHeader(after: response, existing: cookieHeader)
             DispatchQueue.main.async { [weak self, weak attempt] in
                 guard let self, let attempt, self.isCurrentCheck(attempt) else { return }
                 let username = detectedUsername ?? self.presetUsername ?? ""
                 let accessToken = detectedAccessToken ?? self.capturedAccessToken ?? self.restoredSession?.accessToken
                 let refreshToken = detectedRefreshToken ?? self.capturedRefreshToken ?? self.restoredSession?.refreshToken
+                let userID = detectedUserID ?? self.capturedUserID ?? self.restoredSession?.userID
                 guard !username.isEmpty,
                       !(acceptedCookie?.isEmpty ?? true) || !(accessToken?.isEmpty ?? true) else {
                     self.probe(index: index + 1, cookieHeader: cookieHeader, attempt: attempt, automatically: automatically)
                     return
                 }
+                // The station just answered as this family, so the flow and
+                // every later read use it: nothing in this window needs the
+                // family before the first answer arrives.
+                self.resolvedType = probe.family
                 self.persistVerifiedLogin(
                     username: username,
                     cookie: acceptedCookie,
                     accessToken: accessToken,
                     refreshToken: refreshToken,
+                    userID: userID,
                     attempt: attempt
                 )
             }
@@ -6587,6 +6938,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         cookie: String?,
         accessToken: String?,
         refreshToken: String?,
+        userID: String?,
         attempt: NativeRelayLoginAttempt
     ) {
         guard isCurrentCheck(attempt) else { return }
@@ -6601,6 +6953,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
                     cookie: cookie,
                     accessToken: accessToken,
                     refreshToken: refreshToken,
+                    userID: userID,
                     rememberPassword: rememberPassword,
                     capturedPassword: capturedPassword,
                     attempt: attempt
@@ -6615,22 +6968,38 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
             cookie: cookie,
             accessToken: accessToken,
             refreshToken: refreshToken,
+            userID: userID,
             rememberPassword: nil,
             capturedPassword: nil,
             attempt: attempt
         )
     }
 
-    /// Post-login subordinate prompt on the sign-in surface: keep the typed
-    /// password on this device, or keep only the current login state.  It is the
-    /// app's decision surface rather than an attached sheet — the same panel every
-    /// other question uses — and the sign-in window is locked while it is up, so
-    /// the answer always lands before the commit begins.
+    /// The post-login question, asked on the sign-in surface **after** that
+    /// surface is gone.
+    ///
+    /// The browser has already served its purpose once the session is verified,
+    /// so the window that carried the station's own page is dismissed first and
+    /// the question is then put to the user over the window the sign-in was
+    /// opened from.  Asking while the browser is still up put a modal question
+    /// on top of a page the user had finished with, and locked the very window
+    /// the flow was about to close — the confirm and the browser it belonged to
+    /// were on screen together, which is the one thing a child surface must not
+    /// do.  The window is dismissed before the question rather than after the
+    /// answer because the answer changes nothing about the page: the session is
+    /// already read out of it, and `finish` only re-dismisses what is already
+    /// gone.
     private func presentRememberPasswordPrompt(completion: @escaping (Bool) -> Void) {
-        guard let promptParent = embeddedWindow ?? panel else {
+        let promptParent = presentationParent
+            ?? embeddedWindow
+            ?? AppKitNativeLeaf.shared.activeWindow()
+        guard let promptParent else {
             completion(false)
             return
         }
+        // The sign-in browser is no longer needed, and the wizard that opened
+        // it is the surface the question belongs to.
+        dismissBrowserSurface()
         AppKitNativeLeaf.shared.presentDecisionPanel(
             text("Remember the password?", "是否记住密码？"),
             message: text(
@@ -6647,18 +7016,68 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         }
     }
 
+    /// Take the sign-in browser off the screen without ending the flow.
+    ///
+    /// The controller is still live — the commit runs after this — so only the
+    /// window and the probes that watch the page are dismissed; the message
+    /// handlers, the verified credential captures, and the attempt all stay
+    /// until `dismissPresentation` runs at the end.  Every page probe is
+    /// cancelled because the question is now the only thing on screen: a login
+    /// watcher left running could call `recoverStalledCheck` while the user is
+    /// answering, drop the attempt, and make the answer commit into a check that
+    /// no longer exists.  The flow is already committed in spirit at this point,
+    /// so nothing is lost by taking the page off the clock.  A browser that is
+    /// already gone is left alone, which makes this safe to call from the prompt
+    /// and again from `finish`.
+    private func dismissBrowserSurface() {
+        automaticCheckProbe?.cancel()
+        automaticCheckProbe = nil
+        loginWatchProbe?.cancel()
+        loginWatchProbe = nil
+        pageReadinessProbe?.cancel()
+        pageReadinessProbe = nil
+        loginFormRevealProbe?.cancel()
+        loginFormRevealProbe = nil
+        agreementRevealProbe?.cancel()
+        agreementRevealProbe = nil
+        embeddedResizeProbe?.cancel()
+        embeddedResizeProbe = nil
+        observedLoginSignature = nil
+        observedLoginForm = nil
+        if let observer = embeddedCloseObserver {
+            NotificationCenter.default.removeObserver(observer)
+            embeddedCloseObserver = nil
+        }
+        embeddedContent?.removeFromSuperview()
+        embeddedContent = nil
+        if let panel, panel.isVisible {
+            withoutAnimations {
+                AppKitNativeLeaf.shared.endChildPanel(panel)
+                panel.orderOut(nil)
+            }
+        }
+        // The embedded flow borrows a region of the wizard's own window rather
+        // than owning a window, so taking the browser off the screen is just
+        // that view leaving the hierarchy — the wizard itself stays up and the
+        // question is asked over it.  Closing the wizard here would end the very
+        // flow that is about to commit the sign-in.
+    }
+
     private func commitVerifiedLogin(
         username: String,
         cookie: String?,
         accessToken: String?,
         refreshToken: String?,
+        userID: String?,
         rememberPassword: Bool?,
         capturedPassword: String?,
         attempt: NativeRelayLoginAttempt
     ) {
         guard isCurrentCheck(attempt) else { return }
         let accountID = self.accountID
-        let accountType = self.type
+        // The family the verified probe answered as; a caller that named one up
+        // front passes it through unchanged.
+        let accountType = resolvedType ?? self.type
         let accountLabel = self.label
         let origin = self.originURL.absoluteString
         let session = NativeRelaySession(
@@ -6666,7 +7085,8 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
             origin: origin,
             cookie: cookie ?? "",
             accessToken: accessToken ?? "",
-            refreshToken: refreshToken ?? ""
+            refreshToken: refreshToken ?? "",
+            userID: userID ?? ""
         )
         let attachFailure = text("The signed-in session could not be saved.", "无法保存登录状态。")
         let pendingAccount = self.pendingAccount
@@ -6699,6 +7119,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
                     accessToken: accessToken,
                     refreshToken: refreshToken,
                     password: rememberPassword == true ? capturedPassword : nil,
+                    userID: userID,
                     stationID: stationID,
                     stationName: stationName,
                     stationType: stationType,
@@ -6777,6 +7198,35 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
                 let trimmed = result.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !trimmed.isEmpty && trimmed.utf8.count <= 32_768 { return trimmed }
             }
+        }
+        return nil
+    }
+
+    /// Read the station's own account id out of one dashboard answer.
+    ///
+    /// A New API fork states it as ``data.id`` and compares it against the
+    /// ``New-Api-User`` header, so only a plain decimal value can ever be
+    /// accepted; anything else is treated as “no id” rather than sent as an
+    /// invented one.  New API answers also nest it under ``data.user.id`` on
+    /// the refresh probe.
+    private func stationUserID(in value: Any) -> String? {
+        for path in [["data", "id"], ["data", "user", "id"], ["id"], ["user", "id"]] {
+            var current: Any = value
+            var valid = true
+            for key in path {
+                guard let map = current as? [String: Any], let next = map[key] else { valid = false; break }
+                current = next
+            }
+            guard valid else { continue }
+            let text: String
+            if let number = current as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() {
+                text = number.stringValue
+            } else if let string = current as? String {
+                text = string.trimmingCharacters(in: .whitespacesAndNewlines)
+            } else {
+                continue
+            }
+            if !text.isEmpty, text.count <= 32, text.allSatisfy({ $0.isNumber }) { return text }
         }
         return nil
     }
@@ -7025,31 +7475,30 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         showBrowserFailure()
     }
 
+    /// Reveal the page as soon as it has painted something, and let it fill in.
+    ///
+    /// The overlay used to wait for `document.body.innerText` to be non-empty,
+    /// which is not "the page arrived" but "the page finished its own data
+    /// fetch".  A station whose shell renders immediately and then streams, or
+    /// polls, or waits on an API leaves that text empty while the page is
+    /// perfectly usable — so the probe re-armed itself and the user stared at
+    /// 正在加载登录页面 while the sign-in form was already in the view behind it.
+    /// A web view paints progressively, so the overlay only needs to cover the
+    /// blank first frame: it lifts on committed content and every later step
+    /// (form reveal, agreement dismissal, resize, session restore) keeps running
+    /// against the live page exactly as before.
     private func schedulePageReadinessProbe() {
         pageReadinessProbe?.cancel()
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.isBrowserFlowLive else { return }
-            self.webView.evaluateJavaScript("Boolean(document.body && document.body.children.length > 0 && document.body.innerText.trim().length > 0)") { [weak self] value, _ in
+            self.pageReadinessAttempts += 1
+            self.webView.evaluateJavaScript(Self.pagePaintedScript) { [weak self] value, _ in
                 guard let self, self.isBrowserFlowLive else { return }
-                if value as? Bool == true {
-                    withoutAnimations { self.loadingOverlay.isHidden = true }
-                    self.scheduleEmbeddedBrowserResize()
-                    self.scheduleAgreementReveal()
-                    if self.mode == .logs {
-                        if !self.didRestoreSession {
-                            self.restoreLocalStorageWhenReady()
-                        }
-                    } else {
-                        self.scheduleLoginFormReveal()
-                        self.prefillLoginWhenReady()
-                        if self.didRestoreSession {
-                            self.probeRestoredSession()
-                        } else if !self.didRestoreSession {
-                            self.restoreLocalStorageWhenReady()
-                        }
-                        self.scheduleAutomaticSignInCheck()
-                        self.scheduleLoginWatch(delay: 1)
-                    }
+                // A document that painted, or one that has had long enough to
+                // paint and did not: either way the page belongs on screen, and
+                // the form/session work below runs against it as usual.
+                if value as? Bool == true || self.pageReadinessAttempts >= Self.pageReadinessMaxAttempts {
+                    self.revealBrowserPage()
                 } else {
                     self.schedulePageReadinessProbe()
                 }
@@ -7057,6 +7506,44 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         }
         pageReadinessProbe = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
+    }
+
+    /// Whether the document has painted anything a person could use.
+    ///
+    /// Any committed element or any laid-out text counts: a station's shell, a
+    /// spinner it draws itself, or the finished form are all "something is on
+    /// screen", and the app must never keep its own cover over a page that is
+    /// already drawing.  An empty document (no elements at all) is the blank
+    /// first frame the overlay actually exists for.
+    private static let pagePaintedScript = """
+    (() => {
+      const body = document.body;
+      if (!body) return false;
+      if (body.children.length > 0) return true;
+      return (body.innerText || '').trim().length > 0;
+    })();
+    """
+
+    /// Lift the overlay and start the per-step work on the live page.
+    private func revealBrowserPage() {
+        withoutAnimations { loadingOverlay.isHidden = true }
+        scheduleEmbeddedBrowserResize()
+        scheduleAgreementReveal()
+        if mode == .logs {
+            if !didRestoreSession {
+                restoreLocalStorageWhenReady()
+            }
+            return
+        }
+        scheduleLoginFormReveal()
+        prefillLoginWhenReady()
+        if didRestoreSession {
+            probeRestoredSession()
+        } else {
+            restoreLocalStorageWhenReady()
+        }
+        scheduleAutomaticSignInCheck()
+        scheduleLoginWatch(delay: 1)
     }
 
     private func scheduleLoginFormReveal() {
@@ -7156,6 +7643,10 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
 
     private func showBrowserLoading() {
         pageReadinessProbe?.cancel()
+        pageReadinessProbe = nil
+        // A fresh navigation is a fresh blank frame: the readiness counter
+        // starts over so a reload gets the same bounded wait as the first load.
+        pageReadinessAttempts = 0
         embeddedResizeProbe?.cancel()
         embeddedResizeProbe = nil
         embeddedResizeAttempts = 0
@@ -7206,6 +7697,31 @@ private struct NativeRelaySession: Codable {
     let cookie: String
     let accessToken: String
     let refreshToken: String
+    /// The station's own account id, captured from the page that proved this
+    /// session.  A New API fork requires it as the ``New-Api-User`` header on
+    /// every dashboard read and rejects one without it, so it is part of the
+    /// session exactly like the cookie.  Decoded leniently: a session stored by
+    /// an older build simply has none.
+    let userID: String
+
+    init(accountType: String, origin: String, cookie: String, accessToken: String, refreshToken: String, userID: String = "") {
+        self.accountType = accountType
+        self.origin = origin
+        self.cookie = cookie
+        self.accessToken = accessToken
+        self.refreshToken = refreshToken
+        self.userID = userID
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        accountType = try container.decode(String.self, forKey: .accountType)
+        origin = try container.decode(String.self, forKey: .origin)
+        cookie = try container.decode(String.self, forKey: .cookie)
+        accessToken = try container.decode(String.self, forKey: .accessToken)
+        refreshToken = try container.decode(String.self, forKey: .refreshToken)
+        userID = try container.decodeIfPresent(String.self, forKey: .userID) ?? ""
+    }
 }
 
 private struct NativeRelaySessionProbeResult {
@@ -7213,6 +7729,7 @@ private struct NativeRelaySessionProbeResult {
     let cookie: String
     let accessToken: String
     let refreshToken: String
+    let userID: String
 }
 
 private enum NativeRelaySessionProbeOutcome {
@@ -7263,6 +7780,11 @@ private enum NativeRelaySessionProbe {
             request.setValue(origin, forHTTPHeaderField: "Referer")
             if !session.cookie.isEmpty { request.setValue(session.cookie, forHTTPHeaderField: "Cookie") }
             if !session.accessToken.isEmpty { request.setValue("Bearer \(session.accessToken)", forHTTPHeaderField: "Authorization") }
+            // A New API fork rejects this read without its own account id, which
+            // would present a healthy remembered session as signed out.
+            if type == "newapi", !session.userID.isEmpty {
+                request.setValue(session.userID, forHTTPHeaderField: "New-Api-User")
+            }
             let semaphore = DispatchSemaphore(value: 0)
             var outcome: (Data?, HTTPURLResponse?)?
             client.dataTask(with: request) { data, response, _ in
@@ -7298,7 +7820,11 @@ private enum NativeRelaySessionProbe {
                 sawNonAuthenticationFailure = true
                 continue
             }
-            return .verified(NativeRelaySessionProbeResult(username: username, cookie: cookie, accessToken: accessToken, refreshToken: refreshToken))
+            // Prefer the id this answer states over the stored one: it belongs to
+            // the session that just proved itself, so a session whose account
+            // changed cannot keep sending the previous account's id.
+            let userID = stationUserID(object) ?? session.userID
+            return .verified(NativeRelaySessionProbeResult(username: username, cookie: cookie, accessToken: accessToken, refreshToken: refreshToken, userID: userID))
         }
         return sawAuthenticationRejection && !sawNonAuthenticationFailure ? .expired : .unavailable
     }
@@ -7324,6 +7850,28 @@ private enum NativeRelaySessionProbe {
         components.host = url.host
         components.port = url.port
         return components.string ?? url.absoluteString
+    }
+
+    private static func stationUserID(_ value: Any) -> String? {
+        for path in [["data", "id"], ["data", "user", "id"], ["id"], ["user", "id"]] {
+            var current: Any = value
+            var valid = true
+            for key in path {
+                guard let map = current as? [String: Any], let next = map[key] else { valid = false; break }
+                current = next
+            }
+            guard valid else { continue }
+            let text: String
+            if let number = current as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() {
+                text = number.stringValue
+            } else if let string = current as? String {
+                text = string.trimmingCharacters(in: .whitespacesAndNewlines)
+            } else {
+                continue
+            }
+            if !text.isEmpty, text.count <= 32, text.allSatisfy({ $0.isNumber }) { return text }
+        }
+        return nil
     }
 
     private static func firstString(_ value: Any, paths: [[String]]) -> String? {
@@ -7402,6 +7950,7 @@ private enum NativeRelaySessionMemoryStore {
               value.cookie.utf8.count <= 32_768,
               value.accessToken.utf8.count <= 32_768,
               value.refreshToken.utf8.count <= 32_768,
+              value.userID.utf8.count <= 32,
               !value.cookie.isEmpty || !value.accessToken.isEmpty else { return nil }
         return value
     }
@@ -7410,6 +7959,7 @@ private enum NativeRelaySessionMemoryStore {
         guard session.cookie.utf8.count <= 32_768,
               session.accessToken.utf8.count <= 32_768,
               session.refreshToken.utf8.count <= 32_768,
+              session.userID.utf8.count <= 32,
               !session.cookie.isEmpty || !session.accessToken.isEmpty else { return }
         lock.lock()
         sessions[accountID] = session

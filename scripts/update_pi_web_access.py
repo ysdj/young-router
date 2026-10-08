@@ -43,7 +43,10 @@ from update_common import (
     find_package_manager,
     flatten_npm_package,
     package_metadata,
+    record_staged_release,
+    release_integrity,
     request_json,
+    reused_staged_release,
     run_package_manager_install,
 )
 
@@ -207,6 +210,41 @@ def _post_stage_package(root: Path) -> None:
     _normalize_staged_user_agents(root)
 
 
+def _carries_the_shared_user_agent(root: Path) -> bool:
+    """Does this staged tree present exactly the shared browser identity?
+
+    A reused tree is one ``_normalize_staged_user_agents`` already rewrote, so
+    it has no self-naming literal left to replace and re-running that pass
+    would fail its own "found too few" assertion rather than confirm anything.
+    What a reuse has to prove instead is the property the rewrite exists to
+    establish, in both directions: nothing self-naming remains, and the
+    identity actually written into the tree is the one this build's host
+    declares.  The second half is what lets a change to the shared identity
+    invalidate a cached tree instead of shipping the previous one.
+
+    Only the package's own sources are read, exactly as the rewrite reads them;
+    ``node_modules`` is skipped so this stays a scan of a few hundred files.
+    """
+
+    if not root.is_dir():
+        return False
+    user_agent = _browser_user_agent()
+    identity_written = False
+    for path in sorted(root.rglob("*")):
+        if path.suffix not in STAGED_USER_AGENT_SUFFIXES or not path.is_file():
+            continue
+        if "node_modules" in path.parts:
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        # One self-naming literal anywhere disqualifies the whole tree, so this
+        # scans every file rather than stopping at the first good one.
+        if SELF_USER_AGENT_VALUE_RE.search(text) or SELF_USER_AGENT_ASSIGNMENT_RE.search(text):
+            return False
+        if user_agent in text:
+            identity_written = True
+    return identity_written
+
+
 def _flatten_package(npm_root: Path, destination: Path) -> str:
     return flatten_npm_package(
         npm_root,
@@ -335,21 +373,35 @@ def update(
     output = output.expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     latest, tarball_url, version_payload = _package_metadata(registry_url)
-    manager, manager_env = _find_executable("LITELLM_NPM_BIN")
-
-    with tempfile.TemporaryDirectory(prefix="young-router-pi-web-access-") as directory:
-        work = Path(directory)
-        package_tarball = work / "pi-web-access.tgz"
-        package_tarball.write_bytes(_request_bytes(tarball_url))
-        npm_root = work / "npm"
-        _install_package(
-            manager, manager_env, npm_root, package_tarball, _peer_specs(version_payload)
-        )
-        package_version = _flatten_package(npm_root, output)
-        if package_version != latest:
-            raise UpdateError(
-                f"The package manager installed {PACKAGE_NAME} {package_version}, "
-                f"expected latest {latest}"
+    integrity = release_integrity(version_payload)
+    # The release was resolved above on this build; the branch below only skips
+    # installing the identical one again.
+    if reused_staged_release(
+        output,
+        package_name=PACKAGE_NAME,
+        version=latest,
+        integrity=integrity,
+        required_files=("package.json", "index.ts"),
+    ) and _carries_the_shared_user_agent(output):
+        package_version = latest
+    else:
+        manager, manager_env = _find_executable("LITELLM_NPM_BIN")
+        with tempfile.TemporaryDirectory(prefix="young-router-pi-web-access-") as directory:
+            work = Path(directory)
+            package_tarball = work / "pi-web-access.tgz"
+            package_tarball.write_bytes(_request_bytes(tarball_url))
+            npm_root = work / "npm"
+            _install_package(
+                manager, manager_env, npm_root, package_tarball, _peer_specs(version_payload)
+            )
+            package_version = _flatten_package(npm_root, output)
+            if package_version != latest:
+                raise UpdateError(
+                    f"The package manager installed {PACKAGE_NAME} {package_version}, "
+                    f"expected latest {latest}"
+                )
+            record_staged_release(
+                output, package_name=PACKAGE_NAME, version=latest, integrity=integrity
             )
 
     node_version: str | None = None

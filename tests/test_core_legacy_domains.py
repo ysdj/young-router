@@ -2444,25 +2444,17 @@ class CodexSettingsDomainTests(unittest.TestCase):
             self.assertEqual(toggled["revision"], snapshot["revision"])
             self.assertTrue(snapshot["drafts"]["codex"]["dirty"])
             self.assertTrue(snapshot["domains"]["codex"]["model_catalog"]["enabled"])
-            self.assertTrue(snapshot["domains"]["codex"]["model_catalog"]["restart_required"])
-            self.assertEqual("enabled", snapshot["domains"]["codex"]["model_catalog"]["change_reason"])
             catalog = json.loads((home / "model-catalog.json").read_text(encoding="utf-8"))
             self.assertEqual(["default-chat"], [model["slug"] for model in catalog["models"]])
 
-            acknowledged = core.dispatch(
-                {"domain": "codex", "type": "acknowledge_model_catalog_restart", "payload": {}},
-                expected_revision=snapshot["revision"],
-            )
             disabled = core.dispatch(
                 {"domain": "codex", "type": "codex.model_catalog.set", "payload": {"enabled": False}},
-                expected_revision=acknowledged["revision"],
+                expected_revision=snapshot["revision"],
             )
             disabled_catalog = core.snapshot()["domains"]["codex"]["model_catalog"]
             self.assertEqual(disabled["revision"], core.snapshot()["revision"])
             self.assertFalse(disabled_catalog["enabled"])
             self.assertEqual([], disabled_catalog["public_models"])
-            self.assertTrue(disabled_catalog["restart_required"])
-            self.assertEqual("disabled", disabled_catalog["change_reason"])
 
     @mock.patch(
         "young_router.core.codex_config._local_exposed_models",
@@ -2546,13 +2538,9 @@ class CodexSettingsDomainTests(unittest.TestCase):
             codex = CodexSettingsDomain(runtime, codex_home=home)
             core = CoreStore(domains=[codex])
 
-            enabled = core.dispatch(
+            core.dispatch(
                 {"domain": "codex", "type": "codex.model_catalog.set", "payload": {"enabled": True}},
                 expected_revision=core.revision,
-            )
-            core.dispatch(
-                {"domain": "codex", "type": "acknowledge_model_catalog_restart", "payload": {}},
-                expected_revision=enabled["revision"],
             )
 
             endpoint["result"] = ([], False)
@@ -2560,8 +2548,6 @@ class CodexSettingsDomainTests(unittest.TestCase):
             snapshot = core.snapshot()["domains"]["codex"]["model_catalog"]
 
             self.assertEqual(["default-chat"], snapshot["public_models"])
-            self.assertFalse(snapshot["restart_required"])
-            self.assertIsNone(snapshot["change_reason"])
             catalog = json.loads((home / "model-catalog.json").read_text(encoding="utf-8"))
             self.assertEqual(["default-chat"], [model["slug"] for model in catalog["models"]])
 
@@ -2585,32 +2571,26 @@ class CodexSettingsDomainTests(unittest.TestCase):
             codex = CodexSettingsDomain(runtime, codex_home=home)
             core = CoreStore(domains=[codex])
 
-            enabled = core.dispatch(
+            core.dispatch(
                 {"domain": "codex", "type": "codex.model_catalog.set", "payload": {"enabled": True}},
                 expected_revision=core.revision,
-            )
-            core.dispatch(
-                {"domain": "codex", "type": "acknowledge_model_catalog_restart", "payload": {}},
-                expected_revision=enabled["revision"],
             )
 
             endpoint["result"] = ([], True)
             codex._catalog_source_checked_at = 0.0
             # Endpoint-backed model-set repairs require two consecutive
             # observations so a transient worker view cannot rewrite the
-            # managed catalog or prompt for a restart.
+            # managed catalog.
             core.snapshot()
             codex._catalog_source_checked_at = 0.0
             snapshot = core.snapshot()["domains"]["codex"]["model_catalog"]
 
             self.assertEqual([], snapshot["public_models"])
-            self.assertTrue(snapshot["restart_required"])
-            self.assertEqual("catalog_repaired", snapshot["change_reason"])
             catalog = json.loads((home / "model-catalog.json").read_text(encoding="utf-8"))
             self.assertEqual([], catalog["models"])
 
     @mock.patch("young_router.core.codex_config._local_exposed_models", return_value=(["default-chat"], True))
-    def test_catalog_metadata_repair_does_not_request_codex_restart(self, _live_models) -> None:
+    def test_catalog_metadata_repair_keeps_the_catalog_current(self, _live_models) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             runtime = root / "config.yaml"
@@ -2625,10 +2605,6 @@ class CodexSettingsDomainTests(unittest.TestCase):
             enabled = core.dispatch(
                 {"domain": "codex", "type": "codex.model_catalog.set", "payload": {"enabled": True}},
                 expected_revision=core.revision,
-            )
-            core.dispatch(
-                {"domain": "codex", "type": "acknowledge_model_catalog_restart", "payload": {}},
-                expected_revision=enabled["revision"],
             )
             catalog_path = home / "model-catalog.json"
             catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
@@ -2638,12 +2614,10 @@ class CodexSettingsDomainTests(unittest.TestCase):
             snapshot = core.snapshot()["domains"]["codex"]["model_catalog"]
 
             self.assertEqual(["default-chat"], snapshot["public_models"])
-            self.assertFalse(snapshot["restart_required"])
-            self.assertIsNone(snapshot["change_reason"])
             self.assertTrue(catalog_is_current(catalog_path, ["default-chat"], registry=codex._context_registry))
 
     @mock.patch("young_router.core.codex_config._local_exposed_models", return_value=(["default-chat"], True))
-    def test_missing_catalog_repair_does_not_request_codex_restart(self, _live_models) -> None:
+    def test_missing_catalog_is_rebuilt(self, _live_models) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             runtime = root / "config.yaml"
@@ -2659,20 +2633,14 @@ class CodexSettingsDomainTests(unittest.TestCase):
                 {"domain": "codex", "type": "codex.model_catalog.set", "payload": {"enabled": True}},
                 expected_revision=core.revision,
             )
-            core.dispatch(
-                {"domain": "codex", "type": "acknowledge_model_catalog_restart", "payload": {}},
-                expected_revision=enabled["revision"],
-            )
             catalog_path = home / "model-catalog.json"
             catalog_path.unlink()
 
             snapshot = core.snapshot()["domains"]["codex"]["model_catalog"]
 
-            self.assertFalse(snapshot["restart_required"])
-            self.assertIsNone(snapshot["change_reason"])
             self.assertTrue(catalog_is_current(catalog_path, ["default-chat"], registry=codex._context_registry))
 
-    def test_catalog_priority_reorder_does_not_request_codex_restart(self) -> None:
+    def test_catalog_priority_reorder_keeps_the_catalog_current(self) -> None:
         with tempfile.TemporaryDirectory() as directory, mock.patch(
             "young_router.core.codex_config._local_exposed_models",
             return_value=(["model-a", "model-b"], True),
@@ -2719,13 +2687,9 @@ class CodexSettingsDomainTests(unittest.TestCase):
                 {"domain": "codex", "type": "codex.model_catalog.set", "payload": {"enabled": True}},
                 expected_revision=core.revision,
             )
-            acknowledged = core.dispatch(
-                {"domain": "codex", "type": "acknowledge_model_catalog_restart", "payload": {}},
-                expected_revision=enabled["revision"],
-            )
             staged = core.dispatch(
                 {"domain": "codex", "type": "patch", "payload": {"model": "model-b"}},
-                expected_revision=acknowledged["revision"],
+                expected_revision=enabled["revision"],
             )
             core.apply("codex", revision=staged["revision"])
 
@@ -2734,10 +2698,8 @@ class CodexSettingsDomainTests(unittest.TestCase):
 
             self.assertEqual(["model-b", "model-a"], snapshot["public_models"])
             self.assertEqual(["model-b", "model-a"], [model["slug"] for model in catalog["models"]])
-            self.assertFalse(snapshot["restart_required"])
-            self.assertIsNone(snapshot["change_reason"])
 
-    def test_provider_apply_updates_enabled_catalog_and_requests_restart(self) -> None:
+    def test_provider_apply_updates_enabled_catalog(self) -> None:
         live_models = {"names": ["default-chat"]}
 
         def exposed_models(_api_key: str) -> tuple[list[str], bool]:
@@ -2765,10 +2727,6 @@ class CodexSettingsDomainTests(unittest.TestCase):
                 {"domain": "codex", "type": "codex.model_catalog.set", "payload": {"enabled": True}},
                 expected_revision=core.revision,
             )
-            acknowledged = core.dispatch(
-                {"domain": "codex", "type": "acknowledge_model_catalog_restart", "payload": {}},
-                expected_revision=enabled["revision"],
-            )
             upstream_only = core.dispatch(
                 {
                     "domain": "providers_models",
@@ -2779,11 +2737,11 @@ class CodexSettingsDomainTests(unittest.TestCase):
                         "changes": {"upstream_model": "openai/fast-chat"},
                     },
                 },
-                expected_revision=acknowledged["revision"],
+                expected_revision=enabled["revision"],
             )
             upstream_applied = core.apply("providers_models", revision=upstream_only["revision"])
             unchanged_public_name = core.snapshot()["domains"]["codex"]["model_catalog"]
-            self.assertFalse(unchanged_public_name["restart_required"])
+            self.assertEqual(["default-chat"], unchanged_public_name["public_models"])
             changed = core.dispatch(
                 {
                     "domain": "providers_models",
@@ -2801,26 +2759,19 @@ class CodexSettingsDomainTests(unittest.TestCase):
             providers_applied = core.apply("providers_models", revision=changed["revision"])
 
             # The first post-apply observation is not stable yet: the catalog
-            # still carries the acknowledged name.
+            # still carries the previously written name.
             codex._catalog_source_checked_at = 0.0
-            first = core.snapshot()["domains"]["codex"]["model_catalog"]
-            self.assertFalse(first["restart_required"])
+            core.snapshot()["domains"]["codex"]["model_catalog"]
             catalog = json.loads((home / "model-catalog.json").read_text(encoding="utf-8"))
             self.assertEqual(["default-chat"], [model["slug"] for model in catalog["models"]])
 
-            # A second fresh observation completes the repair and queues the
-            # restart prompt for the renamed model set.
+            # A second fresh observation completes the repair.
             codex._catalog_source_checked_at = 0.0
             repaired = core.snapshot()["domains"]["codex"]["model_catalog"]
-            self.assertTrue(repaired["restart_required"])
-            self.assertEqual("catalog_repaired", repaired["change_reason"])
+            self.assertEqual(["deepseek-v4-flash"], repaired["public_models"])
             catalog = json.loads((home / "model-catalog.json").read_text(encoding="utf-8"))
             self.assertEqual(["deepseek-v4-flash"], [model["slug"] for model in catalog["models"]])
 
-            core.dispatch(
-                {"domain": "codex", "type": "acknowledge_model_catalog_restart", "payload": {}},
-                expected_revision=core.revision,
-            )
             selected = core.dispatch(
                 {
                     "domain": "codex",
@@ -2834,9 +2785,8 @@ class CodexSettingsDomainTests(unittest.TestCase):
             snapshot = core.snapshot()
             catalog_state = snapshot["domains"]["codex"]["model_catalog"]
             # A Codex selection alone cannot add a model that LiteLLM's live
-            # /v1/models surface does not expose.
-            self.assertFalse(catalog_state["restart_required"])
-            self.assertIsNone(catalog_state["change_reason"])
+            # /v1/models endpoint does not expose.
+            self.assertEqual(["deepseek-v4-flash"], catalog_state["public_models"])
             catalog = json.loads((home / "model-catalog.json").read_text(encoding="utf-8"))
             self.assertEqual(["deepseek-v4-flash"], [model["slug"] for model in catalog["models"]])
 

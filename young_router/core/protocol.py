@@ -21,6 +21,17 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
+try:
+    # ``orjson`` ships with the managed runtime (LiteLLM depends on it) and is
+    # the codec this IPC uses when it is present.  A snapshot is a six-figure
+    # byte payload exchanged on every window refresh, and orjson serializes it
+    # about nine times faster than the standard library while refusing the
+    # same non-finite numbers.  The fallback keeps Core importable from a bare
+    # interpreter (the contract tests import this module directly).
+    import orjson as _orjson
+except Exception:  # pragma: no cover - exercised only without the managed runtime
+    _orjson = None
+
 MAX_MESSAGE_BYTES = 16 * 1024 * 1024
 # One raw-editor document: the text a read returns, the baseline beside it,
 # and the text a stage accepts all share this cap.  A read therefore carries
@@ -514,12 +525,57 @@ def encode_message(value: Mapping[str, Any] | RequestEnvelope | ResponseEnvelope
         payload = _mapping(value, "message")
         _validate_json_value(payload)
     try:
-        encoded = (json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
+        encoded = _encode_json(payload) + b"\n"
     except (TypeError, ValueError) as exc:
         raise ProtocolError("invalid_message", "IPC message cannot be encoded") from exc
     if len(encoded) > MAX_MESSAGE_BYTES:
         raise ProtocolError("message_too_large", "IPC message exceeds the size limit")
     return encoded
+
+
+def _encode_json(payload: Any) -> bytes:
+    """Encode one envelope's JSON body, refusing anything JSON cannot carry.
+
+    ``orjson`` is faster than the standard encoder, but it is not a drop-in:
+    it writes ``null`` for ``nan``/``inf`` instead of refusing them, and it
+    accepts non-string object keys when asked to.  Both would let a value that
+    the contract calls invalid cross to the client as something else — a silent
+    rewrite of a number into a null is exactly the kind of quiet corruption
+    this boundary exists to prevent.  The encoded bytes must therefore say what
+    the payload said: ``nan``/``inf`` are rejected, and only ``str`` keys are
+    accepted (``allow_nan=False`` plus ``json.dumps``'s own key rule).
+
+    ``_reject_json_value`` performs that check over the same tree the encoder
+    is about to walk, and a snapshot's numbers are all finite, so it costs one
+    pass that the standard encoder was paying anyway.
+    """
+
+    if _orjson is not None:
+        _assert_json_encodable(payload)
+        return _orjson.dumps(payload)
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+
+
+def _assert_json_encodable(value: Any) -> None:
+    """Refuse the values ``json.dumps(..., allow_nan=False)`` would refuse."""
+
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError("Out of range float values are not JSON compliant")
+        return
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                # The standard encoder coerces a non-string key (an int, a
+                # bool, None) while orjson raises, so the refusal is stated
+                # here rather than left to whichever codec is installed.
+                raise TypeError("keys must be str")
+            _assert_json_encodable(item)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            _assert_json_encodable(item)
+        return
 
 
 def decode_message(raw: bytes | str) -> dict[str, Any]:
@@ -538,6 +594,12 @@ def decode_message(raw: bytes | str) -> dict[str, Any]:
         text = raw
     else:
         raise ProtocolError("invalid_message", "IPC message is invalid")
+    # The decoder stays the standard library's.  ``orjson`` does refuse
+    # non-finite and invalid UTF-8, but it silently keeps the *last* value of a
+    # repeated key, and a duplicate key is exactly the ambiguity this boundary
+    # must reject — the same reason every other JSON reader in this app uses
+    # ``duplicate_key_hook``.  Decoding is also the cheaper half (about a third
+    # of encoding), so the encoder is where the win is.
     try:
         payload = json.loads(text, object_pairs_hook=_reject_duplicate_keys, parse_constant=_reject_json_constant)
     except (TypeError, json.JSONDecodeError, ProtocolError) as exc:

@@ -34,6 +34,11 @@ from typing import Any, Callable, Iterable, Iterator
 DOWNLOAD_ATTEMPTS = 3
 PACKAGE_VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
 
+#: Written into a staged npm package by the script that staged it: the release
+#: it was installed from.  Reusing a staged tree is decided by this record, so a
+#: directory that cannot prove which release it holds is reinstalled instead.
+STAGED_RELEASE_MARKER = "young-router-staged-release.json"
+
 
 class UpdateError(RuntimeError):
     """A build dependency could not be resolved or staged."""
@@ -298,6 +303,85 @@ def run_package_manager_install(
         )
 
 
+def reused_staged_release(
+    destination: Path,
+    *,
+    package_name: str,
+    version: str,
+    integrity: str | None,
+    required_files: Iterable[str] = (),
+    required_peer_dirs: Iterable[str] = (),
+) -> bool:
+    """Is the tree at ``destination`` the release this build just resolved?
+
+    The build resolves every staged integration against its upstream release
+    before packaging it, and that resolution costs about two seconds while
+    reinstalling an unchanged npm graph costs thirty.  Resolving a release is
+    not the same work as installing one, so the release is still resolved on
+    every build and only the redundant install is skipped.
+
+    What makes the skip safe is provenance rather than trust: a tree staged by
+    this script records the release it came from, and it is reused only when
+    that record names the exact package, version, and registry digest the
+    lookup above just resolved.  A changed release, a tree staged before this
+    record existed, a partial tree from an interrupted run, or one whose entry
+    points or peers have gone missing all fail this test and are staged from
+    scratch.
+    """
+
+    try:
+        document = json.loads((destination / STAGED_RELEASE_MARKER).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(document, dict):
+        return False
+    if document.get("package") != package_name or document.get("version") != version:
+        return False
+    # A registry that published no digest for this release cannot be matched
+    # against a recorded one, so the release is staged rather than assumed.
+    if integrity is None or document.get("integrity") != integrity:
+        return False
+    for relative in required_files:
+        if not (destination / relative).is_file():
+            return False
+    for name in required_peer_dirs:
+        if not (destination / "node_modules" / name).is_dir():
+            return False
+    return True
+
+
+def record_staged_release(
+    destination: Path,
+    *,
+    package_name: str,
+    version: str,
+    integrity: str | None,
+) -> None:
+    """Record which published release the freshly staged tree came from.
+
+    Written last, after the staging tree is in place, so an interrupted install
+    leaves no record and cannot be mistaken for a complete one.
+    """
+
+    document = {
+        "package": package_name,
+        "version": version,
+        "integrity": integrity,
+    }
+    (destination / STAGED_RELEASE_MARKER).write_text(
+        json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+
+def release_integrity(version_payload: dict[str, Any]) -> str | None:
+    """The registry's own digest for a resolved release, when it published one."""
+
+    dist = version_payload.get("dist")
+    integrity = dist.get("integrity") if isinstance(dist, dict) else None
+    return integrity if isinstance(integrity, str) and integrity else None
+
+
+
 @contextmanager
 def temporary_install_tree(prefix: str) -> Iterator[Path]:
     """A scratch directory for one staging run, removed however it ends."""
@@ -451,8 +535,11 @@ __all__ = [
     "find_package_manager",
     "flatten_npm_package",
     "package_metadata",
+    "record_staged_release",
+    "release_integrity",
     "request_bytes",
     "request_json",
+    "reused_staged_release",
     "run_npm_install",
     "run_package_manager_install",
     "temporary_install_tree",

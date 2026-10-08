@@ -35,7 +35,10 @@ from update_common import (
     find_npm,
     flatten_npm_package,
     package_metadata,
+    record_staged_release,
+    release_integrity,
     request_bytes,
+    reused_staged_release,
     run_npm_install,
 )
 
@@ -124,6 +127,18 @@ def update(output: Path, *, registry_url: str, version: str | None = None) -> st
         if not PACKAGE_VERSION_PATTERN.fullmatch(version):
             raise UpdateError(f"Invalid requested {PACKAGE_NAME} version: {version}")
         latest = version
+    integrity = release_integrity(version_payload)
+    # The release was resolved above on this build; this only skips installing
+    # the identical one again.  See ``reused_staged_release``.
+    if reused_staged_release(
+        output,
+        package_name=PACKAGE_NAME,
+        version=latest,
+        integrity=integrity,
+        required_files=REQUIRED_PACKAGE_FILES,
+        required_peer_dirs=REQUIRED_PEER_DIRECTORIES,
+    ):
+        return latest
     npm = _find_executable("WORKBUDDY_CONNECT_NPM_BIN")
     with tempfile.TemporaryDirectory(prefix="young-router-workbuddy-connect-") as directory:
         work = Path(directory)
@@ -136,6 +151,9 @@ def update(output: Path, *, registry_url: str, version: str | None = None) -> st
             raise UpdateError(
                 f"npm installed {PACKAGE_NAME} {package_version}, expected {latest}"
             )
+        record_staged_release(
+            output, package_name=PACKAGE_NAME, version=latest, integrity=integrity
+        )
     return package_version
 
 

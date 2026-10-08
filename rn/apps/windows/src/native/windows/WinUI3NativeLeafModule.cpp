@@ -747,6 +747,7 @@ void WinUI3NativeLeafModule::ShowGroupManager(
       labels.enabled_label = read("enabledLabel");
       labels.new_key_name = read("newKeyName");
       labels.auto_grouping_label = read("autoGroupingLabel");
+      labels.auto_grouping_help = read("autoGroupingHelp");
       labels.ungrouped_label = read("ungroupedLabel");
       labels.close_label = read("closeLabel");
       labels.apply_label = read("applyLabel");
@@ -929,6 +930,10 @@ void WinUI3NativeLeafModule::RelayLogin(
       (pending_account && !pending_account.value()) ||
       (station_type && station_type->empty()) ||
       (station_type && *station_type != "newapi" && *station_type != "sub2api") ||
+      // "" (or "auto") lets the flow settle the family from the page's own
+      // answer, so the sign-in window opens immediately instead of waiting on
+      // two network probes first.
+      (!IsRelayAccountType(*account_type)) ||
       account_id->empty() || account_id->size() > 96 || label->empty() || label->size() > 160 ||
       origin->empty() || origin->size() > 2048 ||
       (ui_language != "system" && ui_language != "en" && ui_language != "zh-Hans") ||

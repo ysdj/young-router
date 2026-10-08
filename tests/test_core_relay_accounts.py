@@ -46,8 +46,9 @@ class FakeRelayHTTPClient:
         if path in self.errors:
             raise self.errors[path]
         # Group selection is optional metadata on older relay deployments.
-        # Existing resource fixtures intentionally omit it.
-        if path == "/api/user/self/groups":
+        # Existing resource fixtures intentionally omit it; the ones that align
+        # auto-grouping pass their catalog as a normal response instead.
+        if path == "/api/user/self/groups" and path not in self.responses:
             return {"data": {}}
         if path == "/api/v1/groups/available":
             return {"data": []}
@@ -916,6 +917,75 @@ class RelayAccountsDomainTests(unittest.TestCase):
             )
             self.assertTrue(imported["action_summary"]["imported"])
 
+    def test_a_completed_login_reaches_disk_without_an_apply(self) -> None:
+        """A sign-in is a fact, not a draft: it survives a Core restart.
+
+        The host calls Core only after the sign-in page is done and the
+        post-login question has been answered, so nothing about a completed
+        login is left for the user to confirm.  Treating the account shell as a
+        staged draft made every later ``_persist`` return early, so the account
+        and its session lived only in memory — a station that had just been
+        signed in could not be found on disk at all, and a restart lost it.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            relay = RelayAccountsDomain(root, http_client=FakeRelayHTTPClient({}))
+            core = CoreStore(domains=[relay])
+            account_id = "login-nimbus-0123456789abcdef0123"
+
+            core.accept_relay_login(
+                account_id=account_id,
+                account_type="newapi",
+                label="nimbus",
+                origin="https://relay.example.test",
+                username="person@example.test",
+                access_token="replace-token",
+                password="replace-password",
+                user_id="2411",
+                station_name="nimbus",
+                station_type="newapi",
+                station_origin="https://relay.example.test",
+                remember_password=True,
+                pending_account=True,
+            )
+
+            storage = root / ".litellm-runtime" / "relay-accounts.json"
+            persisted = json.loads(storage.read_text(encoding="utf-8"))
+            self.assertEqual([account_id], [item["id"] for item in persisted["accounts"]])
+            self.assertEqual("2411", persisted["accounts"][0]["user_id"])
+            self.assertTrue(persisted["accounts"][0]["session"]["access_token"])
+
+            # The proof: a fresh Core reads the account back.
+            reloaded = RelayAccountsDomain(root, http_client=FakeRelayHTTPClient({}))
+            self.assertEqual(
+                ["nimbus"],
+                [account["label"] for account in reloaded.snapshot()["accounts"]],
+            )
+
+    def test_a_users_own_relay_edit_still_waits_for_apply(self) -> None:
+        """The completed-login write must not let an ordinary draft through.
+
+        A login persists because it is finished work; the panes' own relay CRUD
+        is the draft that waits for Apply.  Those are different writers, and this
+        pins that the second one still holds its edit back — a draft reaching
+        disk on a login would be the far worse bug.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            relay = RelayAccountsDomain(root, http_client=FakeRelayHTTPClient({}))
+            relay.dispatch(
+                "account.add",
+                {"type": "newapi", "label": "manual", "origin": "https://relay.example.test"},
+            )
+            storage = root / ".litellm-runtime" / "relay-accounts.json"
+            self.assertNotEqual({}, relay.draft_state())
+            self.assertEqual([], json.loads(storage.read_text(encoding="utf-8"))["accounts"])
+
+            reloaded = RelayAccountsDomain(root, http_client=FakeRelayHTTPClient({}))
+            self.assertEqual([], reloaded.snapshot()["accounts"])
+
     def test_core_pending_login_creates_account_without_reserving_cancelled_slot(self) -> None:
         fake = FakeRelayHTTPClient(
             {
@@ -967,9 +1037,25 @@ class RelayAccountsDomainTests(unittest.TestCase):
             self.assertEqual(1, len(stations))
             self.assertEqual(stations[0]["id"], account["station_id"])
             self.assertTrue(relay.secret_present("session", account["id"]))
+            # The login is a completed fact: the account, its station, and the
+            # session the post-login answer chose to remember are on disk, so a
+            # Core restart keeps a station the user just signed in to.
+            persisted = json.loads(
+                (root / ".litellm-runtime" / "relay-accounts.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                ["pending0123456789abcdef0123456789ab"],
+                [item["id"] for item in persisted["accounts"]],
+            )
+            self.assertEqual(
+                "session=replace-cookie",
+                persisted["accounts"][0]["session"]["cookie"],
+            )
+            # A station API key is never written: it stays in Core's
+            # process-local cache and crosses the boundary only through the
+            # one-shot plaintext lease.
             persisted_json = "\n".join(path.read_text() for path in root.rglob("*.json"))
-            for secret in ("replace-cookie", "replace-dashboard-token", "replace-relay-key"):
-                self.assertNotIn(secret, persisted_json)
+            self.assertNotIn("replace-relay-key", persisted_json)
 
     def test_core_login_accept_without_pending_flag_still_rejects_unknown_account(self) -> None:
         fake = FakeRelayHTTPClient({})
@@ -3163,6 +3249,352 @@ class RelayReadPolicyTests(unittest.TestCase):
     def test_a_transport_error_keeps_the_message_every_caller_classifies(self) -> None:
         self.assertTrue(issubclass(RelayTransportError, RelayAccountsError))
         self.assertEqual("Relay is unavailable", str(RelayTransportError()))
+    def test_a_newapi_fork_account_id_travels_as_the_account_header(self) -> None:
+        """A fork that requires ``New-Api-User`` must receive the station's own id.
+
+        New API resolves that header with ``strconv.Atoi`` and compares it to the
+        session's user, so without it every dashboard read answers
+        ``未提供 New-Api-User`` and an account that is genuinely signed in reads as
+        unusable — which is what left 供应商与模型 reporting 登录成功 but 无法加载 API
+        资源.  The id is the station's own, captured with the session and sent on
+        every authenticated read (refresh, group catalog, key list, and a key
+        materialization) rather than guessed from a label or a username.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            fake = FakeRelayHTTPClient(
+                {
+                    "/api/user/models": {"data": ["gpt-5.6-sol"]},
+                    "/api/token/?p=1&size=100": {
+                        "data": {
+                            "items": [
+                                {"id": 4154, "name": "x-cheap", "status": 1, "key": "sk-replace-key"}
+                            ]
+                        }
+                    },
+                    "/api/user/self": {"data": {"quota": 1_250_000}},
+                    "/api/status": {"data": {"quota_per_unit": 500_000}},
+                    "/api/token/4154/key": {"data": {"key": "sk-replace-key"}},
+                }
+            )
+            domain = RelayAccountsDomain(directory, http_client=fake)
+            account = domain.dispatch(
+                "account.add",
+                {"type": "newapi", "label": "NIMBUS", "origin": "https://relay.example.test"},
+            )["accounts"][0]
+            domain.accept_login_result(
+                account["id"],
+                username="riveryang6@example.test",
+                access_token="replace-token",
+                user_id="2411",
+            )
+
+            domain.refresh_resources(account["id"])
+            domain.trusted_secret_value("api_key", f"{account['id']}:newapi-4154")
+
+            authenticated = [
+                (path, headers) for _, path, headers in fake.requests if path != "/api/status"
+            ]
+            self.assertTrue(authenticated)
+            for path, headers in authenticated:
+                self.assertEqual("2411", headers.get("New-Api-User"), path)
+                self.assertIn("Authorization", headers)
+            # The unauthenticated type probe still carries no account identity.
+            self.assertEqual(
+                ["/api/status"],
+                [path for _, path, headers in fake.requests if not headers.get("New-Api-User")],
+            )
+
+    def test_a_station_id_that_is_not_a_decimal_id_is_never_sent(self) -> None:
+        """A value the header cannot carry is dropped, never invented.
+
+        ``New-Api-User`` is parsed as a decimal integer, so a username, a UUID,
+        or a label would be rejected as a mismatched account.  An account that
+        never reported a usable id must therefore send no header at all, which
+        is what a stock New API endpoint accepts.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            fake = FakeRelayHTTPClient(
+                {
+                    "/api/user/models": {"data": ["gpt-test"]},
+                    "/api/token/?p=1&size=100": {
+                        "data": {"items": [{"id": 1, "name": "default", "status": 1, "key": "masked"}]}
+                    },
+                    "/api/user/self": {"data": {"quota": 500_000}},
+                    "/api/status": {"data": {"quota_per_unit": 500_000}},
+                }
+            )
+            domain = RelayAccountsDomain(directory, http_client=fake)
+            account = domain.dispatch(
+                "account.add",
+                {"type": "newapi", "label": "New API", "origin": "https://relay.example.test"},
+            )["accounts"][0]
+            for rejected in ("2411\r\nX-Evil: 1", "riveryang6", "user-2411", "4711abc", ""):
+                domain.accept_login_result(
+                    account["id"],
+                    username="person",
+                    access_token="replace-token",
+                    user_id=rejected,
+                )
+                fake.requests.clear()
+
+                domain.refresh_resources(account["id"])
+
+                self.assertNotIn(
+                    "New-Api-User",
+                    {key for _, path, headers in fake.requests for key in headers},
+                    rejected,
+                )
+
+    def test_a_sub2api_station_never_receives_the_newapi_account_header(self) -> None:
+        """The header belongs to one station family, not to every dashboard read.
+
+        A sub2api deployment authenticates its dashboard API with the session
+        cookie alone, and an invented header on its requests would be sent to a
+        service that never asked for one.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            fake = FakeRelayHTTPClient(
+                {
+                    "/api/v1/user/profile": {"data": {"balance": 8.75}},
+                    "/api/v1/keys?page=1&page_size=100": {
+                        "data": {"items": [{"id": "11", "name": "alpha", "status": "active", "key": "sk-a"}]}
+                    },
+                    "/api/v1/channels/available": {
+                        "data": [{"platforms": [{"supported_models": ["model-test"]}]}]
+                    },
+                }
+            )
+            domain = RelayAccountsDomain(directory, http_client=fake)
+            account_id = domain.dispatch(
+                "account.add",
+                {"type": "sub2api", "label": "Sub2API", "origin": "https://relay.example.test"},
+            )["accounts"][0]["id"]
+            # Even an id the caller wrongly attaches stays off a sub2api read.
+            domain.accept_login_result(
+                account_id,
+                username="person@example.test",
+                access_token="replace-token",
+                user_id="2411",
+            )
+            fake.requests.clear()
+
+            domain.refresh_resources(account_id)
+
+            self.assertTrue(fake.requests)
+            self.assertEqual(
+                [],
+                [
+                    path
+                    for _, path, headers in fake.requests
+                    if "New-Api-User" in headers
+                ],
+            )
+
+    def test_a_refresh_keeps_the_staged_rename_visible(self) -> None:
+        """A read must not overwrite the preview of staged work.
+
+        A station read reports the station's own state, and a staged edit has not
+        reached it yet.  Folding the read straight over the account therefore
+        replaced 自动分组's just-staged renames with the station's old key names,
+        and the 分组管理 sheet showed the un-grouped reading again — the switch
+        looked like it had done nothing even though every rename was staged and
+        Apply wrote them all correctly.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            fake = FakeRelayHTTPClient(
+                {
+                    "/api/user/models": {"data": ["gpt-test"]},
+                    "/api/token/?p=1&size=100": {
+                        "data": {
+                            "items": [
+                                {"id": 1, "name": "fast", "status": 1, "key": "sk-1", "group": "gpt-pro"},
+                                {"id": 2, "name": "pro", "status": 1, "key": "sk-2", "group": "gpt-pro"},
+                            ]
+                        }
+                    },
+                    "/api/user/self": {"data": {"quota": 500_000}},
+                    "/api/status": {"data": {"quota_per_unit": 500_000}},
+                    "/api/user/self/groups": {"data": {"gpt-pro": {"ratio": 1.0}}},
+                }
+            )
+            domain = RelayAccountsDomain(directory, http_client=fake)
+            account = domain.dispatch(
+                "account.add",
+                {"type": "newapi", "label": "NIMBUS", "origin": "https://relay.example.test"},
+            )["accounts"][0]
+            domain.accept_login_result(account["id"], username="person", access_token="replace-token")
+            domain.refresh_resources(account["id"])
+
+            aligned = domain.set_auto_grouping(account["id"], True)
+            # 自动分组 owns one key per group: the group's first key is kept and
+            # renamed, and the extra key in the same group is staged for
+            # deletion.
+            self.assertEqual(
+                ["gpt-pro", "pro"],
+                [resource["name"] for resource in aligned["resources"]],
+            )
+            self.assertTrue(any(
+                operation["kind"] == "api_key_update"
+                for operation in domain._pending_operations
+            ))
+            self.assertTrue(any(
+                operation["kind"] == "api_key_delete"
+                for operation in domain._pending_operations
+            ))
+
+            # The pane's own mount probe (or opening the sheet) reads the
+            # station again.  The fixture keeps reporting the original two keys,
+            # so a read that simply replaced the account would undo the rename
+            # and resurrect the duplicate the layout just retired; the layout
+            # must survive it as the one-key-one-group shape it staged.
+            refreshed = domain.refresh_resources(account["id"])
+            self.assertEqual(
+                ["gpt-pro"],
+                [resource["name"] for resource in refreshed["resources"]],
+            )
+            # A second read is equally idempotent.
+            again = domain.refresh_resources(account["id"])
+            self.assertEqual(
+                ["gpt-pro"],
+                [resource["name"] for resource in again["resources"]],
+            )
+
+    def test_an_apply_time_read_still_reports_the_station_itself(self) -> None:
+        """The read that decides "did my write land?" keeps the station's answer.
+
+        ``reconcile_apply`` compares what the station reports against a staged
+        change to decide whether to retire that operation or hand it back for
+        another attempt.  A read that painted the staged change onto its own
+        answer would make an operation whose write never reached the station look
+        applied and silently drop it, so the Apply-time read stays the station's
+        own report.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            fake = FakeRelayHTTPClient(
+                {
+                    "/api/user/models": {"data": ["gpt-test"]},
+                    "/api/token/?p=1&size=100": {
+                        "data": {
+                            "items": [
+                                {"id": 1, "name": "fast", "status": 1, "key": "sk-1", "group": "gpt-pro"},
+                            ]
+                        }
+                    },
+                    "/api/user/self": {"data": {"quota": 500_000}},
+                    "/api/status": {"data": {"quota_per_unit": 500_000}},
+                    "/api/user/self/groups": {"data": {"gpt-pro": {"ratio": 1.0}}},
+                }
+            )
+            domain = RelayAccountsDomain(directory, http_client=fake)
+            account = domain.dispatch(
+                "account.add",
+                {"type": "newapi", "label": "NIMBUS", "origin": "https://relay.example.test"},
+            )["accounts"][0]
+            domain.accept_login_result(account["id"], username="person", access_token="replace-token")
+            domain.refresh_resources(account["id"])
+            domain.set_auto_grouping(account["id"], True)
+
+            apply_read = domain.refresh_resources(account["id"], _for_apply=True)
+            # The station still names the key ``fast``: the staged rename has not
+            # been written, and this read is what proves it.
+            self.assertIn("fast", [resource["name"] for resource in apply_read["resources"]])
+
+    def test_a_slim_fork_token_can_still_be_renamed_and_regrouped(self) -> None:
+        """A fork that omits token fields must not block the edit it was asked for.
+
+        A New API PUT binds the body into a fresh struct and writes every field
+        back, so a field the station did not report is its own zero value rather
+        than "leave this alone".  Requiring every field to be present made an
+        older or slimmer fork refuse the whole edit, and 自动分组 could then
+        never rename or regroup its keys — the switch appeared to do nothing.
+        """
+
+        domain = RelayAccountsDomain
+        # A fork that serializes only the fields its own UI edits.
+        thin = {"id": 1, "name": "fast", "group": "gpt-pro-full", "status": 1}
+        payload = domain._newapi_update_payload(thin, {"name": "gpt-pro-full", "group": "gpt-pro-full"})
+        self.assertEqual("gpt-pro-full", payload["name"])
+        self.assertEqual("gpt-pro-full", payload["group"])
+        # The fields it never reported carry their documented binding default,
+        # never an invented value.
+        self.assertEqual(-1, payload["expired_time"])
+        self.assertEqual(0, payload["remain_quota"])
+        self.assertFalse(payload["unlimited_quota"])
+        self.assertFalse(payload["model_limits_enabled"])
+        self.assertEqual("", payload["model_limits"])
+        self.assertEqual("", payload["allow_ips"])
+        self.assertFalse(payload["cross_group_retry"])
+
+        # A station that states a field with the wrong shape is a broken answer
+        # and is still refused: only a genuinely absent field falls back.
+        broken = dict(thin, expired_time="soon")
+        with self.assertRaises(RelayAccountsError):
+            domain._newapi_update_payload(broken, {"name": "x"})
+        # ``allow_ips`` is nullable in New API; null means the same as absent.
+        for allow_ips in (None, "", "1.2.3.4"):
+            nullish = dict(thin, allow_ips=allow_ips)
+            self.assertEqual(
+                "" if not isinstance(allow_ips, str) else allow_ips,
+                domain._newapi_update_payload(nullish, {})["allow_ips"],
+            )
+
+    def test_a_remembered_account_id_survives_a_restart_and_a_session_check(self) -> None:
+        """The id is durable session material, and it is what the probe sends.
+
+        A Core restart holds no process-local session, so a remembered account
+        verifies itself from storage.  That verification read is an ordinary
+        authenticated read on a fork that requires the header, and without the
+        stored id it would report a healthy session as signed out.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake = FakeRelayHTTPClient(
+                {
+                    "/api/user/models": {"data": ["gpt-test"]},
+                    "/api/token/?p=1&size=100": {
+                        "data": {"items": [{"id": 1, "name": "default", "status": 1, "key": "masked"}]}
+                    },
+                    "/api/user/self": {"data": {"quota": 500_000}},
+                    "/api/status": {"data": {"quota_per_unit": 500_000}},
+                }
+            )
+            domain = RelayAccountsDomain(root, http_client=fake)
+            account_id = domain.dispatch(
+                "account.add",
+                {"type": "newapi", "label": "New API", "origin": "https://relay.example.test"},
+            )["accounts"][0]["id"]
+            domain.accept_login_result(
+                account_id,
+                username="person",
+                cookie="session=replace-cookie",
+                user_id="2411",
+                remember_password=True,
+            )
+            domain.commit_apply()
+            self.assertEqual(
+                "2411",
+                json.loads(Path(domain.storage_path).read_text(encoding="utf-8"))["accounts"][0]["user_id"],
+            )
+
+            reloaded = RelayAccountsDomain(root, http_client=fake)
+            fake.requests.clear()
+            restored = reloaded.restore_saved_session(account_id)
+
+            self.assertEqual("signed_in", restored["login_status"])
+            self.assertEqual(
+                ["2411"],
+                [
+                    headers["New-Api-User"]
+                    for _, path, headers in fake.requests
+                    if path == "/api/user/self"
+                ],
+            )
 
 
 if __name__ == "__main__":

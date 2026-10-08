@@ -2571,6 +2571,149 @@ class HookRouteRecoveryTests(HookTestCase):
         self.assertFalse(hooks._should_return_route_recovery_stream(exc, request_data))
         self.assertFalse(hooks._should_count_deployment_failure_for_cooldown(exc))
 
+    def test_the_client_error_names_the_body_limit_not_a_route_outage(self) -> None:
+        """Every route refused the bytes, so the client must not retry them.
+
+        The synthesized terminal event used to answer ``server_error`` /
+        ``upstream_route_failure`` for this case, which reads as a route outage
+        and invites an identical replay.  The body limit is the request's own
+        property, so the terminal event states it.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+
+        class BadRequestError(Exception):
+            status_code = 400
+
+        exc = BadRequestError(
+            "litellm.badrequesterror: openaiexception - workbuddy upstream client "
+            "(http 400): 内容过长，请精简或新建任务"
+        )
+        request_data = {
+            "model": "deepseek-v4.1-flash",
+            "input": [{"role": "user", "content": "x" * 4_000_000}],
+            "stream": True,
+            "model_info": {"id": "c52c205f", "order": 0},
+        }
+
+        hooks._mark_exception_for_deployment_failover(exc, request_data)
+        self.assertTrue(hooks._request_body_size_rejected(request_data))
+
+        event = json.loads(
+            json.dumps(
+                hooks._synthesized_failed_response_event(request_data, exc)
+            )
+        )
+        error = event["response"]["error"]
+        self.assertEqual(error["type"], "invalid_request_error")
+        self.assertEqual(error["code"], "upstream_request_body_too_large")
+        self.assertNotIn("route failed", error["message"])
+        self.assertIn("too large", error["message"])
+
+    def test_upstream_size_refusal_in_its_own_words_is_a_request_error(self) -> None:
+        """A gateway that refuses an over-large body with HTTP 400 states a limit.
+
+        WorkBuddy answers an over-large Chat Completions body with HTTP 400 and
+        the sentence "内容过长，请精简或新建任务".  The bytes are refused, not the
+        route: treating this as a transient upstream error made the router cool
+        the deployment for 300 s and hold the client in the recovery poll for a
+        request whose body had already been rejected.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+
+        class BadRequestError(Exception):
+            status_code = 400
+
+        exc = BadRequestError(
+            "litellm.badrequesterror: openaiexception - workbuddy upstream client "
+            "(http 400): 内容过长，请精简或新建任务"
+        )
+        exc.failed_deployment_id = "order1-a"
+        request_data = {
+            "model": "deepseek-v4.1-flash",
+            "input": [{"role": "user", "content": "x" * 4_000_000}],
+            "stream": True,
+            "model_info": {"id": "order1-a", "order": 1},
+        }
+
+        self.assertTrue(hooks._is_request_body_size_rejection_error(exc))
+        # Another gateway with a larger body limit may still accept the bytes.
+        self.assertTrue(hooks._is_priority_deployment_failover_error(exc))
+        # The same bytes never fit later, so there is no cooldown and no poll.
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(exc),
+            hooks._RECOVERY_POLICY_ERROR,
+        )
+        self.assertFalse(hooks._is_route_recovery_poll_error(exc))
+        self.assertFalse(hooks._should_return_route_recovery_stream(exc, request_data))
+        self.assertFalse(hooks._should_count_deployment_failure_for_cooldown(exc))
+
+    def test_english_size_refusal_is_a_request_error(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+
+        class BadRequestError(Exception):
+            status_code = 400
+
+        for message in (
+            "This request body is too large for this endpoint",
+            "request entity too large",
+            "payload too large",
+        ):
+            with self.subTest(message=message):
+                self.assertTrue(
+                    hooks._is_request_body_size_rejection_error(
+                        BadRequestError(message)
+                    )
+                )
+
+    def test_a_token_limit_stays_a_context_error_not_a_body_limit(self) -> None:
+        """A context-window refusal names tokens, so it keeps its own treatment.
+
+        The two limits need opposite handling: a context refusal is retried with
+        truncation and never failed over, while a body refusal advances to a
+        gateway that accepts the bytes.  Reading one as the other would either
+        send shrinking retries at a body limit that cannot move, or fail over a
+        conversation that only this route can serve.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+
+        class BadRequestError(Exception):
+            status_code = 400
+
+        for message in (
+            "This model's maximum context length is 262144 tokens. However, your "
+            "prompt contains 262145 input tokens.",
+            "prompt is too long: 1400000 tokens > 1000000 maximum",
+        ):
+            with self.subTest(message=message):
+                exc = BadRequestError(message)
+                self.assertTrue(hooks._is_context_size_error(exc))
+                self.assertFalse(hooks._is_request_body_size_rejection_error(exc))
+
+    def test_a_gateway_capacity_failure_keeps_its_route_failover(self) -> None:
+        """A gateway's own storage-capacity failure is not this request's limit."""
+
+        hooks, _proxy_server = load_hook_module()
+
+        class APIError(Exception):
+            status_code = 413
+
+        exc = APIError("request body storage capacity exhausted")
+        self.assertFalse(hooks._is_request_body_size_rejection_error(exc))
+
+    def test_an_unrelated_bad_request_keeps_the_ordinary_route_treatment(self) -> None:
+        """Only a stated size limit changes the classification."""
+
+        hooks, _proxy_server = load_hook_module()
+
+        class BadRequestError(Exception):
+            status_code = 400
+
+        exc = BadRequestError("invalid_request_error: unknown parameter 'foo'")
+        self.assertFalse(hooks._is_request_body_size_rejection_error(exc))
+
     def test_request_body_size_rejection_is_remembered_and_skips_later_polling(self) -> None:
         hooks, _proxy_server = load_hook_module()
 
@@ -2670,3 +2813,103 @@ class HookRouteRecoveryTests(HookTestCase):
             ],
             [],
         )
+
+    def test_a_local_shutdown_is_not_upstream_evidence(self) -> None:
+        """A stream this worker truncated while exiting must not blame a route.
+
+        ``uvicorn.Server.shutdown`` closes every accepted connection first and
+        waits for the in-flight requests afterwards, so a turn that was still
+        streaming when the app was replaced always loses its response body.
+        The resulting exception reads exactly like a network fault -- LiteLLM
+        wraps the transport error and the nested cause is an ``httpx`` read
+        error -- and reading it as upstream evidence quarantined a healthy
+        deployment and held the client in the recovery poll for a failure the
+        user's own restart caused.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+
+        class MidStreamFallbackError(Exception):
+            status_code = 500
+
+        transport_error = OSError("peer closed connection")
+        exc = MidStreamFallbackError(
+            "litellm.midstreamfallbackerror: litellm.apiconnectionerror: "
+            "apiconnectionerror: openaiexception - response payload is not "
+            "completed: <transferencodingerror: 400, message='not enough data "
+            "to satisfy transfer length header.'>"
+        )
+        exc.__cause__ = transport_error
+        exc.failed_deployment_id = "c52c205f"
+        exc.failed_deployment_order = 0
+        request_data = {
+            "model": "deepseek-v4.1-flash",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "model_info": {"id": "c52c205f", "order": 0},
+        }
+
+        # Without the shutdown marker this is the ordinary connectivity case,
+        # which is why the classification has to distinguish the two.
+        self.assertTrue(hooks._is_network_recovery_exception(exc))
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(exc),
+            hooks._RECOVERY_POLICY_RECOVERY,
+        )
+
+        hooks._mark_exception_as_local_shutdown(exc)
+
+        # Every consequence of reading this as an upstream failure is gone.
+        self.assertFalse(hooks._is_network_recovery_exception(exc))
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(exc),
+            hooks._RECOVERY_POLICY_ERROR,
+        )
+        self.assertFalse(hooks._is_route_recovery_poll_error(exc))
+        self.assertFalse(hooks._should_return_route_recovery_stream(exc, request_data))
+        self.assertFalse(hooks._should_count_deployment_failure_for_cooldown(exc))
+        self.assertEqual(
+            hooks._trace_exception(exc)["reason"], "local-proxy-shutdown"
+        )
+        self.assertEqual(
+            hooks._recovery_diagnostic(exc)["kind"], "local_shutdown"
+        )
+
+        hooks._mark_exception_for_deployment_failover(exc, request_data)
+        # The route stays healthy: the next request must be free to use it.
+        self.assertEqual(request_data.get("_excluded_deployment_ids"), None)
+        self.assertNotIn("c52c205f", hooks._CURRENT_EXCLUDED_DEPLOYMENT_IDS.get() or set())
+
+        # The client's own report names the restart instead of the route outage
+        # the same failure used to claim while a live worker was serving.
+        event = json.loads(
+            json.dumps(hooks._synthesized_failed_response_event(request_data, exc))
+        )
+        error = event["response"]["error"]
+        self.assertEqual(error["code"], "router_restarting")
+        self.assertNotIn("upstream", error["message"])
+        self.assertIn("restarting", error["message"])
+
+    def test_a_live_worker_still_reports_a_real_upstream_failure(self) -> None:
+        """The shutdown marker never widens into ordinary request failures."""
+
+        hooks, _proxy_server = load_hook_module()
+
+        class APIConnectionError(Exception):
+            status_code = 500
+
+        exc = APIConnectionError("cannot connect to host upstream.example.test")
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "model_info": {"id": "order1-a", "order": 0},
+        }
+
+        self.assertFalse(hooks._is_local_shutdown_exception(exc))
+        self.assertTrue(hooks._is_network_recovery_exception(exc))
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(exc),
+            hooks._RECOVERY_POLICY_RECOVERY,
+        )
+        self.assertEqual(hooks._trace_exception(exc)["reason"], "upstream-network-connectivity")

@@ -1788,8 +1788,42 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # ternary picks the source-list step, never a literal.
             self.assertNotRegex(
                 source,
-                r"FontSize\((?!rail_row \? kSourceListFontSize : kUIFontSize\)|kUIFontSize\)|kSourceListFontSize\)|kSourceListGlyphFontSize\))",
+                r"FontSize\((?!rail_row \? kSourceListFontSize : kUIFontSize\)|kUIFontSize\)|kSourceListFontSize\)|kSourceListGlyphFontSize\)|kTipFontSize\))",
             )
+        # The hint step mirrors the shared UI's own tip size, so a native flyout
+        # and a React help tip read the same.
+        self.assertIn("export const UI_TIP_FONT_SIZE = 12;", typography)
+        self.assertIn("constexpr double kTipFontSize = 12.0;", windows_leaf)
+
+        # The native hint the group manager's question mark opens carries the
+        # shared `HelpTip` popup's own metrics, so the one style every other
+        # question mark in the app uses is the style this mark uses too.
+        for constant in (
+            "private let nativeTipFontSize: CGFloat = 12",
+            "private let nativeTipLineHeight: CGFloat = 15",
+            "private let nativeTipWidth: CGFloat = 208",
+            "private let nativeTipInsetX: CGFloat = 8",
+            "private let nativeTipInsetY: CGFloat = 6",
+            "private let nativeTipCornerRadius: CGFloat = 6",
+            "private let nativeTipAnchorGap: CGFloat = 22",
+        ):
+            self.assertIn(constant, self.macos_leaf)
+        # Each constant is actually used to draw the popup rather than kept
+        # beside a second literal.
+        tip_body = self.macos_leaf.split("func presentTip(_ text: String, beside anchor: NSView?) -> NSPanel? {", 1)[1].split("func dismissTip() {", 1)[0]
+        for used in (
+            "nativeTipWidth",
+            "nativeTipInsetX",
+            "nativeTipInsetY",
+            "nativeTipCornerRadius",
+            "nativeTipAnchorGap",
+            "nativeTipFontSize",
+            "nativeTipLineHeight",
+        ):
+            self.assertIn(used, tip_body)
+        self.assertRegex(tip_body, r"cornerRadius = nativeTipCornerRadius")
+        self.assertRegex(tip_body, r"borderColor = NSColor\.separatorColor\.cgColor")
+        self.assertRegex(tip_body, r"backgroundColor = NSColor\.controlBackgroundColor\.cgColor")
 
     def test_logs_default_to_requests_and_show_latest_first(self) -> None:
         self.assertNotIn("logInfoBar", self.ui)
@@ -2563,7 +2597,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # Codex keeps its own model-list switch: the pane writes the same
         # managed catalog the status menu toggles, so checked replaces Codex's
         # model list with this app's public one and unchecked restores the
-        # client's built-in list.
+        # client's built-in list.  The switch writes and reports, and nothing
+        # asks the user to restart the client to pick the change up.
+        for absent in ("CodexRestartNotice", "showCodexRestartConfirmation", "restartCodex"):
+            self.assertNotIn(absent, self.ui)
         for marker in (
             'accessibilityLabel={translate("codex.modelCatalog")}',
             'translate("codex.modelCatalogHint")',
@@ -3423,7 +3460,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("styles.providerSourceFields", identity)
         self.assertNotIn("styles.officialAccountSection", identity)
         self.assertIn('label={translate("providers.providerName")}', identity)
-        self.assertIn('label={translate("providers.wizard.providerType")}', identity)
+        # The detail pane states the provider's identity and nothing more: the
+        # type and the address are what the provider is already bound to, so a
+        # picker here would offer a retarget this pane has no business doing.
+        self.assertNotIn('label={translate("providers.wizard.providerType")}', identity)
         self.assertIn("{SERVICE_BASE_URLS[service]}", identity)
         self.assertLess(editor.index("styles.providerEnabledRow"), editor.index("{service ? <View"))
         # The provider's own fields container is the custom provider's: one
@@ -3610,12 +3650,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # A service provider's type is an ordinary editable field: the
             # pane offers the same picker the wizard does, so WorkBuddy is
             # wired and retargeted like any other service.
-            'const SERVICE_KIND_OPTIONS: ReadonlyArray<{ kind: ProviderKind; label: TranslationKey }> = [',
-            # The picker's short type is translated into the persisted login
-            # kind before it is dispatched, the way Core validates it.
-            'function serviceProviderKindFor(kind: ProviderKind): ServiceProviderKind | undefined {',
-            'const authKind = serviceProviderKindFor(next as ProviderKind);',
-            'dispatch("service_provider.patch", { provider_id: id, provider: { auth_kind: authKind } })',
+            # The detail pane is the ordinary one: it states the name, the
+            # bound address, and the account — never a type picker, because the
+            # provider's service is what it is already bound to.
+            'label={translate("providers.providerName")}',
+            '{SERVICE_BASE_URLS[service]}',
             # Every label column in the pane is the shared one, so a rate row
             # lines up with the fields beside it.
             'providerAuthStatusLabel: { width: 88, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE }',
@@ -3695,6 +3734,40 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.assertIn('"providers.workbuddyCreditUnavailable":', text)
         translation_keys = (ROOT / "rn/packages/shared/src/i18n/types.ts").read_text(encoding="utf-8")
         self.assertIn('| "providers.workbuddyCreditUnavailable"', translation_keys)
+
+    def test_a_rate_row_only_remembers_a_catalog_it_actually_read(self) -> None:
+        """A catalog read that named no model never becomes the cached answer.
+
+        The model detail's 倍率 row is fed by one service catalog, and that
+        read can come back without a catalog at all: a cold worker's first
+        answer, a failed upstream read, or a summary another window's action
+        already replaced in the shared slot.  Remembering that as this
+        service's rates hides every 倍率 for the whole cache interval — the
+        row cannot even ask again, because its own cache claims the question
+        was answered.  Only a read that answers with this service's own
+        catalog is stored, and the row retries once when it is told nothing.
+        """
+
+        for marker in (
+            # The read's own summary is the only one this row accepts.
+            'if (summary.operation !== "workbuddy_models" || summary.available !== true) return undefined;',
+            '): Promise<Record<string, string> | undefined> {',
+            # A read that named no catalog is not cached, and the row asks once
+            # more instead of painting 无 until the interval expires.
+            'if (!options?.force && cached && Date.now() - cached.at < SERVICE_RATE_TTL_MS) return cached.rates;',
+            'const readRates = (force: boolean): void => {',
+            'if (rates) { setServiceRate(rates[upstreamModelID] ?? ""); return; }',
+            'if (!force) readRates(true);',
+            'readRates(false);',
+        ):
+            self.assert_ui_has(marker)
+        # An empty read is never stored as an answer: the cache write sits
+        # behind the gate that accepts only this service's own catalog.
+        self.assertLess(
+            self.ui.index('if (summary.operation !== "workbuddy_models" || summary.available !== true) return undefined;'),
+            self.ui.index("serviceRates.set(service, { at: Date.now(), rates });"),
+        )
+        self.assert_ui_has('if (rates) { setServiceRate(rates[upstreamModelID] ?? ""); return; }')
 
     def test_unified_provider_workspace_lists_every_provider_kind(self) -> None:
         """服务商管理 is integrated: the provider table shows all kinds."""
@@ -3840,6 +3913,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
             1,
         )[0]
         self.assertIn('normalized.startsWith("model_") || normalized.startsWith("provider_")', retryable)
+        # A service provider's own name and enabled switch are absolute values
+        # addressed by a stable editor id, exactly like a custom provider's, so
+        # they rebase too.  Without this a rename lost the race against the
+        # pane's own debounced Apply, came back as a revision conflict, and the
+        # field visibly reverted to the old name.
+        self.assertIn('normalized === "service_provider_patch"', retryable)
+        self.assertIn('normalized === "service_patch_provider"', retryable)
         # Wildcarding the editor families must not swallow the import actions:
         # their file capability is a one-time lease that a retry cannot reuse.
         self.assertIn('normalized.startsWith("model_")', retryable)
@@ -4560,7 +4640,23 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # between the switch and the buttons, which keep their trailing edge,
         # so a message never moves them.
         self.assertIn("let footerStatus = NSTextField(labelWithString: \"\")", mac_leaf)
-        self.assertIn("footerStatus.leadingAnchor.constraint(equalTo: toggle.trailingAnchor, constant: 12)", mac_leaf)
+        # The 自动分组 switch carries a question mark that states what it does,
+        # so the result line starts after that mark instead of at the switch.
+        self.assertIn("let helpButton = NSButton(title: \"\", target: self, action: #selector(showAutoGroupingHelp(_:)))", mac_leaf)
+        self.assertIn('helpButton.image = NSImage(systemSymbolName: "questionmark.circle", accessibilityDescription: label("autoGroupingLabel"))', mac_leaf)
+        self.assertIn("helpButton.leadingAnchor.constraint(equalTo: toggle.trailingAnchor, constant: 4)", mac_leaf)
+        self.assertIn("footerStatus.leadingAnchor.constraint(greaterThanOrEqualTo: helpButton.trailingAnchor, constant: 12)", mac_leaf)
+        self.assertIn("@objc private func showAutoGroupingHelp(_ sender: NSButton) {", mac_leaf)
+        # An explanation is a hint, not a question: the mark opens the app's own
+        # anchored tip beside itself rather than an alert the user must answer.
+        self.assertIn("func presentTip(_ text: String, beside anchor: NSView?) -> NSPanel? {", mac_leaf)
+        self.assertIn("func dismissTip() {", mac_leaf)
+        self.assertIn("AppKitNativeLeaf.shared.presentTip(text, beside: sender)", mac_leaf)
+        # The mark opens a hint, never a question: the handler must not raise the
+        # app's decision panel for a sentence the user only has to read.
+        help_handler = mac_leaf.split("@objc private func showAutoGroupingHelp(_ sender: NSButton) {", 1)[1].split("\n    }", 1)[0]
+        self.assertNotIn("presentDecisionPanel", help_handler)
+        self.assertIn("presentTip", help_handler)
         self.assertIn("footerStatus.trailingAnchor.constraint(lessThanOrEqualTo: closeButton.leadingAnchor, constant: -8)", mac_leaf)
         self.assertIn("footerStatus.centerYAnchor.constraint(equalTo: toggle.centerYAnchor)", mac_leaf)
         self.assertIn("func setStatus(_ text: String) {", mac_leaf)
@@ -4617,6 +4713,19 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("modelsListHeight?.constant = CGFloat(NativeGroupManagerController.modelGridRows(rows)) * 17", mac_leaf)
         self.assertIn("listFrame.bottomAnchor.constraint(equalTo: toggle.topAnchor, constant: -14),", mac_leaf)
         self.assertIn("usePersistentScrollers(horizontal: false, vertical: true)", mac_leaf)
+        # 模型列表 keeps a visible scroller while its models overflow the box.
+        # Overlay+autohide is right for a list that fits and wrong for one that
+        # does not: the overflowing list looked complete with the rest of its
+        # models below the fold.  The policy is the shared table's own — the
+        # capsule exactly while the document is taller than the clip view.
+        self.assertIn("private func applyOverflowScrollerPolicy() {", mac_leaf)
+        self.assertIn("let overflows = textView.frame.height > contentView.bounds.height + 0.5", mac_leaf)
+        self.assertIn("let style: NSScroller.Style = overflows ? .legacy : .overlay", mac_leaf)
+        self.assertIn("autohidesScrollers = !overflows", mac_leaf)
+        self.assertIn("applyOverflowScrollerPolicy()\n    }", mac_leaf)
+        # The models view must not pin the fitting-case chrome as its only state.
+        models_view = mac_leaf.split("private final class NativeModelsListView: NSScrollView {", 1)[1].split("\n/// ", 1)[0]
+        self.assertIn("hasVerticalScroller = true", models_view)
         self.assertIn("std::wstring EllipsizeMiddle(std::wstring const& value) {", windows_leaf)
         self.assertIn("kHead = 14;", windows_leaf)
         self.assertIn("kTail = 10;", windows_leaf)

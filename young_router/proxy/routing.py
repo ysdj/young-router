@@ -104,6 +104,7 @@ from .base import (
     _REQUEST_TIMEOUT_SECONDS_ENV,
     _REQUEST_BODY_SIZE_REJECTED_METADATA_KEY,
     _REQUEST_BODY_SIZE_REJECTED_STATUS_CODE,
+    _REQUEST_BODY_SIZE_REJECTION_MARKERS,
     _ROUTE_RECOVERY_POLL_METADATA_KEY,
     _ROUTE_FAILURE_POLICY_ATTR,
     _RouteOrder,
@@ -154,6 +155,7 @@ from .base import (
     _WEB_SEARCH_EXTERNAL_STARTED_METADATA_KEY,
     _XHIGH_REASONING_EFFORT,
     _exception_text,
+    _is_local_shutdown_exception,
     asyncio,
     datetime,
     json,
@@ -749,6 +751,11 @@ def _recovery_policy_for_exception(exception: Exception) -> str:
             _RECOVERY_POLICY_STREAM_IDLE_TIMEOUT_ENV,
             _RECOVERY_POLICY_RECOVERY,
         )
+    if _is_local_shutdown_exception(exception):
+        # This worker truncated the stream while it was exiting; the upstream
+        # said nothing. No route can be quarantined, and no recovery wait can
+        # outlast the process that owns it, so the failure is terminal here.
+        return _RECOVERY_POLICY_ERROR
 
     status_code = _exception_status_code(exception)
     text = _exception_text(exception)
@@ -4539,7 +4546,9 @@ def _trace_session_context(request_kwargs: Optional[dict]) -> dict[str, Any]:
 def _trace_exception(exception: Exception) -> dict[str, Any]:
     status_code = _exception_status_code(exception)
     text = _exception_text(exception)
-    if _is_image_generation_all_deployments_unsupported_error(exception):
+    if _is_local_shutdown_exception(exception):
+        reason = "local-proxy-shutdown"
+    elif _is_image_generation_all_deployments_unsupported_error(exception):
         reason = "image-generation-tool-all-deployments-unsupported"
     elif _is_codex_compaction_capability_unsupported_error(exception):
         reason = "codex-compaction-unsupported"
@@ -4611,8 +4620,8 @@ def _recovery_diagnostic(exception: Exception) -> dict[str, Any]:
             "kind": "request_size",
             "title": "Request body too large",
             "detail": (
-                "An upstream refused this request body by size. Start a new task, "
-                "or remove images from the conversation."
+                "An upstream refused this request body by size. Start a new task "
+                "so the conversation sent upstream is smaller."
             ),
         }
     elif status_code in (401, 403) or any(
@@ -4630,6 +4639,18 @@ def _recovery_diagnostic(exception: Exception) -> dict[str, Any]:
             "kind": "authentication",
             "title": "Authentication rejected",
             "detail": "Check the provider API key and account permissions.",
+        }
+    elif _is_local_shutdown_exception(exception):
+        # The route is healthy and the upstream answered; this process closed
+        # the stream while it was being replaced.  Reporting "network" here
+        # sends the user to inspect a provider that did nothing wrong.
+        result = {
+            "kind": "local_shutdown",
+            "title": "Router restarting",
+            "detail": (
+                "The router was restarting while this turn was streaming, so the "
+                "response was cut short. Send the message again."
+            ),
         }
     elif _exception_indicates_network_connectivity_error(exception):
         result = {
@@ -4854,8 +4875,12 @@ def _is_network_recovery_exception(exception: Exception) -> bool:
     A sanitized upstream exception intentionally replaces the original message,
     so preserve an explicit marker when that wrapper is created.  The textual
     check also covers wrappers produced by LiteLLM before they reach this
-    module.
+    module.  This worker's own teardown is never a connectivity condition: the
+    socket really did close, but nothing about the upstream became unreachable.
     """
+
+    if _is_local_shutdown_exception(exception):
+        return False
 
     pending = [exception]
     seen: set[int] = set()
@@ -5321,11 +5346,27 @@ def _is_request_body_size_rejection_error(exception: Exception) -> bool:
     the existing failover treatment (a structured compaction body may fit
     another gateway), and a structured compaction transport error is never
     inferred as a size limit.
+
+    An OpenAI-compatible worker that refuses an over-large body with HTTP 400
+    states the same verdict in its own words.  Only a 413 carries the limit as
+    protocol, so a gateway-local 400 without a known size sentence is left to
+    the ordinary route treatment; the sentences below are the ones an upstream
+    uses to say "these bytes, not this route".
     """
 
-    if _exception_status_code(exception) != _REQUEST_BODY_SIZE_REJECTED_STATUS_CODE:
+    status_code = _exception_status_code(exception)
+    if status_code == _REQUEST_BODY_SIZE_REJECTED_STATUS_CODE:
+        return not _is_upstream_request_body_storage_capacity_error(exception)
+    if status_code != 400:
         return False
-    return not _is_upstream_request_body_storage_capacity_error(exception)
+    if _is_upstream_request_body_storage_capacity_error(exception):
+        return False
+    if _is_context_size_error(exception):
+        # A context-window refusal names tokens, not bytes, and the length is
+        # the conversation's own; it must not be read as a body limit.
+        return False
+    text = _exception_text(exception)
+    return any(marker in text for marker in _REQUEST_BODY_SIZE_REJECTION_MARKERS)
 
 
 def _remember_request_body_size_rejection(
@@ -5649,6 +5690,7 @@ def _mark_exception_for_deployment_failover(
             pass
     should_sync_exclusions = (
         not _is_local_stream_timeout_error(exception)
+        and not _is_local_shutdown_exception(exception)
         and (
             not _should_retry_same_deployment_before_fallback(exception)
             or _same_deployment_retry_exhausted(exception)
@@ -5785,6 +5827,7 @@ def _sync_failed_deployment_exclusions(
     if (
         failed_id
         and not _is_local_stream_timeout_error(exception)
+        and not _is_local_shutdown_exception(exception)
         and (
             not _should_retry_same_deployment_before_fallback(exception)
             or _same_deployment_retry_exhausted(exception)
@@ -6388,8 +6431,16 @@ def _sanitized_upstream_route_failure_message(
         # the client from waiting for a route that cannot ever accept it.
         return (
             f"Upstream rejected this request body as too large for {model_group} "
-            "on every candidate route. Start a new task, or remove images from "
-            "the conversation so the replay fits the upstream limit."
+            "on every candidate route. Start a new task so the conversation sent "
+            "upstream is smaller than the upstream limit."
+        )
+    if _is_local_shutdown_exception(exception):
+        # This process closed the stream while it was being replaced.  Naming
+        # the route, the network, or the provider would all be false, and the
+        # client can simply send the turn again.
+        return (
+            "The router was restarting while this turn was streaming, so the "
+            "response was cut short. Send the message again."
         )
     status_code = _exception_status_code(exception)
     relay_message = _upstream_relay_capacity_message(exception)

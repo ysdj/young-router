@@ -89,6 +89,8 @@ struct GroupManagerLabels {
   std::wstring enabled_label;
   std::wstring new_key_name;
   std::wstring auto_grouping_label;
+  // The 自动分组 help mark's popup: what the switch does to the station's keys.
+  std::wstring auto_grouping_help;
   std::wstring ungrouped_label;
   std::wstring close_label;
   std::wstring apply_label;

@@ -45,7 +45,6 @@ export interface NativeLeafBridge {
     title: string;
     closeLabel: string;
   }): Promise<void>;
-  showCodexRestartConfirmation(title: string, message: string, restartLabel: string, laterLabel: string): Promise<"restart" | "later" | undefined>;
   chooseModelsToAdd(models: string[], providerName: string, keyName: string): Promise<string[] | undefined>;
   showGroupManager(options: {
     title: string;
@@ -87,7 +86,10 @@ export interface NativeLeafBridge {
   copySecret(domain: "providers_models" | "relay_accounts", field: "api_key", target: string): Promise<boolean>;
   relayLogin(options: {
     accountId: string;
-    type: "newapi" | "sub2api";
+    /** "" (or "auto") settles the station family from the page's own answer, so
+     * the sign-in window opens at once instead of waiting on a pair of network
+     * probes that ask the same questions before it can appear. */
+    type: "newapi" | "sub2api" | "";
     label: string;
     origin: string;
     language: LanguagePreference;
@@ -118,7 +120,6 @@ export interface NativeLeafBridge {
   clearRelayPassword(accountId: string): Promise<void>;
   clearRelayCredentials(accountId: string): Promise<void>;
   setLaunchAtLogin(enabled: boolean): Promise<void>;
-  restartCodex(): Promise<boolean>;
   showVersion?(): void;
   versionInfo?(): Promise<{ app: string; litellm: string; icon?: string }>;
   openExternalURL?(url: string): void;
@@ -178,7 +179,6 @@ export function createNativeLeafBridgeAdapter(bridge: NativeLeafBridge): NativeL
     showProviderAuth: bridge.showProviderAuth
       ? (options) => bridge.showProviderAuth!(options)
       : undefined,
-    showCodexRestartConfirmation: ({ title, message, restartLabel, laterLabel }) => bridge.showCodexRestartConfirmation(title, message, restartLabel, laterLabel),
     chooseModelsToAdd: ({ models, providerName, keyName }) => bridge.chooseModelsToAdd(models, providerName, keyName),
     showGroupManager: (options) => bridge.showGroupManager(options),
     awaitGroupManagerApply: bridge.awaitGroupManagerApply
@@ -200,7 +200,6 @@ export function createNativeLeafBridgeAdapter(bridge: NativeLeafBridge): NativeL
     clearRelayPassword: (accountId) => bridge.clearRelayPassword(accountId),
     clearRelayCredentials: (accountId) => bridge.clearRelayCredentials(accountId),
     setLaunchAtLogin: (enabled) => bridge.setLaunchAtLogin(enabled),
-    restartCodex: () => bridge.restartCodex(),
     showVersion: () => bridge.showVersion?.(),
     versionInfo: bridge.versionInfo ? () => bridge.versionInfo!() : undefined,
     openExternalURL: bridge.openExternalURL ? (url) => bridge.openExternalURL!(url) : undefined,
