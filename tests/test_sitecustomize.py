@@ -247,6 +247,57 @@ class SiteCustomizeTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.strip(), "False")
 
+    def test_the_shipped_modules_import_where_fcntl_does_not_exist(self) -> None:
+        # ``fcntl`` is POSIX-only, and the Windows build loads the LiteLLM
+        # callback from the packaged Core.  ``proxy/base.py`` used a bare
+        # ``import fcntl`` that it never referenced itself, but ``state.py``
+        # takes the name through it, so the whole graph failed at import time
+        # on Windows:
+        #
+        #   ModuleNotFoundError: No module named 'fcntl'
+        #   ImportError: Could not import image_generation_routing_hook from
+        #   young_router.callbacks
+        #
+        # Every module that imports it now guards the import, which is the
+        # pattern ``log_rotation`` and ``core/domains/logs`` already used.
+        self.require_litellm()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = Path(temp_dir) / "runtime"
+            runtime.mkdir()
+
+            result = self.run_probe(
+                runtime=runtime,
+                template=ROOT,
+                pythonpath_extra=[ROOT],
+                code=textwrap.dedent(
+                    """
+                    import builtins
+
+                    real_import = builtins.__import__
+
+                    def without_fcntl(name, *args, **kwargs):
+                        if name == "fcntl":
+                            raise ImportError("No module named 'fcntl'")
+                        return real_import(name, *args, **kwargs)
+
+                    builtins.__import__ = without_fcntl
+                    from young_router.callbacks import image_generation_routing_hook
+                    from young_router.proxy import base, state
+                    from young_router import log_rotation
+                    from young_router.core.domains import logs
+
+                    print(type(image_generation_routing_hook).__name__)
+                    print(base.fcntl, state.fcntl, log_rotation.fcntl, logs.fcntl)
+                    """
+                ),
+                extra_env={"YOUNG_ROUTER_PROXY_PROCESS": "1"},
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output = result.stdout.split()
+            self.assertEqual(output[0], "YoungRouterHook")
+            self.assertEqual(output[1:], ["None"] * 4)
+
     def test_proxy_console_lines_receive_utc_timestamps(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             runtime = Path(temp_dir) / "runtime"
