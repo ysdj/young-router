@@ -405,6 +405,52 @@ def find_npm(env_name: str, *, purpose: str) -> str:
     raise UpdateError(f"npm is required to {purpose}")
 
 
+def npm_dependency_manifest(npm_root: Path, peer_specs: Iterable[str]) -> None:
+    """Write the peer specs into a manifest instead of onto the command line.
+
+    A peer spec carries npm's own version range, so it contains ``^``
+    (``@scope/name@^4.0.2``).  On Windows the resolved executable is
+    ``npm.cmd``, which Python can only launch through the shell, and ``cmd.exe``
+    reads a bare ``^`` as its escape character and drops it.  npm then receives
+    the exact version ``4.0.2`` instead of the range and refuses the install
+    because a sibling peer requires ``~4.0.4`` -- the whole staging step fails
+    on one character that never reaches npm on macOS or Linux, where no shell
+    is involved:
+
+        npm error Found: @deepseek-ai/cordis@4.0.2
+        npm error   @deepseek-ai/cordis@"4.0.2" from the root project
+        npm error peer @deepseek-ai/cordis@"~4.0.4" from @deepseek-ai/dsh-llm@0.2.0-rc.2
+
+    Naming the peers in ``package.json`` takes them off the command line, so no
+    shell can rewrite them and the same call behaves identically everywhere.
+    The tarball stays an argument: it is one path this script just created,
+    with no range and no shell metacharacter in it.  The manifest is written
+    rather than merged because this installs into a fresh scratch directory.
+    """
+
+    npm_root.mkdir(parents=True, exist_ok=True)
+    dependencies: dict[str, str] = {}
+    for spec in peer_specs:
+        # ``@scope/name@range`` and ``name@range``; rpartition keeps the range
+        # text, so npm resolves exactly what the registry declared.
+        name, separator, version = spec.rpartition("@")
+        if not separator or not name:
+            name, version = spec, "*"
+        dependencies[name] = version
+    (npm_root / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "young-router-staging",
+                "version": "0.0.0",
+                "private": True,
+                "dependencies": dependencies,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def run_npm_install(
     npm: str,
     npm_root: Path,
@@ -414,7 +460,7 @@ def run_npm_install(
     package_name: str,
     timeout: int,
 ) -> None:
-    npm_root.mkdir(parents=True, exist_ok=True)
+    npm_dependency_manifest(npm_root, peer_specs)
     command = [
         npm,
         "install",
@@ -427,7 +473,6 @@ def run_npm_install(
         "--fund=false",
         "--audit=false",
         str(package_tarball),
-        *peer_specs,
     ]
     env = os.environ.copy()
     # npm's cache is still allowed, but metadata was resolved above and the
@@ -535,6 +580,7 @@ __all__ = [
     "find_package_manager",
     "flatten_npm_package",
     "package_metadata",
+    "npm_dependency_manifest",
     "record_staged_release",
     "release_integrity",
     "request_bytes",

@@ -183,6 +183,26 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertNotIn("mac_menu/build.sh", workflow)
         self.assertNotRegex(workflow, r"(?m)^\s*(?:run:\s*)?(?:npm|npx)\b")
 
+    def test_the_macos_job_cannot_run_below_the_xcode_react_native_requires(self) -> None:
+        # React Native 0.85's ``use_react_native!`` raises "Please upgrade XCode"
+        # below 16.1, and the macos-14 image selects 15.4. The mismatch surfaced
+        # as "Invalid `Podfile` file: Please upgrade XCode", which reads as a
+        # broken project rather than an unsuitable toolchain, and it only
+        # appeared after the pod step that needs minutes to reach it.
+        #
+        # The image that selects a sufficient Xcode is what the job runs on, and
+        # the requirement is asserted up front so an image change reports itself
+        # in one line instead of at the bottom of a CocoaPods run.
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+
+        self.assertNotIn("runs-on: macos-14", workflow)
+        self.assertIn("runs-on: macos-15", workflow)
+        self.assertIn("xcodebuild -version", workflow)
+        self.assertIn("React Native 0.85 requires Xcode >= 16.1", workflow)
+        # Read from the toolchain itself, not from a hardcoded path that the
+        # image is free to move.
+        self.assertNotIn("/Applications/Xcode_16", workflow)
+
     def test_react_native_085_line_is_explicitly_pinned(self) -> None:
         package = json.loads((ROOT / "rn/package.json").read_text(encoding="utf-8"))
         vendor = json.loads(
