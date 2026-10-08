@@ -515,6 +515,32 @@ class ReactNativeReleaseTests(unittest.TestCase):
         use_winui3 = "true" if "useWinUI3: true" in config else "false"
         self.assertIn(f"<UseWinUI3>{use_winui3}</UseWinUI3>", props)
 
+    def test_windows_host_pins_the_sdk_that_actually_installed(self) -> None:
+        # React Native Windows forces ``WindowsTargetPlatformVersion`` to
+        # 10.0.22621.0 for a new architecture project and only defers to a value
+        # already at or above it. The hosted Windows image installs exactly one
+        # SDK, and the newer image ships 10.0.26100.0, so the build died inside
+        # RNW's own project:
+        #
+        #   Microsoft.Cpp.WindowsSDK.targets: error MSB8036: The Windows SDK
+        #   version 10.0.22621.0 was not found. [Common.vcxproj]
+        #
+        # The host resolves the newest SDK under Windows Kits and passes it as a
+        # global MSBuild property, which overrides RNW's default for every
+        # project in the solution.
+        script = (ROOT / "rn/scripts/build-windows.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("Windows Kits", script)
+        self.assertIn("WindowsTargetPlatformVersion=$($InstalledSdk.Name)", script)
+        # The value has to be chosen from the disk, not hardcoded to one version.
+        self.assertNotIn("WindowsTargetPlatformVersion=10.0.22621.0", script)
+        # ``--msbuildprops`` is parsed with ``split(',')`` and each entry with
+        # ``split('=')``; anything else yields zero properties and is dropped
+        # silently, which is how the staging directory stopped being passed.
+        msbuild_props = script[script.index("--msbuildprops"):].split("\n", 1)[0]
+        self.assertNotIn(";", msbuild_props, "a semicolon list parses as no properties")
+        self.assertEqual(msbuild_props.count(","), 2, msbuild_props)
+
     def test_windows_build_installs_the_runtime_outside_uvs_management(self) -> None:
         # ``uv python install`` marks the interpreter it lays down as externally
         # managed, so ``uv pip install --python <that python>`` is refused and
