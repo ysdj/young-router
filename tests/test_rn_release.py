@@ -483,6 +483,33 @@ class ReactNativeReleaseTests(unittest.TestCase):
             builder.index("await rm(temporaryBundle"),
         )
 
+    def test_the_windows_autolinker_finds_the_winui3_switch_it_rewrites(self) -> None:
+        # ``react-native.config.js`` declares ``useWinUI3: true``, so the
+        # autolinker reconciles ``ExperimentalFeatures.props`` on every build by
+        # writing that value into the file:
+        #
+        #   const node = content.getElementsByTagName('UseWinUI3');
+        #   changesNeeded = node.item(0)?.textContent !== newValue ...
+        #   node.item(0).textContent = newValue;   // no optional chain here
+        #
+        # The comparison tolerates a missing element and the write does not, so
+        # an absent ``UseWinUI3`` aborts autolinking and therefore the whole
+        # host build, naming a null textContent instead of the missing property:
+        #
+        #   Error: TypeError: Cannot set properties of null (setting 'textContent')
+        #   Autolinking failed.
+        #
+        # The element must also stay in agreement with the config, or every
+        # build rewrites the file it just read.
+        props = (ROOT / "rn/apps/windows/windows/ExperimentalFeatures.props").read_text(
+            encoding="utf-8"
+        )
+        config = (ROOT / "rn/apps/windows/react-native.config.js").read_text(encoding="utf-8")
+
+        self.assertIn("<UseWinUI3>", props)
+        use_winui3 = "true" if "useWinUI3: true" in config else "false"
+        self.assertIn(f"<UseWinUI3>{use_winui3}</UseWinUI3>", props)
+
     def test_windows_build_installs_the_runtime_outside_uvs_management(self) -> None:
         # ``uv python install`` marks the interpreter it lays down as externally
         # managed, so ``uv pip install --python <that python>`` is refused and

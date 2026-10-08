@@ -4,5 +4,25 @@
     <RnwNewArch>true</RnwNewArch>
     <UseExperimentalNuget>false</UseExperimentalNuget>
     <ReactExperimentalFeaturesSet>true</ReactExperimentalFeaturesSet>
+    <!--
+      The Windows host is WinUI 3, and react-native.config.js says so. The
+      autolinker reconciles this file with that setting on every build by
+      writing this element in place:
+
+        const node = experimentalFeatures.content.getElementsByTagName('UseWinUI3');
+        ...
+        node.item(0).textContent = newValue;
+
+      That write is unguarded, while the comparison one line above it uses an
+      optional chain, so an absent element aborts the whole build during
+      autolinking with no mention of the missing property:
+
+        Error: TypeError: Cannot set properties of null (setting 'textContent')
+        Autolinking failed.
+
+      Keeping the element present is what makes that write land, and its value
+      has to agree with react-native.config.js or every build rewrites the file.
+    -->
+    <UseWinUI3>true</UseWinUI3>
   </PropertyGroup>
 </Project>
