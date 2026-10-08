@@ -211,9 +211,14 @@ class ReactNativeReleaseTests(unittest.TestCase):
 
         self.assertEqual(package["engines"]["node"], ">=22")
         self.assertEqual(package["dependencies"]["react-native"], "0.85.3")
+        # ``0.85.0-preview.1`` publishes no ``external/`` directory at all, so
+        # ``Shared.vcxitems``' unconditional import of
+        # ``$(ExternalDir)External.vcxitems`` fails the host build with MSB4019.
+        # ``preview.2`` ships it (892 entries, including that file); the codegen
+        # package still has only a ``preview.1`` release.
         self.assertEqual(
             package["dependencies"]["react-native-windows"],
-            "0.85.0-preview.1",
+            "0.85.0-preview.2",
         )
         self.assertEqual(
             package["devDependencies"]["@react-native-windows/codegen"],

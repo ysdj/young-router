@@ -18,8 +18,8 @@ importers:
         specifier: 0.85.3
         version: 0.85.3(@babel/core@7.29.7)(@react-native-community/cli@20.0.0(typescript@5.7.2))(@react-native/jest-preset@0.85.3(@babel/core@7.29.7)(react@19.2.3))(@react-native/metro-config@0.85.3(@babel/core@7.29.7))(@types/react@19.2.3)(react@19.2.3)
       react-native-windows:
-        specifier: 0.85.0-preview.1
-        version: 0.85.0-preview.1(@babel/core@7.29.7)(@react-native/jest-preset@0.85.3(@babel/core@7.29.7)(react@19.2.3))(@react-native/metro-config@0.85.3(@babel/core@7.29.7))(@types/react@19.2.3)(react-native@0.85.3(@babel/core@7.29.7)(@react-native-community/cli@20.0.0(typescript@5.7.2))(@react-native/jest-preset@0.85.3(@babel/core@7.29.7)(react@19.2.3))(@react-native/metro-config@0.85.3(@babel/core@7.29.7))(@types/react@19.2.3)(react@19.2.3))(react@19.2.3)(tslib@2.8.1)(typescript@5.7.2)
+        specifier: 0.85.0-preview.2
+        version: 0.85.0-preview.2(@babel/core@7.29.7)(@react-native/jest-preset@0.85.3(@babel/core@7.29.7)(react@19.2.3))(@react-native/metro-config@0.85.3(@babel/core@7.29.7))(@types/react@19.2.3)(react-native@0.85.3(@babel/core@7.29.7)(@react-native-community/cli@20.0.0(typescript@5.7.2))(@react-native/jest-preset@0.85.3(@babel/core@7.29.7)(react@19.2.3))(@react-native/metro-config@0.85.3(@babel/core@7.29.7))(@types/react@19.2.3)(react@19.2.3))(react@19.2.3)(tslib@2.8.1)(typescript@5.7.2)
     devDependencies:
       '@react-native-community/cli':
         specifier: 20.0.0
@@ -67,8 +67,8 @@ importers:
         specifier: 0.85.3
         version: 0.85.3(@babel/core@7.29.7)(@react-native-community/cli@20.0.0(typescript@5.7.2))(@react-native/jest-preset@0.85.3(@babel/core@7.29.7)(react@19.2.3))(@react-native/metro-config@0.85.3(@babel/core@7.29.7))(@types/react@19.2.3)(react@19.2.3)
       react-native-windows:
-        specifier: 0.85.0-preview.1
-        version: 0.85.0-preview.1(@babel/core@7.29.7)(@react-native/jest-preset@0.85.3(@babel/core@7.29.7)(react@19.2.3))(@react-native/metro-config@0.85.3(@babel/core@7.29.7))(@types/react@19.2.3)(react-native@0.85.3(@babel/core@7.29.7)(@react-native-community/cli@20.0.0(typescript@5.7.2))(@react-native/jest-preset@0.85.3(@babel/core@7.29.7)(react@19.2.3))(@react-native/metro-config@0.85.3(@babel/core@7.29.7))(@types/react@19.2.3)(react@19.2.3))(react@19.2.3)(tslib@2.8.1)(typescript@5.7.2)
+        specifier: 0.85.0-preview.2
+        version: 0.85.0-preview.2(@babel/core@7.29.7)(@react-native/jest-preset@0.85.3(@babel/core@7.29.7)(react@19.2.3))(@react-native/metro-config@0.85.3(@babel/core@7.29.7))(@types/react@19.2.3)(react-native@0.85.3(@babel/core@7.29.7)(@react-native-community/cli@20.0.0(typescript@5.7.2))(@react-native/jest-preset@0.85.3(@babel/core@7.29.7)(react@19.2.3))(@react-native/metro-config@0.85.3(@babel/core@7.29.7))(@types/react@19.2.3)(react@19.2.3))(react@19.2.3)(tslib@2.8.1)(typescript@5.7.2)
 
   packages/shared: {}
 
@@ -740,8 +740,8 @@ packages:
     engines: {node: '>=18'}
     hasBin: true
 
-  '@react-native-windows/cli@0.85.0-preview.1':
-    resolution: {integrity: sha512-SKa14ZWoNV2tp83RljqdcvwueQNrerrSi9S6ODQQF038AgkwlnmyftOf0R9AV/7boJ/AWU2QSnu3bW8m6xhm9g==}
+  '@react-native-windows/cli@0.85.0-preview.2':
+    resolution: {integrity: sha512-0QAa1Pr+GH2K5U8JqBFUSyb9SwtAdNU4HhODtlWtRyEwDMcb8ZMf2FnZW3IlgkulZtQ54FCLR2gynBMWT9S4og==}
     engines: {node: '>= 22'}
     peerDependencies:
       react-native: '*'
@@ -930,6 +930,7 @@ packages:
   '@xmldom/xmldom@0.8.13':
     resolution: {integrity: sha512-KRYzxepc14G/CEpEGc3Yn+JKaAeT63smlDr+vjB8jRfgTBBI9wRj/nkQEO+ucV8p8I9bfKLWp37uHgFrbntPvw==}
     engines: {node: '>=10.0.0'}
+    deprecated: this version has critical issues, please update to the latest version
 
   abort-controller@3.0.0:
     resolution: {integrity: sha512-h8lQ8tacZYnR3vNQTgibj+tODHI5/+l06Au2Pcriv/Gmet0eaj4TwWH41sO9wnHDiQsEj19q0drzdWdeAHtweg==}
@@ -2222,8 +2223,8 @@ packages:
   react-is@18.3.1:
     resolution: {integrity: sha512-/LLMVyas0ljjAtoYiPqYiL8VWXzUUdThrmU5+n20DZv+a+ClRoevUzw5JxU+Ieh5/c87ytoTBV9G1FiKfNJdmg==}
 
-  react-native-windows@0.85.0-preview.1:
-    resolution: {integrity: sha512-KaiUHKrlSAWoQn3uHzefrzrf2ssSGIa72WZCq7kKimjxbPS+rwZ23GgqVOv20Cl+EfNpn1l2NdWrJTAN4SFdUQ==}
+  react-native-windows@0.85.0-preview.2:
+    resolution: {integrity: sha512-VgOoCWlWuroV3m4zBahQJB9kS0Vv6fU9N5ramqLfU4UZAuRDx0yWkAqHTGb75V6GBFBF7gnnLavofJ6RNANg8A==}
     engines: {node: '>= 22'}
     peerDependencies:
       '@react-native/jest-preset': 0.85.3
@@ -3530,7 +3531,7 @@ snapshots:
       - typescript
       - utf-8-validate
 
-  '@react-native-windows/cli@0.85.0-preview.1(react-native@0.85.3(@babel/core@7.29.7)(@react-native-community/cli@20.0.0(typescript@5.7.2))(@react-native/jest-preset@0.85.3(@babel/core@7.29.7)(react@19.2.3))(@react-native/metro-config@0.85.3(@babel/core@7.29.7))(@types/react@19.2.3)(react@19.2.3))(tslib@2.8.1)':
+  '@react-native-windows/cli@0.85.0-preview.2(react-native@0.85.3(@babel/core@7.29.7)(@react-native-community/cli@20.0.0(typescript@5.7.2))(@react-native/jest-preset@0.85.3(@babel/core@7.29.7)(react@19.2.3))(@react-native/metro-config@0.85.3(@babel/core@7.29.7))(@types/react@19.2.3)(react@19.2.3))(tslib@2.8.1)':
     dependencies:
       '@react-native-windows/codegen': 0.85.0-preview.1(react-native@0.85.3(@babel/core@7.29.7)(@react-native-community/cli@20.0.0(typescript@5.7.2))(@react-native/jest-preset@0.85.3(@babel/core@7.29.7)(react@19.2.3))(@react-native/metro-config@0.85.3(@babel/core@7.29.7))(@types/react@19.2.3)(react@19.2.3))
       '@react-native-windows/find-dotnet-tools': 0.85.0-preview.1
@@ -5291,14 +5292,14 @@ snapshots:
 
   react-is@18.3.1: {}
 
-  react-native-windows@0.85.0-preview.1(@babel/core@7.29.7)(@react-native/jest-preset@0.85.3(@babel/core@7.29.7)(react@19.2.3))(@react-native/metro-config@0.85.3(@babel/core@7.29.7))(@types/react@19.2.3)(react-native@0.85.3(@babel/core@7.29.7)(@react-native-community/cli@20.0.0(typescript@5.7.2))(@react-native/jest-preset@0.85.3(@babel/core@7.29.7)(react@19.2.3))(@react-native/metro-config@0.85.3(@babel/core@7.29.7))(@types/react@19.2.3)(react@19.2.3))(react@19.2.3)(tslib@2.8.1)(typescript@5.7.2):
+  react-native-windows@0.85.0-preview.2(@babel/core@7.29.7)(@react-native/jest-preset@0.85.3(@babel/core@7.29.7)(react@19.2.3))(@react-native/metro-config@0.85.3(@babel/core@7.29.7))(@types/react@19.2.3)(react-native@0.85.3(@babel/core@7.29.7)(@react-native-community/cli@20.0.0(typescript@5.7.2))(@react-native/jest-preset@0.85.3(@babel/core@7.29.7)(react@19.2.3))(@react-native/metro-config@0.85.3(@babel/core@7.29.7))(@types/react@19.2.3)(react@19.2.3))(react@19.2.3)(tslib@2.8.1)(typescript@5.7.2):
     dependencies:
       '@babel/runtime': 7.29.7
       '@jest/create-cache-key-function': 29.7.0
       '@react-native-community/cli': 20.0.0(typescript@5.7.2)
       '@react-native-community/cli-platform-android': 20.0.0
       '@react-native-community/cli-platform-ios': 20.0.0
-      '@react-native-windows/cli': 0.85.0-preview.1(react-native@0.85.3(@babel/core@7.29.7)(@react-native-community/cli@20.0.0(typescript@5.7.2))(@react-native/jest-preset@0.85.3(@babel/core@7.29.7)(react@19.2.3))(@react-native/metro-config@0.85.3(@babel/core@7.29.7))(@types/react@19.2.3)(react@19.2.3))(tslib@2.8.1)
+      '@react-native-windows/cli': 0.85.0-preview.2(react-native@0.85.3(@babel/core@7.29.7)(@react-native-community/cli@20.0.0(typescript@5.7.2))(@react-native/jest-preset@0.85.3(@babel/core@7.29.7)(react@19.2.3))(@react-native/metro-config@0.85.3(@babel/core@7.29.7))(@types/react@19.2.3)(react@19.2.3))(tslib@2.8.1)
       '@react-native/assets': 1.0.0
       '@react-native/assets-registry': 0.85.3
       '@react-native/codegen': 0.85.3(@babel/core@7.29.7)
