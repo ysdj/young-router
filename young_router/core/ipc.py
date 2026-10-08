@@ -41,8 +41,24 @@ from .protocol import (
     make_request,
     validate_method_result,
 )
+from .protocol import _encode_json
 from .security import safe_exception_message
 from .service import ConfirmationNeeded, CoreError, CoreStore, PreparedImport, RevisionConflict
+
+
+def _encode_response_body(payload: Mapping[str, Any]) -> bytes:
+    """Serialize one HTTP response body with the contract's own codec.
+
+    Every snapshot this Core publishes to a window leaves through ``_send``,
+    carrying six figures of JSON, and it used to be serialized here by a
+    second, private copy of the encoder.  Routing it through the contract's
+    encoder keeps one JSON implementation (so the fast codec, the non-finite
+    refusal, and the size accounting cannot drift apart between the two
+    directions) and removes the redundant ``dict()`` copy of a payload that is
+    already a mapping.
+    """
+
+    return _encode_json(payload)
 
 
 BOOTSTRAP_TOKEN_TTL_SECONDS = 120.0
@@ -203,7 +219,7 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
         return body
 
     def _send(self, status: int, payload: Mapping[str, Any], *, session_token: str | None = None) -> None:
-        encoded = json.dumps(dict(payload), ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        encoded = _encode_response_body(payload)
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
@@ -282,7 +298,7 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
             try:
                 data = decode_message(self._read_body())
                 if route.endswith("/relay/login"):
-                    allowed = {"account_id", "type", "label", "origin", "username", "cookie", "access_token", "refresh_token", "password", "station_id", "station_name", "station_type", "station_origin", "remember_password", "pending_account"}
+                    allowed = {"account_id", "type", "label", "origin", "username", "cookie", "access_token", "refresh_token", "password", "user_id", "station_id", "station_name", "station_type", "station_origin", "remember_password", "pending_account"}
                     required = {"account_id", "type", "label", "origin", "username"}
                     if not required.issubset(data) or set(data).difference(allowed):
                         raise CoreError("relay_login_failed", "Relay login result is invalid")
@@ -296,6 +312,7 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
                         access_token=data.get("access_token", ""),
                         refresh_token=data.get("refresh_token", ""),
                         password=data.get("password", ""),
+                        user_id=data.get("user_id", ""),
                         station_id=data.get("station_id"),
                         station_name=data.get("station_name"),
                         station_type=data.get("station_type"),
@@ -305,7 +322,7 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
                     )
                     self._send(200, {"protocol_version": PROTOCOL_VERSION, **result})
                 elif route.endswith("/relay/restore"):
-                    allowed = {"account_id", "type", "label", "origin", "login_status", "username", "cookie", "access_token", "refresh_token"}
+                    allowed = {"account_id", "type", "label", "origin", "login_status", "username", "cookie", "access_token", "refresh_token", "user_id"}
                     required = {"account_id", "type", "label", "origin", "login_status"}
                     if not required.issubset(data) or set(data).difference(allowed):
                         raise CoreError("relay_restore_failed", "Relay login result is invalid")
@@ -319,6 +336,7 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
                         cookie=data.get("cookie", ""),
                         access_token=data.get("access_token", ""),
                         refresh_token=data.get("refresh_token", ""),
+                        user_id=data.get("user_id", ""),
                     )
                     self._send(200, {"protocol_version": PROTOCOL_VERSION, **result})
                 elif route.endswith("/relay/import"):

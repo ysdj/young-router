@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cwctype>
 #include <filesystem>
 #include <map>
@@ -376,6 +377,10 @@ struct StoredSession {
   std::string cookie;
   std::string access_token;
   std::string refresh_token;
+  // The station's own account id.  A New API fork requires it as the
+  // ``New-Api-User`` header on every dashboard read and rejects the read
+  // without it, so it belongs to the session exactly like the cookie.
+  std::string user_id;
 };
 
 std::string EncodeSession(StoredSession const& session) {
@@ -385,7 +390,58 @@ std::string EncodeSession(StoredSession const& session) {
   object.SetNamedValue(L"cookie", json::JsonValue::CreateStringValue(Utf8ToWide(session.cookie)));
   object.SetNamedValue(L"accessToken", json::JsonValue::CreateStringValue(Utf8ToWide(session.access_token)));
   object.SetNamedValue(L"refreshToken", json::JsonValue::CreateStringValue(Utf8ToWide(session.refresh_token)));
+  object.SetNamedValue(L"userID", json::JsonValue::CreateStringValue(Utf8ToWide(session.user_id)));
   return WideToUtf8(object.Stringify().c_str());
+}
+
+// A station states its own account id in several shapes; the ``New-Api-User``
+// header only ever accepts a plain decimal id (a fork parses it with
+// ``strconv.Atoi``), so anything else is treated as no id at all rather than
+// sent as an invented one.
+std::string NumericUserID(std::string const& value) {
+  if (value.empty() || value.size() > 32) return {};
+  for (auto character : value) {
+    if (character < '0' || character > '9') return {};
+  }
+  return value;
+}
+
+std::string NumericUserID(json::IJsonValue const& value) {
+  try {
+    switch (value.ValueType()) {
+      case json::JsonValueType::Number: {
+        auto number = value.GetNumber();
+        if (number < 0 || number > 4294967295.0 || number != std::floor(number)) return {};
+        return NumericUserID(std::to_string(static_cast<unsigned long long>(number)));
+      }
+      case json::JsonValueType::String: {
+        auto text = WideToUtf8(value.GetString().c_str());
+        auto begin = text.find_first_not_of(" \t\r\n");
+        if (begin == std::string::npos) return {};
+        auto end = text.find_last_not_of(" \t\r\n");
+        return NumericUserID(text.substr(begin, end - begin + 1));
+      }
+      default:
+        return {};
+    }
+  } catch (...) {
+    return {};
+  }
+}
+
+std::string SessionUserID(json::IJsonValue const& root) {
+  for (auto const& path : std::vector<std::vector<wchar_t const*>>{
+           {L"data", L"id"}, {L"data", L"user", L"id"}, {L"id"}, {L"user", L"id"}}) {
+    try {
+      json::IJsonValue current = root;
+      for (auto const* key : path) current = current.GetObject().GetNamedValue(key);
+      auto result = NumericUserID(current);
+      if (!result.empty()) return result;
+    } catch (...) {
+      // A path that this answer does not carry is not an error.
+    }
+  }
+  return {};
 }
 
 std::optional<StoredSession> ReadSession(WindowsRelayLoginOptions const& options) {
@@ -393,13 +449,16 @@ std::optional<StoredSession> ReadSession(WindowsRelayLoginOptions const& options
   if (!raw || raw->size() > kMaxSessionBytes) return std::nullopt;
   try {
     auto object = json::JsonObject::Parse(Utf8ToWide(*raw));
-    if (object.Size() != 5) return std::nullopt;
+    // A session written before the account id was stored has five fields; the
+    // id is then absent instead of invalid.
+    if (object.Size() != 5 && object.Size() != 6) return std::nullopt;
     StoredSession session{
         WideToUtf8(object.GetNamedString(L"accountType", L"").c_str()),
         WideToUtf8(object.GetNamedString(L"origin", L"").c_str()),
         WideToUtf8(object.GetNamedString(L"cookie", L"").c_str()),
         WideToUtf8(object.GetNamedString(L"accessToken", L"").c_str()),
         WideToUtf8(object.GetNamedString(L"refreshToken", L"").c_str()),
+        NumericUserID(WideToUtf8(object.GetNamedString(L"userID", L"").c_str())),
     };
     if (session.account_type != options.account_type || session.origin != options.origin ||
         session.cookie.size() > 32768 || session.access_token.size() > 32768 ||
@@ -509,6 +568,13 @@ struct EndpointProbeResult {
   std::string cookie;
   std::optional<std::string> access_token;
   std::optional<std::string> refresh_token;
+  // Which station family answered.  A caller that did not name one settles it
+  // here, from the page's own session, so the sign-in window never waits on a
+  // separate detection round trip before it can appear.
+  std::string family;
+  // The account id the station itself reported for this session, which is what
+  // a New API fork compares its ``New-Api-User`` header against.
+  std::string user_id;
 };
 
 std::optional<std::string> FirstJsonString(json::IJsonValue const& root, std::vector<std::vector<std::wstring>> const& paths) {
@@ -552,6 +618,7 @@ std::optional<EndpointProbeResult> ProbeEndpoint(
     std::string const& cookie_header,
     std::optional<std::string> const& captured_access,
     std::optional<std::string> const& captured_refresh,
+    std::optional<std::string> const& captured_user_id = std::nullopt,
     bool* confirmed_authentication_rejection = nullptr) {
   if (confirmed_authentication_rejection) *confirmed_authentication_rejection = false;
   if (cookie_header.find_first_of("\r\n") != std::string::npos ||
@@ -569,12 +636,24 @@ std::optional<EndpointProbeResult> ProbeEndpoint(
   auto base_path = std::wstring(origin.uri.Path());
   if (base_path.find(L"..") != std::wstring::npos || base_path.find(L'\\') != std::wstring::npos) return std::nullopt;
   while (!base_path.empty() && base_path.back() == L'/') base_path.pop_back();
-  std::vector<std::pair<std::wstring, std::wstring>> probes = options.account_type == "newapi"
-      ? std::vector<std::pair<std::wstring, std::wstring>>{{L"GET", L"api/user/self"}, {L"POST", L"api/user/auth/refresh"}}
-      : std::vector<std::pair<std::wstring, std::wstring>>{{L"GET", L"api/v1/auth/me"}};
+  // The family a probe belongs to, carried beside it so one flow can settle the
+  // family from whichever probe answers when the caller did not name one; the
+  // New-Api-User header follows it too.
+  struct ProbeStep {
+    std::wstring method;
+    std::wstring suffix;
+    char const* family;
+  };
+  std::vector<ProbeStep> probes = options.account_type == "sub2api"
+      ? std::vector<ProbeStep>{{L"GET", L"api/v1/auth/me", "sub2api"}}
+      : std::vector<ProbeStep>{{L"GET", L"api/user/self", "newapi"},
+                               {L"POST", L"api/user/auth/refresh", "newapi"},
+                               {L"GET", L"api/v1/auth/me", "sub2api"}};
   bool saw_authentication_rejection = false;
   bool saw_non_authentication_failure = false;
-  for (auto const& [method, suffix] : probes) {
+  for (auto const& step : probes) {
+    auto const& method = step.method;
+    auto const& suffix = step.suffix;
     auto path = base_path + L"/" + suffix;
     DWORD flags = _wcsicmp(origin.uri.SchemeName().c_str(), L"https") == 0 ? WINHTTP_FLAG_SECURE : 0;
     auto request = WinHttpHandle(WinHttpOpenRequest(
@@ -597,6 +676,12 @@ std::optional<EndpointProbeResult> ProbeEndpoint(
     headers += L"Origin: " + origin_header + L"\r\nReferer: " + origin_header + L"/\r\n";
     if (!cookie_header.empty()) headers += L"Cookie: " + Utf8ToWide(cookie_header) + L"\r\n";
     if (captured_access && !captured_access->empty()) headers += L"Authorization: Bearer " + Utf8ToWide(*captured_access) + L"\r\n";
+    // A New API fork answers without its own account id only with an auth
+    // rejection, which would read as an expired login rather than the missing
+    // header it actually is.
+    if (std::string(step.family) == "newapi" && captured_user_id && !captured_user_id->empty()) {
+      headers += L"New-Api-User: " + Utf8ToWide(*captured_user_id) + L"\r\n";
+    }
     if (!WinHttpSendRequest(request.get(), headers.c_str(), static_cast<DWORD>(headers.size()),
                             WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
         !WinHttpReceiveResponse(request.get(), nullptr)) {
@@ -657,6 +742,10 @@ std::optional<EndpointProbeResult> ProbeEndpoint(
       auto refresh = FirstJsonString(root, {{L"data", L"refresh_token"}, {L"refresh_token"}});
       if (!access) access = captured_access;
       if (!refresh) refresh = captured_refresh;
+      // The answer names the account the session belongs to; that value is what
+      // the header must carry, so it is preferred over an older capture.
+      auto detected_user_id = SessionUserID(root);
+      if (detected_user_id.empty() && captured_user_id) detected_user_id = *captured_user_id;
       auto cookies = ParseCookieHeader(cookie_header);
       DWORD index = 0;
       while (true) {
@@ -683,7 +772,9 @@ std::optional<EndpointProbeResult> ProbeEndpoint(
         saw_non_authentication_failure = true;
         continue;
       }
-      return EndpointProbeResult{std::move(username), std::move(accepted_cookie), std::move(access), std::move(refresh)};
+      return EndpointProbeResult{std::move(username), std::move(accepted_cookie), std::move(access),
+                                 std::move(refresh), std::move(detected_user_id),
+                                 std::string(step.family)};
     } catch (...) {
       saw_non_authentication_failure = true;
     }
@@ -840,8 +931,9 @@ std::map<std::string, std::string> ParseCookieHeader(std::string const& header) 
 }
 
 // Subordinate post-login prompt: keep the typed password on this device, or
-// keep only the current login state. Shown once the sign-in was verified and
-// the commit has begun, so a closed window simply answers "session only".
+// keep only the current login state. Shown once the sign-in was verified, the
+// sign-in window has been taken off the screen, and the commit has begun, so a
+// closed window simply answers "session only".
 //
 // The host draws it on the app's own decision window (the same one every
 // confirmation uses on both hosts) rather than a ContentDialog: one question,
@@ -856,6 +948,26 @@ winrt::Windows::Foundation::IAsyncOperation<bool> ShowRememberPasswordPrompt(
   const std::wstring session_only = Text(state->options, L"Session Only", L"仅记住登录态");
   if (!state->options.decide) co_return false;
   co_return state->options.decide(title, message, remember, session_only);
+}
+
+// Take the sign-in browser off the screen without ending its flow.
+//
+// The window is hidden rather than closed: closing it is what ends the owned
+// window's message loop, and that loop is still running the verification whose
+// import has to finish.  Hiding lets the user see the browser go away while the
+// flow stays alive, so the post-login question is asked over the app instead of
+// on top of a page that has already done its job.  A window that is already
+// gone is left alone.
+void HideLoginDialog(std::shared_ptr<LoginState> const& state) {
+  if (!state) return;
+  try {
+    HWND handle = nullptr;
+    if (SUCCEEDED(state->dialog.as<::IWindowNative>()->get_WindowHandle(&handle)) && handle != nullptr &&
+        IsWindowVisible(handle)) {
+      ShowWindow(handle, SW_HIDE);
+    }
+  } catch (...) {
+  }
 }
 
 winrt::fire_and_forget ProbeLogin(
@@ -875,11 +987,20 @@ winrt::fire_and_forget ProbeLogin(
   try {
     std::wstring script = LR"JS((() => {
       let userToken = '';
-      try { const user = JSON.parse(localStorage.getItem('user') || 'null'); userToken = typeof user?.token === 'string' ? user.token : ''; } catch {}
+      let userID = '';
+      try {
+        const user = JSON.parse(localStorage.getItem('user') || 'null');
+        userToken = typeof user?.token === 'string' ? user.token : '';
+        const value = user && typeof user === 'object' ? user.id : null;
+        // A New API fork parses this header as a decimal integer, so the page
+        // is asked for its id only in that form.
+        const text = typeof value === 'number' ? String(value) : typeof value === 'string' ? value.trim() : '';
+        userID = /^[0-9]{1,32}$/.test(text) ? text : '';
+      } catch {}
       const access = (localStorage.getItem('auth_token') || localStorage.getItem('access_token') || userToken).slice(0,32768);
       const refresh = (localStorage.getItem('refresh_token') || '').slice(0,32768);
       const password = (document.querySelector('input[type=password],input[autocomplete=current-password]')?.value || '').slice(0,4096);
-      return JSON.stringify({password,accessToken:access,refreshToken:refresh});
+      return JSON.stringify({password,accessToken:access,refreshToken:refresh,userID});
     })())JS";
     auto raw_result = co_await state->webview.ExecuteScriptAsync(script);
     if (raw_result.size() > 196 * 1024) throw winrt::hresult_error(E_INVALIDARG);
@@ -888,6 +1009,11 @@ winrt::fire_and_forget ProbeLogin(
     auto probe = json::JsonObject::Parse(outer.GetString());
     auto access_token = JsonString(probe, L"accessToken");
     auto refresh_token = JsonString(probe, L"refreshToken");
+    auto user_id = JsonString(probe, L"userID");
+    if (user_id) {
+      auto numeric = NumericUserID(*user_id);
+      user_id = numeric.empty() ? std::nullopt : std::optional<std::string>(numeric);
+    }
     auto password = JsonString(probe, L"password");
     if (!password) password = state->captured_password;
 
@@ -913,11 +1039,13 @@ winrt::fire_and_forget ProbeLogin(
     }
     co_await winrt::resume_background();
     if (state->canceled.load() || state->finished.load() || !attempt->IsPending()) co_return;
-    auto verified = ProbeEndpoint(state->options, state->origin, cookie_header, access_token, refresh_token);
+    auto verified = ProbeEndpoint(state->options, state->origin, cookie_header, access_token, refresh_token, user_id);
     if (state->canceled.load() || state->finished.load() || !attempt->IsPending()) co_return;
     if (!verified) throw winrt::hresult_error(E_ACCESSDENIED);
-    StoredSession session{state->options.account_type, state->options.origin, verified->cookie,
-                          verified->access_token.value_or(""), verified->refresh_token.value_or("")};
+    StoredSession session{verified->family.empty() ? state->options.account_type : verified->family,
+                          state->options.origin, verified->cookie,
+                          verified->access_token.value_or(""), verified->refresh_token.value_or(""),
+                          verified->user_id};
     auto session_text = EncodeSession(session);
     if (!attempt->BeginCommit()) co_return;
     dispatcher.TryEnqueue([state, attempt] {
@@ -928,10 +1056,18 @@ winrt::fire_and_forget ProbeLogin(
     // Decide what the verified sign-in may keep. A freshly typed password
     // asks in the subordinate post-login prompt; a password auto-filled from
     // the saved store keeps remembering silently.
+    //
+    // The sign-in browser leaves the screen first and the question is asked
+    // afterwards, over the app: the page has served its purpose once the
+    // session is verified, and a modal question on top of a page the user has
+    // finished with is the one thing a child surface must not do.  The prompt
+    // answers "session only" when the window is gone, so hiding it here never
+    // strands the flow.
     bool remember_password = false;
     if (password && !password->empty() && password != state->restored_password) {
       co_await winrt::resume_foreground(dispatcher);
       if (state->canceled.load()) co_return;
+      HideLoginDialog(state);
       remember_password = co_await ShowRememberPasswordPrompt(state);
       if (state->canceled.load()) co_return;
       co_await winrt::resume_background();
@@ -954,11 +1090,14 @@ winrt::fire_and_forget ProbeLogin(
     // definitive failed import, so restore the native side to the same prior
     // state. A visible window close cannot cancel this synchronous boundary.
     auto accepted = credentials_saved ? CoreIPCBridge::Shared().AcceptRelayLogin(
-        state->options.account_id, state->options.account_type, state->options.label,
+        state->options.account_id,
+        verified->family.empty() ? state->options.account_type : verified->family,
+        state->options.label,
         state->options.origin, verified->username,
         verified->cookie.empty() ? std::nullopt : std::optional<std::string>(verified->cookie),
         verified->access_token, verified->refresh_token,
         remember_password ? password : std::nullopt,
+        verified->user_id.empty() ? std::nullopt : std::optional<std::string>(verified->user_id),
         state->options.station_id, state->options.station_name,
         state->options.station_type, state->options.station_origin,
         remember_password, state->options.pending_account) : std::nullopt;
@@ -1122,12 +1261,21 @@ winrt::fire_and_forget InitializeBrowser(std::shared_ptr<LoginState> state) {
 
 }  // namespace
 
+
+// The station families this app can sign in to.  An empty value (or "auto")
+// means the caller did not say: the flow then settles the family from whichever
+// probe the page's own session answers, so the sign-in window can open at once
+// instead of waiting on a pair of network probes that ask the same questions
+// before it is allowed to appear.
+bool IsRelayAccountType(std::string const& value) {
+  return value == "newapi" || value == "sub2api" || value.empty() || value == "auto";
+}
 std::optional<WindowsRelayLoginResult> RunWindowsRelayLogin(
     HWND owner,
     WindowsRelayLoginOptions const& input_options) {
   ConfigureImmediateXamlPresentation();
   if (!ValidAccountID(input_options.account_id) ||
-      (input_options.account_type != "newapi" && input_options.account_type != "sub2api") ||
+      !IsRelayAccountType(input_options.account_type) ||
       input_options.label.empty() || input_options.label.size() > 160 ||
       (input_options.language != "system" && input_options.language != "en" && input_options.language != "zh-Hans") ||
       (input_options.username && input_options.username->size() > 320)) return std::nullopt;
@@ -1347,7 +1495,7 @@ std::optional<WindowsRelayLoginResult> RunWindowsRelayLogin(
 std::optional<WindowsRelaySessionRestoreResult> RestoreWindowsRelaySession(
     WindowsRelayLoginOptions const& input_options) {
   if (!ValidAccountID(input_options.account_id) ||
-      (input_options.account_type != "newapi" && input_options.account_type != "sub2api") ||
+      !IsRelayAccountType(input_options.account_type) ||
       input_options.label.empty() || input_options.label.size() > 160 ||
       (input_options.username && input_options.username->size() > 320)) return std::nullopt;
   auto origin = ParseOrigin(input_options.origin);
@@ -1367,6 +1515,7 @@ std::optional<WindowsRelaySessionRestoreResult> RestoreWindowsRelaySession(
       options, *origin, stored->cookie,
       stored->access_token.empty() ? std::nullopt : std::optional<std::string>(stored->access_token),
       stored->refresh_token.empty() ? std::nullopt : std::optional<std::string>(stored->refresh_token),
+      stored->user_id.empty() ? std::nullopt : std::optional<std::string>(stored->user_id),
       &confirmed_authentication_rejection);
   // An unreachable relay is not evidence that the account logged out. Keep
   // its Core status unknown until a later successful validation occurs.
@@ -1382,7 +1531,8 @@ std::optional<WindowsRelaySessionRestoreResult> RestoreWindowsRelaySession(
       options.account_id, options.account_type, options.label, options.origin,
       "signed_in", verified->username,
       verified->cookie.empty() ? std::nullopt : std::optional<std::string>(verified->cookie),
-      verified->access_token, verified->refresh_token);
+      verified->access_token, verified->refresh_token,
+      verified->user_id.empty() ? std::nullopt : std::optional<std::string>(verified->user_id));
   return accepted ? WindowsRelaySessionRestoreResult{
       accepted->revision, accepted->login_status, accepted->username} : std::nullopt;
 }

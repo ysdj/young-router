@@ -60,6 +60,9 @@ MAX_RESOURCES = 256
 MAX_RESOURCE_ID = 128
 MAX_GROUPS = 256
 MAX_GROUP_ID = 160
+# A New API fork resolves the ``New-Api-User`` header as a decimal integer, so
+# this is a digit string bounded well inside a 64-bit primary key.
+MAX_STATION_USER_ID = 32
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 # One write attempt keeps the long bound: a mutation is never replayed, so it
 # has exactly one chance to finish.
@@ -115,6 +118,13 @@ _SECRET_FIELDS = frozenset(
 
 class RelayAccountsError(ValueError):
     """An error safe to return across the Core boundary."""
+
+
+# A sentinel for one token field a station reported in a shape New API cannot
+# store.  It is distinct from every legal value (including ``None`` and ``0``),
+# so a caller can tell "the station did not report this" from "the station
+# reported something broken".
+_REJECT_FIELD = object()
 
 
 class RelayTransportError(RelayAccountsError):
@@ -348,6 +358,27 @@ def _private_station(
     }
 
 
+def _station_user_id(value: object) -> str:
+    """Validate one station account id used by the ``New-Api-User`` header.
+
+    A New API fork resolves the header with ``strconv.Atoi`` and then compares
+    it to the session's own user, so the only value that can ever work is the
+    station's own numeric primary key.  It is therefore kept as an opaque digit
+    string: never guessed, never synthesized from a label, and dropped the
+    moment a station stops reporting one.
+    """
+
+    if isinstance(value, bool):
+        result = ""
+    elif isinstance(value, (int, str)):
+        result = str(value).strip()
+    else:
+        result = ""
+    if not result or len(result) > MAX_STATION_USER_ID or not result.isdigit():
+        return ""
+    return result
+
+
 def _resource_id(value: object) -> str:
     result = value.strip() if isinstance(value, str) else ""
     if (
@@ -531,6 +562,11 @@ def _private_account(raw: Mapping[str, Any]) -> dict[str, Any]:
         # a resource read records its own time there, and a failed one must not
         # renew a login observation it never made.
         "login_observed_at": _updated_at(raw.get("login_observed_at")),
+        # The station's own account id, which a New API fork requires as the
+        # ``New-Api-User`` header beside the session cookie.  It is the id the
+        # station itself reported, so it always belongs to the session that
+        # proved it; an unrecognized value is dropped instead of sent.
+        "user_id": _station_user_id(raw.get("user_id")),
         "resource_status": resource_status,
         "resource_error": resource_error,
         "resources": _safe_resources(raw.get("resources", [])),
@@ -587,6 +623,11 @@ def _stored_account(account: Mapping[str, Any]) -> dict[str, Any]:
     stored.pop("login_observed_seconds_ago", None)
     stored["password"] = str(account.get("password", ""))
     stored["session"] = copy.deepcopy(account.get("session", {}))
+    # The station's own account id belongs to the session it was captured with,
+    # so it is durable session material exactly like the cookie: a Core restart
+    # that dropped it would send dashboard reads that no New API fork answers.
+    # It stays out of ``_public_account`` because nothing outside Core needs it.
+    stored["user_id"] = _station_user_id(account.get("user_id"))
     return stored
 
 
@@ -978,6 +1019,17 @@ class RelayHTTPClient:
             ),
             "",
         )
+        # The login answer is the one place a station states its own account id
+        # for the session it just minted, so a New API fork is asked for it
+        # here.  Only a plain non-negative integer is kept: the header a fork
+        # parses with ``strconv.Atoi`` accepts nothing else.
+        reported_id = user.get("id", data.get("id"))
+        station_user_id = ""
+        if not isinstance(reported_id, bool):
+            if isinstance(reported_id, int) and reported_id >= 0:
+                station_user_id = str(reported_id)
+            elif isinstance(reported_id, str) and reported_id.strip().isdigit():
+                station_user_id = _station_user_id(reported_id)
         access_token = data.get("access_token")
         refresh_token = data.get("refresh_token")
         cookie_values: dict[str, str] = {}
@@ -992,6 +1044,7 @@ class RelayHTTPClient:
             "cookie": cookie,
             "access_token": access_token.strip() if isinstance(access_token, str) else "",
             "refresh_token": refresh_token.strip() if isinstance(refresh_token, str) else "",
+            "user_id": station_user_id,
         }
         if not result["username"] or not (result["cookie"] or result["access_token"]):
             raise RelayAccountsError("Relay login was rejected")
@@ -1342,6 +1395,9 @@ class RelayAccountsDomain:
         next_account["login_status"] = "signed_out"
         next_account["password"] = ""
         next_account["session"] = {}
+        # The account id names a user on the old host: keeping it would send a
+        # header that host never issued.
+        next_account["user_id"] = ""
         next_account["balance"] = None
         next_account["last_updated_at"] = ""
         next_account["resource_status"] = "idle"
@@ -1907,6 +1963,47 @@ class RelayAccountsDomain:
         operation.clear()
         operation.update(_pending_operation(candidate))
 
+    def _reapply_pending_resource_changes(self, index: int) -> None:
+        """Re-apply this account's staged edits onto a fresh station reading.
+
+        Called after a successful read so one account shape carries both the
+        station's facts and the changes this Core has staged but not yet sent.
+        A resource the station no longer reports is skipped: the operation stays
+        in the journal and Apply reports it, which is the honest answer for work
+        whose target moved.
+        """
+
+        account = self._accounts[index]
+        account_id = str(account.get("id", ""))
+        for operation in self._pending_operations:
+            if operation.get("account_id") != account_id:
+                continue
+            if operation.get("state") in {"completed"}:
+                continue
+            kind = operation.get("kind")
+            resource_id = str(
+                operation.get("remote_resource_id") or operation.get("resource_id") or ""
+            )
+            if not resource_id:
+                continue
+            if kind == "api_key_delete":
+                updated = copy.deepcopy(self._accounts[index])
+                updated["resources"] = [
+                    item
+                    for item in updated.get("resources", [])
+                    if item.get("id") != resource_id
+                ]
+                self._accounts[index] = _private_account(updated)
+                continue
+            if kind not in {"api_key_update", "api_key_set_group", "api_key_set_enabled"}:
+                continue
+            try:
+                self._replace_resource_preview(index, resource_id, operation.get("changes", {}))
+            except RelayAccountsError:
+                # The station stopped reporting this key; the journal keeps the
+                # operation and Apply states it rather than inventing a row.
+                continue
+
     def _replace_resource_preview(self, index: int, resource_id: str, changes: Mapping[str, Any]) -> None:
         account = copy.deepcopy(self._accounts[index])
         resources = account.get("resources", [])
@@ -2411,11 +2508,24 @@ class RelayAccountsDomain:
         changes = operation.get("changes", {})
         key_name = self._api_key_name(changes.get("name"))
         if account["type"] == "newapi":
+            body: dict[str, Any] = {"name": key_name, "unlimited_quota": True}
+            # A New API token carries its group as a plain top-level field, and
+            # the station's own column defaults to the empty string when the
+            # create omits it.  A key created for a group must therefore state
+            # that group in the same request: the one-key-per-group layout is
+            # named after its group, and a key the station filed under no group
+            # is exactly the row that never appears under the group it was
+            # created for.  This writes the group name alone -- the station's
+            # own ``auto`` grouping, its candidate list, and its cross-group
+            # retry stay the user's own configuration and are never touched.
+            group_id = _group_id(changes.get("group_id"))
+            if group_id:
+                body["group"] = group_id
             payload = self._api_key_request(
                 account,
                 method="post",
                 path="/api/token/",
-                body={"name": key_name, "unlimited_quota": True},
+                body=body,
             )
         else:
             payload = self._api_key_request(
@@ -2941,7 +3051,7 @@ class RelayAccountsDomain:
             payload = json.loads(value)
         except json.JSONDecodeError:
             raise RelayAccountsError("Relay login result is invalid") from None
-        if not isinstance(payload, Mapping) or set(payload).difference({"username", "cookie", "access_token", "refresh_token"}):
+        if not isinstance(payload, Mapping) or set(payload).difference({"username", "cookie", "access_token", "refresh_token", "user_id"}):
             raise RelayAccountsError("Relay login result is invalid")
         username = _text(payload.get("username"), "Relay username", limit=320)
         cookie = payload.get("cookie", "")
@@ -2953,6 +3063,9 @@ class RelayAccountsDomain:
             for key in ("cookie", "access_token", "refresh_token")
             if isinstance(payload.get(key), str) and payload.get(key)
         }
+        captured_user_id = _station_user_id(payload.get("user_id"))
+        if captured_user_id:
+            account["user_id"] = captured_user_id
         account["username"] = username
         account["login_status"] = "signed_in"
         account["login_observed_at"] = _utc_now_iso()
@@ -3048,7 +3161,25 @@ class RelayAccountsDomain:
                 self._stations = [item for item in self._stations if item["id"] != station["id"]]
             raise
         self._accounts.append(account)
-        self._draft_staged = True
+        # A completed sign-in is a fact, not an edit waiting for Apply: the host
+        # reaches this method only after the sign-in page is done and the
+        # post-login question (keep the password, or keep just the session) has
+        # been answered, so there is nothing left for the user to confirm.
+        # Marking it as a staged draft was wrong twice over — it made every
+        # later ``_persist`` in this login return early, so the account and its
+        # session existed only in memory and a Core restart lost them (which is
+        # why a station that had just been signed in could not be found on disk
+        # at all).
+        #
+        # The user's own relay CRUD — adding, editing, or removing a station,
+        # account, or key in the panes — is the draft that waits for Apply, and
+        # it still goes through ``_new_pending_operation`` / ``_draft_staged``.
+        # This method is never how such an edit is created.
+        #
+        # ``_persist`` keeps its own gate: with no staged draft the sign-in is
+        # written, and while the panes hold an unrelated draft the write is
+        # deferred exactly as it is for every other non-CRUD transition, so a
+        # draft never reaches disk on a login's account.
         self._last_action = {"kind": "account_add", "account_id": checked_id, "station_id": station["id"]}
         self._persist()
         self.revision += 1
@@ -3063,6 +3194,7 @@ class RelayAccountsDomain:
         access_token: str = "",
         refresh_token: str = "",
         password: str = "",
+        user_id: object = "",
         remember_password: bool | None = None,
         preserve_resources: bool = False,
     ) -> dict[str, Any]:
@@ -3072,6 +3204,13 @@ class RelayAccountsDomain:
         preference (used when no password was typed), while ``True``/``False``
         apply the post-login choice made in the host's subordinate prompt —
         ``False`` also clears an earlier saved password and persisted session.
+
+        ``user_id`` is the station's own account id, captured by the host from
+        the session it just proved.  It is what a New API fork requires as the
+        ``New-Api-User`` header beside the cookie, and it is recorded only when
+        it is a plain decimal id: a fork that reports something else must not
+        have a guessed value sent at it.  An absent id keeps whatever this
+        account already held, so a routine re-login never erases it.
         """
 
         index = self._index(account_id)
@@ -3094,6 +3233,9 @@ class RelayAccountsDomain:
             secrets["refresh_token"] = _text(refresh_token, "Relay refresh token", limit=32768)
         if remember_password is not None:
             account["remember_password"] = remember_password is True
+        captured_user_id = _station_user_id(user_id)
+        if captured_user_id:
+            account["user_id"] = captured_user_id
         observed_at = _utc_now_iso()
         account.update(
             {
@@ -3119,6 +3261,10 @@ class RelayAccountsDomain:
             account["session"] = {}
         self._accounts[index] = _private_account(account)
         self._session_secrets[account_id] = secrets
+        # The sign-in and the session it proved persist here.  ``_persist``
+        # applies its own gate, so a login that lands while the panes hold an
+        # unrelated draft defers its write with every other non-CRUD transition
+        # instead of forcing that draft onto disk.
         self._persist()
         self.revision += 1
         return _public_account(self._accounts[index])
@@ -3168,11 +3314,10 @@ class RelayAccountsDomain:
         token = secrets.get("access_token", "")
         if not cookie and not token:
             return None
-        headers: dict[str, str] = {}
-        if cookie:
-            headers["Cookie"] = cookie
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
+        # The verification read carries the same header every later dashboard
+        # read does: a fork that requires its account id would otherwise reject
+        # this probe and report a healthy session as signed out.
+        headers = self._session_headers(secrets, user_id=account.get("user_id"), station_type=account.get("type"))
         path = "/api/user/self" if account["type"] == "newapi" else "/api/v1/auth/me"
         try:
             payload = self._http.json(account["origin"], path, headers=headers)
@@ -3217,6 +3362,7 @@ class RelayAccountsDomain:
             cookie=str(result.get("cookie", "")),
             access_token=str(result.get("access_token", "")),
             refresh_token=str(result.get("refresh_token", "")),
+            user_id=result.get("user_id", ""),
             preserve_resources=True,
         )
 
@@ -3309,8 +3455,18 @@ class RelayAccountsDomain:
         return age is not None and age < window
 
     @staticmethod
-    def _session_headers(secrets: object) -> dict[str, str]:
-        """Return dashboard headers for one stored session, if it has one."""
+    def _session_headers(secrets: object, *, user_id: object = "", station_type: object = "") -> dict[str, str]:
+        """Return dashboard headers for one stored session, if it has one.
+
+        ``New-Api-User`` travels with the account's own captured id rather than
+        with the session secrets: it is the station's primary key for the user
+        that session proved, and a fork that resolves it rejects the read
+        without it (``未提供 New-Api-User``), with a foreign id
+        (``New-Api-User 与登录用户不匹配``), and with a non-numeric one.  An account
+        that never captured an id sends no header at all, which is what the
+        stock New API endpoint accepts.  The header belongs to the New API
+        family alone, so a sub2api station never receives one.
+        """
 
         if not isinstance(secrets, Mapping):
             return {}
@@ -3321,6 +3477,9 @@ class RelayAccountsDomain:
             headers["Cookie"] = cookie
         if isinstance(token, str) and token:
             headers["Authorization"] = f"Bearer {token}"
+        resolved_user_id = _station_user_id(user_id)
+        if headers and resolved_user_id and station_type == "newapi":
+            headers["New-Api-User"] = resolved_user_id
         return headers
 
     def _has_session_credentials(self, account: Mapping[str, Any]) -> bool:
@@ -3342,11 +3501,15 @@ class RelayAccountsDomain:
         """
 
         account_id = str(account.get("id", ""))
-        headers = self._session_headers(self._session_secrets.get(account_id, {}))
+        user_id = account.get("user_id")
+        station_type = account.get("type")
+        headers = self._session_headers(
+            self._session_secrets.get(account_id, {}), user_id=user_id, station_type=station_type
+        )
         if headers:
             return headers
         session = account.get("session")
-        headers = self._session_headers(session)
+        headers = self._session_headers(session, user_id=user_id, station_type=station_type)
         if not headers:
             raise RelayAccountsError("Relay login is unavailable")
         self._session_secrets[account_id] = {
@@ -3791,7 +3954,27 @@ class RelayAccountsDomain:
         account["last_updated_at"] = _utc_now_iso()
         account["resource_error"] = "none"
         self._accounts[index] = _private_account(account)
+        # A read reports the station's own state, and a staged edit has not
+        # reached the station yet — so an ordinary read must not overwrite the
+        # preview of work this Core already holds.  Without this, 自动分组's
+        # alignment (which stages one rename per key) was visible only until the
+        # next read: opening the sheet, or any mount probe, replaced the renamed
+        # rows with the station's old names, and the switch looked like it had
+        # done nothing even though the renames were staged and applied
+        # correctly.  Re-applying the staged changes keeps one account shape: the
+        # station's facts plus the edits in flight.
+        #
+        # The Apply-time read is deliberately excluded.  It exists to answer
+        # "did my write land?" — ``reconcile_apply`` compares what the station
+        # reports against the staged change to decide whether to retire the
+        # operation or hand it back for another attempt.  Painting the staged
+        # change onto that reading would make an operation whose write never
+        # reached the station look applied and silently drop it.  The read stays
+        # the station's own answer; only the reads that feed the panes fold in
+        # the work in flight.  It runs after the account is written because it
+        # reads that value back.
         if not _for_apply:
+            self._reapply_pending_resource_changes(index)
             self._persist()
             self.revision += 1
         return _public_account(self._accounts[index])
@@ -3869,29 +4052,66 @@ class RelayAccountsDomain:
             raise RelayAccountsError("The selected relay API resource is unavailable")
         return dict(payload)
 
-    @staticmethod
-    def _newapi_update_payload(token: Mapping[str, Any], changes: Mapping[str, Any]) -> dict[str, Any]:
+    # The fields one New API token carries, with the value its own JSON binding
+    # uses when a station omits the field.  A PUT binds into a fresh struct and
+    # writes every field back, so an omitted field is not "leave it alone" — it
+    # is the zero value, which is exactly what a station that did not serialize
+    # the field holds.  Carrying the documented default through is therefore
+    # faithful, while refusing the whole edit (what a strict check did) left an
+    # older or slimmer fork unable to rename a key at all.
+    _NEWAPI_TOKEN_DEFAULTS: dict[str, object] = {
+        "expired_time": -1,
+        "remain_quota": 0,
+        "unlimited_quota": False,
+        "model_limits_enabled": False,
+        "model_limits": "",
+        "cross_group_retry": False,
+    }
+
+    @classmethod
+    def _newapi_update_payload(cls, token: Mapping[str, Any], changes: Mapping[str, Any]) -> dict[str, Any]:
         token_id = token.get("id")
         if type(token_id) is not int:
             raise RelayAccountsError("The selected relay API resource is unavailable")
         name = _resource_name(token.get("name"), f"API {token_id}")
-        expired_time = token.get("expired_time")
-        remain_quota = token.get("remain_quota")
-        unlimited_quota = token.get("unlimited_quota")
-        model_limits_enabled = token.get("model_limits_enabled")
-        model_limits = token.get("model_limits")
-        allow_ips = token.get("allow_ips")
-        cross_group_retry = token.get("cross_group_retry")
-        if (
-            type(expired_time) is not int
-            or type(remain_quota) is not int
-            or not isinstance(unlimited_quota, bool)
-            or not isinstance(model_limits_enabled, bool)
-            or not isinstance(model_limits, str)
-            or (allow_ips is not None and not isinstance(allow_ips, str))
-            or not isinstance(cross_group_retry, bool)
+
+        def reported(field: str, kind: type) -> object:
+            """One token field, or the binding default when it is not reported.
+
+            A field the station states with the wrong shape is a broken answer
+            and still refused: only a genuinely absent field falls back.
+            """
+
+            if field not in token or token.get(field) is None:
+                return cls._NEWAPI_TOKEN_DEFAULTS[field]
+            value = token.get(field)
+            if kind is int:
+                return value if type(value) is int else _REJECT_FIELD
+            if kind is bool:
+                return value if isinstance(value, bool) else _REJECT_FIELD
+            return value if isinstance(value, str) else _REJECT_FIELD
+
+        expired_time = reported("expired_time", int)
+        remain_quota = reported("remain_quota", int)
+        unlimited_quota = reported("unlimited_quota", bool)
+        model_limits_enabled = reported("model_limits_enabled", bool)
+        model_limits = reported("model_limits", str)
+        cross_group_retry = reported("cross_group_retry", bool)
+        if _REJECT_FIELD in (
+            expired_time,
+            remain_quota,
+            unlimited_quota,
+            model_limits_enabled,
+            model_limits,
+            cross_group_retry,
         ):
             raise RelayAccountsError("Relay API key configuration is invalid")
+        # ``allow_ips`` is nullable in New API and was added after the original
+        # token shape, so a station may report null, "", or nothing at all; all
+        # three mean the same thing here and none of them is an error.
+        allow_ips = token.get("allow_ips")
+        if not isinstance(allow_ips, str):
+            allow_ips = ""
         payload: dict[str, Any] = {
             "id": token_id,
             "name": name,
@@ -3901,6 +4121,7 @@ class RelayAccountsDomain:
             "model_limits_enabled": model_limits_enabled,
             "model_limits": model_limits,
             "allow_ips": allow_ips,
+            # A group the station did not report is the empty group it stores.
             "group": _group_id(token.get("group")),
             "cross_group_retry": cross_group_retry,
         }

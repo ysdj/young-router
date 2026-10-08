@@ -738,6 +738,8 @@ export type RelayGroupManagerLabels = {
   enabledLabel: string;
   newKeyName: string;
   autoGroupingLabel: string;
+  /** The 自动分组 help mark's popup: what the switch does to the station's keys. */
+  autoGroupingHelp: string;
   /** The label for a key whose group the station no longer offers. */
   ungroupedLabel: string;
   closeLabel: string;
@@ -799,12 +801,6 @@ export interface NativeLeafAdapter {
     title: string;
     closeLabel: string;
   }): Promise<void>;
-  showCodexRestartConfirmation(options: {
-    title: string;
-    message: string;
-    restartLabel: string;
-    laterLabel: string;
-  }): Promise<"restart" | "later" | undefined>;
   /** Native subordinate sheet: the station's keys with their groups. */
   showGroupManager(options: {
     title: string;
@@ -868,7 +864,10 @@ export interface NativeLeafAdapter {
   }): Promise<boolean>;
   relayLogin(options: {
     accountId: string;
-    type: "newapi" | "sub2api";
+    /** "" (or "auto") settles the station family from the page's own answer, so
+     * the sign-in window opens at once instead of waiting on a pair of network
+     * probes that ask the same questions before it can appear. */
+    type: "newapi" | "sub2api" | "";
     label: string;
     origin: string;
     language: LanguagePreference;
@@ -899,7 +898,6 @@ export interface NativeLeafAdapter {
   clearRelayPassword(accountId: string): Promise<void>;
   clearRelayCredentials(accountId: string): Promise<void>;
   setLaunchAtLogin(enabled: boolean): Promise<void>;
-  restartCodex(): Promise<boolean>;
   /** Native About/version panel (app version and build). */
   showVersion?(): void;
   /** App and bundled LiteLLM versions for the shared About pane. */

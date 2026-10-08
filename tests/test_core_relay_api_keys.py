@@ -443,6 +443,66 @@ class RelayApiKeyDomainTests(unittest.TestCase):
                 core.trusted_secret_value("relay_accounts", "api_key", target, revision=int(descriptor["revision"])),
             )
             self.assertNotIn("replace-generated-secret", json.dumps(core.snapshot()))
+    def test_a_newapi_key_for_a_group_is_created_in_that_group(self) -> None:
+        """The create request states the group, or the key lands ungrouped.
+
+        A New API token carries its group as a plain top-level field, and the
+        station's own column defaults to the empty string when the create omits
+        it.  A key created for a group without that field is therefore filed
+        under no group at all — which is exactly the key that never shows up
+        under the group it was created for after 自动分组 relayouts the account.
+        """
+
+        token = {
+            "id": 7,
+            "name": "old-name",
+            "status": 1,
+            "key": "replace-secret",
+            "expired_time": -1,
+            "remain_quota": 0,
+            "unlimited_quota": True,
+            "model_limits_enabled": False,
+            "model_limits": "",
+            "allow_ips": "",
+            "group": "default",
+            "cross_group_retry": False,
+        }
+        client = RelayMutationHTTPClient(
+            {
+                "/api/user/models": {"data": ["gpt-test"]},
+                "/api/user/self/groups": {"data": {"default": {"ratio": 1}, "premium": {"ratio": 2}}},
+                "/api/token/?p=1&size=100": {"data": {"items": [token]}},
+                "/api/token/7": {"data": token},
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RelayAccountsDomain(directory, http_client=client)
+            account = domain.dispatch(
+                "account.add",
+                {"type": "newapi", "label": "Relay", "origin": "https://relay.example.test"},
+            )["accounts"][0]
+            domain.accept_login_result(account["id"], username="person", cookie="session=fixture")
+            domain.refresh_resources(account["id"])
+
+            domain.dispatch(
+                "api_key.create",
+                {"account_id": account["id"], "name": "premium", "group_id": "premium", "enabled": True},
+            )
+            self.assertEqual([], client.calls)
+            prepared = domain.prepare_apply()
+            self.assertTrue(prepared["ready"])
+            domain.execute_pending_operations(prepared, phase="non_destructive")
+
+            create = next(call for call in client.calls if call[0] == "POST" and call[1] == "/api/token/")
+            self.assertEqual(
+                {"name": "premium", "unlimited_quota": True, "group": "premium"},
+                create[4],
+            )
+            # The station's own automatic grouping is the user's own
+            # configuration: this app creates an ordinary grouped key and never
+            # writes the candidate list or the cross-group retry flag.
+            self.assertNotIn("auto_groups", create[4])
+            self.assertNotIn("cross_group_retry", create[4])
 
 
 if __name__ == "__main__":

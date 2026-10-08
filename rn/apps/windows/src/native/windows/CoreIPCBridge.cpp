@@ -446,6 +446,7 @@ std::optional<CoreIPCBridge::RelayLoginResult> CoreIPCBridge::AcceptRelayLogin(
     std::optional<std::string> const& access_token,
     std::optional<std::string> const& refresh_token,
     std::optional<std::string> const& password,
+    std::optional<std::string> const& user_id,
     std::optional<std::string> const& station_id,
     std::optional<std::string> const& station_name,
     std::optional<std::string> const& station_type,
@@ -460,6 +461,10 @@ std::optional<CoreIPCBridge::RelayLoginResult> CoreIPCBridge::AcceptRelayLogin(
       (access_token && access_token->size() > 32768) ||
       (refresh_token && refresh_token->size() > 32768) ||
       (password && password->size() > 4096) ||
+      // The header the station parses as a decimal integer: a value that cannot
+      // be one is refused here rather than sent to be rejected.
+      (user_id && !user_id->empty() &&
+       (user_id->size() > 32 || user_id->find_first_not_of("0123456789") != std::string::npos)) ||
       ((!cookie || cookie->empty()) && (!access_token || access_token->empty()))) {
     return std::nullopt;
   }
@@ -481,6 +486,9 @@ std::optional<CoreIPCBridge::RelayLoginResult> CoreIPCBridge::AcceptRelayLogin(
     }
     if (password && !password->empty()) {
       payload.SetNamedValue(L"password", winrt::Windows::Data::Json::JsonValue::CreateStringValue(Utf8ToWide(*password)));
+    }
+    if (user_id && !user_id->empty()) {
+      payload.SetNamedValue(L"user_id", winrt::Windows::Data::Json::JsonValue::CreateStringValue(Utf8ToWide(*user_id)));
     }
     if (station_id && !station_id->empty()) {
       payload.SetNamedValue(L"station_id", winrt::Windows::Data::Json::JsonValue::CreateStringValue(Utf8ToWide(*station_id)));
@@ -533,7 +541,8 @@ std::optional<CoreIPCBridge::RelaySessionRestoreResult> CoreIPCBridge::RestoreRe
     std::optional<std::string> const& username,
     std::optional<std::string> const& cookie,
     std::optional<std::string> const& access_token,
-    std::optional<std::string> const& refresh_token) {
+    std::optional<std::string> const& refresh_token,
+    std::optional<std::string> const& user_id) {
   bool signed_in = login_status == "signed_in";
   bool terminal_status = login_status == "signed_out" || login_status == "expired";
   if (account_id.empty() || account_id.size() > 96 ||
@@ -544,6 +553,8 @@ std::optional<CoreIPCBridge::RelaySessionRestoreResult> CoreIPCBridge::RestoreRe
       (cookie && cookie->size() > 32768) ||
       (access_token && access_token->size() > 32768) ||
       (refresh_token && refresh_token->size() > 32768) ||
+      (user_id && !user_id->empty() &&
+       (user_id->size() > 32 || user_id->find_first_not_of("0123456789") != std::string::npos)) ||
       (signed_in && (!username || username->empty() || ((!cookie || cookie->empty()) && (!access_token || access_token->empty()))) ||
       (!signed_in && ((cookie && !cookie->empty()) || (access_token && !access_token->empty()) || (refresh_token && !refresh_token->empty())))) {
     return std::nullopt;
@@ -566,6 +577,9 @@ std::optional<CoreIPCBridge::RelaySessionRestoreResult> CoreIPCBridge::RestoreRe
     }
     if (refresh_token && !refresh_token->empty()) {
       payload.SetNamedValue(L"refresh_token", winrt::Windows::Data::Json::JsonValue::CreateStringValue(Utf8ToWide(*refresh_token)));
+    }
+    if (user_id && !user_id->empty()) {
+      payload.SetNamedValue(L"user_id", winrt::Windows::Data::Json::JsonValue::CreateStringValue(Utf8ToWide(*user_id)));
     }
     auto body = WideToUtf8(payload.Stringify().c_str());
     if (body.size() > 96 * 1024) return std::nullopt;

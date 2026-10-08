@@ -537,10 +537,90 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # Every native scroll view that keeps a scroller on screen draws it with
         # that class: the declaration plus the model chooser, the read-only text
         # editor (install and layout pass), the key list the group manager sheet
-        # hosts, and that sheet's 模型列表 list (install and layout pass).
-        self.assertEqual(7, leaf.count("usePersistentScrollers("))
+        # hosts, and that sheet's 模型列表 list (its install, its layout pass, and
+        # the overflow policy that re-asserts the capsule while it overflows).
+        self.assertEqual(8, leaf.count("usePersistentScrollers("))
         self.assertIn("scrollView.usePersistentScrollers(horizontal: false, vertical: true)", leaf)
         self.assertIn("usePersistentScrollers(horizontal: true, vertical: true)", leaf)
+
+    def test_the_add_account_button_opens_the_sign_in_window_at_once(self) -> None:
+        # The + next to 中转站关联 used to resolve the station family with two
+        # network probes (up to three seconds each) BEFORE the browser window was
+        # allowed to appear, so the button spun for seconds to learn something
+        # the page it is about to open answers anyway.  It now opens the window
+        # immediately and lets the native flow settle the family from the probe
+        # that answers.
+        ui = (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
+        add = ui.split("const addRelayAccountToVendor = async", 1)[1].split("return <PersistentScrollView", 1)[0]
+        self.assertIn("const relayType = station?.type ?? \"\";", add)
+        self.assertNotIn("await relay.detectType(origin)", add)
+        # The binding is created from the family the flow resolved, so a bare
+        # address sends no station type of its own.
+        self.assertIn("stationType: station?.type,", add)
+
+        mac_leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
+        windows_relay = (WIN_NATIVE / "WindowsRelayLogin.cpp").read_text(encoding="utf-8")
+        # Both hosts accept an unnamed family and settle it from the answer.
+        self.assertIn('[\"newapi\", \"sub2api\", \"\", \"auto\"].contains(type),', mac_leaf)
+        self.assertIn("private var resolvedType: String?", mac_leaf)
+        probe_list = mac_leaf.split("private var probes: [Probe] {", 1)[1].split("\n    }", 1)[0]
+        self.assertIn("default: return newapi + sub2api", probe_list)
+        self.assertIn("bool IsRelayAccountType(std::string const& value)", windows_relay)
+        self.assertIn('return value == "newapi" || value == "sub2api" || value.empty() || value == "auto";', windows_relay)
+        # A family that was not named is resolved by the probe that answered,
+        # and every later read follows it.
+        self.assertIn("self.resolvedType = probe.family", mac_leaf)
+        self.assertIn("let accountType = resolvedType ?? self.type", mac_leaf)
+
+    def test_the_provider_detail_is_one_pane_for_every_kind(self) -> None:
+        # A service provider's detail is the ordinary provider detail: its name,
+        # its bound address, and its account.  A type picker there offered a
+        # retarget the pane has no business doing, and a WorkBuddy provider that
+        # could be switched to Claude from its own detail is exactly the
+        # divergence the shared pane exists to prevent.
+        ui = (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
+        self.assertNotIn("SERVICE_KIND_OPTIONS", ui)
+        self.assertNotIn("serviceProviderKindFor", ui)
+        editor = ui.split("function ProviderEditor(", 1)[1].split("function CodexWorkspace(", 1)[0]
+        identity = editor.split("{service ? <View", 1)[1].split("</View> : null}", 1)[0]
+        self.assertNotIn('label={translate("providers.wizard.providerType")}', identity)
+        self.assertIn('label={translate("providers.providerName")}', identity)
+        self.assertIn("{SERVICE_BASE_URLS[service]}", identity)
+
+    def test_relay_login_reveals_the_page_as_soon_as_it_paints(self) -> None:
+        # A web view paints progressively.  The overlay exists for the blank
+        # first frame, not for "the page finished its own data fetch": waiting on
+        # body.innerText covered a station whose shell renders immediately and
+        # then streams, leaving 正在加载登录页面 over a usable sign-in form.
+        leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
+        self.assertIn("private static let pagePaintedScript = \"\"\"", leaf)
+        painted = leaf.split("private static let pagePaintedScript = \"\"\"", 1)[1].split('"""', 1)[0]
+        # Any committed element counts as painted.
+        self.assertIn("if (body.children.length > 0) return true;", painted)
+        # The overlay is lifted on that answer.
+        self.assertIn("private func revealBrowserPage() {", leaf)
+        reveal = leaf.split("private func revealBrowserPage() {", 1)[1].split("\n    }", 1)[0]
+        self.assertIn("loadingOverlay.isHidden = true", reveal)
+        # The per-step work still runs once the page is on screen.
+        for step in (
+            "scheduleEmbeddedBrowserResize()",
+            "scheduleAgreementReveal()",
+            "scheduleLoginFormReveal()",
+            "scheduleLoginWatch(delay: 1)",
+        ):
+            self.assertIn(step, reveal)
+        # The cover can never outlive a page that is drawing.
+        self.assertIn("private var pageReadinessAttempts = 0", leaf)
+        self.assertIn("private static let pageReadinessMaxAttempts = 60", leaf)
+        probe = leaf.split("private func schedulePageReadinessProbe() {", 1)[1].split("\n    }", 1)[0]
+        self.assertIn("self.pageReadinessAttempts += 1", probe)
+        self.assertIn("|| self.pageReadinessAttempts >= Self.pageReadinessMaxAttempts", probe)
+        # The old "wait for non-empty innerText" gate is gone from the readiness
+        # probe (the agreement/form probes keep their own innerText reads).
+        self.assertNotIn(
+            'Boolean(document.body && document.body.children.length > 0 && document.body.innerText.trim().length > 0)',
+            leaf,
+        )
 
     def test_native_group_manager_hides_unusable_add_remove_controls(self) -> None:
         # The sheet's ＋ / － follow the shared pane rule: hide a control the
@@ -559,6 +639,48 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             "remove_button.Visibility(editable ? xaml::Visibility::Visible : xaml::Visibility::Collapsed);",
             windows,
         )
+
+    def test_native_group_manager_toggle_stages_the_one_key_per_group_layout(self) -> None:
+        # 自动分组 is one key per group, named exactly after its group, and the
+        # LIST PREVIEW has to say so the moment the switch is checked: the names
+        # the user reads are the feature.  A switch that only flipped its own
+        # state left the old key names on screen, which read as "checked but
+        # nothing happened" however correct Core's own alignment was.
+        leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
+        windows = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
+
+        # macOS: the toggle renames/retires rows instead of only reloading.
+        self.assertIn("private func stageAutoGroupingLayout(_ enabled: Bool) {", leaf)
+        toggle = leaf.split("@objc private func toggleAutoGrouping(_ sender: NSButton) {", 1)[1].split("\n    }", 1)[0]
+        self.assertIn("stageAutoGroupingLayout(sender.state == .on)", toggle)
+        stage = leaf.split("private func stageAutoGroupingLayout(_ enabled: Bool) {", 1)[1].split("\n    }", 1)[0]
+        # The staged rows reach the table.
+        self.assertIn("table.reloadData()", stage)
+        # The row that keeps a group is renamed to the group's own name.
+        self.assertIn("candidate.name = group.name", stage)
+        # A later key in the same group is retired, so the group owns one key.
+        self.assertIn("guard !keptGroupIDs.contains(group.id) else {", stage)
+        self.assertIn("candidate.deleted = true", stage)
+        # A group no key names gets a draft named after it.
+        self.assertIn("for group in groups where !keptGroupIDs.contains(group.id) && !presentGroupIDs.contains(group.id)", stage)
+        # The user's own rows are not the switch's to rewrite.
+        self.assertIn("if row.isDraft {", stage)
+        self.assertIn("if row.deleted {", stage)
+
+        # Windows stages the same layout on the same event.
+        self.assertIn("auto stage_auto_grouping = [&rows, &groups, staged_deletes, auto_grouping_baseline](bool enabled) {", windows)
+        toggle_win = windows.split("toggle.Click([&](auto const&, auto const&) {", 1)[1].split("close.Click([&]", 1)[0]
+        self.assertIn("stage_auto_grouping(toggle_on());", toggle_win)
+        stage_win = windows.split("auto stage_auto_grouping = [&rows, &groups, staged_deletes, auto_grouping_baseline](bool enabled) {", 1)[1].split("toggle.Click([&]", 1)[0]
+        self.assertIn("candidate.name = group->name.empty() ? group->label : group->name;", stage_win)
+        self.assertIn("kept_groups.count(row.group_id) > 0", stage_win)
+        self.assertIn("candidate.deleted = true;", stage_win)
+        self.assertIn("if (row.draft || row.deleted) {", stage_win)
+
+        # Both keep a baseline so turning the switch off restores what opened.
+        self.assertIn("private var autoGroupingBaselineRows: [KeyRow]?", leaf)
+        self.assertIn("autoGroupingBaselineRows = nil", leaf)
+        self.assertIn("auto auto_grouping_baseline = std::make_shared<std::optional<std::vector<SheetRow>>>();", windows)
 
     def test_native_tables_report_a_cleared_selection(self) -> None:
         # A click below the rows clears the list selection, but the shared view
@@ -631,46 +753,22 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("ShowWindow(window_handle_, SW_HIDE)", windows)
         self.assertNotIn("ShowWindow(window_handle_, SW_DESTROY)", windows)
 
-    def test_macos_codex_catalog_toggle_uses_a_separate_non_modal_restart_confirmation(self) -> None:
+    def test_macos_codex_catalog_toggle_owns_the_managed_catalog(self) -> None:
         ui = (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
         leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
-        module = (MAC_NATIVE / "AppKitNativeLeafModule.swift").read_text(encoding="utf-8")
-        bridge = (MAC_NATIVE / "AppKitNativeLeafBridge.m").read_text(encoding="utf-8")
         platform = (SHARED / "platformEntry.ts").read_text(encoding="utf-8")
 
         self.assertIn('id: "toggle-codex-model-catalog"', ui)
         self.assertIn('checked: booleanValue(catalog.enabled)', ui)
         self.assertIn('type: "codex.model_catalog.set"', ui)
-        self.assertIn("function codexModelCatalogRestartSignature(catalog: UnknownRecord): string", ui)
-        self.assertIn("signature === presentedCatalogRestartSignature.current", ui)
-        self.assertIn("signature === acknowledgedCatalogRestartSignature.current", ui)
-        self.assertNotIn("event <= presentedCatalogRestartEvent.current", ui)
-        self.assertNotIn("CodexRestartNotice", ui)
-        self.assertIn("native.showCodexRestartConfirmation({", ui)
-        self.assertIn("await native.restartCodex()", ui)
         self.assertIn('"toggle-autostart", "toggle-codex-model-catalog", "separator"', leaf)
-        self.assertIn('withBundleIdentifier: "com.openai.codex"', leaf)
-        self.assertIn("func restartCodex() -> Bool", leaf)
-        restart = leaf.split("func restartCodex() -> Bool", 1)[1].split("func systemLocale", 1)[0]
-        self.assertIn("application.forceTerminate()", restart)
-        self.assertNotIn("application.terminate()", restart)
-        confirmation = leaf.split("func showCodexRestartConfirmation(", 1)[1].split(
-            "func showGroupManager(", 1
-        )[0]
-        # The catalog restart question is the app's own decision panel, presented
-        # as a floating window rather than one that locks the window the user is
-        # working in, and it is never a modal session.
-        self.assertIn("codexRestartPanel = presentDecisionPanel(", confirmation)
-        self.assertIn('NativeDecisionAnswer(id: "later", title: laterLabel, isCancel: true)', confirmation)
-        self.assertIn('NativeDecisionAnswer(id: "restart", title: restartLabel, isDefault: true)', confirmation)
-        self.assertIn("locksParent: false", confirmation)
-        self.assertNotIn("runModal", confirmation)
-        self.assertIn("func showCodexRestartConfirmation", module)
-        self.assertIn("@objc func restartCodex", module)
-        self.assertIn("showCodexRestartConfirmation", bridge)
-        self.assertIn("RCT_EXTERN_METHOD(restartCodex:", bridge)
-        self.assertIn("showCodexRestartConfirmation?:", platform)
-        self.assertIn("restartCodex?: () => Promise<boolean>", platform)
+        # Turning the managed catalog on or off writes the client's config and
+        # never asks the user to restart anything: no reminder, no restart
+        # helper, and no dialog about it in the shared UI or the native leaf.
+        for removed in ("CodexRestartNotice", "showCodexRestartConfirmation", "restartCodex", "codexRestartPanel"):
+            self.assertNotIn(removed, ui)
+            self.assertNotIn(removed, leaf)
+            self.assertNotIn(removed, platform)
 
     def test_native_localization_never_falls_back_to_english(self) -> None:
         """Every string a native leaf shows is one the shared UI localized.
@@ -763,7 +861,6 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # Escape, the window that asked going away, and an answer all settle the
         # same entry exactly once, and the lock over the parent is released.
         self.assertIn("func finishDecisionPanel(_ panel: NSWindow, answer: String) {", leaf)
-        self.assertIn("if codexRestartPanel === panel { codexRestartPanel = nil }", leaf)
         self.assertIn("endChildPanel(panel)\n        state.completion(answer)", leaf)
         self.assertIn("if let state = decisionPanels[ObjectIdentifier(window)] {", leaf)
         self.assertIn("if let state = decisionPanels[ObjectIdentifier(panel)] {", leaf)
@@ -980,7 +1077,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertLess(main.index("YoungRouterExistingInstance()"), main.index("NSApplicationMain(argc, argv)"))
 
     def test_macos_preview_metadata_keeps_the_production_instance_identity(self) -> None:
-        build = (ROOT / "rn/scripts/build-macos.sh").read_text(encoding="utf-8")
+        build = (ROOT / "scripts/build-and-install-macos.sh").read_text(encoding="utf-8")
         main = (MAC_PROJECT / "YoungRouter-macOS/main.m").read_text(encoding="utf-8")
 
         self.assertIn("YOUNG_ROUTER_MACOS_BUNDLE_IDENTIFIER is unsupported", build)
@@ -1558,6 +1655,26 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn('text("Session Only", "仅记住登录态")', mac_leaf)
         self.assertIn("presentRememberPasswordPrompt", mac_leaf)
         self.assertIn("ShowRememberPasswordPrompt", windows_relay)
+        # The sign-in browser leaves the screen before the question is asked:
+        # a page the user has finished with must not sit under a modal question
+        # that locks it.  The prompt dismisses the browser surface first, and
+        # that dismissal takes the page probes off the clock so the answer
+        # cannot commit into a check the login watcher already dropped.
+        self.assertIn("private func dismissBrowserSurface() {", mac_leaf)
+        prompt = mac_leaf.split("private func presentRememberPasswordPrompt(completion: @escaping (Bool) -> Void) {", 1)[1].split("\n    }", 1)[0]
+        self.assertIn("dismissBrowserSurface()", prompt)
+        # Order matters inside the prompt: the browser goes away first.
+        self.assertLess(prompt.index("dismissBrowserSurface()"), prompt.index("presentDecisionPanel("))
+        # The dismissal must not end the flow it belongs to.
+        surface = mac_leaf.split("private func dismissBrowserSurface() {", 1)[1].split("\n    }", 1)[0]
+        self.assertNotIn("embeddedClose?()", surface)
+        self.assertIn("panel.orderOut(nil)", surface)
+        # Windows hides the dialog for the same reason rather than closing it,
+        # which would end the message loop that is still importing the session.
+        self.assertIn("void HideLoginDialog(std::shared_ptr<LoginState> const& state) {", windows_relay)
+        self.assertIn("ShowWindow(handle, SW_HIDE);", windows_relay)
+        probe_login = windows_relay.split("winrt::fire_and_forget ProbeLogin", 1)[1].split("winrt::fire_and_forget InitializeBrowser", 1)[0]
+        self.assertLess(probe_login.index("HideLoginDialog(state);"), probe_login.index("co_await ShowRememberPasswordPrompt(state);"))
         self.assertIn('L"Remember Password", L"记住密码"', windows_relay)
         self.assertIn('L"Session Only", L"仅记住登录态"', windows_relay)
         self.assertIn('payload["pending_account"] = true', mac_core)

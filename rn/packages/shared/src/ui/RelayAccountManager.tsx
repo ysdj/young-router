@@ -1058,6 +1058,7 @@ export function StationAccountsPanel({
     enabledLabel: translate("common.enable"),
     newKeyName: translate("relay.apiKeyNewName"),
     autoGroupingLabel: translate("relay.apiKeyAutoGrouping"),
+    autoGroupingHelp: translate("relay.apiKeyAutoGroupingHelp"),
     ungroupedLabel: translate("relay.apiKeyUngrouped"),
     closeLabel: translate("status.close"),
     applyLabel: translate("status.saveAndClose"),

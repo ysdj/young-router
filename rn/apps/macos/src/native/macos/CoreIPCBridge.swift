@@ -223,6 +223,7 @@ import Foundation
         accessToken: String?,
         refreshToken: String?,
         password: String? = nil,
+        userID: String? = nil,
         stationID: String? = nil,
         stationName: String? = nil,
         stationType: String? = nil,
@@ -241,6 +242,13 @@ import Foundation
         if let accessToken, !accessToken.isEmpty { payload["access_token"] = accessToken }
         if let refreshToken, !refreshToken.isEmpty { payload["refresh_token"] = refreshToken }
         if let password, !password.isEmpty { payload["password"] = password }
+        // The station's own account id, which a New API fork requires beside the
+        // session cookie.  Dashes and spaces are not ids: the fork parses this
+        // header as a decimal integer, so a non-numeric value is dropped here
+        // rather than sent to be rejected.
+        if let userID, !userID.isEmpty, userID.utf8.count <= 32, userID.allSatisfy({ $0.isNumber }) {
+            payload["user_id"] = userID
+        }
         if let stationID, !stationID.isEmpty { payload["station_id"] = stationID }
         if let stationName, !stationName.isEmpty { payload["station_name"] = stationName }
         if let stationType, !stationType.isEmpty { payload["station_type"] = stationType }
@@ -282,7 +290,8 @@ import Foundation
         username: String? = nil,
         cookie: String? = nil,
         accessToken: String? = nil,
-        refreshToken: String? = nil
+        refreshToken: String? = nil,
+        userID: String? = nil
     ) throws -> RelaySessionRestoreResult {
         guard ["signed_in", "signed_out", "expired"].contains(loginStatus),
               accountID.utf8.count <= 96,
@@ -293,6 +302,8 @@ import Foundation
               (cookie?.utf8.count ?? 0) <= 32_768,
               (accessToken?.utf8.count ?? 0) <= 32_768,
               (refreshToken?.utf8.count ?? 0) <= 32_768,
+              (userID?.utf8.count ?? 0) <= 32,
+              userID?.allSatisfy({ $0.isNumber }) ?? true,
               loginStatus != "signed_in" || (!(username?.isEmpty ?? true) && (!(cookie?.isEmpty ?? true) || !(accessToken?.isEmpty ?? true))),
               loginStatus == "signed_in" || ((cookie?.isEmpty ?? true) && (accessToken?.isEmpty ?? true) && (refreshToken?.isEmpty ?? true)) else {
             throw BridgeError.invalidResponse
@@ -308,6 +319,7 @@ import Foundation
         if let cookie, !cookie.isEmpty { payload["cookie"] = cookie }
         if let accessToken, !accessToken.isEmpty { payload["access_token"] = accessToken }
         if let refreshToken, !refreshToken.isEmpty { payload["refresh_token"] = refreshToken }
+        if let userID, !userID.isEmpty { payload["user_id"] = userID }
         guard let body = try? JSONSerialization.data(withJSONObject: payload, options: []),
               body.count <= 96 * 1024 else { throw BridgeError.invalidResponse }
         let (data, response, _, restarted) = try performCoreRequest(

@@ -40,6 +40,7 @@ from .base import (
     _SELECTED_DEPLOYMENT_MARKER_PATCH_ATTR,
     _VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY,
     _install_websocket_frame_limit_patch,
+    _install_uvicorn_shutdown_marker_patch,
     _normalize_response_completed_event_usage,
 )
 
@@ -1858,6 +1859,9 @@ def install_all() -> None:
     _install_same_deployment_retry_policy_patch()
     _install_responses_websocket_http_bridge_patch()
     _install_websocket_frame_limit_patch()
+    # A stream this process truncates while it is being replaced is not
+    # upstream evidence, so the teardown is marked wherever uvicorn is run.
+    _install_uvicorn_shutdown_marker_patch()
     _install_managed_responses_websocket_keepalive_patch()
     _install_responses_completion_stream_patch()
     _install_responses_tool_search_bridge_patch()

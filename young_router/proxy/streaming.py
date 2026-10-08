@@ -1358,7 +1358,16 @@ def _synthesized_failed_response_event(
         )
         status_code = _routing_module._exception_status_code(exception)
         status_suffix = f" (HTTP {status_code})" if status_code is not None else ""
-        if _routing_module._is_codex_compaction_capability_unsupported_error(exception):
+        if _routing_module._is_local_shutdown_exception(exception):
+            # The structured compaction request was cut off by this worker's
+            # own teardown, not by the route it selected.
+            message = (
+                "The router was restarting while the context compaction request "
+                "was in flight, so it was cut short. Compact again."
+            )
+            error_type = "server_error"
+            error_code = "router_restarting"
+        elif _routing_module._is_codex_compaction_capability_unsupported_error(exception):
             message = str(exception) or (
                 "The selected upstream route does not support encrypted Responses "
                 "compaction. Codex should use its local context-checkpoint summary fallback."
@@ -1385,6 +1394,32 @@ def _synthesized_failed_response_event(
         )
         error_type = "invalid_request_error"
         error_code = "image_generation_tool_unavailable"
+    elif _routing_module._is_local_shutdown_exception(exception):
+        # The failure every restart used to report as `upstream_route_failure`.
+        # The route is healthy; this process closed the stream while it was
+        # being replaced, so the turn just needs to be sent again.
+        message = (
+            "The router was restarting while this turn was streaming, so the "
+            "response was cut short. Send the message again."
+        )
+        error_type = "server_error"
+        error_code = "router_restarting"
+    elif _routing_module._request_body_size_rejected(request_data):
+        # Every candidate route refused these bytes.  The rejection is the
+        # request's own size, not a route outage, so the client is told what to
+        # change instead of being invited to retry an identical body.
+        model_group = (
+            _responses_execution_module._request_model_group(request_data)
+            or request_data.get("model")
+            or "the requested model"
+        )
+        message = (
+            f"The upstream rejected this request body as too large for "
+            f"{model_group} on every candidate route. Start a new task so the "
+            "conversation sent upstream is smaller than the upstream limit."
+        )
+        error_type = "invalid_request_error"
+        error_code = "upstream_request_body_too_large"
     elif _is_invalid_tool_call_arguments_error(exception):
         # The upstream answered, but the tool call it streamed cannot be run.
         # Naming the real cause keeps this deterministic failure out of the

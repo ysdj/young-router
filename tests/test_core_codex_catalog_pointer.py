@@ -298,10 +298,9 @@ class CodexCatalogPointerTests(unittest.TestCase):
             self.assertTrue(catalog.exists())
             self.assertEqual(["default-chat"], self._catalog_models(catalog))
             # The pointer was already correct and a missing file is not a
-            # model-set change, so no restart prompt is manufactured.
+            # model-set change, so the projection reports the models alone.
             self.assertTrue(snapshot["model_catalog"]["enabled"])
-            self.assertFalse(snapshot["model_catalog"]["restart_required"])
-            self.assertIsNone(snapshot["model_catalog"]["change_reason"])
+            self.assertEqual(["default-chat"], snapshot["model_catalog"]["public_models"])
 
     def test_dangling_pointer_is_dropped_when_the_router_is_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as directory, mock.patch(
@@ -320,8 +319,6 @@ class CodexCatalogPointerTests(unittest.TestCase):
             self.assertFalse(managed_catalog_path(home).exists())
             self.assertFalse(snapshot["model_catalog"]["enabled"])
             self.assertEqual([], snapshot["model_catalog"]["public_models"])
-            self.assertTrue(snapshot["model_catalog"]["restart_required"])
-            self.assertEqual("catalog_missing", snapshot["model_catalog"]["change_reason"])
 
     def test_foreign_catalog_pointer_is_never_touched(self) -> None:
         with tempfile.TemporaryDirectory() as directory, mock.patch(

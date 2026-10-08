@@ -132,7 +132,7 @@ class CoreServiceReloadTests(unittest.TestCase):
             self.assertTrue(result["applied"])
             self.assertEqual([], reload_calls)
 
-    def test_provider_apply_refreshes_enabled_codex_catalog_and_requests_restart(self) -> None:
+    def test_provider_apply_refreshes_enabled_codex_catalog(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config_path = root / "config.yaml"
@@ -201,14 +201,6 @@ class CoreServiceReloadTests(unittest.TestCase):
                     },
                     expected_revision=core.revision,
                 )
-                acknowledged = core.dispatch(
-                    {
-                        "domain": "codex",
-                        "type": "acknowledge_model_catalog_restart",
-                        "payload": {},
-                    },
-                    expected_revision=enabled["revision"],
-                )
                 staged = core.dispatch(
                     {
                         "domain": "providers_models",
@@ -219,15 +211,15 @@ class CoreServiceReloadTests(unittest.TestCase):
                             "changes": {"name": "public-b"},
                         },
                     },
-                    expected_revision=acknowledged["revision"],
+                    expected_revision=enabled["revision"],
                 )
 
                 result = core.apply("providers_models", revision=staged["revision"])
                 self.assertTrue(core.wait_for_service_reload(5.0))
                 # Endpoint-backed repairs require two fresh observations so a
-                # transient post-reload worker view cannot manufacture a
-                # restart prompt. The apply's forced refresh is the first;
-                # the next snapshot with a fresh probe completes the pair.
+                # transient post-reload worker view cannot rewrite the client's
+                # model list. The apply's forced refresh is the first; the next
+                # snapshot with a fresh probe completes the pair.
                 codex._catalog_source_checked_at = 0.0
                 catalog_state = core.snapshot()["domains"]["codex"]["model_catalog"]
 
@@ -237,8 +229,6 @@ class CoreServiceReloadTests(unittest.TestCase):
             self.assertTrue(result["applied"])
             self.assertEqual(["public-b"], [model["slug"] for model in catalog["models"]])
             self.assertEqual(["public-b"], catalog_state["public_models"])
-            self.assertTrue(catalog_state["restart_required"])
-            self.assertEqual("catalog_repaired", catalog_state["change_reason"])
 
 
     def test_proxy_restart_moves_a_codex_client_that_uses_this_apps_proxy(self) -> None:

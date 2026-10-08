@@ -84,8 +84,8 @@ def catalog_names_from_editor(payload: object) -> list[str]:
     model list are eligible: worker processes can transiently carry extra
     routes that are not part of the user's public model set (for example a
     runtime-added ``openai/<model>`` alias present on a subset of workers),
-    and those flapping names must neither rewrite the catalog nor queue a
-    Codex restart prompt.  The configured names act as an allowlist over the
+    and those flapping names must neither rewrite the catalog nor enter the
+    public model list.  The configured names act as an allowlist over the
     live exposure, never as a fallback: a configured model whose route is
     currently unavailable drops out of the catalog, and an unavailable Menu
     still yields an empty catalog.

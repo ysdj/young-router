@@ -44,6 +44,13 @@ std::optional<WindowsRelayLoginResult> RunWindowsRelayLogin(
     HWND owner,
     WindowsRelayLoginOptions const& options);
 
+// The station families this app can sign in to.  An empty value (or "auto")
+// means the caller did not say: the flow then settles the family from whichever
+// probe the page's own session answers, so the sign-in window can open at once
+// instead of waiting on a pair of network probes that ask the same questions
+// before it is allowed to appear.
+bool IsRelayAccountType(std::string const& value);
+
 std::optional<WindowsRelaySessionRestoreResult> RestoreWindowsRelaySession(
     WindowsRelayLoginOptions const& options);
 

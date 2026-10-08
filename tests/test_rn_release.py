@@ -41,7 +41,7 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn('LAUNCH_RETRY_SECONDS=1', installer)
         self.assertNotIn("preserved_proxy_port", installer)
         self.assertNotIn("refuse_running_install", installer)
-        build_replacement = installer.index('YOUNG_ROUTER_MACOS_OUTPUT="$STAGED_APP"')
+        build_replacement = installer.index('YOUNG_ROUTER_MACOS_OUTPUT="$STAGE_ROOT/Young Router.app"')
         self.assertIn('kill -KILL "$pid"', installer)
         self.assertLess(installer.index('kill -TERM "$pid"'), installer.index('kill -KILL "$pid"'))
         self.assertIn('start_installed_app "$OLD_PIDS"', installer)
@@ -50,9 +50,9 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn(' -m young_router.proxy.macos_proxy ', installer)
         self.assertIn('stable_checks >= REQUIRED_HEALTH_CHECKS', installer)
         self.assertIn('restore_previous_app', installer)
-        self.assertIn("copy_tree()", installer)
+        self.assertIn("copy_bundle()", installer)
         self.assertIn('ditto --rsrc --extattr --acl "$source" "$destination"', installer)
-        self.assertIn('copy_tree "$STAGED_APP" "$INSTALL_STAGE"', installer)
+        self.assertIn('copy_bundle "$STAGED_APP" "$INSTALL_STAGE"', installer)
         self.assertIn('codesign --verify --deep --strict --verbose=2 "$INSTALL_STAGE"', installer)
         self.assertIn('open -g "$DESTINATION" >/dev/null 2>&1 || true', installer)
         self.assertIn('if [[ -z "$candidate_pid" && $SECONDS -ge $next_launch_at ]]; then', installer)
@@ -65,7 +65,7 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn("/Applications/Young Router.app/Contents/Resources/Core/runtime/bin/python}", test_script)
         self.assertIn("export PYTHONDONTWRITEBYTECODE=1", test_script)
 
-        staged_copy = installer.index('copy_tree "$STAGED_APP" "$INSTALL_STAGE"')
+        staged_copy = installer.index('copy_bundle "$STAGED_APP" "$INSTALL_STAGE"')
         select_installed_runtime = installer.index(
             'export YOUNG_ROUTER_CORE_RUNTIME_SOURCE="$INSTALLED_RUNTIME"'
         )
@@ -80,8 +80,9 @@ class ReactNativeReleaseTests(unittest.TestCase):
         start_replacement = installer.rindex('if ! start_installed_app "$OLD_PIDS"; then')
         delete_previous = installer.rindex('rm -rf "$PREVIOUS_APP"')
         mark_complete = installer.rindex("INSTALL_COMPLETE=1")
-        self.assertLess(select_installed_runtime, build_replacement)
-        self.assertLess(build_replacement, replace_previous)
+        native_build = installer.index("node scripts/bootstrap-rnmacos-085.mjs")
+        self.assertLess(select_installed_runtime, native_build)
+        self.assertLess(select_installed_runtime, replace_previous)
         self.assertLess(staged_copy, replace_previous)
         self.assertLess(verify_install_stage, replace_previous)
         self.assertLess(capture_old_pids, replace_previous)
@@ -97,7 +98,7 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertLess(delete_previous, mark_complete)
 
     def test_macos_builds_and_installs_invalidate_finder_icon_cache(self) -> None:
-        build = (ROOT / "rn" / "scripts" / "build-macos.sh").read_text(
+        build = (ROOT / "scripts/build-and-install-macos.sh").read_text(
             encoding="utf-8"
         )
         installer = (ROOT / "scripts" / "build-and-install-macos.sh").read_text(
@@ -142,9 +143,7 @@ class ReactNativeReleaseTests(unittest.TestCase):
         installer = (ROOT / "scripts" / "build-and-install-macos.sh").read_text(
             encoding="utf-8"
         )
-        macos = (ROOT / "rn" / "scripts" / "build-macos.sh").read_text(
-            encoding="utf-8"
-        )
+        macos = installer
         windows = (ROOT / "rn" / "scripts" / "build-windows.ps1").read_text(
             encoding="utf-8"
         )
@@ -152,16 +151,17 @@ class ReactNativeReleaseTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        installer_update = installer.index('"$ROOT/scripts/update-litellm.sh"')
+        installer_update = installer.index('"$PROJECT_ROOT/scripts/update-litellm.sh"')
         self.assertLess(installer_update, installer.index('INSTALLED_RUNTIME="$DESTINATION'))
+        # The one script names its build output in the header, so the ordering
+        # that matters is against the native build it must precede.
         self.assertLess(
             installer_update,
-            installer.index('YOUNG_ROUTER_MACOS_OUTPUT="$STAGED_APP"'),
+            installer.index("node scripts/bootstrap-rnmacos-085.mjs"),
         )
 
-        macos_update = macos.index('"$PROJECT_ROOT/scripts/update-litellm.sh"')
-        self.assertLess(macos_update, macos.index("node scripts/bootstrap-rnmacos-085.mjs"))
-        self.assertLess(macos_update, macos.index("build-macos --project-path macos"))
+        self.assertLess(installer_update, installer.index("node scripts/bootstrap-rnmacos-085.mjs"))
+        self.assertLess(installer_update, installer.index("build-macos --project-path macos"))
 
         windows_update = windows.index('scripts\\update_litellm.py')
         self.assertLess(windows_update, windows.index("pnpm run build"))
@@ -209,7 +209,7 @@ class ReactNativeReleaseTests(unittest.TestCase):
         )
 
     def test_macos_build_bootstraps_and_verifies_the_pinned_source_vendor(self) -> None:
-        script = (ROOT / "rn/scripts/build-macos.sh").read_text(encoding="utf-8")
+        script = (ROOT / "scripts/build-and-install-macos.sh").read_text(encoding="utf-8")
 
         self.assertIn("bootstrap-rnmacos-085.mjs", script)
         self.assertIn("verify-rnmacos-085.mjs --check-build-env", script)
@@ -317,6 +317,151 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn("arg !== '--reset-cache'", bundle_wrapper)
         self.assertIn("scripts/bundle.js", bundle_wrapper)
         self.assertIn("react-native-xcode.sh", project)
+
+    def test_one_macos_build_script_serves_build_only_and_install(self) -> None:
+        # Build-only and install used to be two files, and the wrapper re-ran
+        # work the inner script had already done: the LiteLLM sync, the runtime
+        # choice, and the artifact validation all happened twice, and the second
+        # one re-validated an artifact it had not produced. One file serves both
+        # because the install step consumes exactly the bundle this build made.
+        self.assertFalse(
+            (ROOT / "rn" / "scripts" / "build-macos.sh").exists(),
+            "the separate build script must not come back",
+        )
+        script = (ROOT / "scripts" / "build-and-install-macos.sh").read_text(encoding="utf-8")
+
+        # Exactly one sync of the pinned release, and it precedes everything
+        # that reads the version it produces - including the decision to reuse
+        # the installed runtime, which compares against that version.
+        self.assertEqual(1, script.count('"$PROJECT_ROOT/scripts/update-litellm.sh"'))
+        self.assertLess(
+            script.index('"$PROJECT_ROOT/scripts/update-litellm.sh"'),
+            script.index('INSTALLED_RUNTIME="$DESTINATION'),
+        )
+
+        # Build-only is a named output, not a separate entry point. Installing
+        # stages to its own product so the DerivedData app stays incremental.
+        self.assertIn('if [[ -n "${YOUNG_ROUTER_MACOS_OUTPUT:-}" ]]; then\n  BUILD_ONLY=1', script)
+        self.assertIn('if [[ "$BUILD_ONLY" == "1" ]]; then', script)
+        self.assertIn('YOUNG_ROUTER_MACOS_OUTPUT="$STAGE_ROOT/Young Router.app"', script)
+
+        # Exactly one package install reaches the workspace, for the callers
+        # that invoke this script directly.
+        self.assertEqual(1, script.count("pnpm install --frozen-lockfile"))
+
+        # The named output is handed back untouched: nothing installed, no app
+        # restarted. The install half is behind the BUILD_ONLY exit.
+        build_only_exit = script.index('if [[ "$BUILD_ONLY" == "1" ]]; then')
+        self.assertLess(build_only_exit, script.index('mv "$DESTINATION" "$PREVIOUS_APP"'))
+        # The call, not the definition: the install helpers are defined above
+        # the exit so the install half can use them.
+        self.assertLess(build_only_exit, script.index('if ! start_installed_app "$OLD_PIDS"; then'))
+
+    def test_the_portable_smoke_relocates_instead_of_copying_a_gigabyte(self) -> None:
+        # The smoke exists to prove the bundle works from somewhere other than
+        # where it was built, which is what the installed app does. Copying the
+        # Core aside to prove that cost eight to ten seconds and, worse, left
+        # the freshly generated bytecode behind: the copied tree re-imported
+        # cold and paid the interpreter's full start-up again. A rename within
+        # the build volume is instantaneous and keeps the bytecode in place.
+        script = (ROOT / "scripts" / "build-and-install-macos.sh").read_text(encoding="utf-8")
+
+        self.assertIn("relocate_core()", script)
+        self.assertIn("restore_core()", script)
+        self.assertIn('mv "$CORE" "$PORTABLE_SMOKE"', script)
+        self.assertIn('mv "$PORTABLE_SMOKE" "$CORE"', script)
+        # A failed import must not leave the built app without its Core.
+        self.assertIn("trap 'restore_core; cleanup' EXIT", script)
+        # The old form copied the whole Core aside on every build; the copy now
+        # exists only as the cross-volume fallback.
+        self.assertNotIn('PORTABLE_SMOKE="$RUNTIME_WORK/portable-core"', script)
+        self.assertIn('PORTABLE_SMOKE="$(dirname "$CORE")/.young-router-portable-smoke"', script)
+
+    def test_naming_an_output_moves_the_verified_bundle_rather_than_copying_it(self) -> None:
+        # The named-output step put the verified bundle at the caller's path by
+        # copying it aside and renaming. A rename on one volume moves a
+        # gigabyte in constant time and preserves every nested signature the
+        # same way a copy does, so the copy is only the cross-volume fallback.
+        script = (ROOT / "scripts" / "build-and-install-macos.sh").read_text(encoding="utf-8")
+
+        self.assertIn('mv "$APP" "$STAGED_OUTPUT" 2>/dev/null', script)
+        self.assertIn('copy_tree "$APP" "$STAGED_OUTPUT"', script)
+        rename = script.index('mv "$APP" "$STAGED_OUTPUT" 2>/dev/null')
+        fallback = script.index('copy_tree "$APP" "$STAGED_OUTPUT"')
+        self.assertLess(rename, fallback, "the rename must be attempted first")
+        # Both are guarded by a same-volume check against the destination.
+        self.assertIn('"$(stat -f %d "$APP" 2>/dev/null || echo a)" == "$(stat -f %d "$OUT_DIR" 2>/dev/null || echo b)"', script)
+
+    def test_no_empty_array_is_expanded_under_set_u(self) -> None:
+        # macOS ships bash 3.2, where `set -u` treats "${arr[@]}" on an empty
+        # array as an unbound variable. That aborts the command it is part of,
+        # and for a backgrounded job the failure is easy to miss: the build
+        # failed late with a confusing missing-file error from a later step.
+        script = (ROOT / "scripts" / "build-and-install-macos.sh").read_text(encoding="utf-8")
+
+        self.assertIn("set -euo pipefail", script)
+        # A guarded expansion is what an array that can be empty must use.
+        self.assertIn('if [[ ${#NODE_SOURCE_ARGS[@]} -gt 0 ]]; then', script)
+        self.assertIn('PI_WEB_ACCESS_NODE_ARGS+=("${NODE_SOURCE_ARGS[@]}")', script)
+        # The unguarded form must not appear for that array.
+        self.assertNotIn('"${NODE_SOURCE_ARGS[@]}" &', script)
+        # STAGING_PIDS is appended once per staging job before it is ever
+        # expanded, so it cannot be empty at the point of use.
+        self.assertEqual(4, script.count('STAGING_PIDS+=("$!")'))
+
+    def test_staging_caches_are_persistent_and_gated_by_the_staging_scripts(self) -> None:
+
+        # Staging and the native build are disjoint, so a build may overlap them
+        # (macOS) or run them first (Windows) -- but the staged trees must live
+        # somewhere that survives the build.  A per-build temporary directory
+        # makes every build reinstall releases it staged a moment ago, which was
+        # the largest remaining cost of a local build once xcodebuild was warm.
+        macos = (ROOT / "scripts/build-and-install-macos.sh").read_text(encoding="utf-8")
+        windows = (ROOT / "rn/scripts/build-windows.ps1").read_text(encoding="utf-8")
+
+        self.assertIn('STAGING_CACHE="${YOUNG_ROUTER_STAGING_CACHE:-$RN_ROOT/.staging-cache}"', macos)
+        self.assertIn('$StagingCache = if ($env:YOUNG_ROUTER_STAGING_CACHE)', windows)
+        self.assertIn('Join-Path $RnRoot ".staging-cache"', windows)
+
+        # Every staged integration resolves into the cache, and none of them
+        # still points at the throwaway per-build tree.
+        for artifact in ("pi-web-access", "workbuddy-connect", "veridrop", "dsh-vision-router"):
+            self.assertIn(f'"$STAGING_CACHE/{artifact}"', macos)
+            self.assertIn(f'Join-Path $StagingCache "{artifact}"', windows)
+        self.assertNotIn('WORKBUDDY_CONNECT_WORK="$RUNTIME_WORK/', macos)
+        self.assertNotIn('VERIDROP_WORK="$RUNTIME_WORK/', macos)
+        self.assertNotIn('DSH_VISION_ROUTER_WORK="$RUNTIME_WORK/', macos)
+        self.assertNotIn('PI_WEB_ACCESS_PACKAGE_WORK="$RUNTIME_WORK/', macos)
+        self.assertNotIn('Join-Path ([System.IO.Path]::GetTempPath()) ("young-router-veridrop-" + [guid]', windows)
+
+        # The cache is build output, never committed.
+        ignored = (ROOT / ".gitignore").read_text(encoding="utf-8")
+        self.assertIn("rn/.staging-cache/", ignored)
+
+        # Reuse is decided by the staging scripts (which own the upstream
+        # lookup), not by the build scripts trusting a directory that happens
+        # to exist.  Both scripts still invoke every updater on every build.
+        for updater in (
+            "update_pi_web_access.py",
+            "update_workbuddy_connect.py",
+            "update_veridrop.py",
+            "update_dsh_vision_router.py",
+        ):
+            self.assertIn(updater, macos)
+            self.assertIn(updater, windows)
+
+    def test_the_generated_code_editor_bundle_is_not_rewritten_when_unchanged(self) -> None:
+        # This file is a source input to the type check and to Metro, so
+        # republishing identical bytes still moves its mtime and makes every
+        # downstream cache treat an unchanged editor as a change.
+        builder = (ROOT / "rn/scripts/build-code-editor.mjs").read_text(encoding="utf-8")
+
+        self.assertIn("if (existing !== contents)", builder)
+        self.assertIn("await readFile(output, \"utf8\")", builder)
+        self.assertLess(
+            builder.index("if (existing !== contents)"),
+            builder.index("await rm(temporaryBundle"),
+        )
 
     def test_windows_build_checks_085_codegen_before_msbuild(self) -> None:
         package = (ROOT / "rn/package.json").read_text(encoding="utf-8")

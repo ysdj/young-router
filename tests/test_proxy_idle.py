@@ -159,3 +159,54 @@ class UvicornSupervisorHealthcheckTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UvicornShutdownMarkerTests(unittest.TestCase):
+    """The proxy's own teardown must be visible to the routing classifiers."""
+
+    def setUp(self) -> None:
+        from young_router.proxy import base
+
+        self.base = base
+        base._install_uvicorn_shutdown_marker_patch()
+        self.server = self._server()
+
+    def _server(self):
+        base = self.base
+        server = uvicorn.server.Server.__new__(uvicorn.server.Server)
+        server.servers = []
+        server.server_state = _FakeServerState()
+        server.config = types.SimpleNamespace(timeout_graceful_shutdown=None)
+        server.force_exit = False
+
+        observed: list[bool] = []
+
+        class Lifespan:
+            async def shutdown(self) -> None:
+                # uvicorn closes the connections first and awaits the
+                # in-flight requests here, so the marker has to be up already.
+                observed.append(base._proxy_shutdown_in_progress())
+
+        server.lifespan = Lifespan()
+        server.observed = observed
+        return server
+
+    def test_the_marker_is_up_for_the_whole_teardown(self) -> None:
+        self.assertFalse(self.base._proxy_shutdown_in_progress())
+        asyncio.run(uvicorn.server.Server.shutdown(self.server))
+        self.assertEqual(self.server.observed, [True])
+        self.assertFalse(self.base._proxy_shutdown_in_progress())
+
+    def test_the_marker_survives_a_failing_teardown(self) -> None:
+        async def boom() -> None:
+            raise RuntimeError("lifespan shutdown failed")
+
+        self.server.lifespan = types.SimpleNamespace(shutdown=boom)
+        with self.assertRaises(RuntimeError):
+            asyncio.run(uvicorn.server.Server.shutdown(self.server))
+        self.assertFalse(self.base._proxy_shutdown_in_progress())
+
+    def test_the_installer_is_idempotent(self) -> None:
+        original = uvicorn.server.Server.shutdown
+        self.base._install_uvicorn_shutdown_marker_patch()
+        self.assertIs(uvicorn.server.Server.shutdown, original)

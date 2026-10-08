@@ -16,6 +16,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <thread>
 #include <winreg.h>
@@ -28,6 +29,7 @@
 #include <winrt/Microsoft.UI.Interop.h>
 #include <winrt/Microsoft.UI.Windowing.h>
 #include <winrt/Microsoft.UI.Xaml.Automation.h>
+#include <winrt/Microsoft.UI.Xaml.Controls.Primitives.h>
 #include <winrt/Microsoft.UI.Xaml.Input.h>
 #include <winrt/Microsoft.Web.WebView2.Core.h>
 
@@ -36,6 +38,10 @@ constexpr UINT kTrayMessage = WM_APP + 31;
 constexpr UINT kQuitMessage = WM_APP + 32;
 constexpr UINT kTrayMenuFirstCommand = 41000;
 constexpr double kUIFontSize = 13.0;
+// A hint's own step, mirroring the shared UI's `UI_TIP_FONT_SIZE` (12): an
+// explanation reads a half step below the control it belongs to, in the flyout
+// the group manager's question mark opens.
+constexpr double kTipFontSize = 12.0;
 
 // Plaintext relay keys this app already read, keyed by "account:resource".
 // The sheet is rebuilt every time it opens and Core's lease is read-once and
@@ -1522,10 +1528,12 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
 
   controls::Grid footer;
   controls::ColumnDefinition footer_toggle;
+  controls::ColumnDefinition footer_help;
   controls::ColumnDefinition footer_status_column;
   controls::ColumnDefinition footer_actions;
   footer_actions.Width(xaml::GridLengthHelper::Auto());
   footer.ColumnDefinitions().Append(footer_toggle);
+  footer.ColumnDefinitions().Append(footer_help);
   footer.ColumnDefinitions().Append(footer_status_column);
   footer.ColumnDefinitions().Append(footer_actions);
   controls::CheckBox toggle;
@@ -1539,6 +1547,44 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
   };
   controls::Grid::SetColumn(toggle, 0);
   footer.Children().Append(toggle);
+  // The switch owns the station's whole key layout, so the question mark beside
+  // it states what it does before it is turned on.  It takes the info glyph the
+  // rest of the app uses, and the words ride it as its tooltip and automation
+  // name instead of taking a text button's width.
+  controls::Button toggle_help;
+  toggle_help.FontSize(kUIFontSize);
+  auto help_glyph = controls::FontIcon{};
+  help_glyph.FontFamily(winrt::Microsoft::UI::Xaml::Media::FontFamily(L"Segoe MDL2 Assets"));
+  help_glyph.FontSize(kUIFontSize);
+  help_glyph.Glyph(L"\xE897");
+  toggle_help.Content(help_glyph);
+  toggle_help.Padding(xaml::ThicknessHelper::FromLengths(0, 0, 0, 0));
+  toggle_help.Background(theme_brush(L"SubtleFillColorTransparentBrush", winrt::Windows::UI::Color{0, 0, 0, 0}));
+  toggle_help.BorderThickness(xaml::ThicknessHelper::FromLengths(0, 0, 0, 0));
+  toggle_help.VerticalAlignment(xaml::VerticalAlignment::Center);
+  toggle_help.Width(16);
+  toggle_help.Height(16);
+  controls::ToolTipService::SetToolTip(toggle_help, winrt::box_value(winrt::hstring(labels.auto_grouping_help)));
+  winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(toggle_help, winrt::hstring(labels.auto_grouping_label));
+  // The mark opens a hint, never a question: a flyout beside the switch reads
+  // as the explanation the shared UI's help tip draws, while a dialog would ask
+  // the user to answer a sentence.  Its text keeps the shared tip's own body
+  // (208 pt wide, 8 pt of horizontal padding each side).
+  controls::Flyout toggle_flyout;
+  toggle_flyout.Placement(winrt::Microsoft::UI::Xaml::Controls::Primitives::FlyoutPlacementMode::Top);
+  controls::TextBlock flyout_text;
+  flyout_text.FontSize(kTipFontSize);
+  flyout_text.TextWrapping(winrt::Microsoft::UI::Xaml::TextWrapping::Wrap);
+  flyout_text.MaxWidth(192);
+  flyout_text.Text(winrt::hstring(labels.auto_grouping_help));
+  flyout_text.Foreground(theme_brush(
+      L"TextFillColorSecondaryBrush", winrt::Windows::UI::Color{255, 110, 110, 115}));
+  toggle_flyout.Content(flyout_text);
+  toggle_help.Click([toggle_help, toggle_flyout](auto const&, auto const&) {
+    toggle_flyout.ShowAt(toggle_help);
+  });
+  controls::Grid::SetColumn(toggle_help, 1);
+  footer.Children().Append(toggle_help);
   // The window's one status line: its save result, or a failed copy.  It takes
   // the free space, so a message never moves the buttons.
   controls::TextBlock footer_status;
@@ -2030,14 +2076,77 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
     if (args.Key() != winrt::Windows::System::VirtualKey::Enter) return;
     commit_name();
   });
-  toggle.Click([&](auto const&, auto const&) {
-    // Returning to 自动分组 restores the staged deletes the automatic layout had
-    // marked, so the list never shows them while it is on.
-    if (toggle_on() && *staged_deletes > 0) {
-      for (auto& row : *rows) row.deleted = false;
-      *staged_deletes = 0;
-      rebuild();
+  // The rows as they stood before the switch staged the automatic layout, so
+  // turning it back off restores exactly what the sheet opened on.
+  auto auto_grouping_baseline = std::make_shared<std::optional<std::vector<SheetRow>>>();
+  // Stage the automatic layout in the sheet itself: one key per group, named
+  // exactly after its group.  The names the user reads *are* the feature, so a
+  // checked switch that still listed the old key names looked like it had done
+  // nothing at all.  The rule is Core's own alignment, applied to the rows on
+  // screen; a draft is the user's own edit and a row the user already staged for
+  // deletion stays deleted, and neither of those groups is given a replacement
+  // here (Core waits for Apply rather than creating a second key beside one it
+  // is retiring).
+  auto stage_auto_grouping = [&rows, &groups, staged_deletes, auto_grouping_baseline](bool enabled) {
+    if (enabled) {
+      if (!*auto_grouping_baseline) *auto_grouping_baseline = *rows;
+      std::set<std::wstring> kept_groups;
+      std::set<std::wstring> present_groups;
+      for (auto const& row : *rows) {
+        if (!row.draft && !row.group_id.empty()) present_groups.insert(row.group_id);
+      }
+      std::vector<SheetRow> staged;
+      staged.reserve(rows->size() + groups.size());
+      for (auto const& row : *rows) {
+        if (row.draft || row.deleted) {
+          staged.push_back(row);
+          continue;
+        }
+        auto group = std::find_if(groups.begin(), groups.end(), [&row](GroupManagerGroup const& entry) {
+          return entry.id == row.group_id;
+        });
+        if (group == groups.end() || kept_groups.count(row.group_id) > 0) {
+          // No group to name it after, or a later key in a group that already
+          // owns one: the automatic layout retires the row.
+          SheetRow candidate = row;
+          candidate.deleted = true;
+          staged.push_back(candidate);
+          continue;
+        }
+        kept_groups.insert(row.group_id);
+        SheetRow candidate = row;
+        candidate.name = group->name.empty() ? group->label : group->name;
+        candidate.enabled = true;
+        staged.push_back(candidate);
+      }
+      // A group no key names gets one, so every group ends with exactly one key
+      // of its own name.
+      for (auto const& group : groups) {
+        if (kept_groups.count(group.id) > 0 || present_groups.count(group.id) > 0) continue;
+        SheetRow candidate;
+        candidate.id = L"draft-" + group.id;
+        candidate.name = group.name.empty() ? group.label : group.name;
+        candidate.group_id = group.id;
+        candidate.group_label = candidate.name;
+        candidate.multiplier = group.rate;
+        candidate.original_name = candidate.name;
+        candidate.original_group_id = group.id;
+        candidate.draft = true;
+        staged.push_back(candidate);
+      }
+      *rows = std::move(staged);
+    } else if (*auto_grouping_baseline) {
+      *rows = **auto_grouping_baseline;
+      auto_grouping_baseline->reset();
     }
+    *staged_deletes = 0;
+    for (auto const& row : *rows) {
+      if (!row.draft && row.deleted) ++*staged_deletes;
+    }
+  };
+  toggle.Click([&](auto const&, auto const&) {
+    stage_auto_grouping(toggle_on());
+    rebuild();
     load_detail();
     refresh_apply();
   });

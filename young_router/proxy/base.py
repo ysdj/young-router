@@ -100,6 +100,43 @@ def _websocket_max_frame_bytes() -> int:
     return int(_WEBSOCKET_MAX_FRAME_DEFAULT_BYTES)
 
 
+_UVICORN_SHUTDOWN_PATCH_ATTR = "_young_router_shutdown_patch"
+
+
+def _install_uvicorn_shutdown_marker_patch() -> None:
+    """Record uvicorn's teardown so a stream it truncates is not read as upstream.
+
+    uvicorn closes every accepted connection at the start of ``shutdown`` and
+    only then waits ``timeout_graceful_shutdown`` for the in-flight requests,
+    so a turn that is still streaming at that moment always loses its response
+    body.  The patch marks the teardown for the whole await, which lets the
+    routing classifiers separate "the upstream failed" from "this process is
+    exiting".  Safe to call repeatedly and from interpreter startup.
+    """
+
+    try:
+        from uvicorn.server import Server
+    except Exception:  # pragma: no cover - uvicorn is optional in tests
+        return
+
+    original_shutdown = getattr(Server, "shutdown", None)
+    if original_shutdown is None:
+        return
+    if getattr(original_shutdown, _UVICORN_SHUTDOWN_PATCH_ATTR, False):
+        return
+
+    async def shutdown(self: Any, sockets: Any = None) -> None:
+        _begin_proxy_shutdown()
+        try:
+            await original_shutdown(self, sockets)
+        finally:
+            _end_proxy_shutdown()
+
+    setattr(shutdown, _UVICORN_SHUTDOWN_PATCH_ATTR, True)
+    setattr(shutdown, "_original_shutdown", original_shutdown)
+    Server.shutdown = shutdown  # type: ignore[method-assign]
+
+
 def _install_websocket_frame_limit_patch() -> None:
     """Raise uvicorn's default WebSocket frame limit for Responses turns.
 
@@ -371,6 +408,133 @@ _SANITIZED_UPSTREAM_ROUTE_FAILURE_STATUS_CODE = 503
 _SANITIZED_UPSTREAM_ROUTE_FAILURE_POLICY_ATTR = (
     "_sanitized_upstream_route_failure_recovery_policy"
 )
+# A stream that dies while this process is shutting down was not killed by the
+# upstream.  ``uvicorn.Server.shutdown`` closes every accepted connection
+# before it waits for the in-flight requests, so an event that was still being
+# produced at that instant surfaces as a truncated response body whose nested
+# cause reads like a network fault (``httpx.ReadError``, "peer closed
+# connection", "not enough data to satisfy transfer length header").  Reading
+# that as upstream evidence quarantines a healthy route and invites the client
+# to retry a turn the user's own restart caused, so the teardown is recorded
+# here and every classifier below consults it first.
+#
+# The flag belongs to the uvicorn ``Server`` class rather than to this module:
+# that class is the one object the patch is installed on, so the wrapper that
+# raises it and the classifier that reads it agree even when two module objects
+# exist for this file (the interpreter-startup hook and a reloaded hook
+# namespace are exactly that case).  A module global would let a stale wrapper
+# write a counter no reader ever sees.
+_PROXY_SHUTTING_DOWN_MARKER_ATTR = "_young_router_proxy_shutting_down"
+_PROXY_SHUTDOWN_DEPTH_ATTR = "_young_router_shutdown_depth"
+_PROXY_SHUTDOWN_LOCK_ATTR = "_young_router_shutdown_lock"
+_PROXY_SHUTDOWN_SERVER_CLASS: Any = None
+
+
+def _proxy_shutdown_owner() -> Any:
+    """The uvicorn ``Server`` class the teardown flag lives on, or ``None``."""
+
+    global _PROXY_SHUTDOWN_SERVER_CLASS
+    owner = _PROXY_SHUTDOWN_SERVER_CLASS
+    if owner is not None:
+        return owner
+    try:
+        from uvicorn.server import Server
+    except Exception:  # pragma: no cover - uvicorn is optional in tests
+        return None
+    _PROXY_SHUTDOWN_SERVER_CLASS = Server
+    return Server
+
+
+def _proxy_shutdown_lock(owner: Any) -> Any:
+    lock = getattr(owner, _PROXY_SHUTDOWN_LOCK_ATTR, None)
+    if lock is None:
+        lock = threading.RLock()
+        try:
+            setattr(owner, _PROXY_SHUTDOWN_LOCK_ATTR, lock)
+        except Exception:
+            pass
+    return lock
+
+
+def _proxy_shutdown_in_progress() -> bool:
+    """Whether this worker is tearing down and no longer listening."""
+
+    owner = _proxy_shutdown_owner()
+    if owner is None:
+        return False
+    return int(getattr(owner, _PROXY_SHUTDOWN_DEPTH_ATTR, 0) or 0) > 0
+
+
+def _begin_proxy_shutdown() -> None:
+    owner = _proxy_shutdown_owner()
+    if owner is None:  # pragma: no cover - the patch already requires uvicorn
+        return
+    with _proxy_shutdown_lock(owner):
+        depth = int(getattr(owner, _PROXY_SHUTDOWN_DEPTH_ATTR, 0) or 0)
+        try:
+            setattr(owner, _PROXY_SHUTDOWN_DEPTH_ATTR, depth + 1)
+        except Exception:
+            pass
+
+
+def _end_proxy_shutdown() -> None:
+    owner = _proxy_shutdown_owner()
+    if owner is None:  # pragma: no cover - the patch already requires uvicorn
+        return
+    with _proxy_shutdown_lock(owner):
+        depth = int(getattr(owner, _PROXY_SHUTDOWN_DEPTH_ATTR, 0) or 0)
+        try:
+            setattr(owner, _PROXY_SHUTDOWN_DEPTH_ATTR, max(0, depth - 1))
+        except Exception:
+            pass
+
+
+def _mark_exception_as_local_shutdown(exception: Exception) -> None:
+    """Stamp a failure that happened because this process is exiting.
+
+    The marker also travels with the exception's cause chain, because the
+    wrapper LiteLLM raises for a truncated stream and the transport error
+    underneath it are classified separately.
+    """
+
+    pending = [exception]
+    seen: set[int] = set()
+    while pending:
+        candidate = pending.pop()
+        candidate_id = id(candidate)
+        if candidate_id in seen:
+            continue
+        seen.add(candidate_id)
+        try:
+            setattr(candidate, _PROXY_SHUTTING_DOWN_MARKER_ATTR, True)
+        except Exception:
+            pass
+        for attr in ("__cause__", "__context__", "original_exception"):
+            nested = getattr(candidate, attr, None)
+            if isinstance(nested, Exception) and id(nested) not in seen:
+                pending.append(nested)
+
+
+def _is_local_shutdown_exception(exception: Exception) -> bool:
+    """Whether a failure is this worker's own teardown, not upstream evidence."""
+
+    pending = [exception]
+    seen: set[int] = set()
+    while pending:
+        candidate = pending.pop()
+        candidate_id = id(candidate)
+        if candidate_id in seen:
+            continue
+        seen.add(candidate_id)
+        if bool(getattr(candidate, _PROXY_SHUTTING_DOWN_MARKER_ATTR, False)):
+            return True
+        for attr in ("__cause__", "__context__", "original_exception"):
+            nested = getattr(candidate, attr, None)
+            if isinstance(nested, Exception) and id(nested) not in seen:
+                pending.append(nested)
+    return _proxy_shutdown_in_progress()
+
+
 _ROUTE_FAILURE_POLICY_ATTR = "_young_router_route_failure_recovery_policy"
 _SAME_DEPLOYMENT_RETRY_EXHAUSTED_ATTR = (
     "_young_router_same_deployment_retry_exhausted"
@@ -698,6 +862,27 @@ _UPSTREAM_HTML_BAD_REQUEST_MARKERS = (
     "<html",
     "400 bad request",
     "nginx",
+)
+# A gateway that refuses an over-large request body with HTTP 400 states the
+# verdict in prose instead of the 413 status.  These are the sentences that say
+# "these bytes cannot fit through me", as opposed to a context-window refusal
+# that names a token count.  Chinese gates report it as 内容过长 ("the content is
+# too long"), which reaches the trace as that exact phrase.
+_REQUEST_BODY_SIZE_REJECTION_MARKERS = (
+    "内容过长",
+    "请求体过大",
+    "请求过大",
+    "报文过长",
+    "内容过大",
+    "request body too large",
+    "request body is too large",
+    "request entity too large",
+    "payload too large",
+    "body too large",
+    "body is too large",
+    "content too long",
+    "content is too long",
+    "request too large",
 )
 _LITELLM_MODEL_GROUP_FALLBACK_EXHAUSTED_MARKERS = (
     "received model group=",

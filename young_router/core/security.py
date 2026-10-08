@@ -41,6 +41,27 @@ NON_SECRET_TOKEN_COUNTER_KEYS = frozenset(
         "total_tokens",
     }
 )
+# ``_plain_string_is_safe`` has to answer "does REDACT_TEXT leave this string
+# alone?" for every string a snapshot exposes, and the answer for the great
+# majority of them is yes.  Two rules made a snapshot pay for text that never
+# changes:
+#
+# * A Python character loop testing ``isspace() or not isascii()`` cost two
+#   interpreter-level method calls per character.  One C-level scan of the
+#   exact whitespace class replaces it (the class below is
+#   ``chr(c).isspace()`` for the whole code space, verified exhaustively).
+# * Treating every non-ASCII value as unproven sent each CJK provider, group,
+#   and model name through the full rule set.  None of the five patterns can
+#   match text that has no whitespace *and* no ``=``/``:``/``http``/``-``/``/``
+#   shape, and a CJK name has none of them, so the probe now decides on the
+#   literal each pattern needs rather than on the string's encoding.
+#
+# Whitelisting is only ever widened where the rules provably cannot fire;
+# the probes below stay exactly as conservative as the rewrite they stand in
+# for.
+_TEXT_WHITESPACE = re.compile(
+    "[\\x09-\\x0d\\x1c-\\x20\\x85\\xa0\\u1680\\u2000-\\u200a\\u2028-\\u2029\\u202f\\u205f\\u3000]"
+)
 PATH_KEY_MARKERS = ("path", "directory", "dirname", "filename", "file", "cwd", "root")
 SENSITIVE_QUERY_MARKERS = ("key", "token", "secret", "password", "passwd", "credential", "auth")
 # A path value only needs the absolute-path rule when it really carries one.
@@ -52,6 +73,23 @@ _TEXT_BEARER = re.compile(r"(?i)\b(?:bearer\s+)[A-Za-z0-9._~-]{8,}\b")
 
 
 def _key_text(key: object) -> str:
+    """Normalize one key name the way every projection compares it.
+
+    A snapshot asks this once per field of every object it exposes, and the
+    same few hundred names repeat across all of them, so the normalized form
+    is remembered for each distinct string key.  Only a real ``str`` is cached,
+    so a non-string key can never collide with the string that spells it.
+    """
+
+    if type(key) is str:
+        cached = _key_text_cache.get(key)
+        if cached is not None:
+            return cached
+        text = key.strip().lower().replace("-", "_")
+        if len(_key_text_cache) >= _KEY_TEXT_CACHE_LIMIT:
+            _key_text_cache.clear()
+        _key_text_cache[key] = text
+        return text
     return str(key).strip().lower().replace("-", "_")
 
 
@@ -61,6 +99,10 @@ def _key_text(key: object) -> str:
 # repeated path.
 _KEY_CLASSIFICATION_LIMIT = 4096
 _key_classification_cache: "dict[str, tuple[bool, bool]]" = {}
+# The same budget for the name normalization itself: a snapshot's key names are
+# a few hundred distinct strings repeated across every object it projects.
+_KEY_TEXT_CACHE_LIMIT = 8192
+_key_text_cache: "dict[str, str]" = {}
 
 
 def _key_classification(text: str) -> tuple[bool, bool]:
@@ -133,12 +175,19 @@ def redact(value: object, *, known_secrets: Sequence[str] = (), _key: object = "
             return value
         return REDACT_TEXT(value, secret_values=set(secret_values))
     if isinstance(value, Mapping):
-        return {
-            str(key): redact(item, known_secrets=known_secrets, _key=key)
-            for key, item in value.items()
-        }
+        # A plain loop: this runs once per field of every object a snapshot
+        # exposes, and binding the recursive call's arguments here is cheaper
+        # than a comprehension that has to close over the enclosing frame.
+        result: dict[Any, Any] = {}
+        for key, item in value.items():
+            result[str(key)] = redact(item, known_secrets=known_secrets, _key=key)
+        return result
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return [redact(item, known_secrets=known_secrets) for item in value]
+    # An immutable leaf this function hands back unchanged: copying it only paid
+    # for a call, and every caller of a snapshot treats the result as read-only.
+    if value is None or value is True or value is False or type(value) is int or type(value) is float:
+        return value
     return copy.deepcopy(value)
 
 
@@ -157,10 +206,10 @@ def _plain_string_is_safe(value: str, secret_values: set[str]) -> bool:
         return True
     if secret_values and any(secret in value for secret in secret_values):
         return False
-    for character in value:
-        if character.isspace() or not character.isascii():
-            # Whitespace is joined; a non-ASCII value still has to prove it.
-            return False
+    # Whitespace is joined; that join is the one rewrite that can happen to a
+    # string none of the patterns below needs to have matched.
+    if _TEXT_WHITESPACE.search(value) is not None:
+        return False
     if "-" in value and _TEXT_CREDENTIAL_PREFIX.search(value):
         return False
     # A bearer credential needs a space to separate its two words, and the
@@ -183,10 +232,23 @@ def REDACT_TEXT(value: str, *, secret_values: set[str] | None = None) -> str:
             text = text.replace(secret, REDACTED)
     # Provider keys frequently use the OpenAI-looking ``sk-`` prefix.  Keep
     # this generic and bounded; never echo the original token in a traceback.
-    text = _TEXT_CREDENTIAL_PREFIX.sub(REDACTED, text)
-    text = _TEXT_BEARER.sub("Bearer " + REDACTED, text)
-    text = _redact_url_text(text)
-    text = _redact_key_value_text(text)
+    #
+    # Every rule below is guarded by a cheap substring test for a literal its
+    # own pattern cannot match without: the credential rules need the ``-``
+    # that separates their prefix from the token, the URL rule needs ``http``,
+    # the path rule needs ``/``, and the key/value rule needs ``=`` or ``:``.
+    # A snapshot runs this over every string a projection exposes, and almost
+    # all of them are plain names, ids, and slugs that carry none of those —
+    # so those strings now cost a handful of C-level ``in`` tests instead of
+    # four full regex scans.  The guards only ever skip a rule that provably
+    # cannot match, so the rewrite is unchanged wherever it can apply.
+    if "-" in text:
+        text = _TEXT_CREDENTIAL_PREFIX.sub(REDACTED, text)
+        text = _TEXT_BEARER.sub("Bearer " + REDACTED, text)
+    if "http" in text:
+        text = _redact_url_text(text)
+    if "=" in text or ":" in text:
+        text = _redact_key_value_text(text)
     # Absolute paths are private even when no secret is present.  Preserve a
     # useful basename only for paths clearly marked by an error author.
     # A slash immediately following ``:`` or another slash belongs to a URL,

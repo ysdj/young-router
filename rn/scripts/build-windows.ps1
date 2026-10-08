@@ -8,12 +8,24 @@ if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP)) {
 } else {
   $Core = Join-Path $env:RUNNER_TEMP ("young-router-rn-core-" + [guid]::NewGuid().ToString("N"))
 }
-$PiWork = Join-Path ([System.IO.Path]::GetTempPath()) ("young-router-pi-web-access-" + [guid]::NewGuid().ToString("N"))
-$PiPackage = Join-Path $PiWork "package"
-$PiNode = Join-Path $PiWork "node"
-$VeridropWork = Join-Path ([System.IO.Path]::GetTempPath()) ("young-router-veridrop-" + [guid]::NewGuid().ToString("N"))
-$WorkBuddyConnectWork = Join-Path ([System.IO.Path]::GetTempPath()) ("young-router-workbuddy-connect-" + [guid]::NewGuid().ToString("N"))
-$DshVisionRouterWork = Join-Path ([System.IO.Path]::GetTempPath()) ("young-router-dsh-vision-router-" + [guid]::NewGuid().ToString("N"))
+$PiNode = Join-Path ([System.IO.Path]::GetTempPath()) ("young-router-pi-node-" + [guid]::NewGuid().ToString("N"))
+# Third-party staging lives in a persistent cache rather than a fresh GUID
+# directory, for the same reason the macOS build does it: a build stages the
+# same four releases over and over, each script resolves its upstream release
+# on every run, and re-installing a release it has already staged is the
+# largest remaining cost.  A tree is reused only when its own lookup resolves
+# that exact release (see ``reused_staged_release`` in
+# scripts/update_common.py), so deleting this directory is always safe.
+$StagingCache = if ($env:YOUNG_ROUTER_STAGING_CACHE) {
+  $env:YOUNG_ROUTER_STAGING_CACHE
+} else {
+  Join-Path $RnRoot ".staging-cache"
+}
+New-Item -ItemType Directory -Force -Path $StagingCache | Out-Null
+$PiPackage = Join-Path $StagingCache "pi-web-access"
+$VeridropWork = Join-Path $StagingCache "veridrop"
+$WorkBuddyConnectWork = Join-Path $StagingCache "workbuddy-connect"
+$DshVisionRouterWork = Join-Path $StagingCache "dsh-vision-router"
 
 function Copy-CoreSource {
   param([string]$Source, [string]$Destination)
@@ -144,7 +156,7 @@ print('young-router-veridrop-import-ok')
   if (-not (Test-Path (Join-Path $RuntimeBin "node.exe"))) {
     throw "The bundled Node.js runtime is missing."
   }
-  $PiSmokeConfig = Join-Path $PiWork "smoke-config"
+  $PiSmokeConfig = Join-Path $PiNode "smoke-config"
   "" | & (Join-Path $RuntimeBin "node.exe") `
     (Join-Path $Core "young_router\adapters\pi_web_access_worker.mjs") `
     --entry (Join-Path $Core "young_router\adapters\pi-web-access\index.ts") `
@@ -229,7 +241,7 @@ print('young-router-veridrop-import-ok')
   if (Test-Path $Core) {
     Remove-Item -LiteralPath $Core -Recurse -Force -ErrorAction SilentlyContinue
   }
-  if (Test-Path $PiWork) {
-    Remove-Item -LiteralPath $PiWork -Recurse -Force -ErrorAction SilentlyContinue
+  if (Test-Path $PiNode) {
+    Remove-Item -LiteralPath $PiNode -Recurse -Force -ErrorAction SilentlyContinue
   }
 }

@@ -205,25 +205,37 @@ function hasFreshServiceRates(service: ServiceID | undefined): boolean {
   return cached !== undefined && Date.now() - cached.at < SERVICE_RATE_TTL_MS;
 }
 
+/**
+ * One service's rate per model, or `undefined` when no catalog answered.
+ *
+ * The distinction is the whole point of the return type: an answer that named
+ * no model is not a catalog of no rates.  A read that failed, ran before its
+ * worker was ready, or landed on a summary another window's read had already
+ * replaced carries no catalog at all, and remembering that as this service's
+ * answer would hide every 倍率 for the rest of the interval — the row could
+ * not even ask again, because its own cache said the question was answered.
+ */
 async function serviceModelRate(
   service: ServiceID,
   read: (providerId: string) => Promise<CoreSnapshot | undefined>,
-): Promise<Record<string, string>> {
+  options?: { force?: boolean },
+): Promise<Record<string, string> | undefined> {
   const cached = serviceRates.get(service);
-  if (cached && Date.now() - cached.at < SERVICE_RATE_TTL_MS) return cached.rates;
+  if (!options?.force && cached && Date.now() - cached.at < SERVICE_RATE_TTL_MS) return cached.rates;
   const providerId = service === "workbuddyAI" ? "workbuddy-ai" : service === "workbuddy" ? "workbuddy" : "";
-  if (!providerId) return {};
+  if (!providerId) return undefined;
   const snapshot = await read(providerId);
   const summary = asRecord(asRecord(snapshot?.action_summaries?.providers_models).operation_summary);
+  // Only a named operation is this read's own answer: another action's
+  // summary sitting in the slot says nothing about this service's catalog.
+  if (summary.operation !== "workbuddy_models" || summary.available !== true) return undefined;
   const rates: Record<string, string> = {};
-  if (summary.available === true) {
-    for (const entry of asRecords(summary.models)) {
-      const modelID = stringValue(entry.id).trim();
-      if (!modelID) continue;
-      const billing = asRecord(entry.billing);
-      const credits = stringValue(billing.credits).trim();
-      rates[modelID] = credits ? credits.replace(/\s*credits?$/i, "") : billing.free === true ? "x0.00" : "";
-    }
+  for (const entry of asRecords(summary.models)) {
+    const modelID = stringValue(entry.id).trim();
+    if (!modelID) continue;
+    const billing = asRecord(entry.billing);
+    const credits = stringValue(billing.credits).trim();
+    rates[modelID] = credits ? credits.replace(/\s*credits?$/i, "") : billing.free === true ? "x0.00" : "";
   }
   serviceRates.set(service, { at: Date.now(), rates });
   return rates;
@@ -314,14 +326,6 @@ function workbuddyModelRate(model: UnknownRecord, translate: Translate): string 
 function progressText(busy: boolean, translate: Translate): string | undefined {
   return busy ? translate("common.loading") : undefined;
 }
-
-/** The login types a service provider can be switched between, in menu order. */
-const SERVICE_KIND_OPTIONS: ReadonlyArray<{ kind: ProviderKind; label: TranslationKey }> = [
-  { kind: "openai", label: "providers.type.openai" },
-  { kind: "claude", label: "providers.type.claude" },
-  { kind: "workbuddy", label: "providers.type.workbuddy" },
-  { kind: "workbuddyAI", label: "providers.type.workbuddyAI" },
-];
 
 function providerKindLabel(kind: ProviderKind, translate: Translate): string {
   return kind === "relay"
@@ -927,6 +931,13 @@ function isRevisionRetryableAction(type: string): boolean {
   const editorMutation = normalized.startsWith("model_") || normalized.startsWith("provider_");
   return editorMutation
     || normalized === "service_provider_add"
+    // A service provider's own field — its name and its enabled switch — is an
+    // absolute value addressed by a stable editor id, exactly like a custom
+    // provider's, so a conflict here rebases like every other editor edit.
+    // Without it a rename lost the race against the pane's own debounced
+    // Apply, was reported as a conflict, and the field visibly reverted.
+    || normalized === "service_provider_patch"
+    || normalized === "service_patch_provider"
     || normalized.startsWith("service_provider_auth_")
     || normalized.startsWith("provider_auth_")
     || normalized === "account_add"
@@ -963,16 +974,6 @@ function domainState(snapshot: CoreSnapshot | undefined, domain: ConfigDomain): 
 
 function codexModelCatalogState(snapshot: CoreSnapshot | undefined): UnknownRecord {
   return asRecord(domainState(snapshot, "codex").model_catalog);
-}
-
-function codexModelCatalogRestartSignature(catalog: UnknownRecord): string {
-  const models = Array.isArray(catalog.public_models)
-    ? Array.from(new Set(catalog.public_models
-        .filter((value): value is string => typeof value === "string")
-        .map((value) => value.trim())
-        .filter(Boolean))).sort()
-    : [];
-  return JSON.stringify({ enabled: booleanValue(catalog.enabled), models });
 }
 
 function domainForRoute(route: AppRoute): ConfigDomain | undefined {
@@ -1079,12 +1080,6 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
   // never re-runs it.
   const launchPresented = useRef(false);
   const acceptedSnapshotRevision = useRef<number>(initialSnapshot?.revision ?? -1);
-  // Core can be recreated after an IPC/subscription recovery, so its local
-  // change_event counter may start over. Deduplicate by the actual catalog
-  // signature instead of by that process-local counter.
-  const presentedCatalogRestartSignature = useRef<string | undefined>(undefined);
-  const acknowledgedCatalogRestartSignature = useRef<string | undefined>(undefined);
-  const catalogRestartConfirmationOpen = useRef(false);
 
   const recordMenuAction = useCallback(async (action: string): Promise<void> => {
     try {
@@ -1353,82 +1348,6 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
       })();
     }
   }, [hostTranslate, ipc, isPrimaryHost, nativeAction, receiveSnapshot, recordMenuAction, runServiceOperation, snapshot]);
-
-  useEffect(() => {
-    if (!isPrimaryHost || Platform.OS !== "macos" || !snapshot) return;
-    const catalog = codexModelCatalogState(snapshot);
-    const signature = codexModelCatalogRestartSignature(catalog);
-    if (!booleanValue(catalog.restart_required)) {
-      presentedCatalogRestartSignature.current = undefined;
-      return;
-    }
-    if (signature === presentedCatalogRestartSignature.current
-      || signature === acknowledgedCatalogRestartSignature.current
-      || catalogRestartConfirmationOpen.current) return;
-    presentedCatalogRestartSignature.current = signature;
-    catalogRestartConfirmationOpen.current = true;
-    void (async () => {
-      let acknowledgementCommitted = false;
-      const acknowledge = async (): Promise<void> => {
-        try {
-          await ipc.dispatch({ domain: "codex", type: "acknowledge_model_catalog_restart", payload: {} });
-          // The Core action is committed before it emits a snapshot. Do not
-          // turn a follow-up projection failure into a second prompt.
-          acknowledgementCommitted = true;
-          acknowledgedCatalogRestartSignature.current = signature;
-        } catch (reason) {
-          // A Core action can be committed while its post-action emission
-          // fails (for example while the service status is transient). Read
-          // the authoritative snapshot before deciding to present again.
-          try {
-            const current = await ipc.snapshot();
-            const currentCatalog = codexModelCatalogState(current);
-            receiveSnapshot(current);
-            if (!booleanValue(currentCatalog.restart_required)) {
-              acknowledgementCommitted = true;
-              acknowledgedCatalogRestartSignature.current = codexModelCatalogRestartSignature(currentCatalog);
-              return;
-            }
-          } catch {
-            // Preserve the original failure below.
-          }
-          throw reason;
-        }
-        try {
-          receiveSnapshot(await ipc.snapshot());
-        } catch {
-          // The acknowledgement is already committed; the next subscription
-          // event or explicit snapshot will refresh the UI state.
-        }
-      };
-      try {
-        let restartFailed = false;
-        for (;;) {
-          const choice = await native.showCodexRestartConfirmation({
-            title: translate("codex.modelCatalogRestartTitle"),
-            message: restartFailed
-              ? `${translate("codex.modelCatalogRestartBody")}\n\n${translate("codex.modelCatalogRestartFailed")}`
-              : translate("codex.modelCatalogRestartBody"),
-            restartLabel: translate("codex.modelCatalogRestartNow"),
-            laterLabel: translate("codex.modelCatalogRestartLater"),
-          });
-          if (choice !== "restart" || await native.restartCodex()) {
-            await acknowledge();
-            return;
-          }
-          restartFailed = true;
-        }
-      } catch {
-        // The native panel is independent from every settings window. Keep
-        // those windows usable if its acknowledgement is temporarily
-        // unavailable, then present the same outstanding event again when
-        // the next Core snapshot arrives.
-        if (!acknowledgementCommitted) presentedCatalogRestartSignature.current = undefined;
-      } finally {
-        catalogRestartConfirmationOpen.current = false;
-      }
-    })();
-  }, [hostTranslate, ipc, isPrimaryHost, native, receiveSnapshot, snapshot, translate]);
 
   useEffect(() => {
     if (!isPrimaryHost || !snapshot) return;
@@ -2918,14 +2837,6 @@ function serviceProviderKindLabel(kind: ServiceProviderKind, translate: Translat
  * the short name is not in Core's `_SERVICE_PROVIDER_KINDS`, so a dispatch
  * that sent it would be refused as an unavailable login type.
  */
-function serviceProviderKindFor(kind: ProviderKind): ServiceProviderKind | undefined {
-  return kind === "openai" ? "openai_login"
-    : kind === "claude" ? "claude_login"
-      : kind === "workbuddy" ? "workbuddy_login"
-        : kind === "workbuddyAI" ? "workbuddy_ai_login"
-          : undefined;
-}
-
 function nextServiceProviderName(providers: UnknownRecord[], kind: ServiceProviderKind): string {
   const base = kind === "openai_login" ? "OpenAI"
     : kind === "claude_login" ? "Claude"
@@ -4185,6 +4096,9 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     if (!selectedService || hasFreshServiceRates(selectedService)) return;
     void serviceModelRate(selectedService, (providerId) => dispatchWithOutcome("workbuddy_models", { provider: providerId }, "providers_models", true))
       .catch(() => undefined);
+    // A read that produced no catalog staged nothing, so this effect is free
+    // to be re-entered: selecting another model of the same service, or the
+    // same one again, asks again instead of waiting out the interval.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedService]);
   async function probeModel(targetProviderId: string, targetModelId: string, inputs: string, options?: { confirmRecommendation?: boolean }): Promise<void> {
@@ -5470,9 +5384,19 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
     // travels with the action that asked for it.  Reading the rate is this
     // row's own wait — it reaches the upstream, and for a WorkBuddy route the
     // desktop app's live catalog — so it never holds the pane-wide wait.
-    void serviceModelRate(service, (providerId) => dispatchSnapshot("workbuddy_models", { provider: providerId }, "providers_models", true)).then((rates) => {
-      if (!cancelled) setServiceRate(rates[upstreamModelID] ?? "");
-    }).catch(() => undefined);
+    //
+    // A read that returned no catalog is retried once: the first read after a
+    // worker start can land before its own catalog is in hand, and a second
+    // clear depends on facts this row was already told.  The cache is written
+    // only by a read that answered, so the retry is the last word either way.
+    const readRates = (force: boolean): void => {
+      void serviceModelRate(service, (providerId) => dispatchSnapshot("workbuddy_models", { provider: providerId }, "providers_models", true), { force }).then((rates) => {
+        if (cancelled) return;
+        if (rates) { setServiceRate(rates[upstreamModelID] ?? ""); return; }
+        if (!force) readRates(true);
+      }).catch(() => undefined);
+    };
+    readRates(false);
     return () => { cancelled = true; };
   }, [service, upstreamModelID]);
   const providerIndex = providers.findIndex((item) => editorIdentifier(item) === providerId);
@@ -6146,17 +6070,15 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
     const pendingID = `login-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     const stationName = suggestedRelayStationName(origin) || origin;
     try {
-      // The station family decides which login probes the native flow runs
-      // and which session it keeps, so it is resolved before the sign-in the
-      // way every other surface resolves it: a station this provider is
-      // already bound to states its own type, and a bare address is asked.
-      // Guessing one family here would run the wrong probes against the other
-      // station and end in a sign-in that can never complete.
-      const relayType = station?.type ?? await relay.detectType(origin);
-      if (!relayType) {
-        onStatus?.(translate("relay.typeNotDetected"));
-        return;
-      }
+      // The sign-in window opens at once.  A station this provider is already
+      // bound to states its family here; a bare address does not, and the
+      // native flow settles it from the answer one of the page's own probes
+      // returns.  Asking first cost the user two network probes (up to three
+      // seconds each) of a spinner before the browser could even appear, to
+      // learn something the page they are about to sign in to answers anyway.
+      // The station binding is created when the login lands, from the family
+      // the flow resolved, so a cancelled sign-in still reserves nothing.
+      const relayType = station?.type ?? "";
       const result = await native.relayLogin({
         accountId: pendingID,
         type: relayType,
@@ -6165,7 +6087,7 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
         language,
         pendingAccount: true,
         stationName,
-        stationType: relayType,
+        stationType: station?.type,
         stationOrigin: origin,
       });
       if (!result) {
@@ -6256,17 +6178,6 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
         onCommit={(name) => {
           const next = name.trim();
           if (next && next !== providerName) void dispatch("service_provider.patch", { provider_id: id, provider: { name: next } });
-        }}
-      />
-      <PickerField
-        label={translate("providers.wizard.providerType")}
-        labelWidth={88}
-        value={kind}
-        values={SERVICE_KIND_OPTIONS.map((option) => ({ value: option.kind, label: translate(option.label) }))}
-        disabled={busy}
-        onSelect={(next) => {
-          const authKind = serviceProviderKindFor(next as ProviderKind);
-          if (authKind && next !== kind) void dispatch("service_provider.patch", { provider_id: id, provider: { auth_kind: authKind } });
         }}
       />
       <View style={styles.officialStatusRow}>
@@ -6635,8 +6546,8 @@ function AssistantSettingsWorkspace({ busy, native, codexModels, codexModelCatal
   // Codex's own model list is one Core switch, not a document edit: checked
   // installs this app's public model list as Codex's catalog, unchecked drops
   // the managed pointer so the client falls back to its built-in list. Core
-  // owns the value; the switch only guards the request while it is in flight,
-  // and macOS follows a change with the Codex restart prompt.
+  // owns the value and the switch only guards the request while it is in
+  // flight.
   const [catalogBusy, setCatalogBusy] = useState(false);
   const toggleCatalog = (enabled: boolean): void => {
     if (catalogBusy) return;

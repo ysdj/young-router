@@ -371,6 +371,81 @@ class ServiceProviderBoundaryTests(unittest.TestCase):
             self.assertGreater(result["revision"], before)
             self.assertFalse(domain.draft_state()["providers"][0]["enabled"])
 
+    def test_a_workbuddy_read_answers_with_its_own_action_summary(self) -> None:
+        """The catalog read a rate row asks for travels back with that read.
+
+        A live read stages nothing but still advances Core's shared revision,
+        and the provider pane's own account read runs alongside the model
+        pane's catalog read.  The catalog must therefore come back on the
+        dispatch that asked for it: reading the shared slot afterwards returns
+        whichever read landed last, and a rate row that receives an account
+        document builds no rate at all — the 倍率 row then reads 无 for the
+        whole cache interval.
+        """
+
+        directory, domain = self._domain()
+        with directory:
+            models = [
+                {
+                    "id": "glm-5.3",
+                    "name": "GLM-5.3",
+                    "billing": {"credits": "x0.79 credits", "free": False},
+                }
+            ]
+            catalog_summary = {
+                "operation": "workbuddy_models",
+                "provider": "workbuddy",
+                "display_name": "WorkBuddy",
+                "available": True,
+                "models": models,
+            }
+            status_summary = {
+                "operation": "workbuddy_status",
+                "available": True,
+                "detail": "",
+                "providers": {"workbuddy": {"state": "signed-in"}},
+            }
+
+            def dispatch_operation(action: str, data):  # type: ignore[no-untyped-def]
+                domain._last_operation = (
+                    catalog_summary if action == "workbuddy_models" else status_summary
+                )
+                return {"operation_summary": domain._last_operation}
+
+            core = CoreStore(domains=[domain])
+            with patch.object(domain, "dispatch", side_effect=dispatch_operation):
+                fetched = core.dispatch(
+                    {
+                        "domain": "providers_models",
+                        "type": "workbuddy_models",
+                        "payload": {"provider": "workbuddy"},
+                    },
+                    expected_revision=core.revision,
+                )
+            self.assertEqual(catalog_summary, fetched.get("action_summary"))
+
+    def test_a_workbuddy_account_read_answers_with_its_own_summary(self) -> None:
+        """Every WorkBuddy read names itself, not just the catalog one."""
+
+        directory, domain = self._domain()
+        with directory:
+            core = CoreStore(domains=[domain])
+            result = core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "workbuddy_status",
+                    "payload": {"refresh": True},
+                },
+                expected_revision=core.revision,
+            )
+            summary = result.get("action_summary")
+            self.assertIsInstance(summary, dict)
+            self.assertEqual("workbuddy_status", summary["operation"])
+            self.assertEqual(
+                domain._last_operation,
+                core.snapshot()["action_summaries"]["providers_models"]["operation_summary"],
+            )
+
     def test_dispatch_returns_only_the_current_model_fetch_summary(self) -> None:
         directory, domain = self._domain()
         with directory:

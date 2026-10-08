@@ -46,8 +46,7 @@ _CODEX_ENVIRONMENT_LOCK = threading.RLock()
 _CATALOG_SOURCE_REFRESH_SECONDS = 0.5
 
 # App-private bookkeeping for the managed catalog.  Codex only ever reads the
-# catalog itself (through ``model_catalog_json``): the deferred-restart
-# acknowledgement stays in this process's memory and the pinned inheritance
+# catalog itself (through ``model_catalog_json``): the pinned inheritance
 # profile lives in the runtime settings file, so no catalog state file is
 # written anywhere.
 CATALOG_BASE_PROFILE_SETTING = "YOUNG_ROUTER_CATALOG_BASE_PROFILE"
@@ -156,10 +155,8 @@ class CodexSettingsDomain:
         )
         self.model_catalog_path = managed_catalog_path(resolved_home)
         # App-private catalog bookkeeping stays out of the Codex directory:
-        # the acknowledgement lives in this process's memory (the host's UI
-        # already deduplicates re-presentation) and the inheritance pin lives
-        # in the app's runtime settings file.  Legacy sidecar files are
-        # imported once and removed.
+        # the inheritance pin lives in the app's runtime settings file.
+        # Legacy sidecar files are imported once and removed.
         self._catalog_base_profile_pin: str | None = None
         self._catalog_base_profile_loaded = False
         self._context_registry = ModelContextRegistry(
@@ -169,28 +166,17 @@ class CodexSettingsDomain:
             legacy_cache_paths=legacy_context_cache_paths(resolved_home),
             refresh_enabled=runtime_settings_path is not None,
         )
-        self._catalog_restart_required = False
-        self._catalog_change_reason: str | None = None
-        self._catalog_change_event = 0
         # A managed catalog pointer that names a missing file makes Codex refuse
         # every configuration load ("No such file or directory"), so the repair
         # that clears it must never re-enter itself through ``reload()`` and must
         # report a failure instead of leaving the client broken silently.
         self._catalog_pointer_repairing = False
         self._catalog_pointer_error: str | None = None
-        # A deferred restart acknowledges the current public-model set. Keep
-        # that acknowledgement in memory so a later catalog repair/snapshot
-        # cannot manufacture a new prompt for the same model IDs. A genuine
-        # model-set (or enabled-state) change still creates a new event, and a
-        # recreated Core re-arms the signature instead of writing app state to
-        # disk for it.
-        self._catalog_pending_signature: tuple[bool, tuple[str, ...]] | None = None
-        self._catalog_acknowledged_signature: tuple[bool, tuple[str, ...]] | None = None
         # Endpoint-backed repairs are noisy during proxy reloads: /v1/models
         # can briefly alternate between adjacent worker views. Require two
-        # consecutive observations of the same repaired model set before
-        # asking Codex to restart. Explicit enable/disable actions bypass this
-        # observation gate and remain immediate.
+        # consecutive observations of the same repaired model set before the
+        # catalog is rewritten, so a transient partial view never becomes the
+        # client's model list.
         self._catalog_repair_observed_signature: tuple[bool, tuple[str, ...]] | None = None
         self._catalog_repair_observation_count = 0
         self._catalog_source_checked_at = 0.0
@@ -267,10 +253,10 @@ class CodexSettingsDomain:
     def _import_legacy_catalog_pin(self) -> str:
         """Move a retired sidecar pin into the settings file and clean up.
 
-        The sidecar only ever held the deferred-restart acknowledgement plus
-        this pin.  The acknowledgement is process state now, so the files are
-        imported once, their pin is stored in the runtime settings, and every
-        retired copy is removed from both the app root and the Codex home.
+        The sidecar only ever held this pin plus an acknowledgement no release
+        uses any more.  The files are imported once, their pin is stored in the
+        runtime settings, and every retired copy is removed from both the app
+        root and the Codex home.
         """
 
         candidates = [
@@ -548,7 +534,7 @@ class CodexSettingsDomain:
         for state in (self._raw, self._draft):
             # A failed probe is not an observed empty model list.  Keep the
             # last verified names so a transient startup/reload failure cannot
-            # erase the catalog and manufacture a Codex restart prompt.
+            # erase the catalog.
             if source_available:
                 state["exposed_models"] = copy.deepcopy(exposed_models)
                 # The configured model list is the catalog allowlist.  Refresh
@@ -571,68 +557,12 @@ class CodexSettingsDomain:
         *,
         enabled: bool,
     ) -> tuple[bool, tuple[str, ...]]:
-        # Catalog restart decisions are about model IDs, not endpoint order.
+        # Catalog repair decisions are about model IDs, not endpoint order.
         return enabled, tuple(sorted(set(names)))
 
     def _reset_catalog_repair_observation(self) -> None:
         self._catalog_repair_observed_signature = None
         self._catalog_repair_observation_count = 0
-
-    @staticmethod
-    def _configured_model_names(payload: Mapping[str, Any]) -> set[str]:
-        """Names of the models configured in the runtime model list."""
-
-        names: set[str] = set()
-        models = payload.get("models", [])
-        if not isinstance(models, list):
-            return names
-        for entry in models:
-            if not isinstance(entry, Mapping):
-                continue
-            name = entry.get("model")
-            if isinstance(name, str) and name.strip():
-                names.add(name.strip())
-        return names
-
-    def _queue_catalog_restart(
-        self,
-        reason: str,
-        *,
-        names: list[str] | tuple[str, ...] | None = None,
-        enabled: bool | None = None,
-        force: bool = False,
-    ) -> bool:
-        current_enabled = self._is_catalog_enabled(self._raw) if enabled is None else enabled
-        current_names = names
-        if current_names is None:
-            current_names = self._catalog_model_names(self._raw) if current_enabled else []
-        signature = self._catalog_signature(current_names, enabled=current_enabled)
-        # Endpoint-backed repairs run through the shared stability gate in
-        # ``_ensure_model_catalog_current``; explicit enable/disable actions
-        # queue their restart immediately and bypass that observation gate.
-        self._reset_catalog_repair_observation()
-        if not force and signature == self._catalog_acknowledged_signature:
-            return False
-        if not force:
-            acknowledged = self._catalog_acknowledged_signature
-            if acknowledged is not None and acknowledged[0] == signature[0]:
-                added = set(signature[1]) - set(acknowledged[1])
-                dropped = set(acknowledged[1]) - set(signature[1])
-                configured = self._configured_model_names(self._raw)
-                # Worker views can flap a runtime-added route that is not
-                # part of the configured public model set.  Repairing the
-                # catalog file to match the live exposure is fine, but only
-                # a change that involves configured names warrants a Codex
-                # restart prompt.
-                if not (added & configured) and not (dropped & configured):
-                    return False
-        if self._catalog_restart_required and signature == self._catalog_pending_signature:
-            return False
-        self._catalog_restart_required = True
-        self._catalog_change_reason = reason
-        self._catalog_change_event += 1
-        self._catalog_pending_signature = signature
-        return True
 
     def _remove_retired_catalog_copies(self) -> None:
         """Drop app-written catalogs the applied config no longer names.
@@ -654,7 +584,6 @@ class CodexSettingsDomain:
     def _ensure_model_catalog_current(
         self,
         *,
-        notify: bool,
         force_source_refresh: bool = False,
         require_stable_repair: bool = False,
     ) -> bool:
@@ -673,13 +602,12 @@ class CodexSettingsDomain:
                 # of leaving the client unusable; the next available probe (or an
                 # explicit switch) restores the catalog.
                 if self._repair_catalog_pointer(None):
-                    self._queue_catalog_restart("catalog_missing", names=[], enabled=False, force=True)
                     self.revision += 1
             return False
         names = self._catalog_model_names(self._raw)
         self._context_registry.refresh_if_due()
         model_ids_changed = self._catalog_model_ids_changed(names)
-        if require_stable_repair and notify and model_ids_changed:
+        if require_stable_repair and model_ids_changed:
             if not source_refreshed:
                 # Do not count repeated snapshots of the same cached probe as
                 # separate endpoint observations.
@@ -728,8 +656,6 @@ class CodexSettingsDomain:
                 self._remove_retired_catalog_copies()
         else:
             self._remove_retired_catalog_copies()
-        if notify and model_ids_changed:
-            self._queue_catalog_restart("catalog_repaired", names=names, enabled=True)
         self.revision += 1
         return True
 
@@ -739,12 +665,10 @@ class CodexSettingsDomain:
         Worker reloads briefly alternate between adjacent ``/v1/models``
         views.  Use the same two-observation stability gate as the snapshot
         path so a provider apply that did not change the exposed model set
-        cannot manufacture a Codex restart prompt from a transient partial
-        view.
+        cannot rewrite the catalog from a transient partial view.
         """
 
         return self._ensure_model_catalog_current(
-            notify=True,
             force_source_refresh=True,
             require_stable_repair=True,
         )
@@ -801,14 +725,11 @@ class CodexSettingsDomain:
             "model_catalog": {
                 "enabled": self._is_catalog_enabled(payload),
                 "public_models": public_models or [],
-                "restart_required": self._catalog_restart_required,
-                "change_reason": self._catalog_change_reason,
-                "change_event": self._catalog_change_event,
             },
         }
 
     def snapshot(self) -> dict[str, Any]:
-        self._ensure_model_catalog_current(notify=True, require_stable_repair=True)
+        self._ensure_model_catalog_current(require_stable_repair=True)
         return self._safe_snapshot(self._draft, self.revision)
 
     def draft_state(self) -> object:
@@ -916,18 +837,7 @@ class CodexSettingsDomain:
         auth_text = self._draft.get("auth_text", "{}\n")
         if not isinstance(config_text, str) or not isinstance(auth_text, str):
             raise DomainError("Codex settings are invalid")
-        if name in {"acknowledge_model_catalog_restart", "acknowledgemodelcatalogrestart"}:
-            self._catalog_restart_required = False
-            self._catalog_change_reason = None
-            acknowledged = self._catalog_pending_signature
-            if acknowledged is None:
-                enabled = self._is_catalog_enabled(self._raw)
-                names = self._catalog_model_names(self._raw) if enabled else []
-                acknowledged = self._catalog_signature(names, enabled=enabled)
-            self._catalog_acknowledged_signature = acknowledged
-            self._catalog_pending_signature = None
-            self._reset_catalog_repair_observation()
-        elif name in {"set_raw", "setraw"}:
+        if name in {"set_raw", "setraw"}:
             document = data.get("document")
             text = data.get("text")
             next_config = data.get("config_text", data.get("raw_toml", data.get("toml", config_text)))
@@ -1031,7 +941,6 @@ class CodexSettingsDomain:
         will_be_enabled = self._is_catalog_enabled(self._draft)
         catalog_models: list[str] | None = None
         catalog_changed = False
-        catalog_model_ids_changed = False
         native_models: list[Mapping[str, Any]] | None = None
         base_slug: str | None = None
         if will_be_enabled:
@@ -1055,7 +964,6 @@ class CodexSettingsDomain:
                         native_models=native_models,
                         base_slug=base_slug,
                     )
-                catalog_model_ids_changed = self._catalog_model_ids_changed(catalog_models)
         if catalog_changed and catalog_models is not None and native_models is not None:
             write_catalog(
                 self.model_catalog_path,
@@ -1071,18 +979,6 @@ class CodexSettingsDomain:
         except Exception as exc:
             raise _safe_problem(exc, "Codex settings could not be saved") from None
         self.reload()
-        if will_be_enabled and (not was_enabled or catalog_model_ids_changed):
-            names = catalog_models if catalog_models is not None else self._catalog_model_names(self._raw)
-            self._queue_catalog_restart(
-                "enabled" if not was_enabled else "catalog_repaired",
-                names=names,
-                enabled=True,
-                force=not was_enabled,
-            )
-            self.revision += 1
-        elif was_enabled and not will_be_enabled:
-            self._queue_catalog_restart("disabled", names=[], enabled=False, force=True)
-            self.revision += 1
         return {"applied": True, **self.snapshot()}
 
     def catalog_baseline_state(self) -> object:
@@ -1103,7 +999,6 @@ class CodexSettingsDomain:
         was_enabled = self._is_catalog_enabled(self._raw)
         catalog_models: list[str] | None = None
         catalog_changed = False
-        catalog_model_ids_changed = False
         native_models: list[Mapping[str, Any]] | None = None
         base_slug: str | None = None
         if enabled:
@@ -1127,7 +1022,6 @@ class CodexSettingsDomain:
                         native_models=native_models,
                         base_slug=base_slug,
                     )
-                catalog_model_ids_changed = self._catalog_model_ids_changed(catalog_models)
         draft_before = copy.deepcopy(self._draft)
         draft_next = draft_before
         draft_config = draft_before.get("config_text", "")
@@ -1172,18 +1066,6 @@ class CodexSettingsDomain:
         self.reload()
         if draft_next != draft_before:
             self._draft = draft_next
-        if enabled and (not was_enabled or catalog_model_ids_changed):
-            names = catalog_models if catalog_models is not None else self._catalog_model_names(self._raw)
-            self._queue_catalog_restart(
-                "enabled" if not was_enabled else "catalog_repaired",
-                names=names,
-                enabled=True,
-                force=not was_enabled,
-            )
-            self.revision += 1
-        elif was_enabled and not enabled:
-            self._queue_catalog_restart("disabled", names=[], enabled=False, force=True)
-            self.revision += 1
         return self.snapshot()
 
     def external_disk_state(self) -> dict[str, bool]:
