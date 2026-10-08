@@ -215,12 +215,50 @@ print('young-router-veridrop-import-ok')
   }
 
   $CoreRoot = (Resolve-Path $Core).Path
+  # React Native Windows pins the Windows SDK to 10.0.22621.0 for a new
+  # architecture project and only defers to a value already greater:
+  #
+  #   <WindowsTargetPlatformVersion Condition="'$(WindowsTargetPlatformVersion)'==''
+  #       Or '$(WindowsTargetPlatformVersion)'=='10.0.0.0'">10.0.22621.0</...>
+  #   <WindowsTargetPlatformVersion Condition="'$(RnwNewArch)'=='true' And
+  #       $([MSBuild]::VersionLessThan('$(WindowsTargetPlatformVersion)', '10.0.22621.0'))">10.0.22621.0</...>
+  #
+  # The hosted Windows image installs exactly one SDK, and the newer image
+  # (``windows-latest``) ships 10.0.26100.0 rather than 22621, so the build dies
+  # in RNW's own Common.vcxproj:
+  #
+  #   error MSB8036: The Windows SDK version 10.0.22621.0 was not found.
+  #
+  # Any value at or above what RNW requires survives its condition, and a global
+  # property overrides it for every project in the solution, including the ones
+  # this repository does not own. The newest installed SDK is used, which keeps
+  # the build working on a machine that has 22621 as well as the newer one.
+  $InstalledSdk = Get-ChildItem -LiteralPath "${env:ProgramFiles(x86)}\Windows Kits\10\Include" -Directory -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -match '^10\.0\.\d+\.0$' } |
+    Sort-Object { [version]$_.Name } -Descending |
+    Select-Object -First 1
+  if ($null -eq $InstalledSdk) {
+    $InstalledSdk = Get-ChildItem -LiteralPath "${env:ProgramFiles}\Windows Kits\10\Include" -Directory -ErrorAction SilentlyContinue |
+      Where-Object { $_.Name -match '^10\.0\.\d+\.0$' } |
+      Sort-Object { [version]$_.Name } -Descending |
+      Select-Object -First 1
+  }
+  if ($null -eq $InstalledSdk) {
+    throw "No Windows SDK is installed under Windows Kits\\10\\Include."
+  }
+  Write-Output "Building against Windows SDK $($InstalledSdk.Name)."
+
   # Release sets UseBundle=true through RNW's Bundle.props. Passing --bundle
   # would select a ReleaseBundle solution configuration that this generated
   # Composition solution does not define.
+  #
+  # The properties are comma separated because that is the only separator the
+  # CLI parses (``options.msbuildprops.split(',')``, then ``prop.split('=')``,
+  # discarding anything that does not yield exactly two parts). A semicolon list
+  # parses as zero properties and is dropped without a word.
   pnpm --dir $AppRoot exec react-native run-windows --no-launch --no-deploy --no-packager --release --arch x64 `
     --sln "windows\YoungRouter.sln" --proj "windows\YoungRouter\YoungRouter.vcxproj" `
-    --msbuildprops "YoungRouterCoreStagingDir=$CoreRoot;RunCodegenWindows=false"
+    --msbuildprops "YoungRouterCoreStagingDir=$CoreRoot,RunCodegenWindows=false,WindowsTargetPlatformVersion=$($InstalledSdk.Name)"
 
   $BundledPython = Get-ChildItem -LiteralPath (Join-Path $AppRoot "windows") -Recurse -File -Filter "python.exe" |
     Where-Object { $_.FullName -match '[\\/]Core[\\/]runtime[\\/]bin[\\/]python\.exe$' } |
