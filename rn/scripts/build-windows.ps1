@@ -95,8 +95,27 @@ try {
   Remove-Item -LiteralPath $PythonInstalls -Recurse -Force
 
   $LiteLLMVersion = (Get-Content -Raw (Join-Path $ProjectRoot "LITELLM_VERSION")).Trim()
+  # ``uv`` marks the standalone interpreter it installs as externally managed
+  # (``EXTERNALLY-MANAGED`` in its ``lib/python3.12``), so installing *into* it
+  # is refused:
+  #
+  #   error: The interpreter at ... is externally managed, and indicates the
+  #   following: This Python installation is managed by uv and should not be
+  #   modified.
+  #
+  # ``--target`` writes the packages into that interpreter's own site-packages
+  # instead of asking it to accept an install, so the runtime keeps the layout
+  # its wrappers and the staged Veridrop dependencies already use. The macOS
+  # build has always installed this way, which is why the same refusal never
+  # appeared there.
+  $RuntimeSitePackages = & (Join-Path $RuntimeBin "python.exe") -c "import sysconfig; print(sysconfig.get_paths()['purelib'])"
+  if ($LASTEXITCODE -ne 0 -or -not $RuntimeSitePackages) {
+    throw "Could not resolve the bundled Windows runtime's site-packages path."
+  }
   uv pip install --python (Join-Path $RuntimeBin "python.exe") `
+    --target "$RuntimeSitePackages" `
     "litellm[proxy]==$LiteLLMVersion" "fastapi==0.140.3" PyYAML Pillow
+  if ($LASTEXITCODE -ne 0) { throw "Could not install the bundled Windows runtime dependencies." }
   # The staged scan program is imported into the Core's own interpreter, so what
   # it imports and the bundled runtime does not already carry is added to that
   # runtime here - and only that: a dependency the runtime already has is never

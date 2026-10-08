@@ -483,6 +483,28 @@ class ReactNativeReleaseTests(unittest.TestCase):
             builder.index("await rm(temporaryBundle"),
         )
 
+    def test_windows_build_installs_the_runtime_outside_uvs_management(self) -> None:
+        # ``uv python install`` marks the interpreter it lays down as externally
+        # managed, so ``uv pip install --python <that python>`` is refused and
+        # the runtime ships without LiteLLM:
+        #
+        #   error: The interpreter at ... is externally managed
+        #   ModuleNotFoundError: No module named 'litellm'
+        #
+        # ``--target`` writes into the interpreter's own site-packages instead of
+        # asking it to accept an install, which is how the macOS runtime has
+        # always been assembled, and the packages stay importable there without
+        # any wrapper.
+        script = (ROOT / "rn/scripts/build-windows.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("--target", script)
+        self.assertIn("sysconfig.get_paths()['purelib']", script)
+        # The refusal is only avoided while the runtime install carries the
+        # target; an install into the managed interpreter must not come back.
+        install = script[script.index("uv pip install"):]
+        install = install[:install.index("\n\n")] if "\n\n" in install else install
+        self.assertIn("--target", install)
+
     def test_windows_build_checks_085_codegen_before_msbuild(self) -> None:
         package = (ROOT / "rn/package.json").read_text(encoding="utf-8")
         script = (ROOT / "rn/scripts/build-windows.ps1").read_text(encoding="utf-8")
