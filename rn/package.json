@@ -30,6 +30,8 @@
     "react-native-windows": "0.85.0-preview.1"
   },
   "devDependencies": {
+    "@react-native-community/cli": "20.0.0",
+    "@react-native-community/cli-platform-ios": "20.0.0",
     "@react-native-windows/codegen": "0.85.0-preview.1",
     "@react-native/babel-preset": "0.85.3",
     "@react-native/metro-config": "0.85.3",
