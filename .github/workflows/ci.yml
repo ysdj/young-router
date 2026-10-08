@@ -11,10 +11,28 @@ permissions:
 
 jobs:
   macos:
-    runs-on: macos-14
+    # React Native 0.85 refuses to configure below Xcode 16.1, and the
+    # macos-14 image selects 15.4. That image is also deprecated (unsupported
+    # from 2026-11-02), so the job runs on the image whose default already
+    # satisfies the requirement and reserves the right to stop existing.
+    runs-on: macos-15
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+
+      - name: Assert the Xcode React Native 0.85 requires
+        run: |
+          # `use_react_native!` raises "Please upgrade XCode" below 16.1, and a
+          # runner image's default selection is not a promise: the failure
+          # otherwise surfaces much later as an invalid Podfile, which reads as
+          # a broken project rather than an unsuitable toolchain. State the
+          # requirement here so it reports itself in one line.
+          installed="$(xcodebuild -version | awk 'NR==1 {print $2}')"
+          printf 'Xcode %s is selected.\n' "$installed"
+          if [[ "$(printf '%s\n' 16.1 "$installed" | sort -V | head -1)" != "16.1" ]]; then
+            echo "React Native 0.85 requires Xcode >= 16.1, but $installed is selected." >&2
+            exit 1
+          fi
 
       - uses: pnpm/action-setup@v4
         with:

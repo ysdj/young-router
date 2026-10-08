@@ -159,6 +159,93 @@ class StagedReleaseReuseTests(unittest.TestCase):
         self.assertEqual(calls, [], "an unchanged tree must not be reinstalled")
 
 
+class NpmPeerSpecTransportTests(unittest.TestCase):
+    """A peer spec reaches npm as the range the registry declared.
+
+    The specs carry npm's own version ranges, and a range contains ``^``.  On
+    Windows ``npm`` resolves to ``npm.cmd``, which Python can only launch
+    through ``cmd.exe``, and ``cmd.exe`` consumes a bare ``^`` as its escape
+    character.  Handing the specs to the shell as arguments therefore turned
+    ``@deepseek-ai/cordis@^4.0.2`` into ``@deepseek-ai/cordis@4.0.2``, which
+    conflicts with the ``~4.0.4`` a sibling peer requires:
+
+        npm error Found: @deepseek-ai/cordis@4.0.2
+        npm error peer @deepseek-ai/cordis@"~4.0.4" from @deepseek-ai/dsh-llm@0.2.0-rc.2
+
+    Naming them in a manifest keeps them off the command line, so these tests
+    hold that the range survives the trip and that nothing but the tarball is
+    still passed as an argument.
+    """
+
+    def setUp(self) -> None:
+        self.directory = Path(tempfile.mkdtemp(prefix="young-router-npm-spec-test-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.directory, ignore_errors=True))
+
+    def test_a_caret_range_survives_into_the_manifest(self) -> None:
+        update_common.npm_dependency_manifest(
+            self.directory,
+            ["@deepseek-ai/cordis@^4.0.2", "react@^18.2.0", "@deepseek-ai/dsh-llm@0.2.0-rc.2"],
+        )
+        manifest = json.loads((self.directory / "package.json").read_text(encoding="utf-8"))
+
+        # The exact spec npm must resolve, with its range intact.
+        self.assertEqual(manifest["dependencies"]["@deepseek-ai/cordis"], "^4.0.2")
+        self.assertEqual(manifest["dependencies"]["react"], "^18.2.0")
+        self.assertEqual(manifest["dependencies"]["@deepseek-ai/dsh-llm"], "0.2.0-rc.2")
+
+    def test_a_bare_name_asks_for_any_version(self) -> None:
+        # ``REQUIRED_PEER_DIRECTORIES`` entries can arrive without a range, and
+        # a name with no version must still be installable rather than dropped.
+        update_common.npm_dependency_manifest(self.directory, ["sharp"])
+        manifest = json.loads((self.directory / "package.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(manifest["dependencies"]["sharp"], "*")
+
+    def test_the_staged_peers_never_travel_as_arguments(self) -> None:
+        # The boundary itself: whatever the real workbuddy peer list is, none of
+        # it may appear on the command line, because that is the only place a
+        # shell can rewrite it.
+        version_payload = {
+            "peerDependencies": {
+                "@deepseek-ai/cordis": "^4.0.2",
+                "@deepseek-ai/dsh-llm": "0.2.0-rc.2",
+            }
+        }
+        specs = workbuddy_connect._peer_specs(version_payload)
+        self.assertIn("@deepseek-ai/cordis@^4.0.2", specs)
+
+        recorded: list[list[str]] = []
+
+        def capture(command, **kwargs):
+            recorded.append(list(command))
+            return mock.Mock(returncode=0, stderr="", stdout="")
+
+        tarball = self.directory / "pkg.tgz"
+        tarball.write_bytes(b"")
+        with mock.patch.object(update_common.subprocess, "run", capture):
+            update_common.run_npm_install(
+                "npm",
+                self.directory / "npm",
+                tarball,
+                specs,
+                package_name=PACKAGE,
+                timeout=1,
+            )
+
+        self.assertEqual(len(recorded), 1, "one install command")
+        command = recorded[0]
+        # Nothing that carries a range may be an argument; only the tarball is.
+        for part in command:
+            self.assertNotIn("^", part, f"{part!r} would be rewritten by cmd.exe")
+        self.assertIn(str(tarball), command, "the tarball is still an argument")
+        self.assertNotIn("@deepseek-ai/cordis@^4.0.2", command)
+        # The ranges are in the manifest the same call just wrote.
+        manifest = json.loads(
+            (self.directory / "npm" / "package.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(manifest["dependencies"]["@deepseek-ai/cordis"], "^4.0.2")
+
+
 class PiWebAccessReuseTests(unittest.TestCase):
     """The pi-web-access staging also imposes the shared browser identity."""
 
