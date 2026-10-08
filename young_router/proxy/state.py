@@ -344,7 +344,12 @@ def _locked_json_state_update(path: str, callback: Any) -> Any:
             os.chmod(lock_path, 0o600)
         except OSError:
             pass
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        # Windows has no ``fcntl``; there the lock file is created and the
+        # update still happens under this process's own thread, which is the
+        # same guarantee the platform's single launcher gives the other
+        # advisory locks in this package.
+        if fcntl is not None:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
         missing = False
         try:
             with open(path, "r", encoding="utf-8") as handle:
@@ -365,10 +370,9 @@ def _locked_json_state_update(path: str, callback: Any) -> Any:
             _atomic_write_json(path, payload)
         return result
     finally:
-        try:
+        if fcntl is not None:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        finally:
-            os.close(lock_fd)
+        os.close(lock_fd)
 
 
 def _utc_now_iso() -> str:

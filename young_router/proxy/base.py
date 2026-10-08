@@ -8,7 +8,6 @@ import copy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-import fcntl
 import inspect
 import io
 import json
@@ -19,6 +18,14 @@ import re
 import threading
 import time
 from urllib.parse import urlparse
+
+# ``state.py`` takes this name from here, and Windows has no ``fcntl``: the
+# advisory lock it guards is a cooperative one between this app's own
+# processes, and the platform without it already runs a single Core launcher.
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows does not provide POSIX flock.
+    fcntl = None  # type: ignore[assignment]
 
 from .. import browser_identity as _browser_identity
 from ..values import int_or_none as _int_or_none
