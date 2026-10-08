@@ -67,41 +67,45 @@ target 'YoungRouter-macOS' do
     # not cover this include and it is not on the pinned 0.85 branch, so the
     # search path is added here rather than by moving the vendor pin.
     fbreactnativespec_header_root = 'Headers/Public/React-RCTFBReactNativeSpec'
-    if Dir.exist?(File.join(Pod::Config.instance.project_pods_root, fbreactnativespec_header_root))
-      search_path_entry = "\"$(PODS_ROOT)/#{fbreactnativespec_header_root}\""
+    search_path_entry = "\"$(PODS_ROOT)/#{fbreactnativespec_header_root}\""
 
-      add_fbreactnativespec_search_path = lambda do |attributes|
-        existing = attributes['HEADER_SEARCH_PATHS'] || '$(inherited)'
-        next if existing.include?(search_path_entry)
+    add_fbreactnativespec_search_path = lambda do |attributes|
+      existing = attributes['HEADER_SEARCH_PATHS'] || '$(inherited)'
+      next if existing.include?(search_path_entry)
 
-        attributes['HEADER_SEARCH_PATHS'] = "#{existing} #{search_path_entry}"
+      attributes['HEADER_SEARCH_PATHS'] = "#{existing} #{search_path_entry}"
+    end
+
+    # Every pod, not a hand-kept list: the sources that include the header
+    # live in pods React Native reorganizes between releases, and a stale list
+    # would fail the build only on the release that moved one.
+    #
+    # The path is added unconditionally rather than guarded on the header
+    # directory existing here. CocoaPods removes and re-creates that store
+    # while it installs, so whether it is present at this point in the run is
+    # an ordering detail, and a search path that names a directory this build
+    # never creates is inert.
+    installer.pod_targets.each do |pod_target|
+      pod_target.build_settings.each_key do |config_name|
+        xcconfig_path = pod_target.xcconfig_path(config_name)
+        next unless File.exist?(xcconfig_path)
+
+        xcconfig = Xcodeproj::Config.new(xcconfig_path)
+        before = xcconfig.attributes['HEADER_SEARCH_PATHS']
+        add_fbreactnativespec_search_path.call(xcconfig.attributes)
+        xcconfig.save_as(xcconfig_path) if xcconfig.attributes['HEADER_SEARCH_PATHS'] != before
       end
+    end
 
-      # Every pod, not a hand-kept list: the sources that include the header
-      # live in pods React Native reorganizes between releases, and a stale list
-      # would fail the build only on the release that moved one.
-      installer.pod_targets.each do |pod_target|
-        pod_target.build_settings.each_key do |config_name|
-          xcconfig_path = pod_target.xcconfig_path(config_name)
-          next unless File.exist?(xcconfig_path)
+    # The app target is an aggregate, and it compiles the host's own sources
+    # against the same headers, so it needs the path for the same reason.
+    installer.aggregate_targets.each do |aggregate_target|
+      aggregate_target.xcconfigs.each do |config_name, config_file|
+        before = config_file.attributes['HEADER_SEARCH_PATHS']
+        add_fbreactnativespec_search_path.call(config_file.attributes)
+        next if config_file.attributes['HEADER_SEARCH_PATHS'] == before
 
-          xcconfig = Xcodeproj::Config.new(xcconfig_path)
-          before = xcconfig.attributes['HEADER_SEARCH_PATHS']
-          add_fbreactnativespec_search_path.call(xcconfig.attributes)
-          xcconfig.save_as(xcconfig_path) if xcconfig.attributes['HEADER_SEARCH_PATHS'] != before
-        end
-      end
-
-      # The app target is an aggregate, and it compiles the host's own sources
-      # against the same headers, so it needs the path for the same reason.
-      installer.aggregate_targets.each do |aggregate_target|
-        aggregate_target.xcconfigs.each do |config_name, config_file|
-          before = config_file.attributes['HEADER_SEARCH_PATHS']
-          add_fbreactnativespec_search_path.call(config_file.attributes)
-          next if config_file.attributes['HEADER_SEARCH_PATHS'] == before
-
-          config_file.save_as(aggregate_target.xcconfig_path(config_name))
-        end
+        config_file.save_as(aggregate_target.xcconfig_path(config_name))
       end
     end
 

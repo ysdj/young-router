@@ -685,6 +685,11 @@ class ReactNativeReleaseTests(unittest.TestCase):
         # A target that already resolves the header must be left alone, so a
         # repeat install cannot append the entry a second time.
         self.assertIn("next if existing.include?(search_path_entry)", code)
+        # The addition must not be guarded on the header directory already
+        # existing: CocoaPods removes and re-creates that store while it
+        # installs, so a guard makes the repair depend on an ordering detail.
+        # A search path naming a directory this build never creates is inert.
+        self.assertNotIn("Dir.exist?", code)
 
 
 if __name__ == "__main__":
