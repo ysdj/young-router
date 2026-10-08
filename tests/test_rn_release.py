@@ -636,6 +636,56 @@ class ReactNativeReleaseTests(unittest.TestCase):
         podfile = (ROOT / "rn/apps/macos/macos/Podfile").read_text(encoding="utf-8")
         self.assertIn("use_native_modules!", podfile)
 
+    def test_the_podfile_resolves_the_fbreactnativespec_header_for_every_pod(self) -> None:
+        # Fourteen pods in the pinned tree include
+        # ``FBReactNativeSpec/FBReactNativeSpecJSI.h``, but the header is
+        # published by ``React-RCTFBReactNativeSpec`` under its own
+        # ``header_dir``, one directory below the search path those pods carry:
+        #
+        #   Pods/Headers/Public/FBReactNativeSpec/FBReactNativeSpecJSI.h
+        #   Pods/Headers/Public/React-RCTFBReactNativeSpec/FBReactNativeSpec/FBReactNativeSpecJSI.h
+        #
+        # ``React-Fabric`` never declares the dependency, so nothing adds the
+        # pod's header root and its compile ends with:
+        #
+        #   fatal error: 'FBReactNativeSpec/FBReactNativeSpecJSI.h' file not found
+        #
+        # Only the code lines matter: the block above the fix quotes the wrong
+        # path to explain what the include asks for.
+        podfile = (ROOT / "rn/apps/macos/macos/Podfile").read_text(encoding="utf-8")
+        code = "\n".join(
+            line for line in podfile.splitlines() if not line.lstrip().startswith("#")
+        )
+
+        # The path added is the pod's own header root, which is what the
+        # ``FBReactNativeSpec/`` prefix in the include needs.
+        self.assertIn("Headers/Public/React-RCTFBReactNativeSpec", code)
+        self.assertNotIn("Headers/Public/FBReactNativeSpec", code)
+        # Both the pod targets and the app's aggregate target compile sources
+        # that need it, and neither is a hand-kept list of pod names.
+        self.assertIn("installer.pod_targets.each", code)
+        self.assertIn("installer.aggregate_targets.each", code)
+        # The repair runs in the post_install hook, which CocoaPods invokes after
+        # writing those xcconfig files and before the build reads them.
+        self.assertLess(
+            code.index("post_install do |installer|"),
+            code.index("fbreactnativespec_header_root ="),
+        )
+        # Appending keeps the paths CocoaPods already generated for the target;
+        # assigning would replace them and break the rest of that target's build.
+        assignments = [
+            line.strip()
+            for line in code.splitlines()
+            if "attributes['HEADER_SEARCH_PATHS'] = " in line
+        ]
+        self.assertEqual(
+            ['attributes[\'HEADER_SEARCH_PATHS\'] = "#{existing} #{search_path_entry}"'],
+            assignments,
+        )
+        # A target that already resolves the header must be left alone, so a
+        # repeat install cannot append the entry a second time.
+        self.assertIn("next if existing.include?(search_path_entry)", code)
+
 
 if __name__ == "__main__":
     unittest.main()

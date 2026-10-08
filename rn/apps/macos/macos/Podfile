@@ -32,6 +32,79 @@ target 'YoungRouter-macOS' do
 
   post_install do |installer|
     react_native_post_install(installer, react_native_macos_relative_path)
+
+    # Fourteen pods in this tree include
+    # ``FBReactNativeSpec/FBReactNativeSpecJSI.h`` — among them
+    # ``React-Fabric``'s ``NativeAnimatedNodesManager.h`` and ``AnimatedModule.h``,
+    # plus ``React-FabricImage``, ``ReactCommon``, and the
+    # ``react/nativemodule/*`` pods.
+    #
+    # The header is published by the ``React-RCTFBReactNativeSpec`` pod, which
+    # declares ``header_dir = 'FBReactNativeSpec'``, so CocoaPods installs it one
+    # directory deeper than the search path every pod already carries:
+    #
+    #   Pods/Headers/Public/FBReactNativeSpec/...                      (searched)
+    #   Pods/Headers/Public/React-RCTFBReactNativeSpec/FBReactNativeSpec/...  (actual)
+    #
+    # ``React-Fabric`` does not depend on ``React-RCTFBReactNativeSpec``, so
+    # nothing adds the pod's own header root to its build, and the compile ends:
+    #
+    #   fatal error: 'FBReactNativeSpec/FBReactNativeSpecJSI.h' file not found
+    #
+    # The pod's own header root is added below to the targets that lack it, and
+    # it is the entry CocoaPods itself generates: ``React-FabricComponents``
+    # declares this dependency and carries the same path verbatim, so a target
+    # that already resolves the header is left alone. The addition is written
+    # into the xcconfig CocoaPods generated, which is where every target in this
+    # build keeps its search paths — neither the Pods project nor this app's
+    # project sets ``HEADER_SEARCH_PATHS`` itself.
+    #
+    # The directory publishes only ``FBReactNativeSpec`` and
+    # ``react/renderer/components/FBReactNativeSpec``, so it cannot shadow a
+    # header another target meant to find first. Upstream 0.86 carries the same
+    # class of fix for a different header in this subspec (facebook/react-native
+    # #56151, ``header_mappings_dir`` on ``React-Fabric/animated``), but it does
+    # not cover this include and it is not on the pinned 0.85 branch, so the
+    # search path is added here rather than by moving the vendor pin.
+    fbreactnativespec_header_root = 'Headers/Public/React-RCTFBReactNativeSpec'
+    if Dir.exist?(File.join(Pod::Config.instance.project_pods_root, fbreactnativespec_header_root))
+      search_path_entry = "\"$(PODS_ROOT)/#{fbreactnativespec_header_root}\""
+
+      add_fbreactnativespec_search_path = lambda do |attributes|
+        existing = attributes['HEADER_SEARCH_PATHS'] || '$(inherited)'
+        next if existing.include?(search_path_entry)
+
+        attributes['HEADER_SEARCH_PATHS'] = "#{existing} #{search_path_entry}"
+      end
+
+      # Every pod, not a hand-kept list: the sources that include the header
+      # live in pods React Native reorganizes between releases, and a stale list
+      # would fail the build only on the release that moved one.
+      installer.pod_targets.each do |pod_target|
+        pod_target.build_settings.each_key do |config_name|
+          xcconfig_path = pod_target.xcconfig_path(config_name)
+          next unless File.exist?(xcconfig_path)
+
+          xcconfig = Xcodeproj::Config.new(xcconfig_path)
+          before = xcconfig.attributes['HEADER_SEARCH_PATHS']
+          add_fbreactnativespec_search_path.call(xcconfig.attributes)
+          xcconfig.save_as(xcconfig_path) if xcconfig.attributes['HEADER_SEARCH_PATHS'] != before
+        end
+      end
+
+      # The app target is an aggregate, and it compiles the host's own sources
+      # against the same headers, so it needs the path for the same reason.
+      installer.aggregate_targets.each do |aggregate_target|
+        aggregate_target.xcconfigs.each do |config_name, config_file|
+          before = config_file.attributes['HEADER_SEARCH_PATHS']
+          add_fbreactnativespec_search_path.call(config_file.attributes)
+          next if config_file.attributes['HEADER_SEARCH_PATHS'] == before
+
+          config_file.save_as(aggregate_target.xcconfig_path(config_name))
+        end
+      end
+    end
+
     installer.pods_project.targets.each do |target|
       target.build_configurations.each do |config|
         config.build_settings['MACOSX_DEPLOYMENT_TARGET'] = '14.0'
