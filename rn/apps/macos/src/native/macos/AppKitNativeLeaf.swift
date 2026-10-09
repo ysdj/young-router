@@ -6556,13 +6556,17 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
             accountType: type,
             origin: originURL.absoluteString
         )
-        let cookies = restoredSession.map { cookies(fromHeader: $0.cookie) } ?? []
-        guard !cookies.isEmpty else {
+        // The local is not named ``cookies``: that identifier is the method
+        // called in the same expression, and declaring the result under it makes
+        // Swift resolve the call to the array being defined, which fails the
+        // build with "cannot call value of non-function type '[Any]'" .
+        let restoredCookies = restoredSession.map { cookies(fromHeader: $0.cookie) } ?? []
+        guard !restoredCookies.isEmpty else {
             webView.load(URLRequest(url: loginURL))
             return
         }
         let group = DispatchGroup()
-        for cookie in cookies {
+        for cookie in restoredCookies {
             group.enter()
             webView.configuration.websiteDataStore.httpCookieStore.setCookie(cookie) { group.leave() }
         }
