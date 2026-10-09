@@ -663,8 +663,15 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertNotIn("Headers/Public/FBReactNativeSpec", code)
         # Both the pod targets and the app's aggregate target compile sources
         # that need it, and neither is a hand-kept list of pod names.
+        self.assertIn("installer.pods_project.targets.each", code)
         self.assertIn("installer.pod_targets.each", code)
         self.assertIn("installer.aggregate_targets.each", code)
+        # The path is set on the Pods project's targets as well as written into
+        # the xcconfig. A target build setting outranks the xcconfig, so this
+        # survives a `pod install` that rewrites that file from the target's own
+        # settings — the state an install recomputes on a second run.
+        self.assertIn("config.build_settings['HEADER_SEARCH_PATHS']", code)
+        self.assertIn("'$(inherited)'", code)
         # The repair runs in the post_install hook, which CocoaPods invokes after
         # writing those xcconfig files and before the build reads them.
         self.assertLess(

@@ -80,11 +80,33 @@ target 'YoungRouter-macOS' do
     # live in pods React Native reorganizes between releases, and a stale list
     # would fail the build only on the release that moved one.
     #
-    # The path is added unconditionally rather than guarded on the header
-    # directory existing here. CocoaPods removes and re-creates that store
-    # while it installs, so whether it is present at this point in the run is
-    # an ordering detail, and a search path that names a directory this build
-    # never creates is inert.
+    # The path goes into the Pods project's own build settings, not only into the
+    # xcconfig CocoaPods wrote. A build setting set on the target takes
+    # precedence over the xcconfig, so this survives a later `update_changed_file`
+    # rewriting that file from the target's settings — which is exactly the
+    # state a second `pod install` recomputes. `$(inherited)` keeps every path
+    # CocoaPods already generated for the target, so this adds rather than
+    # replaces.
+    #
+    # It is added unconditionally rather than guarded on the header directory
+    # existing here. CocoaPods removes and re-creates that store while it
+    # installs, so whether it is present at this point in the run is an ordering
+    # detail, and a search path naming a directory this build never creates is
+    # inert.
+    installer.pods_project.targets.each do |pods_target|
+      pods_target.build_configurations.each do |config|
+        existing = config.build_settings['HEADER_SEARCH_PATHS']
+        existing = '$(inherited)' if existing.nil? || existing.empty?
+        next if existing.include?(search_path_entry)
+
+        config.build_settings['HEADER_SEARCH_PATHS'] =
+          existing.is_a?(Array) ? existing + [search_path_entry] : "#{existing} #{search_path_entry}"
+      end
+    end
+
+    # The same path in the xcconfig each pod target owns preserves the behaviour
+    # of a build that reads only that file, and keeps the aggregate target below
+    # from being the only one that carries it.
     installer.pod_targets.each do |pod_target|
       pod_target.build_settings.each_key do |config_name|
         xcconfig_path = pod_target.xcconfig_path(config_name)
