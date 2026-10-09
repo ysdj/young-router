@@ -1223,7 +1223,16 @@ class HookStreamingResponseEventTests(HookTestCase):
         self.assertIsNone(normalized)
         self.assertIsNone(hooks._codex_repaired_function_arguments("not json at all"))
 
-    async def test_responses_delivery_replaces_unrepairable_arguments_with_failed_event(self) -> None:
+    async def test_responses_delivery_keeps_arguments_it_cannot_repair(self) -> None:
+        """Unreadable arguments are delivered, never turned into a dead turn.
+
+        A tool call whose arguments no parser accepts is the request's own
+        shape, so it must not end the response: the Codex client treats a
+        failed terminal as fatal, which killed turns the model was still
+        writing.  The event travels as the upstream wrote it and the client's
+        own tolerant reader reports whatever it could not use.
+        """
+
         hooks, _proxy_server = load_hook_module()
         delivered = hooks._responses_stream_chunk_for_delivery(
             {
@@ -1240,10 +1249,8 @@ class HookStreamingResponseEventTests(HookTestCase):
             },
         )
 
-        self.assertEqual(delivered["type"], "response.failed")
-        self.assertEqual(delivered["response"]["status"], "failed")
-        self.assertIn("code", delivered["response"]["error"])
-        self.assertIn("message", delivered["response"]["error"])
+        self.assertEqual(delivered["type"], "response.function_call_arguments.done")
+        self.assertEqual(delivered["arguments"], "{broken json")
         json.dumps(delivered)
 
     async def test_guarded_responses_stream_fails_on_unrepairable_arguments(self) -> None:
@@ -1301,13 +1308,12 @@ class HookStreamingResponseEventTests(HookTestCase):
         ]
 
         self.assertTrue(chunks)
-        self.assertTrue(
-            any(
-                chunk.get("type") == "response.failed"
-                and chunk.get("response", {}).get("status") == "failed"
-                for chunk in chunks
-            )
+        # The stream reaches its own terminal: unreadable arguments are not a
+        # reason to replace the turn with a failed response.
+        self.assertFalse(
+            any(chunk.get("type") == "response.failed" for chunk in chunks)
         )
+        self.assertEqual(chunks[-1].get("type"), "response.completed")
         for chunk in chunks:
             json.dumps(chunk)
             for item in [chunk.get("item")]:
@@ -1330,45 +1336,93 @@ class HookStreamingToolCallArgumentsTests(HookTestCase):
             "input": "run a command",
         }
 
-    async def test_unparseable_arguments_state_their_own_cause(self) -> None:
-        """A tool call nobody can run belongs to the request, not to a route.
+    async def test_unreadable_arguments_do_not_end_the_turn(self) -> None:
+        """Arguments no parser accepts are reported, never fatal.
 
-        This shape used to be reported as ``upstream_route_failure``, which
-        reads as a server-side route outage: it invited a deployment cooldown
-        and the long recovery poll for a stream whose parameters had already
-        arrived and could not be parsed.  The code and message now name the
-        real cause so terminal classification can keep it deterministic.
+        Naming this shape precisely (once ``upstream_tool_call_arguments_invalid``)
+        still ended the turn, and the Codex client treats a failed terminal as
+        fatal: a tool call the model was still writing took the whole response
+        with it.  The cause is now traced where it can be diagnosed while the
+        event itself is delivered, so the client runs the call with what it can
+        read.
         """
 
         hooks, _proxy_server = load_hook_module()
+        arguments = '{"edits": [{"newText": "x", "oldText'
         delivered = hooks._responses_stream_chunk_for_delivery(
             {
                 "type": "response.function_call_arguments.done",
                 "output_index": 0,
                 "item_id": "call_bad",
-                "arguments": '{"edits": [{"newText": "x", "oldText',
+                "arguments": arguments,
             },
             self.request_data(),
         )
 
-        self.assertEqual(delivered["type"], "response.failed")
-        error = delivered["response"]["error"]
-        self.assertEqual(error["code"], "upstream_tool_call_arguments_invalid")
-        self.assertEqual(error["type"], "invalid_request_error")
-        self.assertIn("not a valid JSON object", error["message"])
+        self.assertEqual(delivered["type"], "response.function_call_arguments.done")
+        # Unchanged and delivered, so the client's own reader decides what to
+        # do with it rather than losing the turn.
+        self.assertEqual(delivered["arguments"], arguments)
         json.dumps(delivered)
+        self.assertNotIn("response.failed", json.dumps(delivered))
 
-    async def test_invalid_arguments_error_is_recognized_by_the_delivery_path(self) -> None:
+    async def test_arguments_cut_by_an_output_limit_are_closed_not_failed(self) -> None:
+        """An output limit truncates a tool call; it does not corrupt one.
+
+        A stream cut off mid-call hands over a *prefix* of a JSON object: every
+        byte of it is what the model wrote, and only the closing brackets never
+        arrived.  Discarding that as unparseable ended turns that had a
+        perfectly usable tool call in hand, so the containers the fragment
+        genuinely opened are closed and the call runs on the arguments that did
+        arrive.
+        """
+
         hooks, _proxy_server = load_hook_module()
-
-        self.assertTrue(
-            hooks._is_invalid_tool_call_arguments_error(
-                hooks._InvalidToolCallArgumentsError("unparseable")
+        cases = (
+            ('{"command": "ls", "timeout": 30', {"command": "ls", "timeout": 30}),
+            ('{"a": 1, "b": [1, 2], "c": 3', {"a": 1, "b": [1, 2], "c": 3}),
+            ('{"a": {"b": {"c": 1}, "d": 2}', {"a": {"b": {"c": 1}, "d": 2}}),
+        )
+        for arguments, expected in cases:
+            delivered = hooks._responses_stream_chunk_for_delivery(
+                {
+                    "type": "response.function_call_arguments.done",
+                    "output_index": 0,
+                    "item_id": "call_cut",
+                    "arguments": arguments,
+                },
+                self.request_data(),
             )
-        )
-        self.assertFalse(
-            hooks._is_invalid_tool_call_arguments_error(RuntimeError("route failed"))
-        )
+            self.assertNotEqual(delivered.get("type"), "response.failed")
+            self.assertEqual(json.loads(delivered["arguments"]), expected)
+
+    async def test_a_truncated_value_is_never_completed_with_a_guess(self) -> None:
+        """Nothing is invented to make a cut fragment parse.
+
+        Closing a container the fragment opened is reconstruction; writing the
+        missing quote or value is fabrication.  A ``rm -rf`` path cut in half
+        must not become a runnable command pointing somewhere the model never
+        named, so a fragment that stops inside a string (or on a separator whose
+        value never arrived) is left exactly as it was streamed.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        for arguments in (
+            '{"command": "rm -rf /tmp/important',   # cut inside a string
+            '{"command": "ls",',                     # value never arrived
+            '{"edits": [{"newText": "x", "oldText',  # cut inside a nested string
+        ):
+            delivered = hooks._responses_stream_chunk_for_delivery(
+                {
+                    "type": "response.function_call_arguments.done",
+                    "output_index": 0,
+                    "item_id": "call_cut",
+                    "arguments": arguments,
+                },
+                self.request_data(),
+            )
+            self.assertNotEqual(delivered.get("type"), "response.failed")
+            self.assertEqual(delivered["arguments"], arguments)
 
     async def test_streamed_arguments_survive_an_unusable_mirror(self) -> None:
         """One call owns two identity keys and no mirror may erase them.

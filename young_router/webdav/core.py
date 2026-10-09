@@ -51,6 +51,9 @@ PASSWORD_ENV = "LITELLM_WEBDAV_PASSWORD"
 REMOTE_NAME_ENV = "LITELLM_WEBDAV_REMOTE_NAME"
 SYNC_INTERVAL_MINUTES_ENV = "LITELLM_WEBDAV_SYNC_INTERVAL_MINUTES"
 REMOTE_FILE_SUFFIXES = (".json",)
+
+RELAY_ACCOUNTS_FILE = "relay-accounts.json"
+"""The one synced target whose content exists nowhere else."""
 SENSITIVE_QUERY_KEYS = {"x-vercel-protection-bypass"}
 SYNC_STATE_VERSION = 1
 DEFAULT_SYNC_INTERVAL_MINUTES = 30
@@ -499,6 +502,115 @@ def _atomic_write(path: pathlib.Path, data: bytes) -> None:
     atomic_write_bytes(path, data)
 
 
+def _relay_identity(document: bytes) -> set[tuple[str, str]]:
+    """The (station id, account id) pairs one relay document holds.
+
+    A document that cannot be read is not an identity: the caller treats that
+    as "nothing to merge" and falls back to the configured replacement, so a
+    corrupt remote file is never silently trusted or silently dropped.
+    """
+
+    try:
+        loaded = json.loads(document.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return set()
+    if not isinstance(loaded, dict):
+        return set()
+    stations = loaded.get("stations")
+    accounts = loaded.get("accounts")
+    if not isinstance(stations, list) or not isinstance(accounts, list):
+        return set()
+    pairs: set[tuple[str, str]] = set()
+    for account in accounts:
+        if not isinstance(account, dict):
+            continue
+        account_id = account.get("id")
+        station_id = account.get("station_id")
+        if isinstance(account_id, str) and isinstance(station_id, str):
+            pairs.add((station_id, account_id))
+    return pairs
+
+
+def _merge_relay_accounts(local: bytes, incoming: bytes) -> bytes | None:
+    """Keep the accounts this Mac holds that the incoming file would drop.
+
+    The relay store is the only synced file whose content exists nowhere else:
+    it carries the stations, their saved sessions, and the plaintext passwords
+    that make every bound key readable again.  A remote copy is accepted for
+    the accounts it describes, but an account that exists only in the local
+    file is kept — the incoming bundle is usually simply older, and an
+    outbound run on another machine has no way to know about a station added
+    here.  Returns ``None`` when the incoming file already covers the local
+    accounts, so the caller installs it verbatim and this stays a no-op in the
+    ordinary case.
+
+    Nothing is invented: every kept record is copied from the local file, and
+    the document keeps the local ``version``.  A remote copy that adds or
+    updates accounts still lands, so this can only ever add.
+    """
+
+    local_identity = _relay_identity(local)
+    if not local_identity:
+        return None
+    # Nothing local is missing from the incoming copy: install it verbatim, so
+    # the ordinary case stays a plain whole-file replacement.
+    if not (local_identity - _relay_identity(incoming)):
+        return None
+    try:
+        local_document = json.loads(local.decode("utf-8"))
+        incoming_document = json.loads(incoming.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(local_document, dict) or not isinstance(incoming_document, dict):
+        return None
+    incoming_account_ids = {
+        account.get("id")
+        for account in incoming_document.get("accounts", [])
+        if isinstance(account, dict)
+    }
+    incoming_station_ids = {
+        station.get("id")
+        for station in incoming_document.get("stations", [])
+        if isinstance(station, dict)
+    }
+    kept_accounts = [
+        account
+        for account in local_document.get("accounts", [])
+        if isinstance(account, dict) and account.get("id") not in incoming_account_ids
+    ]
+    kept_station_ids = {
+        account.get("station_id") for account in kept_accounts if isinstance(account.get("station_id"), str)
+    }
+    kept_stations = [
+        station
+        for station in local_document.get("stations", [])
+        if isinstance(station, dict)
+        and station.get("id") not in incoming_station_ids
+        and station.get("id") in kept_station_ids
+    ]
+    if not kept_accounts:
+        return None
+    merged = dict(incoming_document)
+    merged["stations"] = [*incoming_document.get("stations", []), *kept_stations]
+    merged["accounts"] = [*incoming_document.get("accounts", []), *kept_accounts]
+    # A cleanup tombstone belongs to the account it names: one whose account is
+    # gone in both copies is dropped, and the local tombstones for accounts the
+    # merge keeps would be a contradiction.
+    kept_account_id_set = {account.get("id") for account in merged["accounts"]}
+    merged["pending_credential_cleanups"] = [
+        cleanup
+        for cleanup in [
+            *local_document.get("pending_credential_cleanups", []),
+            *incoming_document.get("pending_credential_cleanups", []),
+        ]
+        if isinstance(cleanup, dict)
+        and cleanup.get("account_id") in kept_account_id_set
+        and cleanup.get("account_id") not in incoming_account_ids
+    ]
+    merged.setdefault("version", local_document.get("version", 3))
+    return json.dumps(merged, ensure_ascii=False, indent=2).encode("utf-8")
+
+
 def _backup(path: pathlib.Path) -> str:
     backup_path = path.with_name(f"{path.name}.bak-webdav-{_timestamp()}")
     shutil.copy2(path, backup_path)
@@ -900,6 +1012,32 @@ def install_bundle(bundle_data: bytes, config_path: pathlib.Path) -> dict[str, A
     config_path.parent.mkdir(parents=True, exist_ok=True)
     for archive_name, target_path, required, _required_key in sync_targets(config_path):
         if archive_name in files:
+            # A bundle is a *whole-file* replacement, and the relay store is the
+            # one target whose content is not reconstructible from anything else
+            # in it: it holds the stations, their saved sessions, and the
+            # plaintext passwords that make every bound key readable again.
+            # Accepting a remote copy of it unconditionally is what let an
+            # outbound run on another Mac (or an older bundle that predates a
+            # station this one just added) silently drop a station that exists
+            # only here, with no tombstone and nothing in the UI naming it.
+            # The reader is the only side that can see both copies, so it keeps
+            # the local station when the incoming one would remove an account
+            # this Mac still holds.  Nothing is lost either way: a local file
+            # the sync does replace is backed up first, and the skipped
+            # accounts stay exactly as they were.
+            if archive_name == RELAY_ACCOUNTS_FILE and target_path.exists():
+                local_document = target_path.read_bytes()
+                merged = _merge_relay_accounts(local_document, files[archive_name])
+                if merged is not None:
+                    backups.append(_backup(target_path))
+                    _atomic_write(target_path, merged)
+                    installed.append(str(target_path))
+                    continue
+                if merged is None and local_document == files[archive_name]:
+                    # Identical copies: nothing to install and nothing to back
+                    # up, so a converged pairing stops accumulating backups on
+                    # every run.
+                    continue
             if target_path.exists():
                 backups.append(_backup(target_path))
             _atomic_write(target_path, files[archive_name])
@@ -907,6 +1045,12 @@ def install_bundle(bundle_data: bytes, config_path: pathlib.Path) -> dict[str, A
         elif required:
             raise SyncError(f"WebDAV sync bundle is missing required file {archive_name}")
         elif target_path.exists():
+            # An absent relay store is not an instruction to delete the local
+            # one.  The station inventory is the user's own work, and a bundle
+            # built before it existed (or by a machine that never had it) says
+            # nothing about whether it should still be here.
+            if archive_name == RELAY_ACCOUNTS_FILE:
+                continue
             backups.append(_backup(target_path))
             target_path.unlink()
             removed.append(str(target_path))

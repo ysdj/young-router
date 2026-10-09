@@ -508,8 +508,7 @@ async function main() {
     }
     if (req.method === 'POST' && url.pathname === '/control/shutdown') {
       json(res, 200, { ok: true })
-      server.close(() => process.exit(0))
-      server.closeAllConnections()
+      beginShutdown()
       return
     }
     const [first, ...rest] = url.pathname.split('/').filter(segment => segment.length > 0)
@@ -539,11 +538,43 @@ async function main() {
     void runtime.warm().catch(error => console.error('[warm]', runtime.id, String(error?.message ?? error)))
   }
 
-  const shutdown = () => {
-    for (const runtime of runtimes.values()) void runtime.shim.close()
-    server.close(() => process.exit(0))
-    server.closeAllConnections()
+  // Shutdown stops accepting work but lets a turn already in flight finish.
+  //
+  // This worker is the managed proxy's upstream: a Responses turn streams
+  // through it for as long as the model keeps producing.  Tearing those
+  // sockets down the moment SIGTERM arrives is what turned every app
+  // restart into a cut turn the user had to resend, because the proxy above
+  // is still draining and its upstream had already been destroyed.  Close
+  // the listener, leave the open responses alone, and exit once they end.
+  //
+  // The shims are closed only after the drain: they own the real upstream
+  // sockets, so closing them first would cut exactly the streams this is
+  // waiting for.
+  const DRAIN_MAX_SECONDS = 600
+  let shuttingDown = false
+
+  function beginShutdown() {
+    if (shuttingDown) return
+    shuttingDown = true
+    server.close(() => finishShutdown())
+    // Drop keep-alive sockets that hold nothing: they are not mid-response,
+    // and they would otherwise keep the close callback pending forever.
+    // In-flight responses keep their sockets.
+    server.closeIdleConnections?.()
+    // A response that never ends must not pin the previous app forever.
+    const limit = setTimeout(() => finishShutdown(), DRAIN_MAX_SECONDS * 1000)
+    limit.unref?.()
   }
+
+  let finished = false
+  function finishShutdown() {
+    if (finished) return
+    finished = true
+    for (const runtime of runtimes.values()) void runtime.shim.close()
+    process.exit(0)
+  }
+
+  const shutdown = () => beginShutdown()
   process.on('SIGTERM', shutdown)
   process.on('SIGINT', shutdown)
   await new Promise(() => {})

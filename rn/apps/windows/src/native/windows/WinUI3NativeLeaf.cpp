@@ -124,7 +124,11 @@ ContentSize RouteInitialContentSize(std::wstring_view route) {
   if (route == L"general-settings" || route == L"providers-models" || route == L"codex-settings" ||
       route == L"claude-settings" || route == L"runtime-settings" || route == L"data-management" ||
       route == L"logs") {
-    return {960, 640};
+    // One height for every settings pane, tall enough for the tallest detail
+    // pane: the provider detail carries 535 pt of content beside 112 pt of
+    // window chrome (82 above, 30 below), so the former 640 opened its own
+    // pane seven points short onto a scrollbar.
+    return {960, 660};
   }
   if (route == L"provider-wizard") return {620, 460};
   if (route == L"file-editor") return {900, 560};
@@ -1233,6 +1237,12 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
     bool enabled = true;
     bool deleted = false;
     bool draft = false;
+    // A row 自动分组's own preview derived for a group that has no key yet.  It
+    // is a draft because saving the switch is what creates it, but it is *not* a
+    // pending edit: it is the layout the checked switch already states, so the
+    // list draws it like any other row.  Only a row the user added with ＋ is a
+    // pending create, and only that one is dimmed.
+    bool preview = false;
   };
 
   auto rows = std::make_shared<std::vector<SheetRow>>();
@@ -1620,14 +1630,28 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
   auto selected_index = [&list]() -> int32_t { return list.SelectedIndex(); };
 
   // Save and Close stays disabled until the draft would change the account:
-  // the auto-grouping switch, a staged create, update, or delete.
+  // the auto-grouping switch, a staged create, or an edit the user made.  With
+  // the preview up, a rename or a retirement the switch's own layout produced is
+  // not a change the user made, so it never enables the save.
   auto staged_deletes = std::make_shared<size_t>(0);
-  auto has_staged_changes = [&rows, &toggle_on, initial_auto_grouping = auto_grouping, staged_deletes]() {
+  // The rows as they stood before the switch staged the automatic layout, so
+  // turning it back off restores exactly what the sheet opened on.
+  auto auto_grouping_baseline = std::make_shared<std::optional<std::vector<SheetRow>>>();
+  auto has_staged_changes = [&rows, &toggle_on, auto_grouping_baseline, initial_auto_grouping = auto_grouping, staged_deletes]() {
     if (toggle_on() != initial_auto_grouping) return true;
     if (*staged_deletes > 0) return true;
     for (auto const& row : *rows) {
+      if (row.preview) {
+        // The switch's own derived row is the layout it already states, so it
+        // is not a change the user made and must not enable 保存并关闭.
+        continue;
+      }
       if (row.draft) {
         if (!row.name.empty()) return true;
+        continue;
+      }
+      if (*auto_grouping_baseline && toggle_on()) {
+        if (row.enabled != row.original_enabled) return true;
         continue;
       }
       if (row.name != row.original_name || row.group_id != row.original_group_id || row.enabled != row.original_enabled) return true;
@@ -1661,7 +1685,13 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
     return multiplier_text(row, labels);
   };
   // A row the draft will create or delete; the list shows it dimmed.
-  auto is_staged = [](SheetRow const& row) { return row.deleted || row.draft; };
+  //
+  // 自动分组's own preview rows are not staged: the checked switch *is* the
+  // statement that each group holds one key named after it, so a row it derived
+  // is the layout the sheet is showing rather than an edit waiting to happen.
+  // Dimming those was what made a checked switch read as a list of pending
+  // changes.
+  auto is_staged = [](SheetRow const& row) { return row.deleted || (row.draft && !row.preview); };
 
   // The station's presence sentinel is the only key material the descriptor
   // carries, and a draft key has no key on the station yet.
@@ -2022,6 +2052,7 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
     row.multiplier = groups.front().rate;
     row.original_group_id = row.group_id;
     row.draft = true;
+    row.preview = false;
     rows->push_back(std::move(row));
     rebuild();
     list.SelectedIndex(static_cast<int32_t>(rows->size()) - 1);
@@ -2076,9 +2107,6 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
     if (args.Key() != winrt::Windows::System::VirtualKey::Enter) return;
     commit_name();
   });
-  // The rows as they stood before the switch staged the automatic layout, so
-  // turning it back off restores exactly what the sheet opened on.
-  auto auto_grouping_baseline = std::make_shared<std::optional<std::vector<SheetRow>>>();
   // Stage the automatic layout in the sheet itself: one key per group, named
   // exactly after its group.  The names the user reads *are* the feature, so a
   // checked switch that still listed the old key names looked like it had done
@@ -2087,57 +2115,96 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
   // deletion stays deleted, and neither of those groups is given a replacement
   // here (Core waits for Apply rather than creating a second key beside one it
   // is retiring).
+  //
+  // Every group the account offers is listed, because that is what the switch
+  // means.  A row the layout cannot keep — its group is gone from the station —
+  // is dropped from the list instead of sitting there as a struck-through line
+  // the user cannot act on, and a group that owns no key yet gets the draft row
+  // that carries it.  Nothing is ever handed to Core as a *deletion* on the
+  // strength of the preview: the switch is saved, and Core's own alignment is
+  // what retires the extra keys.
   auto stage_auto_grouping = [&rows, &groups, staged_deletes, auto_grouping_baseline](bool enabled) {
-    if (enabled) {
-      if (!*auto_grouping_baseline) *auto_grouping_baseline = *rows;
-      std::set<std::wstring> kept_groups;
-      std::set<std::wstring> present_groups;
-      for (auto const& row : *rows) {
-        if (!row.draft && !row.group_id.empty()) present_groups.insert(row.group_id);
+    if (!enabled) {
+      if (*auto_grouping_baseline) {
+        *rows = **auto_grouping_baseline;
+        auto_grouping_baseline->reset();
       }
-      std::vector<SheetRow> staged;
-      staged.reserve(rows->size() + groups.size());
-      for (auto const& row : *rows) {
-        if (row.draft || row.deleted) {
-          staged.push_back(row);
-          continue;
-        }
-        auto group = std::find_if(groups.begin(), groups.end(), [&row](GroupManagerGroup const& entry) {
-          return entry.id == row.group_id;
-        });
-        if (group == groups.end() || kept_groups.count(row.group_id) > 0) {
-          // No group to name it after, or a later key in a group that already
-          // owns one: the automatic layout retires the row.
-          SheetRow candidate = row;
-          candidate.deleted = true;
-          staged.push_back(candidate);
-          continue;
-        }
-        kept_groups.insert(row.group_id);
-        SheetRow candidate = row;
-        candidate.name = group->name.empty() ? group->label : group->name;
-        candidate.enabled = true;
-        staged.push_back(candidate);
-      }
-      // A group no key names gets one, so every group ends with exactly one key
-      // of its own name.
+    } else {
+      // The picker also offers 未分组 while the switch is off, because manual
+      // assignment needs it — but it is the *absence* of a group, not one the
+      // station offers, so it is never part of the layout.  Reading it as a
+      // group made a switch checked inside the sheet invent a 未分组 key with no
+      // rate, no value, and no models: a line for a group that does not exist,
+      // in a list that states one key per group the station offers.
+      std::vector<GroupManagerGroup> layout_groups;
       for (auto const& group : groups) {
-        if (kept_groups.count(group.id) > 0 || present_groups.count(group.id) > 0) continue;
-        SheetRow candidate;
-        candidate.id = L"draft-" + group.id;
-        candidate.name = group.name.empty() ? group.label : group.name;
-        candidate.group_id = group.id;
-        candidate.group_label = candidate.name;
-        candidate.multiplier = group.rate;
-        candidate.original_name = candidate.name;
-        candidate.original_group_id = group.id;
-        candidate.draft = true;
-        staged.push_back(candidate);
+        if (group.id.empty()) continue;
+        layout_groups.push_back(group);
       }
-      *rows = std::move(staged);
-    } else if (*auto_grouping_baseline) {
-      *rows = **auto_grouping_baseline;
-      auto_grouping_baseline->reset();
+      // An empty layout has nothing to state: an account with no current group
+      // list would look entirely ungrouped, and the list would empty itself
+      // under a checked switch.  Core's own alignment waits for a refresh that
+      // reports groups instead, so the keys stay exactly as they were.
+      if (!layout_groups.empty()) {
+        // Staging is a *derivation*, not an accumulation: it is applied to the
+        // account's own rows every time, so applying it twice cannot pile up a
+        // second set of preview rows.  The baseline is what the sheet opened
+        // on, and it is kept until the switch goes off.
+        if (!*auto_grouping_baseline) *auto_grouping_baseline = *rows;
+        std::set<std::wstring> kept_groups;
+        std::set<std::wstring> present_groups;
+        for (auto const& row : *rows) {
+          if (!row.draft && !row.preview && !row.group_id.empty()) present_groups.insert(row.group_id);
+        }
+        std::vector<SheetRow> staged;
+        staged.reserve(rows->size() + layout_groups.size());
+        for (auto const& row : *rows) {
+          // A preview row is this derivation's own output, never part of the
+          // account: re-deriving from a staged list therefore reproduces the
+          // same layout instead of piling a second copy of it on top.
+          if (row.preview) continue;
+          if (row.draft || row.deleted) {
+            staged.push_back(row);
+            continue;
+          }
+          // 未分组 is the manual-assignment sentinel: it is the absence of a
+          // group, so a key naming none has no place in a layout that states
+          // one key per group.  Core's own alignment retires it, and the row it
+          // used to leave behind read as a group.
+          if (row.group_id.empty()) continue;
+          auto group = std::find_if(layout_groups.begin(), layout_groups.end(), [&row](GroupManagerGroup const& entry) {
+            return entry.id == row.group_id;
+          });
+          if (group == layout_groups.end() || kept_groups.count(row.group_id) > 0) {
+            // No group to name it after, or a later key in a group that already
+            // owns one: the row is what the layout replaces, so it is not
+            // listed.
+            continue;
+          }
+          kept_groups.insert(row.group_id);
+          SheetRow candidate = row;
+          candidate.name = group->name.empty() ? group->label : group->name;
+          candidate.enabled = true;
+          staged.push_back(candidate);
+        }
+        // A group no key names gets one, so every group ends with exactly one
+        // key of its own name.
+        for (auto const& group : layout_groups) {
+          if (kept_groups.count(group.id) > 0 || present_groups.count(group.id) > 0) continue;
+          SheetRow candidate;
+          candidate.id = L"draft-" + group.id;
+          candidate.name = group.name.empty() ? group.label : group.name;
+          candidate.group_id = group.id;
+          candidate.group_label = candidate.name;
+          candidate.multiplier = group.rate;
+          candidate.original_name = candidate.name;
+          candidate.original_group_id = group.id;
+          candidate.draft = true;
+          candidate.preview = true;
+          staged.push_back(candidate);
+        }
+        *rows = std::move(staged);
+      }
     }
     *staged_deletes = 0;
     for (auto const& row : *rows) {
@@ -2171,13 +2238,27 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
     GroupManagerResult result;
     auto checked = toggle.IsChecked();
     result.auto_grouping = checked && checked.Value();
+    // While the preview is up the list on screen is the layout that switch
+    // owns, not the account: the only thing it can be reporting that the
+    // account does not already have is the key each group without one needs,
+    // and Core's own alignment is what renames and retires the rest once the
+    // switch is saved.  So the drafts are the whole of what the preview
+    // creates, and a rename or a retirement the preview produced never travels
+    // as a write the user did not make.
+    const bool previewing = *auto_grouping_baseline && result.auto_grouping;
     for (auto const& row : *rows) {
       if (row.draft) {
         if (!row.name.empty()) result.creates.emplace_back(row.name, row.group_id);
         continue;
       }
       if (row.deleted) {
-        result.deletes.push_back(row.id);
+        if (!previewing) result.deletes.push_back(row.id);
+        continue;
+      }
+      if (previewing) {
+        if (row.enabled != row.original_enabled) {
+          result.updates.push_back(GroupManagerUpdate{row.id, row.name, row.group_id, row.enabled});
+        }
         continue;
       }
       if (row.name != row.original_name || row.group_id != row.original_group_id || row.enabled != row.original_enabled) {
@@ -2187,6 +2268,12 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
     outcome = std::move(result);
   });
 
+  // A sheet that opens on a checked 自动分组 states the layout that switch means,
+  // exactly as clicking it would: the list has to be one key per group the moment
+  // it is on screen, or a checked switch would be showing the account's raw key
+  // list — ungrouped rows and keys in groups the station no longer offers — under
+  // a switch that says otherwise.
+  if (toggle_on()) stage_auto_grouping(true);
   rebuild();
   // The selection drives the detail column, so the sheet opens on the first
   // key instead of a blank form.

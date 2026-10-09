@@ -240,6 +240,12 @@ def _responses_namespace_tool_map_from_tools(value: Any) -> dict[str, str]:
             function = tool.get("function")
             function_dict = function if isinstance(function, dict) else {}
             add_tool_name(function_dict.get("name") or tool.get("name"), namespace)
+            return
+        # Responses custom tools are also flattened to Chat function tools.
+        # Keep their namespace so the restored custom_tool_call remains
+        # executable by the client that declared the namespace.
+        if tool_type == "custom":
+            add_tool_name(tool.get("name"), namespace)
 
     if isinstance(value, list):
         for item in value:
@@ -322,7 +328,10 @@ def _restore_response_function_call_namespace(
 ) -> Any:
     if not namespace_by_name:
         return item
-    if _responses_web_search_bridge_module._response_item_get(item, "type") != "function_call":
+    if _responses_web_search_bridge_module._response_item_get(item, "type") not in {
+        "function_call",
+        "custom_tool_call",
+    }:
         return item
     if _responses_web_search_bridge_module._response_item_get(item, "namespace") is not None:
         return item

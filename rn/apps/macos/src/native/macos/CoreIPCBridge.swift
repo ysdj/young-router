@@ -942,11 +942,27 @@ import Foundation
     /// minutes on a slow server.  The short cap is what catches a wedged Core;
     /// applying it to the sync told the reader "the local Core is unavailable"
     /// while Core was still finishing the sync it had already started (the
-    /// pane's own status file recorded it succeeding afterwards).
+    /// pane's own status file recorded it succeeding afterwards).  A service
+    /// lifecycle dispatch earns the same wait: it replaces the proxy, which the
+    /// drain budget lets run for minutes, and a request that expires here tears
+    /// Core down mid-restart.
     private static func responseTimeoutInterval(for method: String, request: Data) -> TimeInterval {
         if method == "probe" { return 900 }
         if method == "dispatch", webdavRemoteOperation(in: request) != nil { return 900 }
+        if method == "dispatch", serviceLifecycleOperation(in: request) != nil { return 900 }
         return 30
+    }
+
+    /// The managed-proxy lifecycle operation inside a dispatch request, when it
+    /// has one.  These are the only dispatches that replace the proxy, so they
+    /// are the ones whose answer arrives after a whole drain.
+    private static func serviceLifecycleOperation(in data: Data) -> String? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let params = object["params"] as? [String: Any],
+              let action = params["action"] as? [String: Any],
+              action["domain"] == nil else { return nil }
+        let type = ((action["type"] as? String) ?? (action["action"] as? String) ?? "").lowercased()
+        return ["service.start", "service.stop", "service.restart", "service.reload"].contains(type) ? type : nil
     }
 
     /// The WebDAV operation inside a dispatch request, when it has one: these

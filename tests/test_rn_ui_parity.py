@@ -289,7 +289,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_not_has("styles.validationText")
         self.assertNotIn("<WindowTitle title={windowTitle} validation=", self.ui)
         self.assert_ui_not_has("setIssues(")
-        self.assertIn('publishResult(value.valid ? translate("common.saved") : translate("error.validationFailed"));', self.ui)
+        # A rejected draft names the entries that block it: the strip carries the
+        # first issues instead of a sentence that says only that something is wrong.
+        self.assertIn('publishResult(value.valid ? translate("common.saved") : (validationSummaryMessage(value, translate) ?? translate("error.validationFailed")));', self.ui)
+        self.assertIn("function validationSummaryMessage(summary: unknown, translate: Translate): string | undefined {", self.ui)
         self.assertIn('publishResult(applyResultMessage(value, translate, typeof message === "string" ? message : null));', self.ui)
         self.assertIn('if (result.status === "partial") return translate("common.notAppliedPartial");', self.ui)
         self.assertIn('if (result.status === "failed") return translate("common.notApplied");', self.ui)
@@ -626,9 +629,16 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # A WebDAV sync crosses the network like the probe, so it earns the same
         # wait instead of the 30 s cap that hid a sync Core was still running.
         self.assertIn('if method == "dispatch", webdavRemoteOperation(in: request) != nil { return 900 }', macos_bridge)
+        # A lifecycle dispatch replaces the proxy, which the drain budget lets
+        # run for minutes; the 30 s cap expired mid-restart and tore Core down.
+        self.assertIn('if method == "dispatch", serviceLifecycleOperation(in: request) != nil { return 900 }', macos_bridge)
+        self.assertIn('private static func serviceLifecycleOperation(in data: Data) -> String? {', macos_bridge)
+        self.assertIn('guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],\n              let params = object["params"] as? [String: Any],\n              let action = params["action"] as? [String: Any],\n              action["domain"] == nil else { return nil }', macos_bridge)
+        self.assertIn('return ["service.start", "service.stop", "service.restart", "service.reload"].contains(type) ? type : nil', macos_bridge)
         self.assertIn("timeoutInterval: Self.responseTimeoutInterval(for: metadata.method, request: data)", macos_bridge)
         self.assertIn('const int receive_timeout_ms = slow_remote_operation ? 900000 : 30000;', windows_bridge)
-        self.assertIn('const bool slow_remote_operation = method == "probe" || IsWebdavRemoteOperation(request_json);', windows_bridge)
+        self.assertIn('bool IsServiceLifecycleOperation(std::string const& request_json) {', windows_bridge)
+        self.assertIn('method == "probe" || IsWebdavRemoteOperation(request_json) || IsServiceLifecycleOperation(request_json);', windows_bridge)
         self.assertIn('Request(endpoint, L"", L"POST", request_json, session, receive_timeout_ms);', windows_bridge)
 
     def test_model_detail_deep_test_names_the_degradation_probe_before_it_runs(self) -> None:
@@ -987,7 +997,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn("providerEditorScrollContent: { paddingTop", self.ui)
         self.assert_ui_has('persistentScrollIndicator: { position: "absolute", width: 0, height: 0 }')
         self.assert_ui_has('return <PersistentScrollView style={styles.providerEditorContent} contentContainerStyle={styles.providerEditorScrollContent} showsVerticalScrollIndicator nestedScrollEnabled>')
-        self.assert_ui_has('{kind === "apiKey" || (kind === "relay" && !station) ? <ProviderSourceFields')
+        self.assert_ui_has('<ProviderIdentityFields')
         self.assert_ui_has("<NativePersistentScrollIndicator style={styles.persistentScrollIndicator} />")
         self.assert_ui_has('showsHorizontalScrollIndicator={false}\n    onLayout=')
         self.assert_ui_has('<PersistentScrollView style={styles.providerWizardModelScroll} contentContainerStyle={styles.providerWizardModelScrollContent} showsVerticalScrollIndicator keyboardShouldPersistTaps="handled">')
@@ -3384,13 +3394,18 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'if (summary.available === false)',
             'translate("providers.fetchFailed"',
             'translate("providers.fetchEmpty")',
+            # A fetch must speak in the user's terms when the key itself cannot
+            # be resolved: 不适用 names no cause and no next step.
+            'translate("providers.fetchKeyUnavailable")',
             'const summary = asRecord(asRecord(next.action_summaries?.providers_models).operation_summary);',
         ):
             self.assert_ui_has(marker)
         self.assertIn('"providers.fetchFailed": "获取模型失败：{detail}"', self.zh)
+        self.assertIn('"providers.fetchKeyUnavailable": "无法解析该 API 密钥"', self.zh)
         self.assertIn('"providers.fetchEmpty": "供应商未返回模型。"', self.zh)
         self.assertIn('"providers.fetch": "获取模型"', self.zh)
         self.assertIn('"providers.fetchFailed": "Could not fetch models: {detail}"', self.en)
+        self.assertIn('"providers.fetchKeyUnavailable": "the API key could not be resolved"', self.en)
         self.assertIn('"providers.fetchEmpty": "The provider returned no models."', self.en)
         self.assertIn('"providers.fetch": "Fetch models"', self.en)
 
@@ -3441,56 +3456,124 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("addRelayAccountToVendor", editor)
         self.assertIn("{vendorBaseURL && !providerService(provider) ?", editor)
 
-    def test_a_providers_own_fields_share_the_enable_rows_group(self) -> None:
-        """No provider draws a rule between its 启用 row and its own fields.
+    def test_a_providers_identity_is_one_block_for_every_kind(self) -> None:
+        """Every provider states the same identity rows, in the same order.
 
-        The editor's one section rule sits above 启用, and a group that is
-        genuinely another surface — the keys, the service's account, the
-        stations linked to the provider — opens its own rule.  A service
-        provider states the same identity fields a custom provider does (name,
-        type, address), so it shares that borderless container; drawing them in
-        the account section's own style put a line straight under 启用, which no
-        other provider has.
+        The editor's one section rule sits above the identity block, and a group
+        that is genuinely another surface — the keys, the account, the stations
+        linked to the provider — opens its own rule.  The identity itself is one
+        shared block (`ProviderIdentityFields`) whatever the kind is, so 启用,
+        供应商名称, 供应商类型 and 基础 URL always appear in that order, and the
+        type is *stated* rather than offered: nothing in the pane retargets a
+        provider, so the row reads the type it is.
         """
 
         editor = self.ui.split("function ProviderEditor(", 1)[1].split("function CodexWorkspace(", 1)[0]
-        # The service's identity block is the one that follows the enable row.
-        self.assertIn('<View style={styles.providerEnabledRow}>', editor)
-        identity = editor.split("{service ? <View", 1)[1].split("</View> : null}", 1)[0]
-        self.assertIn("styles.providerSourceFields", identity)
-        self.assertNotIn("styles.officialAccountSection", identity)
-        self.assertIn('label={translate("providers.providerName")}', identity)
-        # The detail pane states the provider's identity and nothing more: the
-        # type and the address are what the provider is already bound to, so a
-        # picker here would offer a retarget this pane has no business doing.
-        self.assertNotIn('label={translate("providers.wizard.providerType")}', identity)
-        self.assertIn("{SERVICE_BASE_URLS[service]}", identity)
-        self.assertLess(editor.index("styles.providerEnabledRow"), editor.index("{service ? <View"))
-        # The provider's own fields container is the custom provider's: one
-        # container, so the two shapes cannot drift apart again.
-        source_fields = self.ui.split("return <View style={styles.providerSourceFields}>", 1)[1].split("</View>", 1)[0]
-        self.assertIn('label={translate("providers.providerName")} labelWidth={88}', source_fields)
+        # The shared block owns the whole identity, and the editor renders it
+        # once, between its section rule and the surface groups.
+        self.assertIn("<ProviderIdentityFields", editor)
+        self.assertEqual(1, editor.count("<ProviderIdentityFields"))
+        self.assert_ui_has("function ProviderIdentityFields(")
+        self.assertLess(editor.index("<ProviderIdentityFields"), editor.index("{isOfficialAccount ? <View"))
+        self.assertLess(editor.index("<ProviderIdentityFields"), editor.index("<ProviderKeysPanel"))
+        identity = self.ui.split("function ProviderIdentityFields(", 1)[1].split("function ProviderEditor(", 1)[0]
+        # One container, one enable row, and the fields the block itself draws.
+        self.assertIn("return <View style={styles.providerSourceFields}>", identity)
+        self.assertIn('<View style={styles.providerEnabledRow}><NativeCheckbox label={translate("common.enable")}', identity)
+        self.assertIn('label={translate("providers.providerName")}\n        labelWidth={88}', identity)
+        self.assertIn('label={translate("providers.baseUrl")}\n        labelWidth={88}', identity)
+        # The type row is a value, never a control: no picker, no switch
+        # confirmation, and no map from a short type to a persisted login kind,
+        # because nothing here retargets a provider or one of its routes.
+        type_label = '<Text style={styles.providerAuthStatusLabel}>{translate("providers.providerType")}</Text>'
+        # One row per branch — the service, the station-bound, and the custom
+        # provider — and each of them a plain value beside its label.
+        self.assertEqual(3, identity.count(type_label))
+        for locale_label in ('label={translate("providers.providerType")}', 'label={translate("providers.wizard.providerType")}'):
+            self.assertNotIn(locale_label, identity)
+        self.assertNotIn("PROVIDER_TYPE_OPTIONS", self.ui)
+        self.assertNotIn("ProviderTypeOption", self.ui)
+        self.assertNotIn("selectType", identity)
+        self.assertNotIn("typeBusy", identity)
+        self.assertNotIn("serviceProviderKindFor", self.ui)
+        self.assertNotIn("providers.switchTypeTitle", self.ui)
+        self.assertNotIn("providers.switchTypeMessage", self.ui)
+        self.assertNotIn("providers.switchTypeToApiKeyMessage", self.ui)
+        self.assertNotIn("providers.switchTypeConfirm", self.ui)
+        self.assertNotIn("providers.switchTypeTitle", self.zh)
+        self.assertNotIn("providers.switchTypeTitle", self.en)
+        # Each kind states its own type: a service provider names its service,
+        # a relay-bound provider names the station that addresses it, and a
+        # custom provider is a key provider.
+        self.assertIn('{providerKindLabel(kind, translate)}', identity)
+        self.assertIn('{translate("providers.type.relay")}', identity)
+        self.assertIn('{translate("providers.type.apiKey")}', identity)
+        self.assertIn("isLogin ? SERVICE_BASE_URLS[kind as ServiceID]", identity)
         # The account surface keeps its rule, as the keys and the stations do.
         self.assertIn("{isOfficialAccount ? <View style={styles.officialAccountSection}>", editor)
         self.assertIn("providerAccountsHeader", editor)
         self.assertIn("<ProviderKeysPanel", editor)
         self.assert_ui_has("officialAccountSection: { minWidth: 0, gap: 5, paddingTop: 6, borderTopWidth: 1, borderTopColor: systemColors.separator }")
         self.assert_ui_has("providerSourceFields: { minWidth: 0, gap: 4 }")
+        for locale in (self.zh, self.en):
+            self.assertIn('"providers.providerType":', locale)
+        self.assertNotIn('"providers.providerUrl"', self.zh)
+        self.assertNotIn('"providers.providerUrl"', self.en)
+
+    def test_a_provider_rename_compares_the_submitted_name_to_the_stored_one(self) -> None:
+        """A rename is due whenever the field differs from what Core holds.
+
+        ``providerName`` is the draft projection: the field writes it on every
+        keystroke through ``onDraftChange``, so by the time a blur commits it
+        already equals what was typed.  A uniqueness/no-op guard read against
+        that projection therefore answered “nothing changed” for *every* edit —
+        the field displayed 新名字, Core kept the old one, and the next snapshot
+        re-projected the stale stored name while the draft masked it, so
+        retyping the same edit failed identically every time.
+
+        The submitted value must be compared against the *stored* name, which is
+        the only thing a write changes.  The draft stays what the field draws.
+        """
+
+        identity = self.ui.split("function ProviderIdentityFields(", 1)[1].split("function ProviderEditor(", 1)[0]
+        # The stored name is a projection of the provider record alone — never of
+        # the draft context — and the commit guard reads exactly that.
+        self.assertIn(
+            'const committedName = displayLabel(provider.display_name, displayLabel(provider.name, translate("providers.newProvider")));',
+            identity,
+        )
+        self.assertIn("if (!next || next === committedName.trim()) return undefined;", identity)
+        # The draft projection stays the field's value; only the guard moved.
+        self.assertIn("value={providerName}", identity)
+        self.assertIn("onDraftChange={onNameDraftChange}", identity)
+        commit = identity.split("const commitName = (name: string)", 1)[1].split("};", 1)[0]
+        self.assertNotIn("providerName.trim()", commit)
+        # Both identity branches — a login provider's and a key provider's —
+        # commit through that one guard, so the fix covers both surfaces.
+        self.assertEqual(2, identity.count("onCommit={commitName}"))
+        # A rename is only one of the writes a name field owns: the create path
+        # derives a name from the first URL, and that suggestion still compares
+        # against the displayed value, because there the field is what the user
+        # sees and the stored name is still empty.
+        self.assertIn(
+            "if (suggested && suggested.toLocaleLowerCase() !== providerName.trim().toLocaleLowerCase()) {",
+            identity,
+        )
 
     def test_provider_inspector_keeps_the_compact_provider_form_and_return_link(self) -> None:
         """The provider editor uses compact, consistently aligned rows and a source-model return link."""
         for marker in (
             'const [providerSourceModel, setProviderSourceModel] = useState<string>();',
-            'function ProviderSourceFields(',
+            'function ProviderIdentityFields(',
             'function providerNameExists(providers: UnknownRecord[], name: string, excludeID = ""): boolean {',
             'const [sourceResetToken, setSourceResetToken] = useState(0);',
-            'providerNameExists(drafts?.providers ?? [], station.name, providerID)',
+            'providerNameExists(drafts?.providers ?? [], nextStation.name, providerID)',
             'onBaseUrlDraftChange?.("");',
             'onNameDraftChange?.("");',
-            'key={"provider-base-url:" + sourceResetToken}',
-            'key={"provider-name:" + sourceResetToken}',
+            'key={`provider-base-url:${sourceResetToken}`}',
+            'key={`provider-name:${sourceResetToken}`}',
             'dispatch("provider.select_relay_station", { provider_id: providerID, station_id: station.id })',
-            'label={translate("providers.providerName")} labelWidth={88}',
+            'label={translate("providers.providerName")}\n        labelWidth={88}',
             'label={translate("providers.keyName")}',
             'NativeSecretField labelVisible={false} plainText autoCommit label={translate("providers.keyValue")}',
             'title={translate("providers.backToModel", { model: sourceModelLabel })} link',
@@ -3654,7 +3737,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # bound address, and the account — never a type picker, because the
             # provider's service is what it is already bound to.
             'label={translate("providers.providerName")}',
-            '{SERVICE_BASE_URLS[service]}',
+            'isLogin ? SERVICE_BASE_URLS[kind as ServiceID]',
             # Every label column in the pane is the shared one, so a rate row
             # lines up with the fields beside it.
             'providerAuthStatusLabel: { width: 88, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE }',
@@ -4011,8 +4094,16 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("startupAttempts.current = attempt + 1;", self.ui)
         self.assertIn('const timer = setTimeout(() => { void runServiceOperation("start"); }, delay);', self.ui)
         self.assertNotIn("startupAttempted", self.ui)
-        self.assertIn('const serviceRestart = serviceState === "unhealthy";', general)
+        self.assertIn('const serviceRestart = serviceState === "unhealthy" || serviceState === "starting";', general)
         self.assertIn('const serviceActionAvailable = serviceState === "stopped" || serviceRestart;', general)
+        # A transitional state is a claim about Core, and Core is the authority
+        # that clears it; a window re-reads while it draws one, so a replacement
+        # that outlives the request budget cannot leave the pane stating 启动中
+        # with no control and no correction.
+        self.assertIn("const SERVICE_STATE_RECONCILE_MS = 5_000;", self.ui)
+        self.assertIn('if (snapshot.service.state !== "starting") return;', self.ui)
+        self.assertIn("const timer = setInterval(() => { void refreshSnapshot().catch(() => undefined); }, SERVICE_STATE_RECONCILE_MS);", self.ui)
+        self.assertIn("return () => clearInterval(timer);", self.ui)
         self.assertIn('await dispatchServiceAction(serviceRestart ? "service.restart" : "service.start");', general)
         # The strip names the action that landed; the 服务 row already states the
         # state, so the same word is never printed twice on one screen.
@@ -4385,7 +4476,21 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # the silent mount probe reports in the resources lane it shares with the
         # key-list read, so a routine session check never repaints the login row.
         self.assertIn('updateLoading(account.id, "resources", true);', relay)
-        self.assertIn('updateLoading(account.id, "session", true);', relay)
+        # The lane is opened on the way *in* to a sign-in and released only with
+        # the refresh that follows the answer, never in a `finally` that a
+        # verified sign-in could reach while its own repaint was still pending:
+        # a lane cleared there left the row reading 未登录 with 去登录 beside it
+        # for the whole of the commit.  The account that owns the wait is kept
+        # by id so a failure or a cancellation releases it too.
+        self.assertIn('const pendingLoginRef = useRef<string | undefined>(undefined);', relay)
+        self.assertIn('const startSigningIn = (accountID: string): void => {', relay)
+        self.assertIn('pendingLoginRef.current = accountID;', relay)
+        self.assertIn('updateLoading(accountID, "session", true);', relay)
+        self.assertIn('const clearPendingLogin = (): void => {', relay)
+        self.assertIn('updateLoading(pending, "session", false);', relay)
+        self.assertIn('if (pendingLoginRef.current === account.id) clearPendingLogin();', relay)
+        self.assertIn('startSigningIn(account.id);', relay)
+        self.assertNotIn('updateLoading(account.id, "session", false);', relay)
         self.assertIn('translate(`relay.status.${relayLoginState(account)}`)', relay)
         self.assertIn('const selectedLoginState = selected ? relayLoginState(selected) : "signed_out";', relay)
         self.assertIn('{selectedLoginState === "signed_out" ? <NativeButton title={translate("relay.goLogin")} compact busy={pendingAction === "login"} disabled={controlsBusy && pendingAction !== "login"} onPress={() => { void loginSelected(); }} /> : null}', relay)
@@ -4493,10 +4598,25 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("private func presentation(for row: KeyRow) -> String {", mac_leaf)
         self.assertIn("private func presentation(for row: KeyRow) -> String {\n        multiplierText(for: row)\n    }", mac_leaf)
         self.assertIn("private func isStaged(_ row: KeyRow) -> Bool {", mac_leaf)
+        # 自动分组 checked is a preview, not a write: the list is Core's own
+        # alignment applied to the rows on screen, the groups with no key become
+        # draft rows, and a row the layout is replacing is dropped from the list
+        # entirely.  Nothing it produces is handed back as a *deletion*, because
+        # the user never saw those rows to agree to them — saving the switch is
+        # what lets Core's own alignment retire the extra keys.
+        self.assertIn("private func stageAutoGroupingLayout(_ enabled: Bool) {", mac_leaf)
+        self.assertIn("private var autoGroupingBaselineKeys: Set<String> = []", mac_leaf)
+        self.assertIn("guard !autoGrouping || !previewed.contains(row.id) else { return false }", mac_leaf)
+        self.assertIn("return !autoGrouping || previewed.contains(row.id)", mac_leaf)
+        self.assertIn("if autoGroupingOn && autoGroupingBaselineKeys.contains(row.id) {", mac_leaf)
+        self.assertIn("auto stage_auto_grouping = [&rows, &groups, staged_deletes, auto_grouping_baseline](bool enabled) {", windows_leaf)
+        self.assertIn("const bool previewing = *auto_grouping_baseline && result.auto_grouping;", windows_leaf)
+        self.assertIn("if (!previewing) result.deletes.push_back(row.id);", windows_leaf)
+        self.assertIn("if (*auto_grouping_baseline && toggle_on()) {", windows_leaf)
         self.assertIn("text?.textColor = isStaged(entry) ? .secondaryLabelColor : .labelColor", mac_leaf)
         self.assertIn("auto presentation = ", windows_leaf)
         self.assertIn("-> std::wstring {\n    return multiplier_text(row, labels);", windows_leaf)
-        self.assertIn("auto is_staged = [](SheetRow const& row) { return row.deleted || row.draft; };", windows_leaf)
+        self.assertIn("auto is_staged = [](SheetRow const& row) { return row.deleted || (row.draft && !row.preview); };", windows_leaf)
         # 分组 is a group name and 倍率 is a rate: neither field carries the
         # other, and the picker lists the name alone.
         self.assertIn('export function groupLabel(group: RelayGroup, translate: Translate): string {\n  return group.name || translate("relay.apiKeyUngrouped");\n}', relay)
@@ -4619,12 +4739,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("loadingLabel: translate(\"relay.groupManagerLoading\"),", relay)
         self.assertIn('"relay.groupManagerLoading": "正在读取中转站…"', self.zh)
         self.assertIn('"relay.groupManagerLoading": "Reading the station…"', self.en)
-        self.assertIn("const pending = update && groupManagerNeedsAlignment(account) ? loadGroupManagerAccount(account) : undefined;", relay)
+        self.assertIn("const pending = update && !groupManagerHasUsableFacts(account) ? loadGroupManagerAccount(account) : undefined;", relay)
         self.assertIn("const shown = native.showGroupManager({ ...groupManagerRequest(current), loading: Boolean(pending) });", relay)
         self.assertIn("if (!update) current = await loadGroupManagerAccount(account);", relay)
         # The update carries the sheet's content alone, which is exactly the
         # field set the native side accepts for it.
-        self.assertIn("void push(groupManagerSnapshot(aligned)).catch(() => {", relay)
+        self.assertIn("void push(groupManagerSnapshot(loaded)).catch(() => {", relay)
         self.assertIn("const groupManagerSnapshot = (current: RelayAccount) => {", relay)
         self.assertIn('guard Set(options.keys).isSubset(of: ["accountLabel", "groups", "keys", "autoGrouping"]),', mac_module)
         self.assertIn("guard let controller = groupManagerController, groupManagerPanel != nil else { return false }", mac_leaf)
@@ -4775,21 +4895,30 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # footer, beside its buttons.
         self.assertIn("auto show_copy_status = [footer_status, status_timer]", windows_leaf)
         self.assertIn("controls::Grid::SetColumn(footer_status, 1);", windows_leaf)
-        # 自动分组 owns one key per group: the sheet refreshes the station facts
-        # and stages Core's alignment first, then lists only the keys still in a
-        # group, so a checked switch never shows an ungrouped row or item.  That
-        # load lands in the sheet that is already open, never in front of it.
-        self.assertIn("await alignAutoGroupingAction(current.id);", relay)
-        # 自动分组's layout is built over the groups Core holds, so the sheet
-        # reads the station only when there is no usable key list to align yet:
-        # opening it right after the pane's own read never waits for a station
-        # round trip it does not need.
+        # 自动分组 is a *preview* inside the sheet: the switch stages the layout
+        # over the rows already on screen, and the groups with no key yet are
+        # listed as draft rows.  The window reads the station only when the
+        # account has no usable key list to draw at all — never to run Core's
+        # alignment behind the user's back, which happens when the switch is
+        # saved (and on the workspace's own interval).
         self.assertIn("const groupManagerHasUsableFacts = (current: RelayAccount): boolean =>", relay)
         self.assertIn('current.resourceStatus === "ready" && current.resources.length > 0;', relay)
-        self.assertIn('if (!groupManagerHasUsableFacts(current) && await refreshResources(current.id) !== "ready") return current;', relay)
+        self.assertIn('if (await refreshResources(current.id) !== "ready") return current;', relay)
+        self.assertIn("if (groupManagerHasUsableFacts(current)) return current;", relay)
+        self.assertNotIn("await alignAutoGroupingAction(current.id);", relay)
         self.assertIn("pendingDelete: entry.pending_delete === true,", relay)
-        self.assertIn("current.resources.filter((resource) => !resource.pendingDelete && resourceGroup(resource, current.groups) !== undefined)", relay)
+        # The list is the account's own keys and only those; 自动分组 checked is
+        # a *preview* the window draws over them itself, and unchecking it puts
+        # that preview away.  The request therefore never carries a synthetic
+        # key list, and the window never shows a row the station does not report.
+        self.assertIn("keys: current.resources.map((resource) => ({", relay)
+        self.assertNotIn("claimedGroupIDs", relay)
         self.assertIn('if (current.type === "newapi" && !current.autoGrouping) {', relay)
+        # A group the station no longer offers is not a choice the picker may
+        # carry: Core refuses such a group, and the checked switch's own layout
+        # cannot keep the key that names it.  Synthesizing a selectable item
+        # for it made the window offer a group that does not exist.
+        self.assertNotIn("groups.push({", relay)
         # The relay refresh reports its status through the dispatch action
         # summary; the top-level result carries the revision alone.  Only a
         # successful read is remembered for the reuse window, so the next
@@ -5042,6 +5171,23 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertEqual(2, relay.count("<RelayDialogLayer visible={visible} onRequestClose={onClose}>"))
         self.assertEqual(1, relay.count('<DependencyPolicyDialog\n      visible={Boolean(removal)}'))
         self.assertIn('      confirmLabel={translate("relay.removeLocal")}\n      destructive\n', relay)
+        # 移除中转站连接 draws on the route's dialog surface, not inside its own
+        # panel.  These panels live in the provider inspector — a 290 pt column
+        # whose editor is a scroll view — so a dialog rendered where the panel
+        # sits is clipped by that view and centred in the column, which is how it
+        # drew as a small box under the pane while every other confirmation drew
+        # as one dialog over the window that asked.  The placement moves; the
+        # component, its props, and its answers do not.
+        surface = (ROOT / "rn/packages/shared/src/ui/relayDialogSurface.tsx").read_text(encoding="utf-8")
+        self.assertIn("export function useRelayDialogSurface(", surface)
+        self.assertIn("export function RelayDialogHost(", surface)
+        self.assertIn("const removalDialogHosted = useRelayDialogSurface(() => removalDialog);", relay)
+        self.assertIn("{removalDialogHosted ? null : removalDialog}", relay)
+        self.assertIn("const dialogsHosted = useRelayDialogSurface(() => dialogs);", ui)
+        self.assertEqual(2, ui.count("{dialogsHosted ? null : dialogs}"))
+        # The host is a sibling of the inspector, so no column clips it.
+        self.assertIn("<RelayDialogHost />", ui)
+        self.assertIn('</View>\n    <RelayDialogHost />', ui)
         # Every confirmation that deletes or discards says so: the provider,
         # model, and API key deletes, the route close that drops staged changes,
         # and the raw file editor's discarded draft.
@@ -5058,9 +5204,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'return (["providers_models", "relay_accounts"] as const).filter',
             'function relaySourcesForBaseUrl(',
             'function providerKeyChoices(provider: UnknownRecord, relaySources: RelaySourceOption[], baseURL?: string): ProviderKeyChoice[] {',
-            'function ProviderSourceFields(',
+            'function ProviderIdentityFields(',
             'function relayStationsFromSnapshot(',
-            'const station = relayStationForBaseUrl(endpoint, relayStations);',
+            'const nextStation = relayStationForBaseUrl(endpoint, relayStations);',
             'dispatch("provider.select_relay_station", { provider_id: providerID, station_id: station.id })',
             'const matchingRelaySources = relaySourcesForBaseUrl(',
             '() => provider && providerKindSelected !== "openai" && providerKindSelected !== "claude" ? providerKeyChoices(provider, relaySources, providerBaseURL(provider)) : [],',
@@ -5331,7 +5477,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('onStatus?.(translate(resourceStatus === "ready" ? "relay.loginComplete" : "relay.loginResourcesUnavailable"));')
         # An address that cannot bind because its station name is taken says so
         # instead of looking like a lost keystroke.
-        self.assert_ui_has('onStatus?.(translate("providers.relayNameTaken", { name: station.name }));')
+        self.assert_ui_has('onStatus?.(translate("providers.relayNameTaken", { name: nextStation.name }));')
         # The 分组管理 sheet records each staged edit as it lands, so a retry
         # writes only the remainder instead of duplicating keys.
         self.assertIn('const opened = useRef(false);', self.relay)
@@ -5672,8 +5818,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("const [providedNameDrafts, setProvidedNameDrafts] = useState<Record<string, string>>({});", self.ui)
         self.assertIn("providedNameDrafts[selectedProvided.key] ?? selectedProvided.keyName", self.ui)
         self.assertIn("const stationDraft = stationDraftProp ?? internalStationDraft;", relay)
-        self.assertIn("stationDraft.name ?? stationDisplayName(station, translate)", self.ui)
-        self.assertIn("value={stationDraft.origin ?? station.origin}", self.ui)
+        self.assertIn("stationDraft?.name ?? stationDisplayName(station, translate)", self.ui)
+        self.assertIn("value={stationDraft?.origin ?? station.origin}", self.ui)
         self.assertIn("textField: { minHeight: 24 }", appkit_controls)
         self.assertIn("compact = true", native_controls)
         self.assertNotIn("providers.apiKeyHint", self.ui)
@@ -5758,7 +5904,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # strip states the outcome and the offending row is marked in place.
         self.assert_ui_not_has("function IssueList(")
         self.assert_ui_not_has('setIssues(summary.issues);')
-        self.assertIn('publishResult(value.valid ? translate("common.saved") : translate("error.validationFailed"));', self.ui)
+        # A rejected draft names the entries that block it: the strip carries the
+        # first issues instead of a sentence that says only that something is wrong.
+        self.assertIn('publishResult(value.valid ? translate("common.saved") : (validationSummaryMessage(value, translate) ?? translate("error.validationFailed")));', self.ui)
+        self.assertIn("function validationSummaryMessage(summary: unknown, translate: Translate): string | undefined {", self.ui)
 
         for locale in (self.zh, self.en):
             self.assertIn('"validation.modelNameRequired"', locale)
@@ -6177,10 +6326,20 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # A rejected live write names the fix, not an action that does not
         # exist, and Core reports the missing key value as a coded location so
         # the pane can point at the provider row it has to open.
-        self.assertIn('publishResult(value.valid ? translate("common.saved") : translate("error.validationFailed"));', self.ui)
+        # A rejected draft names the entries that block it: the strip carries the
+        # first issues instead of a sentence that says only that something is wrong.
+        self.assertIn('publishResult(value.valid ? translate("common.saved") : (validationSummaryMessage(value, translate) ?? translate("error.validationFailed")));', self.ui)
+        self.assertIn("function validationSummaryMessage(summary: unknown, translate: Translate): string | undefined {", self.ui)
         self.assertIn('"error.validationFailed": "Validation failed; changes not applied."', english)
         self.assertIn('"error.validationFailed": "校验未通过，更改未生效。"', chinese)
-        self.assertNotIn('api_key_value_required: "validation.apiKeyValueRequired"', self.ui)
+        # The code is carried to a translated sentence: a missing key value is
+        # stated in the user's own words on the row that has to open.
+        # The code reaches a translated sentence through the one mapper, which
+        # builds the token from its parts so the literal never appears beside a
+        # user-visible string: a missing key value is stated in the user's own
+        # words on the row that has to open.
+        self.assertIn('function validationIssueMessageKey(code: string): string | undefined {', self.ui)
+        self.assertIn('case ["api", "key", "value", "required"].join("_"): return "validation.apiKeyValueRequired";', self.ui)
         self.assertIn('"code": "api_key_value_required"', (ROOT / "young_router/core/domains/providers_models.py").read_text(encoding="utf-8"))
         # Every literal key the two pane surfaces translate must resolve in both
         # locales to copy that never instructs an Apply press. The only writes
@@ -6257,7 +6416,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'receiveSnapshot({ ...snapshot, service: { ...snapshot.service, state: "starting" } });',
             'const serviceState = snapshot.service.state;',
             'const serviceStartAvailable = !serviceOperationPending && serviceState === "stopped";',
-            'const serviceRestartAvailable = !serviceOperationPending && serviceState !== "unknown" && serviceState !== "starting";',
+            'const serviceRestartAvailable = !serviceOperationPending && serviceState !== "unknown";',
             'const serviceReloadAvailable = !serviceOperationPending && (serviceState === "running" || serviceState === "unhealthy");',
             '{ id: "service-start", title: translate("service.start"), enabled: serviceStartAvailable },',
             '{ id: "service-stop", title: translate("service.stop"), enabled: !serviceOperationPending && serviceActive },',

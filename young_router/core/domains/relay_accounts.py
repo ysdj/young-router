@@ -89,6 +89,10 @@ OPTIONAL_READ_PATHS = frozenset(
         "/api/v1/user/profile",
         "/api/v1/auth/me",
         "/api/v1/groups/rates",
+        # One group's own model list: the key list is the refresh's reason to
+        # run, and a station stalled on this companion read keeps the union
+        # catalog instead of losing the keys it belongs to.
+        "/api/user/models",
         # A key's own catalog is optional by construction: a stalled read keeps
         # the model list that key already has instead of failing the refresh.
         "/v1/models",
@@ -1203,7 +1207,33 @@ class RelayAccountsDomain:
         operations = [_pending_operation(item) for item in raw_operations if isinstance(item, Mapping)]
         if len(operations) != len(raw_operations) or len({item["id"] for item in operations}) != len(operations):
             raise RelayAccountsError("Relay operation storage is invalid")
-        return operations
+        return self._prune_orphan_operations(operations)
+
+    def _prune_orphan_operations(self, operations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Drop journaled work whose account is not in the durable document.
+
+        An operation names the account it belongs to, so one whose account is
+        gone can never run: ``_operation_account`` refuses it and Apply reports
+        ``account_unavailable`` every time.  Left in place it is worse than
+        dead weight, because a non-empty journal is what makes the reload mark
+        the draft dirty — and a dirty draft is what makes ``_persist`` refuse
+        *every* write.  A store that had ever lost an account therefore stopped
+        saving anything at all: a new station lived in memory, the file never
+        changed again, and the next restart silently dropped it.  The account's
+        own removal is what retired the work, so the residue is discarded here,
+        on read, before it can pin the draft.
+        """
+
+        if not operations:
+            return []
+        known = {str(account.get("id", "")) for account in self._accounts}
+        retained = [operation for operation in operations if str(operation.get("account_id", "")) in known]
+        if len(retained) != len(operations):
+            # The durable journal is rewritten so the next reload reads a clean
+            # one instead of depending on this prune running again.
+            self._pending_operations = retained
+            self._persist_journal()
+        return retained
 
     def _persist_journal(self) -> None:
         try:
@@ -1735,6 +1765,8 @@ class RelayAccountsDomain:
         if not isinstance(loaded, Mapping):
             raise RelayAccountsError("Relay account storage is invalid")
         migrated = self._replace_storage_state(loaded)
+        # The prune runs before the draft flag is derived: the flag is what
+        # decides whether this store may be written at all.
         self._pending_operations = self._read_journal()
         self._auto_grouping_draft_baselines = {}
         self._draft_staged = bool(self._pending_operations)
@@ -3556,6 +3588,89 @@ class RelayAccountsDomain:
         # not cross the ordinary Core snapshot boundary.
         return "configured" if isinstance(value, str) and value.strip() else ""
 
+    def _newapi_key_values(self, account: Mapping[str, Any], token_ids: Sequence[object]) -> dict[int, str]:
+        """Read the key values one New API key list leaves empty.
+
+        New API's token list reports each key identity with its own redaction
+        marker in place of the value, so the credential a model needs from a
+        key this Core has never read comes from the key's own endpoint — the
+        one read whose result the cache above later answers every caller from.
+
+        Only the keys that are still unknown are asked for, and they are asked
+        for together: a station with ten unread keys costs one wait rather than
+        ten, and a key whose value is already in hand costs nothing at all.
+        """
+
+        missing = [
+            token_id
+            for token_id in token_ids
+            if type(token_id) is int
+            and not self._resource_secret_cache.get(
+                self._resource_cache_key(account["id"], f"newapi-{token_id}")
+            )
+        ]
+        if not missing:
+            return {}
+
+        def read(token_id: int) -> tuple[int, str]:
+            try:
+                payload = _json_data(
+                    self._http.post(
+                        account["origin"],
+                        f"/api/token/{token_id}/key",
+                        headers=self._headers(account),
+                    )
+                )
+            except Exception:
+                # A key this read cannot answer stays unknown instead of
+                # becoming a wrong value; the caller reports it as such.
+                return token_id, ""
+            key = payload.get("key") if isinstance(payload, Mapping) else None
+            if not isinstance(key, str) or not key.strip():
+                return token_id, ""
+            value = key.strip()
+            return token_id, value if value.startswith("sk-") else f"sk-{value}"
+
+        values: dict[int, str] = {}
+        with ThreadPoolExecutor(max_workers=min(RESOURCE_REFRESH_MAX_WORKERS, len(missing))) as executor:
+            for token_id, value in executor.map(read, missing):
+                if value:
+                    values[token_id] = value
+        return values
+
+    def _newapi_group_models(self, account: Mapping[str, Any], group_id: str) -> list[str]:
+        """Return the models one New API group actually serves.
+
+        The bare ``/api/user/models`` answer is a *union* over every group the
+        account may use — New API builds it by collecting each usable group's
+        models into one list — so handing it to every key made each key report
+        the whole station's catalog.  Opening any key in the group manager then
+        showed the same list, and a linked route could offer a model the key's
+        own group does not serve.  The endpoint takes ``?group=``, which answers
+        that group alone, so a key's list is read from the group it names.
+
+        The read is documentary: the group list is the key list's companion, and
+        a stall on it must not lose the keys themselves.
+        """
+
+        if not group_id:
+            return []
+        try:
+            payload = self._http.json(
+                account["origin"],
+                f"/api/user/models?group={urllib.parse.quote(group_id, safe='')}",
+                headers=self._headers(account),
+            )
+        except Exception:
+            # An older or slimmer fork that rejects the parameter keeps the
+            # union list the caller already read, so this stays an improvement
+            # rather than a new way to lose a catalog.
+            return []
+        try:
+            return _model_names(payload)
+        except RelayAccountsError:
+            return []
+
     def _newapi_resources(self, account: Mapping[str, Any]) -> list[dict[str, Any]]:
         headers = self._headers(account)
         with ThreadPoolExecutor(max_workers=2) as executor:
@@ -3577,6 +3692,42 @@ class RelayAccountsDomain:
             tokens = tokens.get("items", [])
         if not isinstance(tokens, Sequence) or isinstance(tokens, (str, bytes, bytearray)):
             raise RelayAccountsError("Relay API key list is invalid")
+        # One read per distinct group, never one per key: the keys in a group
+        # share its catalog, so a station with ten keys across ten groups costs
+        # ten reads and not one per key.
+        groups: dict[str, list[str]] = {}
+        for item in tokens:
+            if not isinstance(item, Mapping):
+                continue
+            group_id = _group_id(item.get("group"))
+            if group_id and group_id not in groups:
+                groups[group_id] = []
+        if groups:
+            # One pool for every read this key list still needs: the group
+            # catalogs and the key values New API does not carry in the list
+            # itself.  They are independent requests on the same station, so
+            # the refresh waits once instead of once per concern.
+            with ThreadPoolExecutor(max_workers=RESOURCE_REFRESH_MAX_WORKERS) as executor:
+                values_future = executor.submit(
+                    self._newapi_key_values,
+                    account,
+                    [item.get("id") for item in tokens],
+                )
+                for group_id, group_models in zip(
+                    list(groups),
+                    executor.map(lambda value: self._newapi_group_models(account, value), list(groups)),
+                ):
+                    groups[group_id] = group_models
+                values = values_future.result()
+            if values:
+                # The value a key list leaves empty is the same credential the
+                # station's own key endpoint serves, so a later listing, sync,
+                # or Apply resolves it from here instead of paying for the read
+                # again.
+                for token_id, value in values.items():
+                    self._resource_secret_cache[
+                        self._resource_cache_key(account["id"], f"newapi-{token_id}")
+                    ] = value
         resources: list[dict[str, Any]] = []
         for index, item in enumerate(tokens):
             if not isinstance(item, Mapping):
@@ -3593,7 +3744,9 @@ class RelayAccountsDomain:
                     "api_base": f"{account['origin'].rstrip('/')}/v1",
                     "key_hint": self._key_hint(item.get("key")),
                     "enabled": _newapi_token_enabled(item.get("status")),
-                    "models": models,
+                    # The key's own group, falling back to the union only while a
+                    # station refuses the per-group read.
+                    "models": groups.get(group_id) or models,
                     "group_id": group_id,
                     "group_name": group_id,
                     "_token_id": token_id,

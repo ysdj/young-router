@@ -101,6 +101,15 @@ _DOMAIN_ALIASES = {
 }
 
 SERVICE_STATES = frozenset({"starting", "running", "unhealthy", "stopped", "unknown"})
+# The operations that go all the way to the managed proxy process.  A cached
+# status read is not one of them: each of these can wait out the whole drain
+# budget while the proxy finishes the turns it already accepted, so none may run
+# under the store lock that every snapshot needs.
+SERVICE_PROXY_OPERATIONS = frozenset({"start", "start_async", "restart", "reload", "stop"})
+# The subset that answers by replacing (or first creating) the proxy. Their
+# transitional answer is "starting", so a window that asked for one sees the
+# proxy leave its state immediately instead of after the whole replacement.
+SERVICE_TRANSITION_OPERATIONS = frozenset({"start", "start_async", "restart", "reload"})
 
 # Import previews identify only settings that have a Core-owned adapter. Logs
 # are a read-only projection and must never become a staged configuration
@@ -815,6 +824,16 @@ class CoreStore:
         # Manual lifecycle operations and the background post-apply restart
         # replace the same proxy, so they take turns on one transition guard.
         self._service_transition_guard = threading.Lock()
+        # A proxy operation replaces the proxy, which the drain budget now lets
+        # take minutes.  It must therefore not hold ``self._lock`` while it
+        # runs: every ``snapshot`` needs that lock, the native hosts cap one
+        # request at 30 s, and a host whose request times out tears Core down --
+        # which is how a restart left every window reporting "启动中" with
+        # nothing left to correct it.  This count is how many such operations
+        # are between their transitional publish and their answer; while it is
+        # non-zero ``snapshot`` keeps projecting the state the dispatch already
+        # published instead of a controller reading taken mid-replacement.
+        self._service_proxy_operations = 0
         self._last_actions: dict[str, dict[str, Any]] = {}
         # The WebDAV interval loop is created on request, started by the Core
         # entry point, and stopped with the store.
@@ -1199,11 +1218,11 @@ class CoreStore:
             # synthetic Core state transition.
             reload_thread = self._service_reload_thread
             planned_restart = reload_thread is not None and reload_thread.is_alive()
-            if planned_restart and self._service.get("state") == "starting":
-                # A background post-apply restart owns the transitional state:
-                # the controller reports stopped/unhealthy while its proxy is
-                # replaced, and a cached status must not hide the planned
-                # restart from the menu or the settings panes.
+            if (planned_restart or self._service_proxy_operations > 0) and self._service.get("state") == "starting":
+                # A planned restart owns the transitional state: the controller
+                # reports stopped/unhealthy -- or nothing at all, while its own
+                # replacement is in flight -- and a cached status must not hide
+                # the planned restart from the menu or the settings panes.
                 pass
             else:
                 status_handler = self._service_handlers.get("status")
@@ -2725,6 +2744,19 @@ class CoreStore:
                     data.get("payload"),
                     expected_revision if expected_revision is not None else data.get("expected_revision"),
                 )
+        if domain_value is None and action_type.startswith("service.") and action_type.removeprefix("service.") in SERVICE_PROXY_OPERATIONS:
+            # A proxy operation runs the controller's own replacement, so it
+            # never runs under this store's lock: see ``_dispatch_service``.
+            # Every other action -- a status read, a settings transaction --
+            # still takes the lock for its whole transaction below.
+            with self._lock:
+                self._check_revision(expected_revision if expected_revision is not None else data.get("expected_revision"))
+                previous_revision = self._revision
+            result = self._dispatch_service(action_type, _as_mapping(data.get("payload")))
+            with self._lock:
+                if self._revision != previous_revision:
+                    self._emit()
+                return {"revision": self._revision}
         with self._lock:
             self._check_revision(expected_revision if expected_revision is not None else data.get("expected_revision"))
             previous_revision = self._revision
@@ -3073,30 +3105,86 @@ class CoreStore:
 
     def _dispatch_service(self, action: str, payload: Mapping[str, Any]) -> dict[str, Any]:
         operation = action.removeprefix("service.")
-        previous_service = copy.deepcopy(self._service)
         handler = self._service_handlers.get(operation)
-        if handler is not None:
+        if handler is None:
+            # Test-only stores can use an injected handler. Never use this
+            # optimistic fallback in production construction.
+            state = {"start": "starting", "start_async": "starting", "running": "running", "stop": "stopped", "stopped": "stopped", "restart": "starting", "reload": self._service.get("state", "unknown"), "health": self._service.get("state", "unknown")}.get(operation)
+            with self._lock:
+                previous_service = copy.deepcopy(self._service)
+                if state in SERVICE_STATES:
+                    self._service["state"] = state
+                return self._project_service_dispatch(previous_service, payload)
+        # The controller replaces the proxy on its own threads.  That is the
+        # one service call that is not a cache read: under the drain budget a
+        # restart legitimately takes minutes.  Holding ``self._lock`` across it
+        # blocked every ``snapshot`` in the app, each native host caps a
+        # request at 30 s and tears Core down when it expires, and the window
+        # that had optimistically drawn "starting" was then left with nothing
+        # to correct it.  ``dispatch`` therefore runs the proxy operations with
+        # the store lock released, and this method only ever holds it for the
+        # short critical sections that project their answer.  The count is
+        # raised and every exit path lowers it in ``finally``, so a persist or
+        # controller failure can never leave a window unable to see a snapshot.
+        with self._lock:
+            previous_service = copy.deepcopy(self._service)
+            self._service_proxy_operations += 1
             try:
-                # A manual restart and a background post-apply restart must
-                # never replace the proxy at the same time.
-                with self._service_transition_guard:
-                    result = handler(operation)
-            except Exception as exc:
-                raise CoreError("service_error", safe_exception_message(exc)) from None
-            if isinstance(result, Mapping):
+                if operation in SERVICE_TRANSITION_OPERATIONS and self._service.get("state") != "starting":
+                    # Publish the transition now so every window sees the proxy
+                    # leave its state without waiting for the replacement.  The
+                    # count is raised first because ``_emit`` re-enters
+                    # ``snapshot``, which would otherwise project the
+                    # controller's mid-replacement reading back over the state
+                    # this dispatch just published.
+                    self._service["state"] = "starting"
+                    self._service.pop("detail", None)
+                    self._revision += 1
+                    self._persist_metadata()
+                    self._emit()
+            except BaseException:
+                self._service_proxy_operations -= 1
+                raise
+        try:
+            # A manual restart and a background post-apply restart must never
+            # replace the proxy at the same time.
+            with self._service_transition_guard:
+                result = handler(operation)
+            if not isinstance(result, Mapping):
+                raise CoreError("service_error", "LiteLLM service returned invalid status")
+            # The answer lands while the count is still held: releasing it first
+            # would let a concurrent snapshot read the controller
+            # mid-replacement and publish that reading over the state this
+            # dispatch just settled.
+            with self._lock:
                 self._set_service_from_result(result, increment=False)
                 if str(result.get("state")) == "running" and operation in {"start", "start_async", "restart", "reload"}:
                     # The proxy's port or key may have just changed; a Codex
                     # client that already uses the proxy has to follow it.
                     self._follow_codex_local_api()
-            else:
-                raise CoreError("service_error", "LiteLLM service returned invalid status")
-        else:
-            # Test-only stores can use an injected handler. Never use this
-            # optimistic fallback in production construction.
-            state = {"start": "starting", "start_async": "starting", "running": "running", "stop": "stopped", "stopped": "stopped", "restart": "starting", "reload": self._service.get("state", "unknown"), "health": self._service.get("state", "unknown")}.get(operation)
-            if state in SERVICE_STATES:
-                self._service["state"] = state
+                return self._project_service_dispatch(previous_service, payload)
+        except CoreError:
+            self._project_service_reload_failure()
+            raise
+        except Exception as exc:
+            # The proxy's real state decides what the window shows next; the
+            # failed operation itself is still reported to its caller.
+            self._project_service_reload_failure()
+            raise CoreError("service_error", safe_exception_message(exc)) from None
+        finally:
+            # Every exit path releases the count, including a persist failure
+            # or a cancelled operation: a leak would stop Core from ever
+            # projecting a real service state again.
+            with self._lock:
+                self._service_proxy_operations = max(0, self._service_proxy_operations - 1)
+
+    def _project_service_dispatch(self, previous_service: Mapping[str, Any], payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Apply one service answer to the public projection.
+
+        The caller holds ``self._lock``; this is the short critical section
+        that ends a lifecycle dispatch, never the controller call itself.
+        """
+
         if isinstance(payload.get("detail"), str):
             self._service["detail"] = safe_error_message(payload["detail"])
         # A manual health check which projects the same public status is not a
@@ -4476,5 +4564,7 @@ __all__ = [
     "PACKAGE_FORMAT",
     "PACKAGE_VERSION",
     "RevisionConflict",
+    "SERVICE_PROXY_OPERATIONS",
     "SERVICE_STATES",
+    "SERVICE_TRANSITION_OPERATIONS",
 ]
