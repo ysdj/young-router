@@ -467,6 +467,50 @@ class HookResponsesToolBridgeTests(HookTestCase):
             f"text(await tools.apply_patch({json.dumps(patch, ensure_ascii=False)}));",
         )
 
+    def test_responses_tool_bridge_restores_namespace_on_custom_tool_call(self) -> None:
+        hooks, _ = load_hook_module()
+        request = {
+            "input": [
+                {
+                    "type": "additional_tools",
+                    "tools": [
+                        {
+                            "type": "namespace",
+                            "name": "functions",
+                            "tools": [{"type": "custom", "name": "exec"}],
+                        }
+                    ],
+                }
+            ]
+        }
+        retry_kwargs = {"input": request["input"]}
+        metadata = {"responses_chat_bridge": True}
+        hooks._with_responses_chat_bridge_compatible_tools(retry_kwargs, metadata)
+
+        mapping = hooks._responses_namespace_tool_map(
+            request["input"],
+            retry_kwargs,
+        )
+        self.assertEqual(mapping.get("exec"), "functions")
+        restored = hooks._restore_response_custom_tool_call(
+            {
+                "type": "function_call",
+                "id": "fc_exec",
+                "call_id": "call_exec",
+                "name": "exec",
+                "arguments": '{"input":"text(await tools.exec_command({\\"cmd\\":\\"pwd\\"}));"}',
+                "status": "completed",
+            },
+            {"exec"},
+        )
+        restored = hooks._restore_response_function_call_namespace(
+            restored,
+            mapping,
+        )
+        self.assertEqual(restored["type"], "custom_tool_call")
+        self.assertEqual(restored["namespace"], "functions")
+        self.assertEqual(restored["name"], "exec")
+
     def test_exec_patch_repair_leaves_javascript_and_partial_patch_unchanged(self) -> None:
         hooks, _ = load_hook_module()
         javascript = 'text(await tools.exec_command({"cmd":"pwd"}));'

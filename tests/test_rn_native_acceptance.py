@@ -92,7 +92,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # Every settings pane shares one window, so it uses one minimum size
         # wide enough for the sidebar plus the widest pane.
         self.assertIn('route == L"providers-models" || route == L"codex-settings"', leaf)
-        self.assertIn("return {960, 640};", leaf)
+        self.assertIn("return {900, 560};", leaf)
         self.assertIn('route == L"provider-wizard") return {540, 420};', leaf)
         self.assertIn("MinimumTrackSizeForActiveRoute();", leaf)
         self.assertIn("DipToPhysicalPixels", leaf)
@@ -103,8 +103,9 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         leaf = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
 
         self.assertIn("ContentSize RouteInitialContentSize", leaf)
-        # Settings panes share one window with one responsive initial size.
-        self.assertIn("return {960, 640};", leaf)
+        # Settings panes share one window with one responsive initial size,
+        # tall enough that the provider detail opens without a scrollbar.
+        self.assertIn("return {960, 660};", leaf)
         self.assertIn("{620, 460}", leaf)
         self.assertIn("RouteInitialContentSize(route)", leaf)
 
@@ -148,8 +149,10 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # One shared settings window plus the provider wizard sheet.
         self.assertIn("if Self.settingsPaneRoutes.contains(route) {", leaf)
         # One fixed size for every pane, so switching panes never resizes the
-        # window; it only needs to fit the widest workspace.
-        self.assertIn("contentSize: NSSize(width: 960, height: 640)", leaf)
+        # window; it only needs to fit the widest workspace and the tallest
+        # detail pane, which is the provider detail at 535 pt of content
+        # beneath 112 pt of chrome.
+        self.assertIn("contentSize: NSSize(width: 960, height: 660)", leaf)
         self.assertIn("minSize: NSSize(width: 900, height: 560)", leaf)
         self.assertNotIn("applySettingsPaneLayout", leaf)
         # The General pane joins the shared settings window on both hosts.
@@ -573,19 +576,30 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("let accountType = resolvedType ?? self.type", mac_leaf)
 
     def test_the_provider_detail_is_one_pane_for_every_kind(self) -> None:
-        # A service provider's detail is the ordinary provider detail: its name,
-        # its bound address, and its account.  A type picker there offered a
-        # retarget the pane has no business doing, and a WorkBuddy provider that
-        # could be switched to Claude from its own detail is exactly the
-        # divergence the shared pane exists to prevent.
+        # A service provider's detail is the ordinary provider detail: the same
+        # 启用 / 供应商名称 / 供应商类型 / 基础 URL block every other kind states,
+        # drawn by the one shared component.  Its type is *stated* there — the
+        # service it is, the station that addresses it, or the key contract a
+        # custom provider holds — because nothing in the app retargets a
+        # provider in place: the pane shows the fact, and a different type is a
+        # different provider (created through the wizard).
         ui = (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
-        self.assertNotIn("SERVICE_KIND_OPTIONS", ui)
-        self.assertNotIn("serviceProviderKindFor", ui)
         editor = ui.split("function ProviderEditor(", 1)[1].split("function CodexWorkspace(", 1)[0]
-        identity = editor.split("{service ? <View", 1)[1].split("</View> : null}", 1)[0]
-        self.assertNotIn('label={translate("providers.wizard.providerType")}', identity)
+        self.assertIn("<ProviderIdentityFields", editor)
+        self.assertEqual(1, editor.count("<ProviderIdentityFields"))
+        identity = ui.split("function ProviderIdentityFields(", 1)[1].split("function ProviderEditor(", 1)[0]
         self.assertIn('label={translate("providers.providerName")}', identity)
-        self.assertIn("{SERVICE_BASE_URLS[service]}", identity)
+        self.assertIn('<Text style={styles.providerAuthStatusLabel}>{translate("providers.providerType")}</Text>', identity)
+        self.assertIn('label={translate("providers.baseUrl")}', identity)
+        self.assertIn("isLogin ? SERVICE_BASE_URLS[kind as ServiceID]", identity)
+        # No picker, no confirmation, no retarget dispatch: the whole surface
+        # that used to switch a provider's type is gone from both hosts' shared
+        # UI, so a provider's type has exactly one place it is decided.
+        self.assertNotIn("PROVIDER_TYPE_OPTIONS", ui)
+        self.assertNotIn("serviceProviderKindFor", ui)
+        self.assertNotIn('title: translate("providers.switchTypeTitle")', identity)
+        self.assertNotIn("auth_kind", identity)
+        self.assertNotIn("auth_kind", editor)
 
     def test_relay_login_reveals_the_page_as_soon_as_it_paints(self) -> None:
         # A web view paints progressively.  The overlay exists for the blank
@@ -649,23 +663,80 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
         windows = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
 
-        # macOS: the toggle renames/retires rows instead of only reloading.
+        # macOS: the toggle renames rows and lists every group instead of only
+        # reloading.  It is a preview the window draws over the rows it already
+        # holds: a row the layout is replacing is dropped from the list rather
+        # than shown as a struck-through line, so nothing it produces is handed
+        # back as a write the user never made.
         self.assertIn("private func stageAutoGroupingLayout(_ enabled: Bool) {", leaf)
         toggle = leaf.split("@objc private func toggleAutoGrouping(_ sender: NSButton) {", 1)[1].split("\n    }", 1)[0]
         self.assertIn("stageAutoGroupingLayout(sender.state == .on)", toggle)
-        stage = leaf.split("private func stageAutoGroupingLayout(_ enabled: Bool) {", 1)[1].split("\n    }", 1)[0]
+        stage_layout = leaf.split("private func stageAutoGroupingLayout(_ enabled: Bool) {", 1)[1].split("\n    }", 1)[0]
         # The staged rows reach the table.
-        self.assertIn("table.reloadData()", stage)
+        self.assertIn("stageAutoGroupingRows(enabled)", stage_layout)
+        self.assertIn("table?.reloadData()", stage_layout)
+        stage_layout = leaf.split("private func stageAutoGroupingRows(_ enabled: Bool) {", 1)[1].split("\n    }", 1)[0]
+        # Staging is a derivation applied to the account's own rows, so applying
+        # it twice reproduces the layout instead of piling a second copy on top.
+        self.assertIn("rows = autoGroupingRows(from: autoGroupingBaselineRows ?? rows)", stage_layout)
+        stage = leaf.split("private func autoGroupingRows(from source: [KeyRow]) -> [KeyRow] {", 1)[1].split("\n    }", 1)[0]
+        # The derivation never consumes its own output.
+        self.assertIn("if row.isPreview { continue }", stage)
+        # An account with no group list has no layout to align to: the preview
+        # shows its keys unchanged instead of emptying the list.  Core's own
+        # alignment refuses the same case for the same reason.
+        self.assertIn("guard !layoutGroups.isEmpty else { return source }", stage)
+        # 未分组 is the manual-assignment sentinel (an empty group id), not a
+        # group the station offers.  The picker carries it while the switch is
+        # off, so deriving over the picker's own list invented a 未分组 key with
+        # no rate, no value, and no models — a line for a group that does not
+        # exist.  The layout is derived from the station's groups only, and a
+        # key naming no group is not part of it.
+        self.assertIn("let layoutGroups = groups.filter { !$0.id.isEmpty }", stage)
+        self.assertIn("if row.groupID.isEmpty {", stage)
+        self.assertIn("for group in layoutGroups where !keptGroupIDs.contains(group.id)", stage)
+        self.assertNotIn("for group in groups where !keptGroupIDs.contains(group.id)", stage)
+        self.assertIn("guard let group = layoutGroups.first(where: { $0.id == row.groupID }) else {", stage)
         # The row that keeps a group is renamed to the group's own name.
         self.assertIn("candidate.name = group.name", stage)
-        # A later key in the same group is retired, so the group owns one key.
+        # A later key in the same group leaves the list: the group owns one key.
         self.assertIn("guard !keptGroupIDs.contains(group.id) else {", stage)
-        self.assertIn("candidate.deleted = true", stage)
-        # A group no key names gets a draft named after it.
-        self.assertIn("for group in groups where !keptGroupIDs.contains(group.id) && !presentGroupIDs.contains(group.id)", stage)
+        # A group no key names gets a preview row named after it.
+        self.assertIn("for group in layoutGroups where !keptGroupIDs.contains(group.id) && !presentGroupIDs.contains(group.id)", stage)
         # The user's own rows are not the switch's to rewrite.
         self.assertIn("if row.isDraft {", stage)
         self.assertIn("if row.deleted {", stage)
+        # The preview never reports a deletion of its own to Core.
+        self.assertNotIn("candidate.deleted = true", stage)
+        # A window that OPENS on a checked switch states the layout that switch
+        # means, exactly as clicking it would: showing the account's raw key list
+        # under a checked switch is what left ungrouped rows and keys in groups
+        # the station no longer offers on screen.
+        apply_data = leaf.split("func applyData(accountLabel: String, groups: [GroupOption], rows: [KeyRow], autoGrouping: Bool) {", 1)[1].split("\n    }", 1)[0]
+        self.assertIn("if autoGrouping {", apply_data)
+        self.assertIn("stageAutoGroupingRows(true)", apply_data)
+        # The window's FIRST open states it too: a sheet that opens on a checked
+        # switch must never show the account's raw key list under it.
+        make_panel = leaf.split("func makePanel() -> NSPanel? {", 1)[1]
+        self.assertIn("if initialAutoGrouping {", make_panel)
+        self.assertIn("stageAutoGroupingRows(true)", make_panel)
+        # ...and the row the switch derives is NOT dimmed: it is the layout the
+        # checked switch states, not an edit waiting to happen.  Only a row the
+        # user added with ＋ (and a row the user retired) is a pending change.
+        self.assertIn("let isPreview: Bool", leaf)
+        self.assertIn("row.deleted || (row.isDraft && !row.isPreview)", leaf)
+        self.assertIn("isPreview: true", stage)
+        self.assertIn("isPreview: false", leaf)
+        # A line the layout cannot keep is dropped from the list entirely, so
+        # nothing in an auto-grouping list is dimmed for a reason the user
+        # cannot see; the switch states its own layout, and the preview rows are
+        # drawn like every other row.
+        has_staged = leaf.split("var hasStagedChanges: Bool {", 1)[1].split("\n    }", 1)[0]
+        self.assertIn("if row.isPreview { return false }", has_staged)
+        staged = leaf.split("func stagedResult() -> NativeGroupManagerResult? {", 1)[1].split("\n    }", 1)[0]
+        self.assertIn("let previewed = autoGroupingBaselineKeys", staged)
+        self.assertIn("guard !autoGrouping || !previewed.contains(row.id) else { return false }", staged)
+        self.assertIn("return !autoGrouping || previewed.contains(row.id)", staged)
 
         # Windows stages the same layout on the same event.
         self.assertIn("auto stage_auto_grouping = [&rows, &groups, staged_deletes, auto_grouping_baseline](bool enabled) {", windows)
@@ -674,8 +745,27 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         stage_win = windows.split("auto stage_auto_grouping = [&rows, &groups, staged_deletes, auto_grouping_baseline](bool enabled) {", 1)[1].split("toggle.Click([&]", 1)[0]
         self.assertIn("candidate.name = group->name.empty() ? group->label : group->name;", stage_win)
         self.assertIn("kept_groups.count(row.group_id) > 0", stage_win)
-        self.assertIn("candidate.deleted = true;", stage_win)
         self.assertIn("if (row.draft || row.deleted) {", stage_win)
+        self.assertNotIn("candidate.deleted = true;", stage_win)
+        result_win = windows.split("auto checked = toggle.IsChecked();", 1)[1].split("outcome = std::move(result);", 1)[0]
+        self.assertIn("const bool previewing = *auto_grouping_baseline && result.auto_grouping;", result_win)
+        self.assertIn("if (!previewing) result.deletes.push_back(row.id);", result_win)
+        # Windows opens on the same stated layout, and its preview rows are not
+        # dimmed either.
+        self.assertIn("bool preview = false;", windows)
+        self.assertIn("auto is_staged = [](SheetRow const& row) { return row.deleted || (row.draft && !row.preview); };", windows)
+        self.assertIn("candidate.preview = true;", stage_win)
+        self.assertIn("if (toggle_on()) stage_auto_grouping(true);", windows)
+        # Windows keeps the same no-groups rule: no layout to state means the
+        # keys are shown unchanged rather than emptied — and the same 未分组 rule,
+        # because the picker there carries the sentinel too.
+        self.assertIn("if (!layout_groups.empty()) {", stage_win)
+        self.assertIn("if (group.id.empty()) continue;", stage_win)
+        self.assertIn("if (row.group_id.empty()) continue;", stage_win)
+        self.assertIn("for (auto const& group : layout_groups) {", stage_win)
+        self.assertNotIn("} else if (groups.empty()) {", stage_win)
+        has_staged_win = windows.split("auto has_staged_changes = [", 1)[1].split("return false;", 1)[0]
+        self.assertIn("if (row.preview) {", has_staged_win)
 
         # Both keep a baseline so turning the switch off restores what opened.
         self.assertIn("private var autoGroupingBaselineRows: [KeyRow]?", leaf)
@@ -1047,7 +1137,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # The material belongs to the window; a per-table backdrop would stack
         # a second vibrancy layer over only the table's own rows.
         self.assertNotIn("NSVisualEffectMaterialSidebar", controls)
-        self.assertIn("contentSize: NSSize(width: 960, height: 640)", leaf)
+        self.assertIn("contentSize: NSSize(width: 960, height: 660)", leaf)
 
     def test_macos_reopen_shows_the_primary_configuration_window(self) -> None:
         app_delegate = (MAC_PROJECT / "YoungRouter-macOS/AppDelegate.mm").read_text(encoding="utf-8")
@@ -1720,8 +1810,8 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("import WebKit", mac_leaf)
         self.assertIn("configuration.websiteDataStore = .nonPersistent()", mac_leaf)
         self.assertNotIn("configuration.websiteDataStore = .default()", mac_leaf)
-        self.assertIn('Probe(path: "api/user/self"', mac_leaf)
-        self.assertIn('Probe(path: "api/v1/auth/me"', mac_leaf)
+        self.assertIn('Probe(family: "newapi", path: "api/user/self"', mac_leaf)
+        self.assertIn('Probe(family: "sub2api", path: "api/v1/auth/me"', mac_leaf)
         self.assertIn("sameOrigin(url)", mac_leaf)
         self.assertIn("NativeRelaySessionMemoryStore", mac_leaf)
         self.assertNotIn("NativeRelayCredentialStore", mac_leaf)
@@ -1735,7 +1825,12 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("localStorage.setItem('access_token', accessToken)", mac_leaf)
         self.assertIn("localStorage.getItem('user')", mac_leaf)
         self.assertIn("user.token = accessToken", mac_leaf)
-        self.assertIn("typeof user.token === 'string' ? user.token : ''", mac_leaf)
+        self.assertIn("if (user && typeof user.token === 'string' && user.token) return user.token;", mac_leaf)
+        # The page's own account record is the authority for the token the
+        # sign-in just produced: a New API fork keeps it in ``user.token`` and
+        # nowhere else, so the capture and the watcher both read that record
+        # first instead of the key names a fork never writes.
+        self.assertIn("const candidate = user && typeof user === 'object' ? user.token : '';", mac_leaf)
         self.assertIn("WKScriptMessageHandler", mac_leaf)
         self.assertIn('configuration.userContentController.add(self, name: "litellmRelayPassword")', mac_leaf)
         self.assertIn("window.webkit.messageHandlers.litellmRelayPassword.postMessage(password)", mac_leaf)

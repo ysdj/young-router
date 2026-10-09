@@ -3593,6 +3593,79 @@ def _codex_normalized_function_arguments(
     return json.dumps(parsed, ensure_ascii=False, separators=(",", ":")), True
 
 
+def _codex_open_container_closers(text: str) -> Optional[str]:
+    """The brackets needed to close ``text``, or ``None`` when it cannot be.
+
+    Walks the fragment the way a JSON reader does — string literals and their
+    escapes hide every structural character — and reports the containers still
+    open at the end.  ``None`` means the cut landed where nothing may be
+    appended: inside a string literal, or on a separator (``,``/``:``) whose
+    value never arrived.  Closing *those* would mean writing a value the model
+    did not, so they are refused rather than completed.
+    """
+
+    stack: list[str] = []
+    quote: Optional[str] = None
+    escaped = False
+    for character in text:
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            continue
+        if character == '"':
+            quote = character
+            continue
+        if character in "{[":
+            stack.append("}" if character == "{" else "]")
+            continue
+        if character in "}]":
+            if stack and stack[-1] == character:
+                stack.pop()
+            continue
+    if quote is not None or not stack:
+        return None
+    # A fragment that stops on a separator is missing a whole member, and one
+    # that stops on an opening bracket is missing a whole value.
+    if text.rstrip().endswith((",", ":", "{", "[")):
+        return None
+    return "".join(reversed(stack))
+
+
+def _codex_closed_function_arguments(value: Any) -> Optional[dict[str, Any]]:
+    """Read a JSON object an output limit cut short by closing its brackets.
+
+    An upstream that runs out of output tokens mid-tool-call streams a prefix
+    of a JSON object: every byte of it is exactly what the model wrote, and
+    only the closing brackets never arrived.  That is an *incomplete*
+    document, not a malformed one, so it is closed here rather than discarded
+    — the arguments that did arrive are real, and a call whose arguments are
+    unusable ends a turn the model was still in the middle of.
+
+    Nothing is invented: the fragment must not end inside a string or on a
+    separator, so only containers that were genuinely opened get closed.  A
+    truncated value is therefore never completed with a guessed tail (a
+    shortened ``rm -rf`` path is not the command that was meant).
+    """
+
+    if not isinstance(value, str):
+        return None
+    text = _codex_unwrap_function_arguments(value)
+    if not text.startswith("{"):
+        return None
+    closers = _codex_open_container_closers(text)
+    if not closers:
+        return None
+    try:
+        parsed = json.loads(text + closers)
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def _codex_repaired_function_arguments(value: Any) -> Optional[str]:
     if not isinstance(value, str) or not value.strip():
         return None

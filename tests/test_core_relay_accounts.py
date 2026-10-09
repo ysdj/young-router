@@ -227,6 +227,95 @@ class RelayAccountsDomainTests(unittest.TestCase):
 
             self.assertEqual(2.5, refreshed["balance"])
 
+    def test_a_newapi_key_reports_its_own_groups_models(self) -> None:
+        """The bare catalog is a union; a key learns its own group's list.
+
+        New API builds ``/api/user/models`` by collecting every usable group's
+        models into one answer, so handing that list to each key made every key
+        report the whole station: opening any row in 分组管理 showed the same
+        models, and a linked route could offer one the key's group never serves.
+        The endpoint takes ``?group=``, which answers that group alone.
+        """
+
+        class PerGroupRelay(FakeRelayHTTPClient):
+            union = ["claude-opus-5", "gpt-5.5", "gpt-image-2.5"]
+            by_group = {
+                "claude-kiro": ["claude-opus-5"],
+                "gpt-plus": ["gpt-5.5"],
+                "gpt-image-2.5": ["gpt-image-2.5"],
+            }
+
+            def json(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
+                self.requests.append((origin, path, dict(headers)))
+                if path.startswith("/api/user/models?group="):
+                    group = path.split("group=", 1)[1]
+                    return {"data": list(self.by_group.get(group, []))}
+                if path == "/api/user/models":
+                    return {"data": list(self.union)}
+                if path == "/api/user/self/groups":
+                    return {"data": {group: {"ratio": 1} for group in self.by_group}}
+                if path not in self.responses:
+                    raise AssertionError(f"unexpected relay path: {path}")
+                return self.responses[path]
+
+        with tempfile.TemporaryDirectory() as directory:
+            fake = PerGroupRelay(
+                {
+                    "/api/token/?p=1&size=100": {
+                        "data": {
+                            "items": [
+                                {"id": 1, "name": "claude", "status": 1, "key": "masked-1", "group": "claude-kiro"},
+                                {"id": 2, "name": "plus", "status": 1, "key": "masked-2", "group": "gpt-plus"},
+                                {"id": 3, "name": "image", "status": 1, "key": "masked-3", "group": "gpt-image-2.5"},
+                            ]
+                        }
+                    },
+                    "/api/user/self": {"data": {"quota": 1_000_000}},
+                    "/api/status": {"data": {"quota_per_unit": 500_000}},
+                }
+            )
+            domain = RelayAccountsDomain(directory, http_client=fake)
+            account = domain.dispatch(
+                "account.add",
+                {"type": "newapi", "label": "New API", "origin": "https://relay.example.test"},
+            )["accounts"][0]
+            domain.accept_login_result(account["id"], username="person", access_token="replace-token")
+
+            resources = domain.refresh_resources(account["id"])["resources"]
+            by_name = {resource["name"]: resource["models"] for resource in resources}
+            self.assertEqual(["claude-opus-5"], by_name["claude"])
+            self.assertEqual(["gpt-5.5"], by_name["plus"])
+            self.assertEqual(["gpt-image-2.5"], by_name["image"])
+            # One read per distinct group, never one per key.
+            scoped = [path for _origin, path, _headers in fake.requests if "group=" in path]
+            self.assertEqual(3, len(scoped))
+
+    def test_a_newapi_fork_without_a_group_parameter_keeps_the_union_catalog(self) -> None:
+        """A station that refuses ``?group=`` must not lose its catalog."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            fake = FakeRelayHTTPClient(
+                {
+                    "/api/user/models": {"data": ["model-a", "model-b"]},
+                    "/api/token/?p=1&size=100": {
+                        "data": {"items": [{"id": 1, "name": "default", "status": 1, "key": "masked", "group": "default"}]}
+                    },
+                    "/api/user/self": {"data": {"quota": 1_000_000}},
+                    "/api/status": {"data": {"quota_per_unit": 500_000}},
+                }
+            )
+            domain = RelayAccountsDomain(directory, http_client=fake)
+            account = domain.dispatch(
+                "account.add",
+                {"type": "newapi", "label": "New API", "origin": "https://relay.example.test"},
+            )["accounts"][0]
+            domain.accept_login_result(account["id"], username="person", access_token="replace-token")
+
+            resources = domain.refresh_resources(account["id"])["resources"]
+            # The fixture raises on the unexpected scoped path, so this proves
+            # the failure was absorbed and the union list survived.
+            self.assertEqual(["model-a", "model-b"], resources[0]["models"])
+
     def test_sub2api_balance_comes_from_the_user_profile(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fake = FakeRelayHTTPClient(

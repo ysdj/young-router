@@ -421,21 +421,6 @@ def _normalize_sse_response_completed_chunk(
     )
 
 
-class _InvalidToolCallArgumentsError(RuntimeError):
-    """An upstream streamed a tool call whose arguments are not a JSON object.
-
-    This is the request's own protocol defect, not a route failure: the
-    arguments arrived and are unparseable, so no other deployment would have
-    answered differently.  It carries its own type so terminal-event
-    classification states the real cause instead of reporting the shape as an
-    ``upstream_route_failure`` and inviting a route cooldown for it.
-    """
-
-
-def _is_invalid_tool_call_arguments_error(exception: Exception) -> bool:
-    return isinstance(exception, _InvalidToolCallArgumentsError)
-
-
 def _function_call_arguments_valid(value: Any) -> bool:
     normalized, valid = _responses_request_module._codex_normalized_function_arguments(
         value,
@@ -445,6 +430,18 @@ def _function_call_arguments_valid(value: Any) -> bool:
 
 
 def _payload_invalid_function_call_reason(payload: Any) -> Optional[str]:
+    """Where a Responses event still carries function-call arguments nothing can read.
+
+    Reached *after* normalization has had its turn, so a value reported here is
+    one no parser accepts even with the containers an output limit left open
+    closed (see ``_normalize_response_function_call_arguments``).  The reason is
+    recorded rather than turned into a terminal: the value travels to the
+    client exactly as the upstream wrote it, and a client that cannot read it
+    runs the call with no arguments and reports that itself, which leaves the
+    turn intact instead of ending it for a tool call the model was still in the
+    middle of writing.
+    """
+
     if not isinstance(payload, dict):
         return None
     event_type = payload.get("type")
@@ -481,9 +478,19 @@ def _responses_stream_chunk_for_delivery(
         _normalize_response_function_call_arguments(chunk)
         invalid_reason = _payload_invalid_function_call_reason(chunk)
         if invalid_reason is not None:
-            return _synthesized_failed_response_event(
-                request_data or {},
-                _InvalidToolCallArgumentsError(invalid_reason),
+            # A tool call whose arguments no parser accepts is the request's own
+            # shape, not a route fault and not a reason to end the turn: the
+            # event is delivered as the upstream wrote it so the client's own
+            # tolerant reader runs the call and reports the arguments it could
+            # not use.  Failing the response here threw that work away — the
+            # Codex client treats a failed terminal as fatal, so a turn the
+            # model was still writing died with it.
+            _trace_module._request_route_trace(
+                "responses_stream_unreadable_tool_call_arguments",
+                request_data,
+                reason=invalid_reason,
+                event_type=_stream_chunk_type(chunk),
+                arguments_length=len(str(chunk.get("arguments") or "")) if isinstance(chunk.get("arguments"), str) else None,
             )
         _image_generation_module._normalize_image_generation_result_status(chunk)
         _normalize_response_completed_event_usage(
@@ -529,9 +536,12 @@ def _responses_stream_chunk_for_delivery(
         _normalize_response_function_call_arguments(json_chunk)
         invalid_reason = _payload_invalid_function_call_reason(json_chunk)
         if invalid_reason is not None:
-            return _synthesized_failed_response_event(
-                request_data or {},
-                _InvalidToolCallArgumentsError(invalid_reason),
+            # Delivered, not failed: see the dict-event path above.
+            _trace_module._request_route_trace(
+                "responses_stream_unreadable_tool_call_arguments",
+                request_data,
+                reason=invalid_reason,
+                event_type=_stream_chunk_type(json_chunk),
             )
         _image_generation_module._normalize_image_generation_result_status(json_chunk)
         _normalize_response_completed_event_usage(
@@ -559,6 +569,28 @@ def _normalize_response_function_call_added_arguments(payload: Any) -> None:
     payload["item"] = normalized_item
 
 
+def _normalized_item_arguments(value: Any) -> Optional[str]:
+    """One function call's arguments as a parseable object, or ``None``.
+
+    A value an output limit cut short is closed rather than discarded: the
+    fragment holds every byte the model wrote and only its closing brackets are
+    missing, so the arguments that did arrive are usable.  A fragment cut
+    inside a value is left alone — closing that would mean inventing a tail the
+    model never wrote.
+    """
+
+    normalized, valid = _responses_request_module._codex_normalized_function_arguments(
+        value,
+        empty_is_object=True,
+    )
+    if valid and normalized is not None:
+        return normalized
+    closed = _responses_request_module._codex_closed_function_arguments(value)
+    if closed is None:
+        return None
+    return json.dumps(closed, ensure_ascii=False, separators=(",", ":"))
+
+
 def _normalize_response_function_call_arguments(payload: Any) -> None:
     """Normalize function-call arguments before a Responses event is delivered."""
 
@@ -569,11 +601,8 @@ def _normalize_response_function_call_arguments(payload: Any) -> None:
     def normalize_item(item: Any) -> Any:
         if not isinstance(item, dict) or item.get("type") != "function_call":
             return item
-        normalized, valid = _responses_request_module._codex_normalized_function_arguments(
-            item.get("arguments"),
-            empty_is_object=True,
-        )
-        if not valid or normalized is None:
+        normalized = _normalized_item_arguments(item.get("arguments"))
+        if normalized is None:
             return item
         if item.get("arguments") == normalized:
             return item
@@ -589,11 +618,8 @@ def _normalize_response_function_call_arguments(payload: Any) -> None:
         return
 
     if event_type == "response.function_call_arguments.done":
-        normalized, valid = _responses_request_module._codex_normalized_function_arguments(
-            payload.get("arguments"),
-            empty_is_object=True,
-        )
-        if valid and normalized is not None:
+        normalized = _normalized_item_arguments(payload.get("arguments"))
+        if normalized is not None:
             payload["arguments"] = normalized
         return
 
@@ -1420,16 +1446,6 @@ def _synthesized_failed_response_event(
         )
         error_type = "invalid_request_error"
         error_code = "upstream_request_body_too_large"
-    elif _is_invalid_tool_call_arguments_error(exception):
-        # The upstream answered, but the tool call it streamed cannot be run.
-        # Naming the real cause keeps this deterministic failure out of the
-        # route cooldown and recovery poll it does not belong to.
-        message = (
-            "The upstream streamed a tool call whose arguments are not a valid "
-            "JSON object, so the call could not be run. Retry the turn."
-        )
-        error_type = "invalid_request_error"
-        error_code = "upstream_tool_call_arguments_invalid"
     else:
         message = "The upstream model route failed before a final assistant response was available."
         error_type = "server_error"
@@ -2251,6 +2267,57 @@ async def _yield_codex_responses_initial_keepalive_stream(
         await cancel_pending_read()
 
 
+def _stream_chunk_reasoning_only_text(chunk: Any) -> str:
+    """Return the thinking an arriving non-Responses frame carries, if any.
+
+    Chat Completions and Anthropic Messages name their thinking carriers
+    differently from a Responses ``*.delta`` event, so the generic branch in
+    ``_stream_chunk_has_meaningful_delta`` cannot read them.  A route that
+    streams ``reasoning_content`` while it thinks is producing the frames a
+    client renders as a live thinking block: that is stream activity, and read
+    as silence it tears the turn down as ``stream_idle_timeout`` while the
+    route is healthy and still working.
+    """
+
+    dumped = _stream_chunk_dump(chunk)
+    if not isinstance(dumped, dict):
+        return ""
+    if _stream_chunk_type(dumped) == "content_block_delta":
+        # Anthropic states the thinking carrier in the delta's own ``type``.
+        delta = dumped.get("delta")
+        if isinstance(delta, dict) and delta.get("type") in {
+            "thinking_delta",
+            "signature_delta",
+        }:
+            value = delta.get("thinking") or delta.get("signature")
+            return value if isinstance(value, str) else ""
+        return ""
+    choices = dumped.get("choices")
+    if not isinstance(choices, (list, tuple)):
+        return ""
+    for choice in choices:
+        delta = _responses_web_search_bridge_module._response_item_get(
+            choice, "delta"
+        )
+        if not isinstance(delta, dict):
+            continue
+        for field in (
+            "reasoning_content",
+            "reasoning",
+            "thinking_blocks",
+            "reasoning_items",
+        ):
+            value = _responses_web_search_bridge_module._response_item_get(
+                delta, field
+            )
+            if isinstance(value, str):
+                if value.strip():
+                    return value
+            elif value not in (None, "", [], {}):
+                return "reasoning"
+    return ""
+
+
 def _stream_chunk_has_meaningful_delta(chunk: Any) -> bool:
     dumped = _stream_chunk_dump(chunk)
     chunk_type = _stream_chunk_type(dumped)
@@ -2260,6 +2327,8 @@ def _stream_chunk_has_meaningful_delta(chunk: Any) -> bool:
             return bool(delta.strip())
         if delta not in (None, "", [], {}):
             return True
+    if _stream_chunk_reasoning_only_text(chunk).strip():
+        return True
     return _stream_chunk_has_visible_output(chunk)
 
 
@@ -3818,15 +3887,26 @@ async def _yield_guarded_original_stream(
         saw_terminal = False
         success_recorded = False
         native_chunk_count = 0
+        # Whether any part of the *answer* reached the client.  Thinking does
+        # not count: a client renders it as a live activity block and needs no
+        # reconciliation, so a route that only ever streamed thinking can still
+        # be replaced by a peer.
+        visible_output_delivered = saw_visible_output
 
         def inspect_native_chunk(chunk: Any) -> bool:
-            nonlocal saw_terminal, success_recorded, native_chunk_count
+            nonlocal saw_terminal
+            nonlocal success_recorded
+            nonlocal native_chunk_count
+            nonlocal visible_output_delivered
             chunk_exception = _stream_chunk_error_exception(chunk)
             if chunk_exception is not None:
                 if saw_terminal:
                     return False
                 raise chunk_exception
             native_chunk_count += 1
+            visible_output_delivered = (
+                visible_output_delivered or _stream_chunk_has_visible_output(chunk)
+            )
             saw_terminal = saw_terminal or _native_stream_chunk_is_terminal(
                 chunk,
                 request_data,
@@ -3848,7 +3928,7 @@ async def _yield_guarded_original_stream(
                 response,
                 request_data,
                 stream_started_at=stream_started_at,
-                saw_visible_output=saw_visible_output,
+                saw_visible_output=visible_output_delivered,
                 initial_chunk_count=len(buffer),
             ):
                 if not inspect_native_chunk(chunk):
@@ -3865,12 +3945,37 @@ async def _yield_guarded_original_stream(
                     exception,
                     request_data,
                 )
-            raise
+            # Committing the buffered start to the client -- which the chunk
+            # cap does after 20 frames -- must not cost a thinking-only turn
+            # its route recovery.  An answer that was never delivered leaves
+            # nothing to reconcile, so a peer route may still serve the turn;
+            # a stream that already showed answer text keeps its pinned
+            # behaviour and reports the failure itself.
+            if visible_output_delivered:
+                raise
+            async for fallback_chunk in _yield_streaming_error_fallback_or_raise(
+                request_data,
+                exception,
+            ):
+                yield fallback_chunk
+            return
         if not saw_terminal:
-            raise _native_stream_incomplete_exception(
+            incomplete_exception = _native_stream_incomplete_exception(
                 request_data,
                 buffered_chunks=native_chunk_count,
             )
+            # Same rule for the stream that simply ended: the route is only
+            # pinned once it has delivered part of the answer.  A clean EOF
+            # after thinking alone advances to the next route instead of
+            # ending the turn with a route the user never saw an answer from.
+            if visible_output_delivered:
+                raise incomplete_exception
+            async for fallback_chunk in _yield_streaming_error_fallback_or_raise(
+                request_data,
+                incomplete_exception,
+            ):
+                yield fallback_chunk
+            return
         return
 
     if _responses_request_module._request_has_structured_codex_compaction(
@@ -4519,6 +4624,25 @@ async def _yield_guarded_original_stream(
         evidence_task = asyncio.create_task(hidden_web_search_evidence_for_recovery())
         try:
             while True:
+                # A task that has already finished must be consumed instead of
+                # re-awaited.  ``wait_for`` cancels the shielded inner future on
+                # timeout, but a task that raised ``asyncio.TimeoutError`` itself
+                # (the shape every bridged sub-call and socket read uses) makes
+                # the very same exception surface as the wait's own timeout: the
+                # guard below is what tells a real silence apart from a finished
+                # read.  Without it this loop re-awaits a settled task with no
+                # suspension point and spins at full core until the client
+                # disappears -- idle energy the battery panel then reports as
+                # this app's.  Resolve the done case through ``.result()`` so the
+                # attempt fails with the error it actually raised.
+                if evidence_task.done():
+                    (
+                        search_results,
+                        completed_labels,
+                        completed_actions_for_recovery,
+                        source_urls_for_recovery,
+                    ) = evidence_task.result()
+                    break
                 try:
                     (
                         search_results,
@@ -4531,6 +4655,11 @@ async def _yield_guarded_original_stream(
                     )
                     break
                 except asyncio.TimeoutError:
+                    if evidence_task.done():
+                        # The evidence read may settle exactly at the keepalive
+                        # boundary; consume its outcome on the next pass rather
+                        # than emitting a tick for a finished task.
+                        continue
                     yield _route_recovery_sse_keepalive(
                         0,
                         request_data=request_data,

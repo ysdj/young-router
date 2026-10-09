@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import unittest
 from unittest import mock
 
@@ -294,6 +295,76 @@ class CoreOperationsTests(unittest.TestCase):
             popen.assert_not_called()
             self.assertTrue(controller.paths.recovery.exists())
             self.assertTrue(controller.paths.cooldowns.exists())
+
+    def test_a_slow_service_transition_keeps_snapshots_answering(self) -> None:
+        """A lifecycle operation never holds the lock snapshots need.
+
+        The proxy replacement is the one service call that takes minutes under
+        the drain budget.  Holding ``self._lock`` across it blocked every
+        ``snapshot``; each native host caps a request at 30 s and tears Core
+        down when it expires, which left every window stating "starting" with
+        nothing left to correct it.
+        """
+
+        release = threading.Event()
+        entered = threading.Event()
+
+        def handler(operation: str) -> dict[str, object]:
+            if operation == "status":
+                return {"state": "running", "pid": 1, "port": 49173}
+            entered.set()
+            self.assertTrue(release.wait(10.0))
+            return {"state": "running", "pid": 2, "port": 49173}
+
+        core = CoreStore(service_handlers={"status": handler, "restart": handler})
+        core.snapshot()
+        events: list[dict[str, object]] = []
+        unsubscribe = core.subscribe(events.append)
+        self.addCleanup(unsubscribe)
+
+        dispatched: list[dict[str, object]] = []
+        worker = threading.Thread(
+            target=lambda: dispatched.append(core.dispatch({"type": "service.restart"})),
+            daemon=True,
+        )
+        worker.start()
+        self.assertTrue(entered.wait(5.0))
+
+        answer: list[dict[str, object]] = []
+        reader = threading.Thread(target=lambda: answer.append(core.snapshot()), daemon=True)
+        reader.start()
+        reader.join(2.0)
+        self.assertFalse(reader.is_alive(), "snapshot() blocked while a restart replaced the proxy")
+        # The window that asked for the restart sees the proxy leave its state
+        # immediately, instead of after the whole replacement finished.
+        self.assertEqual("starting", answer[0]["service"]["state"])
+        self.assertEqual(["starting"], [event["snapshot"]["service"]["state"] for event in events])
+
+        release.set()
+        worker.join(10.0)
+        reader.join(10.0)
+        self.assertEqual("running", core.snapshot()["service"]["state"])
+        self.assertEqual(1, len(dispatched))
+
+    def test_a_failed_service_transition_projects_the_controllers_real_state(self) -> None:
+        """A refused replacement answers with the real state, never "starting".
+
+        The transitional state is published before the controller runs, so the
+        failure path has to hand the window Core's actual answer back.
+        """
+
+        def handler(operation: str) -> dict[str, object]:
+            if operation == "status":
+                return {"state": "stopped"}
+            raise RuntimeError("LiteLLM service could not start")
+
+        core = CoreStore(service_handlers={"status": handler, "restart": handler})
+        core.snapshot()
+
+        with self.assertRaises(CoreError):
+            core.dispatch({"type": "service.restart"})
+
+        self.assertEqual("stopped", core.snapshot()["service"]["state"])
 
     def test_unchanged_service_health_does_not_publish_a_new_revision(self) -> None:
         status = {

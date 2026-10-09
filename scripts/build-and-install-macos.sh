@@ -60,6 +60,11 @@ NEW_PIDS=""
 START_TIMEOUT_SECONDS="${YOUNG_ROUTER_START_TIMEOUT_SECONDS:-70}"
 STOP_TIMEOUT_SECONDS="${YOUNG_ROUTER_STOP_TIMEOUT_SECONDS:-20}"
 STOP_GRACE_POLLS=20
+# How long the replacement host may wait for the running app to finish the
+# turns it already accepted before the stale tree is forced down.  It matches
+# the Core's own proxy-drain budget (same variable, same default) so the two
+# layers agree on when a slow drain has become a wedged one.
+STOP_DRAIN_SECONDS="${YOUNG_ROUTER_PROXY_DRAIN_SECONDS:-300}"
 REQUIRED_HEALTH_CHECKS=3
 LAUNCH_RETRY_SECONDS=1
 LAST_STARTUP_STATE=""
@@ -149,14 +154,42 @@ installed_pids() {
 }
 
 stop_installed_app() {
-  local deadline bundle_pids="$1" grace_polls pid state
+  local deadline bundle_pids="$1" grace_polls pid state roots descendants
   [[ -n "$bundle_pids" ]] || return 0
 
   OLD_PIDS="$bundle_pids"
+  # Stop the host first and let it unwind, instead of signalling every
+  # descendant at once.
+  #
+  # Core owns an ordered teardown: it drains the proxy, then releases the
+  # upstream workers the proxy streams through.  Signalling the whole tree
+  # together inverted that order -- the workers died in the same instant as the
+  # proxy they feed, so a turn that was mid-answer lost its upstream before the
+  # proxy could finish it and the user had to resend.  The kill ladder below
+  # also used to pre-empt that drain after one second.
+  roots="$(bundle_roots)"
   while read -r pid; do
     [[ -n "$pid" ]] || continue
     kill -TERM "$pid" 2>/dev/null || true
-  done <<<"$bundle_pids"
+  done <<<"$roots"
+
+  # The host's own end is immediate; the work it leaves behind is the drain.
+  # Wait for it, bounded by the same budget the Core reads, so an ordinary
+  # restart never cuts a turn that is still being written.
+  grace_polls=$(( STOP_DRAIN_SECONDS * 20 ))
+  while pids_are_alive "$bundle_pids" && (( grace_polls > 0 )); do
+    sleep 0.05
+    grace_polls=$((grace_polls - 1))
+  done
+
+  # Anything the host did not unwind -- a descendant it never owned, or one a
+  # wedged process is holding -- still has to go before the replacement can
+  # bind the same listener.
+  descendants="$(bundle_processes)"
+  while read -r pid; do
+    [[ -n "$pid" ]] || continue
+    kill -TERM "$pid" 2>/dev/null || true
+  done <<<"$descendants"
 
   grace_polls=$STOP_GRACE_POLLS
   while pids_are_alive "$bundle_pids" && (( grace_polls > 0 )); do

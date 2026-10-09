@@ -424,6 +424,70 @@ class RelayApplyDomainTests(unittest.TestCase):
             self.assertEqual([], reloaded.snapshot()["accounts"])
             self.assertEqual(1, len(reloaded.snapshot()["pending_credential_cleanups"]))
 
+    def test_a_journal_entry_for_a_missing_account_cannot_deadlock_apply(self) -> None:
+        """Orphaned journal work is dropped, not left to pin the draft forever.
+
+        An operation names the account it belongs to, so one whose account is
+        gone can never run: ``_operation_account`` refuses it, Apply reports
+        ``account_unavailable`` on every attempt, and ``ready`` stays false.
+        Because a non-empty journal also marks the draft dirty, the store then
+        refused *every* write — a newly added station lived in memory only and
+        the next restart silently dropped it.  That is the shape of the lost
+        relay account: adding one changed nothing on disk and Apply could not
+        commit it either.
+
+        The orphan is real rather than hypothetical: the journal is a sibling
+        file, not part of the synced bundle, so a store replaced from the remote
+        keeps operations for accounts that replacement removed.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            domain, _client, _account = self._signed_in_domain(directory)
+            domain.commit_apply()
+
+            # An operation whose account the document does not carry, which is
+            # how the residue is produced: the store lost the account, the
+            # journal did not.
+            operations = domain._journal_payload()["operations"]
+            self.assertEqual([], operations)
+            domain._new_pending_operation(
+                kind="api_key_create",
+                account={
+                    "id": "account-gone",
+                    "station_id": "station-gone",
+                    "type": "sub2api",
+                    "origin": "https://gone.example.test",
+                },
+                resource_id="pending-gone",
+                changes={"name": "Gone", "enabled": True},
+                known_resource_ids=[],
+            )
+            domain._persist_journal()
+            self.assertEqual(1, len(json.loads(domain.journal_path.read_text(encoding="utf-8"))["operations"]))
+
+            # The orphan must not survive into the next read, and Apply must be
+            # ready again.
+            reloaded = RelayAccountsDomain(directory)
+            self.assertEqual([], reloaded._pending_operations)
+            self.assertTrue(reloaded.prepare_apply()["ready"])
+            self.assertEqual([], json.loads(reloaded.journal_path.read_text(encoding="utf-8"))["operations"])
+
+            # The deadlock itself: a fresh station must reach disk.  Before the
+            # orphan was dropped, Apply stayed unready here and the commit below
+            # refused to write, so the next restart lost it.
+            reloaded.dispatch(
+                "account.add",
+                {"type": "sub2api", "label": "Added", "origin": "https://added.example.test"},
+            )
+            self.assertTrue(reloaded.prepare_apply()["ready"])
+            reloaded.commit_apply()
+            after_restart = RelayAccountsDomain(directory)
+            self.assertIn(
+                "https://added.example.test",
+                [entry["origin"] for entry in after_restart.snapshot()["accounts"]],
+            )
+            self.assertEqual([], after_restart._pending_operations)
+
 
 if __name__ == "__main__":
     unittest.main()

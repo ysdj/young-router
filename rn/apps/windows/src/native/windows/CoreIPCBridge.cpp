@@ -4,6 +4,7 @@
 #include <Windows.h>
 #include <winhttp.h>
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cwctype>
@@ -211,6 +212,26 @@ bool IsWebdavRemoteOperation(std::string const& request_json) {
   }
 }
 
+// A managed-proxy lifecycle dispatch replaces the proxy, which the drain budget
+// lets run for minutes.  The 30 s default expired mid-restart and tore Core
+// down, leaving every window stating "starting" with nothing to correct it.
+bool IsServiceLifecycleOperation(std::string const& request_json) {
+  try {
+    auto request = winrt::Windows::Data::Json::JsonObject::Parse(Utf8ToWide(request_json));
+    if (WideToUtf8(request.GetNamedString(L"method", L"").c_str()) != "dispatch") return false;
+    auto action = request.GetNamedObject(L"params").GetNamedObject(L"action");
+    if (action.HasKey(L"domain")) return false;
+    std::string type = WideToUtf8(action.GetNamedString(L"type", L"").c_str());
+    std::transform(type.begin(), type.end(), type.begin(), [](unsigned char character) {
+      return static_cast<char>(std::tolower(character));
+    });
+    return type == "service.start" || type == "service.stop" ||
+           type == "service.restart" || type == "service.reload";
+  } catch (...) {
+    return false;
+  }
+}
+
 struct WinHttpHandleCloser {
   void operator()(HINTERNET handle) const noexcept {
     if (handle) WinHttpCloseHandle(handle);
@@ -248,8 +269,9 @@ std::string CoreIPCBridge::Send(std::string const& request_json) {
   const bool is_subscription = method == "subscribe";
   // A model probe waits for the deployment's own first-event budget and then
   // for a complete fingerprint answer, so it outlives the 30 s default; a
-  // WebDAV remote operation earns the same wait.
-  const bool slow_remote_operation = method == "probe" || IsWebdavRemoteOperation(request_json);
+  // WebDAV remote operation and a proxy lifecycle dispatch earn the same wait.
+  const bool slow_remote_operation =
+      method == "probe" || IsWebdavRemoteOperation(request_json) || IsServiceLifecycleOperation(request_json);
   const int receive_timeout_ms = slow_remote_operation ? 900000 : 30000;
   for (int attempt = 0; attempt < 2; ++attempt) {
     auto [endpoint, session, generation] = EnsureSession();

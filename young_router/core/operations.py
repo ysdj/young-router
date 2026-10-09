@@ -15,6 +15,7 @@ import copy
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import secrets
@@ -57,7 +58,20 @@ OWNER_TOKEN_ENV = "YOUNG_ROUTER_SERVICE_OWNER_TOKEN"
 CORE_PID_ENV = "YOUNG_ROUTER_CORE_PID"
 OWNER_TOKEN_BYTES = 32
 MACOS_DEFAULT_WORKERS = "16"
-PROXY_STOP_GRACE_SECONDS = 2.0
+# How long a stopping proxy may keep finishing the turns it already accepted.
+#
+# The managed proxy drains an in-flight streaming response when it receives
+# SIGTERM, and the fixed upstream workers now drain with it.  Two seconds was
+# chosen when nothing downstream was allowed to finish, so the kill it bounds
+# was the only outcome and the number only decided how long that took.  A turn
+# whose model is thinking holds the client's connection open for as long as the
+# model produces -- measured p90 77 s, p95 103 s, max 317 s on this machine --
+# so the cap has to cover an ordinary turn or every app restart, settings
+# apply, and replacement Core cuts the user's answer in half.  It stays finite
+# so a wedged proxy is still replaced; ``YOUNG_ROUTER_PROXY_DRAIN_SECONDS``
+# overrides it, and ``0`` keeps the previous stop-immediately behaviour.
+PROXY_DRAIN_GRACE_SECONDS = 300.0
+PROXY_DRAIN_GRACE_ENV = "YOUNG_ROUTER_PROXY_DRAIN_SECONDS"
 SERVICE_STATUS_CACHE_SECONDS = 10.0
 # Upper bound for the configurable start/restart health wait. The Runtime
 # Settings schema documents the same 1..600 second range; a larger host
@@ -94,6 +108,26 @@ def _runtime_root(value: Path | str | None = None) -> Path:
 
 def _bounded_text(value: object, *, limit: int = 240) -> str:
     return REDACT_TEXT(str(value))[:limit]
+
+
+def _proxy_drain_grace_seconds() -> float:
+    """How long a stopping proxy may finish the turns it already accepted.
+
+    A deployment may lower this (a faster restart) or raise it (a very long
+    turn); an unreadable value falls back to the default rather than to a
+    stop-immediately kill.
+    """
+
+    raw = os.environ.get(PROXY_DRAIN_GRACE_ENV, "").strip()
+    if not raw:
+        return PROXY_DRAIN_GRACE_SECONDS
+    try:
+        parsed = float(raw)
+    except ValueError:
+        return PROXY_DRAIN_GRACE_SECONDS
+    if not math.isfinite(parsed) or parsed < 0:
+        return PROXY_DRAIN_GRACE_SECONDS
+    return parsed
 
 
 # LiteLLM's Router takes a per-exception retry count only inside
@@ -1064,7 +1098,7 @@ class CoreServiceController:
                 os.kill(pid, signal.SIGTERM)
         except OSError:
             return
-        deadline = time.monotonic() + PROXY_STOP_GRACE_SECONDS
+        deadline = time.monotonic() + _proxy_drain_grace_seconds()
         while time.monotonic() < deadline and CoreServiceController._process_alive(pid):
             time.sleep(0.1)
         if CoreServiceController._process_alive(pid):

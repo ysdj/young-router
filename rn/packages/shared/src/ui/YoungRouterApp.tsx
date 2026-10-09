@@ -35,6 +35,7 @@ import {
 } from "./RelayAccountManager";
 import { suggestedProviderName, suggestedRelayStationName } from "./relayOrigin";
 import { isAssistantEditorOpen, isGroupManagerOpen, isProviderWizardOpen, setAssistantEditorOpen, setGroupManagerOpen, setProviderWizardOpen, subscribeProviderWizard } from "./providerWizardGate";
+import { RelayDialogHost, useRelayDialogSurface } from "./relayDialogSurface";
 import { SOURCE_LIST_FONT_SIZE, UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
 import type {
   AppRoute,
@@ -91,6 +92,12 @@ type ServiceOperation = "start" | "stop" | "restart" | "reload" | "health";
 // competes with every other start-up item, and a proxy whose workers failed to
 // spawn then must come back without the user relaunching the app.
 const SERVICE_STARTUP_RETRY_DELAYS_MS = [0, 5_000, 20_000, 60_000];
+// How often a window re-reads Core while it is drawing a transitional service
+// state. The state is only a claim until Core answers, and the answer is what
+// clears it; without this a restart that outlives the request budget leaves the
+// pane stating "启动中" forever. It costs one loopback read every interval and
+// only while the state is transitional.
+const SERVICE_STATE_RECONCILE_MS = 5_000;
 type EditableDiskDomain = "codex" | "claude" | "clients" | "providers_models" | "runtime" | "webdav";
 type RawEditorConflictResolution = "reload" | "keep";
 type AssistantSettingsDomain = "codex" | "claude" | "clients";
@@ -339,6 +346,13 @@ function providerKindLabel(kind: ProviderKind, translate: Translate): string {
           : kind === "workbuddyAI"
             ? translate("providers.type.workbuddyAI")
             : translate("providers.type.apiKey");
+}
+
+/** Whether this provider kind is one of the account-backed login services, whose
+ * name, address, and key all belong to the service surface rather than to the
+ * provider editor. */
+function isLoginProviderKind(kind: ProviderKind): boolean {
+  return kind === "openai" || kind === "claude" || kind === "workbuddy" || kind === "workbuddyAI";
 }
 
 const DATA_PACKAGE_SECTIONS: ReadonlyArray<{ domain: ConfigDomain; labelKey: string }> = [
@@ -806,6 +820,48 @@ function applyResultMessage(result: IpcResults["apply"], translate: Translate, a
 // the status strip: the pane reports the outcome instead.
 const INTERNAL_STEP_NAME = /^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$/;
 
+// Core records precise validation locations on the draft even when the Apply
+// request itself returns a stable error code. The row markers point at the
+// editor; this sentence tells the user which rule caused the refusal.
+function validationIssueMessageKey(code: string): string | undefined {
+  switch (code) {
+    case ["api", "key", "value", "required"].join("_"): return "validation.apiKeyValueRequired";
+    case ["model", "name", "required"].join("_"): return "validation.modelNameRequired";
+    case ["model", "upstream", "required"].join("_"): return "validation.modelUpstreamRequired";
+    case ["model", "provider", "key", "missing"].join("_"): return "validation.modelProviderKeyMissing";
+    case ["invalid", "syntax"].join("_"): return "validation.invalidSyntax";
+    default: return undefined;
+  }
+}
+
+function validationSummaryMessage(summary: unknown, translate: Translate): string | undefined {
+  const record = asRecord(summary);
+  if (record.valid === true) return undefined;
+  const issues = asRecords(record.issues)
+    .filter((issue) => stringValue(issue.severity, "error") === "error")
+    .map((issue) => {
+      const code = stringValue(issue.code);
+      const translatedKey = validationIssueMessageKey(code);
+      const rawMessage = stringValue(issue.message).trim();
+      const message = translatedKey
+        ? translate(translatedKey)
+        : rawMessage && !/^validation failed$|^fix (the )?(validation|provider\/model) issues?$/i.test(rawMessage)
+          ? rawMessage
+          : translate("validation.invalid_settings");
+      const path = stringValue(issue.path).trim();
+      return path ? translate("validation.issueAt", { path, message }) : message;
+    })
+    .filter(Boolean);
+  if (issues.length === 0) return undefined;
+  const shown = issues.slice(0, 3);
+  const extra = issues.length > shown.length ? translate("validation.moreIssues", { count: issues.length - shown.length }) : "";
+  return [translate("error.validationFailed"), shown.join("; "), extra].filter(Boolean).join(" ");
+}
+
+function validationFailureCode(reason: unknown): string {
+  return stringValue(asRecord(reason).code);
+}
+
 function errorMessage(reason: unknown, translate: Translate): string {
   const code = stringValue(asRecord(reason).code);
   if (reason instanceof Error && reason.message === "Claude supports at most 3 fallback models") {
@@ -1230,6 +1286,26 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
   }, [isPrimaryHost, native, routeRequest, snapshot]);
 
   useEffect(() => {
+    if (!isPrimaryHost || !snapshot) return;
+    // A transitional state is a claim about a proxy replacement, and the only
+    // authority for it is Core.  The optimistic copy this window drew before
+    // dispatching a lifecycle operation is corrected by the next snapshot --
+    // but a restart that outlives the request budget, or a host that replaced
+    // Core underneath a stuck request, leaves no snapshot coming: the
+    // subscription is restored empty and Core only emits on its next mutation.
+    // A window would then keep drawing "启动中" over a service that is already
+    // running (or long dead) with nothing able to correct it.  Re-read Core
+    // while the state is transitional so the pane recovers on its own; a
+    // stopped service then hands off to the existing start-retry effect below.
+    if (snapshot.service.state !== "starting") return;
+    // An interval, not a single timer: a successful re-read that still answers
+    // "starting" leaves the revision unchanged, so a one-shot effect would
+    // never run again and the pane would go back to waiting forever.
+    const timer = setInterval(() => { void refreshSnapshot().catch(() => undefined); }, SERVICE_STATE_RECONCILE_MS);
+    return () => clearInterval(timer);
+  }, [isPrimaryHost, refreshSnapshot, snapshot?.revision, snapshot?.service.state]);
+
+  useEffect(() => {
     if (!isPrimaryHost || !snapshot || !serviceShouldBeRunning.current) return;
     const serviceState = snapshot.service.state;
     if (serviceState === "running") {
@@ -1354,7 +1430,12 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
     const serviceState = snapshot.service.state;
     const serviceActive = serviceState === "running" || serviceState === "starting" || serviceState === "unhealthy";
     const serviceStartAvailable = !serviceOperationPending && serviceState === "stopped";
-    const serviceRestartAvailable = !serviceOperationPending && serviceState !== "unknown" && serviceState !== "starting";
+    // 启动中 is a claim about a replacement in flight, and the replacement can
+    // outlive the request budget.  Leaving restart disabled there made a stuck
+    // transitional state a dead end whose only exit was 停止服务; restarting a
+    // transitional service is exactly the retry that recovers it, and Core
+    // serializes the two operations on its own transition guard.
+    const serviceRestartAvailable = !serviceOperationPending && serviceState !== "unknown";
     const serviceReloadAvailable = !serviceOperationPending && (serviceState === "running" || serviceState === "unhealthy");
     const catalog = codexModelCatalogState(snapshot);
     const actions = [
@@ -1767,6 +1848,42 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
     onSnapshot(next);
     return next;
   };
+  const validationStatusAfterFailure = async (reason: unknown): Promise<string | undefined> => {
+    const code = validationFailureCode(reason);
+    if (!(code === "provider_model_invalid" || code === "validation_failed" || code === "relay_preflight_failed")) return undefined;
+    try {
+      const preferred: ConfigDomain[] = code === "provider_model_invalid"
+        ? ["providers_models"]
+        : domain ? [domain] : ["providers_models", "relay_accounts", "codex", "claude", "clients", "runtime", "webdav"];
+      // Some coordinated relay failures happen during preflight, before the
+      // ordinary domain validator is called. Ask Core for that summary here so
+      // the failed draft still carries a precise issue for the UI to render.
+      let validatedMessage: string | undefined;
+      for (const name of preferred) {
+        try {
+          const summary = await ipc.validate(name, revision.current);
+          validatedMessage ??= validationSummaryMessage(summary, translate);
+        } catch {
+          // A domain that is not part of this transaction must not hide the
+          // validation detail from the domain that is.
+        }
+      }
+      // Apply records the issue before returning its error. Read that same
+      // snapshot so the strip and alertRowKeys describe the failed draft.
+      const next = await ipc.snapshot();
+      revision.current = Math.max(revision.current ?? -1, next.revision);
+      latestSnapshot.current = next;
+      onSnapshot(next);
+      for (const name of preferred) {
+        const message = validationSummaryMessage(next.drafts[name]?.validation, translate);
+        if (message) return message;
+      }
+      return validatedMessage;
+    } catch {
+      // The original IPC error remains the fallback if the diagnostic read is unavailable.
+    }
+    return undefined;
+  };
   const onSecretState = (state: SecretState): void => {
     if (state.status !== "saved" || state.revision < 0) return;
     revision.current = state.revision;
@@ -1811,7 +1928,7 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
         // A rejected draft leaves its own rows marked in the pane
         // (`alertRowKeys`), so the strip states the outcome instead of a
         // second report of the same problem.
-        publishResult(value.valid ? translate("common.saved") : translate("error.validationFailed"));
+        publishResult(value.valid ? translate("common.saved") : (validationSummaryMessage(value, translate) ?? translate("error.validationFailed")));
       } else if (isApplyResult(value)) {
         // An explicit caller message wins for the applied case so instant
         // applies can say "Saved" instead of the generic "Applied".
@@ -1824,7 +1941,8 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
       }
       if (refreshAfter) await refresh();
     } catch (reason: unknown) {
-      publishResult(errorMessage(reason, translate));
+      const validationStatus = await validationStatusAfterFailure(reason);
+      publishResult(validationStatus ?? errorMessage(reason, translate));
     } finally {
       activeRuns.current -= 1;
       if (!keepControlsEnabled) {
@@ -3970,6 +4088,10 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   const relayAccounts = useMemo(() => accountsFromSnapshot(snapshot), [snapshot]);
   const relayStationsFull = useMemo(() => stationsFromSnapshot(snapshot, relayAccounts), [relayAccounts, snapshot]);
   const providers = useMemo(() => snapshotProviderRecords(snapshot), [snapshot?.providers_models.providers, state.providers]);
+  const validationIssues = useMemo(
+    () => asRecords(snapshot?.drafts.providers_models?.validation.issues).filter((issue) => stringValue(issue.severity, "error") === "error"),
+    [snapshot],
+  );
   const [selectedProvider, setSelectedProvider] = useState<string>();
   const [providerNameDrafts, setProviderNameDrafts] = useState<Record<string, string>>({});
   const [providerBaseUrlDrafts, setProviderBaseUrlDrafts] = useState<Record<string, string>>({});
@@ -4044,9 +4166,12 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   );
   const providerId = provider ? editorIdentifier(provider) : "";
   const providerKindSelected = provider ? providerKind(provider) : "apiKey" as ProviderKind;
-  const models = useMemo(
-    () => provider ? asRecords(provider.models).map(modelRecord) : [],
-    [provider],
+  const models = useMemo<UnknownRecord[]>(
+    () => provider ? asRecords(provider.models).map((entry, index) => ({
+      ...modelRecord(entry),
+      __validation_issue: validationIssues.some((issue) => validationIssueMatchesModel(issue, provider, index)),
+    })) : [],
+    [provider, validationIssues],
   );
   const [selectedModel, setSelectedModel] = useState<string>();
   const [providerSourceModel, setProviderSourceModel] = useState<string>();
@@ -4233,7 +4358,11 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     if (stringValue(summary.operation) !== "fetch_models" || (summaryProviderId !== providerId && summaryProviderId !== providerIdentity)) return;
     const candidates = stringList(summary.models);
     if (summary.available === false) {
-      onStatus(translate("providers.fetchFailed", { detail: stringValue(summary.detail, translate("common.notAvailable")) }));
+      // Core's own detail names the cause (the endpoint rejected the request,
+      // the key was refused, the address is not configured); only a refusal
+      // that names nothing falls back to the pane's own words, because 不适用
+      // says nothing about what the user could do next.
+      onStatus(translate("providers.fetchFailed", { detail: stringValue(summary.detail) || translate("providers.fetchKeyUnavailable") }));
       return;
     }
     if (candidates.length === 0) {
@@ -4246,7 +4375,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     const providerName = provider ? providerDisplayName(provider) : providerId;
     const apiKeyName = stringValue(summary.api_key_name);
     if (!apiKeyName) {
-      onStatus(translate("providers.fetchFailed", { detail: translate("common.notAvailable") }));
+      onStatus(translate("providers.fetchFailed", { detail: translate("providers.fetchKeyUnavailable") }));
       return;
     }
     // A relay fetch stages the key slot it listed the models for, and the
@@ -4286,17 +4415,28 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     };
     setFetchModelsBusy(true);
     try {
+      // A linked key resolves from the credential this app already holds, so
+      // the listing has to have that credential in hand before it runs.  The
+      // refresh that answers the key list is what records every key's value
+      // (one page, already paid for by the read the pane does on mount), and a
+      // slot that no document carries is the only case that then pays for a
+      // station read of its own.  A station that refuses the refresh still
+      // resolves from what the slot already carries.
+      if (relaySource) {
+        await relay.refreshResources(relaySource.accountID).catch(() => undefined);
+        onSnapshot(await ipc.snapshot());
+      }
       // 获取模型 reports its own progress (a relay round trip, or the desktop
       // app's live catalog), so the rest of the pane stays usable while it
       // waits.  The row list it stages still applies as a normal write.
       const next = await dispatchWithOutcome(action, payload, "providers_models", true);
       if (!next) {
-        onStatus(translate("providers.fetchFailed", { detail: translate("common.notAvailable") }));
+        onStatus(translate("providers.fetchFailed", { detail: translate("providers.fetchKeyUnavailable") }));
         return;
       }
       const summary = asRecord(asRecord(next.action_summaries?.providers_models).operation_summary);
       if (Object.keys(summary).length === 0) {
-        onStatus(translate("providers.fetchFailed", { detail: translate("common.notAvailable") }));
+        onStatus(translate("providers.fetchFailed", { detail: translate("providers.fetchKeyUnavailable") }));
         return;
       }
       const slotID = stringValue(summary.slot_id);
@@ -4330,6 +4470,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       ?? providerKeyStates(provider)[0];
     void dispatch("model.add", { provider_id: providerId, model: { name, upstream_model: name, enabled: true, order: 0, ...(inheritedKey ? { api_key_name: inheritedKey.name, provider_key_id: inheritedKey.id } : {}) } });
   };
+
   const addProvider = (): void => {
     // The pane commits every edit, so a new provider is valid the moment it
     // exists: a placeholder name and no key or model yet, with the editor
@@ -4711,10 +4852,11 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   );
   const alertProviderKeys = useMemo(
     () => providers.filter((item) => {
+      if (validationIssues.some((issue) => validationIssueMatchesProvider(issue, item))) return true;
       if (bindingIssues.some((issue) => stringValue(issue.provider) === editorIdentifier(item))) return true;
       return asRecords(item.models).some((model) => modelNeedsAttention(model, translate) || Boolean(bindingIssueFor(model)));
     }).map(editorIdentifier),
-    [bindingIssueFor, bindingIssues, providers, translate],
+    [bindingIssueFor, bindingIssues, providers, translate, validationIssues],
   );
   const routeRows = useMemo(() => {
     const rows: Array<{ key: string; cells: string[]; spanning?: boolean }> = [];
@@ -4741,8 +4883,11 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     [routeGroups],
   );
   const alertRouteKeys = useMemo(
-    () => routeGroups.flatMap((group) => group.entries.filter((entry) => Boolean(bindingIssueFor(entry.model))).map((entry) => entry.key)),
-    [bindingIssueFor, routeGroups],
+    () => routeGroups.flatMap((group) => group.entries.filter((entry) => {
+      const modelIndex = asRecords(entry.provider.models).findIndex((candidate) => editorIdentifier(candidate) === editorIdentifier(entry.model));
+      return Boolean(bindingIssueFor(entry.model)) || (modelIndex >= 0 && validationIssues.some((issue) => validationIssueMatchesModel(issue, entry.provider, modelIndex)));
+    }).map((entry) => entry.key)),
+    [bindingIssueFor, routeGroups, validationIssues],
   );
   const disabledRouteKeys = useMemo(
     () => routes.filter((entry) => !entry.providerEnabled || !entry.modelEnabled || !entry.keyAvailable).map((entry) => entry.key),
@@ -4869,6 +5014,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
                   // the display name the drafts already project, so 设置 opens that
                   // group's settings even while the name field holds a draft.
                   const publicModel = activeRoute.publicModel.trim(); if (!publicModel) return; selectRouteTableRow(routePublicModelRowKey(publicModel)); setPublicModelReturn({ routeKey: activeRoute.key, label: modelUpstreamDisplay(editorIdentifier(activeRoute.provider), activeRoute.model) || publicModel }); }} onProviderChange={(destinationProviderId) => dispatch("model.move_provider", { provider_id: editorIdentifier(activeRoute.provider), model_id: editorIdentifier(activeRoute.model), destination_provider_id: destinationProviderId }).then(() => { setSelectedProvider(destinationProviderId); setSelectedModel(editorIdentifier(activeRoute.model)); setSelectedRoute(`${destinationProviderId}:${activeRoute.deploymentID}`); setProviderSourceModel(undefined); })} />) : <EmptyState translate={translate} />) : provider && model ? <ModelInspector key={`model:${providerId}:${editorIdentifier(model)}`} providers={providers} providerLabels={providers.map(providerDisplayName)} provider={provider} providerId={providerId} model={model} modelName={modelDisplayName(providerId, model)} relaySources={relaySources} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} modelContexts={modelContexts} bindingIssue={bindingIssueFor(model)} {...modelProbeProps(providerId, editorIdentifier(model), probeInputFingerprint(providerBaseURL(provider), modelUpstreamDisplay(providerId, model), model))} onNameDraftChange={(value) => setModelNameDraft(providerId, editorIdentifier(model), value)} onProviderClick={() => { setProviderSourceModel(editorIdentifier(model)); setSelectedModel(undefined); }} onOpenPublicModel={() => { const publicModel = modelDisplayName(providerId, model).trim(); if (!publicModel) return; const originRouteKey = `${providerId}:${stringValue(model.editor_id, stringValue(model.deployment_id, identifier(model))).trim()}`; setViewMode("routes"); selectRouteTableRow(routePublicModelRowKey(publicModel)); setPublicModelReturn({ routeKey: originRouteKey, label: modelUpstreamDisplay(providerId, model) || publicModel }); }} onProviderChange={(destinationProviderId) => dispatch("model.move_provider", { provider_id: providerId, model_id: editorIdentifier(model), destination_provider_id: destinationProviderId }).then(() => { setSelectedProvider(destinationProviderId); setSelectedModel(editorIdentifier(model)); setProviderSourceModel(undefined); })} /> : provider ? <ProviderEditor key={`provider:${providerId}`} provider={provider} relaySources={relaySources} relayStations={relayStations} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onNameDraftChange={(value) => setProviderNameDraft(providerId, value)} sourceModel={models.find((item) => editorIdentifier(item) === providerSourceModel)} onReturnToModel={() => { if (providerSourceModel) setSelectedModel(providerSourceModel); setProviderSourceModel(undefined); }} station={selectedStation} stationAccounts={selectedStationAccounts} relay={relay} addOfficialAccount={addOfficialAccount} onActivateAndRestart={onActivateAndRestart} onStatus={onStatus} language={snapshot?.language ?? "system"} bindingIssues={bindingIssues} snapshotForCleanups={snapshot} /> : <EmptyState translate={translate} />}</View>
+    <RelayDialogHost />
   </View></ProviderWorkspaceDraftContext.Provider>;
 }
 
@@ -5262,6 +5408,10 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
         translate={translate}
       />
     </>;
+  // The keys panel lives in the provider inspector, so its dialogs are drawn on
+  // the route's surface: rendered here they would be clipped by this pane's
+  // column and centred inside it rather than over the window that asked.
+  const dialogsHosted = useRelayDialogSurface(() => dialogs);
   if (variant === "inline") {
     return <View style={styles.keysInline}>
       <View style={styles.panelHeader}>
@@ -5272,13 +5422,13 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
         {keysTable}
         {keysEditorView}
       </View> : keysEditorView}
-      {dialogs}
+      {dialogsHosted ? null : dialogs}
     </View>;
   }
   return <TablePane style={[styles.keysPane]} title={translate("providers.keys")} actions={toolbar}>
     {tableRows.length > 0 ? keysTable : null}
     {keysEditorView}
-    {dialogs}
+    {dialogsHosted ? null : dialogs}
   </TablePane>;
 }
 
@@ -5665,10 +5815,30 @@ function isDraftModel(model: UnknownRecord, translate: Translate): boolean {
 // letting the placeholder read as a real public model.
 function modelNeedsAttention(model: UnknownRecord, translate: Translate): boolean {
   if (!booleanValue(model.model_enabled, booleanValue(model.enabled, true))) return false;
+  if (booleanValue(model.__validation_issue)) return true;
   const name = stringValue(model.model_name).trim() || stringValue(model.name).trim();
   if (!name) return true;
   if (isDraftModel(model, translate)) return true;
   return !(stringValue(model.litellm_model).trim() || stringValue(model.upstream_model).trim());
+}
+
+function validationProviderLabel(provider: UnknownRecord): string {
+  const label = stringValue(provider.display_name, stringValue(provider.name)).trim();
+  return label.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "provider";
+}
+
+function validationIssueMatchesProvider(issue: UnknownRecord, provider: UnknownRecord): boolean {
+  const path = stringValue(issue.path).trim();
+  if (!path || path === "configuration") return true;
+  const prefix = `providers_models.${validationProviderLabel(provider)}`;
+  return path === prefix || path.startsWith(`${prefix}.`);
+}
+
+function validationIssueMatchesModel(issue: UnknownRecord, provider: UnknownRecord, modelIndex: number): boolean {
+  const path = stringValue(issue.path).trim();
+  if (!path || path === "configuration") return true;
+  const modelPath = `providers_models.${validationProviderLabel(provider)}.models[${modelIndex + 1}]`;
+  return path === modelPath || path.startsWith(`${modelPath}.`);
 }
 
 function isProbeSurface(value: string): value is "openai/responses" | "openai/chat" | "anthropic" {
@@ -5789,33 +5959,90 @@ function uniqueProviderName(providers: UnknownRecord[], name: string, excludeID 
   return candidate;
 }
 
-function ProviderSourceFields({ provider, providerID, relayStations, busy, translate, dispatch, onStatus, onBaseUrlDraftChange, onNameDraftChange }: { provider: UnknownRecord; providerID: string; relayStations: RelayStationOption[]; busy: boolean; translate: Translate; dispatch: Dispatch; onStatus?: (status?: string) => void; onBaseUrlDraftChange?: (baseURL: string) => void; onNameDraftChange?: (name: string) => void }): React.JSX.Element {
+/**
+ * One provider's identity, whichever kind it is: its 启用 row, the name it is
+ * listed under, the type it is, and the address that type is bound to.
+ *
+ * Every provider states those rows in that one order, so the pane reads the
+ * same whichever row opened it — the drift this replaces printed 基础 URL above
+ * 供应商名称 for a service provider and 供应商名称 above 供应商URL for a
+ * relay-bound one, off one shared form.  What differs between kinds is where a
+ * value comes from, never the shape: a custom provider types its own name and
+ * address, a relay-bound provider's are its station's (editing the address there
+ * is the station switch), and a service provider's address follows its type.
+ *
+ * The type is stated, never offered.  A provider's type is the contract behind
+ * it — an account or a key, the address that contract is served at, and every
+ * route's protocol surface — so it is decided where the provider is created and
+ * read back here afterwards; the pane shows the fact rather than a control that
+ * would have to rewire a provider, its address, and its routes in place.
+ */
+function ProviderIdentityFields({ provider, providerID, relayStations, station, stationDraft, onStationDraftChange, onStageStationUpdate, busy, translate, dispatch, onStatus, onBaseUrlDraftChange, onNameDraftChange }: {
+  provider: UnknownRecord;
+  providerID: string;
+  relayStations: RelayStationOption[];
+  station?: RelayStation;
+  stationDraft?: StationDraft;
+  onStationDraftChange?: (draft: StationDraft) => void;
+  onStageStationUpdate?: (overrides: StationDraft) => Promise<void>;
+  busy: boolean;
+  translate: Translate;
+  dispatch: Dispatch;
+  onStatus?: (status?: string) => void;
+  onBaseUrlDraftChange?: (baseURL: string) => void;
+  onNameDraftChange?: (name: string) => void;
+}): React.JSX.Element {
   const drafts = useContext(ProviderWorkspaceDraftContext);
+  const kind = providerKind(provider);
+  const isLogin = isLoginProviderKind(kind);
   const [sourceResetToken, setSourceResetToken] = useState(0);
-  const providerName = drafts?.providerDisplayName(provider) ?? stringValue(provider.name, stringValue(provider.display_name));
-  const providerBaseURL = drafts?.providerBaseURL(provider) ?? stringValue(provider.endpoint, stringValue(provider.api_base));
-  // There is no explicit source switcher: a base URL that matches a station
-  // binds to it automatically, and the always-present 中转站关联
-  // section carries the account workflow.
+  const providerName = drafts?.providerDisplayName(provider) ?? stringValue(provider.display_name, stringValue(provider.name, translate("providers.newProvider")));
+  // The name Core actually holds, as opposed to ``providerName`` above, which
+  // is the *draft* projection this field writes on every keystroke through
+  // ``onDraftChange``.  A commit must never compare the submitted value against
+  // the draft it came from: by the time a blur commits, the projection already
+  // equals what was typed, so a guard read against it answers “nothing changed”
+  // for every edit — the field showed the new name, Core kept the old one, and
+  // retyping repeated the same silent no-op.  The draft is only what the field
+  // displays while typing; what was stored is what decides whether a write is due.
+  const committedName = displayLabel(provider.display_name, displayLabel(provider.name, translate("providers.newProvider")));
+  const stationDraftRef = useRef<StationDraft>({});
+  stationDraftRef.current = stationDraft ?? {};
+  const setStationDraftValue = (draft: StationDraft): void => {
+    onStationDraftChange?.({ ...stationDraftRef.current, ...draft });
+  };
+  const stageStationUpdate = async (overrides: StationDraft = {}): Promise<void> => {
+    await onStageStationUpdate?.(overrides);
+  };
+  // A login provider is addressed by its type, a relay-bound provider by its
+  // station, and only a custom provider types its own — a relay provider whose
+  // station is gone still states the address it kept.  A custom provider whose
+  // URL happens to point at an official host stays a custom provider: `service`
+  // is a fallback recognition for labels, never what decides a row here.
+  const providerBaseURL = station
+    ? station.origin
+    : isLogin ? SERVICE_BASE_URLS[kind as ServiceID]
+      : drafts?.providerBaseURL(provider) ?? stringValue(provider.endpoint, stringValue(provider.api_base));
   const commitBaseURL = (endpoint: string): void | Promise<void> => {
-    const station = relayStationForBaseUrl(endpoint, relayStations);
-    if (station) {
-      if (providerNameExists(drafts?.providers ?? [], station.name, providerID)) {
+    if (station) return undefined;
+    const nextStation = relayStationForBaseUrl(endpoint, relayStations);
+    if (nextStation) {
+      if (providerNameExists(drafts?.providers ?? [], nextStation.name, providerID)) {
         // The bind needs this provider to take the station's name, and Core
         // refuses a duplicate name.  The field goes back to its previous value,
         // so the cause is stated instead of looking like a lost keystroke.
-        onStatus?.(translate("providers.relayNameTaken", { name: station.name }));
+        onStatus?.(translate("providers.relayNameTaken", { name: nextStation.name }));
         onBaseUrlDraftChange?.("");
         onNameDraftChange?.("");
         setSourceResetToken((value) => value + 1);
         return;
       }
-      return dispatch("provider.select_relay_station", { provider_id: providerID, station_id: station.id });
+      return dispatch("provider.select_relay_station", { provider_id: providerID, station_id: nextStation.id });
     }
     // A relay provider whose station is gone keeps its dangling source, and
-    // the Core rejects direct URL/name edits on relay providers.  Editing the
+    // Core rejects direct URL/name edits on relay providers.  Editing the
     // address therefore turns it back into a plain custom provider.
-    const changes: UnknownRecord = providerKind(provider) === "relay" ? { provider_type: "custom", endpoint } : { endpoint };
+    const changes: UnknownRecord = kind === "relay" ? { provider_type: "custom", endpoint } : { endpoint };
     // The name follows the first URL the provider is given: derive it from the
     // host while the provider still has no address, and leave it alone after
     // that so a later edit cannot overwrite a name the user chose.
@@ -5830,9 +6057,91 @@ function ProviderSourceFields({ provider, providerID, relayStations, busy, trans
     }
     return dispatch("provider.patch", { provider_id: providerID, changes });
   };
+  const commitName = (name: string): void | Promise<void> => {
+    const next = name.trim();
+    if (!next || next === committedName.trim()) return undefined;
+    return isLogin
+      ? dispatch("service_provider.patch", { provider_id: providerID, provider: { name: next } })
+      : dispatch("provider.patch", { provider_id: providerID, changes: kind === "relay" ? { provider_type: "custom", name: next } : { name: next } });
+  };
   return <View style={styles.providerSourceFields}>
-    <TextField key={"provider-base-url:" + sourceResetToken} label={translate("providers.baseUrl")} labelWidth={88} value={providerBaseURL} disabled={busy} onDraftChange={onBaseUrlDraftChange} onCommit={commitBaseURL} />
-    <TextField key={"provider-name:" + sourceResetToken} label={translate("providers.providerName")} labelWidth={88} value={providerName} disabled={busy} onDraftChange={onNameDraftChange} onCommit={(name) => dispatch("provider.patch", { provider_id: providerID, changes: providerKind(provider) === "relay" ? { provider_type: "custom", name } : { name } })} />
+    <View style={styles.providerEnabledRow}><NativeCheckbox label={translate("common.enable")} value={booleanValue(provider.enabled, true)} disabled={busy} onValueChange={(enabled) => dispatch(isLogin ? "service_provider.patch" : "provider.patch", isLogin ? { provider_id: providerID, provider: { enabled } } : { provider_id: providerID, changes: { enabled } })} /></View>
+    {/* The name, always in this row, and the one identity underneath it: the
+        name this provider is listed under, the type it is, and the address
+        that type is bound to.  The type is stated, never offered: a provider's
+        type is not a preference but the whole contract behind it — an account
+        or a key, the address, and every route's protocol surface — so it is
+        decided where the provider is created (the wizard) or by the service it
+        is bound to (its station, or its address), and read back here. */}
+    {isLogin ? <>
+      <TextField
+        key={`provider-name:${sourceResetToken}`}
+        label={translate("providers.providerName")}
+        labelWidth={88}
+        value={providerName}
+        disabled={busy}
+        onDraftChange={onNameDraftChange}
+        onCommit={commitName}
+      />
+      <View style={styles.officialStatusRow}>
+        <Text style={styles.providerAuthStatusLabel}>{translate("providers.providerType")}</Text>
+        <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{providerKindLabel(kind, translate)}</Text>
+      </View>
+      <View style={styles.officialStatusRow}>
+        <Text style={styles.providerAuthStatusLabel}>{translate("providers.baseUrl")}</Text>
+        <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{providerBaseURL}</Text>
+      </View>
+    </> : station ? <>
+      <TextField
+        key={`provider-name:${station.id}:${sourceResetToken}`}
+        label={translate("providers.providerName")}
+        labelWidth={88}
+        value={stationDraft?.name ?? stationDisplayName(station, translate)}
+        disabled={busy}
+        onDraftChange={(value) => setStationDraftValue({ name: value })}
+        onCommit={() => { void stageStationUpdate(); }}
+      />
+      <View style={styles.officialStatusRow}>
+        <Text style={styles.providerAuthStatusLabel}>{translate("providers.providerType")}</Text>
+        <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{translate("providers.type.relay")}</Text>
+      </View>
+      <TextField
+        key={`provider-base-url:${station.id}:${sourceResetToken}`}
+        label={translate("providers.baseUrl")}
+        labelWidth={88}
+        value={stationDraft?.origin ?? station.origin}
+        disabled={busy}
+        onDraftChange={(value) => setStationDraftValue({ origin: value })}
+        onCommit={() => { void stageStationUpdate(); }}
+      />
+    </> : <>
+      <TextField
+        key={`provider-name:${sourceResetToken}`}
+        label={translate("providers.providerName")}
+        labelWidth={88}
+        value={providerName}
+        disabled={busy}
+        onDraftChange={onNameDraftChange}
+        onCommit={commitName}
+      />
+      <View style={styles.officialStatusRow}>
+        <Text style={styles.providerAuthStatusLabel}>{translate("providers.providerType")}</Text>
+        {/* A provider whose station is gone still records a relay source but is
+            addressed by nothing any more: editing its address is what makes it
+            a plain custom provider again (``commitBaseURL`` does exactly that),
+            so that is the type it states. */}
+        <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{translate("providers.type.apiKey")}</Text>
+      </View>
+      <TextField
+        key={`provider-base-url:${sourceResetToken}`}
+        label={translate("providers.baseUrl")}
+        labelWidth={88}
+        value={providerBaseURL}
+        disabled={busy}
+        onDraftChange={onBaseUrlDraftChange}
+        onCommit={commitBaseURL}
+      />
+    </>}
   </View>;
 }
 
@@ -6122,28 +6431,21 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
   return <PersistentScrollView style={styles.providerEditorContent} contentContainerStyle={styles.providerEditorScrollContent} showsVerticalScrollIndicator nestedScrollEnabled>
     <View style={styles.providerEditorHeader}><Text numberOfLines={1} style={styles.providerEditorHeading}>{translate("providers.provider")}: {providerName}</Text>{sourceModel ? <NativeButton title={translate("providers.backToModel", { model: sourceModelLabel })} link disabled={busy} onPress={onReturnToModel} style={styles.providerReturnToModel} /> : null}</View>
     <View style={styles.providerEditorSection}>
-    <View style={styles.providerEnabledRow}><NativeCheckbox label={translate("common.enable")} value={booleanValue(provider.enabled, true)} disabled={busy} onValueChange={(enabled) => dispatch(isLogin ? "service_provider.patch" : "provider.patch", isLogin ? { provider_id: id, provider: { enabled } } : { provider_id: id, changes: { enabled } })} /></View>
-    {kind === "apiKey" || (kind === "relay" && !station) ? <ProviderSourceFields provider={provider} providerID={id} relayStations={relayStations} busy={busy} translate={translate} dispatch={dispatch} onStatus={onStatus} onBaseUrlDraftChange={(value) => drafts?.setProviderBaseUrlDraft(id, value)} onNameDraftChange={(value) => { if (drafts) drafts.setProviderNameDraft(id, value); else onNameDraftChange?.(value); }} /> : null}
-    {kind === "relay" && station ? <>
-      <TextField
-        key={`vendor-name:${station.id}`}
-        label={translate("providers.providerName")}
-        labelWidth={88}
-        value={stationDraft.name ?? stationDisplayName(station, translate)}
-        disabled={busy}
-        onDraftChange={(value) => setStationDraftValue({ name: value })}
-        onCommit={() => { void stageStationUpdate(); }}
-      />
-      <TextField
-        key={`vendor-url:${station.id}`}
-        label={translate("providers.providerUrl")}
-        labelWidth={88}
-        value={stationDraft.origin ?? station.origin}
-        disabled={busy}
-        onDraftChange={(value) => setStationDraftValue({ origin: value })}
-        onCommit={() => { void stageStationUpdate(); }}
-      />
-    </> : null}
+    <ProviderIdentityFields
+      provider={provider}
+      providerID={id}
+      relayStations={relayStations}
+      station={station}
+      stationDraft={stationDraft}
+      onStationDraftChange={setStationDraftValue}
+      onStageStationUpdate={stageStationUpdate}
+      busy={busy}
+      translate={translate}
+      dispatch={dispatch}
+      onStatus={onStatus}
+      onBaseUrlDraftChange={(value) => drafts?.setProviderBaseUrlDraft(id, value)}
+      onNameDraftChange={(value) => { if (drafts) drafts.setProviderNameDraft(id, value); else onNameDraftChange?.(value); }}
+    />
     {!isLogin ? <ProviderKeysPanel
       provider={provider}
       providerId={id}
@@ -6160,31 +6462,6 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
       bindingIssues={bindingIssues}
       variant="inline"
     /> : null}
-    {service ? <View style={styles.providerSourceFields}>
-      {/* The service's own identity: the name stays editable here, while the
-          type and the address are what this provider is bound to.  These are
-          the same fields a custom provider states — the 启用 row above them
-          belongs to this group — so they share that container and draw no
-          rule under the enable row; the dividers below open the groups that
-          are genuinely other surfaces (the keys, the service's account, the
-          stations linked to it). */}
-      <TextField
-        key={`service-name:${id}`}
-        label={translate("providers.providerName")}
-        labelWidth={88}
-        value={providerName}
-        disabled={busy}
-        onDraftChange={(value) => drafts?.setProviderNameDraft(id, value)}
-        onCommit={(name) => {
-          const next = name.trim();
-          if (next && next !== providerName) void dispatch("service_provider.patch", { provider_id: id, provider: { name: next } });
-        }}
-      />
-      <View style={styles.officialStatusRow}>
-        <Text style={styles.providerAuthStatusLabel}>{translate("providers.wizard.baseUrl")}</Text>
-        <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{SERVICE_BASE_URLS[service]}</Text>
-      </View>
-    </View> : null}
     {isOfficialAccount ? <View style={styles.officialAccountSection}>
       <View style={styles.panelHeader}><Text style={styles.panelTitle}>{translate("providers.serviceLinks")}</Text></View>
       <View style={styles.officialStatusRow}>
@@ -6218,9 +6495,7 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
       apiKeyActions={relay.apiKeyActions}
       applyStagedQuietly={relay.applyStagedQuietly}
       detectType={relay.detectType}
-      stationDraft={stationDraft}
-      onStationDraftChange={setStationDraftValue}
-      onStageStationUpdate={stageStationUpdate}
+      showConnectionFields={false}
       onStatus={onStatus}
     /> : null}
     {(!isLogin || isWorkBuddyAccount) && !station ? <View style={styles.providerAccountsHeader}>
@@ -6846,8 +7121,11 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
           : translate("service.unknown");
   // The proxy follows the app, and a launch-time start can lose its race with
   // the rest of the login session, so a stopped or unhealthy service keeps one
-  // recovery control in this pane instead of only in the status menu.
-  const serviceRestart = serviceState === "unhealthy";
+  // recovery control in this pane instead of only in the status menu.  A
+  // transitional state belongs here too: a replacement that outlives the
+  // request budget otherwise leaves this pane stating 启动中 with no control at
+  // all, and the only way out was the status menu's Stop.
+  const serviceRestart = serviceState === "unhealthy" || serviceState === "starting";
   const serviceActionAvailable = serviceState === "stopped" || serviceRestart;
   const runServiceAction = async (): Promise<void> => {
     if (!snapshot || serviceBusy) return;

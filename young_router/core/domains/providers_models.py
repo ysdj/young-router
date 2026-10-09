@@ -3155,10 +3155,17 @@ class ProvidersModelsDomain:
         current_auth = self._provider_auth_state(provider)
         requested_kind = changes.pop("auth_kind", changes.pop("kind", None))
         if requested_kind is not None:
-            next_kind = self._service_provider_kind(requested_kind)
+            # A provider's type is what it *is*, not a field it adopts: the
+            # contract a provider was created under owns its address, its key
+            # slot, and every route's protocol surface, and the pane states it
+            # read-only.  A patch that asks for a different one is refused here
+            # instead of half-applying a document, so a caller that still
+            # believes a type can be retargeted is told what actually happened.
+            next_kind = self._requested_provider_auth_kind(requested_kind)
             if next_kind != current_auth["kind"]:
-                self._retype_service_provider(provider, current_auth, next_kind, index)
-                current_auth = self._provider_auth_state(provider)
+                raise DomainError(
+                    "A provider's type is fixed; create a provider of the new type"
+                )
         changes.pop("auth_credential_ref", None)
         for forbidden in ("api_key", "api_keys", "api_base", "endpoint", "provider_type", "relay_station_id"):
             if forbidden in changes:
@@ -3202,38 +3209,20 @@ class ProvidersModelsDomain:
             "auth_kind": current_auth["kind"],
         }
 
-    def _retype_service_provider(
-        self,
-        provider: dict[str, Any],
-        current_auth: Mapping[str, Any],
-        next_kind: str,
-        index: int,
-    ) -> None:
-        """Switch a login provider's type, which is also its endpoint.
+    @classmethod
+    def _requested_provider_auth_kind(cls, value: object) -> str:
+        """Read the type one patch names for a provider.
 
-        The type owns the address, the key slot, and every model's protocol
-        surface, so the switch rewires all three together. The account that
-        belonged to the previous type is left behind: it signed in against a
-        service this provider no longer points at, and the new type starts
-        signed out.
+        ``api_key`` is a type like any other here: it is the one every provider
+        starts on, and the one an account-backed provider deliberately is not.
+        A name outside the contract is refused rather than read as a key
+        provider, so a misspelling cannot be mistaken for a real type.
         """
 
-        existing_refs = {
-            str(self._provider_auth_state(candidate).get("credential_ref", "")).strip()
-            for candidate_index, candidate in enumerate(self._draft.get("providers", []))
-            if candidate_index != index and isinstance(candidate, Mapping)
-        }
-        self._configure_provider_auth(provider, next_kind, existing_refs=existing_refs)
-        self._apply_auth_to_models(provider, next_kind)
-        provider["enabled"] = False
-        previous_ref = str(current_auth.get("credential_ref", "")).strip()
-        if previous_ref:
-            try:
-                self._auth_manager().logout(
-                    str(current_auth.get("kind", "")), previous_ref
-                )
-            except Exception:
-                pass
+        kind = str(value or "api_key").strip().lower() or "api_key"
+        if kind not in {"api_key", *cls._SERVICE_PROVIDER_KINDS}:
+            raise DomainError("Service provider login type is unavailable")
+        return kind
 
     def _dispatch_service_provider(self, action: str, data: Mapping[str, Any]) -> None:
         if action in {"service_provider_add", "service_add_provider"}:
@@ -3397,6 +3386,12 @@ class ProvidersModelsDomain:
             previous_name = str(provider.get("name", "")).strip()
             current_source = self._provider_source_state(provider)
             current_auth = self._provider_auth_state(provider)
+            # A login provider is managed through the service surface, and this
+            # editor never edits one: an account-backed provider's name, address,
+            # and key all belong to that surface, so every patch from here is
+            # refused.  Its type is not a control either — nothing in this app
+            # retargets a provider, and a type that can be read on both sides has
+            # exactly one place it is decided (the create).
             if current_auth["kind"] != "api_key":
                 raise DomainError(
                     "Login providers are managed in Service Provider Management"
@@ -3408,10 +3403,10 @@ class ProvidersModelsDomain:
             requested_auth_kind = changes.pop("auth_kind", None)
             changes.pop("auth_credential_ref", None)
             if auth_requested:
-                requested_auth_kind = str(requested_auth_kind or "").strip() or "api_key"
+                requested_auth_kind = self._requested_provider_auth_kind(requested_auth_kind)
                 if requested_auth_kind != current_auth["kind"]:
                     raise DomainError(
-                        "Account login is managed in Service Provider Management"
+                        "A provider's type is fixed; create a provider of the new type"
                     )
             source_requested = "provider_type" in changes or "relay_station_id" in changes
             next_source = current_source
@@ -3455,16 +3450,10 @@ class ProvidersModelsDomain:
             ):
                 raise DomainError("A provider with this name already exists")
             provider.update(changes)
-            if auth_requested and requested_auth_kind != current_auth["kind"]:
-                if current_auth["kind"] != "api_key":
-                    try:
-                        self._auth_manager().logout(
-                            current_auth["kind"], current_auth["credential_ref"]
-                        )
-                    except Exception:
-                        pass
-                if requested_auth_kind == "api_key":
-                    self._sync_primary_api_key(provider, [])
+            # The type never changes here, so an auth patch can only restate the
+            # contract the provider already holds; no account is left behind and
+            # no key slot is cleared by a patch that names the type it already is
+            # (``_dispatch_service_provider_patch`` does the same).
             auth = (
                 self._configure_provider_auth(provider, requested_auth_kind)
                 if auth_requested

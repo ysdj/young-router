@@ -302,26 +302,39 @@ class WorkBuddyProviderTests(unittest.TestCase):
                     {"provider_id": provider_id, "provider": {"api_base": "https://elsewhere.test/v1"}},
                 )
 
-    def test_the_login_type_is_an_ordinary_editable_field(self) -> None:
-        """Switching the type rewires the address, the key slot and the routes."""
+    def test_a_workbuddy_providers_type_is_not_switchable(self) -> None:
+        """The type is what the provider is, not a field it adopts.
+
+        Both workbuddy kinds address *different* loopback workers with different
+        key slots, so a switch between them is a different provider, not a
+        rename — and the pane states the type read-only.  The patch is refused,
+        and the address, the key slot, and every route stay where they were.
+        """
 
         directory, domain, _config = self._domain()
         with directory:
             added = domain.dispatch("service_provider.add", {"kind": "workbuddy_login"})
             provider_id = added["providers"][0]["id"]
-            retyped = domain.dispatch(
-                "service_provider.patch",
-                {"provider_id": provider_id, "provider": {"auth_kind": "workbuddy_ai_login"}},
+            before = {
+                key: added["providers"][0][key]
+                for key in ("api_base", "api_key_names", "auth_kind")
+            }
+            with self.assertRaisesRegex(DomainError, "type is fixed"):
+                domain.dispatch(
+                    "service_provider.patch",
+                    {"provider_id": provider_id, "provider": {"auth_kind": "workbuddy_ai_login"}},
+                )
+            provider = domain.snapshot()["providers"][0]
+            self.assertEqual(provider["auth_kind"], "workbuddy_login")
+            self.assertEqual(provider["api_base"], before["api_base"])
+            self.assertEqual(provider["api_key_names"], before["api_key_names"])
+            self.assertEqual(
+                provider["extra"]["x-young-router-provider-auth"]["kind"], "workbuddy_login"
             )
-            self.assertEqual(retyped["operation_summary"]["auth_kind"], "workbuddy_ai_login")
-            provider = retyped["providers"][0]
-            self.assertEqual(provider["api_base"], workbuddy.api_base_reference("workbuddy-ai"))
-            self.assertEqual(provider["api_key_names"], [workbuddy.API_KEY_NAME])
-            self.assertEqual(provider["extra"]["x-young-router-provider-auth"]["kind"], "workbuddy_ai_login")
-            self.assertIs(provider["enabled"], False)
-            for model in provider["models"]:
-                self.assertEqual(model["api_base"], workbuddy.api_base_reference("workbuddy-ai"))
-                self.assertEqual(model["api_key_name"], workbuddy.API_KEY_NAME)
+            self.assertEqual(
+                provider["models"][0]["upstream_url_surface"] if provider["models"] else "openai/chat",
+                "openai/chat",
+            )
 
     def test_a_snapshot_never_calls_the_live_worker(self) -> None:
         """A projection must not pay for a WorkBuddy account read.

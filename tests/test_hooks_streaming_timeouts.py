@@ -253,6 +253,149 @@ class HookStreamingTimeoutTests(HookTestCase):
         self.assertFalse(upstream_cancelled)
         self.assertTrue(upstream_closed)
 
+    async def test_a_chat_reasoning_frame_is_stream_activity_not_silence(self) -> None:
+        """The gap budget measures upstream silence, and thinking is not silence.
+
+        Chat Completions names its thinking carrier ``reasoning_content`` rather
+        than a Responses ``*.delta`` event, so the reasoning frames a client
+        renders as a live 深度思考 block used to read as *silence*: a route that
+        thought for longer than ``YOUNG_ROUTER_STALL_TIMEOUT_SECONDS`` in one
+        unbroken run was torn down, cooled down, and reported to the user as
+        "无法连接到服务器" while it was healthy and still working.  Every frame
+        here arrives well inside the budget, so the turn must simply finish.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        self.set_env(hooks._STALL_TIMEOUT_SECONDS_ENV, "0.2")
+
+        def reasoning_chunk(index: int) -> dict:
+            return {
+                "id": "chatcmpl-1",
+                "object": "chat.completion.chunk",
+                "model": "default-chat",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "role": "assistant",
+                            "reasoning_content": f"think {index} ",
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            }
+
+        # Every gap stays well inside the budget while the *thinking run* as a
+        # whole outlasts it several times over, so the only question the test
+        # asks is whether arriving thinking resets the deadline.
+        async def original_stream():
+            for index in range(16):
+                await asyncio.sleep(0.04)
+                yield reasoning_chunk(index)
+            yield {
+                "id": "chatcmpl-1",
+                "object": "chat.completion.chunk",
+                "model": "default-chat",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": "the answer"},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+            yield {
+                "id": "chatcmpl-1",
+                "object": "chat.completion.chunk",
+                "model": "default-chat",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }
+
+        chunks = [
+            chunk
+            async for chunk in hooks._stream_with_idle_timeout(
+                original_stream(),
+                {"model": "default-chat", "messages": [], "stream": True},
+            )
+        ]
+
+        self.assertEqual(len(chunks), 18)
+        self.assertEqual(
+            chunks[-2]["choices"][0]["delta"],
+            {"content": "the answer"},
+        )
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop")
+
+    def test_reasoning_progress_is_read_from_every_thinking_carrier(self) -> None:
+        """Only thinking counts, and every name a route states it under counts.
+
+        The predicate that resets the gap budget reads thinking from the Chat
+        and Anthropic carriers, while a frame that carries nothing -- a
+        ``role`` marker, a ``finish_reason`` frame end, an empty value, or a
+        comment-style keepalive -- stays silence so a genuinely stalled route
+        is still cut off.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+
+        def chat(delta: dict, finish_reason: object = None) -> dict:
+            return {
+                "id": "chatcmpl-1",
+                "object": "chat.completion.chunk",
+                "model": "default-chat",
+                "choices": [
+                    {"index": 0, "delta": delta, "finish_reason": finish_reason}
+                ],
+            }
+
+        self.assertTrue(
+            hooks._stream_chunk_has_meaningful_delta(
+                chat({"reasoning_content": "thinking"})
+            )
+        )
+        self.assertTrue(
+            hooks._stream_chunk_has_meaningful_delta(chat({"reasoning": "thinking"}))
+        )
+        self.assertTrue(
+            hooks._stream_chunk_has_meaningful_delta(
+                chat({"thinking_blocks": [{"type": "thinking", "thinking": "t"}]})
+            )
+        )
+        self.assertTrue(
+            hooks._stream_chunk_has_meaningful_delta(
+                chat({"reasoning_items": [{"type": "reasoning_text", "text": "t"}]})
+            )
+        )
+        self.assertTrue(
+            hooks._stream_chunk_has_meaningful_delta(
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "thinking_delta", "thinking": "hmm"},
+                }
+            )
+        )
+
+        for silent in (
+            chat({"role": "assistant"}),
+            chat({}, "stop"),
+            chat({}),
+            chat({"reasoning_content": ""}),
+            chat({"reasoning_content": "   "}),
+            chat({"thinking_blocks": [], "content": ""}),
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "input_json_delta", "partial_json": "{\"a\""},
+            },
+            {"type": "response.created", "response": {"id": "resp"}},
+            b": young_router keepalive sequence=1\n\n",
+        ):
+            self.assertFalse(
+                hooks._stream_chunk_has_meaningful_delta(silent),
+                f"{silent!r} states nothing and must not extend the gap budget",
+            )
+
     async def test_whitespace_delta_does_not_extend_stream_idle_deadline(self) -> None:
         hooks, _ = load_hook_module()
         self.set_env(hooks._STALL_TIMEOUT_SECONDS_ENV, "0.01")

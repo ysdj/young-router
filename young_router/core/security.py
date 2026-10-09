@@ -30,6 +30,15 @@ SECRET_KEY_MARKERS = (
     "secret",
     "token",
 )
+# Fields whose names merely *count* a model's tokens.  The one marker cannot
+# tell a credential from a budget, so the bare substring test read every
+# token-shaped number as a secret and replaced it with the presence marker: a
+# route's ``max_input_tokens`` — the window this app hands Codex — arrived at
+# the pane as the string ``configured``.  The pane reads that string as "no
+# custom window", so it painted the field empty beside the registry default's
+# placeholder and a value the user typed there replaced whatever was set.  A
+# name that states a quantity is therefore classified by shape, and never by
+# the marker alone.
 NON_SECRET_TOKEN_COUNTER_KEYS = frozenset(
     {
         "cached_tokens",
@@ -40,6 +49,43 @@ NON_SECRET_TOKEN_COUNTER_KEYS = frozenset(
         "reasoning_tokens",
         "total_tokens",
     }
+)
+# What the number beside a token word counts.  ``input_tokens`` and
+# ``codex_compaction_max_output_tokens`` both say how many tokens, never which
+# one, and the word immediately before the plural noun is what proves it.  A
+# credential's own qualifier (``access``, ``refresh``, ``bootstrap``, ``id``)
+# is deliberately absent from this set, so those names stay secrets.
+NON_SECRET_TOKEN_COUNT_KINDS = frozenset(
+    {
+        "actual",
+        "cache_creation",
+        "cache_read",
+        "cached",
+        "completion",
+        "creation",
+        "image",
+        "input",
+        "long",
+        "output",
+        "prompt",
+        "read",
+        "reasoning",
+        "short",
+        "stream",
+        "target",
+        "text",
+        "thought",
+        "thoughts",
+        "total",
+    }
+)
+# Segments that state a budget rather than a credential, wherever they sit in
+# the name: ``model_auto_compact_token_limit``, ``token_budget``,
+# ``token_count``, and the runtime setting spelled
+# ``..._VISION_ROUTER_MAX_TOKENS`` are all configuration this app reads back
+# and edits.
+NON_SECRET_TOKEN_QUANTITY_SEGMENTS = frozenset(
+    {"budget", "count", "limit", "max", "min"}
 )
 # ``_plain_string_is_safe`` has to answer "does REDACT_TEXT leave this string
 # alone?" for every string a snapshot exposes, and the answer for the great
@@ -113,7 +159,8 @@ def _key_classification(text: str) -> tuple[bool, bool]:
         return cached
     secret = (
         False
-        if text in {
+        if text in NON_SECRET_TOKEN_COUNTER_KEYS
+        or text in {
             "key_name",
             "key_names",
             "api_key_name",
@@ -125,6 +172,7 @@ def _key_classification(text: str) -> tuple[bool, bool]:
             "password_saved",
         }
         or text.endswith(("_configured", "_present", "_exists"))
+        or _token_quantity_key(text)
         else any(marker == text or marker in text for marker in SECRET_KEY_MARKERS)
     )
     path = any(marker == text or text.endswith(f"_{marker}") for marker in PATH_KEY_MARKERS)
@@ -132,6 +180,33 @@ def _key_classification(text: str) -> tuple[bool, bool]:
         _key_classification_cache.clear()
     _key_classification_cache[text] = (secret, path)
     return secret, path
+
+
+def _token_quantity_key(text: str) -> bool:
+    """Whether one normalized name states how many tokens, not which token.
+
+    Only a name that mentions ``token`` is considered, so a credential spelled
+    any other way is untouched.  Such a name is a quantity when it carries a
+    budget segment (``max_input_tokens``, ``model_auto_compact_token_limit``,
+    ``token_budget``, ``token_count``) or when it ends in a plural count of a
+    named token kind (``input_tokens``, ``cache_read_tokens``).  Every other
+    token name — ``access_token``, ``refresh_token``, ``bootstrap_token``,
+    ``id_token``, ``provider_auth_token``, ``bootstrap_token_ttl_seconds``, or
+    a bare ``tokens`` — names the credential itself and stays classified as
+    one.  A name this test cannot prove is therefore a secret, which is the
+    safe direction.
+    """
+
+    if "token" not in text:
+        return False
+    parts = text.split("_")
+    if any(part in NON_SECRET_TOKEN_QUANTITY_SEGMENTS for part in parts):
+        return True
+    return (
+        len(parts) >= 2
+        and parts[-1] == "tokens"
+        and parts[-2] in NON_SECRET_TOKEN_COUNT_KINDS
+    )
 
 
 def is_secret_key(key: object) -> bool:

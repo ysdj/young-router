@@ -249,6 +249,184 @@ class HookStreamingFailoverTests(HookTestCase):
         self.assertEqual(delivered[0]["choices"][0]["delta"]["content"], "Partial")
         self.assertIn("id:partial-chat-route", hooks._DEPLOYMENT_COOLDOWNS)
 
+    async def test_a_committed_thinking_only_native_stream_still_recovers(self) -> None:
+        """Committing the buffered start must not cost a thinking turn its peer.
+
+        The buffered-start wrapper flushes to the client after 20 chunks so a
+        long preamble stays live.  Past that point a stall used to escape the
+        native branch as a raw transport error: no peer route was tried, the
+        client saw a broken connection, and the route kept its failures.  A
+        stream that has delivered thinking but no answer text has nothing to
+        reconcile, so it must still advance to the next route.
+        """
+
+        hooks, proxy_server = load_hook_module()
+        hooks._DEPLOYMENT_COOLDOWNS.clear()
+        self.addCleanup(hooks._DEPLOYMENT_COOLDOWNS.clear)
+        calls = []
+
+        def reasoning_chunk(index: int) -> dict:
+            return {
+                "id": "chatcmpl-thinking",
+                "object": "chat.completion.chunk",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "role": "assistant",
+                            "reasoning_content": f"think {index} ",
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            }
+
+        async def thinking_then_stall():
+            # More chunks than the buffered-start cap, so the client is already
+            # holding the preamble when the route stops producing.
+            for index in range(24):
+                yield reasoning_chunk(index)
+            # The stall the user actually hit: the route's socket dies mid-turn
+            # and the local gap budget expires with thinking already delivered.
+            raise hooks._stream_idle_timeout_exception(
+                {}, idle_seconds=120.0, saw_chunk=True
+            )
+
+        async def recovered_stream():
+            yield {
+                "id": "chatcmpl-recovered",
+                "object": "chat.completion.chunk",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": "Recovered."},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+            yield {
+                "id": "chatcmpl-recovered",
+                "object": "chat.completion.chunk",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }
+
+        class FakeRouter:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [
+                    {
+                        "litellm_params": {"model": "provider/default-chat"},
+                        "model_info": {"id": "thinking-original"},
+                    },
+                    {
+                        "litellm_params": {"model": "provider/default-chat"},
+                        "model_info": {"id": "thinking-recovered"},
+                    },
+                ]
+
+            async def acompletion(self, **payload):
+                calls.append(payload)
+                hooks._remember_selected_deployment(
+                    {
+                        "litellm_params": {"model": "provider/default-chat"},
+                        "model_info": {"id": "thinking-recovered", "order": 1},
+                    }
+                )
+                return recovered_stream()
+
+        proxy_server.llm_router = FakeRouter()
+        request_data = {
+            "model": "default-chat",
+            "messages": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/chat/completions"},
+            "model_info": {"id": "thinking-original", "order": 1},
+        }
+
+        chunks = [
+            chunk
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=thinking_then_stall(),
+                request_data=request_data,
+            )
+        ]
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["_excluded_deployment_ids"], ["thinking-original"])
+        # The thinking the client already held stays: it was flushed through the
+        # buffered-start cap and cannot be unshown.  What changes is that the
+        # *answer* now arrives, from the peer route, instead of the turn dying
+        # with a raw transport error.
+        self.assertEqual(chunks[-2]["id"], "chatcmpl-recovered")
+        self.assertEqual(
+            chunks[-2]["choices"][0]["delta"], {"content": "Recovered."}
+        )
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop")
+        self.assertIn("chatcmpl-recovered", json.dumps(chunks))
+        # A local gap timeout keeps its documented ``recovery`` policy: the peer
+        # absorbs the turn without cooling the original route down.
+        self.assertNotIn("id:thinking-original", hooks._DEPLOYMENT_COOLDOWNS)
+
+    async def test_a_committed_answer_prefix_never_replays_over_itself(self) -> None:
+        """The one boundary that must keep failing in band.
+
+        Once answer *text* has reached the client, replaying another route would
+        duplicate it in the transcript.  That stream keeps the pre-existing
+        behaviour: the failure is raised after what was already delivered.
+        """
+
+        hooks, proxy_server = load_hook_module()
+        calls = []
+
+        def visible_chunk(index: int) -> dict:
+            return {
+                "id": "chatcmpl-visible",
+                "object": "chat.completion.chunk",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": f"part {index} "},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+
+        async def visible_then_stall():
+            for index in range(24):
+                yield visible_chunk(index)
+            raise hooks._stream_idle_timeout_exception(
+                {}, idle_seconds=120.0, saw_chunk=True
+            )
+
+        class FakeRouter:
+            async def acompletion(self, **payload):
+                calls.append(payload)
+                raise AssertionError(
+                    "answer text already reached the client; no replay may follow"
+                )
+
+        proxy_server.llm_router = FakeRouter()
+        request_data = {
+            "model": "default-chat",
+            "messages": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/chat/completions"},
+            "model_info": {"id": "visible-original", "order": 1},
+        }
+
+        delivered = []
+        with self.assertRaisesRegex(TimeoutError, "stream idle timeout"):
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=visible_then_stall(),
+                request_data=request_data,
+            ):
+                delivered.append(chunk)
+
+        self.assertEqual(calls, [])
+        self.assertEqual(len(delivered), 24)
+        self.assertEqual(delivered[-1]["choices"][0]["delta"]["content"], "part 23 ")
+
     async def test_incomplete_responses_stream_after_tool_activity_cools_route_immediately(self) -> None:
         hooks, _proxy_server = load_hook_module()
         hooks._DEPLOYMENT_COOLDOWNS.clear()

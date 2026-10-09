@@ -350,6 +350,147 @@ class WebDAVSyncBundleTests(unittest.TestCase):
             self.assertEqual(relay_payload, json.loads(installed_relay.read_text(encoding="utf-8")))
             self.assertEqual(0o600, installed_relay.stat().st_mode & 0o777)
 
+    def test_a_pull_never_drops_a_relay_account_this_mac_holds(self) -> None:
+        """The relay store is not replaceable by the remote copy.
+
+        It is the one synced file whose content exists nowhere else: the
+        stations, their saved sessions, and the plaintext passwords that make
+        every bound key readable again.  A station added on this Mac while the
+        remote still holds an older bundle was silently dropped by the next
+        pull, with no tombstone and nothing in the UI naming it — the account
+        simply vanished.
+        """
+
+        nimbus_station = {"id": "station-nimbus", "name": "nimbus", "origin": "https://relay.example.test", "type": "newapi"}
+        atlas_station = {
+            "id": "station-atlas",
+            "name": "atlas",
+            "origin": "https://peer.example.test",
+            "type": "sub2api",
+        }
+
+        def account(account_id: str, station_id: str, origin: str) -> dict[str, object]:
+            return {
+                "id": account_id,
+                "station_id": station_id,
+                "type": "newapi",
+                "label": account_id,
+                "origin": origin,
+                "username": "person@example.test",
+                "login_status": "unknown",
+                "remember_password": True,
+                "password": "replace-password",
+                "session": {"cookie": "session=c", "access_token": "replace-token", "refresh_token": ""},
+                "balance": 1.0,
+                "last_updated_at": "",
+                "login_observed_at": "",
+                "resource_status": "ready",
+                "resource_error": "none",
+                "resources": [],
+                "groups": [],
+            }
+
+        def document(stations: list[dict[str, str]], accounts: list[dict[str, object]]) -> dict[str, object]:
+            return {"version": 3, "stations": stations, "accounts": accounts, "pending_credential_cleanups": []}
+
+        local_document = document(
+            [nimbus_station, atlas_station],
+            [
+                account("account-nimbus", "station-nimbus", "https://relay.example.test"),
+                account("account-atlas", "station-atlas", "https://peer.example.test"),
+            ],
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            local = root / "local"
+            remote = root / "remote"
+            local.mkdir()
+            remote.mkdir()
+            local_config = self.write_config(local)
+            remote_config = self.write_config(remote)
+
+            local_relay = webdav_core.relay_accounts_path(local_config)
+            local_relay.parent.mkdir(parents=True, exist_ok=True)
+            local_relay.write_text(json.dumps(local_document), encoding="utf-8")
+
+            # The remote side predates the station this Mac added, and still
+            # carries the other account under a name it has since been given.
+            remote_document = document(
+                [atlas_station], [account("account-atlas", "station-atlas", "https://peer.example.test")]
+            )
+            remote_document["accounts"][0]["label"] = "atlas-renamed"  # type: ignore[index]
+            remote_relay = webdav_core.relay_accounts_path(remote_config)
+            remote_relay.parent.mkdir(parents=True, exist_ok=True)
+            remote_relay.write_text(json.dumps(remote_document), encoding="utf-8")
+
+            bundle, _manifest = webdav_core.create_bundle(remote_config)
+            webdav_core.install_bundle(bundle, local_config)
+
+            merged = json.loads(local_relay.read_text(encoding="utf-8"))
+            self.assertEqual(
+                {"atlas", "nimbus"},
+                {station["name"] for station in merged["stations"]},
+            )
+            # The incoming copy still lands for the accounts it describes, so
+            # this can only ever keep an account, never pin the old version.
+            self.assertEqual(
+                ["atlas-renamed"],
+                [entry["label"] for entry in merged["accounts"] if entry["id"] == "account-atlas"],
+            )
+            # The kept account carries its credential, not a hollow row.
+            self.assertEqual(
+                ["replace-password"],
+                [entry["password"] for entry in merged["accounts"] if entry["id"] == "account-nimbus"],
+            )
+
+    def test_a_bundle_without_a_relay_store_does_not_delete_the_local_one(self) -> None:
+        """An absent file in the bundle is not an instruction to delete."""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            local = root / "local"
+            remote = root / "remote"
+            local.mkdir()
+            remote.mkdir()
+            local_config = self.write_config(local)
+            remote_config = self.write_config(remote)
+
+            local_relay = webdav_core.relay_accounts_path(local_config)
+            local_relay.parent.mkdir(parents=True, exist_ok=True)
+            local_relay.write_text(
+                json.dumps(
+                    {
+                        "version": 3,
+                        "stations": [
+                            {
+                                "id": "station-nimbus",
+                                "name": "nimbus",
+                                "origin": "https://relay.example.test",
+                                "type": "newapi",
+                            }
+                        ],
+                        "accounts": [],
+                        "pending_credential_cleanups": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            # The remote tree never had a relay store at all.
+            bundle, manifest = webdav_core.create_bundle(remote_config)
+            self.assertFalse(
+                [entry for entry in manifest["files"] if entry["path"] == "relay-accounts.json"][0]["present"]
+            )
+            result = webdav_core.install_bundle(bundle, local_config)
+
+            self.assertNotIn(str(local_relay), result["removed"])
+            self.assertTrue(local_relay.exists())
+            self.assertEqual(
+                "nimbus",
+                json.loads(local_relay.read_text(encoding="utf-8"))["stations"][0]["name"],
+            )
+
     def test_current_version_three_relay_document_is_accepted_by_the_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

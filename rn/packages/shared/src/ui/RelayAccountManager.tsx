@@ -4,6 +4,7 @@ import type { CoreSnapshot, NativeLeafAdapter, RelayGroupManagerResult } from ".
 import { NativeButton, NativeCheckbox, NativePicker, NativeTable, NativeTextField } from "./NativeControls";
 import { usePendingAction } from "./pendingAction";
 import { setGroupManagerOpen } from "./providerWizardGate";
+import { useRelayDialogSurface } from "./relayDialogSurface";
 import { normalizeRelayOrigin } from "./relayOrigin";
 import { UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
 
@@ -613,6 +614,10 @@ export function StationAccountsPanel({
   loadingRef.current = loading;
   const [localSignedIn, setLocalSignedIn] = useState<Set<string>>(() => new Set());
   const [loginFailure, setLoginFailure] = useState<Set<string>>(() => new Set());
+  // The account whose sign-in this pane started, while that wait is in flight.
+  // The session lane is cleared against *this* id, so the lane and the account
+  // it belongs to can never drift apart.
+  const pendingLoginRef = useRef<string | undefined>(undefined);
   const [formBusy, setFormBusy] = useState(false);
   // Which account action is running: the button that started one keeps its own
   // inline spinner instead of graying out.
@@ -661,6 +666,30 @@ export function StationAccountsPanel({
   const relayLoginState = (account: RelayAccount): "signed_in" | "signing_in" | "signed_out" => {
     if (loading[account.id]?.session) return "signing_in";
     return effectiveLoginStatus(account) === "signed_in" ? "signed_in" : "signed_out";
+  };
+  // The session lane is set on the way in to a sign-in, never cleared in a
+  // `finally`: 去登录 hands the wait to a browser window the native host owns,
+  // and the promise it resolves settles at the moment the sign-in is verified.
+  // A lane cleared only from that promise is therefore still up while the
+  // answer is in flight — and a lane that *is* cleared before the repaint it
+  // belongs to used to leave the row reading 未登录 with 去登录 beside it for the
+  // whole of the commit.  The account this pane is looking at is therefore kept
+  // 登录中 from the moment the wait starts until the pane is unquestionably
+  // looking at a settled state: the lane is cleared in the same batch as the
+  // refresh that follows it, never on its own.
+  const startSigningIn = (accountID: string): void => {
+    clearPendingLogin();
+    pendingLoginRef.current = accountID;
+    updateLoading(accountID, "session", true);
+  };
+  // One account can hold the pane's sign-in at a time, so the lane's owner is
+  // one id rather than a set: a second sign-in replaces the first instead of
+  // leaving a lane nothing will ever clear.
+  const clearPendingLogin = (): void => {
+    const pending = pendingLoginRef.current;
+    if (!pending) return;
+    pendingLoginRef.current = undefined;
+    updateLoading(pending, "session", false);
   };
   const updateLoading = (accountID: string, kind: keyof AccountLoading, value: boolean): void => {
     const current = loadingRef.current;
@@ -764,7 +793,7 @@ export function StationAccountsPanel({
   };
   const loginAccount = async (account: AddedRelayAccount): Promise<boolean> => {
     setFormBusy(true);
-    updateLoading(account.id, "session", true);
+    startSigningIn(account.id);
     try {
       const result = await native.relayLogin({
         accountId: account.id,
@@ -793,7 +822,10 @@ export function StationAccountsPanel({
       }
       // The station round trip after a sign-in is paid for once: the key list
       // this pane shows must be the one the fresh session can read, so it
-      // forces a read instead of reusing a pre-login result.
+      // forces a read instead of reusing a pre-login result.  The lane stays up
+      // across it: the row is still the sign-in that just landed until the
+      // facts beside it are the signed-in account's own, so a caller never sees
+      // 已登录 next to a key list from before the login.
       await refreshAccountResources({ id: account.id }, { silent: true, force: true });
       return true;
     } catch {
@@ -801,7 +833,10 @@ export function StationAccountsPanel({
       markLocalSignedIn(account.id, false);
       return false;
     } finally {
-      updateLoading(account.id, "session", false);
+      // The lane is released with the account's settled facts already in hand,
+      // and a sign-in that failed or was cancelled releases it instead of
+      // leaving the row reading 登录中 forever.
+      if (pendingLoginRef.current === account.id) clearPendingLogin();
       setFormBusy(false);
     }
   };
@@ -956,36 +991,28 @@ export function StationAccountsPanel({
   // 分组管理 is a native subordinate window of the workspace: the
   // pre-refactor master-detail editor with the key list (＋ / －), the selected
   // key's detail, and Close / Apply at the bottom.  Apply returns the staged
-  // edits; Close discards them.  Core rejects manual key writes while
-  // automatic grouping owns the layout, so the switch is staged around them.
+  // edits; Close discards them.  The switch is not a store of its own: 自动分组
+  // checked previews the one-key-per-group layout against the rows already on
+  // hand, unchecking it puts that preview away, and the layout itself is Core's
+  // own alignment — reached by saving the switch.
   //
-  // 自动分组 owns the key layout, so the list the window shows comes from the
-  // aligned draft: let Core stage its one-key-per-group layout over the groups
-  // it already holds, then read the account back so the list never shows keys
-  // the switch is already replacing.  The layout is built from held facts — a
-  // station round trip can only add groups Core has not seen — so the window
-  // reads the station only when there is no usable key list to align yet.
-  // Otherwise opening 分组管理 right after the account pane's own read would
-  // make the user wait for a second station round trip it does not need, which
-  // is exactly the wait this window's wheel used to state.
+  // The station is therefore read only when the account has no usable key list
+  // yet, so the usual opening never pays for a station round trip it does not
+  // need and the window's wheel only states a read that is really running.
   const alignAutoGroupingAction = apiKeyActions?.alignAutoGrouping;
-  const groupManagerNeedsAlignment = (current: RelayAccount): boolean =>
-    Boolean(alignAutoGroupingAction) && current.autoGrouping && current.groups.length > 0;
-  // The held facts a layout still needs: a ready account read with at least one
-  // key.  Without one there is nothing to align, so the window reads first.
   const groupManagerHasUsableFacts = (current: RelayAccount): boolean =>
     current.resourceStatus === "ready" && current.resources.length > 0;
-  // The account facts the window's rows are built from: the aligned draft while
-  // 自动分组 owns the layout, otherwise the account as this pane already holds
-  // it.  A station that cannot be refreshed keeps the keys it last reported.
-  // The station is read only when the account has no usable key list, and that
-  // read reuses one the pane already ran when it is seconds old, so the usual
-  // opening never pays for a station round trip twice.
+  // 分组管理's own list is the account's real keys: 自动分组 checked is a
+  // *preview* in the window, and unchecking it puts that preview away. So the
+  // window never reads or stages an aligned draft of its own — the one place the
+  // layout is applied is Core's own alignment, which the switch is saved into
+  // (and which the workspace also re-runs on its own interval). The station is
+  // read only when the account has no usable key list at all, because the list
+  // the window shows has to be one the station actually reported.
   const loadGroupManagerAccount = async (current: RelayAccount): Promise<RelayAccount> => {
-    if (!alignAutoGroupingAction || !groupManagerNeedsAlignment(current)) return current;
+    if (groupManagerHasUsableFacts(current)) return current;
     try {
-      if (!groupManagerHasUsableFacts(current) && await refreshResources(current.id) !== "ready") return current;
-      await alignAutoGroupingAction(current.id);
+      if (await refreshResources(current.id) !== "ready") return current;
       const snapshot = await refreshAccounts();
       return (snapshot ? accountsFromSnapshot(snapshot) : []).find((entry) => entry.id === current.id) ?? current;
     } catch {
@@ -1008,24 +1035,21 @@ export function StationAccountsPanel({
     if (current.type === "newapi" && !current.autoGrouping) {
       groups.unshift({ id: "", label: translate("relay.apiKeyUngrouped"), name: translate("relay.apiKeyUngrouped"), rate: "" });
     }
-    // A key can point at a group the station no longer offers; keep it
-    // selectable so the picker never shows a different group than the row.
-    for (const resource of current.resources) {
-      if (resource.groupID && !groups.some((group) => group.id === resource.groupID)) {
-        const name = resourceGroupName(resource, current.groups, translate);
-        groups.push({ id: resource.groupID, label: name, name, rate: "" });
-      }
-    }
-    // While 自动分组 is on, the list is the layout that switch owns: one key
-    // per group, so a dropped group or a key Core already replaced is never
-    // listed as an ungrouped row.
-    const keyResources = current.autoGrouping && current.groups.length > 0
-      ? current.resources.filter((resource) => !resource.pendingDelete && resourceGroup(resource, current.groups) !== undefined)
-      : current.resources;
+    // A key can point at a group the station no longer offers.  Such a group
+    // is not a choice: it is not on the station any more, so Core refuses it
+    // and the layout cannot keep it.  It is deliberately *not* added to the
+    // picker — offering a group the user can select and Core then refuses is
+    // the app promising something that does not exist.
+    //
+    // The list is the account's own keys, and only those: a row the station no
+    // longer reports is not on the station, so it is not listed either.  自动分组
+    // checked is a *preview* drawn by the window itself over these rows, and
+    // unchecking it puts that preview away, so the request never carries a
+    // second, synthetic key list of its own.
     return {
       accountLabel: accountDisplayName(current, translate),
       groups,
-      keys: keyResources.map((resource) => ({
+      keys: current.resources.map((resource) => ({
         id: resource.id,
         name: resource.apiName || resource.name,
         groupID: resource.groupID,
@@ -1087,22 +1111,23 @@ export function StationAccountsPanel({
   const openGroupManager = async (): Promise<void> => {
     const account = selected;
     if (!account || !native.showGroupManager) return;
-    // The window appears first and loads second: 自动分组's aligned draft costs a
-    // station round trip, and the window must never stay closed for it.  The
-    // window opens on the account facts this pane already holds, keeps its rows
-    // read-only while the load is in flight, and takes the aligned draft
-    // through the native update when it lands.  A host without that update
-    // opens the window on the loaded facts instead, as it always has — the
+    // The window appears first and loads second.  The read is no longer an
+    // alignment pass — the list is the account's own keys, and 自动分组 is a
+    // preview inside the window — so it only runs when the pane holds no key
+    // list to draw.  The window opens on the facts this pane already holds,
+    // keeps its rows read-only while that read is in flight, and takes the
+    // account's own keys through the native update when they land.  A host
+    // without that update opens the window on the loaded facts instead: the
     // window there can only ever show data that is already loaded.
     const update = native.updateGroupManager;
-    const pending = update && groupManagerNeedsAlignment(account) ? loadGroupManagerAccount(account) : undefined;
+    const pending = update && !groupManagerHasUsableFacts(account) ? loadGroupManagerAccount(account) : undefined;
     let current = account;
     if (!update) current = await loadGroupManagerAccount(account);
     if (pending) {
-      void pending.then((aligned) => {
+      void pending.then((loaded) => {
         const push = native.updateGroupManager;
         if (!push) return;
-        void push(groupManagerSnapshot(aligned)).catch(() => {
+        void push(groupManagerSnapshot(loaded)).catch(() => {
           // A payload the host refuses would leave the window on its loading
           // line forever, so the facts it opened on clear it instead.
           void push(groupManagerSnapshot(account)).catch(() => undefined);
@@ -1130,8 +1155,12 @@ export function StationAccountsPanel({
         deletes: [...(previous?.deletes ?? [])],
       };
       handedOver = staged;
-      // Manual key writes are rejected while auto-grouping owns the layout, so
-      // turning it off is staged first and turning it on is staged last.
+      // 自动分组 is the owner of the layout, so the switch is staged first when
+      // it is being turned off (a manual key write is refused while it is on)
+      // and last when it is being turned on (Core's own alignment reads the keys
+      // the draft just staged).  The key edits this window hands over are the
+      // user's own either way: the preview's own renames and retirement live in
+      // the window and are produced by that alignment once the switch lands.
       const turningOff = current.autoGrouping && !edits.autoGrouping && staged.autoGrouping;
       if (turningOff) {
         await apiKeyActions?.setAutoGrouping?.(account.id, false);
@@ -1144,6 +1173,9 @@ export function StationAccountsPanel({
         staged.creates.push(create);
       }
       for (const edit of edits.updates) {
+        // A key the station no longer lists is one the account does not hold:
+        // there is nothing to write against, so the edit is dropped instead of
+        // being reported back as a save that did not happen.
         const resource = current.resources.find((item) => item.id === edit.keyID);
         if (!resource) continue;
         let stagedEdit = staged.updates.find((entry) => entry.keyID === edit.keyID);
@@ -1258,6 +1290,28 @@ export function StationAccountsPanel({
     });
   };
   const stationCleanups = (cleanups ?? []).filter((cleanup) => station.accountIDs.includes(cleanup.accountID));
+  // 移除中转站连接 renders on the route's dialog surface, not here: this panel
+  // lives in the provider inspector, so a dialog drawn here is clipped by that
+  // column's scroll view and centred inside it instead of over the window.
+  const removalDialog = <DependencyPolicyDialog
+      visible={Boolean(removal)}
+      title={translate("relay.removeLocalTitle")}
+      message={removal ? translate("relay.removeAccountBody", { label: accountDisplayName(removal.account, translate), keys: removalKeys, models: selectedRemovalModels }) : ""}
+      options={[
+        { value: "detach", label: translate("relay.policyRelease"), hint: translate("relay.policyReleaseHint") },
+        { value: "delete_models", label: translate("relay.policyDeleteModels"), hint: translate("relay.policyDeleteModelsHint") },
+      ]}
+      value={removalPolicy}
+      disabled={controlsBusy && pendingAction !== "remove"}
+      busy={pendingAction === "remove"}
+      confirmLabel={translate("relay.removeLocal")}
+      destructive
+      onValueChange={setRemovalPolicy}
+      onClose={() => setRemoval(undefined)}
+      onConfirm={() => { void removeSelected(); }}
+      translate={translate}
+    />;
+  const removalDialogHosted = useRelayDialogSurface(() => removalDialog);
   return <View style={styles.accountsPanel}>
     {stationCleanups.map((cleanup) => <View key={`cleanup:${cleanup.accountID}`} style={styles.cleanupRow}>
       <Text numberOfLines={2} style={styles.cleanupText}>{translate("relay.credentialsCleanupPending", { label: cleanup.label })}</Text>
@@ -1292,24 +1346,7 @@ export function StationAccountsPanel({
         <NativeButton title={translate("relay.groupManager")} compact disabled={controlsBusy || !native.showGroupManager} onPress={() => { void openGroupManager(); }} />
       </View>
     </View> : null}
-    <DependencyPolicyDialog
-      visible={Boolean(removal)}
-      title={translate("relay.removeLocalTitle")}
-      message={removal ? translate("relay.removeAccountBody", { label: accountDisplayName(removal.account, translate), keys: removalKeys, models: selectedRemovalModels }) : ""}
-      options={[
-        { value: "detach", label: translate("relay.policyRelease"), hint: translate("relay.policyReleaseHint") },
-        { value: "delete_models", label: translate("relay.policyDeleteModels"), hint: translate("relay.policyDeleteModelsHint") },
-      ]}
-      value={removalPolicy}
-      disabled={controlsBusy && pendingAction !== "remove"}
-      busy={pendingAction === "remove"}
-      confirmLabel={translate("relay.removeLocal")}
-      destructive
-      onValueChange={setRemovalPolicy}
-      onClose={() => setRemoval(undefined)}
-      onConfirm={() => { void removeSelected(); }}
-      translate={translate}
-    />
+    {removalDialogHosted ? null : removalDialog}
   </View>;
 }
 

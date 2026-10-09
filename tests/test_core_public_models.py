@@ -452,6 +452,37 @@ class PublicModelDomainTests(unittest.TestCase):
             self.domain.snapshot()["model_contexts"]["gpt-5.6-sol"]["context_window"],
         )
 
+    def test_the_pane_receives_the_configured_context_window_verbatim(self) -> None:
+        """The snapshot a window reads carries the window's number, not a marker.
+
+        A route's ``max_input_tokens`` is the value the Codex catalog hands the
+        client.  Core projects its snapshots through the secret redactor, and a
+        bare ``token`` marker once classified that number as a credential: the
+        key arrived as the string ``configured``, so the pane's Codex 上下文
+        field painted empty, read as "no custom window", and the next commit
+        wrote whatever was typed over the window the user had set.
+        """
+
+        from young_router.core.service import _safe_public
+
+        self.domain.dispatch(
+            "public.model_patch",
+            {"public_model": "gpt-5.6-sol", "changes": {"max_input_tokens": 372000}},
+        )
+        projected = _safe_public(self.domain.snapshot())
+        routes = [
+            model
+            for provider in projected["providers"]
+            for model in provider["models"]
+            if model["model_name"] == "gpt-5.6-sol"
+        ]
+        self.assertEqual(2, len(routes))
+        for route in routes:
+            self.assertEqual(372000, route["max_input_tokens"])
+        # The route that declares no window still reports none, so the pane
+        # keeps showing the registry default rather than a custom claim.
+        self.assertIsNone(self.model("00000003")["max_input_tokens"])
+
 
 if __name__ == "__main__":
     unittest.main()

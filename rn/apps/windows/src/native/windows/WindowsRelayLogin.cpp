@@ -129,7 +129,37 @@ constexpr wchar_t kRelayLoginBlockingOverlayScript[] = LR"JS((() => {
   const dismissPattern = /^(?:今日关闭|关闭公告|关闭|我知道了|知道了|明白|确定|好的|暂不|稍后再说|close|dismiss|got it|ok|no thanks)$/iu;
   const signInActionPattern = /登录|登陆|注册|继续|提交|进入|sign in|sign up|log in|login|submit|continue|register/iu;
   const closeAffordancePattern = /(close|dismiss|icon-close)/i;
+  // A station's consent surface exists to be answered, not hidden: the newest
+  // stations disable the whole sign-in form (fields *and* buttons, not just
+  // submit) until the user accepts the current terms, and the app cannot accept
+  // a legal agreement on the user's behalf.  A surface whose own words say it
+  // is one is therefore left exactly as the page drew it, however much of the
+  // viewport it covers — hiding it is what left a login window whose every
+  // control refused to answer.
+  const consentPattern = /登录协议|用户协议|服务条款|专项条款|支持地区|隐私政策|协议与隐私|政策与条款|同意并|同意本|我已阅读|我已同意|阅读并同意|继续登录前|未同意前|login agreement|user agreement|terms of service|terms of use|privacy policy|consent to|i have read|i agree|before continuing|accept the terms/iu;
+  const consentActionPattern = /同意|接受|允许|我已阅读|我已同意|accept|agree|allow/i;
+  const agreementSelector = '[class*="loginAgreement"],[class*="LoginAgreement"],[id*="agreement"],[id*="Agreement"],[class*="agreementConsent"],[class*="consentCheckbox"],[class*="legalConsent"]';
   const containsSignInForm = (node) => Boolean(node.querySelector?.('input[type=password],input[autocomplete=current-password]'));
+  // Read through textContent, never innerText: this test runs for every
+  // candidate layer of a page the app is also measuring, and innerText would
+  // force a layout for each one.
+  const shallowText = (node) => (node.textContent || '').replace(whitespacePattern, ' ').slice(0, 4000);
+  const isConsentSurface = (node) => {
+    if (node.matches?.(agreementSelector) || node.querySelector?.(agreementSelector)) return true;
+    if (!consentPattern.test(shallowText(node))) return false;
+    // Wording alone is not proof: an announcement may mention the terms too.
+    // The layer is a consent surface when it carries an answerable control —
+    // the checkbox the form waits for, or an accept action — or when it
+    // occupies most of the page, which is exactly the case where hiding it is
+    // what disables the form.
+    if (node.querySelector?.('input[type="checkbox"],[role="checkbox"]')) return true;
+    const controls = node.querySelectorAll ? node.querySelectorAll('button,[role="button"],a') : [];
+    for (const control of controls) {
+      if (consentActionPattern.test(shallowText(control).slice(0, 60))) return true;
+    }
+    const viewport = Math.max(1, window.innerWidth * window.innerHeight);
+    return coveredArea(node) >= viewport * 0.3;
+  };
   const dismissalControl = (root) => {
     for (const node of root.querySelectorAll('button,[role="button"],a,[class*="close"],[class*="Close"]')) {
       if (!visible(node) || node.disabled) continue;
@@ -151,7 +181,7 @@ constexpr wchar_t kRelayLoginBlockingOverlayScript[] = LR"JS((() => {
     const selectors = '[role="dialog"],[aria-modal="true"],[class*="backdrop"],[class*="Backdrop"],[class*="mask"],[class*="Mask"],[class*="modal"],[class*="Modal"],[class*="dialog"],[class*="Dialog"],[class*="overlay"],[class*="Overlay"],[class*="popup"],[class*="Popup"],[class*="notice"],[class*="Notice"]';
     let changed = false;
     for (const node of document.querySelectorAll(selectors)) {
-      if (!visible(node) || containsSignInForm(node)) continue;
+      if (!visible(node) || containsSignInForm(node) || isConsentSurface(node)) continue;
       const position = getComputedStyle(node).position;
       if (position !== 'fixed' && position !== 'absolute') continue;
       const covered = coveredArea(node);
@@ -163,6 +193,9 @@ constexpr wchar_t kRelayLoginBlockingOverlayScript[] = LR"JS((() => {
         continue;
       }
       if (covered >= viewportArea * 0.6) {
+        // A layer that carries the station's own sign-in form is its cover, and
+        // a consent surface was excluded above; everything left here is an
+        // announcement this app may retire.
         try { node.style.setProperty('display', 'none', 'important'); } catch {}
         changed = true;
       }

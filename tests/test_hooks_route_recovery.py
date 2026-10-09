@@ -2913,3 +2913,76 @@ class HookRouteRecoveryTests(HookTestCase):
             hooks._RECOVERY_POLICY_RECOVERY,
         )
         self.assertEqual(hooks._trace_exception(exc)["reason"], "upstream-network-connectivity")
+
+
+class RouteRecoveryKeepaliveWaitTests(HookTestCase):
+    """A finished wait must be consumed, never re-awaited.
+
+    Every recovery wait in this pipeline is written as
+    ``while True: try: await wait_for(shield(task), timeout=T)
+    except asyncio.TimeoutError: <keepalive>; continue``.  ``asyncio.TimeoutError``
+    is ``TimeoutError`` on the supported runtimes, and the bridged sub-calls and
+    socket reads raise exactly that class on their own per-io timeout.  A task
+    that has already failed that way therefore keeps raising the very exception
+    the loop reads as "still silent", so an unguarded loop re-awaits a settled
+    task without ever suspending and pins a core until the client goes away.
+
+    That is idle energy the battery panel attributes to this app, and it is
+    invisible to every behavioural assertion: the stream still produces its
+    keepalives, it just burns the machine to do it.  These tests pin the
+    contract that keeps the wait loop from collapsing into a spin.
+    """
+
+    def _source(self, hooks, name: str) -> str:
+        import inspect
+
+        owner = hooks._owners.get(name)
+        return inspect.getsource(getattr(owner, name))
+
+    def test_the_evidence_wait_consumes_a_settled_task(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        source = self._source(hooks, "_yield_guarded_original_stream")
+
+        self.assertIn("evidence_task = asyncio.create_task(", source)
+        self.assertIn("if evidence_task.done():", source)
+        self.assertIn("evidence_task.result()", source)
+
+        # The done-check has to sit inside the keepalive handler as well: a read
+        # that settles exactly at the boundary is otherwise read as silence and
+        # the next pass re-awaits it.
+        handler_start = source.index("except asyncio.TimeoutError:")
+        handler = source[handler_start : handler_start + 400]
+        self.assertIn(
+            "evidence_task.done()",
+            handler,
+            "the keepalive handler must not treat a finished evidence read as silence",
+        )
+
+    async def test_a_settled_task_is_never_re_awaited_across_the_pipeline(self) -> None:
+        """No recovery wait may loop on a task that is already done."""
+
+        hooks, _proxy_server = load_hook_module()
+        import inspect
+        import re
+
+        offenders: list[str] = []
+        for name in (
+            "_yield_guarded_original_stream",
+            "_yield_downstream_keepalive_stream",
+        ):
+            owner = hooks._owners.get(name)
+            if owner is None:
+                continue
+            source = inspect.getsource(getattr(owner, name))
+            for match in re.finditer(r"asyncio\.wait_for\(\s*asyncio\.shield\((\w+)\)", source):
+                task_name = match.group(1)
+                # The handler that follows this wait must test the same task.
+                window = source[match.end() : match.end() + 600]
+                self.assertIn(
+                    f"{task_name}.done()",
+                    window,
+                    f"{name}: the wait around {task_name} must resolve a settled task",
+                )
+                offenders.append(task_name)
+
+        self.assertTrue(offenders, "expected the recovery keepalive waits to be present")

@@ -2697,10 +2697,14 @@ private enum NativeRelayOriginPolicy {
             // One window hosts every settings pane at one fixed size, so
             // switching panes never moves or resizes the window. The size fits
             // the widest workspace (provider three-column, assistant cards)
-            // without the former extra width. The window is full-size content
-            // view, so its content height includes the transparent title strip.
+            // without the former extra width, and the tallest detail pane: the
+            // provider detail carries 535 pt of content beside the 112 pt of
+            // window chrome around it (82 above, 30 below), so the former 640
+            // left its own pane seven points short and it opened on a
+            // scrollbar. The window is full-size content view, so its content
+            // height includes the transparent title strip.
             return RouteWindowLayout(
-                contentSize: NSSize(width: 960, height: 640),
+                contentSize: NSSize(width: 960, height: 660),
                 minSize: NSSize(width: 900, height: 560),
                 maxSize: nil
             )
@@ -3217,6 +3221,13 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         var enabled: Bool
         var deleted: Bool
         let isDraft: Bool
+        /// A row 自动分组's own preview derived for a group that has no key yet.
+        ///
+        /// It is a draft because saving the switch is what creates it, but it is
+        /// *not* a pending edit: it is the layout the checked switch already
+        /// states, so the list draws it like any other row.  Only a row the user
+        /// added with ＋ is a pending create, and only that one is dimmed.
+        let isPreview: Bool
     }
 
     /// The picker's group options, built from the native payload: the name
@@ -3249,7 +3260,8 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
                 originalEnabled: enabled,
                 enabled: enabled,
                 deleted: false,
-                isDraft: false
+                isDraft: false,
+                isPreview: false
             )
         }
     }
@@ -3332,6 +3344,11 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
     /// The rows as they stood before the switch staged the automatic layout, so
     /// turning it back off restores exactly what the sheet opened on.
     private var autoGroupingBaselineRows: [KeyRow]?
+    /// The account's rows as they stood before the switch staged its preview:
+    /// with 自动分组 checked the list is the *view* the switch owns, so a row
+    /// that was already there keeps the user's own edits and the preview's own
+    /// rename or retirement is never handed back as a write nobody made.
+    private var autoGroupingBaselineKeys: Set<String> = []
 
     private var autoGroupingOn: Bool {
         (toggle?.state ?? (initialAutoGrouping ? .on : .off)) == .on
@@ -3344,7 +3361,16 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         guard autoGroupingOn == initialAutoGrouping else { return true }
         if stagedDeleteCount > 0 { return true }
         return rows.contains { row in
+            // The switch's own derived row is the layout it already states, so
+            // it is not a change the user made and must not enable 保存并关闭.
+            if row.isPreview { return false }
             if row.isDraft { return !row.name.isEmpty }
+            // With the preview up, a rename or a retirement the switch's own
+            // layout produced is not a change the user made: 保存并关闭 would
+            // otherwise be enabled by lines that only exist on this screen.
+            if autoGroupingOn && autoGroupingBaselineKeys.contains(row.id) {
+                return row.enabled != row.originalEnabled
+            }
             return row.name != row.originalName
                 || row.groupID != row.originalGroupID
                 || row.enabled != row.originalEnabled
@@ -3400,8 +3426,14 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
     }
 
     /// A row the draft will create or delete; the list shows it dimmed.
+    ///
+    /// 自动分组's own preview rows are not staged: the checked switch *is* the
+    /// statement that each group holds one key named after it, so a row it
+    /// derived is the layout the window is showing rather than an edit waiting
+    /// to happen.  Dimming those was what made a checked switch read as a list
+    /// of pending changes.
     private func isStaged(_ row: KeyRow) -> Bool {
-        row.deleted || row.isDraft
+        row.deleted || (row.isDraft && !row.isPreview)
     }
 
     /// 未分组 when the key has no group the store still offers; otherwise the
@@ -3863,6 +3895,15 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         // a three-key account still shows every detail row.  The fit is
         // reapplied once a selection loads its wrapped rows.
         fitPanelToContent()
+        // A window that opens on a checked 自动分组 states the layout that switch
+        // means, exactly as clicking it would.  Without this the sheet showed
+        // the account's raw key list under a checked switch — an 未分组 row and
+        // keys in groups the station no longer offers were exactly what made a
+        // checked switch read as nothing having happened.
+        if initialAutoGrouping {
+            stageAutoGroupingRows(true)
+            table.reloadData()
+        }
         // The selection drives the detail column, so the window opens on the
         // first key instead of a blank form.
         if !rows.isEmpty {
@@ -3890,6 +3931,14 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         accountField?.stringValue = accountLabel
         toggle?.state = autoGrouping ? .on : .off
         stagedDeleteCount = 0
+        // A window that opens on a checked 自动分组 states the layout that switch
+        // means, exactly as clicking it would: the list has to be one key per
+        // group the moment it is on screen, or a checked switch would be showing
+        // the account's raw key list — ungrouped rows and keys in groups the
+        // station no longer offers — under a switch that says otherwise.
+        if autoGrouping {
+            stageAutoGroupingRows(true)
+        }
         // A plaintext value the window read belongs to the key id it came from;
         // a key the refresh replaced is read again on its next selection.
         let ids = Set(rows.map { $0.id })
@@ -4124,7 +4173,8 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
             originalEnabled: true,
             enabled: true,
             deleted: false,
-            isDraft: true
+            isDraft: true,
+            isPreview: false
         ))
         let index = rows.count - 1
         table?.reloadData()
@@ -4348,75 +4398,133 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
     /// deleted, and its group is *not* given a replacement: Core waits for
     /// Apply rather than creating a second key beside one it is retiring.
     ///
+    /// Every group the account offers is listed, because that is what the
+    /// switch means: the list has to be the full set of groups the station
+    /// offers, not the subset a key happens to name.  A group the *station still
+    /// offers* is a real thing to hold a key for, so the draft row that carries
+    /// it stays; a row whose group the station no longer offers is a key the
+    /// layout cannot keep, and it is dropped from the list instead of sitting
+    /// there as a struck-through line the user cannot act on.
+    ///
     /// Turning the switch off restores the rows the sheet opened on, the way
     /// Core restores its own pre-toggle baseline.
     private func stageAutoGroupingLayout(_ enabled: Bool) {
-        guard let table else { return }
+        stageAutoGroupingRows(enabled)
+        table?.reloadData()
+    }
+
+    /// The layout itself, so the rows can be staged by a caller that has no
+    /// table yet — a window that opens on a checked switch stages its layout
+    /// while it is still being built.
+    private func stageAutoGroupingRows(_ enabled: Bool) {
         if enabled {
+            // Staging is a *derivation*, not an accumulation: it is applied to
+            // the account's own rows every time, so applying it twice cannot
+            // pile up a second set of preview rows.  The baseline is what the
+            // window opened on, and it is kept until the switch goes off.
             if autoGroupingBaselineRows == nil { autoGroupingBaselineRows = rows }
-            var keptGroupIDs = Set<String>()
-            var presentGroupIDs = Set<String>()
-            for row in rows where !row.isDraft && !row.groupID.isEmpty {
-                presentGroupIDs.insert(row.groupID)
-            }
-            var staged: [KeyRow] = []
-            for row in rows {
-                if row.isDraft {
-                    staged.append(row)
-                    continue
-                }
-                if row.deleted {
-                    // The user's own deletion is theirs to keep.
-                    staged.append(row)
-                    continue
-                }
-                guard let group = groups.first(where: { $0.id == row.groupID }) else {
-                    var candidate = row
-                    candidate.deleted = true
-                    staged.append(candidate)
-                    continue
-                }
-                guard !keptGroupIDs.contains(group.id) else {
-                    // A group owns one key: every later one is retired.
-                    var candidate = row
-                    candidate.deleted = true
-                    staged.append(candidate)
-                    continue
-                }
-                keptGroupIDs.insert(group.id)
-                var candidate = row
-                candidate.name = group.name
-                candidate.enabled = true
-                staged.append(candidate)
-            }
-            for group in groups where !keptGroupIDs.contains(group.id) && !presentGroupIDs.contains(group.id) {
-                staged.append(
-                    KeyRow(
-                        id: "draft-\(group.id)-\(UUID().uuidString)",
-                        name: group.name,
-                        groupID: group.id,
-                        groupLabel: group.name,
-                        multiplier: group.rate,
-                        hint: "",
-                        modelNames: [],
-                        originalName: group.name,
-                        originalGroupID: group.id,
-                        originalEnabled: true,
-                        enabled: true,
-                        deleted: false,
-                        isDraft: true
-                    )
-                )
-            }
-            rows = staged
+            rows = autoGroupingRows(from: autoGroupingBaselineRows ?? rows)
         } else if let baseline = autoGroupingBaselineRows {
             rows = baseline
             autoGroupingBaselineRows = nil
+            autoGroupingBaselineKeys = []
         }
         stagedDeleteCount = rows.filter { !$0.isDraft && $0.deleted }.count
-        table.reloadData()
     }
 
+    /// 自动分组's own layout, derived from the account's rows.
+    ///
+    /// The derivation is pure: one key per group the account still offers,
+    /// named after its group, plus a preview row for every group that owns no
+    /// key yet.  A row whose group is gone, and a second key in a group that
+    /// already owns one, are not part of the layout and are therefore not
+    /// listed — the switch states what the account *will* be, so a line it is
+    /// replacing is not a fact the user is being shown.
+    private func autoGroupingRows(from source: [KeyRow]) -> [KeyRow] {
+        // The picker also offers 未分组 while the switch is off, because manual
+        // assignment needs it — but it is the *absence* of a group, not one the
+        // station offers, so it is never part of the layout.  Reading it as a
+        // group made a switch checked inside the sheet invent a 未分组 key with
+        // no rate, no value, and no models: a line for a group that does not
+        // exist, in a list that states one key per group the station offers.
+        let layoutGroups = groups.filter { !$0.id.isEmpty }
+        // An account with no current group list has no layout to align to: every
+        // key would look ungrouped, and the list would empty itself under a
+        // checked switch.  Core's own alignment waits for a refresh that reports
+        // groups instead, so the preview shows the account's keys unchanged
+        // until there is a layout to state.
+        guard !layoutGroups.isEmpty else { return source }
+        var keptGroupIDs = Set<String>()
+        var presentGroupIDs = Set<String>()
+        for row in source where !row.isDraft && !row.groupID.isEmpty {
+            presentGroupIDs.insert(row.groupID)
+        }
+        var staged: [KeyRow] = []
+        for row in source {
+            // A preview row is this derivation's own output, never part of the
+            // account: re-deriving from a staged list therefore reproduces the
+            // same layout instead of piling a second copy of it on top.
+            if row.isPreview { continue }
+            if row.isDraft {
+                staged.append(row)
+                continue
+            }
+            if row.deleted {
+                // The user's own deletion is theirs to keep.
+                staged.append(row)
+                continue
+            }
+            if row.groupID.isEmpty {
+                // 未分组 is the manual-assignment sentinel: it is the absence of
+                // a group, so a key naming none has no place in a layout that
+                // states one key per group.  Core's own alignment retires it,
+                // and the row it used to leave behind read as a group.
+                continue
+            }
+            guard let group = layoutGroups.first(where: { $0.id == row.groupID }) else {
+                // The station no longer offers this key's group, so the layout
+                // has nowhere to put it.
+                continue
+            }
+            guard !keptGroupIDs.contains(group.id) else {
+                // A group owns one key: every later one leaves the list.
+                continue
+            }
+            keptGroupIDs.insert(group.id)
+            var candidate = row
+            candidate.name = group.name
+            candidate.enabled = true
+            staged.append(candidate)
+        }
+        for group in layoutGroups where !keptGroupIDs.contains(group.id) && !presentGroupIDs.contains(group.id) {
+            staged.append(
+                KeyRow(
+                    id: "draft-\(group.id)",
+                    name: group.name,
+                    groupID: group.id,
+                    groupLabel: group.name,
+                    multiplier: group.rate,
+                    hint: "",
+                    modelNames: [],
+                    originalName: group.name,
+                    originalGroupID: group.id,
+                    originalEnabled: true,
+                    enabled: true,
+                    deleted: false,
+                    isDraft: true,
+                    isPreview: true
+                )
+            )
+        }
+        // A key the layout kept is a row that was already there, so the
+        // preview's own rename is not an edit of the account.  A row the switch
+        // retires is not in the list to be read back as a deletion either, so
+        // 自动分组 can never report a write the user never made: every group no
+        // key names becomes a preview row, and those are the whole of what this
+        // window adds.
+        autoGroupingBaselineKeys = Set(source.filter { !$0.isDraft }.map { $0.id })
+        return staged
+    }
     /// The question mark beside 自动分组: the switch relayouts the station's own
     /// keys, so the mark states what it does before the user commits to it.  It
     /// opens the app's own hint beside the mark, not an alert: an explanation is
@@ -4449,19 +4557,40 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
     }
 
     /// The staged edits, or nil when the draft would not change the account.
+    ///
+    /// While 自动分组 is checked the list on screen is the layout that switch
+    /// owns, not the account: the only thing the list can be reporting that the
+    /// account does not already have is the key each group without one needs, so
+    /// the drafts are the whole of what this window creates.  Every rename and
+    /// every retirement the preview shows happens inside Core's own align once
+    /// the switch is saved, and the keys the switch is retiring are not in the
+    /// list to be read back as deletions.  A row the user staged *before* the
+    /// switch was checked is the user's own edit and travels either way.
     func stagedResult() -> NativeGroupManagerResult? {
         guard hasStagedChanges else { return nil }
+        let autoGrouping = (toggle?.state ?? (initialAutoGrouping ? .on : .off)) == .on
+        // A row this switch's preview produced: kept or renamed, either way it
+        // is the layout's own line and not an edit of the account.
+        let previewed = autoGroupingBaselineKeys
         return NativeGroupManagerResult(
-            autoGrouping: (toggle?.state ?? (initialAutoGrouping ? .on : .off)) == .on,
+            autoGrouping: autoGrouping,
             creates: rows.filter { $0.isDraft && !$0.deleted && !$0.name.isEmpty }.map {
                 NativeGroupManagerResult.Create(name: $0.name, groupID: $0.groupID)
             },
-            updates: rows.filter {
-                !$0.isDraft && !$0.deleted && ($0.name != $0.originalName || $0.groupID != $0.originalGroupID || $0.enabled != $0.originalEnabled)
+            updates: rows.filter { row in
+                guard !row.isDraft, !row.deleted else { return false }
+                guard !autoGrouping || !previewed.contains(row.id) else { return false }
+                return row.name != row.originalName || row.groupID != row.originalGroupID || row.enabled != row.originalEnabled
             }.map {
                 NativeGroupManagerResult.Update(keyID: $0.id, name: $0.name, groupID: $0.groupID, enabled: $0.enabled)
             },
-            deletes: rows.filter { !$0.isDraft && $0.deleted }.map { $0.id }
+            deletes: rows.filter { row in
+                guard !row.isDraft, row.deleted else { return false }
+                // With the preview up, a row it is retiring in a list that no
+                // longer shows it is not the user's decision: only a row the
+                // user retired before the switch was checked travels here.
+                return !autoGrouping || previewed.contains(row.id)
+            }.map { $0.id }
         )
     }
 
@@ -5839,7 +5968,37 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
       const dismissPattern = /^(?:关闭公告|关闭|我知道了|知道了|明白|确定|好的|暂不|稍后再说|close|dismiss|got it|ok|no thanks)$/iu;
       const signInActionPattern = /登录|登陆|注册|继续|提交|进入|sign in|sign up|log in|login|submit|continue|register/iu;
       const closeAffordancePattern = /(close|dismiss|icon-close)/i;
+      // A station's consent surface exists to be answered, not hidden: the
+      // newest stations disable the whole sign-in form (fields *and* buttons,
+      // not just submit) until the user accepts the current terms, and the app
+      // cannot accept a legal agreement on the user's behalf.  A surface whose
+      // own words say it is one is therefore left exactly as the page drew it,
+      // however much of the viewport it covers — hiding it is what left a login
+      // window whose every control refused to answer.
+      const consentPattern = /登录协议|用户协议|服务条款|专项条款|支持地区|隐私政策|协议与隐私|政策与条款|同意并|同意本|我已阅读|我已同意|阅读并同意|继续登录前|未同意前|login agreement|user agreement|terms of service|terms of use|privacy policy|consent to|i have read|i agree|before continuing|accept the terms/iu;
+      const consentActionPattern = /同意|接受|允许|我已阅读|我已同意|accept|agree|allow/i;
+      const agreementSelector = '[class*="loginAgreement"],[class*="LoginAgreement"],[id*="agreement"],[id*="Agreement"],[class*="agreementConsent"],[class*="consentCheckbox"],[class*="legalConsent"]';
       const containsSignInForm = (node) => Boolean(node.querySelector?.('input[type=password],input[autocomplete=current-password]'));
+      // Read through textContent, never innerText: this test runs for every
+      // candidate layer of a page the app is also measuring, and innerText
+      // would force a layout for each one.
+      const shallowText = (node) => (node.textContent || '').replace(whitespacePattern, ' ').slice(0, 4000);
+      const isConsentSurface = (node) => {
+        if (node.matches?.(agreementSelector) || node.querySelector?.(agreementSelector)) return true;
+        if (!consentPattern.test(shallowText(node))) return false;
+        // Wording alone is not proof: an announcement may mention the terms
+        // too.  The layer is a consent surface when it carries an answerable
+        // control — the checkbox the form waits for, or an accept action — or
+        // when it occupies most of the page, which is exactly the case where
+        // hiding it is what disables the form.
+        if (node.querySelector?.('input[type="checkbox"],[role="checkbox"]')) return true;
+        const controls = node.querySelectorAll ? node.querySelectorAll('button,[role="button"],a') : [];
+        for (const control of controls) {
+          if (consentActionPattern.test(shallowText(control).slice(0, 60))) return true;
+        }
+        const viewport = Math.max(1, window.innerWidth * window.innerHeight);
+        return coveredArea(node) >= viewport * 0.3;
+      };
       const dismissalControl = (root) => {
         let best = null;
         for (const node of root.querySelectorAll('button,[role="button"],a,[class*="close"],[class*="Close"]')) {
@@ -5883,9 +6042,17 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
             changed = true;
             continue;
           }
+          // Only *hiding* is off the table for a consent surface: its own
+          // dismissal was already given its try, and a layer the user still
+          // has to answer is left on screen where they can answer it.  This is
+          // the second thing that used to disable the form — the first was
+          // pressing the layer's accept action, which is refused above.
+          if (isConsentSurface(node)) continue;
           // A station can reopen an announcement right after it is dismissed
           // (its own close action does not always persist), so a layer that
-          // survives the dismissal attempts is hidden outright.
+          // survives the dismissal attempts is hidden outright.  Only a real
+          // announcement reaches this point: a consent surface, and any layer
+          // that carries the station's own sign-in form, was excluded above.
           if (covered >= viewportArea * 0.3) {
             try { node.style.setProperty('display', 'none', 'important'); } catch {}
             changed = true;
@@ -5937,14 +6104,18 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
           return typeof value === 'string' ? value : '';
         } catch { return ''; }
       };
-      let token = read('auth_token') || read('access_token') || '';
-      if (!token) {
-        try {
-          const user = JSON.parse(read('user') || 'null');
-          const candidate = user && typeof user === 'object' ? (user.token || user.access_token) : '';
-          if (typeof candidate === 'string') token = candidate;
-        } catch {}
-      }
+      // The page's own account record is where a New API fork keeps the token
+      // it just created, and the token keys are the fallbacks for a station
+      // that writes one there instead.  Reading only the key names reported a
+      // signed-in page as "no token", which is what kept the sign-in watcher
+      // from ever recognizing the session the page had already established.
+      let token = '';
+      try {
+        const user = JSON.parse(read('user') || 'null');
+        const candidate = user && typeof user === 'object' ? user.token : '';
+        if (typeof candidate === 'string') token = candidate;
+      } catch {}
+      if (!token) token = read('auth_token') || read('access_token') || '';
       const loginField = document.querySelector('input[type=password],input[autocomplete=current-password]');
       return {
         token: token ? `${token.length}:${token.slice(-8)}` : '',
@@ -6250,6 +6421,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         embeddedResizeProbe = nil
         embeddedResizeAttempts = 0
         lastEmbeddedContentHeight = nil
+        signInProbeAttempts = 0
         clearCapturedCredentials()
     }
 
@@ -6719,7 +6891,10 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         if message.name == "litellmRelayPage" {
             // The page routed itself: the sign-in step may just have been
             // replaced by the station console, and the form geometry changed
-            // with it.
+            // with it.  A route *is* a fresh step, so the probe budget reopens
+            // with it: the previous bound was spent on a form that no longer
+            // exists, and the sign-in that replaced it deserves its own tries.
+            signInProbeAttempts = 0
             embeddedResizeAttempts = 0
             scheduleEmbeddedBrowserResize(delay: 0.05)
             schedulePageReadinessProbe()
@@ -6750,12 +6925,16 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         let script = """
         (() => ({
           accessToken: (() => {
-            const direct = localStorage.getItem('auth_token') || localStorage.getItem('access_token') || '';
-            if (direct) return direct;
+            // The page's own account record is the authority for the session it
+            // just created; the token keys are the fallbacks for a station that
+            // writes one there instead.  A New API fork keeps its token in
+            // ``user.token`` and nowhere else, so reading only the key names
+            // dropped the very credential the sign-in had just produced.
             try {
               const user = JSON.parse(localStorage.getItem('user') || 'null');
-              return user && typeof user.token === 'string' ? user.token : '';
-            } catch { return ''; }
+              if (user && typeof user.token === 'string' && user.token) return user.token;
+            } catch {}
+            return localStorage.getItem('auth_token') || localStorage.getItem('access_token') || '';
           })(),
           refreshToken: localStorage.getItem('refresh_token') || '',
           userID: (() => {
@@ -7322,9 +7501,27 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
 
     private func scheduleAutomaticSignInCheck() {
         guard mode == .login, isBrowserFlowLive, !checking else { return }
+        // A station whose sign-in never answers is not retried forever: past the
+        // bound the window states what it found and puts the check back in the
+        // user's hands, through the same control that performs it on demand.
+        guard signInProbeAttempts < Self.signInProbeMaxAttempts else {
+            setStatus(text(
+                "No valid sign-in was found. Complete sign-in in the page and try again.",
+                "未检测到有效登录状态。请完成登录后重试。"
+            ))
+            return
+        }
+        signInProbeAttempts += 1
         automaticCheckProbe?.cancel()
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.isBrowserFlowLive, !self.checking else { return }
+            // A quiet automatic check must be *stated*: it replaced the typed
+            // `Waiting for sign-in…` line with whatever the last probe left
+            // behind, so a station that keeps answering something the app
+            // cannot verify would spin here with nothing on screen saying so.
+            // The status line is the one report surface every sign-in state
+            // already uses, so the retry puts its own words back.
+            self.setStatus(self.waitingForSignInStatus)
             self.startSignInCheck(automatically: true)
         }
         automaticCheckProbe = work
@@ -7336,6 +7533,22 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     /// the sign-in surface is open and starts one verification per new
     /// credential fingerprint; the quiet automatic check keeps retrying behind
     /// it, so a slow or temporarily failing station still settles.
+    /// A station sign-in completes inside the page, so no navigation callback
+    /// announces it. The watcher polls the page's own credential storage while
+    /// the sign-in surface is open and starts one verification per new
+    /// credential fingerprint; the quiet automatic check keeps retrying behind
+    /// it, so a slow or temporarily failing station still settles.
+    ///
+    /// One verified sign-in answers this many probes before the app stops
+    /// trying.  The flow is not left spinning because a station keeps
+    /// answering a shape this app cannot verify — a login page that never
+    /// leaves, a captcha step the page has not finished, a response with no
+    /// username and no credentials this app can use.  Past the bound the window
+    /// states what it found and hands the decision back to the user through the
+    /// one control that performs the check on demand.
+    private static let signInProbeMaxAttempts = 24
+    private var signInProbeAttempts = 0
+
     private func scheduleLoginWatch(delay: TimeInterval = 1) {
         guard mode == .login, isBrowserFlowLive else { return }
         loginWatchProbe?.cancel()
@@ -7352,11 +7565,23 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
             let token = (fields?["token"] as? String) ?? ""
             let path = (fields?["path"] as? String) ?? ""
             let formPresent = (fields?["form"] as? Bool) ?? false
+            // The page is the authority on whether the station has accepted a
+            // sign-in: a document that still carries its password field has
+            // not, and neither the absence of a token nor an HTTP answer is
+            // enough to call it verified.  So an intact sign-in form never
+            // spends a probe, which is what kept this loop asking forever.
+            if formPresent {
+                self.observedLoginSignature = token.isEmpty ? nil : "\(token)@\(path)"
+                self.observedLoginForm = true
+                self.signInProbeAttempts = 0
+                self.scheduleLoginWatch(delay: token.isEmpty ? 1 : 1.5)
+                return
+            }
             if token.isEmpty {
                 self.observedLoginSignature = nil
                 // A sign-in form that disappeared means the station accepted
                 // the credentials, and a cookie-only station stores no token.
-                if self.observedLoginForm == true, !formPresent {
+                if self.observedLoginForm == true {
                     self.recoverStalledCheck()
                     self.startSignInCheck(automatically: true)
                 }
@@ -7744,6 +7969,9 @@ private enum NativeRelaySessionProbeOutcome {
 
 private enum NativeRelaySessionProbe {
     private struct Probe {
+        /// The station family this probe belongs to, so one flow can settle the
+        /// family from whichever probe answers instead of being told in advance.
+        let family: String
         let path: String
         let method: String
         let usernamePaths: [[String]]
@@ -7755,12 +7983,20 @@ private enum NativeRelaySessionProbe {
         presetUsername: String?,
         session: NativeRelaySession
     ) -> NativeRelaySessionProbeOutcome {
-        let probes: [Probe] = type == "newapi"
-            ? [
-                Probe(path: "api/user/self", method: "GET", usernamePaths: [["data", "username"], ["data", "email"]]),
-                Probe(path: "api/user/auth/refresh", method: "POST", usernamePaths: [["data", "user", "username"], ["data", "user", "email"]]),
-              ]
-            : [Probe(path: "api/v1/auth/me", method: "GET", usernamePaths: [["data", "email"], ["data", "username"], ["email"], ["username"]])]
+        let newAPI: [Probe] = [
+            Probe(family: "newapi", path: "api/user/self", method: "GET", usernamePaths: [["data", "username"], ["data", "email"]]),
+            Probe(family: "newapi", path: "api/user/auth/refresh", method: "POST", usernamePaths: [["data", "user", "username"], ["data", "user", "email"]]),
+        ]
+        let sub2API: [Probe] = [
+            Probe(family: "sub2api", path: "api/v1/auth/me", method: "GET", usernamePaths: [["data", "email"], ["data", "username"], ["email"], ["username"]]),
+        ]
+        // An unknown family probes both surfaces instead of being reported as
+        // unavailable: a station this app already signed into answers the same
+        // dashboard routes as the family it turned out to be, so a saved session
+        // is verified from whichever one answers rather than refused because the
+        // caller could not name it up front.  A named family keeps its own single
+        // surface, so a known account still costs one round trip.
+        let probes: [Probe] = type == "newapi" ? newAPI : type == "sub2api" ? sub2API : newAPI + sub2API
         let configuration = URLSessionConfiguration.ephemeral
         configuration.httpShouldSetCookies = false
         let client = URLSession(configuration: configuration, delegate: NativeRelayProbeRedirectGuard(originURL: originURL), delegateQueue: nil)

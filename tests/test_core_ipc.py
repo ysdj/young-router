@@ -399,6 +399,57 @@ class CoreProtocolTests(unittest.TestCase):
         self.assertNotIn(secret, json.dumps(value))
         self.assertNotIn("/private/user", safe_error_message(f"failed at /private/user/config.json: {secret}"))
 
+    def test_redaction_keeps_the_limits_it_must_not_hide(self) -> None:
+        """A token *limit* is configuration, not a credential.
+
+        The one ``token`` marker cannot tell a budget from a secret, and reading
+        every token-shaped name as a secret replaced the window this app hands
+        Codex with the presence marker: ``max_input_tokens`` arrived at the pane
+        as the string ``configured``, so the field painted empty and the value
+        the user had set was destroyed on the next write.  A name that states a
+        quantity therefore survives redaction verbatim, while every name that
+        presents a credential stays redacted.
+        """
+
+        limits = {
+            "max_input_tokens": 372000,
+            "model_auto_compact_token_limit": 80000,
+            "tool_output_token_limit": 4096,
+            "token_budget": 1000,
+            "token_count": 12,
+        }
+        self.assertEqual(limits, redact(limits))
+        for key in (
+            "input_tokens",
+            "output_tokens",
+            "prompt_tokens",
+            "completion_tokens",
+            "cached_tokens",
+            "reasoning_tokens",
+            "total_tokens",
+            "cache_creation_tokens",
+            "cache_read_tokens",
+            "codex_compaction_max_output_tokens",
+        ):
+            self.assertEqual({key: 7}, redact({key: 7}), key)
+
+        # A name that presents a credential is still a secret, including the
+        # ones spelled beside the quantity names above.
+        for key in (
+            "token",
+            "tokens",
+            "access_token",
+            "refresh_token",
+            "bootstrap_token",
+            "id_token",
+            "auth_token",
+            "provider_auth_token",
+            "refresh_token_expires_at",
+            "bootstrap_token_ttl_seconds",
+            "file_token",
+        ):
+            self.assertEqual({key: "configured"}, redact({key: "synthetic-credential"}), key)
+
     def test_redaction_preserves_urls_but_removes_sensitive_query_values(self) -> None:
         redacted = REDACT_TEXT(
             "probe https://example.test/v1/models?token=synthetic-token&region=us failed at /private/user/config.yaml"

@@ -23,7 +23,18 @@ class ServiceProviderBoundaryTests(unittest.TestCase):
             config, auth_manager=ProviderAuthManager(root)
         )
 
-    def test_provider_editor_cannot_create_or_switch_to_login(self) -> None:
+    def test_a_providers_type_is_never_retargeted_in_place(self) -> None:
+        """A type is what a provider *is*, so no patch changes it.
+
+        A provider's type owns its account contract, its address, its key slot,
+        and every route's protocol surface.  The pane therefore states it
+        read-only, and Core refuses a patch that asks for a different one
+        instead of rewiring a live provider half-way — a refused patch must
+        leave the document exactly as it was.  The two refusals are separate
+        facts: the editor may not touch an account-backed provider at all, and
+        no surface may retarget a key provider.
+        """
+
         directory, domain = self._domain()
         with directory:
             with self.assertRaisesRegex(DomainError, "Service Provider Management"):
@@ -39,17 +50,74 @@ class ServiceProviderBoundaryTests(unittest.TestCase):
                         "name": "Custom",
                         "api_base": "https://api.example.test/v1",
                         "create_default_api_key": True,
+                        "models": [
+                            {"name": "m1", "upstream_model": "m1", "enabled": True, "order": 1}
+                        ],
                     }
                 },
             )
-            with self.assertRaisesRegex(DomainError, "Service Provider Management"):
+            provider_id = snapshot["providers"][0]["id"]
+            for requested in ("claude_login", "workbuddy_login", "workbuddy_ai_login"):
+                with self.assertRaisesRegex(DomainError, "type is fixed"):
+                    domain.dispatch(
+                        "provider.patch",
+                        {"provider_id": provider_id, "changes": {"auth_kind": requested}},
+                    )
+            # The refusal is not partial: the address, the key slot, and every
+            # route stay exactly as the create wrote them.
+            provider = domain.snapshot()["providers"][0]
+            self.assertEqual(provider["auth_kind"], "api_key")
+            self.assertEqual(provider["api_base"], "https://api.example.test/v1")
+            self.assertEqual(provider["api_key_names"], ["default"])
+            self.assertIs(provider["enabled"], True)
+            self.assertEqual(provider["models"][0]["upstream_protocol_mode"], "fallback")
+            # A type outside the contract is refused as an unavailable type, so
+            # a misspelling is never read as a real one.
+            with self.assertRaisesRegex(DomainError, "login type is unavailable"):
                 domain.dispatch(
                     "provider.patch",
-                    {
-                        "provider_id": snapshot["providers"][0]["id"],
-                        "changes": {"auth_kind": "claude_login"},
-                    },
+                    {"provider_id": provider_id, "changes": {"auth_kind": "bogus_login"}},
                 )
+            # Naming the type the provider already holds is a no-op, not a
+            # retarget: the same patch from any client stays idempotent.
+            unchanged = domain.dispatch(
+                "provider.patch",
+                {"provider_id": provider_id, "changes": {"auth_kind": "api_key"}},
+            )["providers"][0]
+            self.assertEqual(unchanged["auth_kind"], "api_key")
+            self.assertEqual(unchanged["api_base"], "https://api.example.test/v1")
+            self.assertEqual(unchanged["api_key_names"], ["default"])
+
+    def test_the_service_surface_states_a_type_and_never_switches_it(self) -> None:
+        """The account side is the same fact from the other end.
+
+        ``service_provider.patch`` owns a login provider's name and enabled
+        state; its type is stated there too, and a patch that asks for another
+        one is refused rather than performed.  That is what makes the pane's
+        read-only type row honest: there is no action behind it at all.
+        """
+
+        directory, domain = self._domain()
+        with directory:
+            added = domain.dispatch("service_provider.add", {"kind": "claude_login"})
+            provider_id = added["providers"][0]["id"]
+            for requested in ("openai_login", "workbuddy_login", "api_key"):
+                with self.assertRaisesRegex(DomainError, "type is fixed"):
+                    domain.dispatch(
+                        "service_provider.patch",
+                        {"provider_id": provider_id, "provider": {"auth_kind": requested}},
+                    )
+            provider = domain.snapshot()["providers"][0]
+            self.assertEqual(provider["auth_kind"], "claude_login")
+            self.assertEqual(provider["api_key_names"], ["claude-oauth"])
+            # The name and the enabled state are still the service surface's
+            # own edits, and stating the type it already holds changes nothing.
+            renamed = domain.dispatch(
+                "service_provider.patch",
+                {"provider_id": provider_id, "provider": {"name": "Claude 2", "auth_kind": "claude_login"}},
+            )["providers"][0]
+            self.assertEqual(renamed["name"], "Claude 2")
+            self.assertEqual(renamed["auth_kind"], "claude_login")
 
     def test_api_key_provider_names_are_unique_case_insensitively(self) -> None:
         directory, domain = self._domain()
