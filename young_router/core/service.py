@@ -996,6 +996,11 @@ class CoreStore:
             "launch_background_status",
         )
         service_handlers = {operation: controller.dispatch for operation in operations}
+        # Staging the runtime document is what the proxy actually loads, so it
+        # answers whether a commit is one the proxy can see.  It is not a
+        # lifecycle operation: it never touches the child process.
+        service_handlers["stage_runtime_config"] = controller.stage_runtime_config
+        service_handlers["runtime_fingerprint"] = controller.runtime_fingerprint
         initial_service = controller.status()
         store = cls(
             metadata_path=metadata_path,
@@ -1208,6 +1213,16 @@ class CoreStore:
         return unsubscribe
 
     def snapshot(self) -> dict[str, Any]:
+        """Project the current state for every window that asks for one.
+
+        This is a projection, never a probe: nothing that can block on a
+        subprocess, a network round trip, or a credential read may run on this
+        path.  Every window in the app reads this method, so one such read here
+        freezes all of them — a provider projection that reached a live worker
+        once did exactly that.  A read of external state belongs to a user's
+        own action, on its own lane, reporting on its own control.
+        """
+
         with self._lock:
             # The managed proxy can outlive a replaced Core briefly.  Project
             # the controller's current ownership/health result into every
@@ -3137,8 +3152,7 @@ class CoreStore:
                     # ``snapshot``, which would otherwise project the
                     # controller's mid-replacement reading back over the state
                     # this dispatch just published.
-                    self._service["state"] = "starting"
-                    self._service.pop("detail", None)
+                    self._publish_service_transition()
                     self._revision += 1
                     self._persist_metadata()
                     self._emit()
@@ -3177,6 +3191,27 @@ class CoreStore:
             # projecting a real service state again.
             with self._lock:
                 self._service_proxy_operations = max(0, self._service_proxy_operations - 1)
+
+    def _publish_service_transition(self) -> None:
+        """Publish the proxy leaving its state, without erasing its record.
+
+        A planned replacement is announced so every window sees the proxy
+        leave the state it was in instead of after the whole replacement.  The
+        announcement is a claim about one process being replaced, never about
+        the rest of the service record: the port, the recovery summary, and the
+        WebDAV result describe settings this replacement does not touch, and a
+        pane that loses them during a restart is showing a partly blank service
+        row for a router that is still serving.
+
+        The caller holds ``self._lock``.
+        """
+
+        if self._service.get("state") == "starting":
+            return
+        self._service["state"] = "starting"
+        # ``detail`` describes the state being left; keeping it would caption
+        # the transition with the failure that preceded it.
+        self._service.pop("detail", None)
 
     def _project_service_dispatch(self, previous_service: Mapping[str, Any], payload: Mapping[str, Any]) -> dict[str, Any]:
         """Apply one service answer to the public projection.
@@ -3220,6 +3255,54 @@ class CoreStore:
         self._service = service
         if increment:
             self._revision += 1
+
+    def _runtime_document_fingerprint(self) -> str | None:
+        """What the running proxy loads, read before a commit rewrites it.
+
+        ``runtime_config`` is written only by start/reload, so before an Apply
+        commits it still holds the exact bytes the live proxy was handed.
+        """
+
+        reader = self._service_handlers.get("runtime_fingerprint")
+        value = reader() if callable(reader) else None
+        return value if isinstance(value, str) else None
+
+    def _schedule_reload_for_applied_domains(
+        self,
+        applied: Sequence[str],
+        runtime_document_before: str | None,
+    ) -> None:
+        """Restart the proxy only for a commit it can actually see.
+
+        A providers Apply rewrites ``config.yaml`` whether or not the edit
+        reaches the runtime list.  A parked row, a renamed parked row, and the
+        credential materialization that writes a relay slot's value all change
+        the editor document while leaving the document the proxy loads
+        byte-identical.  Each of those used to replace the proxy anyway — a full
+        drain, minutes on a machine with long turns in flight — during which
+        every window sat at 启动中 for a reload that could not change anything.
+
+        ``runtime`` applies always restart: those settings reach the proxy
+        through its process environment, which no document digest covers.
+        """
+
+        if "providers_models" not in applied:
+            if applied:
+                self._schedule_service_reload_after_apply()
+            return
+        stager = self._service_handlers.get("stage_runtime_config")
+        try:
+            staged = stager("stage_runtime_config") if callable(stager) else None
+        except Exception:
+            # A config the proxy cannot load is still a commit worth publishing;
+            # the restart below reports the failure on the service's own row.
+            staged = None
+        fingerprint = staged.get("fingerprint") if isinstance(staged, Mapping) else None
+        if isinstance(fingerprint, str) and fingerprint == runtime_document_before:
+            # The proxy already holds this document; replacing it would spend
+            # the whole drain budget to load the bytes it is serving now.
+            return
+        self._schedule_service_reload_after_apply()
 
     def _schedule_service_reload_after_apply(self) -> None:
         """Queue the post-apply LiteLLM restart without blocking the commit.
@@ -3294,8 +3377,9 @@ class CoreStore:
             if reloader is None:
                 return
             # Project the restart so every open window sees the service leave
-            # the running state while the proxy is replaced.
-            self._set_service_from_result({"state": "starting"}, increment=False)
+            # the running state while the proxy is replaced.  The rest of the
+            # record is the service's own, not part of this claim.
+            self._publish_service_transition()
             self._emit()
         try:
             with self._service_transition_guard:
@@ -3538,6 +3622,10 @@ class CoreStore:
             name: _checkpoint_adapter(adapter, error_code="apply_failed")
             for name, adapter in transaction_adapters.items()
         }
+        # Read before anything commits: the runtime document still holds the
+        # bytes the running proxy was handed, so this is what the proxy is
+        # serving now.
+        runtime_document_before = self._runtime_document_fingerprint()
         core_checkpoint = {
             "revision": self._revision,
             "drafts": copy.deepcopy(self._drafts),
@@ -3678,10 +3766,23 @@ class CoreStore:
                     # on a fresh Core while the station is unreachable.
                     slot_reader = getattr(providers, "relay_slot_credentials", None)
                     slot_credentials = slot_reader() if callable(slot_reader) else None
+                    # A dependency-only Apply carries no relay work of its own:
+                    # it needs each key the draft binds, and the document already
+                    # persists every one of them.  Asking the station anyway spent
+                    # that whole round trip *inside* the store lock — an account
+                    # refresh plus one gateway catalog per key, which outlasts the
+                    # native hosts' request budget once a station stalls — and the
+                    # read could not change the answer, because the resolution
+                    # already falls back to the slot's own value.  Resolving
+                    # locally is what keeps "add a model" an edit about the model.
+                    # A key only a station read could reveal is still reported
+                    # unresolved, exactly as it is when the station cannot be
+                    # reached at all.
                     materials = binding_materials(
                         {"resources": sources},
                         refresh=True,
                         slot_credentials=slot_credentials,
+                        local_only=relay_dependency_only,
                     )
                     materialized = materialize(materials)
                     # Whatever this resolution said becomes the pane's own map
@@ -3750,7 +3851,10 @@ class CoreStore:
                 applied.append("relay_accounts")
 
             if provider_locally_applied:
-                self._schedule_service_reload_after_apply()
+                self._schedule_reload_for_applied_domains(
+                    ("providers_models",),
+                    runtime_document_before,
+                )
 
             destructive = [] if relay_dependency_only else [
                 operation
@@ -3974,6 +4078,10 @@ class CoreStore:
                 name: _checkpoint_adapter(adapter, error_code="apply_failed")
                 for name, adapter in transaction_adapters.items()
             }
+            # Read before anything commits: the runtime document still holds the
+            # bytes the running proxy was handed, so this is what the proxy is
+            # serving now.
+            runtime_document_before = self._runtime_document_fingerprint()
             core_checkpoint = {
                 "revision": self._revision,
                 "drafts": copy.deepcopy(self._drafts),
@@ -4039,8 +4147,9 @@ class CoreStore:
                 if "providers_models" in applied or "runtime" in applied:
                     # The restart takes seconds; hand it to the background so
                     # the committed edit stays fast and the next request is
-                    # not stuck behind the Core lock.
-                    self._schedule_service_reload_after_apply()
+                    # not stuck behind the Core lock.  Only a commit that
+                    # changed the document the proxy loads needs one.
+                    self._schedule_reload_for_applied_domains(applied, runtime_document_before)
                 self._revision += 1
                 self._persist_metadata()
             except Exception as exc:

@@ -790,6 +790,38 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("args.index = -1;", windows_table)
         self.assertIn('args.key = "";', windows_table)
 
+    def test_native_tables_emit_one_selection_event_for_each_row_click(self) -> None:
+        mac = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
+        windows = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
+        mac_table = mac.split(
+            "- (void)handleRowClick:", 1
+        )[1].split("- (void)handleDoubleClick:", 1)[0]
+        windows_table = windows.split(
+            "struct TableComponentView final", 1
+        )[1].split("struct TextEditorComponentView final", 1)[0]
+
+        # AppKit's selection notification is enough for ordinary rows; its
+        # target/action is only needed for selectable group rows, which AppKit
+        # will not select itself.
+        self.assertIn("![self isSelectableSpanningRow:row]", mac_table)
+        self.assertNotIn("([self isSpanningRow:row] && ![self isSelectableSpanningRow:row])", mac_table)
+        self.assertIn("onSelectionChange(event);", mac_table)
+        # WinUI's SelectionChanged is the sole selection path. ItemClick used
+        # to send the same row again, and enabling it had no independent use.
+        self.assertIn("list_.SelectionChanged([this](auto const&, auto const&) {", windows_table)
+        self.assertNotIn("list_.ItemClick", windows_table)
+        self.assertNotIn("list_.IsItemClickEnabled(true);", windows_table)
+
+    def test_native_pickers_do_not_emit_change_for_controlled_props(self) -> None:
+        mac = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
+        windows = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
+        mac_picker = mac.split("@implementation LiteLLMAppKitPickerComponentView", 1)[1].split("Class<RCTComponentViewProtocol> LiteLLMAppKitPickerCls", 1)[0]
+        win_picker = windows.split("struct PickerComponentView final", 1)[1].split("struct CheckboxComponentView final", 1)[0]
+        self.assertIn("_picker.target = nil;", mac_picker)
+        self.assertIn("_picker.target = self;", mac_picker)
+        self.assertIn("syncing_ = true;", win_picker)
+        self.assertIn("syncing_ = false;", win_picker)
+
     def test_native_login_item_registration_follows_core_target_state(self) -> None:
         ui = (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
         mac = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
@@ -3112,8 +3144,10 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             "struct TextEditorComponentView final", 1
         )[0]
         self.assertIn("ScrollViewer::SetHorizontalScrollBarVisibility(", table)
-        self.assertIn("list_.IsItemClickEnabled(true);", table)
-        self.assertIn("list_.ItemClick", table)
+        # SelectionChanged is the table's one row-selection event path; an
+        # ItemClick handler would report every ordinary row twice.
+        self.assertNotIn("list_.IsItemClickEnabled(true);", table)
+        self.assertNotIn("list_.ItemClick", table)
         self.assertIn("ScrollBarVisibility::Disabled", table)
         self.assertIn("ScrollViewer::SetVerticalScrollBarVisibility(", table)
         self.assertIn("ScrollBarVisibility::Auto", table)

@@ -5055,6 +5055,7 @@ class RelayAccountsDomain:
         *,
         refresh: bool = False,
         slot_credentials: object | None = None,
+        local_only: bool = False,
     ) -> dict[str, Any]:
         """Resolve private relay binding material for the Core Apply coordinator.
 
@@ -5066,11 +5067,14 @@ class RelayAccountsDomain:
         Model management therefore stays decoupled from relay sign-in — only the
         key value itself is shared, and it needs no sign-in to be used.
 
-        ``slot_credentials`` carries the key values the provider document
-        already persists on its relay slots (account_id, resource_id) -> value.
-        That is the durable half of the same fact: this Core's in-process cache
-        is empty after a restart, so without it a fresh Core would report a
-        key it holds as unavailable while the station is unreachable.
+        ``local_only`` marks the dependency-only Apply: it needs the key the
+        draft already binds and nothing else.  When ``slot_credentials`` covers
+        every source it named, the resolution then needs no station round trip at
+        all, and it takes none — the read could not change an answer already on
+        disk, and an account refresh plus one catalog per key is what a model
+        edit used to spend inside the store lock.  A source the slots do not
+        cover still reads the station, exactly as it does for every other
+        caller, because a key only it could reveal has to come from somewhere.
 
         This method is intentionally *not* used by ``snapshot`` or generic
         actions. Its return value can contain ``api_key`` and must remain
@@ -5104,8 +5108,53 @@ class RelayAccountsDomain:
                 except (TypeError, ValueError):
                     continue
                 cached_keys.setdefault((str(account_id), str(resource_id)), value)
+        # A local-only caller resolves entirely from what the *document* already
+        # persists on its slots — not from this process's read cache, which may
+        # hold a key whose slot has never been materialized.  That is only
+        # possible when every source it needs is carried on a slot: a key only
+        # the station could reveal still needs the station, so it takes the
+        # ordinary path below rather than failing.  The distinction is what keeps
+        # "add a model to a key I already have" a local edit while leaving an
+        # import that has never been materialized able to reach the station.
+        held_sources: set[tuple[str, str]] = set()
+        if isinstance(slot_credentials, Mapping) and slot_credentials:
+            for raw_key, value in slot_credentials.items():
+                if not isinstance(value, str) or not value:
+                    continue
+                try:
+                    account_id, resource_id = raw_key
+                except (TypeError, ValueError):
+                    continue
+                held_sources.add((str(account_id), str(resource_id)))
+        # A local-only caller that already holds every source named resolves
+        # from the document itself.  A source the slots do not cover still reads
+        # the station below — a key only it could reveal has to come from
+        # somewhere.
+        resolve_locally = local_only and bool(held_sources)
+        if resolve_locally:
+            for raw in raw_sources:
+                if not isinstance(raw, Mapping):
+                    resolve_locally = False
+                    break
+                try:
+                    source_key = (
+                        _account_id(raw.get("account_id")),
+                        _resource_id(raw.get("resource_id")),
+                    )
+                except Exception:
+                    resolve_locally = False
+                    break
+                if source_key not in held_sources:
+                    resolve_locally = False
+                    break
         refresh_issues: list[dict[str, str]] = []
-        if refresh:
+        # The account refresh is also the read that renews an aged-out session,
+        # so a caller that is not purely local still makes it: an uncovered
+        # source has to come from the station, and an expired session has to be
+        # minted again for that read to succeed.  A resolution that is entirely
+        # local skips it — the refresh could not change an answer already on
+        # disk, and it is the wait a model edit used to pay inside the lock.
+        if refresh and not resolve_locally:
             try:
                 refresh_result = self.refresh_binding_sources(sources)
             except Exception:
@@ -5146,7 +5195,13 @@ class RelayAccountsDomain:
             if resource_id.startswith("pending-"):
                 issues.append(self._apply_issue("created_resource_unresolved", account_id=account_id, resource_id=resource_id))
                 continue
+            # A source this Core already holds needs nothing from the station,
+            # and a caller that resolved locally reads nothing else: its whole
+            # point is that the edit binds a credential the document persists.
+            reads_allowed = not resolve_locally
             try:
+                if not reads_allowed:
+                    raise RelayTransportError()
                 material = self._relay_source(account, resource, include_key=True)
             except Exception:
                 # The station could not hand over the key value.  A key this
@@ -5162,7 +5217,15 @@ class RelayAccountsDomain:
             # key's own catalog joins the group page's list here.  The page's
             # narrower list stays the fallback when that read cannot be made,
             # and the union keeps every model the page already allowed.
-            catalog = self._gateway_catalog(account, material.get("api_key", ""))
+            catalog = (
+                self._gateway_catalog(account, material.get("api_key", ""))
+                if reads_allowed
+                else []
+            )
+            # Whether this resolution could judge what the key may call.  A
+            # resolution that read no catalog learned nothing, so an absent model
+            # is not evidence about the key and must not refuse the write.
+            material["catalog_authoritative"] = reads_allowed
             if catalog:
                 listed = _model_names(material.get("models", []))
                 merged = [*listed, *(model for model in catalog if model not in listed)]

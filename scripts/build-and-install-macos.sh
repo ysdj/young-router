@@ -704,6 +704,11 @@ copy_tree "$PI_WEB_ACCESS_NODE_WORK" "$CORE/runtime/bin"
 # the copied package before the bundle checks inspect the assembled Core.
 cp -p "$VERIDROP_WORK/LICENSE" "$CORE/young_router/adapters/veridrop/LICENSE"
 
+# Published JavaScript packages include declaration files, source maps, tests,
+# docs and demo media for npm consumers. The shipped workers execute only the
+# package runtime; prune the copied Core before smoke tests and signing.
+"$CORE/runtime/python/bin/python3.12" "$PROJECT_ROOT/scripts/prune-macos-core.py" "$CORE"
+
 VISION_HELPER_SOURCE="$APP_ROOT/src/native/macos/VisionOCR.swift"
 VISION_HELPER="$CORE/bin/vision_ocr"
 mkdir -p "$CORE/bin"
@@ -811,16 +816,24 @@ import(process.argv[1]).then((m) => {
   exit 5
 fi
 # The staged program is imported into the Core's own interpreter, so the bundle
-# proves that import - and the dependency set the runtime was completed with -
-# before the app is installed: a module that cannot be imported here would
-# otherwise surface as a failed deep test long after the build.
+# proves the entry points the adapter drives - and the dependency set the
+# runtime was completed with - before the app is installed: a module that cannot
+# be imported here would otherwise surface as a failed deep test long after the
+# build.  The check names the same objects the adapter imports, so a release
+# that renames one fails here rather than at probe time.
 if ! VERIDROP_SMOKE_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 "$CORE/runtime/bin/python" -c "
 import sys
 sys.path.insert(0, '$CORE/young_router/adapters/veridrop/src')
-import relay_detector.cli
+from relay_detector.models import DetectionReport, ExecutionConfig, Mode, Protocol, mask_api_key
+from relay_detector.scorer import compute_total, effective_verdict, fatal_run_error, summary_text
 import relay_detector.protocols.anthropic
 import relay_detector.protocols.openai
 import relay_detector.protocols.gemini
+import relay_detector.protocols.anthropic as a, relay_detector.protocols.openai as o, relay_detector.protocols.gemini as g
+for proto in (a, o, g):
+    for name in ('build_detectors', 'build_runner', 'make_client'):
+        assert hasattr(proto, name), (proto.__name__, name)
+assert ExecutionConfig.for_mode(Mode.QUICK, max_concurrent=3) is not None
 print('young-router-veridrop-import-ok')
 " 2>&1)"; then
   echo "The bundled Veridrop program could not be imported: $VERIDROP_SMOKE_OUTPUT" >&2
@@ -838,9 +851,8 @@ esac
   exit 5
 }
 
-# Native wheels carry large local symbol tables that are not needed at runtime.
-# Strip only bundled site-package extensions; the outer app is signed again
-# below after this transformation.
+# Native wheels and the bundled language runtimes carry local symbol tables
+# that are not needed at runtime. Strip them before the final app signature.
 while IFS= read -r -d '' binary; do
   case "$(file -b "$binary")" in
     Mach-O*)
@@ -852,7 +864,10 @@ while IFS= read -r -d '' binary; do
       codesign --force --sign - "$binary" >/dev/null
       ;;
   esac
-done < <(find "$CORE/runtime/site-packages" -type f \( -name '*.so' -o -name '*.dylib' \) -print0)
+done < <(
+  find "$CORE/runtime/site-packages" -type f \( -name '*.so' -o -name '*.dylib' \) -print0
+  printf '%s\0' "$CORE/runtime/bin/node" "$CORE/runtime/python/bin/python3.12" "$CORE/runtime/python/lib/libpython3.12.dylib"
+)
 
 # A full-tree compileall pass adds roughly 100 MB of caches, most of which
 # this app never imports. Remove stale caches before the real startup smoke

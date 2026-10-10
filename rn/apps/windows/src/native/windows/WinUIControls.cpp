@@ -773,7 +773,6 @@ struct TableComponentView final
         winrt::Windows::UI::Color{255, 255, 255, 255}));
     list_ = ListView{};
     list_.SelectionMode(ListViewSelectionMode::Single);
-    list_.IsItemClickEnabled(true);
     list_.HorizontalContentAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);
     list_.Padding(Thickness{0, 0, 0, 0});
     list_.Background(ThemeBrush(
@@ -813,22 +812,10 @@ struct TableComponentView final
         emitter->onSelectionChange(std::move(args));
       }
     });
-    list_.ItemClick([this](auto const&, auto const& args) {
-      if (!Props()) return;
-      uint32_t index = 0;
-      if (!list_.Items().IndexOf(args.ClickedItem(), index) || index >= Props()->rowKeys.size()) return;
-      if (IsClickableSpanningKey(Props()->rowKeys[index])) return;
-      if (auto emitter = EventEmitter()) {
-        winrt::YoungRouter::Codegen::LiteLLMWinUITableEventEmitter::OnSelectionChange event;
-        event.index = static_cast<int32_t>(index);
-        event.key = Props()->rowKeys[index];
-        emitter->onSelectionChange(std::move(event));
-      }
-    });
-    // A row's own double-click opens that row.  The list-level handler used to
-    // read the selection instead, so a double-click on the empty space below
-    // the rows opened whichever row happened to be highlighted; the row carries
-    // its own handler now, and empty space carries none.
+    // SelectionChanged is the one selection event path. A ListView ItemClick
+    // handler duplicates it for ordinary rows; a selected row needs no second
+    // callback just because it was clicked again. Each row owns its double
+    // click handler, so empty space carries none.
 
     Grid::SetRow(header_frame_, 0);
     Grid::SetRow(list_, 1);

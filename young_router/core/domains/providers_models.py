@@ -733,8 +733,11 @@ class ProvidersModelsDomain:
                         "order_mode": order_mode,
                         "manual_order": manual_order,
                         "effective_order": effective_order,
-                        # The user's public-model context window; absent means
-                        # the client resolves the model's own default.
+                        # The public model's declared Codex window, as the
+                        # group writes it on every route; absent means the
+                        # client resolves the model's own default.  Read-only
+                        # here: the pane states the group's number and the
+                        # public-model pane is where it is set.
                         "max_input_tokens": _positive_int(model.get("max_input_tokens")),
                         "binding_health": self._binding_health(model, keys_by_id),
                         "enabled": model_enabled,
@@ -1669,27 +1672,42 @@ class ProvidersModelsDomain:
     ) -> dict[str, Any]:
         """Describe what the model detail pane's deep test will actually run.
 
-        The staged Veridrop program only carries tables for the models it can
-        probe, and each run speaks one protocol on one surface, so a deep test
-        means something only where the route's own model is one of those and the
-        route answers on that protocol's surface. The pane's projection asks
-        without a probe - there the supported model is the whole answer, and a
-        route that turns out not to answer on that surface reports its own
-        skipped finding - while a running probe passes the surfaces it tested
-        so the scan is not started against a route that cannot carry it.
+        The staged tables say which models upstream keeps a reference for; they
+        do not say which names the suite can measure.  The quick suite compares
+        a response against the request that asked for it, so a route whose name
+        resolves to one of the suite's protocols is probeable whether or not
+        upstream has listed that exact name yet.  ``target`` is therefore the
+        name the scan was pointed at - the staged spelling when there is one,
+        otherwise this route's own - and it is never what decides the plan.
+
+        Each run speaks one protocol on one surface, so the plan still requires
+        that the route answer on that protocol's surface.  The pane's projection
+        asks without a probe - there the plan is the whole answer, and a route
+        that turns out not to answer on that surface reports its own skipped
+        finding - while a running probe passes the surfaces it tested so the
+        scan is never started against a route that cannot carry it.
         """
 
         wire_name = self._wire_model_name(model)
         public_name = str(model.get("model_name", "")).strip()
         found = veridrop.target(wire_name, public_name)
-        target = str(found.get("model", "")) if isinstance(found, Mapping) else ""
-        protocol = str(found.get("protocol", "")) if isinstance(found, Mapping) else ""
+        listed = isinstance(found, Mapping)
+        protocol = (
+            str(found.get("protocol", "")) if listed else ""
+        ) or veridrop.protocol_for(wire_name, public_name)
         surface = self._degradation_requirements(protocol)
         reachable = surfaces is None or not surface or surface in surfaces
-        includes = bool(target) and reachable
+        # A route with no upstream name has nothing to scan, whatever its
+        # public alias resolves to.
+        includes = bool(wire_name) and bool(protocol) and reachable
+        target = (
+            (str(found.get("model", "")) if listed else "") or wire_name
+            if includes
+            else ""
+        )
         return {
             "includes_degradation": includes,
-            "target": target if includes else None,
+            "target": target or None,
             "protocol": protocol if includes else "",
             "surface": surface if includes else "",
         }
@@ -3558,6 +3576,11 @@ class ProvidersModelsDomain:
             requested_auth_kind = changes.pop("auth_kind", None)
             changes.pop("auth_credential_ref", None)
             if auth_requested:
+                # A provider's type is fixed for its lifetime.  It owns the
+                # account contract, the address, the key slot, and every route's
+                # protocol surface, so adopting another type is a different
+                # provider rather than an edit of this one — the patch is refused
+                # whole and no other field of it lands.
                 requested_auth_kind = self._requested_provider_auth_kind(requested_auth_kind)
                 if requested_auth_kind != current_auth["kind"]:
                     raise DomainError(
@@ -3823,6 +3846,10 @@ class ProvidersModelsDomain:
         used_deployment_ids: set[str],
     ) -> dict[str, Any]:
         model = _copy_mapping(value, "model")
+        # A new route arrives with the public model's own fields only: the Codex
+        # window is the group's declaration, and a copy that carried one per
+        # route would make the group's window depend on which route answered.
+        model.pop(PUBLIC_MODEL_CONTEXT_KEY, None)
         # Model catalogs may return explicit web-search capability flags. Keep
         # those flags in the canonical model_info_extra bucket used by the
         # config dumper instead of leaving them as transient top-level draft
@@ -4597,6 +4624,33 @@ class ProvidersModelsDomain:
                     source_model_id = self._wire_model_name(model)
                     model["source_model_id"] = source_model_id
                     if source_model_id not in catalog:
+                        # An absent model is evidence only where the station was
+                        # actually consulted about this key.  A dependency-only
+                        # Apply resolves from the credential the document already
+                        # persists and reads no catalog at all
+                        # (``catalog_authoritative`` false), so it learned nothing
+                        # and cannot refuse the write: judging it there refused
+                        # the automatic Apply that the shell fires the instant a
+                        # model is added, which is what left every later edit in
+                        # the window failing with 中转密钥无法解析.  A resolution
+                        # that did read the station still names the real cause —
+                        # a linked route whose upstream the group does not serve.
+                        #
+                        # Only an explicit false suppresses the refusal: a mapping
+                        # handed straight to this method carries no claim about how
+                        # its ``models`` list was obtained, so that list is the
+                        # evidence it states.
+                        if resource.get("catalog_authoritative") is False:
+                            model["binding_health"] = {"status": "linked"}
+                            materialized_models += 1
+                            affected_models.append(
+                                {
+                                    "provider_key_id": key["id"],
+                                    "model_id": model_id,
+                                    "upstream_model": source_model_id,
+                                }
+                            )
+                            continue
                         issues.append(
                             {
                                 "code": "catalog_model_missing",
@@ -5427,16 +5481,14 @@ class ProvidersModelsDomain:
                 merged_extra = dict(model.get("litellm_extra", {})) if isinstance(model.get("litellm_extra"), Mapping) else {}
                 merged_extra.update(changes["litellm_extra"])
                 changes["litellm_extra"] = merged_extra
-            for limit_key, limit_label in (
-                (PUBLIC_MODEL_CONTEXT_KEY, "Context window"),
-            ):
-                if limit_key not in changes:
-                    continue
-                limit = self._public_model_limit(changes.pop(limit_key), label=limit_label)
-                if limit is None:
-                    model.pop(limit_key, None)
-                else:
-                    model[limit_key] = limit
+            # A route declares no Codex window of its own.  The number is the
+            # public model's, written once for the whole group by
+            # ``public.model_patch``, so a per-route write is refused instead of
+            # quietly making one route of a group disagree with the others.
+            if PUBLIC_MODEL_CONTEXT_KEY in changes:
+                raise DomainError(
+                    "The Codex context window is set on the public model, not on one route"
+                )
             model.update(changes)
             if api_key_name_changed and not provider_key_changed:
                 selected_name = str(changes.get("api_key_name", "")).strip()

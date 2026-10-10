@@ -95,13 +95,30 @@ REQUIRED_ENTRY_POINT = "relay_detector.cli:app"
 
 # The adapter imports the staged package into the Core's interpreter and drives
 # these upstream objects.  A release that renames one must fail the build: the
-# alternative is a shipped app whose deep test raises at probe time.
+# alternative is a shipped app whose deep test raises at probe time.  The
+# per-protocol suite entry points are named here rather than the ``detect``
+# command because the adapter drives the library path upstream's own web
+# application uses; the CLI wrapper renders a terminal report between the run
+# and the JSON write and is not an entry point this app can use.
 REQUIRED_SOURCE_MARKERS: dict[str, tuple[str, ...]] = {
     "src/relay_detector/cli.py": ("async def _run_detect(",),
     # The adapter imports the compatibility module, so it has to keep
-    # re-exporting the execution models the suite is configured with.
+    # re-exporting the execution models and the scorer the report is built with.
     "src/relay_detector/models.py": ("core.models",),
-    "src/relay_detector/core/models.py": ("class ExecutionConfig", "class Mode", "class Protocol"),
+    "src/relay_detector/core/models.py": (
+        "class ExecutionConfig",
+        "class Mode",
+        "class Protocol",
+        "class DetectionReport",
+        "def mask_api_key(",
+    ),
+    "src/relay_detector/scorer.py": ("core.scorer",),
+    "src/relay_detector/core/scorer.py": (
+        "def compute_total(",
+        "def effective_verdict(",
+        "def fatal_run_error(",
+        "def summary_text(",
+    ),
     "src/relay_detector/report.py": ("def write_json(",),
 }
 PROTOCOL_MARKERS: dict[str, str] = {
@@ -110,6 +127,17 @@ PROTOCOL_MARKERS: dict[str, str] = {
     "gemini": "src/relay_detector/protocols/gemini/detectors/__init__.py",
 }
 BUILD_ALL_MARKER = "def build_all("
+# Every protocol module must keep publishing the three suite entry points the
+# adapter calls, with the two-argument detector factory it passes a mode to.
+PROTOCOL_ENTRY_POINTS: dict[str, tuple[str, ...]] = {
+    protocol: (
+        f"src/relay_detector/protocols/{protocol}/__init__.py",
+        "def build_detectors(",
+        "def build_runner(",
+        "def make_client(",
+    )
+    for protocol in ("anthropic", "openai", "gemini")
+}
 
 REQUIREMENT_NAME_PATTERN = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)")
 
@@ -262,6 +290,13 @@ def validate_entry_points(files: dict[str, bytes]) -> None:
     for protocol, path in PROTOCOL_MARKERS.items():
         if BUILD_ALL_MARKER not in _source_text(files, path):
             raise UpdateError(f"The {protocol} protocol no longer declares {BUILD_ALL_MARKER.strip()}")
+    for protocol, (path, *entry_points) in PROTOCOL_ENTRY_POINTS.items():
+        text = _source_text(files, path)
+        for entry_point in entry_points:
+            if entry_point not in text:
+                raise UpdateError(
+                    f"The {protocol} protocol no longer publishes {entry_point.strip('(')}"
+                )
 
 
 def _source_text(files: dict[str, bytes], path: str) -> str:

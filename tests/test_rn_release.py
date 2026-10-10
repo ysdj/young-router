@@ -287,6 +287,11 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn("YOUNG_ROUTER_PROXY_PROCESS=1", script)
         self.assertIn("image_generation_routing_hook", script)
         self.assertIn("strip -x -S", script)
+        self.assertIn("prune-macos-core.py", script)
+        self.assertIn("Published JavaScript packages include declaration files", script)
+        self.assertIn("Deduplicated", (ROOT / "scripts/prune-macos-core.py").read_text(encoding="utf-8"))
+        self.assertIn("OPTIONAL_RUNTIME_DIRS", (ROOT / "scripts/prune-macos-core.py").read_text(encoding="utf-8"))
+        self.assertIn('".ts"', (ROOT / "scripts/prune-macos-core.py").read_text(encoding="utf-8"))
         self.assertIn("case \"$(file -b \"$binary\")\"", script)
         self.assertIn('codesign --force --sign - "$binary"', script)
         self.assertLess(

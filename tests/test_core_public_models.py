@@ -200,17 +200,34 @@ class PublicModelDomainTests(unittest.TestCase):
                 {"public_model": "gpt-5.6-sol", "changes": {"provider": "backup"}},
             )
 
-    def test_a_model_limit_can_be_edited_on_one_route(self) -> None:
+    def test_a_route_refuses_a_context_window_of_its_own(self) -> None:
+        """The Codex window belongs to the public model, not to one route.
+
+        ``public.model_patch`` writes the number to every route of the group, so
+        a route-level write is what would make one route disagree with the
+        others.  It is refused with a sentence that names where the write
+        belongs, instead of silently landing on a single route.
+        """
+
+        with self.assertRaisesRegex(DomainError, "public model, not on one route"):
+            self.domain.dispatch(
+                "model.patch",
+                {
+                    "provider_id": "primary",
+                    "model_id": "00000001",
+                    "changes": {"max_input_tokens": 200000},
+                },
+            )
+        self.assertIsNone(self.model("00000001")["max_input_tokens"])
+        self.assertIsNone(self.model("00000002")["max_input_tokens"])
+
+        # The group's own action still writes it, to every route at once.
         self.domain.dispatch(
-            "model.patch",
-            {
-                "provider_id": "primary",
-                "model_id": "00000001",
-                "changes": {"max_input_tokens": 200000},
-            },
+            "public.model_patch",
+            {"public_model": "gpt-5.6-sol", "changes": {"max_input_tokens": 200000}},
         )
         self.assertEqual(200000, self.model("00000001")["max_input_tokens"])
-        self.assertIsNone(self.model("00000002")["max_input_tokens"])
+        self.assertEqual(200000, self.model("00000002")["max_input_tokens"])
 
     def test_a_negative_context_is_refused(self) -> None:
         with self.assertRaises(DomainError):

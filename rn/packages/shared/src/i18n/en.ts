@@ -452,7 +452,7 @@ export const en: Record<TranslationKey, string> = {
   "providers.fetchKeyUnavailable": "the API key could not be resolved",
   "providers.fetchEmpty": "The provider returned no models.",
   "providers.probe": "Probe",
-  "providers.deepTest": "Deep test",
+  "providers.deepTest": "Probe",
   "providers.deepTestHint": "Availability, then Veridrop's quick authenticity check",
   "providers.degradationMatched": "Not diluted",
   "providers.degradationMatchedDetail": "Check passed (fingerprint matches {target})",
@@ -553,6 +553,10 @@ export const en: Record<TranslationKey, string> = {
   // proxy-side ceiling the proxy never enforces, so the label keeps Codex in it.
   "providers.contextWindow": "Codex context",
   "providers.publicModelDefaultHint": "Default {value}",
+  // The button opens the public-model pane, which owns the write: the window
+  // is one number for the whole group, so the model detail never edits it.
+  "providers.publicModelSettings": "Set",
+  "providers.publicModelSettingsHint": "Change this model's Codex context in the public model's own settings",
   "providers.contextWindowHelpTitle": "What the Codex compaction window is",
   "providers.contextWindowHelp": "Tells a Codex client with the model catalog enabled how much conversation this model can hold, and it compacts on its own past that. This is not a proxy limit: requests are not capped, Codex simply compacts earlier. A value here also overrides the upstream metadata's maximum window and effective percentage.",
   "providers.followMultiplier": "Follow multiplier",

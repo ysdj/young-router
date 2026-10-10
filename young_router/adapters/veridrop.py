@@ -15,6 +15,16 @@ runtime does not already carry, and this adapter imports the staged package into
 the Core's own interpreter and runs its quick suite directly.  The upstream
 license text is staged beside it.
 
+The suite is driven through the per-protocol library entry points
+``build_detectors`` / ``build_runner`` / ``make_client`` and its report is built
+with upstream's own ``DetectionReport`` and scorer, which is the same path the
+upstream project's own web application takes.  The ``detect`` CLI wrapper is
+deliberately not the entry point: it renders a rich terminal report between the
+run and the JSON write, so a route that fails a detector - the one case the deep
+test exists to report - raises while formatting the failure and takes the whole
+finding with it.  The suite's rendering is a terminal concern and this Core has
+no terminal.
+
 The staged directory contains::
 
     src/relay_detector/**     upstream package, verbatim
@@ -36,13 +46,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from datetime import datetime, timezone
+import importlib
 import io
 import json
 import os
 from pathlib import Path
 import sys
-import tempfile
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, NamedTuple, Sequence
 
 
 _VERIDROP_DIR_ENV = "YOUNG_ROUTER_VERIDROP_DIR"
@@ -141,6 +152,33 @@ def target(*names: object) -> dict[str, str] | None:
     return None
 
 
+def protocol_for(*names: object) -> str:
+    """Which staged suite can speak for a model name, from the name alone.
+
+    The staged tables say which models upstream keeps a *reference* for; they
+    do not say which names the suite can measure.  The quick suite measures any
+    endpoint it can reach - its structural detectors compare a response against
+    the request that asked for it, not against a stored fingerprint - so a name
+    upstream has not listed yet is still probeable, and upstream's own entry
+    points select the suite the same way this does.
+
+    Empty means the name names no protocol, and the caller decides from what it
+    knows about the route rather than from a guess made here.
+    """
+
+    for name in names:
+        normalized = normalize_model_name(name)
+        if not normalized:
+            continue
+        if normalized.startswith("claude") or "/claude" in normalized:
+            return "anthropic"
+        if normalized.startswith(("gpt-", "o1", "o3", "o4", "chatgpt")):
+            return "openai"
+        if normalized.startswith("gemini") or "/gemini" in normalized:
+            return "gemini"
+    return ""
+
+
 def _missing_staged_files() -> list[str]:
     root = staged_root()
     missing: list[str] = []
@@ -185,13 +223,17 @@ def engine() -> dict[str, Any]:
     }
 
 
-def _import_upstream() -> tuple[Any, Any, Any, Any]:
+def _import_upstream() -> tuple[Any, Any, Any, Any, Any]:
     """Import the staged upstream entry points into this interpreter.
 
     The package directory is put on ``sys.path`` once; everything it imports
     from outside itself comes from the runtime's own site-packages, which the
     build completes with whatever the upstream project declares and the runtime
     does not already carry.
+
+    Every object named here is one the adapter calls, so a release that renames
+    one is caught by ``scripts/update_veridrop.py`` at build time instead of
+    surfacing as a failed probe in someone's settings pane.
     """
 
     missing = _missing_staged_files()
@@ -204,14 +246,57 @@ def _import_upstream() -> tuple[Any, Any, Any, Any]:
     if source not in sys.path:
         sys.path.insert(0, source)
     try:
-        from relay_detector import cli as cli_module
-        from relay_detector.models import ExecutionConfig, Mode, Protocol
+        from relay_detector.models import (
+            DetectionReport,
+            ExecutionConfig,
+            Mode,
+            Protocol,
+            mask_api_key,
+        )
+        from relay_detector.scorer import (
+            compute_total,
+            effective_verdict,
+            fatal_run_error,
+            summary_text,
+        )
     except Exception as exc:  # noqa: BLE001 - reported as an unavailable probe
         raise VeridropUnavailable(f"Veridrop could not be imported: {exc}") from exc
-    run_detect = getattr(cli_module, "_run_detect", None)
-    if run_detect is None:
-        raise VeridropUnavailable("The staged Veridrop no longer publishes its quick-suite runner")
-    return cli_module, run_detect, ExecutionConfig, Mode, Protocol
+    return (
+        ExecutionConfig,
+        Mode,
+        Protocol,
+        _ReportSupport(
+            report=DetectionReport,
+            mask_api_key=mask_api_key,
+            compute_total=compute_total,
+            effective_verdict=effective_verdict,
+            fatal_run_error=fatal_run_error,
+            summary_text=summary_text,
+        ),
+        _protocol_module,
+    )
+
+
+class _ReportSupport(NamedTuple):
+    """Upstream's report model and scorer, held together for one run."""
+
+    report: Any
+    mask_api_key: Any
+    compute_total: Any
+    effective_verdict: Any
+    fatal_run_error: Any
+    summary_text: Any
+
+
+def _protocol_module(protocol: str) -> Any:
+    """The staged module carrying one protocol's suite entry points."""
+
+    try:
+        return importlib.import_module(f"relay_detector.protocols.{protocol}")
+    except Exception as exc:  # noqa: BLE001 - reported as an unavailable probe
+        raise VeridropUnavailable(
+            f"The staged Veridrop carries no {protocol} entry points: {exc}"
+        ) from exc
 
 
 def _timeout_seconds(value: float | None) -> float:
@@ -257,61 +342,120 @@ def run_quick(
     if not isinstance(model, str) or not model.strip():
         raise ValueError("Veridrop needs the upstream model name")
 
-    cli_module, run_detect, execution_config, mode, protocol_type = _import_upstream()
+    execution_config, mode, protocol_type, support, load_protocol = _import_upstream()
     try:
         selected_protocol = protocol_type(normalized_protocol)
     except ValueError as exc:
         raise ValueError(f"Veridrop cannot probe the {protocol!r} protocol") from exc
+    # The suite's own module carries the entry points for this protocol, and
+    # loading it through the staged package is what keeps a renamed one a
+    # reported probe failure instead of an import error in the Core.
+    protocol_module = load_protocol(normalized_protocol)
     config = execution_config.for_mode(mode.QUICK, max_concurrent=_MAX_CONCURRENT_REQUESTS)
     config.overall_timeout_s = _timeout_seconds(timeout_seconds)
 
-    with tempfile.TemporaryDirectory(prefix="young-router-veridrop-") as directory:
-        report_path = Path(directory) / "report.json"
-        # The suite renders a terminal report through rich; the Core has no
-        # terminal of its own, so its own noise is captured and dropped instead
-        # of reaching the application log.
-        captured = io.StringIO()
-        try:
-            with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
-                asyncio.run(
-                    run_detect(
-                        selected_protocol,
-                        base_url.strip(),
-                        api_key,
-                        model,
-                        config,
-                        report_path,
-                    )
+    # The suite prints progress and its own terminal report; the Core has no
+    # terminal, so that noise is captured and dropped instead of reaching the
+    # application log.
+    captured = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
+            report = asyncio.run(
+                _run_suite(
+                    protocol=normalized_protocol,
+                    protocol_module=protocol_module,
+                    support=support,
+                    base_url=base_url.strip(),
+                    api_key=api_key,
+                    model=model,
+                    config=config,
+                    selected_protocol=selected_protocol,
                 )
-        except RuntimeError as exc:
-            if "asyncio.run() cannot be called" in str(exc):
-                raise RuntimeError(
-                    "Veridrop needs a thread without a running event loop"
-                ) from exc
-            raise RuntimeError(f"Veridrop failed: {exc}") from exc
-        except Exception as exc:  # noqa: BLE001 - reported as a failed finding
-            raise RuntimeError(f"Veridrop failed: {exc}") from exc
-        report = _read_report(report_path, captured.getvalue())
+            )
+    except RuntimeError as exc:
+        if "asyncio.run() cannot be called" in str(exc):
+            raise RuntimeError(
+                "Veridrop needs a thread without a running event loop"
+            ) from exc
+        raise RuntimeError(f"Veridrop failed: {exc}") from exc
+    except Exception as exc:  # noqa: BLE001 - reported as a failed finding
+        raise RuntimeError(f"Veridrop failed: {exc}") from exc
     return _normalize_report(report)
 
 
-def _read_report(report_path: Path, output: str) -> dict[str, Any]:
-    """The JSON report Veridrop wrote, or a failure naming what it printed."""
+async def _run_suite(
+    *,
+    protocol: str,
+    protocol_module: Any,
+    support: _ReportSupport,
+    base_url: str,
+    api_key: str,
+    model: str,
+    config: Any,
+    selected_protocol: Any,
+) -> dict[str, Any]:
+    """Run one quick suite and return its report as a plain mapping.
 
-    try:
-        payload = report_path.read_text(encoding="utf-8")
-    except OSError as exc:
-        detail = output.strip()
-        raise RuntimeError(
-            "Veridrop wrote no report"
-            + (f": {detail[-600:]}" if detail else f": {exc}")
-        ) from exc
+    The report is assembled exactly the way upstream's own web application
+    assembles it - same runner, same detectors, same scorer - and serialized
+    through upstream's report model, so the JSON shape is the one
+    :func:`_normalize_report` already reads.
+    """
+
+    for name in ("build_detectors", "build_runner", "make_client"):
+        if not hasattr(protocol_module, name):
+            raise VeridropUnavailable(
+                f"The staged Veridrop {protocol} module no longer publishes {name}"
+            )
+
+    async with protocol_module.make_client(
+        base_url, api_key, timeout=config.request_timeout_s
+    ) as client:
+        runner = protocol_module.build_runner(
+            client, protocol_module.build_detectors(config.mode), config
+        )
+        outcome = await runner.run(model)
+
+    results = list(outcome.results)
+    run_error = support.fatal_run_error(results)
+    score = 0.0 if run_error else support.compute_total(results)
+    verdict = support.effective_verdict(score, results)
+
+    # Identity is populated only by the Anthropic identity detector; the other
+    # protocols keep both fields empty, exactly as upstream reports them.
+    identity: str | None = None
+    brands: list[str] = []
+    for result in results:
+        if result.name != "identity" or not isinstance(result.details, dict):
+            continue
+        text = result.details.get("response_text")
+        if isinstance(text, str) and text.strip():
+            identity = text.strip()
+        found = result.details.get("detected_non_anthropic_brands")
+        if isinstance(found, list):
+            brands = [item for item in found if isinstance(item, str)]
+        break
+
+    report = support.report(
+        protocol=selected_protocol,
+        base_url=base_url,
+        api_key_masked=support.mask_api_key(api_key),
+        target_model=model,
+        mode=config.mode,
+        timestamp=datetime.now(timezone.utc),
+        total_score=score,
+        verdict=verdict,
+        results=results,
+        performance=outcome.performance,
+        summary=run_error or support.summary_text(score, verdict),
+        run_error=run_error,
+        self_reported_identity=identity,
+        detected_non_anthropic_brands=brands,
+    )
+    payload = report.model_dump_json()
     if len(payload) > _MAX_OUTPUT_BYTES:
         raise RuntimeError("Veridrop returned an oversized report")
-    try:
-        decoded = json.loads(payload)
-    except ValueError as exc:
-        raise RuntimeError(f"Veridrop returned an unreadable report: {exc}") from exc
+    decoded = json.loads(payload)
     if not isinstance(decoded, dict):
         raise RuntimeError("Veridrop returned an unexpected report shape")
     return decoded
@@ -367,6 +511,7 @@ __all__ = [
     "engine",
     "manifest",
     "normalize_model_name",
+    "protocol_for",
     "run_quick",
     "source_root",
     "staged_root",

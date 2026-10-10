@@ -904,6 +904,31 @@ class CoreServiceController:
         except Exception:
             raise RuntimeError("Provider/model configuration is invalid") from None
 
+    def stage_runtime_config(self, _operation: object = None) -> dict[str, Any]:
+        """Restage the runtime document and answer what the proxy would read.
+
+        The answer is a digest of the runtime config after staging, which is how
+        a caller decides whether a commit is one the proxy can see at all.  A
+        source edit that only touches parked rows, editor ids, or a relay slot's
+        materialized credential rewrites ``config.yaml`` while leaving this file
+        byte-identical; restarting for one of those spent the whole drain budget
+        to reload a document the proxy already had.
+
+        ``_operation`` is accepted because every service handler is invoked with
+        its own name; this one stages a document and never touches the child.
+        """
+
+        self._stage_runtime_config()
+        return {"fingerprint": self.runtime_fingerprint()}
+
+    def runtime_fingerprint(self) -> str | None:
+        """A digest of the exact bytes the managed proxy loads at startup."""
+
+        try:
+            return hashlib.sha256(self.paths.runtime_config.read_bytes()).hexdigest()
+        except OSError:
+            return None
+
     def reset_transient_routing_state(self) -> None:
         """Remove recovery/cooldown/affinity data at the start of a new app/proxy run."""
 
