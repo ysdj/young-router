@@ -46,6 +46,7 @@ from ...config.schema import (
 
 from ...adapters import veridrop
 from ...adapters import workbuddy as workbuddy_module
+from ... import adapters as managed_adapters
 from ...browser_identity import browser_request_headers
 from ...values import explicit_bool
 from ...api_base import isolated_http_opener, service_root
@@ -287,10 +288,20 @@ class ProvidersModelsDomain:
         # linked route, and the pane must point at it instead of only stating
         # that the change is not in effect.
         self._binding_issues: list[dict[str, str]] = []
+        # An empty slot that was already present when the user adds a model is
+        # unrelated to that model's write. Keep the action context long enough
+        # for the debounced Apply validator to distinguish that case from a
+        # newly added key, which still needs the secure editor.
+        self._model_edit_existing_key_ids: set[str] = set()
         # What the last live WorkBuddy read observed, per variant.  A snapshot
         # projects this instead of calling the worker: see
         # `_workbuddy_projection_status`.
         self._workbuddy_observed: dict[str, dict[str, Any]] = {}
+        # The per-model rate each managed account last published, per variant.
+        # Keys are model ids, and the values are the numbers themselves: a
+        # route set to follow its rate reads this at Apply time instead of
+        # spending a live catalog read while it writes.
+        self._published_rates: dict[str, dict[str, float]] = {}
         self.revision = 0
         self.reload()
 
@@ -515,16 +526,44 @@ class ProvidersModelsDomain:
         provider: Mapping[str, Any],
         model: Mapping[str, Any],
     ) -> str:
+        """The surface a route is given when it states none of its own.
+
+        One fact, one home: an account-backed provider serves its credentials
+        over exactly one surface, so a route that has not chosen yet starts
+        there.  A route that *has* chosen keeps its choice — the pane offers
+        both protocol mode and backup protocol on every route, and re-deciding
+        for the user would silently discard the one field he came to edit.
+        """
+
+        surface, _mode = ProvidersModelsDomain._account_route_defaults(provider)
+        if surface:
+            return surface
+        return infer_upstream_fallback_surface(model.get("litellm_model"))
+
+    @staticmethod
+    def _account_route_defaults(provider: Mapping[str, Any]) -> tuple[str, str]:
+        """``(surface, protocol mode)`` for a provider that owns its transport.
+
+        A subscription or desktop-app account is reached through one mounted
+        wire format, so its routes start pinned to it (``fixed``) instead of
+        probing a surface the account cannot serve.  A plain key authenticates
+        any surface, so those routes start on the inferred one and stay free to
+        follow the client (``fallback``).  A provider this function does not
+        recognize states no default, and its routes keep whatever they carry.
+        """
+
         auth_kind = ProvidersModelsDomain._provider_auth_state(provider)["kind"]
         if auth_kind == "claude_login":
-            return "anthropic"
+            return "anthropic", "fixed"
         if auth_kind == "openai_login":
-            return "openai/responses"
+            return "openai/responses", "fixed"
         if auth_kind in workbuddy_module.WORKBUDDY_AUTH_KINDS:
-            # The WorkBuddy upstream is a chat-completions endpoint only, so a
-            # WorkBuddy route never falls back to the Responses surface.
-            return "openai/chat"
-        return infer_upstream_fallback_surface(model.get("litellm_model"))
+            # The WorkBuddy worker mounts Chat Completions alone, so a route on
+            # this account never probes a Responses endpoint that cannot exist.
+            return "openai/chat", "fixed"
+        if auth_kind == "api_key":
+            return "", "fallback"
+        return "", "fixed"
 
     @classmethod
     def _canonical_upstream_model(
@@ -662,7 +701,17 @@ class ProvidersModelsDomain:
                     and selected_key["source"].get("kind") == "relay"
                 )
                 raw_order_mode = str(model.get("order_mode", "manual")).strip() or "manual"
-                order_mode = raw_order_mode if relay_selected or raw_order_mode != "relay_multiplier" else "manual"
+                # A mode whose authority went away is projected as manual: the
+                # station stopped publishing the group's rate, or the account
+                # behind it changed.  The same question the write path asks
+                # decides it, so a mode the editor accepted is never reported
+                # back as a different one.
+                order_mode = (
+                    raw_order_mode
+                    if raw_order_mode != "relay_multiplier"
+                    or self._route_has_rate_authority(provider, selected_key)
+                    else "manual"
+                )
                 models.append(
                     {
                         "id": str(model.get("deployment_id") or model.get("model_name") or self._editor_id(model, model=True)),
@@ -858,6 +907,7 @@ class ProvidersModelsDomain:
             "model_editor_ids": copy.deepcopy(self._model_editor_ids),
             "provider_editor_keys": copy.deepcopy(self._provider_editor_keys),
             "model_editor_keys": copy.deepcopy(self._model_editor_keys),
+            "model_edit_existing_key_ids": copy.deepcopy(self._model_edit_existing_key_ids),
             "revision": self.revision,
             "has_last_operation": has_last_operation,
             "last_operation": copy.deepcopy(getattr(self, "_last_operation", None)),
@@ -876,6 +926,7 @@ class ProvidersModelsDomain:
         self._model_editor_ids = copy.deepcopy(checkpoint["model_editor_ids"])
         self._provider_editor_keys = copy.deepcopy(checkpoint.get("provider_editor_keys", {}))
         self._model_editor_keys = copy.deepcopy(checkpoint.get("model_editor_keys", {}))
+        self._model_edit_existing_key_ids = copy.deepcopy(checkpoint.get("model_edit_existing_key_ids", set()))
         self.revision = int(checkpoint["revision"])
         if checkpoint.get("has_last_operation"):
             self._last_operation = copy.deepcopy(checkpoint.get("last_operation"))
@@ -1765,12 +1816,12 @@ class ProvidersModelsDomain:
         return result
 
     _PROBE_SURFACES: tuple[str, ...] = ("openai/responses", "openai/chat", "anthropic")
-    # The addresses this deployment serves itself.  A provider created for one
-    # of its own managed services carries the reference Core publishes for that
-    # worker (`os.environ/YOUNG_ROUTER_...`), never a literal URL.
-    _MANAGED_BASE_REFERENCES = frozenset(
-        f"os.environ/{name}" for name in workbuddy_module.API_BASE_ENV.values()
-    )
+
+    @classmethod
+    def _managed_base_references(cls) -> frozenset[str]:
+        """The ``os.environ/`` addresses of workers this deployment runs itself."""
+
+        return managed_adapters.managed_base_references()
 
     @classmethod
     def _is_managed_service(
@@ -1779,21 +1830,29 @@ class ProvidersModelsDomain:
         model: Mapping[str, Any],
         provider: Mapping[str, Any] | None,
     ) -> bool:
-        """Whether an address belongs to a service this deployment runs itself."""
+        """Whether an address belongs to a service this deployment runs itself.
 
+        The registry of bundled workers owns the answer, so adding an
+        integration that serves a model endpoint does not require teaching this
+        rule its name.  A loopback address the *user* runs is deliberately not
+        covered: only a reference Core itself published, or an address that
+        resolves to one of them in this process, counts.
+        """
+
+        references = cls._managed_base_references()
+        if not references:
+            return False
         for source in (model, provider):
             if not isinstance(source, Mapping):
                 continue
             value = source.get("api_base")
-            if isinstance(value, str) and value.strip() in cls._MANAGED_BASE_REFERENCES:
+            if isinstance(value, str) and value.strip() in references:
                 return True
         root = service_root(api_base)
         if not isinstance(root, str) or not root:
             return False
-        published = workbuddy_module.published_environment()
-        for name in workbuddy_module.API_BASE_ENV.values():
-            candidate = str(published.get(name, "")).strip()
-            if candidate and service_root(candidate) == root:
+        for candidate in managed_adapters.managed_base_urls():
+            if service_root(candidate) == root:
                 return True
         return False
 
@@ -2194,18 +2253,91 @@ class ProvidersModelsDomain:
                     "providers": dict(providers) if isinstance(providers, Mapping) else {},
                 }
                 return
-            document = runtime.models(provider_id, refresh=bool(data.get("refresh", True)))
+            # The catalog behind the pane's 倍率 column is the same document for
+            # every route on this account, so a read that did not ask to refresh
+            # is served from the worker client's remembered answer.  The pane's
+            # 刷新 button and the account import pass ``refresh``, which reaches
+            # upstream; anything else would fetch the whole desktop catalog again
+            # on every model switch.
+            document = runtime.models(provider_id, refresh=bool(data.get("refresh", False)))
         except Exception:
             raise DomainError("The WorkBuddy integration is unavailable") from None
         # A catalog read answers the account question too, and the worker's own
         # status rides that response.
         self._workbuddy_remember({"providers": {provider_id: document.get("status")}})
+        self._remember_published_rates(provider_id, document.get("models"))
         self._last_operation = {
             "operation": action,
             "provider": provider_id,
             "display_name": workbuddy_module.WORKBUDDY_DISPLAY_NAMES[provider_id],
             **document,
         }
+
+    def _refresh_published_rates(self, provider: Mapping[str, Any]) -> None:
+        """Learn the rates this provider's own account publishes, once.
+
+        Called only from an explicit edit that asks a route to follow a rate.
+        A snapshot, a load, and a projection must never reach this: it may
+        start a worker and read the desktop credential, so it belongs to a
+        user's own action, never to rendering one.
+        """
+
+        auth_kind = self._provider_auth_state(provider)["kind"]
+        if auth_kind not in managed_adapters.rate_publishing_auth_kinds():
+            return
+        provider_id = managed_adapters.rate_provider_id(auth_kind)
+        if not provider_id:
+            return
+        if isinstance(self._published_rates.get(provider_id), Mapping):
+            # The rates are already known; do not spend a read to learn them
+            # again.  A wrong rate is corrected by reading the catalog (刷新),
+            # which is the same place the 倍率 column comes from.
+            return
+        try:
+            document = self._workbuddy().models(provider_id, refresh=False)
+        except Exception:
+            return
+        self._remember_published_rates(provider_id, document.get("models"))
+
+    def _remember_published_rates(self, provider_id: str, models: object) -> None:
+        """Remember the rate one account's catalog states for each model.
+
+        A route set to follow its rate needs the number at Apply time, when no
+        live read may be spent: a catalog read is where the account states
+        what each model bills at, so it is recorded here as it arrives.
+        """
+
+        rates: dict[str, float] = {}
+        if isinstance(models, Sequence) and not isinstance(models, (str, bytes, bytearray)):
+            for entry in models:
+                if not isinstance(entry, Mapping):
+                    continue
+                model_id = str(entry.get("id", "")).strip()
+                rate = managed_adapters.model_rate(entry)
+                if not model_id or rate is None:
+                    continue
+                rates[model_id] = float(rate)
+        if rates:
+            self._published_rates[provider_id] = rates
+
+    def _published_rate(
+        self,
+        provider: Mapping[str, Any],
+        model: Mapping[str, Any],
+    ) -> float | None:
+        """The rate this route's own account publishes for it, if any."""
+
+        auth_kind = self._provider_auth_state(provider)["kind"]
+        if auth_kind not in managed_adapters.rate_publishing_auth_kinds():
+            return None
+        provider_id = managed_adapters.rate_provider_id(auth_kind)
+        if not provider_id:
+            return None
+        model_id = self._wire_model_name(model)
+        if not model_id:
+            return None
+        stored = self._published_rates.get(provider_id)
+        return stored.get(model_id) if isinstance(stored, Mapping) else None
 
     def _workbuddy_login_status(self, auth: Mapping[str, Any]) -> dict[str, Any]:
         """The worker's account record for one WorkBuddy login provider.
@@ -2516,23 +2648,21 @@ class ProvidersModelsDomain:
         for model in models:
             if not isinstance(model, dict):
                 continue
-            if auth_kind == "openai_login":
-                model["upstream_url_surface"] = "openai/responses"
-                model["upstream_protocol_mode"] = "fixed"
-            elif auth_kind == "claude_login":
-                model["upstream_url_surface"] = "anthropic"
-                model["upstream_protocol_mode"] = "fixed"
-            elif auth_kind in workbuddy_module.WORKBUDDY_AUTH_KINDS:
-                # The worker serves Chat Completions only; pinning the surface
-                # keeps the router from probing a Responses endpoint that
-                # cannot exist on this route.
-                model["upstream_url_surface"] = "openai/chat"
-                model["upstream_protocol_mode"] = "fixed"
-            else:
+            # A route the user has already decided keeps its decision.  The
+            # pane offers 协议方式 and the backup protocol on every route, and
+            # this function runs on *every* model of the provider whenever one
+            # model is added, so assigning here unconditionally would rewrite
+            # the whole group's protocol each time the roster grows — including
+            # a surface the user picked against the account's own default.
+            default_surface, default_mode = cls._account_route_defaults(provider)
+            if default_surface and not str(model.get("upstream_url_surface", "")).strip():
+                model["upstream_url_surface"] = default_surface
+            if not str(model.get("upstream_protocol_mode", "")).strip():
+                model["upstream_protocol_mode"] = default_mode
+            if not str(model.get("upstream_url_surface", "")).strip():
                 model["upstream_url_surface"] = infer_upstream_fallback_surface(
                     model.get("litellm_model")
                 )
-                model["upstream_protocol_mode"] = "fallback"
             model["litellm_model"] = cls._canonical_upstream_model(
                 model.get("litellm_model"), model, provider
             )
@@ -2680,6 +2810,26 @@ class ProvidersModelsDomain:
             return None
         return keys[0] if keys else None
 
+    @staticmethod
+    def _route_has_rate_authority(
+        provider: Mapping[str, Any],
+        key: Mapping[str, Any] | None,
+    ) -> bool:
+        """Whether something outside this document states this route's rate.
+
+        Two authorities can: a relay key, whose station states the group's
+        multiplier, and a managed account whose own catalog states what each
+        model bills at.  Both are the same relation — the route's order follows
+        a number this app does not decide — so the mode has one gate that asks
+        this question instead of naming either one.
+        """
+
+        if key is not None and isinstance(key.get("source"), Mapping):
+            if key["source"].get("kind") == "relay":
+                return True
+        auth_kind = ProvidersModelsDomain._provider_auth_state(provider)["kind"]
+        return auth_kind in managed_adapters.rate_publishing_auth_kinds()
+
     def _normalize_model_binding(
         self,
         provider: Mapping[str, Any],
@@ -2703,8 +2853,8 @@ class ProvidersModelsDomain:
             and isinstance(key.get("source"), Mapping)
             and key["source"].get("kind") == "relay"
         )
-        if order_mode == "relay_multiplier" and not relay_selected:
-            raise DomainError("Relay multiplier order requires a relay provider key")
+        if order_mode == "relay_multiplier" and not self._route_has_rate_authority(provider, key):
+            raise DomainError("Following a rate requires a provider key that publishes one")
         # ProviderKey.source is the single relation source of truth.  These
         # editor fields remain derived for old documents/UI readers, but they
         # are never accepted as an independent model-level binding contract.
@@ -2723,7 +2873,18 @@ class ProvidersModelsDomain:
         else:
             effective = model.get("effective_order")
             if effective is None or str(effective).strip() == "":
-                model["effective_order"] = None
+                # Before Apply a relay multiplier has not been fetched yet, so
+                # the placeholder below keeps the staged draft valid; the
+                # coordinator is still the strict gate that writes the real
+                # one.  A rate the account *has* published is already known,
+                # so it materializes here instead of waiting for a fetch that
+                # only a station read could satisfy.
+                published = self._published_rate(provider, model)
+                model["effective_order"] = (
+                    None if published is None else self._order_value(published, label="Model rate")
+                )
+                if published is not None:
+                    model["order"] = model["effective_order"]
             else:
                 model["effective_order"] = self._order_value(effective)
                 model["order"] = model["effective_order"]
@@ -2754,15 +2915,9 @@ class ProvidersModelsDomain:
                 if not isinstance(model, dict):
                     continue
                 key = self._model_provider_key(provider, model)
-                relay_selected = (
-                    key is not None
-                    and isinstance(key.get("source"), Mapping)
-                    and key["source"].get("kind") == "relay"
-                )
                 if (
-                    not relay_selected
-                    and str(model.get("order_mode", "manual")).strip()
-                    == "relay_multiplier"
+                    str(model.get("order_mode", "manual")).strip() == "relay_multiplier"
+                    and not self._route_has_rate_authority(provider, key)
                 ):
                     manual_order = self._order_value(
                         model.get("manual_order", model.get("order", 0)),
@@ -3736,11 +3891,7 @@ class ProvidersModelsDomain:
         if not str(model.get("upstream_url_surface", "")).strip():
             model["upstream_url_surface"] = self._default_upstream_surface(provider, model)
         if not str(model.get("upstream_protocol_mode", "")).strip():
-            model["upstream_protocol_mode"] = (
-                "fixed"
-                if self._provider_auth_state(provider)["kind"] != "api_key"
-                else "fallback"
-            )
+            model["upstream_protocol_mode"] = self._account_route_defaults(provider)[1]
         if "litellm_model" in model:
             model["litellm_model"] = self._canonical_upstream_model(
                 model["litellm_model"], model, provider
@@ -5076,6 +5227,11 @@ class ProvidersModelsDomain:
         providers = self._draft["providers"]
         provider_index = self._provider_index(data)
         provider = self._copy_provider_for_edit(providers[provider_index])
+        existing_key_ids = {
+            str(item.get("id", "")).strip()
+            for item in self._provider_api_keys(provider)
+            if str(item.get("id", "")).strip()
+        }
         models = provider.get("models")
         if not isinstance(models, list):
             models = []
@@ -5171,6 +5327,7 @@ class ProvidersModelsDomain:
             providers[provider_index] = provider
             return
         if action in {"model_add", "add_model", "model_add_many", "add_models"}:
+            self._model_edit_existing_key_ids = existing_key_ids
             values: list[object]
             if action in {"model_add_many", "add_models"}:
                 supplied = data.get("models")
@@ -5227,12 +5384,16 @@ class ProvidersModelsDomain:
             next_order_mode = str(changes.get("order_mode", current_order_mode)).strip() or "manual"
             if "order" in changes and "manual_order" not in changes and next_order_mode == "manual":
                 changes["manual_order"] = changes["order"]
-            if (
-                next_order_mode == "relay_multiplier"
-                and current_order_mode != "relay_multiplier"
-                and "effective_order" not in changes
-            ):
-                changes["effective_order"] = None
+            if next_order_mode == "relay_multiplier" and current_order_mode != "relay_multiplier":
+                # The mode is being asked for now, so this is the moment to
+                # learn the number it follows.  An account that states its
+                # rates publishes them on a catalog read, and a relay station's
+                # multiplier arrives with the Apply's own binding read — so a
+                # rate this app has not been told yet is fetched once, here,
+                # instead of being written as a null the dumper then refuses.
+                self._refresh_published_rates(provider)
+                if "effective_order" not in changes:
+                    changes["effective_order"] = None
             if "model_enabled" in changes:
                 changes["enabled"] = changes["model_enabled"]
             elif "enabled" in changes:
@@ -5802,10 +5963,42 @@ class ProvidersModelsDomain:
                     keys = self._provider_api_keys(provider)
                 except DomainError:
                     return {"valid": False, "errors": ["Provider API keys are invalid"]}
+                models = provider.get("models", [])
+                required_key_ids: set[str] = set()
+                referenced_key_ids: set[str] = set()
+                if isinstance(models, list):
+                    for model in models:
+                        if not isinstance(model, Mapping):
+                            continue
+                        key = _key_for_model(keys, model)
+                        if key is None:
+                            continue
+                        key_id = str(key.get("id", "")).strip()
+                        if not key_id:
+                            continue
+                        referenced_key_ids.add(key_id)
+                        if _model_is_live(provider, model):
+                            required_key_ids.add(key_id)
                 # One coded issue per nameless-value key instead of a single
                 # anonymous error: the pane can only point at the provider row
-                # it has to open when the location travels with the issue.
+                # it has to open when the location travels with the issue. A
+                # key used only by a disabled route is a saved choice; it does
+                # not need a credential until that route is enabled. Keep the
+                # existing requirement for a newly added independent slot so
+                # the secure key editor can finish before its slot is written.
                 for index, key in enumerate(keys):
+                    key_id = str(key.get("id", "")).strip()
+                    if key_id in referenced_key_ids and key_id not in required_key_ids:
+                        continue
+                    if key_id in self._model_edit_existing_key_ids and key_id not in required_key_ids:
+                        continue
+                    if (
+                        key_id not in required_key_ids
+                        and allow_unmaterialized_relay_keys
+                        and isinstance(key.get("source"), Mapping)
+                        and key["source"].get("kind") == "relay"
+                    ):
+                        continue
                     name = key.get("name")
                     if not isinstance(name, str) or not name.strip():
                         continue
@@ -6040,6 +6233,7 @@ class ProvidersModelsDomain:
                 raise DomainError("Provider/model configuration changed on disk; reload and try again") from None
             raise _safe_problem(exc, "Provider/model configuration could not be saved") from None
         self.reload()
+        self._model_edit_existing_key_ids.clear()
         return {"applied": True, **self.snapshot()}
 
     def _current_disk_revision(self) -> object:
@@ -6090,6 +6284,7 @@ class ProvidersModelsDomain:
         self._exists = bool(loaded["exists"])
         self._restore_editor_id_bindings(provider_bindings, model_bindings)
         self._probe_overlay.clear()
+        self._model_edit_existing_key_ids.clear()
         self.revision += 1
         return self.snapshot()
 

@@ -957,7 +957,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('value={String(displayedOrder)}')
         self.assert_ui_has('label={translate("providers.order")}')
         self.assert_ui_has('label={translate("providers.followMultiplier")}')
-        self.assert_ui_has('const canFollowMultiplier = usesRelayKey && relayMultiplier !== undefined;')
+        # The switch is offered wherever a rate is known — a relay group's
+        # multiplier or an account's own published catalog — so it asks about
+        # the rate, not about which kind of provider the route uses.
+        self.assert_ui_has('const followsServiceRate = usesRelayKey || providerService(provider) !== undefined;')
+        self.assert_ui_has('const followedRate = usesRelayKey ? relayMultiplier : serviceRateNumber(serviceRate);')
+        self.assert_ui_has('const canFollowMultiplier = followsServiceRate && followedRate !== undefined;')
         self.assert_ui_has('{canFollowMultiplier ? <NativeCheckbox')
         self.assert_ui_has('const order = Number.isFinite(parsed) ? parsed : 0;')
         self.assert_ui_has('changes: { manual_order: order, order }')
@@ -5217,7 +5222,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'changes: { provider_key_id: providerKey.id, api_key_name: providerKeyName },',
             'providerKeyOptions.length > 0 ? <PickerField label={translate("providers.providerKey")}',
             'const activeRouteGroupUsesMultiplier = activeRouteGroup.some((entry) => modelOrderMode(entry.model) === "relay_multiplier");',
-            'const canFollowMultiplier = usesRelayKey && relayMultiplier !== undefined;',
+            'const canFollowMultiplier = followsServiceRate && followedRate !== undefined;',
             'label={translate("providers.order")}',
             'label={translate("providers.followMultiplier")}',
             '{canFollowMultiplier ? <NativeCheckbox',
@@ -6360,21 +6365,16 @@ class ReactNativeUiParityTests(unittest.TestCase):
                 self.assertIsNone(english_apply.search(english_copy[key]), f"{path.name}: {key}")
                 self.assertIsNone(chinese_apply.search(chinese_copy[key]), f"{path.name}: {key}")
 
-    def test_macos_leaf_localizes_window_titles_and_keeps_status_menu_order(self) -> None:
+    def test_macos_leaf_localizes_window_titles_and_keeps_no_status_menu(self) -> None:
         # Settings panes share one window, so its title is the app name and the
         # sidebar selection names the active pane.
         self.assertIn('if Self.settingsPaneRoutes.contains(canonicalRoute(route)) {', self.macos_leaf)
         self.assertIn('return localized("appTitle", fallback: "Young Router")', self.macos_leaf)
         self.assertIn('case "provider-wizard": return "LiteLLM " + localized("routeProviderWizard", fallback: "Add Provider")', self.macos_leaf)
-        self.assertIn("private static let statusMenuOrder", self.macos_leaf)
-        for ordered_item in (
-            '"toggle-autostart", "toggle-codex-model-catalog", "separator"',
-            '"open-providers-models", "open-runtime-settings", "open-codex-settings", "separator"',
-            '"webdav-status", "open-data-management", "separator"',
-            '"open-logs", "separator"',
-            '"show-version", "quit"',
-        ):
-            self.assertIn(ordered_item, self.macos_leaf, ordered_item)
+        # macOS no longer draws a status-item menu, so there is no order to
+        # keep: either mouse button opens the shared settings window.
+        self.assertNotIn("statusMenuOrder", self.macos_leaf)
+        self.assertNotIn("makeMenu", self.macos_leaf)
 
     def test_data_management_route_replaces_standalone_webdav_route_everywhere(self) -> None:
         routes = (ROOT / "rn/packages/shared/src/routes.ts").read_text(encoding="utf-8")

@@ -190,6 +190,149 @@ class WorkBuddyProviderTests(unittest.TestCase):
             self.assertEqual([model["model_name"] for model in added["models"]], ["glm-5.3", "hy3"])
             self.assertTrue(all(model["upstream_protocol_mode"] == "fixed" for model in added["models"]))
 
+    def test_a_route_the_user_re_protocolled_survives_the_next_model_add(self) -> None:
+        """Growing the roster never rewrites a route's own protocol choice.
+
+        The pane offers 协议方式 and the backup protocol on *every* route, so the
+        user can move one off the account's default.  Adding a model runs over
+        the provider's whole model list, and a wholesale assignment there
+        silently re-pinned every route each time the roster grew — the one
+        field the user had just edited reverted, and which surface a route
+        speaks is what decides whether a client is bridged or refused.
+        """
+
+        directory, domain, _config = self._domain()
+        with directory:
+            provider = domain.dispatch("service_provider.add", {"kind": "workbuddy_login"})["providers"][0]
+            provider_id = provider["id"]
+            model_id = provider["models"][0]["id"]
+            self.assertEqual(provider["models"][0]["upstream_protocol_mode"], "fixed")
+
+            domain.dispatch(
+                "model.patch",
+                {
+                    "provider_id": provider_id,
+                    "model_id": model_id,
+                    "changes": {"upstream_protocol_mode": "fallback"},
+                },
+            )
+            self.assertEqual(
+                domain.snapshot()["providers"][0]["models"][0]["upstream_protocol_mode"],
+                "fallback",
+            )
+
+            domain.dispatch(
+                "model.add",
+                {"provider_id": provider_id, "model": {"name": "extra", "upstream_model": "extra"}},
+            )
+            models = domain.snapshot()["providers"][0]["models"]
+            self.assertEqual(
+                [model["upstream_protocol_mode"] for model in models],
+                ["fallback", "fixed", "fixed"],
+            )
+            # The account's own surface is still what every route starts on.
+            self.assertTrue(all(model["upstream_url_surface"] == "openai/chat" for model in models))
+
+    def test_a_workbuddy_route_can_follow_the_rate_its_own_catalog_states(self) -> None:
+        """跟随倍率 is not reserved for relay keys.
+
+        The desktop catalog already states what each model bills at
+        (``x0.79``), which is the same relation a station's group multiplier
+        is: the route's order follows a number this app does not decide.  The
+        account publishes it on a catalog read, so the order materializes from
+        that number instead of waiting for a station read — and the write has
+        to survive the round trip through the config file, since `order` is what
+        the router actually sorts by.
+        """
+
+        directory, domain, config = self._domain()
+        with directory:
+            provider = domain.dispatch("service_provider.add", {"kind": "workbuddy_login"})["providers"][0]
+            provider_id = provider["id"]
+            # The catalog read is where the account states its rates.
+            domain.dispatch("workbuddy_models", {"provider": "workbuddy"})
+            self.assertEqual(domain._published_rates, {"workbuddy": {"glm-5.3": 0.79, "hy3": 0.0}})
+
+            model_id = provider["models"][0]["id"]
+            domain.dispatch(
+                "model.patch",
+                {"provider_id": provider_id, "model_id": model_id, "changes": {"order_mode": "relay_multiplier"}},
+            )
+            followed = domain.snapshot()["providers"][0]["models"][0]
+            self.assertEqual(followed["order_mode"], "relay_multiplier")
+            self.assertEqual(followed["effective_order"], 0.79)
+            self.assertEqual(followed["order"], 0.79)
+            self.assertTrue(domain.validate()["valid"])
+
+            self.assertTrue(domain.apply()["applied"])
+            document = config.read_text(encoding="utf-8")
+            self.assertIn("x-young-router-order-mode: relay_multiplier", document)
+            self.assertIn("order: 0.79", document)
+
+            # The mode and the number it resolved to both come back.
+            domain.reload()
+            reloaded = domain.snapshot()["providers"][0]["models"][0]
+            self.assertEqual(reloaded["order_mode"], "relay_multiplier")
+            self.assertEqual(reloaded["effective_order"], 0.79)
+
+    def test_following_the_rate_learns_it_before_the_pane_ever_shows_it(self) -> None:
+        """The rate arrives when it is asked for, not only when a pane read it.
+
+        A route can be told to follow its rate before any catalog read happened
+        — a link created straight from the provider editor, or a session that
+        never opened the model list.  The edit is the moment the number is
+        needed, so it is learned there; otherwise the mode was accepted and the
+        write then failed with a null the dumper could not order by.
+        """
+
+        directory, domain, config = self._domain()
+        with directory:
+            provider = domain.dispatch("service_provider.add", {"kind": "workbuddy_login"})["providers"][0]
+            self.assertEqual(domain._published_rates, {})
+            domain.dispatch(
+                "model.patch",
+                {
+                    "provider_id": provider["id"],
+                    "model_id": provider["models"][0]["id"],
+                    "changes": {"order_mode": "relay_multiplier"},
+                },
+            )
+            followed = domain.snapshot()["providers"][0]["models"][0]
+            self.assertEqual(followed["effective_order"], 0.79)
+            self.assertTrue(domain.validate()["valid"])
+            self.assertTrue(domain.apply()["applied"])
+            self.assertIn("order: 0.79", config.read_text(encoding="utf-8"))
+
+    def test_a_plain_key_route_cannot_follow_a_rate_nobody_states(self) -> None:
+        """Following a rate needs an authority that states one.
+
+        A plain key authenticates any surface but states no rate, so a route on
+        one cannot follow a number that does not exist.  The refusal keeps its
+        own message instead of silently writing a hand-typed order.
+        """
+
+        directory, domain, _config = self._domain()
+        with directory:
+            provider = domain.dispatch(
+                "provider.add",
+                {
+                    "provider": {
+                        "name": "Custom",
+                        "api_base": "https://api.example.test/v1",
+                        "models": [{"name": "m1", "upstream_model": "m1", "enabled": True}],
+                    }
+                },
+            )["providers"][0]
+            with self.assertRaisesRegex(DomainError, "publishes one"):
+                domain.dispatch(
+                    "model.patch",
+                    {
+                        "provider_id": provider["id"],
+                        "model_id": provider["models"][0]["id"],
+                        "changes": {"order_mode": "relay_multiplier"},
+                    },
+                )
+
     def test_service_provider_add_refuses_a_signed_out_desktop_app(self) -> None:
         directory, domain, _config = self._domain(StubRuntime(state="signed-out"))
         with directory:
@@ -578,6 +721,26 @@ class WorkBuddyModuleTests(unittest.TestCase):
             ["anthropic", "openai/chat", "openai/responses"],
         )
 
+    def test_the_managed_registry_names_no_particular_integration(self) -> None:
+        """\u201cA service this deployment runs itself\u201d is a registry, not a product.
+
+        The rule that keeps a probe off this app's own plumbing is about the
+        deployment owning the worker, so the addresses come from the adapters
+        that publish one.  A product name here would mean the next bundled
+        worker silently gets probed as if it were a third party's server.
+        """
+
+        import young_router.adapters as adapters
+        from young_router.adapters import workbuddy as workbuddy_module
+
+        expected = frozenset(
+            f"os.environ/{name}" for name in workbuddy_module.API_BASE_ENV.values()
+        )
+        self.assertEqual(adapters.managed_base_references(), expected)
+        # The resolved half of the same fact is asked for by address, so a
+        # worker that publishes one is recognized without naming it here.
+        self.assertIsInstance(adapters.managed_base_urls(), tuple)
+
     def test_a_remembered_worker_publishes_its_environment(self) -> None:
         """Core resolves the loopback base and bearer before it starts one."""
 
@@ -648,6 +811,72 @@ class WorkBuddyModuleTests(unittest.TestCase):
         with unittest.mock.patch.object(workbuddy, "available", return_value=False):
             self.assertFalse(runtime.ensure_started())
             self.assertEqual(runtime.environment(), {})
+
+    def test_a_fresh_catalog_is_remembered_and_an_explicit_read_refreshes(self) -> None:
+        """The 倍率 column does not pay for a worker round trip per model switch.
+
+        Every route on one account shows a rate from that account's single
+        catalog, and the pane reads it once per selected model.  Without a
+        remembered answer each switch started the worker and asked the desktop
+        app to resolve a credential and fetch the roster again.
+        """
+
+        root = tempfile.mkdtemp()
+        runtime = workbuddy.WorkBuddyRuntime(root)
+        document = {
+            "available": True,
+            "source": "live",
+            "fetchedAtMs": 1,
+            "models": [{"id": "glm-5.3", "billing": {"credits": "x0.79 credits"}}],
+            "status": {"state": "signed-in"},
+        }
+        with unittest.mock.patch.object(workbuddy, "available", return_value=True), unittest.mock.patch.object(
+            runtime, "_request", return_value=dict(document)
+        ) as request:
+            first = runtime.models("workbuddy")
+            self.assertEqual([model["id"] for model in first["models"]], ["glm-5.3"])
+            self.assertEqual(request.call_count, 1)
+            self.assertNotIn("refresh=1", request.call_args.args[0])
+
+            # A second plain read is answered from the remembered catalog.
+            second = runtime.models("workbuddy")
+            self.assertEqual(second["models"], first["models"])
+            self.assertEqual(request.call_count, 1)
+
+            # An explicit read reaches upstream again, and says so on the wire.
+            runtime.models("workbuddy", refresh=True)
+            self.assertEqual(request.call_count, 2)
+            self.assertIn("refresh=1", request.call_args.args[0])
+
+            # The answer is this object's own: a caller cannot mutate the cache.
+            second["models"].append({"id": "invented"})
+            self.assertEqual(len(runtime.models("workbuddy")["models"]), 1)
+
+    def test_a_failed_catalog_read_is_never_remembered(self) -> None:
+        """A signed-out account must not stay signed-out in the cache."""
+
+        root = tempfile.mkdtemp()
+        runtime = workbuddy.WorkBuddyRuntime(root)
+        with unittest.mock.patch.object(workbuddy, "available", return_value=True):
+            with unittest.mock.patch.object(
+                runtime,
+                "_request",
+                return_value={"available": False, "status": {"state": "signed-out"}, "models": []},
+            ) as request:
+                self.assertFalse(runtime.models("workbuddy")["available"])
+                self.assertFalse(runtime.models("workbuddy")["available"])
+                self.assertEqual(request.call_count, 2)
+
+            # An available-but-empty read is the same hazard: remembering it
+            # would blank every 倍率 until the interval expired.
+            with unittest.mock.patch.object(
+                runtime,
+                "_request",
+                return_value={"available": True, "models": [], "status": {"state": "signed-in"}},
+            ) as request:
+                runtime.models("workbuddy")
+                runtime.models("workbuddy")
+                self.assertEqual(request.call_count, 2)
 
 
 # The staged worker's own product knowledge is a Node process this Core owns,

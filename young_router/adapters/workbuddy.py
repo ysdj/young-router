@@ -21,9 +21,12 @@ it and the provider stays disabled until the user signs in.
 
 from __future__ import annotations
 
+import copy
 import json
+import math
 import os
 from pathlib import Path
+import re
 import secrets
 import socket
 import subprocess
@@ -50,6 +53,10 @@ AUTH_KIND_TO_PROVIDER = {
     WORKBUDDY_AI_AUTH_KIND: WORKBUDDY_AI_PROVIDER,
 }
 PROVIDER_TO_AUTH_KIND = {value: key for key, value in AUTH_KIND_TO_PROVIDER.items()}
+# The desktop catalog states what each model bills at, so a route on either
+# variant can follow that rate the way a relay group's multiplier is followed.
+RATE_AUTH_KINDS = frozenset(WORKBUDDY_AUTH_KINDS)
+RATE_AUTH_KIND_TO_PROVIDER = dict(AUTH_KIND_TO_PROVIDER)
 
 WORKBUDDY_DISPLAY_NAMES = {
     WORKBUDDY_PROVIDER: "WorkBuddy",
@@ -77,12 +84,69 @@ _WORKBUDDY_WORKER_ENV = "YOUNG_ROUTER_WORKBUDDY_WORKER"
 _WORKBUDDY_START_TIMEOUT_SECONDS = 45.0
 _WORKBUDDY_STATUS_TIMEOUT_SECONDS = 20.0
 _WORKBUDDY_MODELS_TIMEOUT_SECONDS = 90.0
+# Two reads answer through this client, and both are asked for more often than
+# their upstream changes.  A signed-in state moves when the user signs the
+# desktop app in or out; a catalog churns about daily.  Caching them keeps one
+# opened model pane from paying a worker round trip (and, for the credit, a
+# desktop credential read) per model switch, while an explicit refresh still
+# reaches upstream.  The TTLs differ because the cost and the churn differ:
+# sign-in state is cheap to re-read and can change under the user, while the
+# catalog is what the pane's 倍率 column shows and does not.
+_WORKBUDDY_STATUS_TTL_SECONDS = 20.0
+_WORKBUDDY_MODELS_TTL_SECONDS = 120.0
 # A worker that served for at least this long died a casualty, not a defect:
 # it is replaced on the spot.  One that dies younger is restarted on the next
 # delay step instead, and one that keeps dying young is left to the demand
 # path (a pane read, the next proxy launch) after the steps run out.
 _WORKBUDDY_SETTLED_SECONDS = 60.0
 _WORKBUDDY_RESTART_DELAYS_SECONDS = (0.0, 0.5, 2.0, 5.0, 15.0)
+
+
+def _billing_multiplier(billing: object) -> float | None:
+    """The credit rate one catalog entry bills at, as a number.
+
+    The desktop catalog spells a rate the way its own UI does (``\"x0.79
+    credits\"``, or a free entry that costs nothing).  Parsing it here keeps
+    the worker's document shape in the adapter that owns the protocol, so a
+    caller reasons about a rate rather than about how the catalog spells one.
+    """
+
+    if not isinstance(billing, Mapping):
+        return None
+    raw = billing.get("credits")
+    if isinstance(raw, str) and raw.strip():
+        text = raw.strip()
+        if text[:1] in {"x", "X", "×"}:
+            text = text[1:].strip()
+        text = re.sub(r"\s*credits?\s*$", "", text, flags=re.IGNORECASE).strip()
+        try:
+            value = float(text)
+        except ValueError:
+            return None
+        if not math.isfinite(value) or value < 0:
+            return None
+        return value
+    if billing.get("free") is True:
+        return 0.0
+    return None
+
+
+def model_rate(entry: object) -> float | None:
+    """The rate one catalog entry bills at, or ``None`` when it states none.
+
+    A catalog entry is the worker's own document shape, so interpreting it
+    belongs here rather than in each caller.  An entry that already carries a
+    parsed ``rate`` is answered with it; otherwise the ``billing`` document is
+    read the way the upstream spells it.
+    """
+
+    if not isinstance(entry, Mapping):
+        return None
+    parsed = entry.get("rate")
+    if not isinstance(parsed, bool) and isinstance(parsed, (int, float)):
+        value = float(parsed)
+        return value if math.isfinite(value) and value >= 0 else None
+    return _billing_multiplier(entry.get("billing"))
 
 
 class WorkBuddyUnavailable(RuntimeError):
@@ -183,6 +247,10 @@ class WorkBuddyRuntime:
         self._token = ""
         self._environment: dict[str, str] = {}
         self._status_cache: tuple[float, dict[str, Any]] | None = None
+        # One catalog per variant, stamped like the status cache above: a model
+        # pane reads this once per model switch, and the worker's own read is a
+        # full credential resolve plus an upstream fetch.
+        self._models_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._log_path = self.root / "worker.log"
         # The loopback port and its bearer outlive this Core: a replacement
         # Core resumes the same listener, so a proxy that is still running
@@ -280,7 +348,10 @@ class WorkBuddyRuntime:
             return False
         self._port = int(ready.get("port") or 0)
         self._environment = self._proxy_environment()
+        # A freshly started worker has its own credential read ahead of it: what
+        # the previous worker answered describes a process that is gone.
         self._status_cache = None
+        self._models_cache = {}
         self._started_at = time.monotonic()
         self._persist_state()
         # The fragment this process hands out is the address the worker it just
@@ -459,6 +530,7 @@ class WorkBuddyRuntime:
         self._port = 0
         self._environment = {}
         self._status_cache = None
+        self._models_cache = {}
         for name in (API_BASE_ENV, API_KEY_ENV):
             for variable in name.values():
                 os.environ.pop(variable, None)
@@ -526,7 +598,7 @@ class WorkBuddyRuntime:
         now = time.monotonic()
         if not refresh and self._status_cache is not None:
             stamped, cached = self._status_cache
-            if now - stamped < 20.0:
+            if now - stamped < _WORKBUDDY_STATUS_TTL_SECONDS:
                 return cached
         if not available():
             return {"available": False, "detail": "integration_unstaged", "providers": {}}
@@ -542,12 +614,32 @@ class WorkBuddyRuntime:
             "providers": dict(providers) if isinstance(providers, dict) else {},
         }
         self._status_cache = (now, result)
+        if refresh:
+            # A refreshing status read also re-reads both catalogs upstream (the
+            # worker refreshes every variant before it answers), so an answer
+            # remembered from before this call describes a catalog the worker
+            # has already replaced.  That is what makes the account's own 刷新
+            # button refresh the 倍率 column beside it.
+            self._models_cache.clear()
         return result
 
     def models(self, provider: str, *, refresh: bool = False) -> dict[str, Any]:
-        """Return one variant's catalog, with the worker's own provenance."""
+        """Return one variant's catalog, with the worker's own provenance.
+
+        The catalog answers the 倍率 column of every route on this account, so
+        it is read far more often than it changes.  A fresh remembered answer
+        is returned as-is; an explicit ``refresh`` (the pane's 刷新 button, the
+        account import) always reaches upstream, and so does any read whose
+        remembered answer is stale or was a failure — a signed-out variant must
+        not stay signed-out in the cache once the user signs in.
+        """
 
         name = validated_provider(provider)
+        now = time.monotonic()
+        if not refresh:
+            remembered = self._models_cache.get(name)
+            if remembered is not None and now - remembered[0] < _WORKBUDDY_MODELS_TTL_SECONDS:
+                return copy.deepcopy(remembered[1])
         if not available():
             return {"available": False, "detail": "integration_unstaged", "models": []}
         suffix = "&refresh=1" if refresh else ""
@@ -555,8 +647,11 @@ class WorkBuddyRuntime:
             f"/control/models?provider={name}{suffix}",
             timeout=_WORKBUDDY_MODELS_TIMEOUT_SECONDS,
         )
+        # A catalog read answers the account question too, so the status
+        # document it carries replaces the one the status cache holds.
         self._status_cache = None
         if document.get("available") is not True:
+            self._models_cache.pop(name, None)
             return {
                 "available": False,
                 "detail": str(document.get("status", {}).get("reason") or document.get("detail") or "signed_out")
@@ -566,13 +661,29 @@ class WorkBuddyRuntime:
                 "status": document.get("status") if isinstance(document.get("status"), dict) else {},
             }
         models = document.get("models")
-        return {
+        entries = [item for item in models if isinstance(item, dict)] if isinstance(models, list) else []
+        for entry in entries:
+            # The rate a route may follow is stated once, here, beside the
+            # catalog entry that owns it, so every reader (the pane's 倍率
+            # column and the order mode that follows it) agrees on the number.
+            rate = _billing_multiplier(entry.get("billing"))
+            if rate is not None:
+                entry["rate"] = rate
+        result = {
             "available": True,
             "source": str(document.get("source") or ""),
             "fetched_at_ms": document.get("fetchedAtMs"),
-            "models": [item for item in models if isinstance(item, dict)] if isinstance(models, list) else [],
+            "models": entries,
             "status": document.get("status") if isinstance(document.get("status"), dict) else {},
         }
+        # A read that ran before the worker had a credential in hand comes back
+        # available but empty.  Remembering that would blank every 倍率 for the
+        # whole interval, so only a catalog that actually named a model is kept.
+        if result["models"]:
+            self._models_cache[name] = (now, copy.deepcopy(result))
+        else:
+            self._models_cache.pop(name, None)
+        return result
 
     def provider_status(self, provider: str) -> dict[str, Any]:
         document = self.status()

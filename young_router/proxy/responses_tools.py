@@ -601,15 +601,110 @@ def _responses_function_tool_item_id(value: Any, *, output: bool = False) -> Any
     return f"{expected_prefix}{suffix}"
 
 
-def _responses_chat_bridge_input(value: Any) -> tuple[Any, dict[str, Any]]:
+def _responses_chat_bridge_flat_tool_declarations(tools: Any) -> tuple[set[str], set[str]]:
+    """Return the namespace names and bare chat tool names this bridge declares.
+
+    A namespace tool declared on the wire is flattened to its bare child names,
+    and each bridged child keeps the namespace under
+    ``x-young-router-responses-namespace``. Both shapes are read here, because
+    the replay items must be flattened by exactly the keys the declaration was
+    flattened by.
+    """
+
+    namespaces: set[str] = set()
+    tool_names: set[str] = set()
+
+    def visit(tool: Any, inherited_namespace: Optional[str] = None) -> None:
+        if not isinstance(tool, dict):
+            return
+        explicit = tool.get(_RESPONSES_BRIDGE_NAMESPACE_KEY)
+        namespace = (
+            explicit.strip()
+            if isinstance(explicit, str) and explicit.strip()
+            else inherited_namespace
+        )
+        if tool.get("type") == "namespace":
+            name = tool.get("name")
+            namespace = name.strip() if isinstance(name, str) and name.strip() else namespace
+            if namespace:
+                namespaces.add(namespace)
+            child_tools = tool.get("tools")
+            if isinstance(child_tools, list):
+                for child_tool in child_tools:
+                    visit(child_tool, namespace)
+            return
+        if namespace:
+            namespaces.add(namespace)
+        name = tool.get("name")
+        if isinstance(name, str) and name.strip():
+            tool_names.add(name.strip())
+
+    if isinstance(tools, list):
+        for tool in tools:
+            visit(tool)
+    return namespaces, tool_names
+
+
+def _responses_chat_bridge_flat_tool_name(
+    name: Any,
+    namespace: Any,
+    declared_namespaces: set[str],
+    declared_tool_names: set[str],
+) -> Optional[str]:
+    """Return the bare chat tool name a replayed call must carry.
+
+    The bridged declarations are flat functions, so a replayed call is only
+    answerable when its name is the bare child name. Two spellings reach here:
+    an item still carrying ``namespace``, whose name may already be qualified,
+    and an item whose recorded name was already qualified by an earlier bridged
+    turn. Qualifying either again produces ``functions__functions__exec_command``
+    in the replayed Chat history, which the client can never execute.
+
+    A name is only rewritten towards a tool this bridge really declares: an
+    exact declaration always wins, and otherwise the namespace the item names is
+    tried before the remaining ``__`` splits. A namespace whose every child was
+    deduplicated away names no key of its own, so the declared child alone is
+    what the flat surface can answer -- which is why the split fallback exists.
+    An unrelated tool that matches neither is left exactly as it was recorded.
+    """
+
+    if not isinstance(name, str) or not name.strip():
+        return None
+    tool_name = name.strip()
+    if tool_name in declared_tool_names:
+        return tool_name
+    qualified_namespace = namespace.strip() if isinstance(namespace, str) else ""
+    candidates = [qualified_namespace] if qualified_namespace else []
+    candidates.extend(sorted(declared_namespaces))
+    for candidate in candidates:
+        prefix = f"{candidate}__"
+        bare_name = tool_name[len(prefix) :]
+        if tool_name.startswith(prefix) and bare_name in declared_tool_names:
+            return bare_name
+    remainder = tool_name
+    while "__" in remainder:
+        remainder = remainder.split("__", 1)[1]
+        if remainder in declared_tool_names:
+            return remainder
+    return tool_name
+
+
+def _responses_chat_bridge_input(
+    value: Any,
+    tools: Any = None,
+) -> tuple[Any, dict[str, Any]]:
     if not isinstance(value, list):
         return value, {"changed": False, "dropped_tool_search_items": 0}
 
+    declared_namespaces, declared_tool_names = (
+        _responses_chat_bridge_flat_tool_declarations(tools)
+    )
     filtered: list[Any] = []
     dropped_tool_search = 0
     dropped_additional_tools = 0
     converted_custom_tool_calls = 0
     converted_custom_tool_outputs = 0
+    flattened_namespace_calls = 0
     for item in value:
         if isinstance(item, dict) and item.get("type") in {
             "tool_search_call",
@@ -621,6 +716,30 @@ def _responses_chat_bridge_input(value: Any) -> tuple[Any, dict[str, Any]]:
             dropped_additional_tools += 1
             continue
         updated_item = copy.deepcopy(item)
+        if (
+            isinstance(updated_item, dict)
+            and updated_item.get("type") in {"function_call", "custom_tool_call"}
+        ):
+            namespace = updated_item.get("namespace")
+            namespace_name = namespace.strip() if isinstance(namespace, str) else ""
+            item_was_flattened = False
+            flat_name = _responses_chat_bridge_flat_tool_name(
+                updated_item.get("name"),
+                namespace_name,
+                declared_namespaces,
+                declared_tool_names,
+            )
+            if flat_name is not None and flat_name != updated_item.get("name"):
+                updated_item["name"] = flat_name
+                item_was_flattened = True
+            if namespace_name and namespace_name in declared_namespaces:
+                # A namespace this bridge really flattened is dropped, because
+                # the declaration it belonged to is gone. An item belonging to
+                # some other tool keeps every field it was replayed with.
+                updated_item.pop("namespace", None)
+                item_was_flattened = True
+            if item_was_flattened:
+                flattened_namespace_calls += 1
         # Custom declarations become ordinary functions with an ``input``
         # parameter at this bridge boundary. Normalize replay items here too;
         # otherwise LiteLLM serializes the raw custom payload under ``content``
@@ -660,6 +779,7 @@ def _responses_chat_bridge_input(value: Any) -> tuple[Any, dict[str, Any]]:
         and dropped_additional_tools == 0
         and converted_custom_tool_calls == 0
         and converted_custom_tool_outputs == 0
+        and flattened_namespace_calls == 0
     ):
         return value, {"changed": False, "dropped_tool_search_items": 0}
     stats = {
@@ -672,6 +792,8 @@ def _responses_chat_bridge_input(value: Any) -> tuple[Any, dict[str, Any]]:
         stats["converted_custom_tool_calls"] = converted_custom_tool_calls
     if converted_custom_tool_outputs:
         stats["converted_custom_tool_outputs"] = converted_custom_tool_outputs
+    if flattened_namespace_calls:
+        stats["flattened_namespace_calls"] = flattened_namespace_calls
     return filtered, stats
 
 

@@ -2853,7 +2853,8 @@ async def _streaming_error_fallback_response(
         )
         bridge_input, input_stats = (
             _responses_tools_module._responses_chat_bridge_input(
-                payload.get("input")
+                payload.get("input"),
+                payload.get("tools"),
             )
         )
         if input_stats.get("changed"):

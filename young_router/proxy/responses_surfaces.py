@@ -282,7 +282,8 @@ def _responses_chat_bridge_retry_kwargs(
         return None
     _with_responses_chat_bridge_compatible_tools(retry_kwargs, retry_metadata)
     bridge_input, input_stats = _responses_tools_module._responses_chat_bridge_input(
-        retry_kwargs.get("input")
+        retry_kwargs.get("input"),
+        retry_kwargs.get("tools"),
     )
     if input_stats.get("changed"):
         retry_kwargs["input"] = bridge_input
@@ -1264,7 +1265,8 @@ def _responses_chat_bridge_preemptive_kwargs(
         ),
     )
     bridge_input, input_stats = _responses_tools_module._responses_chat_bridge_input(
-        bridge_kwargs.get("input")
+        bridge_kwargs.get("input"),
+        bridge_kwargs.get("tools"),
     )
     if input_stats.get("changed"):
         bridge_kwargs["input"] = bridge_input
@@ -1384,7 +1386,8 @@ def _responses_function_tool_bridge_preemptive_kwargs(
         outer_for_tool_plan,
     )
     bridge_input, input_stats = _responses_tools_module._responses_chat_bridge_input(
-        bridge_kwargs.get("input")
+        bridge_kwargs.get("input"),
+        bridge_kwargs.get("tools"),
     )
     if input_stats.get("changed"):
         bridge_kwargs["input"] = bridge_input
@@ -1613,7 +1616,8 @@ def _responses_function_tool_bridge_retry_kwargs(
     )
     bridge_input, input_stats = (
         _responses_tools_module._responses_chat_bridge_input(
-            bridge_kwargs.get("input")
+            bridge_kwargs.get("input"),
+            bridge_kwargs.get("tools"),
         )
     )
     if input_stats.get("changed"):

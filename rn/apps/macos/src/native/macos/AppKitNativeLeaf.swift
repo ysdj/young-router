@@ -81,7 +81,7 @@ private enum NativeRelayOriginPolicy {
 }
 
 @objc(AppKitNativeLeaf)
-@objcMembers public final class AppKitNativeLeaf: NSObject, NSMenuDelegate, NSWindowDelegate {
+@objcMembers public final class AppKitNativeLeaf: NSObject, NSWindowDelegate {
     private struct RouteWindowLayout {
         let contentSize: NSSize
         let minSize: NSSize
@@ -113,28 +113,9 @@ private enum NativeRelayOriginPolicy {
         return image
     }()
 
-    // Keep the menu-bar shell anchored to the pre-RN AppKit app. The strings
-    // are stable action IDs (plus the two presentation markers), not labels.
+    // Keep the menu-bar shell anchored to the pre-RN AppKit app.
     private static let settingsPaneRoutes: Set<String> = [
         "general-settings", "providers-models", "runtime-settings", "codex-settings", "data-management", "logs",
-    ]
-    private static let statusMenuOrder = [
-        "status", "separator",
-        "toggle-autostart", "toggle-codex-model-catalog", "separator",
-        "open-general-settings", "open-providers-models", "open-runtime-settings", "open-codex-settings", "separator",
-        "webdav-status", "open-data-management", "separator",
-        "open-logs", "separator",
-        "show-version", "quit",
-    ]
-    private static let footerMenuActionIDs: Set<String> = ["show-version", "quit"]
-    // Recovery now has a dedicated tab inside Logs. Keep old shared clients
-    // from adding a second menu item while they update their action list.
-    private static let suppressedStatusMenuActionIDs: Set<String> = [
-        "open-claude-settings", "open-recovery",
-        "service-start", "service-stop", "service-restart", "service-reload", "service-health",
-    ]
-    private static let applicationMenuActionIDs = [
-        "language-picker", "set-language-system", "set-language-en", "set-language-zh-Hans",
     ]
     public static let shared = AppKitNativeLeaf()
     /// The Core capability exchange is asynchronous so AppKit never waits on
@@ -164,10 +145,6 @@ private enum NativeRelayOriginPolicy {
     /// is only released with its last child. See ``presentChildPanel(_:in:prepare:)``.
     private var reactHostStarter: (() -> Void)?
     private var routeWindows: [String: NSWindow] = [:]
-    /// The service menu is shown on right-click only; a left click opens the
-    /// single settings window directly.
-    private var statusMenu: NSMenu?
-    private var statusMenuVisible = false
     private var approvedCloseRoutes: Set<String> = []
     /// Every decision panel on screen, keyed by its window: the answer Escape
     /// and the title-bar close button carry, the answers it offers, and the
@@ -215,11 +192,9 @@ private enum NativeRelayOriginPolicy {
     private var statusTitleIsBootstrap = true
     private var statusRunning = false
     private var menuActions: [MenuAction] = []
-    private var menuTracking = false
-    private var menuNeedsRefresh = false
     private var pendingActions: [String] = []
     private var strings: [String: String] = [
-        "appTitle": "Young Router", "autoStart": "Auto Start at Login", "serviceUnavailable": "service unavailable",
+        "appTitle": "Young Router", "serviceUnavailable": "service unavailable",
         "serviceStatus": "Status: {status}", "serviceStarting": "Starting",
         "cancel": "Cancel", "set": "Set", "clear": "Clear", "stage": "Stage", "find": "Find", "findNext": "Find Next",
         "edit": "Edit", "undo": "Undo", "redo": "Redo", "cut": "Cut", "copy": "Copy",
@@ -250,12 +225,11 @@ private enum NativeRelayOriginPolicy {
         statusItem.button?.image = Self.statusBarIcon
         statusItem.button?.imagePosition = .imageOnly
         statusItem.button?.setAccessibilityLabel(Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String ?? "Young Router")
-        // A left click opens the settings window; the status menu stays on
-        // right-click (and Control-click) for service and lifecycle actions.
+        // Either mouse button opens the settings window: the status item owns
+        // no menu at all.
         statusItem.button?.target = self
         statusItem.button?.action = #selector(statusItemPressed(_:))
         statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
-        statusMenu = makeMenu()
     }
 
     public func setRouteWindowFactory(_ factory: @escaping (String, String?, String?, NSWindow?) -> NSWindow?) {
@@ -276,10 +250,6 @@ private enum NativeRelayOriginPolicy {
         statusItem.button?.image = Self.statusBarIcon
         statusItem.button?.toolTip = statusTitle
         statusItem.button?.setAccessibilityLabel(statusTitle)
-        if let status = statusMenu?.item(withTag: 1) {
-            status.title = statusTitle
-            configureStatusMenuItem(status)
-        }
     }
 
     func setLocalization(_ values: [String: String]) {
@@ -293,7 +263,6 @@ private enum NativeRelayOriginPolicy {
         }
         ensureSystemEditMenu(updateExisting: true)
         updateApplicationMenuTitles()
-        refreshStatusMenu()
         for (route, window) in routeWindows {
             if let title = routeWindowTitle(route) {
                 // Snapshot-driven localization can run as often as live log
@@ -324,7 +293,6 @@ private enum NativeRelayOriginPolicy {
             return
         }
         menuActions = nextActions
-        refreshStatusMenu()
         installLanguageMenuIfAvailable()
     }
 
@@ -2345,174 +2313,10 @@ private enum NativeRelayOriginPolicy {
         fileCapabilityRegistrar?(url, purpose, completion) ?? completion(nil)
     }
 
-    private func makeMenu(actions: [MenuAction] = []) -> NSMenu {
-        let menu = NSMenu()
-        menu.delegate = self
-        menu.autoenablesItems = false
-        var actionMap: [String: MenuAction] = [:]
-        for action in actions {
-            actionMap[action.id] = action
-        }
-        var consumed = Set<String>()
-
-        for marker in Self.statusMenuOrder where !Self.footerMenuActionIDs.contains(marker) {
-            switch marker {
-            case "status":
-                let status = menu.addItem(withTitle: statusTitle, action: nil, keyEquivalent: "")
-                status.tag = 1
-                configureStatusMenuItem(status)
-            case "separator":
-                if menu.items.last?.isSeparatorItem == false {
-                    menu.addItem(.separator())
-                }
-            case let id where Self.footerMenuActionIDs.contains(id):
-                addMenuActionItem(id, from: actionMap, to: menu, consumed: &consumed)
-            case let id:
-                addMenuActionItem(id, from: actionMap, to: menu, consumed: &consumed)
-            }
-        }
-
-        for action in actions where !consumed.contains(action.id) &&
-            !Self.footerMenuActionIDs.contains(action.id) &&
-            !Self.suppressedStatusMenuActionIDs.contains(action.id) &&
-            !Self.applicationMenuActionIDs.contains(action.id) {
-            addMenuItem(action.id, title: action.title, enabled: action.enabled, checked: action.checked, to: menu)
-            consumed.insert(action.id)
-        }
-
-        if menu.items.last?.isSeparatorItem == false { menu.addItem(.separator()) }
-        for marker in Self.statusMenuOrder where Self.footerMenuActionIDs.contains(marker) {
-            addMenuActionItem(marker, from: actionMap, to: menu, consumed: &consumed)
-        }
-        return menu
-    }
-
-    private func refreshStatusMenu() {
-        guard !menuTracking else {
-            menuNeedsRefresh = true
-            return
-        }
-        menuNeedsRefresh = false
-        statusMenu = makeMenu(actions: menuActions)
-    }
-
-    /// Left-clicking the status icon opens the settings window. The service
-    /// menu is reserved for the secondary click so the icon never behaves like
-    /// a navigation menu again.
+    /// Either mouse button on the status icon opens the settings window; the
+    /// icon carries no menu, so no click can drop one over the desktop.
     @objc private func statusItemPressed(_ sender: NSStatusBarButton) {
-        let event = NSApp.currentEvent
-        let secondaryClick = event?.type == .rightMouseUp || event?.modifierFlags.contains(.control) == true
-        if secondaryClick {
-            showStatusMenu()
-            return
-        }
         openNamedRoute("providers-models")
-    }
-
-    private func showStatusMenu() {
-        if statusMenu == nil { statusMenu = makeMenu(actions: menuActions) }
-        guard let menu = statusMenu else { return }
-        statusMenuVisible = true
-        statusItem.menu = menu
-        statusItem.button?.performClick(nil)
-        // ``menuDidClose`` clears ``statusItem.menu`` so the next left click
-        // opens the settings window again.
-    }
-
-    public func menuWillOpen(_ menu: NSMenu) {
-        menuTracking = true
-    }
-
-    public func menuDidClose(_ menu: NSMenu) {
-        menuTracking = false
-        if statusMenuVisible {
-            statusMenuVisible = false
-            statusItem.menu = nil
-        }
-        guard menuNeedsRefresh else { return }
-        refreshStatusMenu()
-    }
-
-    private func addMenuActionItem(
-        _ id: String,
-        from actions: [String: MenuAction],
-        to menu: NSMenu,
-        consumed: inout Set<String>
-    ) {
-        if let action = actions[id] {
-            addMenuItem(id, title: menuTitle(for: id, fallback: action.title), enabled: action.enabled, checked: action.checked, to: menu)
-            consumed.insert(id)
-            return
-        }
-
-        guard let fallback = menuFallback(for: id) else { return }
-        addMenuItem(id, title: fallback, to: menu, keyEquivalent: menuKeyEquivalent(for: id))
-    }
-
-    private func menuTitle(for id: String, fallback: String) -> String {
-        switch id {
-        case "open-general-settings": return localized("routeGeneralSettings", fallback: fallback)
-        case "open-providers-models": return localized("routeProvidersModels", fallback: fallback)
-        case "open-runtime-settings": return localized("routeRuntimeSettings", fallback: fallback)
-        case "open-codex-settings": return localized("routeCodexSettings", fallback: fallback)
-        case "open-data-management": return localized("routeDataManagement", fallback: fallback)
-        case "open-logs", "open-logs?tab=recovery": return fallback
-        case "quit": return localized("menuQuit", fallback: fallback)
-        default: return fallback
-        }
-    }
-
-    private func menuFallback(for id: String) -> String? {
-        switch id {
-        case "toggle-autostart": return localized("autoStart", fallback: "Auto Start at Login")
-        case "toggle-codex-model-catalog": return localized("codexModelCatalog", fallback: "Use LiteLLM models in Codex")
-        case "open-general-settings": return localized("routeGeneralSettings", fallback: "General")
-        case "open-providers-models": return localized("routeProvidersModels", fallback: "Providers & Models")
-        case "open-runtime-settings": return localized("routeRuntimeSettings", fallback: "Runtime")
-        case "open-codex-settings": return localized("routeCodexSettings", fallback: "External")
-        case "open-data-management": return localized("routeDataManagement", fallback: "Data Management")
-        case "open-logs", "open-logs?tab=recovery": return localized("routeLogs", fallback: "Logs")
-        case "show-version": return localized("version", fallback: "Version")
-        case "quit": return localized("menuQuit", fallback: "Quit Young Router")
-        default: return nil
-        }
-    }
-
-    private func menuKeyEquivalent(for id: String) -> String {
-        switch id {
-        case "quit": return "q"
-        default: return ""
-        }
-    }
-
-    private func addMenuItem(
-        _ id: String,
-        title: String,
-        enabled: Bool = true,
-        checked: Bool = false,
-        to menu: NSMenu,
-        keyEquivalent: String = ""
-    ) {
-        let item = NSMenuItem(title: title, action: #selector(menuAction(_:)), keyEquivalent: keyEquivalent)
-        item.keyEquivalentModifierMask = keyEquivalent.isEmpty ? [] : [.command]
-        item.representedObject = id
-        item.isEnabled = enabled
-        item.state = checked ? .on : .off
-        item.target = self
-        if id == "webdav-status" {
-            configureStatusMenuItem(item)
-        }
-        menu.addItem(item)
-    }
-
-    private func configureStatusMenuItem(_ item: NSMenuItem) {
-        item.action = nil
-        item.target = nil
-        item.isEnabled = false
-        item.attributedTitle = NSAttributedString(
-            string: item.title,
-            attributes: [.foregroundColor: NSColor.secondaryLabelColor]
-        )
     }
 
     private func ensureSystemEditMenu(updateExisting: Bool = false) {
@@ -2786,17 +2590,8 @@ private enum NativeRelayOriginPolicy {
         strings[key].flatMap { $0.isEmpty ? nil : $0 } ?? fallback
     }
 
-    @objc private func openProviders() { openNamedRoute("providers-models") }
     @objc private func openCodex() { openNamedRoute("codex-settings") }
-    @objc private func openClaude() { openNamedRoute("claude-settings") }
-    @objc private func openRuntime() { openNamedRoute("runtime-settings") }
     @objc private func openDataManagement() { openNamedRoute("data-management") }
-    private func openLogs(tab: String?) {
-        guard let title = routeWindowTitle("logs") else { return }
-        open(route: "logs", title: title, initialLogTab: tab)
-        emitAction(tab.map { "open-logs?tab=\($0)" } ?? "open-logs")
-    }
-    @objc private func openLogs() { openLogs(tab: nil) }
     @objc private func reloadFromShortcut() { emitAction("service-reload") }
     @objc private func closeFromShortcut() {
         let window = NSApp.keyWindow
@@ -2804,19 +2599,7 @@ private enum NativeRelayOriginPolicy {
     }
     @objc private func menuAction(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String else { return }
-        switch id {
-        case "open-providers-models": openProviders()
-        case "open-codex-settings": openCodex()
-        case "open-claude-settings": openClaude()
-        case "open-runtime-settings": openRuntime()
-        case "open-data-management": openDataManagement()
-        case "open-logs", "open-logs?tab=recovery": openLogs(tab: id == "open-logs?tab=recovery" ? "recovery" : nil)
-        case "toggle-autostart":
-            emitAction(id)
-        case "show-version": showVersion()
-        case "quit": quit()
-        default: emitAction(id)
-        }
+        emitAction(id)
     }
     func requestQuit() {
         NSApp.terminate(nil)
@@ -2827,7 +2610,6 @@ private enum NativeRelayOriginPolicy {
         activeReadOnlyCodeController = nil
         for controller in activeProviderAuthControllers.values { controller.close() }
         activeProviderAuthControllers.removeAll()
-        statusItem.menu = nil
         NSStatusBar.system.removeStatusItem(statusItem)
         for window in routeWindows.values { window.orderOut(nil) }
         hostWindow?.orderOut(nil)

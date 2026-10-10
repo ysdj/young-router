@@ -255,16 +255,17 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         mac = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
         windows = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
 
-        self.assertIn('"open-logs", "separator"', mac)
-        self.assertNotIn('"open-recovery", "open-logs"', mac)
-        self.assertIn('"open-claude-settings", "open-recovery",', mac)
+        # macOS keeps no status-item menu at all, so the retired action cannot
+        # come back there; the Windows tray still suppresses it explicitly.
+        self.assertNotIn("statusMenu", mac)
+        self.assertNotIn('"open-claude-settings", "open-recovery",', mac)
         self.assertIn('action.id != L"open-claude-settings" && action.id != L"open-recovery"', windows)
 
     def test_native_trays_keep_the_recovery_log_action_as_one_logs_entry(self) -> None:
         mac = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
 
-        self.assertIn('"open-logs", "separator"', mac)
-        self.assertIn('case "open-logs", "open-logs?tab=recovery": openLogs(tab:', mac)
+        self.assertNotIn("statusMenu", mac)
+        self.assertIn('emitAction("open-logs?tab=', mac)
 
     def test_native_trays_do_not_append_ellipses_to_direct_window_links(self) -> None:
         mac = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
@@ -303,25 +304,22 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         mac = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
         windows = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
 
-        self.assertIn('item.state = checked ? .on : .off', mac)
-        status_item = mac.split("private func configureStatusMenuItem", 1)[1].split("private func ensureSystemEditMenu", 1)[0]
-        self.assertIn("item.action = nil", status_item)
-        self.assertIn("item.target = nil", status_item)
-        self.assertIn("item.isEnabled = false", status_item)
-        self.assertIn(".foregroundColor: NSColor.secondaryLabelColor", status_item)
         self.assertIn('AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, status_title_.c_str());', windows)
         self.assertIn('auto add_separator = [&menu, &needs_separator]()', windows)
         self.assertIn('action.id == L"open-general-settings" || action.id == L"open-providers-models" ||', windows)
         self.assertIn('action.id == L"open-data-management" ||', windows)
         self.assertIn('action.id == L"open-logs" || action.id == L"show-version") {', windows)
-        self.assertIn('menu.autoenablesItems = false', mac)
+        # macOS draws the status header and the checked rows inside the shared
+        # settings window instead of a status-item menu.
+        self.assertNotIn("statusMenu", mac)
         self.assertNotIn('"webdav-status", "webdav-toggle"', mac)
 
     def test_native_trays_keep_language_controls_reachable_and_hide_auxiliary_lifecycle_actions(self) -> None:
         mac = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
         windows = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
 
-        self.assertIn('"service-start", "service-stop", "service-restart", "service-reload", "service-health",', mac)
+        self.assertNotIn("statusMenu", mac)
+        self.assertIn('"toggle-autostart"', (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8"))
         self.assertIn('action.id != L"service-start"', windows)
         self.assertIn('HMENU language_menu = CreatePopupMenu();', windows)
         self.assertIn('if (is_language_choice) {', windows)
@@ -851,7 +849,10 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn('id: "toggle-codex-model-catalog"', ui)
         self.assertIn('checked: booleanValue(catalog.enabled)', ui)
         self.assertIn('type: "codex.model_catalog.set"', ui)
-        self.assertIn('"toggle-autostart", "toggle-codex-model-catalog", "separator"', leaf)
+        # macOS carries both toggles in the shared settings panes now that the
+        # status item no longer opens a menu of its own.
+        self.assertNotIn("statusMenu", leaf)
+        self.assertIn('id: "toggle-autostart"', ui)
         # Turning the managed catalog on or off writes the client's config and
         # never asks the user to restart anything: no reminder, no restart
         # helper, and no dialog about it in the shared UI or the native leaf.
@@ -1049,11 +1050,11 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             self.assertIn(f'case "{action}": return "{operation}";', ui)
             self.assertIn(f'{{ id: "{action}",', ui)
 
-        # Native leaves retain generic bridge routing; the compact status menu
-        # intentionally follows the product menu and omits these auxiliary
-        # lifecycle actions.
-        self.assertIn("default: emitAction(id)", mac)
-        self.assertIn('"service-start", "service-stop", "service-restart", "service-reload", "service-health",', mac)
+        # Native leaves retain generic bridge routing. macOS has no status menu
+        # left to carry them, so its language submenu is the only application
+        # menu entry that reaches this path.
+        self.assertNotIn("statusMenu", mac)
+        self.assertIn("private func installLanguageMenu(in applicationMenu: NSMenu)", mac)
 
         # WinUI dispatch remains generic for retained menu actions.
         self.assertIn("DispatchAction(WideToUtf8(item.id));", windows)
@@ -1220,7 +1221,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn('"filename" : "status_icon@2x.png"', icon_contents)
         self.assertNotIn("template-rendering-intent", icon_contents)
 
-    def test_macos_status_item_is_ready_before_react_and_defers_menu_rebuilds_while_tracking(self) -> None:
+    def test_macos_status_item_is_ready_before_react_and_carries_no_menu(self) -> None:
         leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
         app_delegate = (MAC_PROJECT / "YoungRouter-macOS/AppDelegate.mm").read_text(encoding="utf-8")
         platform_entry = (SHARED / "platformEntry.ts").read_text(encoding="utf-8")
@@ -1243,34 +1244,24 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("ensureReactHostStarted()\n        if let menuActionHandler", leaf)
         self.assertIn("guard title != statusTitle || running != statusRunning else { return }", leaf)
         self.assertIn("zip(nextActions, menuActions).contains", leaf)
-        self.assertIn("private var menuTracking = false", leaf)
-        self.assertIn("public func menuWillOpen(_ menu: NSMenu)", leaf)
-        self.assertIn("public func menuDidClose(_ menu: NSMenu)", leaf)
-        self.assertIn("guard !menuTracking else", leaf)
+        self.assertNotIn("NSMenuDelegate", leaf)
+        self.assertNotIn("statusMenu", leaf)
         self.assertNotIn("native.tray.setActions(routeActions);", platform_entry)
         self.assertNotIn("native.tray.setStatus(next.service);", ui)
         self.assertNotIn("native.tray.setActions(actions);", ui)
 
-    def test_macos_status_item_left_click_opens_settings_and_right_click_shows_the_menu(self) -> None:
+    def test_macos_status_item_opens_settings_on_both_mouse_buttons(self) -> None:
         leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
-        # The status item no longer owns a permanent menu: a left click opens
-        # the shared settings window and only a secondary click shows the
-        # service menu.
+        # The status item owns no menu: either mouse button opens the shared
+        # settings window, so no click can drop a native menu over the desktop.
         self.assertIn("statusItem.button?.target = self", leaf)
         self.assertIn("statusItem.button?.action = #selector(statusItemPressed(_:))", leaf)
         self.assertIn("statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])", leaf)
-        self.assertIn("statusMenu = makeMenu()", leaf)
-        self.assertNotIn("statusItem.menu = makeMenu()", leaf)
-        press = leaf.split("@objc private func statusItemPressed", 1)[1].split("public func menuWillOpen", 1)[0]
-        self.assertIn("event?.type == .rightMouseUp || event?.modifierFlags.contains(.control) == true", press)
-        self.assertIn("showStatusMenu()", press)
+        self.assertNotIn("statusItem.menu = menu", leaf)
+        press = leaf.split("@objc private func statusItemPressed", 1)[1].split("private func ensureSystemEditMenu", 1)[0]
+        self.assertNotIn("rightMouseUp", press)
+        self.assertNotIn("modifierFlags", press)
         self.assertIn('openNamedRoute("providers-models")', press)
-        menu = leaf.split("private func showStatusMenu()", 1)[1].split("public func menuWillOpen", 1)[0]
-        self.assertIn("statusItem.menu = menu", menu)
-        self.assertIn("statusItem.button?.performClick(nil)", menu)
-        close_menu = leaf.split("public func menuDidClose", 1)[1].split("private func addMenuActionItem", 1)[0]
-        self.assertIn("statusItem.menu = nil", close_menu)
-        self.assertIn("statusMenuVisible = false", close_menu)
 
     def test_native_hosts_expose_app_and_litellm_versions_for_the_about_pane(self) -> None:
         mac_leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
@@ -1692,7 +1683,9 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("window.title = title", localization)
         self.assertNotIn("configure(window", localization)
         self.assertIn('localized("menuQuit", fallback: "Quit Young Router")', mac)
-        self.assertIn('"webdav-status"', mac)
+        # The leaf's own surfaces now read only what the settings panes and the
+        # application menu still show; the status-item menu's strings are gone.
+        self.assertNotIn('"webdav-status"', mac)
         self.assertIn("void WinUI3NativeLeaf::SetLocalization", windows)
 
 
@@ -2889,10 +2882,12 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             header = (codegen / name).read_text(encoding="utf-8")
             self.assertIn(f"REACT_FIELD({field})", header)
 
-    def test_macos_menu_autostart_fallback_uses_localization(self) -> None:
+    def test_macos_localization_drops_the_retired_menu_strings(self) -> None:
         leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
-        self.assertIn('"autoStart": "Auto Start at Login"', leaf)
-        self.assertIn('case "toggle-autostart": return localized("autoStart", fallback: "Auto Start at Login")', leaf)
+        # The shared UI still localizes these for the settings panes; the leaf
+        # only keeps the keys its own surfaces read.
+        self.assertNotIn('"autoStart": "Auto Start at Login"', leaf)
+        self.assertIn("private var strings: [String: String] = [", leaf)
 
     def test_macos_text_editors_autohide_unused_scrollbars(self) -> None:
         controls = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")

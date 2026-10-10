@@ -152,9 +152,6 @@ function providerKind(provider: UnknownRecord | undefined): ProviderKind {
  */
 type ServiceID = "openai" | "claude" | "workbuddy" | "workbuddyAI";
 
-/** The provider-key slot a WorkBuddy provider carries for its loopback route. */
-const WORKBUDDY_LOCAL_KEY_NAME = "workbuddy-local";
-
 /** The address each service is addressed by, used for the wizard's URL field. */
 const SERVICE_BASE_URLS: Record<ServiceID, string> = {
   openai: "https://api.openai.com/v1",
@@ -320,13 +317,19 @@ function workbuddyAccountFacts(live: UnknownRecord, observed: UnknownRecord): Un
   return merged;
 }
 
-
-/** One model's credit multiplier, as the catalog spells it (e.g. `x0.29`). */
-function workbuddyModelRate(model: UnknownRecord, translate: Translate): string {
-  const billing = asRecord(model.billing);
-  const credits = stringValue(billing.credits).trim();
-  if (credits) return credits.replace(/\s*credits?$/i, "");
-  return billing.free === true ? translate("providers.wizard.workbuddyFree") : "";
+/**
+ * One catalog rate as a number, or `undefined` when the row shows none.
+ *
+ * The displayed value keeps the catalog's own spelling (`x0.79`, or the free
+ * entry the catalog marks as `x0.00`), while the order a route follows is a
+ * number.  Reading it back here means the switch and the row it sits beside
+ * can never disagree about which rate is being followed.
+ */
+function serviceRateNumber(value: string): number | undefined {
+  const text = value.trim().replace(/^[x×]\s*/i, "");
+  if (!text) return undefined;
+  const parsed = Number(text);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
 }
 
 /** The shared busy word, or nothing when the read has settled. */
@@ -5574,11 +5577,18 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
     ?? keyStates.find((key) => key.name === stringValue(model.api_key_name));
   const usesRelayKey = selectedProviderKey?.source.kind === "relay";
   const relayMultiplier = relaySourceForKey(selectedProviderKey, relaySources)?.multiplier;
-  const canFollowMultiplier = usesRelayKey && relayMultiplier !== undefined;
+  // A route can follow a rate two ways: a relay key, whose station states the
+  // group's multiplier, or an account whose own catalog states what each model
+  // bills at (the 倍率 row above).  Both are the same relation — the order
+  // follows a number this app does not decide — so the switch asks whether a
+  // rate is known, not which kind of provider the route happens to use.
+  const followsServiceRate = usesRelayKey || providerService(provider) !== undefined;
+  const followedRate = usesRelayKey ? relayMultiplier : serviceRateNumber(serviceRate);
+  const canFollowMultiplier = followsServiceRate && followedRate !== undefined;
   const manualOrder = numberValue(model.manual_order, modelEffectiveOrder(model));
   const followsMultiplier = canFollowMultiplier && modelOrderMode(model) === "relay_multiplier";
   const displayedOrder = followsMultiplier
-    ? String(relayMultiplier ?? modelEffectiveOrder(model))
+    ? String(followedRate ?? modelEffectiveOrder(model))
     : drafts?.modelOrderText(providerId, model) ?? String(manualOrder);
   const matchingRelaySources = providerAuthKind(provider) === "api_key" ? relaySourcesForBaseUrl(providerBaseUrl, relaySources) : [];
   const persistedRelaySourceIDs = new Set(keyStates.filter((key) => key.source.kind === "relay").map((key) => relaySourceSelectionID(key.source)));
