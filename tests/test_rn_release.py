@@ -254,6 +254,7 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertNotIn("pnpm run build &", script)
         self.assertIn("STATIC_CHECKS_PID=$!", script)
         self.assertIn('wait "$STATIC_CHECKS_PID"', script)
+        self.assertIn('-destination "platform=macOS,arch=$ARCH"', script)
         self.assertIn("YOUNG_ROUTER_REFRESH_PODS", script)
         self.assertIn("Reusing CocoaPods workspace", script)
         self.assertIn('! -d "$APP_ROOT/macos/Pods"', script)

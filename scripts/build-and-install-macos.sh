@@ -84,7 +84,6 @@ cleanup() {
 trap cleanup EXIT
 cd "$RN_ROOT"
 
-
 copy_tree() {
   local source="$1"
   local destination="$2"
@@ -558,33 +557,61 @@ fi
 # These checks only read the shared/macOS JS/TS workspace while CocoaPods
 # prepares the native workspace. Windows codegen remains checked by its build
 # and the cross-platform CI job.
-pnpm run check:macos &
-STATIC_CHECKS_PID=$!
+if [[ -f node_modules/typescript/bin/tsc ]]; then
+  pnpm run test &
+  RN_TESTS_PID=$!
+  pnpm run contract-check &
+  RN_CONTRACT_PID=$!
+  pnpm run code-editor:build &
+  RN_EDITOR_PID=$!
+  pnpm run typecheck:no-editor &
+  RN_TYPECHECK_PID=$!
+else
+  pnpm run check:macos &
+  STATIC_CHECKS_PID=$!
+fi
+wait_static_checks() {
+  local failed=0 pid
+  if [[ -n "${STATIC_CHECKS_PID:-}" ]]; then
+    wait "$STATIC_CHECKS_PID" || failed=1
+  else
+    for pid in "$RN_TESTS_PID" "$RN_CONTRACT_PID" "$RN_EDITOR_PID" "$RN_TYPECHECK_PID"; do
+      wait "$pid" || failed=1
+    done
+  fi
+  return "$failed"
+}
 if [[ "${YOUNG_ROUTER_REFRESH_PODS:-0}" == "1" \
   || -n "${CI:-}" \
   || ! -d "$APP_ROOT/macos/Pods" \
   || ! -d "$APP_ROOT/macos/YoungRouter.xcworkspace" \
   || ! -f "$APP_ROOT/macos/Podfile.lock" ]]; then
   if ! pod install --project-directory="$APP_ROOT/macos"; then
-    wait "$STATIC_CHECKS_PID" || true
+    wait_static_checks || true
     exit 1
   fi
 else
   printf '%s\n' "Reusing CocoaPods workspace (set YOUNG_ROUTER_REFRESH_PODS=1 after native dependency or codegen changes)."
 fi
-wait "$STATIC_CHECKS_PID"
+wait_static_checks
+
+XCODE_DESTINATION=()
+case "$ARCH" in
+  arm64|x86_64) XCODE_DESTINATION=( -destination "platform=macOS,arch=$ARCH" ) ;;
+  *) echo "Unsupported macOS build architecture: $ARCH" >&2; exit 3 ;;
+esac
+APP="$(xcodebuild -workspace "$APP_ROOT/macos/YoungRouter.xcworkspace" -scheme YoungRouter-macOS -configuration Release "${XCODE_DESTINATION[@]}" -showBuildSettings 2>/dev/null | awk -F ' = ' '/TARGET_BUILD_DIR = / { target = $2 } /FULL_PRODUCT_NAME = / { product = $2 } END { if (target && product) print target "/" product }')"
+if [[ -z "$APP" ]]; then
+  echo "Could not resolve the React Native macOS build product path." >&2
+  exit 4
+fi
+
 RNMACOS_CLI="$RN_ROOT/vendor/react-native-macos-0.85/packages/react-native/cli.js"
 (
   cd "$APP_ROOT"
   node "$RNMACOS_CLI" build-macos --project-path macos --mode Release
 )
 
-APP="$(xcodebuild \
-  -workspace "$APP_ROOT/macos/YoungRouter.xcworkspace" \
-  -scheme YoungRouter-macOS \
-  -configuration Release \
-  -showBuildSettings 2>/dev/null \
-  | awk -F ' = ' '/TARGET_BUILD_DIR = / { target = $2 } /FULL_PRODUCT_NAME = / { product = $2 } END { if (target && product) print target "/" product }')"
 if [[ -z "$APP" || ! -d "$APP" ]]; then
   echo "React Native macOS build did not produce YoungRouter.app." >&2
   exit 4
@@ -672,6 +699,10 @@ copy_tree "$PI_WEB_ACCESS_NODE_WORK" "$CORE/runtime/bin"
   echo "Could not complete the bundled Veridrop dependencies." >&2
   exit 5
 }
+# The dependency pass operates on the staged tree and may replace its package
+# payload while resolving missing wheels; restore the upstream license beside
+# the copied package before the bundle checks inspect the assembled Core.
+cp -p "$VERIDROP_WORK/LICENSE" "$CORE/young_router/adapters/veridrop/LICENSE"
 
 VISION_HELPER_SOURCE="$APP_ROOT/src/native/macos/VisionOCR.swift"
 VISION_HELPER="$CORE/bin/vision_ocr"

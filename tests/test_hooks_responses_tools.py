@@ -396,6 +396,100 @@ class HookResponsesToolBridgeTests(HookTestCase):
             },
         )
 
+    def test_chat_bridge_flattens_replayed_namespace_calls_to_the_declared_names(self) -> None:
+        hooks, _ = load_hook_module()
+        tools = [
+            {
+                "type": "namespace",
+                "name": "functions",
+                "tools": [
+                    {"type": "function", "name": "exec_command"},
+                ],
+            },
+            {
+                "type": "namespace",
+                "name": "clock",
+                "tools": [
+                    {"type": "function", "name": "sleep"},
+                ],
+            },
+        ]
+        # The first call is an item still carrying its namespace; the second
+        # one is a name an earlier bridged turn already qualified. Both must
+        # reach the upstream as the bare chat tool name the bridge declared.
+        canonical = [
+            {
+                "type": "function_call",
+                "name": "exec_command",
+                "namespace": "functions",
+                "arguments": '{"cmd":"pwd"}',
+                "call_id": "c1",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "c1",
+                "output": "ok",
+            },
+            {
+                "type": "function_call",
+                "name": "functions__exec_command",
+                "arguments": '{"cmd":"ls"}',
+                "call_id": "c2",
+            },
+            {
+                "type": "function_call",
+                "name": "clock__sleep",
+                "arguments": '{"duration_ms":1}',
+                "call_id": "c3",
+            },
+        ]
+
+        bridged, stats = hooks._responses_chat_bridge_input(canonical, tools)
+
+        self.assertEqual(
+            [item.get("name") for item in bridged if "name" in item],
+            ["exec_command", "exec_command", "sleep"],
+        )
+        for item in bridged:
+            self.assertNotIn("namespace", item)
+        self.assertEqual(stats["flattened_namespace_calls"], 3)
+        # A namespace whose every child was deduplicated away declares none of
+        # its own, so only the declared child can answer the call.
+        deduped = [
+            {
+                "type": "namespace",
+                "name": "mcp__node_repl",
+                "tools": [{"type": "function", "name": "js"}],
+            },
+            {
+                "type": "namespace",
+                "name": "mcp__cua_repl",
+                "tools": [{"type": "function", "name": "js"}],
+            },
+        ]
+        node_repl_call, node_repl_stats = hooks._responses_chat_bridge_input(
+            [{"type": "function_call", "name": "mcp__node_repl__js", "call_id": "c5"}],
+            deduped,
+        )
+        self.assertEqual(node_repl_call[0]["name"], "js")
+        self.assertEqual(node_repl_stats["flattened_namespace_calls"], 1)
+        # A call whose tool the bridge never declared keeps its recorded name
+        # and its namespace: nothing here declares that tool to flatten by.
+        untouched, untouched_stats = hooks._responses_chat_bridge_input(
+            [
+                {
+                    "type": "function_call",
+                    "name": "other__tool",
+                    "namespace": "other",
+                    "call_id": "c4",
+                }
+            ],
+            tools,
+        )
+        self.assertEqual(untouched[0]["name"], "other__tool")
+        self.assertEqual(untouched[0]["namespace"], "other")
+        self.assertEqual(untouched_stats["changed"], False)
+
     def test_responses_tool_bridge_describes_codex_local_file_workflow(self) -> None:
         hooks, _ = load_hook_module()
 

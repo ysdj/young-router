@@ -31,6 +31,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from ..browser_identity import browser_request_headers
+from .. import adapters as managed_adapters
 from ..dsh_config_keys import (
     DSH_VISION_ROUTER_CONFIG_KEY as _DSH_VISION_ROUTER_CONFIG_KEY,
     DSH_VISION_ROUTER_LOCAL_QUICK_KEYS as _DSH_VISION_ROUTER_LOCAL_QUICK_KEYS,
@@ -269,13 +270,22 @@ class CoreServiceController:
         self._workbuddy = runtime
 
     def _runtime_config_references_workbuddy(self) -> bool:
-        """Whether the staged config routes anything through the worker."""
+        """Whether the staged config routes anything through a managed worker.
 
+        The dumper writes a managed route's base URL as the ``os.environ/``
+        reference Core publishes for its worker, so the reference itself — not
+        the product — is what a config is asked about.  Any worker that
+        publishes one is covered by the same question.
+        """
+
+        references = managed_adapters.managed_base_references()
+        if not references:
+            return False
         try:
             text = self.paths.runtime_config.read_text(encoding="utf-8")
         except OSError:
             return False
-        return "YOUNG_ROUTER_WORKBUDDY" in text
+        return any(reference in text for reference in references)
 
     def _workbuddy_environment(self, *, autostart: bool) -> dict[str, str]:
         """The loopback base URLs and bearer the proxy child resolves.

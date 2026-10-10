@@ -769,6 +769,96 @@ class ServiceProviderBoundaryTests(unittest.TestCase):
             )
             self.assertTrue(domain.validate()["valid"])
 
+    def test_validation_does_not_require_a_key_for_a_disabled_route(self) -> None:
+        directory, domain = self._domain()
+        with directory:
+            added = domain.dispatch(
+                "provider.add",
+                {
+                    "provider": {
+                        "name": "image-provider",
+                        "api_base": "https://image.example.test/v1",
+                        "api_keys": [
+                            {"name": "chat", "value": "test-chat-secret"},
+                            {"name": "image", "value": ""},
+                        ],
+                        "models": [],
+                    }
+                },
+            )
+            provider_id = added["providers"][0]["id"]
+            domain.dispatch(
+                "model.add",
+                {
+                    "provider_id": provider_id,
+                    "model": {
+                        "name": "chat",
+                        "upstream_model": "chat",
+                        "api_key_name": "chat",
+                        "enabled": True,
+                    },
+                },
+            )
+            domain.dispatch(
+                "model.add",
+                {
+                    "provider_id": provider_id,
+                    "model": {
+                        "name": "image",
+                        "upstream_model": "image",
+                        "api_key_name": "image",
+                        "enabled": False,
+                    },
+                },
+            )
+
+            # A route created from the routes pane is deliberately disabled
+            # until its upstream is filled in. Its inherited empty key must not
+            # block the unrelated live route from being saved.
+            self.assertTrue(domain.validate()["valid"])
+
+            image_id = domain.snapshot()["providers"][0]["models"][1]["editor_id"]
+            domain.dispatch(
+                "model.patch",
+                {
+                    "provider_id": provider_id,
+                    "model_id": image_id,
+                    "changes": {"model_enabled": True},
+                },
+            )
+            validation = domain.validate()
+            self.assertFalse(validation["valid"])
+            self.assertEqual(
+                ["api_key_value_required"],
+                [issue["code"] for issue in validation["issues"]],
+            )
+
+    def test_validation_keeps_an_unreferenced_new_key_pending(self) -> None:
+        directory, domain = self._domain()
+        with directory:
+            added = domain.dispatch(
+                "provider.add",
+                {
+                    "provider": {
+                        "name": "pending-provider",
+                        "api_base": "https://pending.example.test/v1",
+                        "models": [],
+                    }
+                },
+            )
+            provider_id = added["providers"][0]["id"]
+            domain.dispatch(
+                "provider.key_add",
+                {"provider_id": provider_id, "name": "pending"},
+            )
+
+            # A just-created key has no persisted value yet. Keep rejecting
+            # this draft so the secure key editor can fill it before Apply;
+            # only disabled routes are exempt from the value check.
+            validation = domain.validate()
+            self.assertFalse(validation["valid"])
+            self.assertEqual("api_key_value_required", validation["issues"][0]["code"])
+
     def test_validation_issue_paths_survive_the_shared_sanitizer(self) -> None:
         # A rejected Apply shows the location from this path; the shared
         # sanitizer keeps it only while it reads as a plain identifier.

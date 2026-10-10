@@ -14,6 +14,7 @@
     "codegen:windows": "react-native-windows-codegen --files packages/shared/src/ui/windows/*NativeComponent.ts --componentsWindows --libraryName YoungRouter --namespace winrt::YoungRouter::Codegen --outputDirectory apps/windows/windows/YoungRouter/codegen",
     "codegen:windows:check": "pnpm run codegen:windows --test",
     "typecheck": "pnpm run code-editor:build && tsc --noEmit",
+    "typecheck:no-editor": "tsc --noEmit",
     "contract-check": "node scripts/check-contract.mjs",
     "specs:generate": "node scripts/gen-native-specs.mjs",
     "specs:check": "node scripts/gen-native-specs.mjs --check",
