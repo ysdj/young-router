@@ -35,32 +35,21 @@ FIXTURE_PYPROJECT = textwrap.dedent(
     """
 )
 
-# The entry points the adapter drives.  The fixture mirrors their shapes so the
-# staging guard and the in-process call are exercised, not mocked.
+# The fixture mirrors the shapes the staging guard and the in-process call
+# exercise, so both run against real modules instead of mocks.  The credential
+# is echoed back through the report's identity field, which is how a test
+# proves the suite ran inside this interpreter.
+FIXTURE_PROTOCOL_CHOICES = {
+    "anthropic": "MODELS",
+    "openai": "OPENAI_MODEL_CHOICES",
+    "gemini": "GEMINI_MODEL_CHOICES",
+}
 FIXTURE_CLI = textwrap.dedent(
     '''
     """Fixture entry point for the staged program."""
 
-    import json
-    from pathlib import Path
-
-
     async def _run_detect(protocol, base_url, api_key, model, config, output_path) -> None:
-        payload = {
-            "protocol": getattr(protocol, "value", str(protocol)),
-            "target_model": api_key,
-            "verdict": "failed",
-            "total_score": 37.5,
-            "summary": json.dumps({"base_url": base_url, "overall_timeout_s": config.overall_timeout_s}),
-            "self_reported_identity": "I am a different model",
-            "detected_non_anthropic_brands": ["Amazon Q"],
-            "results": [
-                {"name": "identity", "status": "fail", "score": 0.0},
-                {"name": "protocol", "status": "pass", "score": 100.0},
-                {"name": "message_id", "status": "skip", "score": 0.0},
-            ],
-        }
-        Path(output_path).write_text(json.dumps(payload), encoding="utf-8")
+        raise NotImplementedError
     '''
 )
 
@@ -92,13 +81,270 @@ FIXTURE_MODELS = textwrap.dedent(
         @classmethod
         def for_mode(cls, mode, **overrides):
             return cls(mode, **overrides)
+
+
+    class _Report:
+        """Stands in for upstream's pydantic report model."""
+
+        def __init__(self, **fields):
+            self.fields = fields
+
+        def model_dump_json(self):
+            import json
+            fields = dict(self.fields)
+            fields["protocol"] = getattr(fields.get("protocol"), "value", fields.get("protocol"))
+            fields["mode"] = getattr(fields.get("mode"), "value", fields.get("mode"))
+            # The real model serializes the results it was handed; the fixture
+            # keeps only the fields the adapter reads back.
+            fields["results"] = [
+                {
+                    "name": r.name,
+                    "status": r.status,
+                    "score": r.score,
+                    "error": getattr(r, "error", None),
+                }
+                for r in fields.get("results") or []
+            ]
+            return json.dumps(fields, default=str)
+
+
+    def mask_api_key(key):
+        return key[:3] + "••••" if key else ""
+
+
+    class DetectionReport(_Report):
+        pass
+    '''
+)
+
+# The scorer the adapter builds each report with, mirroring upstream's
+# weighted average and verdict thresholds (DESIGN.md 5.2 / 5.3).
+FIXTURE_SCORER = textwrap.dedent(
+    '''
+    """Fixture scorer."""
+
+
+    def compute_total(results):
+        valid = [r for r in results if r.status != "skip"]
+        weights = sum(r.weight for r in valid)
+        if not valid or weights <= 0:
+            return 0.0
+        return sum(r.score * r.weight for r in valid) / weights
+
+
+    def effective_verdict(score, results):
+        return "passed" if score >= 70 else "marginal" if score >= 50 else "failed"
+
+
+    def fatal_run_error(results):
+        return None
+
+
+    def summary_text(score, verdict):
+        if verdict == "passed" and score >= 85:
+            return "优秀"
+        if verdict == "passed":
+            return "通过"
+        if verdict == "marginal":
+            return "基本合格"
+        return "未达标"
+    '''
+)
+
+# One fixture protocol module per protocol: the three entry points the adapter
+# calls, plus the result objects the report is built from.
+FIXTURE_PROTOCOL_MODULE = textwrap.dedent(
+    '''
+    """Fixture {protocol} suite entry points."""
+
+
+    class _Result:
+        def __init__(self, name, status, score):
+            self.name = name
+            self.status = status
+            self.score = score
+            self.weight = 1.0
+            self.details = {{}}
+            self.error = None
+
+        def skip(self, reason):
+            return _Result(self.name, "skip", 0.0)
+
+
+    class _Client:
+        def __init__(self, base_url, api_key, timeout):
+            self.base_url = base_url
+            self.api_key = api_key
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+
+    class _Runner:
+        def __init__(self, client, detectors, config):
+            self.client = client
+            self.detectors = detectors
+            self.config = config
+
+        async def run(self, model):
+            import json
+
+            class _Outcome:
+                pass
+
+            outcome = _Outcome()
+            # The credential is echoed into a field the test reads back, which
+            # is how it proves the suite ran in this process.
+            outcome.results = [
+                _Result("identity", "pass", 100.0),
+                _Result("protocol", "fail", 0.0),
+                _Result("message_id", "skip", 0.0),
+            ]
+            outcome.results[0].name = "identity"
+            outcome.results[0].details = {{"response_text": self.client.api_key}}
+            outcome.performance = {{"base_url": self.client.base_url}}
+            return outcome
+
+
+    def build_detectors(mode=None):
+        return ["fixture-detector"]
+
+
+    def build_runner(client, detectors, config):
+        return _Runner(client, detectors, config)
+
+
+    def make_client(base_url, api_key, timeout):
+        return _Client(base_url, api_key, timeout)
     '''
 )
 
 FIXTURE_REPORT = 'def write_json(report, path) -> None:\n    raise NotImplementedError\n'
 
+# The adapter imports this shim and the scorer behind it; the fixture mirrors
+# upstream's layout so a rename is caught by the staging guard.
+FIXTURE_SCORER_SHIM = 'from .core.scorer import *  # noqa: F403\n'
+FIXTURE_CORE_SCORER = FIXTURE_SCORER
+
+FIXTURE_PROTOCOL_INIT = textwrap.dedent(
+    '''
+    """Fixture protocol package."""
+
+    from .config import {choices}
+    from .detectors import build_all
+
+
+    def build_detectors(mode=None):
+        return build_all()
+
+
+    def build_runner(client, detectors, config):
+        from .runner import Runner
+
+        return Runner(client, detectors, config)
+
+
+    def make_client(base_url, api_key, timeout):
+        from .client import Client
+
+        return Client(base_url, api_key, timeout)
+    '''
+)
+
+FIXTURE_PROTOCOL_RUNNER = textwrap.dedent(
+    '''
+    """Fixture protocol runner."""
+
+
+    class _Result:
+        def __init__(self, name, status, score, details=None):
+            self.name = name
+            self.status = status
+            self.score = score
+            self.weight = 1.0
+            self.details = details or {}
+            self.error = None
+
+
+    class _Outcome:
+        def __init__(self, client):
+            self.client = client
+
+        @property
+        def results(self):
+            return [
+                _Result(
+                    "identity",
+                    "pass",
+                    100.0,
+                    # The credential is echoed back through the report's own
+                    # identity field: a test reads it there to prove the suite
+                    # ran inside this interpreter, with the route's credential.
+                    {
+                        "response_text": self.client.api_key,
+                        "detected_non_anthropic_brands": ["Amazon Q"],
+                    },
+                ),
+                _Result("protocol", "fail", 0.0),
+                _Result("message_id", "skip", 0.0),
+            ]
+
+
+    class Runner:
+        # The most recent runner, so a test can read back the config the
+        # adapter passed without the adapter exposing it in the finding.
+        last = None
+
+        def __init__(self, client, detectors, config):
+            self.client = client
+            self.detectors = detectors
+            self.config = config
+            Runner.last = self
+
+        async def run(self, model):
+            outcome = _Outcome(self.client)
+            outcome.performance = {"model": model}
+            return outcome
+    '''
+)
+
+FIXTURE_PROTOCOL_CLIENT = textwrap.dedent(
+    '''
+    """Fixture protocol client."""
+
+
+    class Client:
+        # The most recent client, so a test can prove the adapter handed the
+        # suite the route's own address and credential.
+        last = None
+
+        def __init__(self, base_url, api_key, timeout):
+            self.base_url = base_url
+            self.api_key = api_key
+            self.timeout = timeout
+            Client.last = self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+    '''
+)
 FIXTURE_ANTHROPIC_CONFIG = textwrap.dedent(
     '''
+    from dataclasses import dataclass
+
+
+    @dataclass(frozen=True)
+    class ModelInfo:
+        alias: str
+
+
     MODELS = {
         "claude-opus-4-8": ModelInfo(alias="claude-opus-4-8"),
         "claude-haiku-4-5": ModelInfo(alias="claude-haiku-4-5"),
@@ -112,7 +358,9 @@ FIXTURE_GEMINI_CONFIG = 'GEMINI_MODEL_CHOICES = [\n    "gemini-3-pro-preview",\n
 FIXTURE_LICENSE = "GNU AFFERO GENERAL PUBLIC LICENSE\nVersion 3, 19 November 2007\n"
 
 
-def fixture_archive(*, with_models: bool = True, cli: str = FIXTURE_CLI) -> bytes:
+def fixture_archive(
+    *, with_models: bool = True, cli: str = FIXTURE_CLI, scorer: str | None = None
+) -> bytes:
     """A minimal upstream archive with the same layout the updater reads."""
 
     files = {
@@ -120,14 +368,21 @@ def fixture_archive(*, with_models: bool = True, cli: str = FIXTURE_CLI) -> byte
         "src/relay_detector/cli.py": cli,
         "src/relay_detector/models.py": 'from .core.models import *  # noqa: F403\n',
         "src/relay_detector/core/models.py": FIXTURE_MODELS,
+        "src/relay_detector/scorer.py": FIXTURE_SCORER_SHIM,
+        "src/relay_detector/core/scorer.py": FIXTURE_CORE_SCORER if scorer is None else scorer,
         "src/relay_detector/report.py": FIXTURE_REPORT,
-        "src/relay_detector/protocols/anthropic/detectors/__init__.py": "def build_all():\n    return []\n",
-        "src/relay_detector/protocols/openai/detectors/__init__.py": "def build_all():\n    return []\n",
-        "src/relay_detector/protocols/gemini/detectors/__init__.py": "def build_all():\n    return []\n",
         "pyproject.toml": FIXTURE_PYPROJECT,
         "LICENSE": FIXTURE_LICENSE,
         "src/relay_detector/protocols/anthropic/data/test_document.pdf": "not a pdf",
     }
+    for protocol in FIXTURE_PROTOCOL_CHOICES:
+        base = f"src/relay_detector/protocols/{protocol}"
+        files[f"{base}/__init__.py"] = FIXTURE_PROTOCOL_INIT.format(
+            choices=FIXTURE_PROTOCOL_CHOICES[protocol]
+        )
+        files[f"{base}/runner.py"] = FIXTURE_PROTOCOL_RUNNER
+        files[f"{base}/client.py"] = FIXTURE_PROTOCOL_CLIENT
+        files[f"{base}/detectors/__init__.py"] = "def build_all():\n    return []\n"
     if with_models:
         files["src/relay_detector/protocols/anthropic/config.py"] = FIXTURE_ANTHROPIC_CONFIG
         files["src/relay_detector/protocols/openai/config.py"] = FIXTURE_OPENAI_CONFIG
@@ -190,13 +445,35 @@ class StagingTests(unittest.TestCase):
         for name, replacement, path in (
             ("async def _run_detect(", "async def run_scan(", "src/relay_detector/cli.py"),
             ("class ExecutionConfig", "class ScanConfig", "src/relay_detector/core/models.py"),
+            ("class DetectionReport", "class ScanReport", "src/relay_detector/core/models.py"),
+            ("def mask_api_key(", "def hide_key(", "src/relay_detector/core/models.py"),
             ("core.models", "another.models", "src/relay_detector/models.py"),
+            ("def compute_total(", "def total_for(", "src/relay_detector/core/scorer.py"),
+            ("def effective_verdict(", "def verdict_for_final(", "src/relay_detector/core/scorer.py"),
+            ("def fatal_run_error(", "def blocking_error(", "src/relay_detector/core/scorer.py"),
+            ("def summary_text(", "def summary_for(", "src/relay_detector/core/scorer.py"),
+            ("core.scorer", "other.scorer", "src/relay_detector/scorer.py"),
         ):
             with self.subTest(marker=name):
                 files = update.extract(fixture_archive())
                 files[path] = files[path].replace(name.encode(), replacement.encode())
                 with self.assertRaises(update.UpdateError):
                     update.validate_entry_points(files)
+
+    def test_a_protocol_that_drops_a_suite_entry_point_fails_the_build(self) -> None:
+        """Each protocol module must keep build_detectors/build_runner/make_client."""
+
+        update = veridrop_update()
+        for protocol in ("anthropic", "openai", "gemini"):
+            for entry_point in ("build_detectors", "build_runner", "make_client"):
+                with self.subTest(protocol=protocol, entry_point=entry_point):
+                    files = update.extract(fixture_archive())
+                    path = f"src/relay_detector/protocols/{protocol}/__init__.py"
+                    files[path] = files[path].replace(
+                        f"def {entry_point}(".encode(), f"def legacy_{entry_point}(".encode()
+                    )
+                    with self.assertRaises(update.UpdateError):
+                        update.validate_entry_points(files)
 
     def test_the_entry_point_must_still_be_published(self) -> None:
         update = veridrop_update()
@@ -389,7 +666,7 @@ class AdapterTests(unittest.TestCase):
         broken = self.stage(
             Path(tempfile.mkdtemp()),
             self.MANIFEST,
-            cli="import a_dependency_that_is_not_installed\n",
+            scorer="import a_dependency_that_is_not_installed\n",
         )
         self.addCleanup(lambda: __import__("shutil").rmtree(broken.parent, ignore_errors=True))
         with mock.patch.dict(os.environ, {veridrop._VERIDROP_DIR_ENV: str(broken)}):
@@ -403,6 +680,14 @@ class AdapterTests(unittest.TestCase):
                 )
 
     def test_run_quick_drives_the_staged_suite_in_this_interpreter(self) -> None:
+        """The adapter drives upstream's library entry points, not its CLI.
+
+        The CLI renders a terminal report between the run and the JSON write,
+        so a route that fails a detector loses the whole finding to a
+        rendering error.  Driving the same objects upstream's own web
+        application drives is what keeps a real mismatch reportable.
+        """
+
         with mock.patch.dict(
             os.environ,
             {
@@ -416,18 +701,22 @@ class AdapterTests(unittest.TestCase):
                 model="claude-opus-4-8",
                 protocol="anthropic",
             )
-        observed = json.loads(result["summary"])
+            sys.path.insert(0, str(self.root / "src"))
+            from relay_detector.protocols.anthropic.runner import Runner
+            from relay_detector.protocols.anthropic.client import Client
+
         self.assertEqual("anthropic", result["protocol"])
-        # The fixture echoes the credential it was handed, proving the suite is
-        # driven in this process rather than through a command line.
-        self.assertEqual("secret-value", result["model"])
-        self.assertEqual("https://relay.example.test", observed["base_url"])
-        self.assertEqual(42.0, observed["overall_timeout_s"])
-        self.assertEqual("failed", result["verdict"])
-        self.assertEqual(37.5, result["score"])
+        self.assertEqual("claude-opus-4-8", result["model"])
+        # The suite received the route's own address, credential and timeout.
+        self.assertEqual("https://relay.example.test", Client.last.base_url)
+        self.assertEqual("secret-value", Client.last.api_key)
+        self.assertEqual(42.0, Runner.last.config.overall_timeout_s)
+        # 100 for identity and 0 for protocol, message_id skipped.
+        self.assertEqual(50.0, result["score"])
+        self.assertEqual("marginal", result["verdict"])
         self.assertEqual(["Amazon Q"], result["brands"])
         self.assertEqual(["message_id"], result["skipped"])
-        self.assertEqual(["identity"], result["failed"])
+        self.assertEqual(["protocol"], result["failed"])
         self.assertEqual(3, len(result["detectors"]))
 
     def test_an_out_of_range_verdict_reads_as_inconclusive(self) -> None:

@@ -452,7 +452,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "providers.fetchKeyUnavailable": "无法解析该 API 密钥",
   "providers.fetchEmpty": "供应商未返回模型。",
   "providers.probe": "探测",
-  "providers.deepTest": "深测",
+  "providers.deepTest": "探测",
   "providers.deepTestHint": "先验可用性，再跑 veridrop quick 真伪核验",
   "providers.degradationMatched": "未掺假",
   "providers.degradationMatchedDetail": "核验通过（{target} 的真伪指纹一致）",
@@ -553,6 +553,10 @@ export const zhHans: Record<TranslationKey, string> = {
   // proxy-side ceiling the proxy never enforces, so the label keeps Codex in it.
   "providers.contextWindow": "Codex 上下文",
   "providers.publicModelDefaultHint": "留空默认 {value}",
+  // The button opens the public-model pane, which owns the write: the window
+  // is one number for the whole group, so the model detail never edits it.
+  "providers.publicModelSettings": "设置",
+  "providers.publicModelSettingsHint": "在公开模型设置中修改该模型的 Codex 上下文",
   "providers.contextWindowHelpTitle": "Codex 压缩窗口是什么",
   "providers.contextWindowHelp": "告知启用了模型目录的 Codex 这个模型能吃多少对话，超出后它自行压缩。这不是代理的限制：请求本身不受限，只是 Codex 会提前开始压缩。填写会覆盖上游元数据的最大窗口与有效百分比。",
   "providers.followMultiplier": "跟随倍率",

@@ -1289,9 +1289,9 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
   }, [isPrimaryHost, native, routeRequest, snapshot]);
 
   useEffect(() => {
-    if (!isPrimaryHost || !snapshot) return;
+    if (!snapshot) return;
     // A transitional state is a claim about a proxy replacement, and the only
-    // authority for it is Core.  The optimistic copy this window drew before
+    // authority for it is Core.  The optimistic copy a window drew before
     // dispatching a lifecycle operation is corrected by the next snapshot --
     // but a restart that outlives the request budget, or a host that replaced
     // Core underneath a stuck request, leaves no snapshot coming: the
@@ -1300,13 +1300,18 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
     // running (or long dead) with nothing able to correct it.  Re-read Core
     // while the state is transitional so the pane recovers on its own; a
     // stopped service then hands off to the existing start-retry effect below.
+    //
+    // Every window that draws the state re-reads, not only the primary host:
+    // the 服务 row lives in the settings window, which is *not* the primary
+    // host, so restricting this to the primary host left the one surface that
+    // shows the word as the one surface that could never correct it.
     if (snapshot.service.state !== "starting") return;
     // An interval, not a single timer: a successful re-read that still answers
     // "starting" leaves the revision unchanged, so a one-shot effect would
     // never run again and the pane would go back to waiting forever.
     const timer = setInterval(() => { void refreshSnapshot().catch(() => undefined); }, SERVICE_STATE_RECONCILE_MS);
     return () => clearInterval(timer);
-  }, [isPrimaryHost, refreshSnapshot, snapshot?.revision, snapshot?.service.state]);
+  }, [refreshSnapshot, snapshot?.revision, snapshot?.service.state]);
 
   useEffect(() => {
     if (!isPrimaryHost || !snapshot || !serviceShouldBeRunning.current) return;
@@ -1566,13 +1571,7 @@ function SettingsShell({ route, windowRoute, snapshot, ipc, native, translate, l
   const paneSymbolColors = useMemo(() => SETTINGS_PANES.map(({ id }) => SETTINGS_PANE_PRESENTATION[id]?.color ?? ""), []);
   const paneImageNames = useMemo(() => SETTINGS_PANES.map(({ id }) => SETTINGS_PANE_PRESENTATION[id]?.image ?? ""), []);
   const paneTitleKey = SETTINGS_PANES.find(({ id }) => id === pane)?.titleKey ?? "app.title";
-  const lastSelection = useRef<{ key: string; at: number }>({ key: "", at: 0 });
   const selectPane = (key: string): void => {
-    // The native table emits both a selection change and the row action for a
-    // single click; keep one logical selection.
-    const now = Date.now();
-    if (lastSelection.current.key === key && now - lastSelection.current.at < 250) return;
-    lastSelection.current = { key, at: now };
     const next = SETTINGS_PANES.find(({ id }) => id === key)?.id;
     if (!next) return;
     // Leaving a pane commits and applies what that pane staged, exactly as
@@ -2144,6 +2143,10 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
     stagedDomainsForRoute(currentSnapshot).length > 0
     || hasPendingFieldEdits()
   ), [hasPendingFieldEdits, stagedDomainsForRoute]);
+  // The domains this pane's disk watcher is responsible for.  The poll asks
+  // only for these: a full snapshot is a response to a changed marker, never the
+  // routine tick, so an idle window does not make the store project the whole
+  // configuration every few seconds.
   const monitoredDiskDomains = useMemo<EditableDiskDomain[]>(() => {
     if (!isSettingsRoute(route)) return [];
     if (settingsRoute) return ["codex", "claude", "clients"];
@@ -4194,6 +4197,16 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   const [publicModelReturn, setPublicModelReturn] = useState<{ routeKey: string; label: string }>();
   const [fetchKeyID, setFetchKeyID] = useState<string>();
   const [fetchModelsBusy, setFetchModelsBusy] = useState(false);
+  // Native command buttons stay pressable while they show progress. CRUD
+  // mutations therefore need a semantic single-flight guard as well as the
+  // pane's visual busy state, otherwise a fast double-click creates/deletes
+  // the same record twice before Core publishes the next snapshot.
+  const mutationInFlight = useRef(new Set<string>());
+  const runMutationOnce = (key: string, action: () => Promise<unknown>): void => {
+    if (mutationInFlight.current.has(key)) return;
+    mutationInFlight.current.add(key);
+    void Promise.resolve().then(action).finally(() => mutationInFlight.current.delete(key));
+  };
   const probingModelKeys = useRef(new Set<string>());
   const [, setProbeActivityRevision] = useState(0);
   // A result is kept with the inputs it was measured on: a route the user has
@@ -4471,7 +4484,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     const inheritedKey = modelProviderKeyState(model, provider)
       ?? providerKeyStates(provider).find((key) => key.id === selectedFetchKey)
       ?? providerKeyStates(provider)[0];
-    void dispatch("model.add", { provider_id: providerId, model: { name, upstream_model: name, enabled: true, order: 0, ...(inheritedKey ? { api_key_name: inheritedKey.name, provider_key_id: inheritedKey.id } : {}) } });
+    runMutationOnce(`model.add:${providerId}`, () => dispatch("model.add", { provider_id: providerId, model: { name, upstream_model: name, enabled: true, order: 0, ...(inheritedKey ? { api_key_name: inheritedKey.name, provider_key_id: inheritedKey.id } : {}) } }));
   };
 
   const addProvider = (): void => {
@@ -4486,11 +4499,11 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     setProviderSourceModel(undefined);
     // A new provider starts enabled the way a new model does: it carries no
     // model yet, so it contributes no deployment until the user adds one.
-    void dispatch("provider.add", { provider: { name, models: [], enabled: true } });
+    runMutationOnce("provider.add", () => dispatch("provider.add", { provider: { name, models: [], enabled: true } }));
   };
   const duplicateModel = (): void => {
     if (!model) return;
-    void dispatch("model.duplicate", { provider_id: providerId, model_id: editorIdentifier(model) });
+    runMutationOnce(`model.duplicate:${providerId}:${editorIdentifier(model)}`, () => dispatch("model.duplicate", { provider_id: providerId, model_id: editorIdentifier(model) }));
   };
   const providerDisplayName = useCallback((entry: UnknownRecord): string => {
     const entryID = editorIdentifier(entry);
@@ -4680,7 +4693,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     const inheritedKey = (activeRoute && editorIdentifier(activeRoute.provider) === targetProviderID ? modelProviderKeyState(activeRoute.model, targetProvider) : undefined)
       ?? providerKeyStates(targetProvider).find((key) => key.id === selectedFetchKey)
       ?? providerKeyStates(targetProvider)[0];
-    void dispatchWithOutcome("model.add", {
+    runMutationOnce(`route.add:${targetProviderID}:${publicModel}`, () => dispatchWithOutcome("model.add", {
       provider_id: targetProviderID,
       model: {
         name,
@@ -4695,7 +4708,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       const added = nextProvider ? asRecords(nextProvider.models).map(modelRecord).find((entry) => !knownModelIds.has(editorIdentifier(entry)) && stringValue(entry.model_name ?? entry.name).trim() === name) : undefined;
       pendingModelIds.current = undefined;
       if (added) pendingRouteKey.current = `${targetProviderID}:${stringValue(added.editor_id, stringValue(added.deployment_id, identifier(added))).trim()}`;
-    });
+    }));
   };
   // − deletes what the user selected: one route, or — with a public model's own
   // row selected — every route that serves that name.  The group case is one
@@ -4704,24 +4717,24 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   const confirmDeleteRoute = (): void => {
     const selectedGroup = selectedPublicModel !== undefined ? routeGroups.find((group) => group.name === selectedPublicModel) : undefined;
     if (selectedGroup) {
-      void native.showConfirmation({
+      runMutationOnce(`route.delete-group:${selectedGroup.name}`, () => native.showConfirmation({
         title: translate("providers.deletePublicModel", { model: selectedGroup.name }),
         message: translate("providers.deletePublicModelMessage", { routes: selectedGroup.entries.length }),
         confirmLabel: translate("common.delete"),
         destructive: true,
-      }).then((confirmed) => confirmed ? dispatch("public.model_delete", { public_model: selectedGroup.name }).then(() => { setSelectedPublicModel(undefined); setSelectedRoute(""); }) : undefined);
+      }).then((confirmed) => confirmed ? dispatch("public.model_delete", { public_model: selectedGroup.name }).then(() => { setSelectedPublicModel(undefined); setSelectedRoute(""); }) : undefined));
       return;
     }
     if (!activeRoute) return;
     const routeProviderID = editorIdentifier(activeRoute.provider);
     const routeModelID = editorIdentifier(activeRoute.model);
     const upstream = modelUpstreamDisplay(routeProviderID, activeRoute.model) || activeRoute.publicModel;
-    void native.showConfirmation({
+    runMutationOnce(`route.delete:${activeRoute.key}`, () => native.showConfirmation({
       title: translate("providers.deleteRoute"),
       message: translate("providers.deleteRouteMessage", { provider: providerDisplayName(activeRoute.provider), upstream, model: activeRoute.publicModel }),
       confirmLabel: translate("common.delete"),
       destructive: true,
-    }).then((confirmed) => confirmed ? dispatch("model.delete", { provider_id: routeProviderID, model_id: routeModelID }).then(() => setSelectedRoute("")) : undefined);
+    }).then((confirmed) => confirmed ? dispatch("model.delete", { provider_id: routeProviderID, model_id: routeModelID }).then(() => setSelectedRoute("")) : undefined));
   };
   const confirmDeleteProvider = (): void => {
     if (!provider) return;
@@ -4739,7 +4752,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
           models: models.length,
         })
       : `${label} (${models.length} ${translate("providers.models")})`;
-    void native.showConfirmation({ title: translate("providers.deleteProvider"), message, confirmLabel: translate("common.delete"), destructive: true }).then((confirmed) => {
+    runMutationOnce(`provider.delete:${providerId}`, () => native.showConfirmation({ title: translate("providers.deleteProvider"), message, confirmLabel: translate("common.delete"), destructive: true }).then((confirmed) => {
       if (!confirmed) return undefined;
       return dispatch(action, { provider_id: providerId }).then(async () => {
         // A 中转站 provider owns its station connection: once the last
@@ -4769,12 +4782,12 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
         setSelectedModel(undefined);
         setProviderSourceModel(undefined);
       });
-    });
+    }));
   };
   const confirmDeleteModel = (): void => {
     if (!model) return;
     const modelId = editorIdentifier(model);
-    void native.showConfirmation({ title: translate("providers.deleteModel"), message: modelDisplayName(providerId, model) || modelId, confirmLabel: translate("common.delete"), destructive: true }).then((confirmed) => confirmed ? dispatch("model.delete", { provider_id: providerId, model_id: modelId }).then(() => setSelectedModel(undefined)) : undefined);
+    runMutationOnce(`model.delete:${providerId}:${modelId}`, () => native.showConfirmation({ title: translate("providers.deleteModel"), message: modelDisplayName(providerId, model) || modelId, confirmLabel: translate("common.delete"), destructive: true }).then((confirmed) => confirmed ? dispatch("model.delete", { provider_id: providerId, model_id: modelId }).then(() => setSelectedModel(undefined)) : undefined));
   };
   const providerRows = useMemo(
     () => providers.map((item) => ({
@@ -5477,12 +5490,11 @@ function PublicModelInspector({ group, modelContexts, backLabel, busy, translate
   // shows what every route can honour and a commit writes it to all of them.
   const customContext = publicModelCustomLimit(providers, group.name, "max_input_tokens");
   const defaultContext = publicModelDefault(modelContexts, group.name);
-  // The routes table is a list view read dozens of rows at a time, so this pane
-  // states the window and nothing else: the number is a declaration handed to
-  // Codex, it enforces nothing here, and a registry escape hatch buried in a
-  // high-frequency scan reads as a proxy limit the proxy never applies.  The
-  // per-model editor lives in the model detail, one click from either entrance.
-  const resolvedContext = customContext !== undefined ? customContext : defaultContext;
+  // This pane is where the Codex window is *set*: it is the public model's own
+  // declaration, written to every route of the group in one staged action, and
+  // the model detail states it read-only with a 设置 button that lands here.
+  const contextHint = translate("providers.publicModelDefaultHint", { value: publicModelTokensText(defaultContext, translate) });
+  const [contextTipOpen, setContextTipOpen] = useState(false);
   return <View style={styles.inspectorContent}>
     {/* The provider editor's own header shape: the title takes the row and the
         return link sits on the trailing edge, never in front of the title.  A
@@ -5503,10 +5515,7 @@ function PublicModelInspector({ group, modelContexts, backLabel, busy, translate
         if (!renamed || renamed === group.name) return undefined;
         return dispatchSnapshot("public.model_patch", { public_model: group.name, changes: { name: renamed } }).then((snapshot) => { if (snapshot) onRenamed(renamed); });
       }} />
-      {resolvedContext !== undefined ? <View style={styles.formRow}>
-        <Text numberOfLines={1} style={styles.modelInspectorLabel}>{translate("providers.contextWindow")}</Text>
-        <Text numberOfLines={1} style={styles.modelWindowText}>{publicModelTokensText(resolvedContext, translate)}</Text>
-      </View> : null}
+      <TextField label={translate("providers.contextWindow")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} value={customContext !== undefined ? String(customContext) : ""} placeholder={contextHint} keyboardType="numeric" disabled={busy} onCommit={(next) => dispatch("public.model_patch", { public_model: group.name, changes: { max_input_tokens: next.trim() } })} accessory={<HelpTip open={contextTipOpen} text={translate("providers.contextWindowHelp")} title={translate("providers.contextWindowHelpTitle")} onToggle={() => setContextTipOpen((current) => !current)} />} />
     </View>
   </View>;
 }
@@ -5564,14 +5573,13 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
   const modelFieldName = stringValue(model.model_name, stringValue(model.name));
   // The public model's client-facing context window: the value the user
   // declared wins, otherwise the registry default the managed catalog
-  // resolves.  This is where the window is edited — the routes table's
-  // public-model pane states it read-only, because that list view is scanned
-  // dozens of rows at a time and an escape hatch there reads as a proxy limit.
+  // resolves.  It is the *group's* declaration — one number for every route
+  // that serves the name — so this pane states it and hands the edit to the
+  // public-model pane, which writes it to all of them at once.
   const publicModelName = modelFieldName.trim();
   const publicModelWindow = publicModelDefault(modelContexts ?? {}, publicModelName);
   const customWindow = publicModelCustomLimit(providers, publicModelName, "max_input_tokens");
-  const [windowTipOpen, setWindowTipOpen] = useState(false);
-  const windowHint = translate("providers.publicModelDefaultHint", { value: publicModelTokensText(publicModelWindow, translate) });
+  const resolvedWindow = customWindow !== undefined ? customWindow : publicModelWindow;
   const keyStates = providerAuthKind(provider) === "api_key" ? providerKeyStates(provider) : [];
   const selectedProviderKey = keyStates.find((key) => key.id === stringValue(model.provider_key_id))
     ?? keyStates.find((key) => key.name === stringValue(model.api_key_name));
@@ -5680,6 +5688,18 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
     <View style={styles.inspectorBody}>
       <View style={styles.inspectorEnabledRow}><View style={styles.inspectorEnableControl}><NativeCheckbox label={translate("common.enable")} value={booleanValue(model.model_enabled, booleanValue(model.enabled, true))} disabled={busy} onValueChange={(model_enabled) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { model_enabled } })} /></View><ActionButton title={probeTitle} titleWidth="tight" busy={probing} toolTip={(probePresentation.compact ? probePresentation.tooltip : "") || (degradationIncluded ? translate("providers.deepTestHint") : undefined)} disabled={(busy && !probing) || !probeReady} onPress={probe} />{probePresentation.compactSentence ? <Pressable style={styles.inspectorProbeFinding} onPress={openProbeDetails} accessibilityRole="link" accessibilityLabel={probePresentation.compactSentence}><TooltipText numberOfLines={1} ellipsizeMode="tail" tooltip={probePresentation.tooltip} style={styles.inspectorProbeFindingText}>{probePresentation.compactSentence}</TooltipText></Pressable> : null}</View>
       <TextField label={translate("providers.publicModel")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} value={modelFieldName} onDraftChange={onNameDraftChange} onCommit={(name) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { name } })} />
+      {/* The Codex window belongs to the *public name* on the row above, so it
+          is stated directly under it: one number for the whole group, written
+          by the public-model pane that 设置 opens.  This pane never commits it
+          — a route that carried a window of its own would make the group's
+          number depend on which route happened to answer. */}
+      {publicModelName ? <View style={styles.formRow}>
+        <Text numberOfLines={1} style={styles.modelInspectorLabel}>{translate("providers.contextWindow")}</Text>
+        <View style={styles.modelWindowValue}>
+          <Text numberOfLines={1} style={styles.modelWindowText}>{publicModelTokensText(resolvedWindow, translate)}</Text>
+          <NativeButton title={translate("providers.publicModelSettings")} toolTip={translate("providers.publicModelSettingsHint")} accessibilityLabel={translate("providers.publicModelSettingsHint")} compact disabled={busy || !onOpenPublicModel} onPress={() => onOpenPublicModel?.()} style={styles.modelWindowLink} />
+        </View>
+      </View> : null}
       <PickerField label={translate("providers.provider")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} allowShrink value={providerLabel} values={providerLabels} disabled={busy || providers.length <= 1} onSelect={(label) => { const next = providers[providerLabels.indexOf(label)]; if (next) onProviderChange(editorIdentifier(next)); }} />
       {isDraftModel(model, translate) ? <Text style={styles.fieldHint}>{translate(selectedProviderKey ? "providers.draftModelHint" : "providers.draftModelKeylessHint")}</Text> : null}
       {providerKeyOptions.length > 0 ? <PickerField label={translate("providers.providerKey")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} allowShrink value={selectedProviderKey?.id ?? ""} values={[{ value: "", label: translate("providers.undefinedKey") }, ...providerKeyOptions]} disabled={busy} onSelect={selectProviderKey} /> : null}
@@ -5713,11 +5733,6 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
         })} style={styles.orderFollowControl} /> : null}
       </View>
       <ProtocolPicker providerId={providerId} model={model} busy={busy} translate={translate} dispatch={dispatch} />
-      {/* The window is the pane's last row: it is a per-model escape hatch for
-          a registry that resolved this route wrong, not part of how the route
-          is called, so it sits below 协议方式 instead of splitting the calling
-          fields apart. */}
-      {publicModelName ? <TextField label={translate("providers.contextWindow")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} value={customWindow !== undefined ? String(customWindow) : ""} placeholder={windowHint} keyboardType="numeric" disabled={busy} onCommit={(next) => dispatch("public.model_patch", { public_model: publicModelName, changes: { max_input_tokens: next.trim() } })} accessory={<HelpTip open={windowTipOpen} text={translate("providers.contextWindowHelp")} title={translate("providers.contextWindowHelpTitle")} onToggle={() => setWindowTipOpen((current) => !current)} />} /> : null}
     </View>
   </View>;
 }
@@ -5726,7 +5741,7 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
 // clickable question mark beside it, and the tip opens over the pane when it is
 // asked for. The mark is the platform's own help glyph — an SF Symbol on macOS,
 // the MDL2 glyph on Windows — drawn as a quiet icon-only link, so it is neither
-// a button bezel nor a text mark, and the picker keeps its 60 pt label column
+// a button bezel nor a text mark, and the picker keeps its label column
 // intact. The panel is anchored upward because these rows sit at the bottom of
 // the model inspector, where a panel opening downward would fall outside the
 // workspace.
@@ -10022,7 +10037,7 @@ const styles = StyleSheet.create({
   // points below it, and the sections under it keep the left column's row pitch.
   providersLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }, providerWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, providerLeftColumn: { flex: 1, minWidth: 0, minHeight: 0, gap: 6 }, providerModelColumns: { flex: 1, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }, routeWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, fetchKeyPicker: { width: 170, height: 24, marginRight: 6, flexShrink: 0 }, providerListPane: { width: 140, minWidth: 140, maxWidth: 140, flexGrow: 0, flexShrink: 0 }, modelListPane: { flex: 1, minWidth: 0 }, tablePane: { flex: 1, minWidth: 0, gap: 6 }, tablePaneWide: { flex: 1, minWidth: 0 }, tableTitleRow: { height: 24, flexDirection: "row", alignItems: "center" }, tableTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, tableActions: { marginLeft: "auto", flexDirection: "row", gap: 6 }, iconButton: { minWidth: 22, width: 22, minHeight: 22, height: 22, alignItems: "center", justifyContent: "center" }, tableBottomRow: { minHeight: 26, flexDirection: "row", alignItems: "center" }, nativeProviderTable: { flex: 1, minHeight: 0 }, nativeModelTable: { flex: 1, minHeight: 0 }, nativeRouteTable: { flex: 1, minHeight: 0 }, providerInspector: { width: 290, minWidth: 290, maxWidth: 290, flexGrow: 0, flexShrink: 0 }, providerEditorContent: { flex: 1, minHeight: 0 }, providerEditorScrollContent: { paddingLeft: 0, paddingRight: 16, paddingBottom: 12, gap: 6 }, persistentScrollIndicator: { position: "absolute", width: 0, height: 0 }, providerEditorHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerEditorHeading: { flex: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerReturnToModel: { flexShrink: 1 }, providerEditorSection: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 3, gap: 4 }, providerEnabledRow: { minHeight: 22, flexDirection: "row", alignItems: "center" }, providerSourceFields: { minWidth: 0, gap: 4 }, inspectorContent: { paddingLeft: 0, paddingRight: 6, paddingBottom: 12, gap: 6 }, inspectorBody: { gap: 4 }, modelBreadcrumb: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 4 }, breadcrumbProvider: { flexShrink: 1, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, breadcrumbSeparator: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorHeading: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorDivider: { height: 1, backgroundColor: systemColors.separator }, inspectorEnabledRow: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, // A link is also a cursor: the row shows the pointing hand over the whole
 // finding, label included, exactly like every native link in the app.
-inspectorProbeFinding: { flexShrink: 1, minWidth: 0, cursor: "pointer" }, inspectorProbeFindingText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textDecorationLine: "underline" }, inspectorEnableControl: { flexShrink: 0 }, orderEditorRow: { width: "100%", minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, orderEditorField: { flex: 1, width: undefined }, orderFollowControl: { flexShrink: 0 }, modelWindowText: { flexShrink: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE }, protocolSettings: { gap: 4 }, helpTipAnchor: { position: "relative", zIndex: 2 }, helpTipDismiss: { position: "absolute", left: -2400, right: -2400, top: -2400, bottom: -2400 }, helpTipButton: { width: 16, height: 16, minWidth: 16, minHeight: 16 }, helpTipPopup: { position: "absolute", right: 0, bottom: 22, width: 208, paddingHorizontal: 8, paddingVertical: 6, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.control, shadowColor: "#000000", shadowOpacity: 0.18, shadowRadius: 8, shadowOffset: { width: 0, height: 2 } }, helpTipText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
+inspectorProbeFinding: { flexShrink: 1, minWidth: 0, cursor: "pointer" }, inspectorProbeFindingText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textDecorationLine: "underline" }, inspectorEnableControl: { flexShrink: 0 }, orderEditorRow: { width: "100%", minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, orderEditorField: { flex: 1, width: undefined }, orderFollowControl: { flexShrink: 0 }, modelWindowValue: { flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 6 }, modelWindowText: { flexShrink: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE }, modelWindowLink: { flexShrink: 0 }, protocolSettings: { gap: 4 }, helpTipAnchor: { position: "relative", zIndex: 2 }, helpTipDismiss: { position: "absolute", left: -2400, right: -2400, top: -2400, bottom: -2400 }, helpTipButton: { width: 16, height: 16, minWidth: 16, minHeight: 16 }, helpTipPopup: { position: "absolute", right: 0, bottom: 22, width: 208, paddingHorizontal: 8, paddingVertical: 6, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.control, shadowColor: "#000000", shadowOpacity: 0.18, shadowRadius: 8, shadowOffset: { width: 0, height: 2 } }, helpTipText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
   externalSettingsWorkspace: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }, externalSettingsFieldList: { ...SETTINGS_FIELD_LIST }, externalSettingsField: { ...SETTINGS_FIELD }, externalSettingsInputRow: { ...SETTINGS_FIELD_ROW_INDENTED }, externalSettingsFieldLabel: { ...SETTINGS_FIELD_LABEL }, externalSettingsValueSlot: { ...SETTINGS_FIELD_ROUTE_SLOT }, externalSettingsBooleanControl: { ...SETTINGS_FIELD_SWITCH_SLOT }, externalSettingsHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }, externalSettingsHelpText: { ...SETTINGS_FIELD_HELP_TEXT }, externalSettingsPane: { flex: 1, minHeight: 0 }, externalSettingsPaneContent: { paddingVertical: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, gap: 14 }, codexRawEditorBase: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, minHeight: 0, gap: 5 }, codexRawEditorHeader: { minHeight: 18 }, codexRawEditorLabel: { fontFamily: Platform.select({ macos: "Menlo", windows: "Cascadia Mono", default: "monospace" }), fontWeight: "600" }, codexRawNativeEditor: { minHeight: 0 }, codexRawEditorLoading: { minHeight: 0 },
   runtimeWorkspaceFrame: { flex: 1, minHeight: 0, gap: 6 }, runtimeWorkspaceBody: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }, runtimeWorkspace: { width: "100%", padding: SETTINGS_PANE_INSET, gap: 14 }, runtimeScrollSurface: { flex: 1, minWidth: 0, backgroundColor: systemColors.textBackground }, runtimeFieldList: { ...SETTINGS_FIELD_LIST }, runtimeField: { ...SETTINGS_FIELD }, runtimeInputRow: { ...SETTINGS_FIELD_ROW_INDENTED }, runtimeModifiedBar: { position: "absolute", left: 0, top: 3, bottom: 3, width: 2, borderRadius: 1, backgroundColor: "transparent" }, runtimeModifiedBarInline: { width: 2, alignSelf: "center", height: 16, borderRadius: 1, backgroundColor: "transparent" }, runtimeModifiedBarActive: { backgroundColor: systemColors.blue }, runtimeFieldError: { marginLeft: SETTINGS_FIELD_HELP_INDENT, color: systemColors.red, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, runtimeValueControlInvalid: { borderWidth: 1, borderColor: systemColors.red, borderRadius: 4 }, runtimeResetButton: { minWidth: 28, width: 28, height: 22, paddingHorizontal: 0 }, runtimeFieldLabel: { ...SETTINGS_FIELD_LABEL }, runtimeValueSlot: { ...SETTINGS_FIELD_VALUE_SLOT }, runtimeValueControl: { width: SETTINGS_FIELD_VALUE_WIDTH, minWidth: SETTINGS_FIELD_VALUE_WIDTH, height: 26 }, runtimeBooleanControl: { ...SETTINGS_FIELD_SWITCH_SLOT }, runtimeUnit: { width: 68, flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, runtimeActionSlot: { width: 72, minHeight: 26, flexShrink: 0, justifyContent: "center" }, runtimeHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }, runtimeHelpText: { ...SETTINGS_FIELD_HELP_TEXT }, runtimeMultilineField: { minWidth: 0, flexGrow: 1, flexBasis: "100%", maxWidth: "100%" }, runtimeMultilineHeader: { minHeight: 26, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8, paddingLeft: SETTINGS_FIELD_LEAD }, runtimeMultilineLabel: { flex: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, runtimeMultilineHeaderActions: { flexShrink: 0, minHeight: 26, justifyContent: "center" }, runtimeMultilineEditor: { width: "100%", minWidth: 0, height: 108, flex: 1, alignSelf: "stretch" }, runtimeMultilineHelpSlot: { marginLeft: 0, maxWidth: "100%", minWidth: 0, paddingTop: 6, gap: 3 }, runtimeJsonDefaultHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15, fontWeight: "600", minWidth: 0 },
   dataManagementWorkspace: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }, dataManagementPane: { flex: 1, minHeight: 0 }, dataManagementPaneScrollContent: { paddingTop: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, paddingBottom: 4, gap: 10 }, dataManagementImportIntro: { width: "100%", minHeight: 72, paddingHorizontal: 12, paddingVertical: 12, justifyContent: "center" }, dataManagementImportFileRow: { width: "100%", minHeight: 28, flexDirection: "row", alignItems: "center", gap: SETTINGS_FIELD_GAP, paddingLeft: SETTINGS_FIELD_LEAD }, dataManagementImportFileLabel: { ...SETTINGS_FIELD_LABEL }, dataManagementImportFileValue: { flex: 1, minWidth: 0, minHeight: 26, justifyContent: "center", paddingHorizontal: 8, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 4, backgroundColor: systemColors.textBackground }, dataManagementImportFilePlaceholder: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, dataManagementSelectionBar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementSelectionCount: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, dataManagementToolbarButtons: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, dataManagementSectionsField: { flex: 1, minWidth: 0, gap: 6 }, dataManagementSectionList: { gap: 4 }, dataManagementSectionItem: { minHeight: 22 }, dataManagementActionStatus: { flexShrink: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 14 }, dataManagementSensitiveHint: { color: systemColors.brown, fontSize: UI_FONT_SIZE, lineHeight: 16, paddingVertical: 5, paddingHorizontal: 7, backgroundColor: Platform.select({ macos: (PlatformColor("systemYellow") as unknown as { withAlphaComponent?: (alpha: number) => string })?.withAlphaComponent?.(0.08) ?? "rgba(255, 204, 0, 0.08)", default: "rgba(255, 204, 0, 0.08)" }), borderRadius: 4, borderWidth: 1, borderColor: Platform.select({ macos: (PlatformColor("systemYellow") as unknown as { withAlphaComponent?: (alpha: number) => string })?.withAlphaComponent?.(0.2) ?? "rgba(255, 204, 0, 0.2)", default: "rgba(255, 204, 0, 0.2)" }) }, dataManagementSyncScopeValue: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, dataManagementDirectionPicker: { width: SETTINGS_FIELD_VALUE_WIDTH, height: 24, flexGrow: 0, flexShrink: 0 },

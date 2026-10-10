@@ -1997,10 +1997,56 @@ class ProvidersModelsDomainTests(unittest.TestCase):
         self.assertEqual("network_error", result["degradation"]["cause"])
         self.assertIn("did not answer", result["degradation"]["detail"])
 
-    def test_model_deep_test_skips_a_model_the_staged_program_does_not_carry(self) -> None:
+    def test_model_deep_test_scans_a_name_the_staged_tables_do_not_carry(self) -> None:
+        """An unlisted name is still scanned; the tables are not a permission list.
+
+        The quick suite compares a response against the request that asked for
+        it, so a name upstream has not listed yet - a newer model, a local
+        alias - is probeable on the protocol its own name resolves to.  Only a
+        name that resolves to no protocol the suite speaks is skipped.
+        """
+
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.yaml"
             path.write_text(deep_test_config(model_name="gpt-6-astra"), encoding="utf-8")
+            domain = ProvidersModelsDomain(path)
+            core = CoreStore(domains=[domain])
+
+            def surface_probe(*, surface: str, **_kwargs: object) -> dict[str, object]:
+                return {"surface": surface, "available": True, "status": "ok"}
+
+            with mock.patch.object(ProvidersModelsDomain, "_surface_probe", side_effect=surface_probe), degradation_engine(
+                supported=False
+            ) as staged:
+                result = core.probe(
+                    {"provider_id": "primary", "model_id": "00000071"},
+                    domain="providers_models",
+                )
+            model = core.snapshot()["domains"]["providers_models"]["providers"][0]["models"][0]
+
+        self.assertEqual(1, len(staged.call_args_list))
+        # Scanned under this route's own wire name, on the protocol its name
+        # resolves to.
+        self.assertEqual("gpt-6-astra", staged.call_args.kwargs["model"])
+        self.assertEqual("openai", staged.call_args.kwargs["protocol"])
+        self.assertEqual("gpt-6-astra", result["degradation"]["target"])
+        self.assertEqual(
+            {
+                "includes_degradation": True,
+                "target": "gpt-6-astra",
+                "protocol": "openai",
+                "surface": "openai/chat",
+            },
+            model["deep_probe"],
+        )
+        self.assertTrue(model["model_enabled"])
+
+    def test_model_deep_test_skips_a_name_no_protocol_can_speak_for(self) -> None:
+        """A name that resolves to no suite protocol reports itself skipped."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(deep_test_config(model_name="space-bunny"), encoding="utf-8")
             domain = ProvidersModelsDomain(path)
             core = CoreStore(domains=[domain])
 

@@ -1185,6 +1185,12 @@ def _responses_context_truncation_fallback_kwargs(
     if request_kwargs.get("use_chat_completions_api") is True:
         return None
     if _request_is_codex_compaction(request_kwargs):
+        # A compaction request never takes the truncation fallback, however
+        # large its prefix: the upstream compacts exactly what it receives, so
+        # an injected ``truncation=auto`` would drop signed replay items and
+        # bake that loss into the history the client keeps.  Encrypted history
+        # is an immutable replay prefix — never recompress, re-encode, reorder,
+        # drop, or path-rewrite a signed item.
         return None
     if _request_disables_responses_truncation_fallback(request_kwargs):
         return None

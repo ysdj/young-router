@@ -1309,7 +1309,156 @@ class LocalEditBesideARelayBacklogTests(unittest.TestCase):
                 else:
                     self.fail("the relay's own backlog must be reported as a relay failure")
             del account_id, resource_id, relay
+class LinkedEditResolvesFromTheKeyItAlreadyHolds(unittest.TestCase):
+    """A model edit on a linked key is not a station round trip.
 
+    The credential is on the provider slot, so the edit needs nothing from
+    the station; and a row the pane has not finished is never a verdict
+    about the key.  A resolution that did read the station still names a
+    route the group does not serve.
+    """
+
+    def test_a_model_edit_on_a_held_linked_key_reads_nothing_from_the_station(self) -> None:
+        """A dependency-only Apply resolves the key the document already holds.
+
+        The linked key's credential is materialized onto its provider slot by the
+        first Apply, so a later model edit needs nothing from the station.  Asking
+        anyway spent a whole account refresh plus one gateway catalog per key
+        inside Core's store lock, and that round trip can outlast the native
+        hosts' request budget once a station stalls: the window then reports
+        本地 Core 不可用 while Core is still rendering an answer it already had.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            http = RelayCoordinatorHTTP()
+            relay = RelayAccountsDomain(root, http_client=http)
+            providers = ProvidersModelsDomain(root / "config.yaml")
+            core = CoreStore(domains=[relay, providers])
+            account_id = self._linked_provider_core(core, relay)
+            provider = providers.snapshot()["providers"][0]
+            key = provider["key_states"][0]
+            self._add_linked_model(core, providers, "model-a", "model-a")
+            core.apply("providers_models", revision=core.revision)
+            # The first Apply wrote the key onto its slot; that value is the
+            # durable half of what a later edit needs.
+            self.assertTrue(providers.relay_slot_credentials())
+
+            key = providers.snapshot()["providers"][0]["key_states"][0]
+            self._add_linked_model(core, providers, "model-a", "model-a")
+            http.calls.clear()
+            result = core.apply("providers_models", revision=core.revision)
+
+            self.assertTrue(result["applied"], result)
+            # No station read at all: the answer was already on the slot.
+            self.assertEqual([], http.calls)
+            del account_id, provider, key
+
+    def test_an_unfinished_draft_row_does_not_refuse_a_linked_apply(self) -> None:
+        """A row the user has not finished is never reported as an error.
+
+        The pane ships the localized placeholder as both the public name and the
+        upstream of a ＋ row until the user replaces it, and the shell applies
+        that draft immediately.  Judging the placeholder against the key's
+        catalog refused the whole commit, so pressing ＋ on a linked key made
+        every later edit in that window fail with 中转密钥无法解析.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            http = RelayCoordinatorHTTP()
+            relay = RelayAccountsDomain(root, http_client=http)
+            providers = ProvidersModelsDomain(root / "config.yaml")
+            core = CoreStore(domains=[relay, providers])
+            self._linked_provider_core(core, relay)
+            self._add_linked_model(core, providers, "model-a", "model-a")
+            core.apply("providers_models", revision=core.revision)
+
+            # The pane's ＋ : the placeholder is both the public name and the upstream.
+            self._add_linked_model(core, providers, "新建模型", "新建模型")
+            result = core.apply("providers_models", revision=core.revision)
+
+            self.assertTrue(result["applied"], result)
+            self.assertIn("新建模型", (root / "config.yaml").read_text(encoding="utf-8"))
+
+    def test_a_linked_route_the_key_does_not_serve_still_names_its_cause(self) -> None:
+        """A real claim about the key is still refused.
+
+        Resolving locally must not turn every catalog refusal into a silent
+        accept: a resolution that read the station keeps reporting a route whose
+        upstream the key does not serve.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            http = RelayCoordinatorHTTP()
+            relay = RelayAccountsDomain(root, http_client=http)
+            providers = ProvidersModelsDomain(root / "config.yaml")
+            core = CoreStore(domains=[relay, providers])
+            self._linked_provider_core(core, relay)
+            self._add_linked_model(core, providers, "public-chat", "model-not-in-the-catalog")
+
+            with self.assertRaises(CoreError) as raised:
+                core.apply("providers_models", revision=core.revision)
+            self.assertEqual("relay_binding_failed", raised.exception.code)
+            self.assertEqual(
+                {"catalog_model_missing"},
+                {item["code"] for item in providers.snapshot()["binding_issues"]},
+            )
+
+    def _linked_provider_core(self, core: CoreStore, relay: RelayAccountsDomain) -> str:
+        """Sign in, refresh, and import the station's one key as a linked provider."""
+
+        core.dispatch(
+            {
+                "domain": "relay_accounts",
+                "type": "account.add",
+                "payload": {"type": "newapi", "label": "Relay", "origin": "https://relay.example.test"},
+            }
+        )
+        account_id = relay.snapshot()["accounts"][0]["id"]
+        core.accept_relay_login(
+            account_id=account_id,
+            account_type="newapi",
+            label="Relay",
+            origin="https://relay.example.test",
+            username="person",
+            cookie="session=fixture",
+        )
+        core.refresh_relay_resources(account_id, revision=core.revision)
+        resource_id = relay.snapshot()["accounts"][0]["resources"][0]["id"]
+        core.import_relay_resources(account_id, [resource_id], revision=core.revision)
+        return account_id
+
+    def _add_linked_model(
+        self,
+        core: CoreStore,
+        providers: ProvidersModelsDomain,
+        name: str,
+        upstream: str,
+    ) -> None:
+        """Stage one row on the linked key the way the shared pane's ＋ does."""
+
+        provider = providers.snapshot()["providers"][0]
+        key = provider["key_states"][0]
+        core.dispatch(
+            {
+                "domain": "providers_models",
+                "type": "model.add",
+                "payload": {
+                    "provider_id": provider["name"],
+                    "model": {
+                        "name": name,
+                        "upstream_model": upstream,
+                        "enabled": True,
+                        "order": 0,
+                        "api_key_name": key["name"],
+                        "provider_key_id": key["id"],
+                    },
+                },
+            },
+            expected_revision=core.revision,
+        )
 
 if __name__ == "__main__":
     unittest.main()

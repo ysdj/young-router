@@ -395,6 +395,9 @@ export function NativeTable({ columns, rows, selectedKey = "", striped = true, a
   const stripedRows = striped && !sourceList && (alternatingRows || rows.length > 0);
   const spanningRowKeys = rows.filter((row) => row.spanning).map((row) => row.key);
   const selectableSpanningKeys = new Set(selectableSpanningRowKeys.filter((key) => spanningRowKeys.includes(key)));
+  // Every key here must also appear in the macOS wrapper's own parameter list:
+  // `AppKitControls.tsx` forwards props by hand, so a prop added on one host and
+  // forgotten on the other arrives empty instead of failing to compile.
   const nativeProps = {
     columnLabels: columns.map((column) => column.label),
     columnWidths: columns.map((column) => column.width),

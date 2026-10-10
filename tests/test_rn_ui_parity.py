@@ -724,7 +724,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('titleWidth={titleWidth} toolTip={toolTip} onPress={onPress} style={style} />;')
         for marker in (
             '"providers.probe": "探测"',
-            '"providers.deepTest": "深测"',
+            '"providers.deepTest": "探测"',
             '"providers.deepTestHint": "先验可用性，再跑 veridrop quick 真伪核验"',
             '"providers.degradationUnavailable": "核验不可用"',
             '"providers.degradationError": "核验失败"',
@@ -732,7 +732,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.assertIn(marker, self.zh)
         for marker in (
             '"providers.probe": "Probe"',
-            '"providers.deepTest": "Deep test"',
+            '"providers.deepTest": "Probe"',
         ):
             self.assertIn(marker, self.en)
 
@@ -1094,23 +1094,25 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('setSelectedRoute("");', select_public)
 
         inspector = self.ui.split("function PublicModelInspector(", 1)[1].split("function ModelInspector(", 1)[0]
-        # One surface owns the rename and states the context window; the route
-        # order list lives in the routes table, not here.
+        # One surface owns the rename and the Codex window; the route order list
+        # lives in the routes table, not here.
         self.assertIn('dispatchSnapshot("public.model_patch", { public_model: group.name, changes: { name: renamed } })', inspector)
         self.assertIn('translate("providers.contextWindow")', inspector)
         self.assertNotIn("routes.reorder_group", inspector)
         self.assertNotIn("publicModelRouteRow", inspector)
         self.assertNotIn("styles.publicModelRoutes", inspector)
-        # The window is stated, not edited, here.  It is a declaration the
-        # managed catalog hands to Codex, it enforces nothing in the proxy, and
-        # an input box beside a route table read as a proxy ceiling the proxy
-        # never applies.  The per-model editor is the model detail's own row,
-        # so this pane must never carry the commit again.
-        self.assertIn('publicModelTokensText(resolvedContext, translate)', inspector)
-        self.assertNotIn("max_input_tokens: next.trim()", inspector)
-        self.assertNotIn('placeholder={contextHint}', inspector)
-        self.assertNotIn('hint={contextHint}', inspector)
-        self.assertNotIn("contextWindowHelp", inspector)
+        # The window is declared for the *group*, so this pane is where it is
+        # written: one commit lands the number on every route of the public
+        # model, and the field keeps the registry default as its placeholder
+        # hint and a help mark that says it reaches Codex rather than capping
+        # the proxy.  A per-route editor is what this replaces — a single route
+        # carrying its own window makes the group's number depend on which
+        # route happened to answer.
+        self.assertIn('dispatch("public.model_patch", { public_model: group.name, changes: { max_input_tokens: next.trim() } })', inspector)
+        self.assertIn('placeholder={contextHint}', inspector)
+        self.assertIn('text={translate("providers.contextWindowHelp")}', inspector)
+        self.assertIn('title={translate("providers.contextWindowHelpTitle")}', inspector)
+        self.assertIn('accessory={<HelpTip open={contextTipOpen} text={translate("providers.contextWindowHelp")}', inspector)
         self.assertNotIn("max_output_tokens", inspector)
         # Arriving from a model detail keeps a link back to that model, and the
         # header is the provider editor's own shape: the title takes the row and
@@ -1134,36 +1136,37 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn("publicModelRouteCount", self.en)
         self.assertNotIn("breadcrumbProvider}>{translate(\"providers.routes\")", inspector)
 
-        # The model detail edits the window: the number is a per-model escape
-        # hatch for a registry that resolved a route wrong, so it lives with
-        # the model it corrects, and it states in a help mark that it reaches
-        # Codex rather than capping the proxy.
+        # The model detail states the group's window read-only, directly below
+        # 公开模型 — the field the number belongs to — and 设置 opens the
+        # public-model pane that owns the write.  A field here would make one
+        # route of a group disagree with the others.
         model_detail = self.ui.split("function ModelInspector(", 1)[1].split("// The protocol-mode sentence is a tip", 1)[0]
         self.assertIn('publicModelCustomLimit(providers, publicModelName, "max_input_tokens")', model_detail)
-        self.assertIn('dispatch("public.model_patch", { public_model: publicModelName, changes: { max_input_tokens: next.trim() } })', model_detail)
-        self.assertIn('placeholder={windowHint}', model_detail)
-        self.assertIn('text={translate("providers.contextWindowHelp")}', model_detail)
-        self.assertIn('title={translate("providers.contextWindowHelpTitle")}', model_detail)
-        # The help mark rides the same grid level as PickerField's, so a field
-        # carrying one and a picker carrying one draw the same control column.
-        self.assertIn('accessory={<HelpTip open={windowTipOpen} text={translate("providers.contextWindowHelp")}', model_detail)
-        self.assertNotIn('modelWindowField', model_detail)
-        self.assertNotIn('hint={windowHint}', model_detail)
-        # It is the pane's last row, below 协议方式: a per-model escape hatch for
-        # a route the registry resolved wrong is not part of how the route is
-        # called, so it must not split the calling fields apart.
-        self.assertLess(model_detail.index("<ProtocolPicker "), model_detail.index("providers.contextWindowHelpTitle"))
+        self.assertIn('publicModelTokensText(resolvedWindow, translate)', model_detail)
+        self.assertIn('title={translate("providers.publicModelSettings")}', model_detail)
+        self.assertIn('toolTip={translate("providers.publicModelSettingsHint")}', model_detail)
+        self.assertIn('disabled={busy || !onOpenPublicModel} onPress={() => onOpenPublicModel?.()} style={styles.modelWindowLink}', model_detail)
+        # No commit and no input: the window is one number for the whole group.
+        self.assertNotIn("max_input_tokens: next.trim()", model_detail)
+        self.assertNotIn('placeholder={windowHint}', model_detail)
+        self.assertNotIn("contextWindowHelp", model_detail)
+        self.assertNotIn("windowTipOpen", model_detail)
+        self.assertNotIn("windowHint", model_detail)
+        # The row sits directly under 公开模型 and above 供应商, and it is not
+        # pushed below 协议方式: the number is a property of the public name,
+        # not of how the route is called.
+        self.assertLess(model_detail.index('label={translate("providers.publicModel")}'), model_detail.index('providers.publicModelSettingsHint'))
+        self.assertLess(model_detail.index('providers.publicModelSettingsHint'), model_detail.index('<PickerField label={translate("providers.provider")}'))
         self.assertIn('onOpenPublicModel', model_detail)
         # The breadcrumb's public-model segment is the navigation; the upstream
         # model is not a segment of its own (the pane's 上游模型 field states it).
         self.assertIn('<NativeButton title={displayLabel(modelName, translate("providers.unnamedModel"))} link disabled={busy || !publicModelName} onPress={() => onOpenPublicModel?.()} style={styles.breadcrumbProvider} />', model_detail)
         self.assertNotIn('tooltip={upstreamName} style={styles.inspectorHeading}', model_detail)
-        # The navigation is a real button (设置), never a link-dressed one, and
-        # 设置 opens the very group the routes table lists: the pane is keyed by
-        # the display name the drafts project, not by the raw field value a
-        # rename left behind.  The window itself is edited here, so the row
-        # carries no navigation button of its own.
-        self.assertNotIn('title={translate("providers.publicModelSettings")}', model_detail)
+        # The navigation is a real button (设置) that opens the very group the
+        # routes table lists: the pane is keyed by the display name the drafts
+        # project, not by the raw field value a rename left behind.  The window
+        # itself is edited in the pane it opens, so the row states it read-only.
+        self.assertIn('title={translate("providers.publicModelSettings")}', model_detail)
         self.assertIn('setViewMode("routes"); selectRouteTableRow(routePublicModelRowKey(publicModel));', self.ui)
         self.assertIn('const publicModel = modelDisplayName(providerId, model).trim();', self.ui)
         self.assertIn('const publicModel = activeRoute.publicModel.trim();', self.ui)
@@ -1731,7 +1734,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('<View style={styles.settingsSidebarSpacer} />', shell)
         self.assertIn('<View style={styles.settingsPaneHeader}><Text numberOfLines={1} style={styles.settingsPaneTitle}>{translate(paneTitleKey)}</Text></View>', shell)
         self.assertIn('void native.versionInfo().then((next) => { if (active) setAppInfo(next); })', shell)
-        self.assertIn('if (lastSelection.current.key === key && now - lastSelection.current.at < 250) return;', shell)
+        self.assertNotIn("lastSelection", shell)
         self.assertNotIn('AboutPane', shell)
         self.assertNotIn('showAbout', shell)
         self.assertIn('versionInfo: bridge.versionInfo ? () => bridge.versionInfo!() : undefined,', (ROOT / "rn/packages/shared/src/platform/nativeBridge.ts").read_text(encoding="utf-8"))
@@ -2075,7 +2078,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # group rows, so the mouse action reports it instead.
         self.assertIn("return [self isSpanningRow:row];", table_native)
         self.assertIn("return ![self isSpanningRow:row];", table_native)
-        self.assertIn("([self isSpanningRow:row] && ![self isSelectableSpanningRow:row])", table_native)
+        self.assertIn("([self isSpanningRow:selectedRow] && ![self isSelectableSpanningRow:selectedRow])", table_native)
+        # Ordinary rows are delivered by the selection notification; the
+        # target/action is reserved for selectable group rows so one click does
+        # not reach React twice.
+        self.assertIn("![self isSelectableSpanningRow:row]", table_native)
         self.assertIn("selectedIndex >= 0 && [self isSelectableSpanningRow:selectedIndex]", table_native)
         self.assertIn("viewProps.selectableSpanningRowKeys", table_native)
         # AppKit draws no selection for a group row, so a clickable spanning
@@ -2150,12 +2157,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("selectableSpanningRowKeys", windows_native)
         self.assertIn("bool IsSelectableSpanningKey(std::string const& key) const noexcept", windows_native)
         self.assertIn("bool IsClickableSpanningKey(std::string const& key) const noexcept", windows_native)
-        self.assertIn("if (IsClickableSpanningKey(Props()->rowKeys[index])) return;", windows_native)
         self.assertIn("sourceList", windows_native)
         self.assertIn("header_frame_.Visibility(source_list ? winrt::Microsoft::UI::Xaml::Visibility::Collapsed", windows_native)
         self.assertIn('L"ms-appx:///Assets/Sidebar/"', windows_native)
         self.assertIn("Grid::SetColumnSpan(label", windows_native)
-        self.assertIn("if (IsClickableSpanningKey(Props()->rowKeys[index])) return;", windows_native)
+        self.assertIn("if (IsClickableSpanningKey(Props()->rowKeys[static_cast<size_t>(index)]))", windows_native)
         self.assertIn("RestoreControlledSelection();", windows_native)
         self.assertIn('rowKey + "\\x1f" + std::to_string(columnIndex)', mac_native)
         self.assertIn("static_cast<size_t>(row) >= viewProps.rowKeys.size()", mac_native)
@@ -4109,6 +4115,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('if (snapshot.service.state !== "starting") return;', self.ui)
         self.assertIn("const timer = setInterval(() => { void refreshSnapshot().catch(() => undefined); }, SERVICE_STATE_RECONCILE_MS);", self.ui)
         self.assertIn("return () => clearInterval(timer);", self.ui)
+        # Every window that draws the state re-reads it: the 服务 row is drawn by
+        # the settings window, which is not the primary host, so gating the
+        # reconcile on the primary host made the one surface that shows the word
+        # the one surface that could never correct it.
+        self.assertIn("  }, [refreshSnapshot, snapshot?.revision, snapshot?.service.state]);", self.ui)
+        self.assertNotIn('if (!isPrimaryHost || !snapshot) return;\n    // A transitional state is a claim about a proxy replacement', self.ui)
         self.assertIn('await dispatchServiceAction(serviceRestart ? "service.restart" : "service.start");', general)
         # The strip names the action that landed; the 服务 row already states the
         # state, so the same word is never printed twice on one screen.
@@ -5548,7 +5560,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         """
 
         workspace = self.ui.split("function ProviderWorkspace(", 1)[1].split("function ProviderKeysPanel(", 1)[0]
-        self.assertIn('void dispatch("provider.add", { provider: { name, models: [], enabled: true } });', workspace)
+        self.assertIn('runMutationOnce("provider.add", () => dispatch("provider.add", { provider: { name, models: [], enabled: true } }));', workspace)
+        self.assertIn('runMutationOnce(`model.add:${providerId}`, () => dispatch("model.add", {', workspace)
+        self.assertIn('runMutationOnce(`model.duplicate:${providerId}:${editorIdentifier(model)}`, () => dispatch("model.duplicate", {', workspace)
         self.assertIn('model: { name, upstream_model: name, enabled: true, order: 0,', workspace)
         self.assertNotIn('enabled: false, order: 0', workspace)
         self.assertIn("if (isDraftModel(model, translate)) return true;", self.ui)
@@ -6060,7 +6074,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('const addProvider = (): void => {', self.ui)
         self.assertIn('const base = translate("providers.newProvider");', self.ui)
         self.assertIn('const name = uniquePlaceholderName(providers.map((item) => providerDisplayName(item)), base);', self.ui)
-        self.assertIn('void dispatch("provider.add", { provider: { name, models: [], enabled: true } });', self.ui)
+        self.assertIn('runMutationOnce("provider.add", () => dispatch("provider.add", { provider: { name, models: [], enabled: true } }));', self.ui)
         self.assertIn('const pendingProviderIds = useRef<Set<string> | undefined>(undefined);', self.ui)
         self.assertIn(
             '<ActionButton title={translate("providers.addWizard")} disabled={busy} style={styles.providerWizardToolbarButton} onPress={onOpenWizard} />',
@@ -6182,7 +6196,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('<IconButton label="+" title={translate("providers.newRoute")} disabled={busy || providers.length === 0} onPress={addRoute} />', self.ui)
         self.assertIn('<IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteRoute} />', self.ui)
         self.assertIn("const addRoute = (): void => {", self.ui)
+        self.assertIn('runMutationOnce(`route.add:${targetProviderID}:${publicModel}`, () => dispatchWithOutcome("model.add", {', self.ui)
         self.assertIn("const confirmDeleteRoute = (): void => {", self.ui)
+        self.assertIn('runMutationOnce(`route.delete-group:${selectedGroup.name}`, () => native.showConfirmation({', self.ui)
+        self.assertIn('runMutationOnce(`route.delete:${activeRoute.key}`, () => native.showConfirmation({', self.ui)
         self.assertIn('dispatch("model.delete", { provider_id: routeProviderID, model_id: routeModelID })', self.ui)
         # A selected public model deletes its whole group in one action.
         self.assertIn("const selectedGroup = selectedPublicModel !== undefined ? routeGroups.find((group) => group.name === selectedPublicModel) : undefined;", self.ui)

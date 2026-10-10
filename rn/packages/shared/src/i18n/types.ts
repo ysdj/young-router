@@ -550,6 +550,8 @@ export type TranslationKey =
   | "providers.publicModelTitle"
   | "providers.contextWindow"
   | "providers.publicModelDefaultHint"
+  | "providers.publicModelSettings"
+  | "providers.publicModelSettingsHint"
   | "providers.contextWindowHelp"
   | "providers.contextWindowHelpTitle"
   | "providers.followMultiplier"

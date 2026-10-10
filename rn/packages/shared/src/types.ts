@@ -328,7 +328,7 @@ export interface ProviderModelSummary {
   order_mode?: "manual" | "relay_multiplier";
   manual_order?: number;
   effective_order?: number;
-  /** The user's public-model context window; absent means the client resolves it. */
+  /** The Codex context window the *public model* declares, written to every route of the group. Read-only here: `public.model_patch` owns the write. */
   max_input_tokens?: number | null;
   binding_health?: ModelBindingHealth;
   upstream_protocol_mode?: "fallback" | "fixed";

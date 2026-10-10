@@ -1974,12 +1974,16 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitCheckboxCls(void)
     }
   }
   if (labelsChanged || selectedChanged) {
+    // Props are controlled by React; selecting the value must never call the
+    // same action handler as a user click.
+    _picker.target = nil;
     const NSInteger selectedIndex = SegmentIndex(newViewProps.labels, newViewProps.selectedValue);
     if (selectedIndex >= 0) {
       [_picker selectItemAtIndex:selectedIndex];
     } else {
       [_picker selectItem:nil];
     }
+    _picker.target = self;
   }
   if (oldViewProps.disabled != newViewProps.disabled) {
     _picker.enabled = !newViewProps.disabled;
@@ -3681,8 +3685,12 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   }
   const auto &viewProps = *std::static_pointer_cast<const LiteLLMAppKitTableProps>(_props);
   const NSInteger row = _tableView.clickedRow;
+  // Ordinary rows report through tableViewSelectionDidChange. AppKit refuses
+  // to select group rows, so this action exists only to report the public
+  // model groups explicitly marked as selectable. Emitting ordinary rows here
+  // as well sent two selection events for every click.
   if (row < 0 || static_cast<size_t>(row) >= viewProps.rowKeys.size() ||
-      ([self isSpanningRow:row] && ![self isSelectableSpanningRow:row])) {
+      ![self isSelectableSpanningRow:row]) {
     return;
   }
   LiteLLMAppKitTableEventEmitter::OnSelectionChange event{
