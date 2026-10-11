@@ -62,12 +62,29 @@ class CoreOperationsTests(unittest.TestCase):
         domain.apply()
         return domain
 
-    def test_reload_restarts_the_managed_service(self) -> None:
+    def test_reload_rolls_the_workers_instead_of_interrupting_the_service(self) -> None:
         controller = CoreServiceController("/tmp/unused-runtime")
         expected = {"state": "running"}
         with mock.patch.object(controller, "_pid", return_value=4811), mock.patch.object(
-            controller, "restart", return_value=expected
+            controller, "_rolling_restart", return_value=True
+        ) as rolling, mock.patch.object(
+            controller, "_health", return_value=True
+        ), mock.patch.object(
+            controller, "restart"
         ) as restart:
+            self.assertEqual("running", controller.reload()["state"])
+
+        rolling.assert_called_once_with(4811)
+        # A reload keeps serving: replacing the whole tree is what turned every
+        # settings apply into a refused port, so it must not be the reload path.
+        restart.assert_not_called()
+
+    def test_reload_falls_back_to_a_restart_when_the_proxy_cannot_be_signalled(self) -> None:
+        controller = CoreServiceController("/tmp/unused-runtime")
+        expected = {"state": "running"}
+        with mock.patch.object(controller, "_pid", return_value=4811), mock.patch.object(
+            controller, "_rolling_restart", return_value=False
+        ), mock.patch.object(controller, "restart", return_value=expected) as restart:
             self.assertEqual(expected, controller.reload())
 
         restart.assert_called_once_with()

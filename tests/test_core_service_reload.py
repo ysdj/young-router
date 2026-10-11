@@ -656,5 +656,72 @@ class CoreServiceReloadTests(unittest.TestCase):
             self.assertEqual(["reload"], reload_calls)
             self.assertNotIn("parked-chat", runtime_config.read_text(encoding="utf-8"))
 
+    def test_a_runtime_apply_replaces_the_process_the_live_environment_cannot_change(self) -> None:
+        """A runtime setting arrives as an environment variable.
+
+        The rolling reload keeps the running master, and a process can never
+        acquire a variable it did not start with -- verified against a real
+        uvicorn master, where a worker forked after the signal still read the
+        original value.  So a runtime commit must ask for a full replacement
+        while a document commit keeps the non-interrupting reload.
+        """
+
+        reload_calls: list[str] = []
+
+        def reload_service(operation: str) -> dict[str, str]:
+            reload_calls.append(operation)
+            return {"state": "running"}
+
+        core = CoreStore(
+            domains=[],
+            service_handlers={
+                "status": lambda _operation: {"state": "running"},
+                "reload": reload_service,
+            },
+        )
+        core.snapshot()
+
+        core._schedule_service_reload_after_apply(replace_process=True)
+        self.assertTrue(core.wait_for_service_reload(5.0))
+        self.assertEqual(["restart"], reload_calls)
+
+        core._schedule_service_reload_after_apply()
+        self.assertTrue(core.wait_for_service_reload(5.0))
+        self.assertEqual(["restart", "reload"], reload_calls)
+
+    def test_a_failed_replacement_stays_owed_instead_of_becoming_a_reload(self) -> None:
+        """A replacement that did not come up must not be downgraded.
+
+        Answering the next pass with a rolling reload would leave the proxy
+        running the environment the commit could not adopt while reporting
+        success.
+        """
+
+        reload_calls: list[str] = []
+
+        def reload_service(operation: str) -> dict[str, str]:
+            reload_calls.append(operation)
+            return {"state": "running"} if operation == "reload" else {"state": "stopped"}
+
+        core = CoreStore(
+            domains=[],
+            service_handlers={
+                "status": lambda _operation: {"state": "running"},
+                "reload": reload_service,
+            },
+        )
+        core.snapshot()
+
+        core._schedule_service_reload_after_apply(replace_process=True)
+        self.assertTrue(core.wait_for_service_reload(5.0))
+        self.assertEqual(["restart"], reload_calls)
+        # Still owed: the next pass must replace the process, not roll it.
+        self.assertTrue(core._service_reload_replace_process)
+
+        core._schedule_service_reload_after_apply()
+        self.assertTrue(core.wait_for_service_reload(5.0))
+        self.assertEqual(["restart", "restart"], reload_calls)
+
+
 if __name__ == "__main__":
     unittest.main()

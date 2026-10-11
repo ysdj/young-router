@@ -821,6 +821,10 @@ class CoreStore:
         self._service_reload_thread: threading.Thread | None = None
         self._service_reload_pending = False
         self._service_reload_stopping = False
+        # Whether the queued restart must replace the process (a runtime
+        # setting the live environment cannot adopt) instead of rolling its
+        # workers.  Cleared by the worker when it consumes the request.
+        self._service_reload_replace_process = False
         # Manual lifecycle operations and the background post-apply restart
         # replace the same proxy, so they take turns on one transition guard.
         self._service_transition_guard = threading.Lock()
@@ -3173,6 +3177,13 @@ class CoreStore:
             with self._lock:
                 self._set_service_from_result(result, increment=False)
                 if str(result.get("state")) == "running" and operation in {"start", "start_async", "restart", "reload"}:
+                    # A manual start or restart replaced the process, so a
+                    # runtime setting that was still owed one now has its
+                    # environment in the running proxy and is no longer owed.
+                    # ``reload`` rolls the workers and does not: it leaves the
+                    # request standing for the pass that can satisfy it.
+                    if operation in {"start", "start_async", "restart"}:
+                        self._service_reload_replace_process = False
                     # The proxy's port or key may have just changed; a Codex
                     # client that already uses the proxy has to follow it.
                     self._follow_codex_local_api()
@@ -3288,7 +3299,14 @@ class CoreStore:
 
         if "providers_models" not in applied:
             if applied:
-                self._schedule_service_reload_after_apply()
+                # A ``runtime`` apply reaches the proxy through its *process
+                # environment*.  A rolling restart reuses the running master,
+                # which can never acquire an environment variable it was not
+                # started with (verified: a worker forked after SIGHUP still
+                # reads the original value), so only a replaced process can
+                # serve one.  Anything else is a document the workers can
+                # simply reload.
+                self._schedule_service_reload_after_apply(replace_process="runtime" in applied)
             return
         stager = self._service_handlers.get("stage_runtime_config")
         try:
@@ -3304,13 +3322,18 @@ class CoreStore:
             return
         self._schedule_service_reload_after_apply()
 
-    def _schedule_service_reload_after_apply(self) -> None:
+    def _schedule_service_reload_after_apply(self, *, replace_process: bool = False) -> None:
         """Queue the post-apply LiteLLM restart without blocking the commit.
 
         Replacing the proxy takes seconds, so the restart runs on its own
         thread: the committed edit answers immediately and every later IPC
         request stays fast.  A burst of edits coalesces into one final restart
         against the newest configuration.
+
+        ``replace_process`` marks a commit the running process cannot adopt --
+        a runtime setting that arrives as an environment variable.  That one
+        still takes the full stop/start, because no amount of signalling can
+        give a live process a variable it was not started with.
         """
 
         if self._service_handlers.get("reload") is None:
@@ -3318,6 +3341,11 @@ class CoreStore:
         with self._service_reload_guard:
             if self._service_reload_stopping:
                 return
+            # A pending full replacement outranks a rolling one: if any commit
+            # in the coalesced burst needs the process gone, the final restart
+            # must replace it rather than roll its workers.
+            if replace_process:
+                self._service_reload_replace_process = True
             thread = self._service_reload_thread
             if thread is not None and thread.is_alive():
                 # A restart is already replacing the proxy; it will pick up
@@ -3333,6 +3361,18 @@ class CoreStore:
             )
             self._service_reload_thread = thread
         thread.start()
+
+    def _restore_replace_process_request(self, owed: bool) -> None:
+        """Keep owing a full replacement that this pass did not deliver.
+
+        Set again under the scheduler's own lock so a commit that arrived while
+        the failed attempt was in flight keeps its own claim too.
+        """
+
+        if not owed:
+            return
+        with self._service_reload_guard:
+            self._service_reload_replace_process = True
 
     def wait_for_service_reload(self, timeout: float = 10.0) -> bool:
         """Wait for a background post-apply restart to finish.
@@ -3381,17 +3421,33 @@ class CoreStore:
             # record is the service's own, not part of this claim.
             self._publish_service_transition()
             self._emit()
+            # A runtime setting travels as an environment variable, so the live
+            # process cannot adopt it: that commit asks for a replacement
+            # rather than the rolling reload a document-only change takes.
+            # The request is taken (and cleared) here, under the same lock the
+            # scheduler sets it with: a commit that arrives while this pass
+            # runs therefore sets it again and is owed its own pass, instead of
+            # being swallowed by the restart already in flight.
+            replace_process = self._service_reload_replace_process
+            self._service_reload_replace_process = False
         try:
             with self._service_transition_guard:
                 if self._service_reload_stopping:
                     return
-                service_result = reloader("reload")
+                service_result = reloader("restart" if replace_process else "reload")
         except Exception:
+            self._restore_replace_process_request(replace_process)
             self._project_service_reload_failure()
             return
         if not isinstance(service_result, Mapping):
+            self._restore_replace_process_request(replace_process)
             self._project_service_reload_failure()
             return
+        if replace_process and service_result.get("state") != "running":
+            # The replacement did not come up, so the environment this commit
+            # needs is still not in the running process: keep owing it rather
+            # than letting a later pass answer it with a rolling reload.
+            self._restore_replace_process_request(True)
         with self._lock:
             self._set_service_from_result(service_result, increment=False)
             if service_result.get("state") == "running":
