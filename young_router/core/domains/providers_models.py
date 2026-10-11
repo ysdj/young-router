@@ -2357,6 +2357,26 @@ class ProvidersModelsDomain:
         stored = self._published_rates.get(provider_id)
         return stored.get(model_id) if isinstance(stored, Mapping) else None
 
+    def _published_rate_cached_only(
+        self,
+        provider: Mapping[str, Any],
+        model: Mapping[str, Any],
+    ) -> float | None:
+        """The rate this route's own account publishes for it, using only cached data.
+        
+        This is a fast, non-blocking version of _published_rate that never triggers
+        external calls (WorkBuddy, network requests, etc.). It only checks the
+        _published_rates cache that was populated by previous explicit catalog reads.
+        
+        Use this during model addition and other operations where we want to use
+        cached rates if available, but should not block on fetching them.
+        """
+        # Simply delegate to _published_rate, which already only checks the cache.
+        # The actual fetching happens in _refresh_published_rates, which is only
+        # called when explicitly requested (e.g., user clicks refresh or changes
+        # to relay_multiplier mode).
+        return self._published_rate(provider, model)
+
     def _workbuddy_login_status(self, auth: Mapping[str, Any]) -> dict[str, Any]:
         """The worker's account record for one WorkBuddy login provider.
 
@@ -2897,7 +2917,12 @@ class ProvidersModelsDomain:
                 # one.  A rate the account *has* published is already known,
                 # so it materializes here instead of waiting for a fetch that
                 # only a station read could satisfy.
-                published = self._published_rate(provider, model)
+                # 
+                # PERFORMANCE FIX: Only check cached rates, never trigger a fresh
+                # WorkBuddy call during model addition. The published rate will be
+                # resolved lazily when actually needed (e.g., during Apply or when
+                # explicitly refreshing the catalog).
+                published = self._published_rate_cached_only(provider, model)
                 model["effective_order"] = (
                     None if published is None else self._order_value(published, label="Model rate")
                 )

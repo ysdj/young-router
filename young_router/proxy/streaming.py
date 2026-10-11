@@ -5287,10 +5287,11 @@ async def _yield_streaming_error_fallback_or_raise(
     # failover or recovery path can quarantine a healthy deployment or turn
     # the interruption into a reconnect-triggering exception.
     if _routing_module._is_local_shutdown_exception(exception):
-        if _request_is_responses_stream(request_data):
-            yield _synthesized_failed_response_event(request_data, exception)
-            return
-        raise exception
+        # A rolling worker replacement must never surface a synthetic failure
+        # event to the client: that event is rendered as ``router_restarting``
+        # and aborts the turn even though the replacement worker can continue
+        # it. Leave the stream open for the client-side retry/reconnect path.
+        return
 
     # A provider may return an async iterator successfully and raise the
     # upstream 400 only on a later iterator read. That bypasses LiteLLM's

@@ -2946,29 +2946,27 @@ class HookRouteRecoveryTests(HookTestCase):
                 exc,
             )
         ]
-        failed = [chunk for chunk in chunks if chunk.get("type") == "response.failed"]
-        self.assertEqual(len(failed), 1)
-        self.assertEqual(failed[0]["response"]["error"]["code"], "router_restarting")
-        # The one surface that cannot be told to reconnect gets the restart
-        # named; a route outage would be a lie about a healthy deployment.
-        self.assertNotIn("upstream", failed[0]["response"]["error"]["message"])
+        self.assertEqual(chunks, [])
+        # A local worker replacement is intentionally silent at this layer;
+        # emitting a synthetic failure makes the client render a restart error
+        # and abort the turn.
         self.assertEqual(fallback_attempts, [])
 
-        # A Chat Completions turn has no terminal-failure contract to answer
-        # with, so the same teardown is re-raised as it is rather than being
-        # replaced by a reconnecting stream disconnect the client would act on.
+        # A Chat Completions turn follows the same silent teardown path.
         chat_request = {
             "model": "default-chat",
             "messages": [{"role": "user", "content": "Continue."}],
             "stream": True,
             "proxy_server_request": {"path": "/v1/chat/completions"},
         }
-        with self.assertRaises(MidStreamFallbackError):
-            async for _chunk in hooks._yield_streaming_error_fallback_or_raise(
+        chat_chunks = [
+            chunk
+            async for chunk in hooks._yield_streaming_error_fallback_or_raise(
                 chat_request,
                 exc,
-            ):
-                pass
+            )
+        ]
+        self.assertEqual(chat_chunks, [])
         self.assertEqual(fallback_attempts, [])
 
     def test_a_live_worker_still_reports_a_real_upstream_failure(self) -> None:
