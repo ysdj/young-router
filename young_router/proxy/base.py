@@ -815,6 +815,11 @@ class _TerminalFailedResponsesStreamResponse:
     def __init__(self, request_data: dict, exception: Exception) -> None:
         self.request_data = request_data
         self.exception = exception
+        # Keep this marker across module reload boundaries.  The stream hook
+        # must pass this already-terminal response through once; treating its
+        # synthetic `response.failed` event as a fresh incomplete upstream
+        # stream starts the same full-history fallback again.
+        self._young_router_terminal_failed_stream = True
 
     async def __aiter__(self) -> AsyncIterator[Any]:
         from . import streaming as streaming_module
@@ -906,6 +911,9 @@ _UPSTREAM_RELAY_CAPACITY_MARKERS = (
     "channel exhausted",
     "channels exhausted",
     "all channels are busy",
+    "all available accounts exhausted",
+    "all accounts exhausted",
+    "no available accounts",
 )
 _UPSTREAM_TEMPORARY_ERROR_CLASS_NAMES = {
     "APIConnectionError",

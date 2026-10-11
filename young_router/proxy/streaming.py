@@ -906,6 +906,10 @@ def _responses_stream_chunk_is_incomplete_terminal(chunk: Any) -> bool:
     )
 
 
+def _is_young_router_terminal_failure_event(chunk: Any) -> bool:
+    return bool(getattr(chunk, "_young_router_terminal_failure", False))
+
+
 _OUTPUT_TOKEN_LIMIT_INCOMPLETE_REASONS = {
     "length",
     "max_completion_tokens",
@@ -1430,6 +1434,22 @@ def _synthesized_failed_response_event(
         )
         error_type = "server_error"
         error_code = "router_restarting"
+    elif _routing_module._is_upstream_relay_capacity_error(exception):
+        message = _routing_module._sanitized_upstream_route_failure_message(
+            model,
+            exception,
+            request_data,
+        )
+        error_type = "server_error"
+        error_code = "upstream_relay_capacity"
+    elif _routing_module._is_upstream_deployment_failover_error(exception):
+        message = _routing_module._sanitized_upstream_route_failure_message(
+            model,
+            exception,
+            request_data,
+        )
+        error_type = "server_error"
+        error_code = "upstream_auth_or_balance"
     elif _routing_module._request_body_size_rejected(request_data):
         # Every candidate route refused these bytes.  The rejection is the
         # request's own size, not a route outage, so the client is told what to
@@ -1469,7 +1489,12 @@ def _synthesized_failed_response_event(
     }
     if isinstance(model, str):
         event["model"] = model
-    return _json_stream_event(event)
+    terminal_event = _json_stream_event(event)
+    try:
+        terminal_event._young_router_terminal_failure = True  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    return terminal_event
 
 
 def _synthesized_native_stream_error_chunk(
@@ -2950,6 +2975,24 @@ async def _stream_streaming_error_fallback_round(
         if fallback_attempt is None:
             return
         fallback_response, fallback_payload = fallback_attempt
+        if getattr(
+            fallback_response,
+            "_young_router_terminal_failed_stream",
+            False,
+        ) is True:
+            failed_exception = getattr(fallback_response, "exception", None)
+            failed_request = getattr(fallback_response, "request_data", None)
+            if isinstance(failed_exception, Exception):
+                failure_request = (
+                    failed_request
+                    if isinstance(failed_request, dict)
+                    else fallback_payload
+                )
+                yield _synthesized_failed_response_event(
+                    failure_request,
+                    failed_exception,
+                )
+                return
         if not _responses_output_module._response_is_async_iterable(
             fallback_response
         ):
@@ -4963,6 +5006,10 @@ async def _yield_guarded_original_stream(
             await _close_async_iterator_safely(response)
             return
         elif _responses_stream_chunk_is_incomplete_terminal(chunk):
+            if _is_young_router_terminal_failure_event(chunk):
+                yield deliver_client_chunk(chunk)
+                await _close_async_iterator_safely(response)
+                return
             if missing_answer_after_web_search():
                 async for recovered_chunk in yield_recovered_search_tool_answer(
                     "terminal response event after web_search-only output",
@@ -5107,6 +5154,10 @@ async def _yield_guarded_original_stream(
                 await _close_async_iterator_safely(response)
                 return
             elif _responses_stream_chunk_is_incomplete_terminal(chunk):
+                if _is_young_router_terminal_failure_event(chunk):
+                    yield deliver_client_chunk(chunk)
+                    await _close_async_iterator_safely(response)
+                    return
                 if missing_answer_after_web_search():
                     async for recovered_chunk in yield_recovered_search_tool_answer(
                         "terminal response event after web_search-only output",
@@ -5629,7 +5680,10 @@ async def _yield_start_buffered_stream_with_error_fallback(
         async for chunk in response:
             yield chunk
         return
-    if _routing_module._is_failed_responses_stream_response(response):
+    if (
+        _routing_module._is_failed_responses_stream_response(response)
+        or bool(getattr(response, "_young_router_terminal_failed_stream", False))
+    ):
         failed_exception = getattr(response, "exception", None)
         failed_request = getattr(response, "request_data", None)
         if (
@@ -5807,6 +5861,14 @@ async def _yield_start_buffered_stream_with_error_fallback(
                         request_data,
                     )
                 elif _responses_stream_chunk_is_incomplete_terminal(chunk):
+                    if _is_young_router_terminal_failure_event(chunk):
+                        for buffered_chunk in buffer:
+                            yield _responses_stream_chunk_for_delivery(
+                                buffered_chunk,
+                                request_data,
+                            )
+                        await _close_async_iterator_safely(response)
+                        return
                     completed_compat_chunk = (
                         _responses_output_limit_terminal_state_as_completed_chunk(
                             chunk,

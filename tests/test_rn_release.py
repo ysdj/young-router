@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import runpy
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -9,6 +11,27 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ReactNativeReleaseTests(unittest.TestCase):
+    def test_macos_core_pruning_keeps_litellm_proxy_mcp_imports(self) -> None:
+        prune_module = runpy.run_path(str(ROOT / "scripts" / "prune-macos-core.py"))
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            core = Path(temporary_directory) / "Core"
+            site_packages = core / "runtime" / "site-packages"
+            (site_packages / "litellm").mkdir(parents=True)
+            (site_packages / "mcp").mkdir()
+            (site_packages / "mcp" / "types.py").write_text("# runtime import\n", encoding="utf-8")
+            (site_packages / "mcp_types").mkdir()
+            (site_packages / "mcp_types" / "__init__.py").write_text("", encoding="utf-8")
+            (site_packages / "mcp-2.3.0.dist-info").mkdir()
+            (site_packages / "mcp-types-2.3.0.dist-info").mkdir()
+            (core / "runtime" / "python").mkdir(parents=True)
+
+            prune_module["prune_core"](core)
+
+            self.assertTrue((site_packages / "mcp" / "types.py").is_file())
+            self.assertTrue((site_packages / "mcp_types" / "__init__.py").is_file())
+            self.assertTrue((site_packages / "mcp-2.3.0.dist-info").is_dir())
+            self.assertTrue((site_packages / "mcp-types-2.3.0.dist-info").is_dir())
+
     def test_local_test_gate_never_installs_and_explicit_install_restarts_live_app(self) -> None:
         test_script = (ROOT / "scripts" / "test.sh").read_text(encoding="utf-8")
         installer = (ROOT / "scripts" / "build-and-install-macos.sh").read_text(

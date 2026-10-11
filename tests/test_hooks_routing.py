@@ -81,6 +81,8 @@ class HookRoutingTests(HookTestCase):
         idle_timeout.body = {"reason": "stream_idle_timeout"}
         request_error = RuntimeError("OpenAIException invalid_request_error: invalid input")
         request_error.status_code = 400
+        account_pool_exhausted = RuntimeError("all available accounts exhausted")
+        account_pool_exhausted.status_code = 403
 
         self.assertEqual(hooks._recovery_policy_for_exception(balance), "recovery_cooldown")
         self.assertEqual(hooks._recovery_policy_for_exception(rate_limit), "recovery")
@@ -89,6 +91,14 @@ class HookRoutingTests(HookTestCase):
         self.assertEqual(hooks._recovery_policy_for_exception(start_timeout), "recovery_cooldown")
         self.assertEqual(hooks._recovery_policy_for_exception(idle_timeout), "recovery")
         self.assertEqual(hooks._recovery_policy_for_exception(request_error), "error")
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(account_pool_exhausted),
+            "recovery_cooldown",
+        )
+        self.assertEqual(
+            hooks._recovery_diagnostic(account_pool_exhausted)["kind"],
+            "relay_capacity",
+        )
         # A station wording the same failure as a failed pre-deduction with the
         # remaining credit is still a balance failure: it must cool the route
         # down instead of keeping the empty route first in every request.
@@ -3034,6 +3044,20 @@ class HookRoutingTests(HookTestCase):
             event["response"]["error"]["code"],
             "image_generation_tool_unavailable",
         )
+
+    def test_account_pool_exhaustion_is_reported_as_route_capacity(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        error = RuntimeError("all available accounts exhausted")
+        error.status_code = 403
+        event = hooks._synthesized_failed_response_event(
+            {"model": "default-chat", "input": [], "stream": True},
+            error,
+        )
+        response_error = event["response"]["error"]
+
+        self.assertEqual(response_error["code"], "upstream_relay_capacity")
+        self.assertIn("upstream relay channel unavailable", response_error["message"])
+        self.assertIn("all available accounts exhausted", response_error["message"])
 
     def test_prompt_policy_error_is_not_fallback_eligible(self) -> None:
         hooks, _proxy_server = load_hook_module()

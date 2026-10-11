@@ -766,6 +766,11 @@ def _recovery_policy_for_exception(exception: Exception) -> str:
             _RECOVERY_POLICY_BALANCE_ENV,
             _RECOVERY_POLICY_COOLDOWN,
         )
+    if _is_upstream_relay_capacity_error(exception):
+        return _recovery_policy_setting(
+            _RECOVERY_POLICY_SERVER_ENV,
+            _RECOVERY_POLICY_COOLDOWN,
+        )
     if _is_no_deployments_available_error(exception):
         return _recovery_policy_setting(
             _RECOVERY_POLICY_SERVER_ENV,
@@ -1008,7 +1013,9 @@ def _failed_responses_stream_response(
 
 
 def _is_failed_responses_stream_response(response: Any) -> bool:
-    return isinstance(response, _TerminalFailedResponsesStreamResponse)
+    return isinstance(response, _TerminalFailedResponsesStreamResponse) or bool(
+        getattr(response, "_young_router_terminal_failed_stream", False)
+    )
 
 
 def _is_sanitized_upstream_route_failure_error(exception: Exception) -> bool:
@@ -4622,6 +4629,14 @@ def _recovery_diagnostic(exception: Exception) -> dict[str, Any]:
                 "so the conversation sent upstream is smaller."
             ),
         }
+    elif _is_upstream_relay_capacity_error(exception):
+        result = {
+            "kind": "relay_capacity",
+            "title": "Upstream account pool unavailable",
+            "detail": (
+                "The upstream has no available accounts or channels for this route."
+            ),
+        }
     elif status_code in (401, 403) or any(
         marker in text
         for marker in (
@@ -6442,10 +6457,10 @@ def _sanitized_upstream_route_failure_message(
         )
     status_code = _exception_status_code(exception)
     relay_message = _upstream_relay_capacity_message(exception)
-    if _is_upstream_deployment_failover_error(exception):
-        reason = "upstream auth or balance error"
-    elif _is_upstream_relay_capacity_error(exception):
+    if _is_upstream_relay_capacity_error(exception):
         reason = "upstream relay channel unavailable"
+    elif _is_upstream_deployment_failover_error(exception):
+        reason = "upstream auth or balance error"
     elif status_code == 429:
         reason = "upstream rate limit"
     elif status_code == 408:

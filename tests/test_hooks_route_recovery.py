@@ -335,6 +335,45 @@ class HookRouteRecoveryTests(HookTestCase):
         self.assertTrue(hooks._is_route_recovery_stream_response(response))
         self.assertFalse(hooks._is_failed_responses_stream_response(response))
 
+    async def test_generic_helper_recovers_after_upstream_account_pool_exhaustion(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        self.set_env(hooks._SAME_DEPLOYMENT_RETRIES_ENV, "0")
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "60")
+        router_module = types.ModuleType("litellm.router")
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return []
+
+            async def _ageneric_api_call_with_fallbacks_helper(
+                self,
+                model,
+                original_generic_function,
+                **kwargs,
+            ):
+                return await original_generic_function(**kwargs)
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_generic_deployment_failover_patch()
+
+        class AccountPoolError(Exception):
+            status_code = 403
+
+        async def original_generic_function(**kwargs):
+            raise AccountPoolError("all available accounts exhausted")
+
+        response = await Router()._ageneric_api_call_with_fallbacks_helper(
+            "default-chat",
+            original_generic_function,
+            input=[{"role": "user", "content": "Continue."}],
+            stream=True,
+            model_info={"id": "only-route", "order": 1},
+        )
+
+        self.assertTrue(hooks._is_route_recovery_stream_response(response))
+        self.assertFalse(hooks._is_failed_responses_stream_response(response))
+
     def test_route_recovery_does_not_poll_on_context_size_error(self) -> None:
         hooks, _proxy_server = load_hook_module()
 

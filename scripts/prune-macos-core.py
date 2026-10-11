@@ -27,11 +27,10 @@ NODE_DEDUP_SUFFIXES = {
 OPTIONAL_RUNTIME_DIRS = {
     "polars", "_polars_runtime_32", "granian",
     "pyroscope", "pyroscope_io", "hf_xet",
-    # LiteLLM's proxy extra installs these for optional admin/queue/MCP
-    # surfaces. Young Router owns its native UI and never starts those
-    # optional servers.
+    # LiteLLM's proxy extra installs these for optional admin/queue surfaces.
+    # Keep MCP: current LiteLLM imports ``mcp.types`` from its proxy module at
+    # import time even when Young Router never starts an MCP server.
     "litellm_enterprise", "litellm_proxy_extras",
-    "mcp", "mcp_types",
     "prompt_toolkit", "wcwidth",
     "rq", "croniter",
 }
@@ -39,7 +38,6 @@ OPTIONAL_RUNTIME_DIST_PREFIXES = (
     "polars-", "polars_runtime_", "granian-",
     "pyroscope", "hf_xet-",
     "litellm_enterprise-", "litellm_proxy_extras-",
-    "mcp-", "mcp-types-",
     "prompt_toolkit-", "wcwidth-",
     "rq-", "croniter-",
 )

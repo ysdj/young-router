@@ -6,6 +6,135 @@ from hook_test_utils import *
 
 
 class HookStreamingFailoverTests(HookTestCase):
+    async def test_terminal_failed_stream_wrapper_is_delivered_once(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        streaming_module = sys.modules["young_router.proxy.streaming"]
+        original_fallback = streaming_module._stream_streaming_error_fallback
+        self.addCleanup(
+            setattr,
+            streaming_module,
+            "_stream_streaming_error_fallback",
+            original_fallback,
+        )
+        fallback_calls = []
+
+        async def unexpected_fallback(_request_data, exception):
+            fallback_calls.append(exception)
+            raise AssertionError("a terminal wrapper must not be replayed")
+            yield None
+
+        streaming_module._stream_streaming_error_fallback = unexpected_fallback
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/responses"},
+        }
+        terminal_error = RuntimeError("all available accounts exhausted")
+        terminal_error.status_code = 403
+        response = hooks._failed_responses_stream_response(
+            request_data,
+            terminal_error,
+        )
+
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks._yield_start_buffered_stream_with_error_fallback(
+                response,
+                request_data,
+            )
+        ]
+
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0]["type"], "response.failed")
+        self.assertEqual(
+            chunks[0]["response"]["error"]["code"],
+            "upstream_route_failure",
+        )
+        self.assertEqual(fallback_calls, [])
+
+    async def test_router_generated_terminal_failure_is_not_replayed_as_an_upstream_stream(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        streaming_module = sys.modules["young_router.proxy.streaming"]
+        original_recovery = streaming_module._stream_route_recovery_poll
+        self.addCleanup(
+            setattr,
+            streaming_module,
+            "_stream_route_recovery_poll",
+            original_recovery,
+        )
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "60")
+        self.set_env(hooks._SAME_DEPLOYMENT_RETRIES_ENV, "0")
+        calls = []
+
+        class AccountPoolExhausted(Exception):
+            status_code = 403
+
+        terminal_error = AccountPoolExhausted("all available accounts exhausted")
+
+        class FakeRouter:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [
+                    {
+                        "litellm_params": {"order": 0.3},
+                        "model_info": {"id": "route-a", "order": 0.3},
+                    },
+                    {
+                        "litellm_params": {"order": 0.3},
+                        "model_info": {"id": "route-b", "order": 0.3},
+                    },
+                ]
+
+            async def aresponses(self, **payload):
+                calls.append(payload.copy())
+                # This is the terminal wrapper returned by the generic helper
+                # after it has exhausted same-order upstream peers. Simulate
+                # the terminal event after LiteLLM exposes it as an ordinary
+                # async stream: it must be delivered once, not parsed as a new
+                # incomplete provider response and replayed.
+                async def terminal_stream():
+                    yield hooks._synthesized_failed_response_event(
+                        payload,
+                        terminal_error,
+                    )
+
+                return terminal_stream()
+
+        proxy_server.llm_router = FakeRouter()
+
+        async def unexpected_route_recovery(*_args, **_kwargs):
+            raise AssertionError("a router-generated terminal event must stop recovery")
+            yield None
+
+        streaming_module._stream_route_recovery_poll = unexpected_route_recovery
+        upstream_error = RuntimeError("upstream ended before response.completed")
+        upstream_error.status_code = 502
+        upstream_error.failed_deployment_id = "route-a"
+        upstream_error.failed_deployment_order = 0.3
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "model_info": {"id": "route-a", "order": 0.3},
+            "proxy_server_request": {"path": "/v1/responses"},
+        }
+
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks._yield_streaming_error_fallback_or_raise(
+                request_data,
+                upstream_error,
+            )
+        ]
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0]["type"], "response.failed")
+        self.assertEqual(
+            chunks[0]["response"]["error"]["code"],
+            "upstream_route_failure",
+        )
+
     async def test_chat_route_exhaustion_propagates_error_instead_of_cancellation(self) -> None:
         hooks, _proxy_server = load_hook_module()
         streaming_module = sys.modules["young_router.proxy.streaming"]
