@@ -88,18 +88,24 @@ class RelayApiKeyDomainTests(unittest.TestCase):
             )
             self.assertNotIn("replace-secret", json.dumps(domain.snapshot()))
 
+            # The refresh above is where the station's key values are read and
+            # cached, so the staging below is measured from there: every edit
+            # stages locally and reaches the station only through Apply.
+            staged_from = len(client.calls)
             domain.dispatch("api_key.update", {"account_id": account["id"], "resource_id": "newapi-7", "name": "renamed"})
             domain.dispatch("api_key.set_group", {"account_id": account["id"], "resource_id": "newapi-7", "group_id": "premium"})
             domain.dispatch("api_key.set_enabled", {"account_id": account["id"], "resource_id": "newapi-7", "enabled": False})
             domain.dispatch("api_key.create", {"account_id": account["id"], "name": "new-key"})
-            self.assertEqual([], client.calls)
+            self.assertEqual(staged_from, len(client.calls))
             prepared = domain.prepare_apply()
             self.assertTrue(prepared["ready"])
             domain.execute_pending_operations(prepared, phase="non_destructive")
             domain.reconcile_apply(prepared, phase="non_destructive")
-            self.assertEqual("POST", client.calls[0][0])
-            self.assertEqual("/api/token/", client.calls[0][1])
-            self.assertEqual({"name": "new-key", "unlimited_quota": True}, client.calls[0][4])
+            # The refresh already spent the key-value read, so Apply is the
+            # first thing after it that writes to the station.
+            create = next(call for call in client.calls[staged_from:] if call[0] == "POST")
+            self.assertEqual("/api/token/", create[1])
+            self.assertEqual({"name": "new-key", "unlimited_quota": True}, create[4])
             self.assertIn(
                 ("PUT", "/api/token/?status_only=true", "https://relay.example.test", {"Cookie": "session=fixture"}, {"id": 7, "status": 2}),
                 client.calls,
@@ -484,11 +490,15 @@ class RelayApiKeyDomainTests(unittest.TestCase):
             domain.accept_login_result(account["id"], username="person", cookie="session=fixture")
             domain.refresh_resources(account["id"])
 
+            # The refresh is where the station's key values are read and
+            # cached; creating a key stages locally and reaches the station
+            # only through Apply.
+            staged_from = len(client.calls)
             domain.dispatch(
                 "api_key.create",
                 {"account_id": account["id"], "name": "premium", "group_id": "premium", "enabled": True},
             )
-            self.assertEqual([], client.calls)
+            self.assertEqual(staged_from, len(client.calls))
             prepared = domain.prepare_apply()
             self.assertTrue(prepared["ready"])
             domain.execute_pending_operations(prepared, phase="non_destructive")
