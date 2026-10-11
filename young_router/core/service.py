@@ -2132,17 +2132,42 @@ class CoreStore:
                     # proved moments ago, so re-entering the pane inside the
                     # window costs no station round trip at all.
                     public = None
+                    # Whether the station was ever reached.  The host's
+                    # ``signed_out`` is an unauthenticated probe, so it may only
+                    # be recorded once a read actually arrived somewhere: a
+                    # dropped connection or a timeout is not the station saying
+                    # no, and recording it as one is what retired a session the
+                    # user still held after a momentary network failure.
+                    # ``RelayTransportError`` is raised exactly by a read that
+                    # never reached an answer.
+                    unreachable = False
                     if not session_check_is_recent(str(account_id)):
+                        from .domains.relay_accounts import RelayTransportError
+
                         if login_status == "signed_out":
                             try:
                                 public = session_restorer(str(account_id))
+                            except RelayTransportError:
+                                unreachable = True
                             except Exception:
                                 public = None
-                        if public is None:
+                        if public is None and not unreachable:
                             try:
                                 public = password_restorer(str(account_id))
+                            except RelayTransportError:
+                                unreachable = True
                             except Exception:
                                 public = status_setter(str(account_id), str(login_status))
+                        # ``expired`` is the station's own rejection of its
+                        # session, so it is recorded whether or not the renewal
+                        # above reached the site; only the host's signed-out
+                        # guess is dropped, and the caller is told the check did
+                        # not happen instead of being given a login state.
+                        if unreachable and login_status == "signed_out":
+                            raise CoreError(
+                                "relay_restore_unavailable",
+                                "The station could not be reached, so the login was not re-checked",
+                            )
                     if public is None:
                         public = status_settler(str(account_id), str(login_status))
                 elif login_status in {"signed_out", "expired"}:

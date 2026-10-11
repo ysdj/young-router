@@ -2000,6 +2000,94 @@ class RelayAccountsDomainTests(unittest.TestCase):
             )
             self.assertEqual("none", account["resource_error"])
 
+    def test_an_unreachable_station_never_records_a_login_observation(self) -> None:
+        """A network failure is not evidence that the user logged out.
+
+        The pane asks the host to restore the saved session on every mount, and
+        that check reads the station.  A dropped connection or a timeout was
+        answered as if the station had rejected the session, so one offline
+        moment recorded the account as signed out and retired the local session
+        with it — canceling a login state the user never lost.  The check now
+        distinguishes the two: only an answer the station actually gave may
+        change the observation, and a read that never reached it changes
+        nothing and says so.
+        """
+
+        class OfflineClient(FakeRelayHTTPClient):
+            def json(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
+                self.requests.append((origin, path, dict(headers)))
+                raise RelayTransportError()
+
+            def password_login(self, origin: str, account_type: str, username: str, password: str) -> dict[str, str]:
+                self.password_logins.append((origin, account_type, username, password))
+                raise RelayTransportError()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake = OfflineClient({}, password_login_result=RelayTransportError())
+            domain = RelayAccountsDomain(root, http_client=fake)
+            account = domain.dispatch(
+                "add",
+                {"type": "sub2api", "label": "Relay", "origin": "https://relay.example.test", "remember_password": True},
+            )["accounts"][0]
+            domain.accept_login_result(
+                account["id"],
+                username="person@example.test",
+                access_token="replace-access-token",
+                password="replace-password",
+            )
+            domain.apply()
+            stored = root / ".litellm-runtime" / "relay-accounts.json"
+            before = json.loads(stored.read_text(encoding="utf-8"))
+
+            reloaded = RelayAccountsDomain(root, http_client=fake)
+            core = CoreStore(
+                metadata_path=root / ".litellm-runtime" / "core-state.json",
+                domains=[reloaded, ProvidersModelsDomain(root / "config.yaml")],
+            )
+
+            with self.assertRaises(CoreError) as caught:
+                core.restore_relay_session(
+                    account_id=account["id"],
+                    account_type="sub2api",
+                    label="Relay",
+                    origin="https://relay.example.test",
+                    login_status="signed_out",
+                )
+
+            # The caller is told the check did not happen, and the login it
+            # would have overwritten is exactly as it was — on the account and
+            # in the durable document the next restart reads.
+            self.assertEqual("relay_restore_unavailable", caught.exception.code)
+            self.assertEqual("unknown", core.snapshot()["domains"]["relay_accounts"]["accounts"][0]["login_status"])
+            self.assertEqual(before, json.loads(stored.read_text(encoding="utf-8")))
+
+            # A station that answers and refuses the credentials is the other
+            # case, and it is still recorded: an unreachable station is the
+            # only outcome this rule covers.
+            class RefusingClient(OfflineClient):
+                def json(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
+                    self.requests.append((origin, path, dict(headers)))
+                    raise RelayAccountsError("Relay login has expired")
+
+                def password_login(self, origin: str, account_type: str, username: str, password: str) -> dict[str, str]:
+                    self.password_logins.append((origin, account_type, username, password))
+                    raise RelayAccountsError("Relay username or password is invalid")
+
+            refusing = RelayAccountsDomain(root, http_client=RefusingClient({}, password_login_result=RelayAccountsError("Relay is unavailable")))
+            refusing_core = CoreStore(
+                metadata_path=root / ".litellm-runtime" / "core-state.json",
+                domains=[refusing, ProvidersModelsDomain(root / "config.yaml")],
+            )
+            refused = refusing_core.restore_relay_session(
+                account_id=account["id"],
+                account_type="sub2api",
+                label="Relay",
+                origin="https://relay.example.test",
+                login_status="signed_out",
+            )
+            self.assertEqual("signed_out", refused["login_status"])
+
     def test_local_relay_keys_stay_loadable_and_refreshable_while_signed_out(self) -> None:
         """A remembered session is a local credential, not a login gate.
 

@@ -5282,6 +5282,16 @@ async def _yield_streaming_error_fallback_or_raise(
     request_data: dict,
     exception: Exception,
 ) -> AsyncIterator[Any]:
+    # Uvicorn closes accepted connections before waiting for in-flight
+    # requests during a rolling restart. Classify that teardown before any
+    # failover or recovery path can quarantine a healthy deployment or turn
+    # the interruption into a reconnect-triggering exception.
+    if _routing_module._is_local_shutdown_exception(exception):
+        if _request_is_responses_stream(request_data):
+            yield _synthesized_failed_response_event(request_data, exception)
+            return
+        raise exception
+
     # A provider may return an async iterator successfully and raise the
     # upstream 400 only on a later iterator read. That bypasses LiteLLM's
     # generic-call exception path, so record the route-local compaction

@@ -2890,6 +2890,87 @@ class HookRouteRecoveryTests(HookTestCase):
         self.assertNotIn("upstream", error["message"])
         self.assertIn("restarting", error["message"])
 
+    async def test_a_restart_teardown_never_reaches_failover_or_recovery(self) -> None:
+        """The turn this worker truncated states the restart, not a route failure.
+
+        ``uvicorn`` closes accepted connections before it waits for the in-flight
+        requests, so a turn that is still streaming when the app is replaced
+        always loses its response body, and the exception that comes back reads
+        exactly like an upstream fault.  Tested at the entry point the streaming
+        pipeline actually calls: the classification must come first, because a
+        failover or a recovery poll reached from here quarantines a healthy
+        deployment and answers a client that only has to send the turn again.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        streaming_module = sys.modules["young_router.proxy.streaming"]
+        original_fallback = streaming_module._stream_streaming_error_fallback
+        self.addCleanup(
+            setattr,
+            streaming_module,
+            "_stream_streaming_error_fallback",
+            original_fallback,
+        )
+        fallback_attempts: list[Exception] = []
+
+        async def failed_fallback(_request_data, exception):
+            fallback_attempts.append(exception)
+            raise AssertionError("a restart teardown must not reach failover")
+            yield None
+
+        streaming_module._stream_streaming_error_fallback = failed_fallback
+
+        class MidStreamFallbackError(Exception):
+            status_code = 500
+
+        exc = MidStreamFallbackError(
+            "litellm.midstreamfallbackerror: apiconnectionerror: response payload "
+            "is not completed: <transferencodingerror: 400>"
+        )
+        exc.__cause__ = OSError("peer closed connection")
+        exc.failed_deployment_id = "c52c205f"
+        exc.failed_deployment_order = 0
+        hooks._mark_exception_as_local_shutdown(exc)
+
+        responses_request = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/responses"},
+            "model_info": {"id": "c52c205f", "order": 0},
+        }
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks._yield_streaming_error_fallback_or_raise(
+                responses_request,
+                exc,
+            )
+        ]
+        failed = [chunk for chunk in chunks if chunk.get("type") == "response.failed"]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["response"]["error"]["code"], "router_restarting")
+        # The one surface that cannot be told to reconnect gets the restart
+        # named; a route outage would be a lie about a healthy deployment.
+        self.assertNotIn("upstream", failed[0]["response"]["error"]["message"])
+        self.assertEqual(fallback_attempts, [])
+
+        # A Chat Completions turn has no terminal-failure contract to answer
+        # with, so the same teardown is re-raised as it is rather than being
+        # replaced by a reconnecting stream disconnect the client would act on.
+        chat_request = {
+            "model": "default-chat",
+            "messages": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/chat/completions"},
+        }
+        with self.assertRaises(MidStreamFallbackError):
+            async for _chunk in hooks._yield_streaming_error_fallback_or_raise(
+                chat_request,
+                exc,
+            ):
+                pass
+        self.assertEqual(fallback_attempts, [])
+
     def test_a_live_worker_still_reports_a_real_upstream_failure(self) -> None:
         """The shutdown marker never widens into ordinary request failures."""
 

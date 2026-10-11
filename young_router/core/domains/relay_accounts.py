@@ -1002,7 +1002,10 @@ class RelayHTTPClient:
         except urllib.error.HTTPError:
             raise RelayAccountsError("Relay username or password is invalid") from None
         except Exception:
-            raise RelayAccountsError("Relay is unavailable") from None
+            # The station was never reached, so this is not an answer about the
+            # account: the transport error is kept as its own type so a caller
+            # never records a login observation it did not make.
+            raise RelayTransportError() from None
         if not isinstance(status, int) or status < 200 or status >= 300 or len(body) > MAX_RESPONSE_BYTES:
             raise RelayAccountsError("Relay login was rejected")
         try:
@@ -3330,7 +3333,16 @@ class RelayAccountsDomain:
         return self.set_login_status(account_id, status)
 
     def restore_saved_session(self, account_id: str) -> dict[str, Any] | None:
-        """Verify and activate an explicitly remembered browser session."""
+        """Verify and activate an explicitly remembered browser session.
+
+        ``None`` is the one answer that says "this session is not usable".  It
+        is deliberately *not* the answer to a station that could not be asked:
+        a refused read (a timeout, a dropped connection, a 5xx) is a fact about
+        the network, and reporting it as an unusable session is what let an
+        offline moment record an account as signed out.  Such a read raises
+        instead, so the caller distinguishes "the station said no" from "the
+        station was not reached" and only the former may retire a login.
+        """
 
         index = self._index(account_id)
         account = copy.deepcopy(self._accounts[index])
@@ -3353,7 +3365,15 @@ class RelayAccountsDomain:
         path = "/api/user/self" if account["type"] == "newapi" else "/api/v1/auth/me"
         try:
             payload = self._http.json(account["origin"], path, headers=headers)
+        except RelayTransportError:
+            # The station was never reached, so this is not an answer about the
+            # session.  Letting it fall into the ``None`` below reports "no
+            # usable session", and the caller then records 未登录 for a login
+            # that was never actually rejected.
+            raise
         except RelayAccountsError:
+            # The station answered and refused this session.  That is a real
+            # answer, and ``None`` is how it is stated.
             return None
         if not isinstance(_json_data(payload), Mapping):
             return None

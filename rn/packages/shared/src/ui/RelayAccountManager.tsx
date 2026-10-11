@@ -774,7 +774,13 @@ export function StationAccountsPanel({
         origin: account.origin,
         username: account.username || undefined,
       });
-      const signedIn = result?.loginStatus === "signed_in";
+      // No answer at all is not a signed-out answer: the host reports one only
+      // when it could not reach the station (a timeout, a dropped connection),
+      // which says nothing about the login.  The pane keeps what it knows —
+      // treating an absent answer as 未登录 is what turned a momentary network
+      // failure into a login the user then had to redo by hand.
+      if (!result) return false;
+      const signedIn = result.loginStatus === "signed_in";
       markLoginFailure(account.id, !signedIn);
       markLocalSignedIn(account.id, signedIn);
       try {
@@ -784,8 +790,8 @@ export function StationAccountsPanel({
       }
       return signedIn;
     } catch {
-      markLoginFailure(account.id, false);
-      markLocalSignedIn(account.id, false);
+      // Same boundary as an absent answer: a refused round trip observed
+      // nothing, so the pane's login state is left exactly as it was.
       return false;
     } finally {
       updateLoading(account.id, "resources", false);
@@ -1342,8 +1348,11 @@ export function StationAccountsPanel({
         {selectedLoginState === "signed_out" ? <NativeButton title={translate("relay.goLogin")} compact busy={pendingAction === "login"} disabled={controlsBusy && pendingAction !== "login"} onPress={() => { void loginSelected(); }} /> : null}
       </View>
       <View style={styles.accountActionsRow}>
-        <NativeButton title={translate("relay.refreshResources")} symbol="refresh" compact busy={pendingAction === "refresh"} disabled={controlsBusy && pendingAction !== "refresh"} onPress={() => { void refreshSelected(); }} />
-        <NativeButton title={translate("relay.groupManager")} compact disabled={controlsBusy || !native.showGroupManager} onPress={() => { void openGroupManager(); }} />
+        {/* Both controls act on a station session — 刷新资源 reads the station
+            and 分组管理 writes its keys — so neither is offered while the row
+            does not read 已登录.  A row that states 未登录 carries 去登录 alone. */}
+        {selectedLoginState === "signed_in" ? <NativeButton title={translate("relay.refreshResources")} symbol="refresh" compact busy={pendingAction === "refresh"} disabled={controlsBusy && pendingAction !== "refresh"} onPress={() => { void refreshSelected(); }} /> : null}
+        {selectedLoginState === "signed_in" ? <NativeButton title={translate("relay.groupManager")} compact disabled={controlsBusy || !native.showGroupManager} onPress={() => { void openGroupManager(); }} /> : null}
       </View>
     </View> : null}
     {removalDialogHosted ? null : removalDialog}

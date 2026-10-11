@@ -4480,12 +4480,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("const stageStationUpdate = async (overrides: StationDraft = {}): Promise<void> => {", relay)
         self.assertIn('await commit("station.update", { id: station.id, name, origin, type });', relay)
         self.assertIn("translate(\"relay.stationUpdateStaged\")", relay)
-        # One login state drives the status column and both account actions:
+        # One login state drives the status column and the account actions:
         # 登录中 while a sign-in this pane started is in flight, otherwise
         # 已登录 / 未登录 (the expired and not-yet-probed cases read as 未登录
         # and keep the brown alert row). 去登录 only appears while signed out and
-        # is never disabled; 分组管理 shows the station's locally known keys, so
-        # it is never gated on the login state that the keys outlive.
+        # is never disabled; 刷新资源 and 分组管理 are the controls that act on a
+        # session, so they appear only once the row reads 已登录.
         self.assertIn('const relayLoginState = (account: RelayAccount): "signed_in" | "signing_in" | "signed_out" => {', relay)
         self.assertIn('if (loading[account.id]?.session) return "signing_in";', relay)
         self.assertIn('return effectiveLoginStatus(account) === "signed_in" ? "signed_in" : "signed_out";', relay)
@@ -4511,9 +4511,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('translate(`relay.status.${relayLoginState(account)}`)', relay)
         self.assertIn('const selectedLoginState = selected ? relayLoginState(selected) : "signed_out";', relay)
         self.assertIn('{selectedLoginState === "signed_out" ? <NativeButton title={translate("relay.goLogin")} compact busy={pendingAction === "login"} disabled={controlsBusy && pendingAction !== "login"} onPress={() => { void loginSelected(); }} /> : null}', relay)
-        # 刷新资源 is the control the relay messages already name ("请点击刷新
-        # 资源"); it is a forced station round trip with its own progress, so the
-        # message a user reads points at a button that exists on the same row.
+        # 刷新资源 and 分组管理 both act on a station session: 刷新资源 is a
+        # forced station round trip and 分组管理 writes the station's keys, so
+        # neither is offered while the account is not signed in — pressing either
+        # one signed out only ever produced a login failure.  The comments the
+        # relay messages carry ("请点击刷新资源") therefore point at a button the
+        # row shows once there is a session to refresh.
+        self.assertIn('{selectedLoginState === "signed_in" ? <NativeButton title={translate("relay.refreshResources")} symbol="refresh" compact busy={pendingAction === "refresh"} disabled={controlsBusy && pendingAction !== "refresh"} onPress={() => { void refreshSelected(); }} /> : null}', relay)
+        self.assertIn('{selectedLoginState === "signed_in" ? <NativeButton title={translate("relay.groupManager")} compact disabled={controlsBusy || !native.showGroupManager} onPress={() => { void openGroupManager(); }} /> : null}', relay)
         self.assertIn('title={translate("relay.refreshResources")} symbol="refresh" compact busy={pendingAction === "refresh"}', relay)
         self.assertIn('const refreshSelected = async (): Promise<void> => {', relay)
         self.assertIn('await refreshAccountResources({ id: account.id }, { force: true });', relay)
@@ -4527,6 +4532,15 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('disabled={controlsBusy || !native.showGroupManager}', relay)
         self.assertNotIn('!native.showGroupManager || selectedLoginState !== "signed_in"', relay)
         self.assertNotIn('disabled={controlsBusy || isAccountLoading(selected.id)}', relay)
+        # An unreachable station is not an answer about the login.  The host
+        # answers a probe with nothing at all when it could not reach the
+        # station, and the pane keeps what it already knew instead of painting
+        # 未登录 and retiring a session the user still holds.
+        probe = relay.split("const restoreSavedSession = async (account: RelayAccount): Promise<boolean> => {", 1)[1].split("const loginAccount", 1)[0]
+        self.assertIn("if (!result) return false;", probe)
+        self.assertIn('const signedIn = result.loginStatus === "signed_in";', probe)
+        self.assertNotIn('const signedIn = result?.loginStatus === "signed_in";', relay)
+        self.assertNotIn("markLocalSignedIn(account.id, false);\n      return false;", probe)
         self.assertIn('"relay.status.signing_in": "登录中"', self.zh)
         self.assertIn('"relay.status.signing_in": "Signing in"', self.en)
         # The relay family has no manual select: it comes from the station
