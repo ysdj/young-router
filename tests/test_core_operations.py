@@ -70,6 +70,10 @@ class CoreOperationsTests(unittest.TestCase):
         ) as rolling, mock.patch.object(
             controller, "_health", return_value=True
         ), mock.patch.object(
+            controller, "_stage_runtime_config"
+        ), mock.patch.object(
+            controller, "reset_transient_routing_state"
+        ), mock.patch.object(
             controller, "restart"
         ) as restart:
             self.assertEqual("running", controller.reload()["state"])
@@ -79,12 +83,47 @@ class CoreOperationsTests(unittest.TestCase):
         # settings apply into a refused port, so it must not be the reload path.
         restart.assert_not_called()
 
+    def test_reload_stages_the_committed_document_before_rolling(self) -> None:
+        """A roll must replace the workers with the NEW document.
+
+        ``reload`` used to reach staging only because it went through
+        ``start()``.  The rolling path is the same process, so the document the
+        workers read is whatever was staged last: rolling without restaging
+        replaces every worker with the one the proxy already had, and reports
+        success for a change that never took effect.
+        """
+
+        controller = CoreServiceController("/tmp/unused-runtime")
+        order: list[str] = []
+
+        def rolling(_pid: int) -> bool:
+            order.append("roll")
+            return True
+
+        with mock.patch.object(controller, "_pid", return_value=4811), mock.patch.object(
+            controller, "_rolling_restart", side_effect=rolling
+        ), mock.patch.object(
+            controller, "_health", return_value=True
+        ), mock.patch.object(
+            controller, "_stage_runtime_config", side_effect=lambda: order.append("stage")
+        ), mock.patch.object(
+            controller, "reset_transient_routing_state", side_effect=lambda: order.append("reset")
+        ):
+            self.assertEqual("running", controller.reload()["state"])
+
+        # Both pre-flight steps run, and they run before the workers roll.
+        self.assertEqual(["stage", "reset", "roll"], order)
+
     def test_reload_falls_back_to_a_restart_when_the_proxy_cannot_be_signalled(self) -> None:
         controller = CoreServiceController("/tmp/unused-runtime")
         expected = {"state": "running"}
         with mock.patch.object(controller, "_pid", return_value=4811), mock.patch.object(
             controller, "_rolling_restart", return_value=False
-        ), mock.patch.object(controller, "restart", return_value=expected) as restart:
+        ), mock.patch.object(controller, "restart", return_value=expected) as restart, mock.patch.object(
+            controller, "_stage_runtime_config"
+        ), mock.patch.object(
+            controller, "reset_transient_routing_state"
+        ):
             self.assertEqual(expected, controller.reload())
 
         restart.assert_called_once_with()

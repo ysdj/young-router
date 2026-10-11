@@ -1209,11 +1209,24 @@ class CoreServiceController:
         behaviour and stays available for a proxy that cannot be signalled --
         it is simply the slower, service-interrupting path instead of the one
         every settings apply takes.
+
+        What the workers read is the *staged* runtime document, so the same
+        two pre-flight steps the replacing path performed are still owed here:
+        the committed ``config.yaml`` is restaged into the document the proxy
+        loads, and transient routing state is dropped for the run that is about
+        to begin.  Rolling without restaging would replace every worker with
+        one holding the document the proxy already had -- a reload that reports
+        success and changes nothing.
         """
 
         pid = self._pid()
         if pid is None:
             raise RuntimeError("No managed LiteLLM service is running")
+        # Stage before signalling.  The workers load the staged document as they
+        # come up, so a roll started before the new bytes are in place would
+        # bring up replacements carrying the document the proxy already had.
+        self._stage_runtime_config()
+        self.reset_transient_routing_state()
         if self._rolling_restart(pid):
             deadline = time.monotonic() + _proxy_drain_grace_seconds()
             while time.monotonic() < deadline:
