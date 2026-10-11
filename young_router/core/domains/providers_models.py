@@ -6065,27 +6065,21 @@ class ProvidersModelsDomain:
                 # the secure key editor can finish before its slot is written.
                 for index, key in enumerate(keys):
                     key_id = str(key.get("id", "")).strip()
+                    # Always skip relay keys - they get their values dynamically from the
+                    # relay station during Apply/materialization, not from static config.
+                    if (
+                        isinstance(key.get("source"), Mapping)
+                        and key["source"].get("kind") == "relay"
+                    ):
+                        continue
                     if key_id in referenced_key_ids and key_id not in required_key_ids:
                         continue
                     if key_id in self._model_edit_existing_key_ids and key_id not in required_key_ids:
-                        continue
-                    if (
-                        key_id not in required_key_ids
-                        and allow_unmaterialized_relay_keys
-                        and isinstance(key.get("source"), Mapping)
-                        and key["source"].get("kind") == "relay"
-                    ):
                         continue
                     name = key.get("name")
                     if not isinstance(name, str) or not name.strip():
                         continue
                     if isinstance(key.get("value"), str) and key["value"].strip():
-                        continue
-                    if (
-                        allow_unmaterialized_relay_keys
-                        and isinstance(key.get("source"), Mapping)
-                        and key["source"].get("kind") == "relay"
-                    ):
                         continue
                     key_issues.append(
                         {
