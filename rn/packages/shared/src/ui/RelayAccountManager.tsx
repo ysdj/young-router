@@ -538,13 +538,13 @@ export function DependencyPolicyDialog<T extends string>({ visible, title, messa
 /**
  * The lanes one account's work is reported in.
  *
- * ``session`` is a sign-in the user started (去登录, or the ＋ account flow):
- * that wait owns the login column's 登录中.  ``resources`` is the station round
- * trip lane — a silent session restore and the key-list read are the same wait
- * on the same station, so they share it, and neither repaints a login state the
- * pane is about to agree with.
+ * ``session`` is a sign-in the user started (去登录, or the ＋ account flow);
+ * ``checking`` is the session check the pane runs on mount.  Both are statements
+ * about the login, so both own the login column's 登录中.  ``resources`` is the
+ * key-list read, which says nothing about the login and so must not repaint the
+ * login column.
  */
-type AccountLoading = { session: boolean; resources: boolean };
+type AccountLoading = { session: boolean; checking: boolean; resources: boolean };
 
 /**
  * 账号管理 for one relay station: list, add (native webview login), re-login,
@@ -622,6 +622,12 @@ export function StationAccountsPanel({
   // Which account action is running: the button that started one keeps its own
   // inline spinner instead of graying out.
   const [pendingAction, runPendingAction] = usePendingAction<"cleanup" | "add" | "login" | "remove" | "refresh">();
+  // How many sign-ins this pane has started for each account.  A session check
+  // that began before the newest one is asking about a session the pane has
+  // already replaced: 去登录 stays offered while a check runs, so its answer can
+  // land after the sign-in the user made instead — and recording that stale
+  // 未登录 retires a login that just succeeded.
+  const signInCounts = useRef<Record<string, number>>({});
   const [removal, setRemoval] = useState<{ account: RelayAccount }>();
   const [removalPolicy, setRemovalPolicy] = useState<LocalDependencyPolicy>("detach");
   // What a sign-in may save is asked by the native login flow after the
@@ -658,14 +664,25 @@ export function StationAccountsPanel({
     return "unknown";
   };
   // The status column and both account actions read this one state: 已登录,
-  // 登录中 while a sign-in this pane started is in flight, and 未登录 for every
-  // other case (signed out, expired, not probed yet).  Only the session lane
-  // says 登录中: a silent mount probe is a station round trip (the resources
-  // lane), not a sign-in, and it must not repaint the row it is about to agree
-  // with every time the pane opens.
+  // 登录中 while the login is still being settled — a sign-in this pane started
+  // (``session``) or the session check it runs on mount (``checking``) — and
+  // 未登录 for every other case (signed out, expired, and an account no answer
+  // has covered yet).
+  //
+  // 未登录 is a conclusion, and only an answer may state it: the mount check is
+  // a station round trip whose network timeout is long enough that a row painted
+  // 未登录 while it ran read as "sign in again", which is what sent users into a
+  // second, pointless sign-in while the first session was still being verified.
+  // A row the pane already knows is signed in keeps 已登录 through a check that
+  // is about to agree with it, so re-entering the pane never flickers a verified
+  // account through 登录中; only the pane's own sign-in outranks that, because
+  // the facts beside the row must not read 已登录 before they belong to the
+  // account that just signed in.
   const relayLoginState = (account: RelayAccount): "signed_in" | "signing_in" | "signed_out" => {
     if (loading[account.id]?.session) return "signing_in";
-    return effectiveLoginStatus(account) === "signed_in" ? "signed_in" : "signed_out";
+    if (effectiveLoginStatus(account) === "signed_in") return "signed_in";
+    if (loading[account.id]?.checking) return "signing_in";
+    return "signed_out";
   };
   // The session lane is set on the way in to a sign-in, never cleared in a
   // `finally`: 去登录 hands the wait to a browser window the native host owns,
@@ -680,6 +697,12 @@ export function StationAccountsPanel({
   const startSigningIn = (accountID: string): void => {
     clearPendingLogin();
     pendingLoginRef.current = accountID;
+    signInCounts.current[accountID] = (signInCounts.current[accountID] ?? 0) + 1;
+    // The sign-in replaces whatever the mount check was asking about, so it
+    // releases that lane too: the check's answer is discarded by the count
+    // above, and a lane left up would make the key-list read this sign-in forces
+    // look like a read already in progress and skip it.
+    updateLoading(accountID, "checking", false);
     updateLoading(accountID, "session", true);
   };
   // One account can hold the pane's sign-in at a time, so the lane's owner is
@@ -693,17 +716,17 @@ export function StationAccountsPanel({
   };
   const updateLoading = (accountID: string, kind: keyof AccountLoading, value: boolean): void => {
     const current = loadingRef.current;
-    const previous = current[accountID] ?? { session: false, resources: false };
+    const previous = current[accountID] ?? { session: false, checking: false, resources: false };
     const next = { ...current };
     const merged = { ...previous, [kind]: value };
-    if (!merged.session && !merged.resources) delete next[accountID];
+    if (!merged.session && !merged.checking && !merged.resources) delete next[accountID];
     else next[accountID] = merged;
     loadingRef.current = next;
     setLoading(next);
   };
   const isAccountLoading = (accountID: string): boolean => {
     const state = loadingRef.current[accountID];
-    return Boolean(state?.session || state?.resources);
+    return Boolean(state?.session || state?.checking || state?.resources);
   };
   useEffect(() => {
     if (selectedID === "") return;
@@ -760,12 +783,14 @@ export function StationAccountsPanel({
     }
   };
   const restoreSavedSession = async (account: RelayAccount): Promise<boolean> => {
-    // A silent mount probe is stated by nothing: it is a station round trip
-    // (the resources lane, which it shares with the key-list read it precedes),
-    // never a sign-in.  The login column keeps showing what the pane already
-    // knows while it runs, so re-entering the pane does not flicker a verified
-    // account through 登录中.
-    updateLoading(account.id, "resources", true);
+    // The mount check reports in a lane of its own.  It is a statement about the
+    // login, so 登录中 is what the row says while it runs — never 未登录, which is
+    // the answer this check is still fetching — and it stays out of the session
+    // lane, because that lane is the pane's own sign-in: a window the host holds
+    // over this one until it closes, while this check is a wait 去登录 may
+    // interrupt instead of one the user has to sit out.
+    updateLoading(account.id, "checking", true);
+    const checkEpoch = signInCounts.current[account.id] ?? 0;
     try {
       const result = await native.restoreRelaySession({
         accountId: account.id,
@@ -780,7 +805,14 @@ export function StationAccountsPanel({
       // treating an absent answer as 未登录 is what turned a momentary network
       // failure into a login the user then had to redo by hand.
       if (!result) return false;
+      // A sign-in started while this check was in flight owns the row now, and
+      // this answer is about the session that sign-in replaced.
+      if ((signInCounts.current[account.id] ?? 0) !== checkEpoch) return false;
       const signedIn = result.loginStatus === "signed_in";
+      // The lane is released with the answer, in the same batch that records
+      // it: the row states what the station said from here on, instead of
+      // reading 登录中 through the refresh that follows.
+      updateLoading(account.id, "checking", false);
       markLoginFailure(account.id, !signedIn);
       markLocalSignedIn(account.id, signedIn);
       try {
@@ -794,7 +826,7 @@ export function StationAccountsPanel({
       // nothing, so the pane's login state is left exactly as it was.
       return false;
     } finally {
-      updateLoading(account.id, "resources", false);
+      updateLoading(account.id, "checking", false);
     }
   };
   const loginAccount = async (account: AddedRelayAccount): Promise<boolean> => {
@@ -850,7 +882,8 @@ export function StationAccountsPanel({
   // mirrors the old workspace behaviour: selecting a provider must surface
   // fresh login state and resources without a manual refresh click.  A restore
   // that fails never opens the login page on its own: the account reads 未登录
-  // and keeps its cached keys until the user presses 去登录 (or +).
+  // once the check has answered, and keeps its cached keys until the user
+  // presses 去登录 (or +).
   //
   // The mount is not a reason to re-authenticate: Core answers with the
   // observation it already has while that observation is inside the station's
@@ -864,8 +897,17 @@ export function StationAccountsPanel({
       if (attemptedAccounts.current.has(account.id) || isAccountLoading(account.id)) continue;
       attemptedAccounts.current.add(account.id);
       const observed = account.loginObservedSecondsAgo;
-      const fresh = account.loginStatus === "signed_in"
-        && observed !== null
+      // A determined answer is settled, not a question to ask again: 已登录 and
+      // 未登录 both stay put until their observation leaves the window, so
+      // re-entering the pane never re-probes a login that was just answered.
+      // 未登录 with no observation is the placeholder an account carries before
+      // any check ever ran, and that one is exactly what a mount is for.  An
+      // expired login is left out on purpose: it is the station rejecting its
+      // own session, and re-authenticating is how the account comes back
+      // without the user's help.
+      const settled = (account.loginStatus === "signed_in" || account.loginStatus === "signed_out")
+        && observed !== null;
+      const fresh = settled
         && typeof sessionRecheckSeconds === "number"
         && sessionRecheckSeconds > 0
         && observed < sessionRecheckSeconds;
@@ -1345,7 +1387,11 @@ export function StationAccountsPanel({
       <View style={styles.fieldRow}>
         <Text style={[styles.fieldLabel, { width: 44 }]}>{translate("relay.accountField")}</Text>
         <Text numberOfLines={1} style={styles.accountNameValue}>{accountDisplayName(selected, translate)}</Text>
-        {selectedLoginState === "signed_out" ? <NativeButton title={translate("relay.goLogin")} compact busy={pendingAction === "login"} disabled={controlsBusy && pendingAction !== "login"} onPress={() => { void loginSelected(); }} /> : null}
+        {/* Every row that is not 已登录 carries 去登录 — the mount check included,
+            because that station round trip is exactly the wait this button
+            exists to skip.  It is withheld only while a sign-in this pane
+            started owns the row: the window is already open then. */}
+        {selectedLoginState !== "signed_in" && !loading[selected.id]?.session ? <NativeButton title={translate("relay.goLogin")} compact busy={pendingAction === "login"} disabled={controlsBusy && pendingAction !== "login"} onPress={() => { void loginSelected(); }} /> : null}
       </View>
       <View style={styles.accountActionsRow}>
         {/* Both controls act on a station session — 刷新资源 reads the station

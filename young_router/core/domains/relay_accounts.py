@@ -622,8 +622,11 @@ def _public_account(account: Mapping[str, Any]) -> dict[str, Any]:
 def _stored_account(account: Mapping[str, Any]) -> dict[str, Any]:
     stored = _public_account(account)
     stored.pop("password_saved", None)
-    # The pane's own age of the observation is derived on every projection; the
-    # document keeps the stamp it is derived from.
+    # ``login_observed_at`` is deliberately not written here, so the re-check
+    # window never outlives the process that observed the login: a restart reads
+    # this document back with no stamp, and every account is probed for real
+    # once.  The pane derives its own age from the same value while Core holds
+    # it, so both sides measure one observation.
     stored.pop("login_observed_seconds_ago", None)
     stored["password"] = str(account.get("password", ""))
     stored["session"] = copy.deepcopy(account.get("session", {}))
@@ -3484,27 +3487,63 @@ class RelayAccountsDomain:
             return self.DEFAULT_SESSION_RECHECK_SECONDS
         return seconds
 
-    def session_check_is_recent(self, account_id: str) -> bool:
-        """Whether this account's login observation is still inside its window.
+    def recent_login_check_answer(self, account_id: str) -> dict[str, Any] | None:
+        """This account's own answer to a check its observation still covers.
 
-        The observation is the account's own ``last_updated_at``, which every
-        login outcome (a sign-in, a restored session, a rejected one) already
-        refreshes.  Only a session Core still holds counts, so a restart, a
-        reload, or a recorded ``expired`` always answers a check with a real
-        probe.
+        An outcome that has been determined is settled, not a question to ask
+        again: the pane re-checks its station session on every mount, so an
+        account that already read 未登录 was re-probed on every entry -- the row
+        flicked through 登录中 and back to 未登录 without anything having changed,
+        because a check that can only repeat its own last answer is not a check.
+        Both terminal outcomes this Core determined therefore answer later
+        checks inside the window:
+
+        * ``signed_in`` -- a session this Core verified and still holds.
+        * ``signed_out`` -- a login this Core determined from the station's own
+          refusal, or from having no credential left to try.  The account
+          created but never checked carries the same word with no observation
+          stamp, and that placeholder answers nothing: it is the one 未登录 the
+          pane has never actually established.
+
+        ``expired`` is deliberately excluded.  It is the station rejecting its
+        own session, and re-authenticating with the remembered password is how
+        an account comes back without the user's help -- answering that check
+        from the observation would freeze the account out of its own recovery.
+
+        A restart, a reload, or a window of 0 leaves no recent observation, so
+        the station is asked for real; the stamp is not durable, which is what
+        keeps a frozen 未登录 from outliving the process that determined it.
         """
 
         window = self._session_recheck_seconds()
         if window <= 0:
-            return False
+            return None
         index = self._index(account_id)
         account = self._accounts[index]
-        if account.get("login_status") != "signed_in":
-            return False
-        if not self._has_session_credentials(account):
-            return False
+        status = account.get("login_status")
+        if status not in {"signed_in", "signed_out"}:
+            return None
+        # A verified login still needs the credential that proved it, so a
+        # session Core can no longer use is asked about again.  A determined
+        # 未登录 needs nothing: having no usable session is what it states.
+        if status == "signed_in" and not self._has_session_credentials(account):
+            return None
         age = _observed_seconds_ago(account.get("login_observed_at"))
-        return age is not None and age < window
+        if age is None or age >= window:
+            return None
+        return _public_account(account)
+
+    def login_check_is_recent(self, account_id: str) -> bool:
+        """Whether this account's login observation is still inside its window.
+
+        The observation is the account's own ``login_observed_at``, which is
+        stamped by exactly the outcomes that are a statement about the login: a
+        sign-in, a restored session, and a determined 未登录.  A resource read
+        records its own time elsewhere, so a failed one cannot make an old probe
+        look fresh.
+        """
+
+        return self.recent_login_check_answer(account_id) is not None
 
     @staticmethod
     def _session_headers(secrets: object, *, user_id: object = "", station_type: object = "") -> dict[str, str]:

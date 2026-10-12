@@ -1770,15 +1770,92 @@ class RelayAccountsDomainTests(unittest.TestCase):
             )
             self.assertEqual("signed_out", result["login_status"])
 
+    def test_a_determined_signed_out_costs_no_station_round_trip_on_the_next_mount(self) -> None:
+        """The route settles a determined 未登录 instead of re-probing it.
+
+        This is the whole point at the level the pane actually calls: the
+        station is read once, the row reads 未登录, and every later mount inside
+        the window answers from that determination without a single station
+        request — no session probe and no remembered-password renewal.  Before
+        the window covered this outcome, the first request was paid again on
+        every mount, so a row the user could already read kept re-asking a
+        station that had already answered.
+        """
+
+        responses = {
+            "/api/user/models": {"success": True, "data": ["chat-a"]},
+            "/api/token/?p=1&size=100": {
+                "success": True,
+                "data": {"items": [{"id": 7, "status": 1, "key": "masked"}]},
+            },
+        }
+
+        class RefusingStation(FakeRelayHTTPClient):
+            """A station that answers and refuses both the session and the password."""
+
+            def json(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
+                self.requests.append((origin, path, dict(headers)))
+                raise RelayAccountsError("Relay session is expired")
+
+            def password_login(self, origin: str, account_type: str, username: str, password: str) -> dict[str, str]:
+                self.password_logins.append((origin, account_type, username, password))
+                raise RelayAccountsError("Relay username or password is invalid")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake = RefusingStation(responses, password_login_result=RelayAccountsError("Relay username or password is invalid"))
+            domain = RelayAccountsDomain(root, http_client=fake)
+            account_id = domain.dispatch(
+                "add",
+                {"type": "newapi", "label": "Relay", "origin": "https://relay.example.test", "remember_password": True},
+            )["accounts"][0]["id"]
+            domain.accept_login_result(
+                account_id,
+                username="person@example.test",
+                cookie="session=replace-cookie",
+                password="replace-password",
+            )
+            core = CoreStore(
+                metadata_path=root / ".litellm-runtime" / "core-state.json",
+                domains=[domain, ProvidersModelsDomain(root / "config.yaml")],
+            )
+            # Age the verified login past the window so the first mount is a
+            # real check rather than a reuse of the sign-in that just landed.
+            domain._accounts[0]["login_observed_at"] = "2000-01-01T00:00:00Z"
+
+            def mount() -> tuple[str, int]:
+                before = len(fake.requests) + len(fake.password_logins)
+                result = core.restore_relay_session(
+                    account_id=account_id,
+                    account_type="newapi",
+                    label="Relay",
+                    origin="https://relay.example.test",
+                    login_status="signed_out",
+                )
+                return result["login_status"], len(fake.requests) + len(fake.password_logins) - before
+
+            # The first check is the answer: the station is asked, and refuses.
+            status, cost = mount()
+            self.assertEqual("signed_out", status)
+            self.assertGreater(cost, 0)
+
+            # Every later mount inside the window settles on that answer and
+            # pays nothing at all.
+            for _ in range(3):
+                status, cost = mount()
+                self.assertEqual("signed_out", status)
+                self.assertEqual(0, cost)
+
     def test_a_fresh_login_observation_answers_the_panes_own_recheck(self) -> None:
         """One station round trip answers every check inside the window.
 
         The account pane re-checks its station session on every mount, so
         without a window each entry re-probed the site.  Core keeps the
-        observation instead: a session it still holds and observed inside the
-        window answers the next check, and a session it cannot vouch for (a
-        restart, an expired one, or an account with no session) always gets a
-        real probe.  The window is a runtime threshold, and 0 turns the
+        observation instead: a login it determined inside the window answers
+        the next check -- 已登录 from the session it holds, and 未登录 from the
+        refusal it recorded.  A login it cannot vouch for (a restart, an
+        expired one, or an account no check has ever answered for) always gets
+        a real probe.  The window is a runtime threshold, and 0 turns the
         short-circuit off.
         """
 
@@ -1799,14 +1876,14 @@ class RelayAccountsDomainTests(unittest.TestCase):
             )["accounts"][0]["id"]
 
             # Nothing observed yet: a check is not reused.
-            self.assertFalse(domain.session_check_is_recent(account_id))
+            self.assertFalse(domain.login_check_is_recent(account_id))
             # The pane reads the window from the relay projection, so both sides
             # apply one number.
             self.assertIsInstance(domain.snapshot()["session_recheck_seconds"], float)
 
             domain.accept_login_result(account_id, username="sample-user", cookie="session=replace-cookie")
 
-            self.assertTrue(domain.session_check_is_recent(account_id))
+            self.assertTrue(domain.login_check_is_recent(account_id))
             account = domain.snapshot()["accounts"][0]
             # The pane ages the observation itself, so it can decide before it
             # asks the host for anything.
@@ -1816,7 +1893,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
             # A recorded rejection is a fresh observation too, and it retires
             # the session the window was describing.
             domain.set_login_status(account_id, "expired")
-            self.assertFalse(domain.session_check_is_recent(account_id))
+            self.assertFalse(domain.login_check_is_recent(account_id))
 
             # A window of 0 re-checks on every mount by definition.
             domain.accept_login_result(account_id, username="sample-user", cookie="session=replace-cookie")
@@ -1825,12 +1902,12 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with mock.patch("young_router.core.domains._shared._default_runtime_settings_path", return_value=settings):
-                self.assertFalse(domain.session_check_is_recent(account_id))
+                self.assertFalse(domain.login_check_is_recent(account_id))
                 settings.write_text(
                     "YOUNG_ROUTER_RELAY_SESSION_RECHECK_SECONDS=600\n",
                     encoding="utf-8",
                 )
-                self.assertTrue(domain.session_check_is_recent(account_id))
+                self.assertTrue(domain.login_check_is_recent(account_id))
 
             # A stored observation older than the window is probed again.
             domain.apply()
@@ -1840,7 +1917,93 @@ class RelayAccountsDomainTests(unittest.TestCase):
             stored.write_text(json.dumps(aged), encoding="utf-8")
             domain.reload()
             with mock.patch("young_router.core.domains._shared._default_runtime_settings_path", return_value=settings):
-                self.assertFalse(domain.session_check_is_recent(account_id))
+                self.assertFalse(domain.login_check_is_recent(account_id))
+
+    def test_a_determined_signed_out_is_settled_instead_of_re_probed(self) -> None:
+        """A determined 未登录 answers later checks; a placeholder answers none.
+
+        The pane re-checks its station session on every mount.  While the
+        short-circuit covered only ``signed_in``, an account that had actually
+        been determined 未登录 was re-probed on every entry: the row flicked
+        through 登录中 and back to 未登录 with nothing having changed, and each
+        entry paid a station round trip to re-learn the same answer.
+
+        The word alone is therefore not the test -- the observation is.  An
+        account created but never checked carries ``signed_out`` as a
+        placeholder with no stamp, and that is exactly the case a mount must
+        probe.  ``expired`` is excluded as well: it is the station rejecting its
+        own session, and re-authenticating with the remembered password is how
+        such an account comes back, so answering from the observation would
+        freeze it out of its own recovery.
+        """
+
+        responses = {
+            "/api/user/models": {"success": True, "data": ["chat-a"]},
+            "/api/token/?p=1&size=100": {
+                "success": True,
+                "data": {"items": [{"id": 7, "status": 1, "key": "masked"}]},
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            domain = RelayAccountsDomain(root, http_client=FakeRelayHTTPClient(responses))
+            account_id = domain.dispatch(
+                "add",
+                {"type": "newapi", "label": "Relay", "origin": "https://relay.example.test"},
+            )["accounts"][0]["id"]
+
+            # The placeholder: an account that exists but was never checked
+            # carries 未登录 and no observation, so a mount still probes it.
+            placeholder = domain.snapshot()["accounts"][0]
+            self.assertEqual("signed_out", placeholder["login_status"])
+            self.assertIsNone(placeholder["login_observed_seconds_ago"])
+            self.assertFalse(domain.login_check_is_recent(account_id))
+
+            # The determined answer: the station was asked and refused.
+            domain.set_login_status(account_id, "signed_out")
+            self.assertTrue(domain.login_check_is_recent(account_id))
+            determined = domain.snapshot()["accounts"][0]
+            self.assertEqual("signed_out", determined["login_status"])
+            self.assertLess(determined["login_observed_seconds_ago"], 5.0)
+
+            # An account with no credentials left to try is a determination
+            # too: there is nothing to authenticate with, so there is nothing
+            # for a probe to discover.
+            self.assertEqual(
+                "signed_out",
+                domain.recent_login_check_answer(account_id)["login_status"],
+            )
+
+            # An expired login is a fresh observation that never short-circuits:
+            # the recovery it enables is the remembered password, and freezing
+            # the row would prevent that recovery from ever being attempted.
+            domain.accept_login_result(
+                account_id,
+                username="sample-user",
+                cookie="session=replace-cookie",
+                remember_password=True,
+                password="replace-password",
+            )
+            domain.set_login_status(account_id, "expired")
+            self.assertFalse(domain.login_check_is_recent(account_id))
+            self.assertIsNone(domain.recent_login_check_answer(account_id))
+
+            # The window is still the window: a determined 未登录 leaves it and
+            # the station is asked again.
+            domain.set_login_status(account_id, "signed_out")
+            self.assertTrue(domain.login_check_is_recent(account_id))
+            settings = root / "runtime-settings.env"
+            settings.write_text("YOUNG_ROUTER_RELAY_SESSION_RECHECK_SECONDS=0\n", encoding="utf-8")
+            with mock.patch("young_router.core.domains._shared._default_runtime_settings_path", return_value=settings):
+                self.assertFalse(domain.login_check_is_recent(account_id))
+                self.assertIsNone(domain.recent_login_check_answer(account_id))
+
+            # And it does not survive a restart either: the stamp is this
+            # process's own observation, not a durable claim about the station.
+            domain.apply()
+            reloaded = RelayAccountsDomain(root, http_client=FakeRelayHTTPClient(responses))
+            self.assertIsNone(reloaded.snapshot()["accounts"][0]["login_observed_seconds_ago"])
+            self.assertFalse(reloaded.login_check_is_recent(account_id))
 
     def test_a_session_window_does_not_survive_a_core_restart(self) -> None:
         """A fresh Core never inherits the window: it holds no session then.
@@ -1871,14 +2034,14 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 cookie="session=replace-cookie",
                 remember_password=True,
             )
-            self.assertTrue(original.session_check_is_recent(account_id))
+            self.assertTrue(original.login_check_is_recent(account_id))
             original.apply()
 
             reloaded = RelayAccountsDomain(root, http_client=FakeRelayHTTPClient(responses))
             account = reloaded.snapshot()["accounts"][0]
             self.assertEqual("unknown", account["login_status"])
             self.assertIsNone(account["login_observed_seconds_ago"])
-            self.assertFalse(reloaded.session_check_is_recent(account_id))
+            self.assertFalse(reloaded.login_check_is_recent(account_id))
 
     def test_core_records_expired_native_session_without_retaining_secrets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
