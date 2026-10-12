@@ -2597,7 +2597,16 @@ class CodexSettingsDomainTests(unittest.TestCase):
             catalog = json.loads((home / "model-catalog.json").read_text(encoding="utf-8"))
             self.assertEqual(["default-chat"], [model["slug"] for model in catalog["models"]])
 
-    def test_enabled_catalog_updates_when_litellm_reports_an_empty_model_list(self) -> None:
+    def test_enabled_catalog_keeps_the_last_usable_file_when_the_live_view_empties(self) -> None:
+        """An empty live view must never become the catalog Codex loads.
+
+        ``/v1/models`` answers 200 with no model while the proxy is still
+        loading its routes and for part of a worker reload.  Writing that view
+        left the client with a catalog it refuses outright — "must contain at
+        least one model" — so the last usable file stands until a real model
+        set is observed.
+        """
+
         endpoint = {"result": (["default-chat"], True)}
 
         def exposed_models(_api_key: str):
@@ -2621,19 +2630,49 @@ class CodexSettingsDomainTests(unittest.TestCase):
                 {"domain": "codex", "type": "codex.model_catalog.set", "payload": {"enabled": True}},
                 expected_revision=core.revision,
             )
+            catalog_path = home / "model-catalog.json"
+            before = catalog_path.read_text(encoding="utf-8")
 
             endpoint["result"] = ([], True)
-            codex._catalog_source_checked_at = 0.0
-            # Endpoint-backed model-set repairs require two consecutive
-            # observations so a transient worker view cannot rewrite the
-            # managed catalog.
-            core.snapshot()
-            codex._catalog_source_checked_at = 0.0
-            snapshot = core.snapshot()["domains"]["codex"]["model_catalog"]
+            for _ in range(2):
+                codex._catalog_source_checked_at = 0.0
+                core.snapshot()
 
-            self.assertEqual([], snapshot["public_models"])
-            catalog = json.loads((home / "model-catalog.json").read_text(encoding="utf-8"))
-            self.assertEqual([], catalog["models"])
+            # The file Codex loads is unchanged, so the client still starts with
+            # a usable model list of its own.
+            self.assertEqual(before, catalog_path.read_text(encoding="utf-8"))
+            catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+            self.assertEqual(["default-chat"], [model["slug"] for model in catalog["models"]])
+
+            # A real model set is adopted as soon as the surface reports one.
+            runtime.write_text(
+                textwrap.dedent(PROVIDER_CONFIG).lstrip().replace(
+                    "litellm_settings:",
+                    "  - model_name: extra-chat\n"
+                    "    litellm_params:\n"
+                    "      model: openai/extra-chat\n"
+                    '      api_base: "https://example.test/v1"\n'
+                    '      api_key: "replace-me-secret"\n'
+                    "    model_info:\n"
+                    '      id: "00000072"\n'
+                    "      provider: primary\n"
+                    "      upstream_url_surface: openai/responses\n"
+                    "litellm_settings:",
+                ).replace(
+                    "public_model_groups: [default-chat]",
+                    "public_model_groups: [default-chat, extra-chat]",
+                ),
+                encoding="utf-8",
+            )
+            endpoint["result"] = (["default-chat", "extra-chat"], True)
+            for _ in range(3):
+                codex._catalog_source_checked_at = 0.0
+                core.snapshot()
+            catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                ["default-chat", "extra-chat"],
+                [model["slug"] for model in catalog["models"]],
+            )
 
     @mock.patch("young_router.core.codex_config._local_exposed_models", return_value=(["default-chat"], True))
     def test_catalog_metadata_repair_keeps_the_catalog_current(self, _live_models) -> None:

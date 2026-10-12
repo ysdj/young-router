@@ -397,6 +397,21 @@ def catalog_payload(
     }
 
 
+def catalog_is_usable(path: Path | str) -> bool:
+    """Whether the managed catalog on disk is one Codex will load.
+
+    Codex refuses its entire configuration when the catalog holds no model
+    (``must contain at least one model``), so a file with an empty ``models``
+    array is as unusable as a missing one.  Callers use this to tell a live
+    view that is genuinely empty apart from a file that is simply broken: an
+    empty live view must never be handed to the client, and an unusable file
+    it already points at must not be left in place either.
+    """
+
+    names = catalog_model_names(path)
+    return bool(names)
+
+
 def catalog_model_names(path: Path | str) -> list[str] | None:
     try:
         payload = read_json(path, default={"models": None})
@@ -499,6 +514,7 @@ __all__ = [
     "PREVIOUS_CATALOG_FILE_NAME",
     "catalog_carries_native_profile",
     "catalog_is_current",
+    "catalog_is_usable",
     "catalog_model_names",
     "catalog_names_from_editor",
     "catalog_payload",

@@ -19,6 +19,7 @@ from ..model_catalog import (
     catalog_is_current,
     catalog_model_names,
     catalog_names_from_editor,
+    catalog_is_usable,
     legacy_managed_catalog_path,
     managed_catalog_path,
     previous_managed_catalog_path,
@@ -564,6 +565,31 @@ class CodexSettingsDomain:
         self._catalog_repair_observed_signature = None
         self._catalog_repair_observation_count = 0
 
+    def _write_managed_catalog(
+        self,
+        names: Sequence[str],
+        native_models: Sequence[Mapping[str, Any]],
+        base_slug: str | None,
+    ) -> None:
+        """Write the managed catalog, never a model-less one.
+
+        Codex refuses its entire configuration when the catalog it is pointed
+        at holds no model, so an empty observed view must not become the file
+        the client loads.  Every writer of the managed catalog goes through
+        here, which is what makes that a property of the file rather than a
+        rule each caller has to remember.
+        """
+
+        if not names:
+            return
+        write_catalog(
+            self.model_catalog_path,
+            names,
+            registry=self._context_registry,
+            native_models=native_models,
+            base_slug=base_slug,
+        )
+
     def _remove_retired_catalog_copies(self) -> None:
         """Drop app-written catalogs the applied config no longer names.
 
@@ -605,6 +631,22 @@ class CodexSettingsDomain:
                     self.revision += 1
             return False
         names = self._catalog_model_names(self._raw)
+        if not names:
+            # A live view with no public model is never handed to Codex: it
+            # refuses a catalog that lists no model, so writing this view would
+            # break the very configuration it serves.  The view is empty for
+            # reasons unrelated to the user's model set — the proxy answers
+            # ``/v1/models`` while it is still loading its routes, and a worker
+            # reload briefly publishes no group — so a usable file stays
+            # untouched and the next observation repairs from a truthful view.
+            # Where the pointer names a missing or unusable file instead, one
+            # load failure is not exchanged for another: the pointer is dropped
+            # so Codex loads its own model list until a real one is observed.
+            self._reset_catalog_repair_observation()
+            if not catalog_is_usable(pointer):
+                if self._repair_catalog_pointer(None):
+                    self.revision += 1
+            return False
         self._context_registry.refresh_if_due()
         model_ids_changed = self._catalog_model_ids_changed(names)
         if require_stable_repair and model_ids_changed:
@@ -642,13 +684,7 @@ class CodexSettingsDomain:
             self._remove_retired_catalog_copies()
             return False
         if not catalog_current:
-            write_catalog(
-                self.model_catalog_path,
-                names,
-                registry=self._context_registry,
-                native_models=native_models,
-                base_slug=base_slug,
-            )
+            self._write_managed_catalog(names, native_models, base_slug)
         if migrated:
             # Write the current file before moving the pointer so a failure in
             # between leaves Codex with a loadable config, never a dangling one.
@@ -965,13 +1001,7 @@ class CodexSettingsDomain:
                         base_slug=base_slug,
                     )
         if catalog_changed and catalog_models is not None and native_models is not None:
-            write_catalog(
-                self.model_catalog_path,
-                catalog_models,
-                registry=self._context_registry,
-                native_models=native_models,
-                base_slug=base_slug,
-            )
+            self._write_managed_catalog(catalog_models, native_models, base_slug)
         try:
             self._write_documents(self._draft)
         except DomainError:
@@ -1039,13 +1069,7 @@ class CodexSettingsDomain:
                 # document below.
                 draft_next = draft_before
         if catalog_changed and catalog_models is not None and native_models is not None:
-            write_catalog(
-                self.model_catalog_path,
-                catalog_models,
-                registry=self._context_registry,
-                native_models=native_models,
-                base_slug=base_slug,
-            )
+            self._write_managed_catalog(catalog_models, native_models, base_slug)
         disk_patch = {"model_catalog_json": str(self.model_catalog_path) if enabled else None}
         next_disk = self._sync(
             str(current.get("config_text", "")),

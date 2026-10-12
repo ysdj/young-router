@@ -370,6 +370,100 @@ class CodexCatalogRepairTests(unittest.TestCase):
             domain.refresh_model_catalog()
             self.assertEqual(["public-a", "public-b"], catalog_model_names(catalog_path))
 
+    def test_an_empty_live_view_never_replaces_a_usable_catalog(self) -> None:
+        """Codex refuses a catalog that lists no model, so it is never written one.
+
+        The proxy answers ``/v1/models`` with 200 while its workers are still
+        loading their routes, and a reload briefly publishes no public group.
+        Both read as a successful probe of an empty model set, and writing that
+        view broke Codex for every model it had: every later start failed with
+        "must contain at least one model".  No number of agreeing empty views
+        may replace a catalog that still lists models.
+        """
+
+        endpoint = {"models": ["public-a"]}
+
+        def exposed_models(_api_key: str):
+            return endpoint["models"], True
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch(
+            "young_router.core.codex_config._local_exposed_models",
+            side_effect=exposed_models,
+        ), mock.patch(
+            "young_router.core.model_catalog.load_native_catalog",
+            return_value=[],
+        ):
+            domain = self._domain(Path(directory))
+            domain.set_model_catalog_enabled_immediately(True)
+            catalog_path = domain.model_catalog_path
+            before = catalog_path.read_text(encoding="utf-8")
+
+            endpoint["models"] = []
+            for _ in range(3):
+                self._force_catalog_observation(domain)
+                domain.snapshot()
+
+            self.assertEqual(before, catalog_path.read_text(encoding="utf-8"))
+            self.assertEqual(["public-a"], catalog_model_names(catalog_path))
+
+            # The surface comes back, and the catalog is still the one Codex
+            # can load: nothing had to be rebuilt from the empty view.
+            endpoint["models"] = ["public-a"]
+            self._force_catalog_observation(domain)
+            domain.snapshot()
+            self.assertEqual(["public-a"], catalog_model_names(catalog_path))
+
+    def test_an_empty_live_view_drops_a_dangling_pointer_instead_of_writing_it(self) -> None:
+        """With no usable catalog, an empty view must not become the file.
+
+        A deleted managed file is normally rebuilt from the live view.  When
+        that view lists no model there is nothing to rebuild from: writing it
+        would swap one load failure ("No such file or directory") for another
+        ("must contain at least one model"), so the pointer is dropped and
+        Codex falls back to its own model list until a real one is observed.
+        """
+
+        endpoint = {"models": ["public-a"]}
+
+        def exposed_models(_api_key: str):
+            return endpoint["models"], True
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch(
+            "young_router.core.codex_config._local_exposed_models",
+            side_effect=exposed_models,
+        ), mock.patch(
+            "young_router.core.model_catalog.load_native_catalog",
+            return_value=[],
+        ):
+            domain = self._domain(Path(directory))
+            domain.set_model_catalog_enabled_immediately(True)
+            catalog_path = domain.model_catalog_path
+            self.assertTrue(catalog_path.exists())
+
+            # The file goes away while the router is reachable but its model
+            # set reads as empty.
+            catalog_path.unlink()
+            endpoint["models"] = []
+            for _ in range(2):
+                self._force_catalog_observation(domain)
+                domain.snapshot()
+
+            self.assertFalse(catalog_path.exists())
+            self.assertNotIn(
+                "model_catalog_json",
+                (Path(directory) / "codex" / "config.toml").read_text(encoding="utf-8"),
+            )
+
+            # Once the surface reports models again, the switch restores both
+            # the file and the pointer.
+            endpoint["models"] = ["public-a"]
+            domain.set_model_catalog_enabled_immediately(True)
+            self.assertEqual(["public-a"], catalog_model_names(catalog_path))
+            self.assertIn(
+                "model_catalog_json",
+                (Path(directory) / "codex" / "config.toml").read_text(encoding="utf-8"),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
