@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Refuse to push commits that would record a private value.
+#
+# The pre-commit hook guards this machine's staging area; this one guards what
+# is actually about to leave it.  It covers the objects that reach a public
+# remote by any other route -- a commit made with ``--no-verify``, a branch
+# merged in from elsewhere, history that predates the hook -- and it audits
+# every commit being sent, including ones whose blobs the working tree no
+# longer contains.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$ROOT"
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "repo hygiene: python3 is not installed; skipped (CI still enforces this)" >&2
+  exit 0
+fi
+
+# A push of ``HEAD`` to a branch, or of a tag, arrives on stdin as
+# ``<local ref> <local sha> <remote ref> <remote sha>``.  Only new objects are
+# audited: a remote sha of all zeroes means the ref is being created, and any
+# other remote sha means its objects are already public, so re-reading them
+# would only re-report what the earlier push already recorded.
+zero="0000000000000000000000000000000000000000"
+ranges=()
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+  [[ -n "${local_sha:-}" ]] || continue
+  [[ "$local_sha" == "$zero" ]] && continue
+  if [[ "$remote_sha" == "$zero" ]]; then
+    ranges+=("$local_sha")
+  elif ! git merge-base --is-ancestor "$remote_sha" "$local_sha" 2>/dev/null; then
+    # A force-push or a rewritten branch: the remote's own commits cannot be
+    # used as a boundary, so audit everything the new tip reaches.
+    ranges+=("$local_sha")
+  else
+    ranges+=("${remote_sha}..${local_sha}")
+  fi
+done
+
+if ((${#ranges[@]} == 0)); then
+  exit 0
+fi
+
+status=0
+for range in "${ranges[@]}"; do
+  if ! python3 scripts/check-repo-hygiene.py --history "$range"; then
+    status=1
+  fi
+done
+
+if ((status != 0)); then
+  if [[ -n "${YOUNG_ROUTER_ALLOW_PRIVATE_PUSH:-}" ]]; then
+    echo "repo hygiene: continuing because YOUNG_ROUTER_ALLOW_PRIVATE_PUSH is set" >&2
+    exit 0
+  fi
+  cat >&2 <<'MESSAGE'
+
+Refusing to push.  Rewrite the offending commit before it reaches the remote:
+
+  git rebase -i <base>                       # edit or amend the commit
+  git commit --amend --reset-author          # for an identity finding
+  git filter-repo --replace-text rules.txt   # for text already in a blob
+
+A credential that was already pushed must be rotated; it cannot be recalled.
+If the finding is a false positive, report it and push with
+YOUNG_ROUTER_ALLOW_PRIVATE_PUSH=1 git push.
+MESSAGE
+  exit 1
+fi

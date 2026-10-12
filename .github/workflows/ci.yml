@@ -19,6 +19,10 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The hygiene gate re-audits the commits a push would add, so it
+          # needs the range, not just the tip.
+          fetch-depth: 0
 
       - name: Assert the Xcode React Native 0.85 requires
         run: |
@@ -93,6 +97,25 @@ jobs:
             'from litellm.proxy.types_utils.utils import get_instance_fn; callback = get_instance_fn("young_router.callbacks.image_generation_routing_hook", config_file_path="runtime/config.yaml"); assert callback.__class__.__name__ == "YoungRouterHook"'
           codesign --verify --deep --strict --verbose=2 "$APP"
 
+      - name: Repo hygiene
+        shell: bash
+        run: |
+          # The gate that a local hook also runs, so a leak cannot reach the
+          # public branch by way of a clone that never installed the hooks.
+          # The whole reachable history is audited, not just the tree: the
+          # leaks this exists to catch were committed and then deleted, so
+          # their only remaining copy is in an interior commit.
+          python3 scripts/check-repo-hygiene.py --tree HEAD
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            python3 scripts/check-repo-hygiene.py --history \
+              "${{ github.event.before }}..${{ github.sha }}"
+          elif [[ -n "${{ github.event.pull_request.base.sha }}" ]]; then
+            python3 scripts/check-repo-hygiene.py --history \
+              "${{ github.event.pull_request.base.sha }}..${{ github.sha }}"
+          else
+            python3 scripts/check-repo-hygiene.py --history HEAD
+          fi
+
       - name: Validate scripts and metadata
         shell: bash
         env:
@@ -102,6 +125,13 @@ jobs:
             [[ -f "$file" ]] || continue
             bash -n "$file"
           done < <(git ls-files -z '*.sh')
+
+          # The commit hooks are shipped but never installed by CI, so their
+          # syntax is what this checks; the gate itself runs below.
+          while IFS= read -r -d '' file; do
+            [[ -f "$file" ]] || continue
+            bash -n "$file"
+          done < <(git ls-files -z 'scripts/githooks/*')
 
           while IFS= read -r -d '' file; do
             [[ -f "$file" ]] || continue

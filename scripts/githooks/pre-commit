@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Refuse to create a commit that would record a private value.
+#
+# The gate runs here, before the object exists, because that is the only place
+# the leak is still recoverable: once a commit holds an address, a path, or a
+# credential, the blob stays reachable by object id no matter what a later
+# commit deletes.  ``--no-verify`` bypasses this, and CI re-checks the same
+# rules, so a bypass cannot reach the public branch unnoticed.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$ROOT"
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "repo hygiene: python3 is not installed; skipped (CI still enforces this)" >&2
+  exit 0
+fi
+
+exec python3 scripts/check-repo-hygiene.py --staged
