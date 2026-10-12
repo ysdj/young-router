@@ -199,7 +199,6 @@ type TableProps = {
   rows: TableRow[];
   selectedKey?: string;
   striped?: boolean;
-  alternatingRows?: boolean;
   /**
    * Compact density: 22 pt rows for a plain table, and 26 pt rows for a source
    * list — the pane's own rail against the sidebar's regular 30 pt.
@@ -391,8 +390,13 @@ export function NativePicker({ labels, selectedValue, disabled, compact = true, 
 }
 
 
-export function NativeTable({ columns, rows, selectedKey = "", striped = true, alternatingRows = false, compact = true, followBottom = false, framed = true, sourceList = false, rowSymbols = [], rowSymbolColors = [], rowImageNames = [], cellHorizontalPadding = 8, firstColumnHorizontalPadding = 8, preserveColumnWidths = false, scrollTrailingColumnOverflow = false, disabledRowKeys = [], secondaryCellKeys = [], selectableSpanningRowKeys = [], onSelectionChange, onRowDoublePress, style, alertRowKeys = [] }: TableProps): React.JSX.Element {
-  const stripedRows = striped && !sourceList && (alternatingRows || rows.length > 0);
+export function NativeTable({ columns, rows, selectedKey = "", striped = true, compact = true, followBottom = false, framed = true, sourceList = false, rowSymbols = [], rowSymbolColors = [], rowImageNames = [], cellHorizontalPadding = 8, firstColumnHorizontalPadding = 8, preserveColumnWidths = false, scrollTrailingColumnOverflow = false, disabledRowKeys = [], secondaryCellKeys = [], selectableSpanningRowKeys = [], onSelectionChange, onRowDoublePress, style, alertRowKeys = [] }: TableProps): React.JSX.Element {
+  // Striped rows belong to the list surface, not to its contents: the native
+  // table paints its alternating bands across the whole viewport, so an empty
+  // list shows the same stripes and reads as a list that happens to have no
+  // rows. Deriving this from `rows.length` made every empty list a blank white
+  // block, indistinguishable from the pane behind it.
+  const stripedRows = striped && !sourceList;
   const spanningRowKeys = rows.filter((row) => row.spanning).map((row) => row.key);
   const selectableSpanningKeys = new Set(selectableSpanningRowKeys.filter((key) => spanningRowKeys.includes(key)));
   // Every key here must also appear in the macOS wrapper's own parameter list:

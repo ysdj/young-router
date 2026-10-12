@@ -1982,8 +1982,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.assertIn("secondaryCellKeys?: ReadonlyArray<string>;", spec)
             self.assertIn("spanningRowKeys?: ReadonlyArray<string>;", spec)
             self.assertIn("selectableSpanningRowKeys?: ReadonlyArray<string>;", spec)
-        self.assertIn("striped = true, alternatingRows = false", self.native_controls)
-        self.assertIn("const stripedRows = striped && !sourceList && (alternatingRows || rows.length > 0);", self.native_controls)
+        self.assertIn("striped = true, compact = true", self.native_controls)
+        # Striping is a property of the list surface, not of its contents: an
+        # empty list still paints the same alternating bands, which is how the
+        # user sees where an empty list ends. The flag is therefore decided by
+        # `striped`/`sourceList` alone, and tying it to `rows.length` made the
+        # pane's empty model and key lists read as one blank white block.
+        self.assertIn("const stripedRows = striped && !sourceList;", self.native_controls)
+        self.assertNotIn("(alternatingRows || rows.length > 0)", self.native_controls)
         self.assertIn("alternatingRows: stripedRows,", self.native_controls)
         self.assertIn("framed = true, sourceList = false", self.native_controls)
         self.assertIn("borderless: !framed,", self.native_controls)
@@ -4464,11 +4470,20 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("await restoreSavedSession(account);", relay)
         self.assertIn("await refreshAccountResources(account, { silent: true });", relay)
         self.assertNotIn("const canAutoLogin =", relay)
-        # ...and a session the runtime's re-check window still covers skips the
+        # ...and a login the runtime's re-check window still covers skips the
         # probe entirely: entering the pane twice within the window must not
         # re-authenticate or re-read a station whose observation is seconds old.
+        # The short-circuit covers a determined 未登录 as well as 已登录 — a login
+        # that has been answered is settled, not a question to ask again.  The
+        # word alone is not the test, the observation is: an account created but
+        # never checked carries 未登录 with no stamp, and that is exactly what a
+        # mount must probe.  An expired login is left out on purpose, because
+        # re-authenticating is how such an account recovers.
         self.assertIn("const observed = account.loginObservedSecondsAgo;", relay)
+        self.assertIn('const settled = (account.loginStatus === "signed_in" || account.loginStatus === "signed_out")', relay)
+        self.assertIn("&& observed !== null;", relay)
         self.assertIn("&& observed < sessionRecheckSeconds;", relay)
+        self.assertNotIn('const fresh = account.loginStatus === "signed_in"', relay)
         self.assertIn("if (!fresh) {", relay)
         self.assertIn("sessionRecheckSeconds?: number;", relay)
         self.assertIn("export function relaySessionRecheckSeconds(snapshot?: CoreSnapshot): number | undefined {", relay)
@@ -4481,18 +4496,34 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('await commit("station.update", { id: station.id, name, origin, type });', relay)
         self.assertIn("translate(\"relay.stationUpdateStaged\")", relay)
         # One login state drives the status column and the account actions:
-        # 登录中 while a sign-in this pane started is in flight, otherwise
-        # 已登录 / 未登录 (the expired and not-yet-probed cases read as 未登录
-        # and keep the brown alert row). 去登录 only appears while signed out and
-        # is never disabled; 刷新资源 and 分组管理 are the controls that act on a
+        # 登录中 while the login is still being settled — a sign-in this pane
+        # started, or the session check it runs on mount — otherwise 已登录 /
+        # 未登录 (the expired and answered-signed-out cases read as 未登录 and
+        # keep the brown alert row). 去登录 only appears while signed out and is
+        # never disabled; 刷新资源 and 分组管理 are the controls that act on a
         # session, so they appear only once the row reads 已登录.
         self.assertIn('const relayLoginState = (account: RelayAccount): "signed_in" | "signing_in" | "signed_out" => {', relay)
         self.assertIn('if (loading[account.id]?.session) return "signing_in";', relay)
-        self.assertIn('return effectiveLoginStatus(account) === "signed_in" ? "signed_in" : "signed_out";', relay)
-        # 登录中 is drawn from the session lane alone: 去登录 owns that lane, while
-        # the silent mount probe reports in the resources lane it shares with the
-        # key-list read, so a routine session check never repaints the login row.
-        self.assertIn('updateLoading(account.id, "resources", true);', relay)
+        self.assertIn('if (effectiveLoginStatus(account) === "signed_in") return "signed_in";', relay)
+        self.assertIn('if (loading[account.id]?.checking) return "signing_in";', relay)
+        self.assertIn('return "signed_out";', relay)
+        # 未登录 is a conclusion, not a placeholder: the mount check is a station
+        # round trip whose network timeout is long enough that a row painted
+        # 未登录 while it ran read as "sign in again".  It therefore reports in
+        # its own lane, which the login column reads, while the key-list read
+        # stays in the resources lane — a wait that says nothing about the login
+        # must not repaint it.  The check is deliberately not the session lane:
+        # that lane is a sign-in window the host holds over this one, and 去登录
+        # must be able to interrupt the check rather than sit it out.
+        self.assertIn('updateLoading(account.id, "checking", true);', relay)
+        self.assertIn('updateLoading(account.id, "checking", false);', relay)
+        probe_lanes = relay.split("const restoreSavedSession = async (account: RelayAccount): Promise<boolean> => {", 1)[1].split("const loginAccount", 1)[0]
+        self.assertNotIn('"session"', probe_lanes)
+        self.assertNotIn('updateLoading(account.id, "resources"', probe_lanes)
+        self.assertIn('type AccountLoading = { session: boolean; checking: boolean; resources: boolean };', relay)
+        self.assertIn('const previous = current[accountID] ?? { session: false, checking: false, resources: false };', relay)
+        self.assertIn('if (!merged.session && !merged.checking && !merged.resources) delete next[accountID];', relay)
+        self.assertIn('return Boolean(state?.session || state?.checking || state?.resources);', relay)
         # The lane is opened on the way *in* to a sign-in and released only with
         # the refresh that follows the answer, never in a `finally` that a
         # verified sign-in could reach while its own repaint was still pending:
@@ -4509,8 +4540,19 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('startSigningIn(account.id);', relay)
         self.assertNotIn('updateLoading(account.id, "session", false);', relay)
         self.assertIn('translate(`relay.status.${relayLoginState(account)}`)', relay)
+        # 去登录 is the escape hatch from the wait itself: every row that is not
+        # 已登录 carries it — the mount check included, because that station
+        # round trip is exactly what 去登录 exists to skip — and it is withheld
+        # only while a sign-in this pane started owns the row, where the login
+        # window is already open.  A sign-in that lands while a check was in
+        # flight stays authoritative: the check's answer is about the session the
+        # sign-in replaced, so it is discarded by the pane's sign-in count.
+        self.assertIn('const signInCounts = useRef<Record<string, number>>({});', relay)
+        self.assertIn('signInCounts.current[accountID] = (signInCounts.current[accountID] ?? 0) + 1;', relay)
+        self.assertIn('const checkEpoch = signInCounts.current[account.id] ?? 0;', relay)
+        self.assertIn('if ((signInCounts.current[account.id] ?? 0) !== checkEpoch) return false;', relay)
         self.assertIn('const selectedLoginState = selected ? relayLoginState(selected) : "signed_out";', relay)
-        self.assertIn('{selectedLoginState === "signed_out" ? <NativeButton title={translate("relay.goLogin")} compact busy={pendingAction === "login"} disabled={controlsBusy && pendingAction !== "login"} onPress={() => { void loginSelected(); }} /> : null}', relay)
+        self.assertIn('{selectedLoginState !== "signed_in" && !loading[selected.id]?.session ? <NativeButton title={translate("relay.goLogin")} compact busy={pendingAction === "login"} disabled={controlsBusy && pendingAction !== "login"} onPress={() => { void loginSelected(); }} /> : null}', relay)
         # 刷新资源 and 分组管理 both act on a station session: 刷新资源 is a
         # forced station round trip and 分组管理 writes the station's keys, so
         # neither is offered while the account is not signed in — pressing either
