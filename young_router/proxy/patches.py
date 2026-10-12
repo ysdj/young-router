@@ -1849,9 +1849,66 @@ def _install_responses_tool_search_bridge_patch() -> None:
         )
 
 
+_MODEL_LISTING_EFFORTS_PATCH_ATTR = (
+    "_young_router_model_listing_efforts_patch"
+)
+
+
+def _install_model_listing_efforts_patch() -> None:
+    """Publish each route's reasoning levels on the model listing.
+
+    Pi's model discovery reads ``supported_efforts`` from an
+    OpenAI-compatible ``/v1/models`` entry to build a model's
+    ``thinkingLevelMap``: a level the array omits is recorded as an explicit
+    ``null``, which is how Pi says "this model does not offer it".  A route
+    that only reports ``reasoning: true`` therefore loses ``xhigh``/``max`` in
+    Pi even when the connection in front of it accepts both, and the user has
+    to hand-write the map.  Codex reads the same response but ignores this
+    extra key, and its own catalog already carries the levels.
+
+    ``create_model_info_response`` is the one builder behind the listing and
+    the single-model lookup, and ``proxy_server`` imports it inside the
+    endpoint that calls it rather than at module scope, so replacing the
+    ``litellm.proxy.utils`` attribute reaches every listing caller without
+    forking the endpoint.  The added key carries only levels the route's own
+    deployments all accept -- the same common surface the request path clamps
+    against -- so the listing cannot advertise a level this proxy would then
+    refuse to map.
+    """
+
+    try:
+        from litellm.proxy import utils as litellm_proxy_utils
+    except Exception:
+        return
+
+    original = getattr(litellm_proxy_utils, "create_model_info_response", None)
+    if not callable(original) or getattr(
+        original, _MODEL_LISTING_EFFORTS_PATCH_ATTR, False
+    ):
+        return
+
+    def patched_create_model_info_response(*args: Any, **kwargs: Any) -> Any:
+        response = original(*args, **kwargs)
+        if not isinstance(response, dict):
+            return response
+        efforts = _reasoning_module._model_listing_efforts(response.get("id"))
+        if efforts is not None:
+            response[_reasoning_module._MODEL_LISTING_EFFORTS_KEY] = efforts
+        return response
+
+    setattr(patched_create_model_info_response, _MODEL_LISTING_EFFORTS_PATCH_ATTR, True)
+    setattr(
+        patched_create_model_info_response,
+        "_original_create_model_info_response",
+        original,
+    )
+    litellm_proxy_utils.create_model_info_response = patched_create_model_info_response
+
+
 def install_all() -> None:
     _install_latin1_response_headers_patch()
     _install_anthropic_unversioned_endpoint_patch()
+    _install_model_listing_efforts_patch()
     _install_routing_constraint_patch()
     _install_selected_deployment_marker_patch()
     _install_order_peer_failover_patch()

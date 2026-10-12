@@ -76,6 +76,54 @@ def _reasoning_registry() -> ModelContextRegistry:
     return registry
 
 
+# Pi's own discovery reads exactly this array (``supported_efforts``) from an
+# OpenAI-compatible ``/v1/models`` entry to decide which thinking levels a
+# custom endpoint offers: a level the array omits becomes an explicit ``null``
+# in the model's ``thinkingLevelMap``, which is Pi's way of saying "not
+# supported".  The spelling is Pi's, not LiteLLM's, and it is deliberately the
+# only field this app adds to the vendor listing shape (see
+# ``proxy.patches._install_model_listing_efforts_patch``).
+_MODEL_LISTING_EFFORTS_KEY = "supported_efforts"
+
+
+def _model_listing_efforts(public_name: str) -> list[str] | None:
+    """Return the public model's provider-wire efforts for ``/v1/models``.
+
+    A route resolves through its configured deployments, so this is the
+    surface the request path clamps against: never a claim about a level the
+    proxy would then refuse to map.  ``None`` means the route has no reasoning
+    metadata at all (an image model, or an unidentified alias), and the caller
+    leaves the listing entry untouched rather than publishing an empty
+    capability.
+
+    ``reasoning_for`` is the common surface every deployment of the route
+    agrees on, and it is the rule the managed Codex catalog already publishes.
+    A relay alias often has no provider-qualified record at all, though -- the
+    registry carries ``opencode-go/space-bunny`` while the public route is
+    called ``space-bunny`` -- so a route that resolves no metadata that way
+    falls back to the public name's own resolution, which is where the request
+    path ends up too.  The fallback can only widen the answer from ``None``,
+    never contradict a common surface that resolved.
+    """
+
+    if not isinstance(public_name, str) or not public_name.strip():
+        return None
+    name = public_name.strip()
+    try:
+        registry = _reasoning_registry()
+        capability = registry.reasoning_for(name)
+        if capability is None or not capability.supported_levels:
+            capability = registry.reasoning_for_model_id(name)
+    except Exception:
+        # Discovery must never fail a listing: an unreadable route
+        # configuration or model-metadata cache leaves the vendor shape
+        # exactly as it was.
+        return None
+    if capability is None or not capability.supported_levels:
+        return None
+    return list(capability.supported_levels)
+
+
 def _canonical_reasoning_level(value: object) -> str | None:
     if not isinstance(value, str):
         return None
@@ -435,6 +483,8 @@ def _reasoning_parameters_compat_retry_candidates(
 
 
 __all__ = [
+    "_MODEL_LISTING_EFFORTS_KEY",
+    "_model_listing_efforts",
     "_with_model_reasoning_mapping",
     "_with_model_reasoning_parameter_support",
     "_reasoning_parameters_compat_retry_candidates",
