@@ -1040,6 +1040,13 @@ def _should_return_failed_responses_stream(
         return False
     if not _streaming_module._request_is_responses_stream(request_kwargs):
         return False
+    # A worker replacement closes its accepted connection while the stream is
+    # still being drained.  This is local lifecycle teardown, not a terminal
+    # upstream response: returning a synthetic ``response.failed`` here makes
+    # Pi render ``router_restarting`` and abort a turn the replacement can
+    # reconnect.
+    if _is_local_shutdown_exception(exception):
+        return False
     return _is_terminal_responses_stream_failure_error(exception)
 
 

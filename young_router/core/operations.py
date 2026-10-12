@@ -15,7 +15,6 @@ import copy
 from datetime import datetime, timezone
 import hashlib
 import json
-import math
 import os
 from pathlib import Path
 import secrets
@@ -31,6 +30,9 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from ..browser_identity import browser_request_headers
+from ..lifecycle import (
+    proxy_drain_grace_seconds,
+)
 from .. import adapters as managed_adapters
 from ..dsh_config_keys import (
     DSH_VISION_ROUTER_CONFIG_KEY as _DSH_VISION_ROUTER_CONFIG_KEY,
@@ -59,20 +61,6 @@ OWNER_TOKEN_ENV = "YOUNG_ROUTER_SERVICE_OWNER_TOKEN"
 CORE_PID_ENV = "YOUNG_ROUTER_CORE_PID"
 OWNER_TOKEN_BYTES = 32
 MACOS_DEFAULT_WORKERS = "16"
-# How long a stopping proxy may keep finishing the turns it already accepted.
-#
-# The managed proxy drains an in-flight streaming response when it receives
-# SIGTERM, and the fixed upstream workers now drain with it.  Two seconds was
-# chosen when nothing downstream was allowed to finish, so the kill it bounds
-# was the only outcome and the number only decided how long that took.  A turn
-# whose model is thinking holds the client's connection open for as long as the
-# model produces -- measured p90 77 s, p95 103 s, max 317 s on this machine --
-# so the cap has to cover an ordinary turn or every app restart, settings
-# apply, and replacement Core cuts the user's answer in half.  It stays finite
-# so a wedged proxy is still replaced; ``YOUNG_ROUTER_PROXY_DRAIN_SECONDS``
-# overrides it, and ``0`` keeps the previous stop-immediately behaviour.
-PROXY_DRAIN_GRACE_SECONDS = 300.0
-PROXY_DRAIN_GRACE_ENV = "YOUNG_ROUTER_PROXY_DRAIN_SECONDS"
 SERVICE_STATUS_CACHE_SECONDS = 10.0
 # Upper bound for the configurable start/restart health wait. The Runtime
 # Settings schema documents the same 1..600 second range; a larger host
@@ -119,16 +107,7 @@ def _proxy_drain_grace_seconds() -> float:
     stop-immediately kill.
     """
 
-    raw = os.environ.get(PROXY_DRAIN_GRACE_ENV, "").strip()
-    if not raw:
-        return PROXY_DRAIN_GRACE_SECONDS
-    try:
-        parsed = float(raw)
-    except ValueError:
-        return PROXY_DRAIN_GRACE_SECONDS
-    if not math.isfinite(parsed) or parsed < 0:
-        return PROXY_DRAIN_GRACE_SECONDS
-    return parsed
+    return proxy_drain_grace_seconds()
 
 
 # LiteLLM's Router takes a per-exception retry count only inside

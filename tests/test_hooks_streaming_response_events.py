@@ -1320,6 +1320,40 @@ class HookStreamingResponseEventTests(HookTestCase):
                 if isinstance(item, dict):
                     json.dumps(item.get("arguments", ""))
 
+    async def test_local_shutdown_after_visible_output_does_not_emit_restart_failure(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+
+        async def upstream_stream():
+            yield {
+                "type": "response.output_text.delta",
+                "delta": "partial answer",
+            }
+            exception = RuntimeError("peer closed while the worker was replaced")
+            hooks._mark_exception_as_local_shutdown(exception)
+            raise exception
+
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks._yield_guarded_original_stream(
+                [],
+                upstream_stream(),
+                {
+                    "model": "default-chat",
+                    "input": "continue",
+                    "stream": True,
+                    "proxy_server_request": {"path": "/v1/responses"},
+                },
+            )
+        ]
+
+        self.assertEqual(
+            [chunk.get("type") for chunk in chunks],
+            ["response.output_text.delta"],
+        )
+        self.assertFalse(
+            any(chunk.get("type") == "response.failed" for chunk in chunks)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

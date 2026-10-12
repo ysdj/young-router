@@ -28,6 +28,7 @@ except ImportError:  # pragma: no cover - Windows does not provide POSIX flock.
     fcntl = None  # type: ignore[assignment]
 
 from .. import browser_identity as _browser_identity
+from ..lifecycle import proxy_drain_grace_seconds
 from ..values import int_or_none as _int_or_none
 from typing import Any, AsyncIterator, Dict, List, Optional, Union
 import litellm
@@ -113,12 +114,11 @@ _UVICORN_SHUTDOWN_PATCH_ATTR = "_young_router_shutdown_patch"
 def _install_uvicorn_shutdown_marker_patch() -> None:
     """Record uvicorn's teardown so a stream it truncates is not read as upstream.
 
-    uvicorn closes every accepted connection at the start of ``shutdown`` and
-    only then waits ``timeout_graceful_shutdown`` for the in-flight requests,
-    so a turn that is still streaming at that moment always loses its response
-    body.  The patch marks the teardown for the whole await, which lets the
-    routing classifiers separate "the upstream failed" from "this process is
-    exiting".  Safe to call repeatedly and from interpreter startup.
+    Uvicorn stops accepting new connections and lets active responses finish
+    before cancelling their ASGI tasks at ``timeout_graceful_shutdown``.  The
+    patch extends that grace to the managed service's drain limit and marks
+    only a timeout-driven cancellation as local teardown, so upstream errors
+    during a normal drain still use route failover and recovery.
     """
 
     try:
@@ -133,11 +133,37 @@ def _install_uvicorn_shutdown_marker_patch() -> None:
         return
 
     async def shutdown(self: Any, sockets: Any = None) -> None:
-        _begin_proxy_shutdown()
+        original_wait = self._wait_tasks_to_complete
+        had_instance_wait = "_wait_tasks_to_complete" in self.__dict__
+        original_instance_wait = self.__dict__.get("_wait_tasks_to_complete")
+        original_timeout = self.config.timeout_graceful_shutdown
+        shutdown_marked = False
+
+        async def wait_for_active_requests() -> None:
+            nonlocal shutdown_marked
+            try:
+                await original_wait()
+            except asyncio.CancelledError:
+                # Uvicorn cancels this waiter when its graceful timeout fires,
+                # then cancels active ASGI tasks. Mark only that forced teardown
+                # window; a real upstream failure during a healthy drain must
+                # still be treated as an upstream failure.
+                _begin_proxy_shutdown()
+                shutdown_marked = True
+                raise
+
+        self._wait_tasks_to_complete = wait_for_active_requests
+        self.config.timeout_graceful_shutdown = proxy_drain_grace_seconds()
         try:
             await original_shutdown(self, sockets)
         finally:
-            _end_proxy_shutdown()
+            self.config.timeout_graceful_shutdown = original_timeout
+            if had_instance_wait:
+                self._wait_tasks_to_complete = original_instance_wait
+            else:
+                del self._wait_tasks_to_complete
+            if shutdown_marked:
+                _end_proxy_shutdown()
 
     setattr(shutdown, _UVICORN_SHUTDOWN_PATCH_ATTR, True)
     setattr(shutdown, "_original_shutdown", original_shutdown)

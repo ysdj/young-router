@@ -907,7 +907,25 @@ def _responses_stream_chunk_is_incomplete_terminal(chunk: Any) -> bool:
 
 
 def _is_young_router_terminal_failure_event(chunk: Any) -> bool:
-    return bool(getattr(chunk, "_young_router_terminal_failure", False))
+    if bool(getattr(chunk, "_young_router_terminal_failure", False)):
+        return True
+    dumped = _stream_chunk_dump(chunk)
+    if _stream_chunk_type(dumped) != "response.failed":
+        return False
+    response = dumped.get("response")
+    response = response if isinstance(response, dict) else {}
+    error = response.get("error")
+    error = error if isinstance(error, dict) else {}
+    return error.get("code") in {
+        "image_generation_tool_unavailable",
+        "router_restarting",
+        "upstream_auth_or_balance",
+        "upstream_compaction_failure",
+        "upstream_compaction_unsupported",
+        "upstream_relay_capacity",
+        "upstream_request_body_too_large",
+        "upstream_route_failure",
+    }
 
 
 _OUTPUT_TOKEN_LIMIT_INCOMPLETE_REASONS = {
@@ -1375,6 +1393,11 @@ def _synthesized_failed_response_event(
     request_data: dict,
     exception: Exception,
 ) -> _JSONStreamEvent:
+    if _routing_module._is_local_shutdown_exception(exception):
+        # A synthetic ``response.failed`` is terminal to Pi/Codex and turns a
+        # worker teardown into a user-visible retry tip. The connection is
+        # already being closed by Uvicorn, so end the stream quietly.
+        raise asyncio.CancelledError
     model = _responses_execution_module._request_model_group(request_data) or request_data.get("model") or "unknown"
     is_structured_compaction = (
         _responses_request_module._request_has_structured_codex_compaction(
@@ -3979,6 +4002,12 @@ async def _yield_guarded_original_stream(
                     return
                 yield chunk
         except Exception as exception:
+            if _routing_module._is_local_shutdown_exception(exception):
+                # The worker is being replaced.  Once the client has received
+                # answer text, a synthetic terminal failure would be rendered
+                # as ``router_restarting`` and stop the turn; let the response
+                # close so the client-side reconnect path can take over.
+                return
             if saw_terminal:
                 return
             if _routing_module._is_request_scoped_priority_deployment_failover_error(
@@ -4013,6 +4042,10 @@ async def _yield_guarded_original_stream(
             # after thinking alone advances to the next route instead of
             # ending the turn with a route the user never saw an answer from.
             if visible_output_delivered:
+                if _routing_module._is_local_shutdown_exception(
+                    incomplete_exception
+                ):
+                    return
                 raise incomplete_exception
             async for fallback_chunk in _yield_streaming_error_fallback_or_raise(
                 request_data,
@@ -4641,6 +4674,10 @@ async def _yield_guarded_original_stream(
         reason: str,
         exception: Optional[Exception] = None,
     ) -> AsyncIterator[Any]:
+        if exception is not None and _routing_module._is_local_shutdown_exception(
+            exception
+        ):
+            return
         if _responses_web_search_bridge_module._request_has_provider_native_web_search_event(
             request_data
         ):
@@ -5083,6 +5120,10 @@ async def _yield_guarded_original_stream(
             chunk = normalize_tool_bridge_chunk(sanitized_chunk)
             if chunk is None:
                 continue
+            if _is_young_router_terminal_failure_event(chunk):
+                yield deliver_client_chunk(chunk)
+                await _close_async_iterator_safely(response)
+                return
             chunk_exception = _stream_chunk_priority_error_exception(
                 chunk,
                 request_data,
@@ -5211,6 +5252,10 @@ async def _yield_guarded_original_stream(
                 continue
             yield deliver_client_chunk(chunk)
     except Exception as exc:
+        if _routing_module._is_local_shutdown_exception(exc):
+            # Do not turn the local worker teardown into a client-visible
+            # response.failed event after partial output was delivered.
+            return
         if saw_image_generation_activity:
             completed = completed_image_generation_terminal_event(
                 "stream error after completed image generation output"
@@ -5295,6 +5340,13 @@ async def _yield_guarded_original_stream(
                 yield recovered_chunk
             return
         if visible_output_seen:
+            incomplete_exception = _responses_incomplete_stream_exception(
+                "stream ended before response.completed",
+                buffer=event_tail,
+                request_data=request_data,
+            )
+            if _routing_module._is_local_shutdown_exception(incomplete_exception):
+                return
             if synthesize_completed_on_clean_eof_after_visible_output:
                 terminal_items = terminal_completed_output_items()
                 synthetic_completed = _synthesized_completed_response_event(
@@ -5306,7 +5358,10 @@ async def _yield_guarded_original_stream(
                 remember(synthetic_completed)
                 yield synthetic_completed
                 return
-            yield failed_terminal_event("stream ended before response.completed")
+            yield failed_terminal_event(
+                "stream ended before response.completed",
+                incomplete_exception,
+            )
             return
         terminal_items = terminal_completed_output_items()
         synthetic_completed = (
@@ -5801,6 +5856,14 @@ async def _yield_start_buffered_stream_with_error_fallback(
                 and not str(_stream_chunk_dump(chunk).get("delta") or "").strip()
             ):
                 continue
+            if _is_young_router_terminal_failure_event(chunk):
+                for buffered_chunk in [*buffer, chunk]:
+                    yield _responses_stream_chunk_for_delivery(
+                        buffered_chunk,
+                        request_data,
+                    )
+                await _close_async_iterator_safely(response)
+                return
             chunk_exception = _stream_chunk_priority_error_exception(
                 chunk,
                 request_data,

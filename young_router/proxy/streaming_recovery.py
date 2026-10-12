@@ -1709,6 +1709,15 @@ async def _stream_route_recovery_poll(
             ):
                 yield keepalive
 
+        if _routing_module._is_local_shutdown_exception(last_exception):
+            _trace_module._request_route_trace(
+                "route_recovery_poll_local_shutdown", request_data,
+                poll_attempts=attempt,
+                elapsed_seconds=round(time.monotonic() - started_at_monotonic, 3),
+                exception=_routing_module._trace_exception(last_exception),
+            )
+            return
+
         if uses_native_event_stream:
             if (
                 _routing_module._is_context_size_error(last_exception)

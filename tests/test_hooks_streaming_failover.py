@@ -49,7 +49,7 @@ class HookStreamingFailoverTests(HookTestCase):
         self.assertEqual(chunks[0]["type"], "response.failed")
         self.assertEqual(
             chunks[0]["response"]["error"]["code"],
-            "upstream_route_failure",
+            "upstream_relay_capacity",
         )
         self.assertEqual(fallback_calls, [])
 
@@ -132,7 +132,7 @@ class HookStreamingFailoverTests(HookTestCase):
         self.assertEqual(chunks[0]["type"], "response.failed")
         self.assertEqual(
             chunks[0]["response"]["error"]["code"],
-            "upstream_route_failure",
+            "upstream_relay_capacity",
         )
 
     async def test_chat_route_exhaustion_propagates_error_instead_of_cancellation(self) -> None:

@@ -2919,15 +2919,10 @@ class HookRouteRecoveryTests(HookTestCase):
         self.assertEqual(request_data.get("_excluded_deployment_ids"), None)
         self.assertNotIn("c52c205f", hooks._CURRENT_EXCLUDED_DEPLOYMENT_IDS.get() or set())
 
-        # The client's own report names the restart instead of the route outage
-        # the same failure used to claim while a live worker was serving.
-        event = json.loads(
-            json.dumps(hooks._synthesized_failed_response_event(request_data, exc))
-        )
-        error = event["response"]["error"]
-        self.assertEqual(error["code"], "router_restarting")
-        self.assertNotIn("upstream", error["message"])
-        self.assertIn("restarting", error["message"])
+        # A local worker teardown must never synthesize a terminal event that
+        # tells the client to resend the turn.
+        with self.assertRaises(asyncio.CancelledError):
+            hooks._synthesized_failed_response_event(request_data, exc)
 
     async def test_a_restart_teardown_never_reaches_failover_or_recovery(self) -> None:
         """The turn this worker truncated states the restart, not a route failure.
@@ -3007,6 +3002,53 @@ class HookRouteRecoveryTests(HookTestCase):
         ]
         self.assertEqual(chat_chunks, [])
         self.assertEqual(fallback_attempts, [])
+
+    async def test_a_restart_during_recovery_poll_does_not_emit_router_restarting(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        streaming_module = sys.modules["young_router.proxy.streaming"]
+        original_attempt = streaming_module._stream_route_recovery_poll_attempt
+        self.addCleanup(
+            setattr,
+            streaming_module,
+            "_stream_route_recovery_poll_attempt",
+            original_attempt,
+        )
+
+        class MidStreamFallbackError(Exception):
+            status_code = 500
+
+        exception = MidStreamFallbackError("worker replaced during recovery poll")
+        hooks._mark_exception_as_local_shutdown(exception)
+
+        async def failed_attempt(
+            _request_data,
+            _exception,
+            *,
+            attempt,
+            deadline=None,
+        ):
+            raise exception
+            yield None
+
+        streaming_module._stream_route_recovery_poll_attempt = failed_attempt
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "1")
+        self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "model_info": {"id": "route-a", "order": 0},
+        }
+
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks._stream_route_recovery_poll(
+                request_data,
+                RuntimeError("initial route failure"),
+            )
+        ]
+
+        self.assertEqual(chunks, [])
 
     def test_a_live_worker_still_reports_a_real_upstream_failure(self) -> None:
         """The shutdown marker never widens into ordinary request failures."""

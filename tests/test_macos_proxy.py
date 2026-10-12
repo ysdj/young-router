@@ -139,6 +139,7 @@ class MacOSProxyLauncherTests(unittest.TestCase):
             workers=16,
             loop="uvloop",
             ws_max_size=67108864,
+            timeout_graceful_shutdown=14400.0,
         )
 
 

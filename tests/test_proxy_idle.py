@@ -191,10 +191,10 @@ class UvicornShutdownMarkerTests(unittest.TestCase):
         server.observed = observed
         return server
 
-    def test_the_marker_is_up_for_the_whole_teardown(self) -> None:
+    def test_a_clean_worker_drain_does_not_mark_shutdown(self) -> None:
         self.assertFalse(self.base._proxy_shutdown_in_progress())
         asyncio.run(uvicorn.server.Server.shutdown(self.server))
-        self.assertEqual(self.server.observed, [True])
+        self.assertEqual(self.server.observed, [False])
         self.assertFalse(self.base._proxy_shutdown_in_progress())
 
     def test_the_marker_survives_a_failing_teardown(self) -> None:

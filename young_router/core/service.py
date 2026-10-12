@@ -2087,14 +2087,14 @@ class CoreStore:
             session_restorer = getattr(relay, "restore_saved_session", None) if relay is not None else None
             password_restorer = getattr(relay, "restore_saved_password", None) if relay is not None else None
             status_settler = getattr(relay, "settle_login_status", None) if relay is not None else None
-            session_check_is_recent = getattr(relay, "session_check_is_recent", None) if relay is not None else None
+            recent_login_answer = getattr(relay, "recent_login_check_answer", None) if relay is not None else None
             if (
                 not callable(accepter)
                 or not callable(status_setter)
                 or not callable(session_restorer)
                 or not callable(password_restorer)
                 or not callable(status_settler)
-                or not callable(session_check_is_recent)
+                or not callable(recent_login_answer)
             ):
                 raise CoreError("relay_restore_failed", "Relay account is unavailable")
             relay_was_dirty = bool(self._drafts.get("relay_accounts", {}).get("dirty"))
@@ -2126,12 +2126,14 @@ class CoreStore:
                         preserve_resources=True,
                     )
                 elif login_status in {"signed_out", "expired"} and matching.get("remember_password") is True:
-                    # A session this Core already holds and observed inside its
-                    # re-check window answers the check with that observation:
-                    # the site is not asked to re-authenticate a login it
-                    # proved moments ago, so re-entering the pane inside the
-                    # window costs no station round trip at all.
-                    public = None
+                    # A login this Core already determined inside its re-check
+                    # window answers the check with that observation, so the
+                    # site is not asked to re-authenticate -- or to re-refuse --
+                    # a login it answered moments ago.  Re-entering the pane
+                    # inside the window therefore costs no station round trip,
+                    # and a determined 未登录 stays 未登录 instead of being
+                    # re-probed on every mount.
+                    public = recent_login_answer(str(account_id))
                     # Whether the station was ever reached.  The host's
                     # ``signed_out`` is an unauthenticated probe, so it may only
                     # be recorded once a read actually arrived somewhere: a
@@ -2141,7 +2143,7 @@ class CoreStore:
                     # ``RelayTransportError`` is raised exactly by a read that
                     # never reached an answer.
                     unreachable = False
-                    if not session_check_is_recent(str(account_id)):
+                    if public is None:
                         from .domains.relay_accounts import RelayTransportError
 
                         if login_status == "signed_out":

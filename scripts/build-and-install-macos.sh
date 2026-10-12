@@ -64,7 +64,7 @@ STOP_GRACE_POLLS=20
 # turns it already accepted before the stale tree is forced down.  It matches
 # the Core's own proxy-drain budget (same variable, same default) so the two
 # layers agree on when a slow drain has become a wedged one.
-STOP_DRAIN_SECONDS="${YOUNG_ROUTER_PROXY_DRAIN_SECONDS:-300}"
+STOP_DRAIN_SECONDS="${YOUNG_ROUTER_PROXY_DRAIN_SECONDS:-14400}"
 REQUIRED_HEALTH_CHECKS=3
 LAUNCH_RETRY_SECONDS=1
 LAST_STARTUP_STATE=""

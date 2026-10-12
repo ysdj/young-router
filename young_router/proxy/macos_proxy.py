@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any
 import urllib.request
 
+from ..lifecycle import proxy_drain_grace_seconds
+
 
 PROXY_APP = "litellm.proxy.proxy_server:app"
 PROXY_MODULE = "litellm.proxy.proxy_server"
@@ -113,6 +115,11 @@ def run(argv: list[str] | None = None) -> int:
         port=args.port,
         workers=args.workers,
         loop="uvloop",
+        # Uvicorn otherwise cancels a still-streaming request after its 30 s
+        # default, even though the managed service gives the old worker the
+        # configured drain window.  Keep the client connection alive for that
+        # same window so an app restart does not synthesize router_restarting.
+        timeout_graceful_shutdown=proxy_drain_grace_seconds(),
         # Codex sends each Responses turn request -- including the immutable
         # replay prefix with signed image bytes -- as one WebSocket text frame;
         # uvicorn's 16 MiB default closes those with code 1009 before the
