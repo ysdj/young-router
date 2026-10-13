@@ -6027,6 +6027,16 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     private var capturedUserID: String?
     private var capturedPassword: String?
     private var restoredSession: NativeRelaySession?
+    /// The password Core keeps for this account when the user chose to remember
+    /// it.  It is read once through a native plaintext lease and never leaves
+    /// this controller: the station's own sign-in page is the only place it is
+    /// written, so a user who asked to be remembered is not asked to retype the
+    /// same password on every sign-in.
+    private var restoredPassword: String?
+    private var didRestorePassword = false
+    /// Whether the remembered password has already been submitted once, so a
+    /// page that keeps rendering the form is not submitted on every probe.
+    private var didAutoSubmitSavedPassword = false
     private var didRestoreSession = false
     private var didLoadInitialPage = false
     private var didProbeRestoredSession = false
@@ -6205,6 +6215,45 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         lastEmbeddedContentHeight = nil
         signInProbeAttempts = 0
         clearCapturedCredentials()
+        didAutoSubmitSavedPassword = false
+        restoreRememberedPassword()
+    }
+
+    /// Read the password Core keeps for this account, if the user chose to
+    /// remember it, through the same one-time native plaintext lease a key is
+    /// read with.  The read is off the main thread because it is a synchronous
+    /// Core call, and the answer only ever fills the station's own form.
+    private func restoreRememberedPassword() {
+        restoredPassword = nil
+        didRestorePassword = false
+        let accountID = self.accountID
+        let shouldRead = mode == .login
+        DispatchQueue.global(qos: .userInitiated).async { [weak self, accountID] in
+            // A Core revision that moves between the lease and the read fails
+            // that pair, so a lost race is retried against a fresh lease — the
+            // same reason a revealed key is retried.  An account that remembers
+            // no password simply answers nothing, and the form is typed.
+            var value: String?
+            if shouldRead {
+                for attempt in 1...3 {
+                    if let read = try? CoreIPCBridge.shared.readPlainTextSecret(
+                        domain: "relay_accounts",
+                        field: "password",
+                        target: accountID
+                    ), !read.isEmpty {
+                        value = read
+                        break
+                    }
+                    if attempt < 3 { Thread.sleep(forTimeInterval: 0.25) }
+                }
+            }
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.restoredPassword = value.flatMap { $0.isEmpty ? nil : $0 }
+                self.didRestorePassword = true
+                self.prefillLoginWhenReady()
+            }
+        }
     }
 
     private var loginURL: URL {
@@ -6584,36 +6633,66 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         startSignInCheck(automatically: true)
     }
 
+    /// Fill the station's sign-in form from what the app already knows.
+    ///
+    /// The account's username is always filled.  When the user chose to be
+    /// remembered, the password Core keeps is filled beside it and the form is
+    /// submitted, so a station the app has a working credential for does not
+    /// ask the user to retype it.  A page whose credentials are already
+    /// complete is submitted once: the flag is what keeps a resolved page from
+    /// being submitted again on the next probe.
     private func prefillLoginWhenReady() {
         guard mode == .login, isBrowserFlowLive, let username = presetUsername, !username.isEmpty else { return }
         // Let a restored session seed local storage and reload before looking
         // for a login form. Otherwise a restored session could be sent straight
-        // back to the unauthenticated form during its first page load.
-        guard restoredSession == nil || didRestoreSession else { return }
+        // back to the unauthenticated form during its first page load.  The
+        // password read is likewise settled before the form is touched, so the
+        // fill never races a second pass against a page that is still loading.
+        guard restoredSession == nil || didRestoreSession, didRestorePassword else { return }
         let safeUser = jsonLiteral(username)
+        let password = restoredPassword
+        let safePassword = jsonLiteral(password ?? "")
+        let autoSubmit = password == nil
+            ? "false"
+            : (didAutoSubmitSavedPassword ? "false" : "true")
         let script = """
         (() => {
           const user = document.querySelector('input[type=email], input[type=text], input:not([type]), input[name=email], input[name=username], input[autocomplete=username], input[placeholder*="用户名"], input[placeholder*="email" i]');
-          if (!user) {
+          const password = document.querySelector('input[type=password], input[autocomplete=current-password]');
+          if (!user && !password) {
             const words = new Set(['login', 'log in', 'sign in', '登录']);
             const signIn = Array.from(document.querySelectorAll('a, button')).find((node) => words.has((node.textContent || node.getAttribute('aria-label') || '').trim().toLowerCase()));
             if (signIn instanceof HTMLElement) signIn.click();
-            return;
+            return false;
           }
           const set = (node, value) => {
-            if (!node || node.value) return;
+            if (!node || !value || node.value) return;
             const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
             setter?.call(node, value);
             node.dispatchEvent(new Event('input', { bubbles: true }));
             node.dispatchEvent(new Event('change', { bubbles: true }));
           };
           set(user, \(safeUser));
-          return Boolean(user?.value);
+          set(password, \(safePassword));
+          if (\(autoSubmit) && user && password && user.value && password.value) {
+            const form = password.form;
+            const submit = form?.querySelector('button[type=submit],input[type=submit],button:not([type])')
+              ?? Array.from(document.querySelectorAll('button')).find((node) => /sign in|log in|登录/i.test((node.textContent || node.getAttribute('aria-label') || '').trim()));
+            if (submit instanceof HTMLElement) submit.click();
+            else if (form instanceof HTMLFormElement && typeof form.requestSubmit === 'function') form.requestSubmit();
+            return true;
+          }
+          return false;
         })();
         """
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
             guard let self, self.isBrowserFlowLive else { return }
-            self.webView.evaluateJavaScript(script, completionHandler: nil)
+            self.webView.evaluateJavaScript(script) { [weak self] value, _ in
+                guard let self, self.isBrowserFlowLive else { return }
+                if value as? Bool == true {
+                    self.didAutoSubmitSavedPassword = true
+                }
+            }
         }
     }
 
@@ -6909,6 +6988,23 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         guard isCurrentCheck(attempt) else { return }
         let capturedPassword = self.capturedPassword
         if let capturedPassword, !capturedPassword.isEmpty {
+            // A password the app filled back in from its own remembered copy is
+            // not a new decision: the user already answered "keep this" when it
+            // was first saved, and asking again on a sign-in they did not type
+            // would put a question in front of a form they never touched.
+            if let restoredPassword, restoredPassword == capturedPassword {
+                commitVerifiedLogin(
+                    username: username,
+                    cookie: cookie,
+                    accessToken: accessToken,
+                    refreshToken: refreshToken,
+                    userID: userID,
+                    rememberPassword: nil,
+                    capturedPassword: nil,
+                    attempt: attempt
+                )
+                return
+            }
             // The typed password is a decision point, not a default: ask the
             // user whether to keep it after the sign-in was verified.
             presentRememberPasswordPrompt { [weak self, weak attempt] rememberPassword in

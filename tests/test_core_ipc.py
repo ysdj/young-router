@@ -1581,6 +1581,86 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
                     },
                 )
 
+    def test_relay_remembered_password_is_served_only_through_the_native_lease(self) -> None:
+        """The host reads the remembered password through the same native lease
+        a key is read with, and the account's public snapshot never carries it.
+        """
+
+        from young_router.core.domains.relay_accounts import RelayAccountsDomain
+
+        password = "replace-relay-password"
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RelayAccountsDomain(Path(directory))
+            account = domain.dispatch(
+                "account.add",
+                {
+                    "type": "newapi",
+                    "label": "Relay",
+                    "origin": "https://relay.example.test",
+                    "remember_password": True,
+                },
+            )["accounts"][0]
+            domain.accept_login_result(
+                account["id"],
+                username="sample-user",
+                cookie="session=replace-cookie",
+                password=password,
+            )
+            core = CoreStore(domains=[domain])
+            server = CoreIPCServer(core)
+            endpoint = server.start()
+            self.addCleanup(server.stop)
+            client = CoreIPCClient(endpoint, server.bootstrap_token)
+            self.addCleanup(client.close)
+
+            self.assertNotIn(password, json.dumps(client.call("snapshot")))
+            session = client._session_token
+            status, body, _headers = client._http(
+                "/v1/host/secret/read-capability",
+                payload=encode_message(
+                    {"domain": "relay_accounts", "field": "password", "target": account["id"]}
+                ),
+                token=session,
+            )
+            self.assertEqual(200, status)
+            read_capability = decode_message(body)
+            self.assertTrue(read_capability["present"])
+            self.assertNotIn(password, body.decode("utf-8"))
+
+            status, body, _headers = client._http(
+                "/v1/host/secret/read",
+                payload=encode_message({"secret_read_token": read_capability["secret_read_token"]}),
+                token=session,
+            )
+            self.assertEqual(200, status)
+            self.assertEqual(password, decode_message(body)["value"])
+
+            # A read lease is read once: the same token answers nothing again.
+            status, body, _headers = client._http(
+                "/v1/host/secret/read",
+                payload=encode_message({"secret_read_token": read_capability["secret_read_token"]}),
+                token=session,
+            )
+            self.assertNotEqual(200, status)
+
+            # Retiring the password stops the read even for the native host.
+            domain.accept_login_result(
+                account["id"],
+                username="sample-user",
+                cookie="session=replace-cookie",
+                remember_password=False,
+            )
+            domain.apply()
+            status, body, _headers = client._http(
+                "/v1/host/secret/read-capability",
+                payload=encode_message(
+                    {"domain": "relay_accounts", "field": "password", "target": account["id"]}
+                ),
+                token=session,
+            )
+            self.assertNotEqual(200, status)
+            self.assertNotIn(password, body.decode("utf-8"))
+
     def test_codex_and_claude_plaintext_fields_use_native_read_once_capabilities(self) -> None:
         class PlaintextSecretDomain(MemoryDomain):
             def __init__(self, name: str, field: str, secret: str) -> None:

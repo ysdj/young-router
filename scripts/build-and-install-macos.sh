@@ -805,12 +805,34 @@ fi
 # release that renames one of its published exports would break the provider at
 # request time rather than at build time. The bundle proves the staged package
 # still offers the surface the worker imports.
+#
+# The at-rest key factory is checked here too, and it is the one name upstream
+# does *not* export from its entry point: a variant's store can only open a
+# sealed desktop credential through it, so a release that moves or renames it
+# would otherwise read every signed-in account as 未登录 with
+# `electron-binary-unavailable` -- exactly the failure this check exists to
+# catch. Resolution deliberately mirrors `loadAtRestKeyProviderFactory` in
+# `young_router/adapters/workbuddy_worker.mjs`: the entry point first, then the
+# internal chunks beside it. Keep the two in step.
 if ! "$CORE/runtime/bin/node" --input-type=module -e "
-import(process.argv[1]).then((m) => {
+const entry = process.argv[1]
+Promise.all([import(entry), import('node:fs/promises'), import('node:path'), import('node:url')]).then(async ([library, fs, path, url]) => {
   const required = ['WorkBuddyCredentialStore', 'WorkBuddyUpstreamClient', 'WorkBuddyCatalog', 'createWorkBuddyShim', 'WORKBUDDY_VARIANTS']
-  const missing = required.filter((name) => m[name] === undefined)
-  if (missing.length > 0) { process.stderr.write('missing: ' + missing.join(', ') + '\n'); process.exit(1) }
-}).catch((e) => { process.stderr.write(String((e && e.message) || e) + '\n'); process.exit(1) })
+  const missing = required.filter((name) => library[name] === undefined)
+  if (missing.length > 0) { process.stderr.write('missing: ' + missing.join(', ') + '\\n'); process.exit(1) }
+  const isFactory = (value) => typeof value === 'function' && value.name === 'atRestKeyProviderFor'
+  let factory
+  for (const value of Object.values(library)) { if (isFactory(value)) factory = value }
+  const directory = path.resolve(path.dirname(entry))
+  for (const name of (await fs.readdir(directory)).sort()) {
+    if (factory !== undefined) break
+    if (!name.endsWith('.js') || name === path.basename(entry) || name === 'client.js') continue
+    let module
+    try { module = await import(url.pathToFileURL(path.join(directory, name)).href) } catch { continue }
+    for (const value of Object.values(module)) { if (isFactory(value)) factory = value }
+  }
+  if (factory === undefined) { process.stderr.write('the at-rest key factory (atRestKeyProviderFor) is no longer resolvable from the staged package\\n'); process.exit(1) }
+}).catch((e) => { process.stderr.write(String((e && e.message) || e) + '\\n'); process.exit(1) })
 " "$CORE/young_router/adapters/workbuddy-connect/lib/index.js"; then
   echo "The bundled dsh-workbuddy-connect package no longer exports the surface the worker uses." >&2
   exit 5

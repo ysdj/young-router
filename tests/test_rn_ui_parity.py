@@ -214,7 +214,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has("const key = modelProviderKeyState(item, provider ?? {});")
         self.assert_ui_has("if (!key) {")
         self.assert_ui_has("ungrouped.push(item);")
-        self.assert_ui_has("for (const item of ungrouped) {")
+        self.assert_ui_has("for (const item of ungrouped) rows.push({ key: editorIdentifier(item), cells: modelCells(item) });")
         # One group row is one provider key, addressed by its slot id, so the
         # station's key and a custom key that read the same stay two groups and
         # a model is filed under the key it names.
@@ -920,8 +920,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # own re-entry guard instead of relying on `disabled`.
         for marker in (
             "if (loginBusy) return;",
-            "if (processing) return;",
-            "if (modelFetchState === \"loading\") return;",
+            # The wizard's own 下一步 guard also blocks the second delivery of one
+            # press, because the button is the window's default button.
+            "if (processing || stepRef.current !== step) return;",
+            # The model listing's guard is a ref rather than the render's
+            # `modelFetchState`, because a caller that just set that state
+            # would read a stale closure and re-enter.
+            "if (modelFetchInFlight.current) return;",
             "if (fetchModelsBusy) return;",
             "if (cooldownClearPending) return;",
             "if (relayAddBusy) return;",
@@ -1013,18 +1018,30 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has("providerLeftColumn: { flex: 1, minWidth: 0, minHeight: 0, gap: 6 }")
         self.assert_ui_has("providerListPane: { width: 140, minWidth: 140, maxWidth: 140")
         self.assert_ui_has('columns={[{ label: translate("providers.provider"), width: 132 }]}')
-        # The model list is upstream model plus public model and nothing else,
-        # and the two columns keep the table's combined 280 pt (the scroller
-        # floats over the list with no gutter, and the wider public-model column
-        # is the one that reads a whole name).  顺序 stays out of it: a model's
-        # order orders the routes that share its public name, and these rows are
-        # grouped by key, so the column compared numbers from sequences that
-        # have nothing to do with each other.
-        self.assert_ui_has('columns={[{ label: translate("providers.upstream"), width: 120 }, { label: translate("providers.publicModel"), width: 160 }]}')
+        # The model list is the upstream model, the public model, and the rate
+        # the route follows, and the three columns fit the pane the table is
+        # actually drawn in: the model list keeps about 280 pt at the settings
+        # window's own default size, so the widths have to sum inside that.  A
+        # trailing column that does not fit is reduced to nothing by the native
+        # layout, which would make 倍率 read as a column that never existed.
+        # 顺序 stays out of it: a model's order orders the routes that share its
+        # public name, and these rows are grouped by key, so the column compared
+        # numbers from sequences that have nothing to do with each other.  倍率
+        # is the other way round — a rate is a property of the row itself, so
+        # two rates read down this pane are two prices that can be compared —
+        # and it sits last because it is read after the model it prices.
+        self.assert_ui_has('columns={[{ label: translate("providers.upstream"), width: 104 }, { label: translate("providers.publicModel"), width: 120 }, { label: translate("providers.modelRate"), width: 56 }]}')
+        self.assertLessEqual(104 + 120 + 56, 288)
         self.assertNotIn('label: translate("common.order"), width: 60', self.ui)
         self.assertNotIn("modelOrderText(providerId, item)", self.ui)
         self.assert_ui_has('rows.push({ key: `key:${keyID}`, cells: [group.label], spanning: true });')
-        self.assert_ui_has('rows.push({ key: editorIdentifier(item), cells: [`\\t${modelUpstreamDisplay(providerId, item)}`, modelDisplayName(providerId, item)] });')
+        # One cell builder for both row kinds, so an ungrouped row and a grouped
+        # one cannot disagree about the rate or the name they state.
+        self.assert_ui_has('const modelCells = (item: UnknownRecord): string[] => {')
+        self.assert_ui_has('const multiplier = relaySourceForKey(modelProviderKeyState(item, provider ?? {}), relaySources)?.multiplier;')
+        self.assert_ui_has('modelRateText(workspaceService, stringValue(item.upstream_model).trim(), multiplier, translate),')
+        self.assert_ui_has('for (const item of ungrouped) rows.push({ key: editorIdentifier(item), cells: modelCells(item) });')
+        self.assert_ui_has('for (const item of group.models) rows.push({ key: editorIdentifier(item), cells: modelCells(item) });')
         self.assert_ui_has('columns={variant === "inline"')
         self.assert_ui_has('cellHorizontalPadding={6}')
         self.assert_ui_has('firstColumnHorizontalPadding={0}')
@@ -1094,8 +1111,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('setSelectedRoute("");', select_public)
 
         inspector = self.ui.split("function PublicModelInspector(", 1)[1].split("function ModelInspector(", 1)[0]
-        # One surface owns the rename and the Codex window; the route order list
-        # lives in the routes table, not here.
+        # One surface owns the rename and the context window; the route order
+        # list lives in the routes table, not here.
         self.assertIn('dispatchSnapshot("public.model_patch", { public_model: group.name, changes: { name: renamed } })', inspector)
         self.assertIn('translate("providers.contextWindow")', inspector)
         self.assertNotIn("routes.reorder_group", inspector)
@@ -1104,15 +1121,17 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # The window is declared for the *group*, so this pane is where it is
         # written: one commit lands the number on every route of the public
         # model, and the field keeps the registry default as its placeholder
-        # hint and a help mark that says it reaches Codex rather than capping
-        # the proxy.  A per-route editor is what this replaces — a single route
-        # carrying its own window makes the group's number depend on which
-        # route happened to answer.
+        # hint and a help mark that names both halves of the pair the model
+        # detail shows.  A per-route editor is what this replaces — a single
+        # route carrying its own window makes the group's number depend on
+        # which route happened to answer.
         self.assertIn('dispatch("public.model_patch", { public_model: group.name, changes: { max_input_tokens: next.trim() } })', inspector)
         self.assertIn('placeholder={contextHint}', inspector)
-        self.assertIn('text={translate("providers.contextWindowHelp")}', inspector)
-        self.assertIn('title={translate("providers.contextWindowHelpTitle")}', inspector)
-        self.assertIn('accessory={<HelpTip open={contextTipOpen} text={translate("providers.contextWindowHelp")}', inspector)
+        # The hint and the mark state the same resolved pair: the ceiling the
+        # placeholder reports is the one a blank field would fall back to.
+        self.assertIn('contextWindowPairText(defaultContext, defaultCeiling, translate)', inspector)
+        self.assertIn('publicModelCeiling(modelContexts, group.name)', inspector)
+        self.assertIn('accessory={<ContextWindowHelp translate={translate} />}', inspector)
         self.assertNotIn("max_output_tokens", inspector)
         # Arriving from a model detail keeps a link back to that model, and the
         # header is the provider editor's own shape: the title takes the row and
@@ -1136,20 +1155,32 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn("publicModelRouteCount", self.en)
         self.assertNotIn("breadcrumbProvider}>{translate(\"providers.routes\")", inspector)
 
-        # The model detail states the group's window read-only, directly below
-        # 公开模型 — the field the number belongs to — and 设置 opens the
+        # The model detail states the group's pair read-only, directly below
+        # 公开模型 — the field the numbers belong to — and 设置 opens the
         # public-model pane that owns the write.  A field here would make one
         # route of a group disagree with the others.
         model_detail = self.ui.split("function ModelInspector(", 1)[1].split("// The protocol-mode sentence is a tip", 1)[0]
         self.assertIn('publicModelCustomLimit(providers, publicModelName, "max_input_tokens")', model_detail)
-        self.assertIn('publicModelTokensText(resolvedWindow, translate)', model_detail)
+        # Two numbers, two sources: the registry's own resolved window and the
+        # ceiling Codex clamps an override to.  A user's own declaration is
+        # written to both fields, so it stays a single number.
+        self.assertIn('publicModelCeiling(modelContexts ?? {}, publicModelName)', model_detail)
+        self.assertIn('contextWindowPairText(resolvedWindow, resolvedCeiling, translate)', model_detail)
+        self.assertIn('const resolvedCeiling = customWindow !== undefined ? customWindow : publicModelMaxWindow;', model_detail)
         self.assertIn('title={translate("providers.publicModelSettings")}', model_detail)
         self.assertIn('toolTip={translate("providers.publicModelSettingsHint")}', model_detail)
         self.assertIn('disabled={busy || !onOpenPublicModel} onPress={() => onOpenPublicModel?.()} style={styles.modelWindowLink}', model_detail)
+        # The row's own mark names both halves; the pane that always edits the
+        # number is where the help lives, so the read-only copy states the pair
+        # and explains it with the same control.  It rides the value row rather
+        # than a field's accessory slot: this row is a read-only statement, not
+        # an input with a mark beside it.
+        self.assertIn('<ContextWindowHelp translate={translate} />', model_detail)
+        self.assertNotIn('accessory={<ContextWindowHelp', model_detail)
+        self.assertIn('function ContextWindowHelp({ translate }', self.ui)
         # No commit and no input: the window is one number for the whole group.
         self.assertNotIn("max_input_tokens: next.trim()", model_detail)
         self.assertNotIn('placeholder={windowHint}', model_detail)
-        self.assertNotIn("contextWindowHelp", model_detail)
         self.assertNotIn("windowTipOpen", model_detail)
         self.assertNotIn("windowHint", model_detail)
         # The row sits directly under 公开模型 and above 供应商, and it is not
@@ -2881,7 +2912,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         schema = (ROOT / "young_router/core/runtime_settings_schema.py").read_text(encoding="utf-8")
         localized = (ROOT / "rn/packages/shared/src/i18n/runtimeSettingsI18n.ts").read_text(encoding="utf-8")
         keys = re.findall(r"'key': '([^']+)'", schema)
-        self.assertEqual(66, len(keys))
+        self.assertEqual(68, len(keys))
         self.assertEqual(len(keys), len(set(keys)))
         for key in keys:
             self.assertIn(f"  {key}: {{ label:", localized)
@@ -2914,6 +2945,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "YOUNG_ROUTER_STREAM_KEEPALIVE_INTERVAL_SECONDS",
             "YOUNG_ROUTER_SESSION_DEPLOYMENT_AFFINITY",
             "YOUNG_ROUTER_LOG_BACKUP_SEGMENTS",
+            # One account read answers the next entry for a window, so the
+            # provider pane stops re-reading a WorkBuddy account per mount.
+            "YOUNG_ROUTER_SERVICE_ACCOUNT_RECHECK_SECONDS",
+            # A refused sign-in is not retried on the next entry, because every
+            # attempt asks the station to mint another session.
+            "YOUNG_ROUTER_RELAY_LOGIN_BACKOFF_SECONDS",
         ):
             self.assertIn(added, schema)
             self.assertIn(f"  {added}: {{ label:", localized)
@@ -3345,7 +3382,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
     def test_provider_api_key_deletion_confirmation_explains_model_deletion(self) -> None:
         self.assert_ui_has('const affectedModelLines = asRecords(provider?.models)')
-        self.assert_ui_has('.filter((model) => stringValue(model.api_key_name).trim() === selectedKeyName)')
+        self.assert_ui_has('.filter((model) => stringValue(model.api_key_name).trim() === selectedKeyName || stringValue(model.provider_key_id).trim() === localSlot.id)')
         self.assert_ui_has('const label = upstreamName && upstreamName !== publicName ? `${publicName} (${upstreamName})` : publicName;')
         self.assert_ui_has('title: translate("providers.deleteApiKey", { key: apiKeyDisplayName(selectedKeyName, translate) }),')
         self.assert_ui_has('? translate("providers.deleteApiKeyModelsMessage", { models: affectedModelLines.join("\\n") })')
@@ -3593,7 +3630,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'label={translate("providers.providerName")}\n        labelWidth={88}',
             'label={translate("providers.keyName")}',
             'NativeSecretField labelVisible={false} plainText autoCommit label={translate("providers.keyValue")}',
-            'title={translate("providers.backToModel", { model: sourceModelLabel })} link',
+            'title={translate("providers.backToModelShort")}',
+            'toolTip={translate("providers.backToModel", { model: sourceModelLabel })}',
             'providerEditorHeader:',
             'providerEditorSection:',
             'formRow: { width: "100%", minHeight: 26',
@@ -3602,6 +3640,19 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'formRowControl: { flex: 1, minWidth: 0, gap: 3',
         ):
             self.assert_ui_has(marker)
+        # Both panes of the provider workspace share one header: 290 pt wide,
+        # the heading on a flexBasis-0 row that only takes what is left.  The
+        # return link is the same two words here as in the public-model pane —
+        # as a full sentence it measured 246 pt of the row and left the title
+        # rendering as its own first character, which is the whole header's
+        # reason for existing.  The model it returns to rides the tooltip.
+        provider_header = self.ui.split("<View style={styles.providerEditorHeader}>", 2)
+        self.assertEqual(2, len(provider_header) - 1)
+        for header in (provider_header[1], provider_header[2].split("</View>", 1)[0]):
+            self.assertIn('title={translate("providers.backToModelShort")}', header)
+            self.assertIn('toolTip={translate("providers.backToModel"', header)
+        self.assertNotIn('title={translate("providers.backToModel", { model: sourceModelLabel })}', self.ui)
+        self.assertNotIn('title={translate("providers.backToModel", { model: backLabel })}', self.ui)
         self.assert_ui_has('label={translate("providers.publicModel")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} value={group.name} disabled={busy}')
         # The model detail draws every row's label from one column of its own,
         # sized by its longest rendered label (Codex 上下文, 80.9 pt at 13 pt)
@@ -4540,19 +4591,25 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('startSigningIn(account.id);', relay)
         self.assertNotIn('updateLoading(account.id, "session", false);', relay)
         self.assertIn('translate(`relay.status.${relayLoginState(account)}`)', relay)
-        # 去登录 is the escape hatch from the wait itself: every row that is not
-        # 已登录 carries it — the mount check included, because that station
-        # round trip is exactly what 去登录 exists to skip — and it is withheld
-        # only while a sign-in this pane started owns the row, where the login
-        # window is already open.  A sign-in that lands while a check was in
-        # flight stays authoritative: the check's answer is about the session the
-        # sign-in replaced, so it is discarded by the pane's sign-in count.
+        # 去登录 is the escape hatch from the wait itself: a row that states
+        # 未登录 carries it, so the user can skip the station round trip the
+        # mount check would otherwise make them sit through.  It is withheld
+        # while the row already reads 登录中 — the pane's own sign-in, or the
+        # mount check still fetching its answer — because a login already being
+        # settled has no second sign-in to offer, and a button beside that word
+        # read as "your attempt did not start".  A sign-in that lands while a
+        # check was in flight stays authoritative: the check's answer is about
+        # the session the sign-in replaced, so it is discarded by the pane's
+        # sign-in count.
         self.assertIn('const signInCounts = useRef<Record<string, number>>({});', relay)
         self.assertIn('signInCounts.current[accountID] = (signInCounts.current[accountID] ?? 0) + 1;', relay)
         self.assertIn('const checkEpoch = signInCounts.current[account.id] ?? 0;', relay)
         self.assertIn('if ((signInCounts.current[account.id] ?? 0) !== checkEpoch) return false;', relay)
         self.assertIn('const selectedLoginState = selected ? relayLoginState(selected) : "signed_out";', relay)
-        self.assertIn('{selectedLoginState !== "signed_in" && !loading[selected.id]?.session ? <NativeButton title={translate("relay.goLogin")} compact busy={pendingAction === "login"} disabled={controlsBusy && pendingAction !== "login"} onPress={() => { void loginSelected(); }} /> : null}', relay)
+        self.assertIn('{selectedLoginState === "signed_out" ? <NativeButton title={translate("relay.goLogin")} compact busy={pendingAction === "login"} disabled={controlsBusy && pendingAction !== "login"} onPress={() => { void loginSelected(); }} /> : null}', relay)
+        # 登录中 owns no sign-in button at all, whether the wait is the pane's
+        # own session lane or the mount check's.
+        self.assertNotIn('selectedLoginState !== "signed_in" && !loading[selected.id]?.session ? <NativeButton title={translate("relay.goLogin")}', relay)
         # 刷新资源 and 分组管理 both act on a station session: 刷新资源 is a
         # forced station round trip and 分组管理 writes the station's keys, so
         # neither is offered while the account is not signed in — pressing either
@@ -5194,7 +5251,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # A relay key is a row in the provider's key table too, and the reason
         # stands beside the key it belongs to.
         self.assertIn("const bindingIssueForProvidedRow = useCallback((row: ProvidedKeyRow): UnknownRecord | undefined => {", self.ui)
-        self.assertIn("alertRowKeys={providedRows.filter((row) => Boolean(bindingIssueForProvidedRow(row))).map((row) => `provided:${row.key}`)}", self.ui)
+        self.assertIn("alertRowKeys={[...providedRows.filter((row) => Boolean(bindingIssueForProvidedRow(row))).map((row) => `provided:${row.key}`), ...orphanSlots.filter((slot) => bindingIssues?.some((issue) => stringValue(issue.provider_key_id) === slot.id)).map((slot) => `orphan:${slot.id}`)]}", self.ui)
         self.assertIn("<Text style={styles.fieldHint}>{relayBindingIssueText(selectedProvidedIssue, selectedProvided.label, translate)}</Text>", self.ui)
         self.assertIn("if (bindingIssues.some((issue) => stringValue(issue.provider) === editorIdentifier(item))) return true;", self.ui)
         self.assertIn('account_unavailable: "providers.bindingIssueAccount",', self.ui)
@@ -5353,6 +5410,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'pendingOperationCount: count(entry.pending_operation_count)',
         ):
             self.assertIn(marker, relay)
+        # A relay binding Core refused is stated on the row it belongs to: the
+        # code Core reports resolves to the pane's own sentence for that kind of
+        # failure, and the keys panel turns the row it resolves to brown.
+        self.assertIn('resource_unavailable: "providers.bindingIssueResource",', self.ui)
+        self.assertIn(
+            'alertRowKeys={[...providedRows.filter((row) => Boolean(bindingIssueForProvidedRow(row))).map((row) => `provided:${row.key}`), ...orphanSlots.filter((slot) => bindingIssues?.some((issue) => stringValue(issue.provider_key_id) === slot.id)).map((slot) => `orphan:${slot.id}`)]}',
+            self.ui,
+        )
         # Remote-delete policies moved with the keys panel into the ui.
         for marker in (
             'value: "detach_disabled"',
@@ -5391,7 +5456,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # like a value the user could edit.
         self.assertNotIn('translate("providers.keyListHint")', self.ui)
         self.assertNotIn('translate("providers.providedKeysNeedAccount")', self.ui)
-        self.assertIn('} style={styles.panelActionButton} />)}\n        {selectedProvidedIssue ? <Text style={styles.fieldHint}>{relayBindingIssueText(selectedProvidedIssue, selectedProvided.label, translate)}</Text> : null}\n      </> : null}\n    </View>;', self.ui)
+        self.assertIn('} style={styles.panelActionButton} />)}\n        {selectedProvidedIssue ? <Text style={styles.fieldHint}>{relayBindingIssueText(selectedProvidedIssue, selectedProvided.label, translate)}</Text> : null}\n      </> : selectedOrphan ? <>', self.ui)
+        self.assertIn('        <Text style={styles.fieldHint}>{translate("providers.orphanKeyHint")}</Text>\n      </> : null}\n    </View>;', self.ui)
         # The relay account section's + shares the key panel's right edge.
         self.assertIn(
             '<View style={styles.panelHeader}>\n        {/* The one association block: a station-backed provider links a relay\n            station, a provider addressed at an official service links that\n            service\'s own account.  The label follows the provider. */}\n        <Text style={styles.panelTitle}>{translate(providerService(provider) ? "providers.serviceLinks" : "providers.accounts")}</Text>\n        <View style={styles.panelActions}>',
@@ -5525,6 +5591,74 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("pending_keys = self._pending_provider_keys.get(pending_token, {}) if pending_token else {}", core)
         self.assertIn('raise DomainError("The staged API key is unavailable")', core)
 
+    def test_the_wizard_waits_for_the_staged_key_before_it_refuses(self) -> None:
+        """A filled 密钥值 must not be reported as a missing required field.
+
+        The key value is a native field that stages its value when it loses
+        focus, and 下一步 is itself the press that blurs it: reading the
+        readiness flag inside that same press saw the pre-blur state, so the
+        first press always said 请填写必填项后继续 for a key the user had just
+        typed, and only a second press — after Core's answer had arrived — went
+        on.  下一步 and 完成 now wait for that answer instead.
+        """
+
+        wizard = self.ui.split("function ProviderSetupWizard(", 1)[1].split("function ProviderWorkspace(", 1)[0]
+        # The waiting itself: a dirty or saving field is asked to commit, and
+        # the answer is what the step reads.
+        self.assertIn("const flushStagedKey = (): Promise<boolean> => {", wizard)
+        self.assertIn('if (stagedKeyField.current.status !== "dirty" && stagedKeyField.current.status !== "saving") {', wizard)
+        self.assertIn("keyCommitRequest.current += 1;", wizard)
+        self.assertIn("setKeyCommitToken(keyCommitRequest.current);", wizard)
+        # The field reports its own state through one handler, and the commit
+        # it is asked for rides the shared `commitRequest` prop.
+        self.assertIn("const handleKeyFieldState = (state: SecretState): void => {", wizard)
+        self.assertIn("onSecretState={handleKeyFieldState}", wizard)
+        self.assertIn("commitRequest={keyCommitToken}", wizard)
+        self.assertNotIn("setKeyReady(state.present); onSecretState(state);", wizard)
+        # Every retarget of the field drops what the previous one said.
+        self.assertIn("const resetStagedKeyField = (): void => {", wizard)
+        # ...and the only place a bare flag is cleared is that helper itself.
+        self.assertEqual(1, wizard.count("setKeyReady(false);"))
+        self.assertIn("resetStagedKeyField();", wizard)
+        # 下一步 reads the answered value, never the flag the same press would
+        # have left stale — and it reads it *after* the step has changed, so the
+        # press itself never waits on an HTTP round trip.
+        self.assertIn("const advanceToModels = async (keyFlush: Promise<boolean>): Promise<void> => {", wizard)
+        self.assertIn("pendingKeyFlush.current = flushStagedKey();", wizard)
+        self.assertEqual(2, wizard.count("void advanceToModels(pendingKeyFlush.current)"))
+        self.assertIn("void advanceToModels(pendingKeyFlush.current).catch(() => {", wizard)
+        self.assertIn('advanceStepToModel();\n        void advanceToModels(pendingKeyFlush.current)', wizard)
+        # One press must advance one step: 下一步 is the window's default button,
+        # so its Return key equivalent can deliver the action a second time and
+        # would otherwise walk 供应商 → 密钥 → 模型 and skip 密钥.
+        self.assertIn("if (processing || stepRef.current !== step) return;", wizard)
+        self.assertIn('stepRef.current = step === "provider" ? "keys" : "model";', wizard)
+        self.assertIn("const advanceStepToModel = (): void => {", wizard)
+        self.assertIn('stepRef.current = "model";\n    setStep("model");', wizard)
+        # The guard's ref is declared with the step it mirrors.
+        self.assertIn('const [step, setStep] = useState<WizardStep>("provider");', wizard)
+        self.assertIn('const stepRef = useRef<WizardStep | undefined>("provider");', wizard)
+        self.assertIn("const keyPresent = await keyFlush.catch(() => false);", wizard)
+        self.assertIn('setValidation(translate("providers.wizard.required"));', wizard)
+        # A refused key stops the model step, and the wheel reports the wait.
+        self.assertIn('setModelFetchState("loading");', wizard)
+        self.assertIn("<NativeBusySpinner label={translate(\"providers.wizard.fetchingModels\")} />", wizard)
+        # The in-flight guard is a ref: a caller that just set `modelFetchState`
+        # would otherwise read a stale closure and re-enter the listing.
+        self.assertIn("if (modelFetchInFlight.current) return;", wizard)
+        self.assertIn("if (request === modelFetchRequest.current) modelFetchInFlight.current = false;", wizard)
+        # The keys step's own closure predates the model step and cannot see its
+        # `serviceBaseURL`/`manualSelectedKeyName`, so the listing is triggered
+        # by a ticket the model step's own render consumes.
+        self.assertIn("const [modelFetchTicket, setModelFetchTicket] = useState(0);", wizard)
+        self.assertIn("setModelFetchTicket((current) => current + 1);", wizard)
+        self.assertIn('if (modelFetchTicket === 0 || step !== "model") return;', wizard)
+        self.assertIn("void fetchWizardModels();", wizard)
+        self.assertNotIn("await fetchWizardModels();", wizard)
+        # The trigger sits after the listing's own declaration: an effect that
+        # called it from above the `const` would be a temporal-dead-zone throw.
+        self.assertLess(wizard.index("const fetchWizardModels = async"), wizard.index("if (modelFetchTicket === 0"))
+
     def test_a_staged_surface_keeps_a_way_back_and_reports_the_users_action(self) -> None:
         """The second half of a two-step surface must stay reachable.
 
@@ -5652,14 +5786,17 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('"providers.keyValue": "密钥值"', self.zh)
         self.assert_ui_has('columns={[{ label: translate("providers.provider"), width: 132 }]}')
         self.assert_ui_has('providerListPane: { width: 140, minWidth: 140, maxWidth: 140')
-        # The providers side's model list is the upstream model and its public
-        # model: it carries no 顺序 column, because that number orders one
-        # public model's routes while these rows are grouped by provider key.
-        self.assert_ui_has('columns={[{ label: translate("providers.upstream"), width: 120 }, { label: translate("providers.publicModel"), width: 160 }]}')
+        # The providers side's model list is the upstream model, its public
+        # model, and the rate the route follows: it carries no 顺序 column,
+        # because that number orders one public model's routes while these rows
+        # are grouped by provider key.
+        self.assert_ui_has('columns={[{ label: translate("providers.upstream"), width: 104 }, { label: translate("providers.publicModel"), width: 120 }, { label: translate("providers.modelRate"), width: 56 }]}')
         self.assertIn('"providers.upstream": "上游模型"', self.zh)
         self.assertIn('"providers.upstream": "Upstream"', self.en)
         self.assertIn('"providers.publicModel": "公开模型"', self.zh)
         self.assertIn('"providers.publicModel": "Public model"', self.en)
+        self.assertIn('"providers.modelRate": "倍率"', self.zh)
+        self.assertIn('"providers.modelRate": "Rate"', self.en)
         self.assertNotIn('"providers.keyModelColumn"', self.zh)
         self.assertIn('"providers.keyOrderColumn": "密钥名 / 顺序"', self.zh)
         self.assertIn('"providers.keyOrderColumn": "Key / Order"', self.en)
@@ -6033,7 +6170,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.ui,
         )
         self.assertIn(
-            'const canDeleteKey = Boolean(selectedCustom) || Boolean(selectedProvided && !autoGrouping);',
+            'const canDeleteKey = Boolean(selectedCustom) || Boolean(selectedOrphan) || Boolean(selectedProvided && !autoGrouping);',
             self.ui,
         )
         self.assertIn(

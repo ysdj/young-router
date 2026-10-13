@@ -357,6 +357,22 @@ export function relaySessionRecheckSeconds(snapshot?: CoreSnapshot): number | un
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
+/**
+ * How long Core's service-account observation answers a later read for, in
+ * seconds.
+ *
+ * Core publishes one window for the provider domain and the pane applies the
+ * same number, exactly as the relay account pane applies
+ * {@link relaySessionRecheckSeconds}: the account and its credit a WorkBuddy
+ * entry just read are not a question to ask again on the next entry.
+ */
+export function serviceAccountRecheckSeconds(snapshot?: CoreSnapshot): number | undefined {
+  const domain = record(snapshot?.domains.providers_models);
+  const state = Object.keys(record(domain.state)).length > 0 ? record(domain.state) : domain;
+  const value = state.service_account_recheck_seconds;
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
 /** Secret-free cleanup tombstones Core keeps until native storage confirms the erase. */
 export function pendingCredentialCleanups(snapshot?: CoreSnapshot): PendingCredentialCleanup[] {
   const domain = record(snapshot?.domains.relay_accounts);
@@ -1387,11 +1403,13 @@ export function StationAccountsPanel({
       <View style={styles.fieldRow}>
         <Text style={[styles.fieldLabel, { width: 44 }]}>{translate("relay.accountField")}</Text>
         <Text numberOfLines={1} style={styles.accountNameValue}>{accountDisplayName(selected, translate)}</Text>
-        {/* Every row that is not 已登录 carries 去登录 — the mount check included,
-            because that station round trip is exactly the wait this button
-            exists to skip.  It is withheld only while a sign-in this pane
-            started owns the row: the window is already open then. */}
-        {selectedLoginState !== "signed_in" && !loading[selected.id]?.session ? <NativeButton title={translate("relay.goLogin")} compact busy={pendingAction === "login"} disabled={controlsBusy && pendingAction !== "login"} onPress={() => { void loginSelected(); }} /> : null}
+        {/* 去登录 is offered by a row that states 未登录, and only by one: a row
+            already reading 登录中 — the pane's own sign-in or the mount check
+            still fetching its answer — has no second sign-in to hand the user,
+            and a button beside that word reads as "your attempt did not
+            start".  A check that settles to 未登录 brings the button back; a
+            verified account never needed it. */}
+        {selectedLoginState === "signed_out" ? <NativeButton title={translate("relay.goLogin")} compact busy={pendingAction === "login"} disabled={controlsBusy && pendingAction !== "login"} onPress={() => { void loginSelected(); }} /> : null}
       </View>
       <View style={styles.accountActionsRow}>
         {/* Both controls act on a station session — 刷新资源 reads the station

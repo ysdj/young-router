@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import hashlib
 import http.client
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -70,6 +71,37 @@ from ._shared import (
     _safe_problem,
     _selected_identifier,
 )
+
+
+# The relay issue code that says the station answered and does not list this
+# source: the account was read, the key is not among the keys it serves.  The
+# separate code matters because the two are opposites further out — a station
+# nobody could read is no verdict about a key the document holds, while a
+# station that says a key is gone makes the document's copy of its value the
+# residue of a credential the user cannot revoke.  ``_relay_absent_source`` is
+# the one reader of that meaning.
+_RELAY_ABSENT_RESOURCE_CODES = frozenset({"resource_removed"})
+
+
+def _relay_absent_source(value: object) -> tuple[str, str] | None:
+    """Read the account/resource pair an absence issue names, when it is one.
+
+    A source the station no longer lists is gone whatever the document still
+    persists for it, so this is what lets a caller tell "the station answered
+    and this key is not on it" apart from "the station could not be read".  The
+    pair is the binding's identity: an account belongs to exactly one station,
+    so its id already names which station the answer came from.
+    """
+    if not isinstance(value, Mapping):
+        return None
+    if str(value.get("code", "")).strip() not in _RELAY_ABSENT_RESOURCE_CODES:
+        return None
+    source = value.get("source") if isinstance(value.get("source"), Mapping) else {}
+    account_id = str(value.get("account_id", source.get("account_id", ""))).strip()
+    resource_id = str(value.get("resource_id", source.get("resource_id", ""))).strip()
+    if not account_id or not resource_id:
+        return None
+    return (account_id, resource_id)
 
 
 def _relay_site_key(value: object) -> tuple[str, str, int | None] | None:
@@ -794,6 +826,9 @@ class ProvidersModelsDomain:
             # The last state a live read observed, so a projection can show the
             # account and its credit without paying for another worker call.
             "auth_observed": self._workbuddy_observed_account(provider_auth),
+            # How long ago that observation was made, so the pane applies Core's
+            # own account window before it asks for a read.
+            "auth_observed_seconds_ago": self._workbuddy_observed_age_seconds(provider_auth),
             "auth_active": self._provider_auth_active(provider_auth),
             "api_base": REDACT_TEXT(str(provider.get("api_base", ""))),
             "api_key_configured": configured_key,
@@ -818,6 +853,12 @@ class ProvidersModelsDomain:
             "provider_count": len(safe),
             "model_contexts": self._model_context_projection(),
             "binding_issues": [dict(item) for item in self._binding_issues],
+            # The window one service account read answers later reads for.  The
+            # provider pane reads it (with each provider's own observation age
+            # above) so entering the pane twice inside the window costs no
+            # worker round trip, exactly as the relay account pane applies
+            # ``session_recheck_seconds``.
+            "service_account_recheck_seconds": self._workbuddy_recheck_seconds(),
             "raw_editor_available": True,
         }
 
@@ -2259,7 +2300,29 @@ class ProvidersModelsDomain:
                 }
                 return
             if action == "workbuddy_status":
-                document = runtime.status(refresh=bool(data.get("refresh")))
+                # Opening the provider re-reads the account on every entry, and
+                # each read may start a worker, read the desktop credential and
+                # ask upstream for the credit.  A window that already covers
+                # this account answers from the observation instead -- see
+                # ``_workbuddy_recheck_seconds``.  The section's own 刷新 button
+                # passes ``refresh``, which always reads for real.
+                refresh = bool(data.get("refresh"))
+                if not refresh:
+                    remembered = self._workbuddy_recent_status(provider_id)
+                    if remembered is not None:
+                        # Nothing new was learned, so the observation is left
+                        # exactly as it is: re-recording it would restamp the
+                        # clock the window measures and the window would never
+                        # expire under repeated entries.
+                        self._last_operation = {
+                            "operation": action,
+                            "available": True,
+                            "detail": "",
+                            "providers": dict(remembered["providers"]),
+                            "remembered": True,
+                        }
+                        return
+                document = runtime.status(refresh=refresh)
                 providers = document.get("providers")
                 # The pane asked the account question directly, so what came
                 # back becomes the state every later projection reports.
@@ -2289,6 +2352,63 @@ class ProvidersModelsDomain:
             "provider": provider_id,
             "display_name": workbuddy_module.WORKBUDDY_DISPLAY_NAMES[provider_id],
             **document,
+        }
+
+    # One service account read answers later reads of the same account for this
+    # long.  Selecting a WorkBuddy provider reads its desktop-app account and
+    # catalog, and every entry into the pane repeats that read, so without a
+    # window each visit starts the worker and re-reads the credential and the
+    # credit upstream.  The pane applies the window before it asks, and Core
+    # applies the same number to its own answer below, so a read that arrives
+    # anyway still cannot rewrite a fresh observation.
+    DEFAULT_SERVICE_ACCOUNT_RECHECK_SECONDS = 60.0
+    SERVICE_ACCOUNT_RECHECK_KEY = "YOUNG_ROUTER_SERVICE_ACCOUNT_RECHECK_SECONDS"
+
+    def _workbuddy_recheck_seconds(self) -> float:
+        """The configured window, read from the runtime settings file.
+
+        Read per check rather than cached so a change applies on the next
+        entry, and a settings file that cannot be read leaves the default in
+        place instead of failing an account read.
+        """
+
+        try:
+            from ..runtime_settings_io import load_specs, read_settings_file
+
+            values = read_settings_file(_default_runtime_settings_path(), load_specs())
+            raw = str(values.get(self.SERVICE_ACCOUNT_RECHECK_KEY, "")).strip()
+            seconds = float(raw) if raw else self.DEFAULT_SERVICE_ACCOUNT_RECHECK_SECONDS
+        except Exception:
+            seconds = self.DEFAULT_SERVICE_ACCOUNT_RECHECK_SECONDS
+        if not math.isfinite(seconds) or seconds < 0:
+            return self.DEFAULT_SERVICE_ACCOUNT_RECHECK_SECONDS
+        return seconds
+
+    def _workbuddy_recent_status(self, provider_id: str) -> dict[str, Any] | None:
+        """The account answer this provider's observation still covers.
+
+        A read inside the window is not a question to ask again: the account
+        and its credit were just established, and re-reading them costs a
+        worker round trip that can only repeat the answer already on screen.
+        ``None`` is the one answer that says "ask for real" -- no observation
+        yet, an observation outside the window, or a window of 0, which is how
+        the runtime setting asks for a read on every entry.
+        """
+
+        window = self._workbuddy_recheck_seconds()
+        if window <= 0:
+            return None
+        observed = self._workbuddy_observed.get(provider_id)
+        if not isinstance(observed, Mapping) or not str(observed.get("state", "")):
+            return None
+        stamped = observed.get("observed_at")
+        if not isinstance(stamped, (int, float)) or isinstance(stamped, bool):
+            return None
+        if time.time() - float(stamped) >= window:
+            return None
+        return {
+            "available": True,
+            "providers": {provider_id: dict(observed)},
         }
 
     def _refresh_published_rates(self, provider: Mapping[str, Any]) -> None:
@@ -2464,6 +2584,26 @@ class ProvidersModelsDomain:
             "credits": dict(entry.get("credits", {})) if isinstance(entry.get("credits"), Mapping) else {},
             "observed_at": time.time(),
         }
+
+    def _workbuddy_observed_age_seconds(self, auth: Mapping[str, Any]) -> float | None:
+        """How long ago one provider's account was last read, or ``None``.
+
+        The pane reads this to apply Core's own account window before it asks,
+        exactly as the relay account pane applies ``session_recheck_seconds``:
+        one number, published by Core, so neither side decides alone whether a
+        re-entry needs a worker round trip.
+        """
+
+        provider_id = workbuddy_module.AUTH_KIND_TO_PROVIDER.get(str(auth.get("kind", "")))
+        if provider_id is None:
+            return None
+        observed = self._workbuddy_observed.get(provider_id)
+        if not isinstance(observed, Mapping):
+            return None
+        stamped = observed.get("observed_at")
+        if not isinstance(stamped, (int, float)) or isinstance(stamped, bool):
+            return None
+        return max(0.0, time.time() - float(stamped))
 
     def _provider_auth_configured(
         self, provider: Mapping[str, Any], auth: Mapping[str, Any], *, allow_live: bool = False
@@ -4503,9 +4643,28 @@ class ProvidersModelsDomain:
         # credential resolves regardless, and reporting the station's refusal
         # beside it would mark a row that is fine.
         deferred_issues: dict[tuple[str, str], dict[str, str]] = {}
+        # One exception, and it is the whole reason this set exists: a key the
+        # station answered *about* and does not list.  The slot's stored value
+        # is then the residue of a key that no longer exists upstream, so riding
+        # it materializes a route onto a credential nothing can revoke — the
+        # route keeps its name and its order in the pane and reports success
+        # while every request fails upstream.
+        #
+        # Such a source refuses only the routes that actually depend on it.  An
+        # unused slot is a stale row the user can see and delete, not a reason
+        # to refuse every unrelated edit in the app: the coordinator fails the
+        # whole Apply on any issue this method reports, so reporting one here
+        # for a key nothing routes through would break every save everywhere.
+        # A slot with no bound model is therefore left alone and reported as
+        # nothing at all.
+        absent_sources: dict[tuple[str, str], dict[str, str]] = {}
         for raw_issue in payload.get("issues", []):
             safe_issue = self._safe_relay_material_issue(raw_issue)
             if safe_issue is None:
+                continue
+            absent = _relay_absent_source(safe_issue)
+            if absent is not None:
+                absent_sources[absent] = safe_issue
                 continue
             deferred_issues[(safe_issue.get("account_id", ""), safe_issue.get("resource_id", ""))] = safe_issue
 
@@ -4526,6 +4685,11 @@ class ProvidersModelsDomain:
                 models = []
                 provider["models"] = models
             provider_base: str | None = None
+            # One issue per provider, not one per key: a key the station no
+            # longer lists is one row the pane marks, and a station that lost
+            # several keys at once is one sentence about the account rather
+            # than the same sentence repeated down the list.
+            absence_reported = False
             for key in keys:
                 source = key["source"]
                 if source.get("kind") != "relay":
@@ -4536,6 +4700,33 @@ class ProvidersModelsDomain:
                     source["resource_id"],
                 )
                 resource = materials.get(resource_key)
+                absence = absent_sources.get(
+                    (str(source.get("account_id", "")).strip(), str(source.get("resource_id", "")).strip())
+                )
+                if resource is None and absence is not None:
+                    # The station's own answer, applied to a key still bound to
+                    # it.  The slot's leftover value is *not* used here: a
+                    # credential the station cannot be asked about is not a
+                    # reason to keep a dead route looking linked.
+                    linked = [
+                        model
+                        for model in models
+                        if isinstance(model, dict)
+                        and str(model.get("provider_key_id", "")).strip() == key["id"]
+                    ]
+                    if not linked:
+                        # Nothing routes through this slot, so nothing is
+                        # refused: the stale row is the user's to delete.
+                        continue
+                    if not absence_reported:
+                        issues.append(copy.deepcopy(absence))
+                        absence_reported = True
+                    for model in linked:
+                        model["binding_health"] = {
+                            "status": "resource_missing",
+                            "detail": "The linked relay API key is no longer on the station",
+                        }
+                    continue
                 linked_models = [
                     model
                     for model in models
@@ -5889,6 +6080,12 @@ class ProvidersModelsDomain:
             # A discarded draft takes the wizard keys staged for it: nothing
             # is reserved for a provider that will never be created.
             self._pending_provider_keys.clear()
+            # ...and it takes the relay-binding marks that described it.  Those
+            # marks name the key or route a failed write refused, and a
+            # discarded draft has no such write left to explain: keeping them
+            # painted rows brown for a refusal the user had already abandoned,
+            # with no message anywhere saying why.
+            self._binding_issues = []
         elif name in {"routes_reorder_group", "route_reorder_group"}:
             self._reorder_route_group(data)
         elif name in {"public_model_patch", "public_models_patch"}:
@@ -6356,6 +6553,10 @@ class ProvidersModelsDomain:
         self._restore_editor_id_bindings(provider_bindings, model_bindings)
         self._probe_overlay.clear()
         self._model_edit_existing_key_ids.clear()
+        # A reload replaces the draft the relay-binding marks described, so they
+        # go with it: they name the key or route a refused write pointed at, and
+        # the document this reload just read has no such write behind it.
+        self._binding_issues = []
         self.revision += 1
         return self.snapshot()
 

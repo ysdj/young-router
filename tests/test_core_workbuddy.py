@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 import time
@@ -21,6 +22,10 @@ from young_router.adapters import workbuddy
 from young_router.core.domains import DomainError
 from young_router.core.domains.providers_models import ProvidersModelsDomain
 from young_router.core.provider_auth import ProviderAuthManager
+from young_router.core.service import CoreStore
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 CATALOG = [
@@ -479,6 +484,111 @@ class WorkBuddyProviderTests(unittest.TestCase):
                 "openai/chat",
             )
 
+    def test_a_live_read_never_advances_the_shared_revision(self) -> None:
+        """A read that stages nothing is not a settings change.
+
+        Every window keys its debounced Apply on Core's shared revision, so a
+        read that bumped it made the next Apply reconcile against a change the
+        user never made -- the pane reported its own commit back as "settings
+        changed outside this window".  A WorkBuddy entry reads the account and
+        the catalog on every visit, which is exactly the sequence that produced
+        that message; a read must answer from its own ``action_summary`` while
+        leaving the revision alone, and a real edit must still advance it.
+        """
+
+        runtime = StubRuntime()
+        directory, domain, config = self._domain(runtime)
+        with directory:
+            core = CoreStore(
+                metadata_path=Path(directory.name) / ".litellm-runtime" / "core-state.json",
+                domains=[domain],
+            )
+            core.dispatch(
+                {"domain": "providers_models", "type": "service_provider.add", "payload": {"kind": "workbuddy_login", "name": "wb", "models": []}},
+                expected_revision=core.revision,
+            )
+            revision = core.revision
+            # The pane's entry read, then the re-read a cold worker triggers:
+            # both must be accepted at the revision the window already holds.
+            for _ in range(2):
+                result = core.dispatch(
+                    {"domain": "providers_models", "type": "workbuddy_status", "payload": {"refresh": True}},
+                    expected_revision=revision,
+                )
+                self.assertEqual(revision, result["revision"])
+                self.assertEqual("workbuddy_status", result["action_summary"]["operation"])
+            # The other two live reads answer the same way.
+            for action, payload in (
+                ("workbuddy_models", {"provider": "workbuddy"}),
+                ("workbuddy_login", {"provider": "workbuddy"}),
+            ):
+                result = core.dispatch(
+                    {"domain": "providers_models", "type": action, "payload": payload},
+                    expected_revision=revision,
+                )
+                self.assertEqual(revision, result["revision"], action)
+            # A real edit is still a state change, and a repeated no-op is not.
+            provider_id = domain.snapshot()["providers"][0]["editor_id"]
+            edited = core.dispatch(
+                {"domain": "providers_models", "type": "service_provider.patch", "payload": {"provider_id": provider_id, "provider": {"enabled": False}}},
+                expected_revision=revision,
+            )
+            self.assertGreater(edited["revision"], revision)
+            again = core.dispatch(
+                {"domain": "providers_models", "type": "service_provider.patch", "payload": {"provider_id": provider_id, "provider": {"enabled": False}}},
+                expected_revision=edited["revision"],
+            )
+            self.assertEqual(edited["revision"], again["revision"])
+
+    def test_a_service_account_read_answers_the_window_then_reads_for_real(self) -> None:
+        """Entering a WorkBuddy provider repeatedly must not re-read the account.
+
+        Every entry into the pane reads the desktop-app account and its credit,
+        and each read can start a worker and ask upstream, so 运行时 publishes
+        one window that answers a later entry -- the same contract the relay
+        account pane has.  ``refresh`` is the section's own 刷新 button and
+        always reads for real, and a window of 0 re-reads on every entry.
+        """
+
+        runtime = StubRuntime()
+        directory, domain, _config = self._domain(runtime)
+        with directory:
+            reads = lambda: [call for call in runtime.calls if call[0] == "status"]
+            domain.dispatch("workbuddy_status", {"refresh": True})
+            self.assertEqual(1, len(reads()))
+            # An implicit entry inside the window is answered, not re-read.
+            summary = domain.dispatch("workbuddy_status", {"refresh": False})["operation_summary"]
+            self.assertEqual(1, len(reads()))
+            self.assertIs(True, summary["remembered"])
+            self.assertEqual("Example User", summary["providers"]["workbuddy"]["nickname"])
+            # 刷新 always reaches the worker.
+            domain.dispatch("workbuddy_status", {"refresh": True})
+            self.assertEqual(2, len(reads()))
+            # A window of 0 means a read on every entry.
+            settings = Path(directory.name) / "runtime-settings.env"
+            settings.write_text("YOUNG_ROUTER_SERVICE_ACCOUNT_RECHECK_SECONDS=0\n", encoding="utf-8")
+            with mock.patch.object(
+                domain, "_workbuddy_recheck_seconds", return_value=0.0,
+            ):
+                domain.dispatch("workbuddy_status", {"refresh": False})
+            self.assertEqual(3, len(reads()))
+
+    def test_the_projection_publishes_the_window_and_the_observation_age(self) -> None:
+        """The pane applies Core's own window instead of deciding by itself."""
+
+        runtime = StubRuntime()
+        directory, domain, _config = self._domain(runtime)
+        with directory:
+            self.assertEqual(60.0, domain.snapshot()["service_account_recheck_seconds"])
+            domain.dispatch("service_provider.add", {"kind": "workbuddy_login", "models": []})
+            provider = domain.snapshot()["providers"][0]
+            self.assertIsInstance(provider["auth_observed_seconds_ago"], float)
+            self.assertLess(provider["auth_observed_seconds_ago"], 5.0)
+            # A provider that was never read states no age, so the pane cannot
+            # mistake "nothing observed" for "observed just now".
+            domain._workbuddy_observed.clear()
+            self.assertIsNone(domain.snapshot()["providers"][0]["auth_observed_seconds_ago"])
+
     def test_a_snapshot_never_calls_the_live_worker(self) -> None:
         """A projection must not pay for a WorkBuddy account read.
 
@@ -574,7 +684,7 @@ class WorkBuddyServiceEnvironmentTests(unittest.TestCase):
         leaves every other frame byte-for-byte.
         """
 
-        root = Path(__file__).resolve().parents[1]
+        root = ROOT
         worker = (root / "young_router/adapters/workbuddy_worker.mjs").read_text(encoding="utf-8")
         shaper = (root / "young_router/adapters/workbuddy_stream.mjs").read_text(encoding="utf-8")
         self.assertIn("import { normalizeChatCompletionStreamLine } from './workbuddy_stream.mjs'", worker)
@@ -635,6 +745,205 @@ class WorkBuddyServiceEnvironmentTests(unittest.TestCase):
             "model_list:\n  - api_base: os.environ/YOUNG_ROUTER_WORKBUDDY_BASE\n", encoding="utf-8"
         )
         self.assertEqual(controller._workbuddy_environment(autostart=True), {})
+
+
+class WorkBuddyDesktopCredentialTests(unittest.TestCase):
+    """A sealed desktop credential must open for the product it belongs to.
+
+    Both desktop apps seal their token fields behind a key only that product's
+    own Electron binary can produce (5.6-era at-rest protection), so the store
+    can read a credential only through the library's per-variant key provider.
+    The worker used to build its stores without one, which left the provider's
+    own default (``discovery: 'none'``) in place: ``provider_status`` then
+    answered ``electron-binary-unavailable`` no matter how well the user was
+    signed in, so the pane showed 未登录 beside a 刷新 button that could never
+    change it.  The library ships that factory in its internal chunk rather
+    than from its entry point, so these tests drive the real worker against a
+    small stub library that reproduces the published shape.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.node = shutil.which("node")
+        if cls.node is None:
+            raise unittest.SkipTest("Node.js is not available on this machine")
+
+    # The stub library: the entry point exports the surface the worker imports,
+    # and only the internal sibling chunk carries the key factory -- exactly the
+    # arrangement that made the worker's own wiring invisible.
+    _ENTRY = """\
+export class WorkBuddyUpstreamClient {
+  async refreshToken() { return {} }
+}
+export class WorkBuddyCatalog {
+  constructor() { this.models = [] }
+  current() { return this.models }
+  setVisible() {}
+  set(models) { this.models = models }
+}
+export class WorkBuddyCatalogStore {
+  get() { return undefined }
+  set() {}
+}
+export function createWorkBuddyShim() {
+  return { ready: Promise.resolve(), baseUrl: () => 'http://127.0.0.1:1', token: () => 'shim', close: () => {} }
+}
+export const WORKBUDDY_VARIANTS = [
+  { id: 'workbuddy', displayName: 'WorkBuddy', appName: 'WorkBuddy', region: 'cn',
+    electron: { macOS: { defaultPath: '/Applications/WorkBuddy.app/Contents/MacOS/Electron' } } },
+  { id: 'workbuddy-ai', displayName: 'WorkBuddy AI', appName: 'WorkBuddy AI', region: 'global',
+    electron: { macOS: { defaultPath: '/Applications/WorkBuddy AI.app/Contents/MacOS/Electron' } } },
+]
+export function readBundleVersion() { return '9.9.9' }
+export { WorkBuddyCredentialStore } from './chunk.js'
+"""
+
+    _CHUNK = """\
+export class WorkBuddyCredentialStore {
+  constructor(options) {
+    this.variant = options.variant
+    this.keyProvider = options.keyProvider
+  }
+  // What the store was built with is the whole question: a store without the
+  // library's key provider cannot open a sealed document, and says so.
+  async status() {
+    if (this.keyProvider === undefined) return { state: 'signed-out', reasonCode: 'electron-binary-unavailable' }
+    return { state: 'signed-in', reasonCode: 'wired', helper: this.keyProvider.helperPath() }
+  }
+  async resolve() { throw new Error('the stub serves no credential') }
+}
+"""
+
+    # The factory this build publishes, in the shape the worker resolves: a
+    # named function export on the internal chunk beside ``index.js``.
+    _FACTORY = """\
+export function atRestKeyProviderFor(variant) {
+  return { helperPath: () => `/apps/${variant.id}` }
+}
+"""
+
+    def _library(self, root: Path, *, expose_factory: bool) -> Path:
+        """The stub library; ``expose_factory`` publishes the key factory."""
+
+        library_root = root / "library"
+        library_root.mkdir(parents=True)
+        chunk = self._CHUNK + (self._FACTORY if expose_factory else "")
+        (library_root / "index.js").write_text(self._ENTRY, encoding="utf-8")
+        (library_root / "chunk.js").write_text(chunk, encoding="utf-8")
+        return library_root
+
+    def _status(self, library_root: Path, root: Path) -> dict:
+        """Start the real worker against one stub library and read its status."""
+
+        import json
+        import subprocess
+        import urllib.request
+
+        worker = ROOT / "young_router" / "adapters" / "workbuddy_worker.mjs"
+        token = "stub-token"
+        process = subprocess.Popen(
+            [
+                self.node,
+                str(worker),
+                "--port", "0",
+                "--token", token,
+                "--root", str(root),
+                "--entry", str(library_root / "index.js"),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        # ``kill`` is registered after ``wait`` on purpose: cleanups run
+        # last-in-first-out, so this kills the worker and only then reaps it.
+        # The other order waits on a live process and hangs the suite.  The
+        # pipes are closed first, because a killed worker never closes them.
+        self.addCleanup(process.wait)
+        self.addCleanup(process.kill)
+        self.addCleanup(process.stdout.close)
+        self.addCleanup(process.stderr.close)
+        line = process.stdout.readline()
+        if not line:
+            # Read stderr only now, and never inside the assertion's own
+            # message: a worker that is still serving holds this pipe open, so
+            # an eager read would wait forever on the very failure it describes.
+            self.fail(f"the worker never announced itself: {process.stderr.read()}")
+        ready = json.loads(line)
+        self.assertIs(ready.get("ready"), True)
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{int(ready['port'])}/control/status",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def test_the_store_is_wired_with_the_librarys_own_key_provider(self) -> None:
+        """Both products get their own key provider, from the library."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            document = self._status(self._library(root, expose_factory=True), root / "worker")
+
+        providers = document["providers"]
+        for provider_id in ("workbuddy", "workbuddy-ai"):
+            entry = providers[provider_id]
+            self.assertEqual(
+                entry["state"],
+                "signed-in",
+                f"{provider_id} was not given the library's key provider: {entry}",
+            )
+            self.assertEqual(entry["reasonCode"], "wired")
+            # Each variant resolved its *own* helper, not the other product's.
+            self.assertEqual(entry["helper"], f"/apps/{provider_id}")
+
+    def test_a_library_without_the_factory_is_reported_rather_than_guessed(self) -> None:
+        """A build that drops the factory degrades to a diagnosis.
+
+        The worker must not guess an Electron path of its own: resolving which
+        app is installed is the library's product knowledge, and 未登录 with its
+        reason is the honest answer when that name is absent -- the same answer
+        the library's own default gives.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            document = self._status(self._library(root, expose_factory=False), root / "worker")
+
+        self.assertIs(document["ready"], True)
+        for provider_id in ("workbuddy", "workbuddy-ai"):
+            self.assertEqual(
+                document["providers"][provider_id]["reasonCode"],
+                "electron-binary-unavailable",
+            )
+
+    def test_the_worker_names_the_factory_and_embeds_no_product_path(self) -> None:
+        """The seam is the library's published name, not a path copied here."""
+
+        worker = (ROOT / "young_router" / "adapters" / "workbuddy_worker.mjs").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("atRestKeyProviderFor", worker)
+        self.assertIn("keyProvider", worker)
+        # Resolving which app is installed stays upstream's knowledge.
+        self.assertNotIn("/Applications/WorkBuddy", worker)
+        self.assertNotIn("WORKBUDDY_AI_ELECTRON_BIN", worker)
+
+    def test_each_product_reports_its_own_desktop_app(self) -> None:
+        """One product's 去登录 must not open the other product's app.
+
+        The library's ``installedAppVersion`` reads the international App alone
+        -- it takes no variant -- so the host was handed the WorkBuddy AI bundle
+        for a WorkBuddy account, and the Core's ``open <bundle>`` then launched
+        the wrong product for that account's sign-in.
+        """
+
+        worker = (ROOT / "young_router" / "adapters" / "workbuddy_worker.mjs").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("installedDesktopApp", worker)
+        self.assertNotIn("library.installedAppVersion(", worker)
+        # The bundle comes from the descriptor each product publishes.
+        self.assertIn("variant.electron?.macOS?.defaultPath", worker)
 
 
 class WorkBuddyModuleTests(unittest.TestCase):

@@ -324,6 +324,19 @@ export function NativeButton(props: ButtonProps & { ref?: React.Ref<any> }): Rea
   return <NativeButtonWithRef {...props} ref={props.ref} />;
 }
 
+/**
+ * The app's own busy wheel as a standalone control.
+ *
+ * A wait that owns a whole pane is reported with the platform's spinner where
+ * the user is looking, never with a sentence alone and never with a
+ * progress-indicator view: React's `ActivityIndicator` is the same wheel the
+ * native buttons already draw, so a busy surface and a busy button spin alike.
+ * `label` is the accessibility name, because a wheel has no words.
+ */
+export function NativeBusySpinner({ label, style }: { label: string; style?: StyleProp<ViewStyle> }): React.JSX.Element {
+  return <ActivityIndicator accessibilityLabel={label} size="small" style={[styles.busySpinner, style]} />;
+}
+
 const NativeSegmentedControlWithRef = React.forwardRef<any, SegmentedProps>(function NativeSegmentedControlWithRef({ labels, selectedValue, disabled, compact = true, onChange, style }, ref): React.JSX.Element {
   if (Platform.OS === "windows") {
     return <WinUISegmented ref={ref as never} labels={labels} selectedValue={selectedValue} disabled={disabled} compact={compact} onChange={(event) => onChange?.({ ...event, nativeEvent: event.nativeEvent })} style={[styles.segmented, style]} />;
@@ -492,6 +505,7 @@ const styles = StyleSheet.create({
   button: { minWidth: 28, height: 24 },
   buttonBusy: { flexDirection: "row", alignItems: "center", justifyContent: "center", gap: BUSY_SPINNER_GAP },
   buttonBusyIndicator: { width: BUSY_SPINNER_SIZE, height: BUSY_SPINNER_SIZE },
+  busySpinner: { width: BUSY_SPINNER_SIZE, height: BUSY_SPINNER_SIZE },
   controlText: { fontSize: UI_FONT_SIZE },
   linkButton: { minWidth: 72, minHeight: 22 },
   segmented: { minHeight: 24 },

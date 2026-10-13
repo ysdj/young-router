@@ -32,9 +32,10 @@
  */
 
 import { createServer } from 'node:http'
-import { mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync } from 'node:fs'
+import { readdir } from 'node:fs/promises'
 import { pathToFileURL } from 'node:url'
-import { dirname, join, resolve } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { Readable } from 'node:stream'
 
 import { normalizeChatCompletionStreamLine } from './workbuddy_stream.mjs'
@@ -61,6 +62,95 @@ function usage() {
   process.stdout.write(
     'usage: workbuddy_worker.mjs --port <n> --token <secret> --root <dir> [--entry <path>]\n',
   )
+}
+
+/**
+ * The library's own factory for one variant's desktop-key helper.
+ *
+ * A 5.6-era desktop app seals its token fields, so a credential can only be
+ * read through that product's own Electron binary.  The store resolves it
+ * through this factory, which the package builds internally and never
+ * re-exports from its entry point: `atRestKeyProviderFor` lives in the shared
+ * internal chunk beside `index.js`.  Building the store without it (the store's
+ * own default) leaves `discovery` at `none`, and every encrypted credential
+ * then reads as signed-out with `electron-binary-unavailable` however well the
+ * user is signed in.
+ *
+ * So the factory is looked up by name in those sibling chunks.  A release that
+ * renames or relocates it yields `undefined`, which the caller reports as a
+ * diagnosis instead of guessing a binary path here -- resolving which app is
+ * installed stays the library's product knowledge, never this file's.
+ *
+ * @param entry Absolute path of the library entry point the worker loaded.
+ * @param library The already-imported entry point, checked first.
+ * @returns The factory, or `undefined` when this build does not publish one.
+ */
+async function loadAtRestKeyProviderFactory(entry, library) {
+  // A release that starts publishing the factory from its entry point is
+  // answered first; the sibling scan below exists only for the builds that do
+  // not, so promoting it upstream costs nothing here.
+  for (const value of Object.values(library ?? {})) {
+    if (typeof value === 'function' && value.name === 'atRestKeyProviderFor') return value
+  }
+  const directory = resolve(dirname(entry))
+  let names
+  try {
+    names = await readdir(directory)
+  } catch {
+    return undefined
+  }
+  for (const name of names.sort()) {
+    if (!name.endsWith('.js') || name === basename(entry) || name === 'client.js') continue
+    let module
+    try {
+      module = await import(pathToFileURL(join(directory, name)).href)
+    } catch {
+      // A chunk the worker cannot import is not the one holding the factory;
+      // the entry point or the package itself reports a real load failure.
+      continue
+    }
+    for (const value of Object.values(module)) {
+      if (typeof value === 'function' && value.name === 'atRestKeyProviderFor') return value
+    }
+  }
+  return undefined
+}
+
+/**
+ * The installed desktop app that owns one variant's sign-in, when this
+ * machine provably has it.
+ *
+ * The library's own `installedAppVersion` reads the international App alone:
+ * its signature takes no variant, so asking it about the CN product answered
+ * with the *international* bundle.  The host opens whatever bundle it is given
+ * (the Core runs `open <bundle>`), so that defect sent a WorkBuddy account's
+ * 去登录 to the WorkBuddy AI app -- one product opened for the other's account.
+ *
+ * The variant descriptor publishes each product's own macOS Electron path, and
+ * `X.app/Contents/MacOS/Electron` puts the bundle three levels up. A bundle is
+ * reported only once its `Info.plist` is actually there, so an app that lives
+ * elsewhere yields nothing here and the host falls back to opening the app by
+ * the name the descriptor states.  Windows and Linux state no verified layout,
+ * matching the library's own discipline: the path is never guessed.
+ *
+ * @returns `{bundle, version}`; `version` only when the plist states one.
+ */
+async function installedDesktopApp(library, variant) {
+  const electronPath = variant.electron?.macOS?.defaultPath
+  if (typeof electronPath !== 'string' || electronPath === '' || process.platform !== 'darwin') return undefined
+  // `X.app/Contents/MacOS/Electron` -- the bundle is three levels above the
+  // binary the descriptor names.
+  const bundle = dirname(dirname(dirname(electronPath)))
+  const plist = join(bundle, 'Contents', 'Info.plist')
+  try {
+    if (!existsSync(plist)) return undefined
+  } catch {
+    return undefined
+  }
+  // The version rides along when the plist states one; the bundle alone still
+  // names the app, so an unparseable version is not a reason to withhold it.
+  const version = await library.readBundleVersion(plist).catch(() => undefined)
+  return version === undefined ? { bundle } : { bundle, version }
 }
 
 /** Load the staged third-party library (or a developer-supplied entry). */
@@ -198,7 +288,7 @@ async function aggregateStream(response, model) {
 
 /** One WorkBuddy variant: the library's store, catalog, and shim. */
 class VariantRuntime {
-  constructor(id, variant, library, root) {
+  constructor(id, variant, library, root, keyProvider) {
     this.id = id
     this.variant = variant
     this.library = library
@@ -207,6 +297,10 @@ class VariantRuntime {
       variant,
       refresh: credential => this.client.refreshToken(credential),
       ownPath: join(root, `${id}.auth.json`),
+      // Without the library's own factory the store defaults to `discovery:
+      // 'none'` and refuses every encrypted credential, so the variant reads
+      // as signed out while the desktop app is signed in.
+      ...(keyProvider === undefined ? {} : { keyProvider: keyProvider(variant) }),
     })
     this.catalog = new library.WorkBuddyCatalog(
       variant.region === 'global' ? library.FALLBACK_WORKBUDDY_AI_MODELS : library.FALLBACK_WORKBUDDY_MODELS,
@@ -392,9 +486,18 @@ async function main() {
   mkdirSync(root, { recursive: true, mode: 0o700 })
 
   const { library, entry } = await loadLibrary(options.entry)
+  // Read before the runtimes below build their stores: it is what lets a
+  // sealed desktop credential be opened at all.
+  const keyProviderFactory = await loadAtRestKeyProviderFactory(entry, library)
+  if (keyProviderFactory === undefined) {
+    process.stderr.write(
+      '[warn] workbuddy: this dsh-workbuddy-connect build publishes no at-rest key provider; '
+      + 'an encrypted desktop credential will read as signed out\n',
+    )
+  }
   const runtimes = new Map()
   for (const variant of library.WORKBUDDY_VARIANTS) {
-    const runtime = new VariantRuntime(variant.id, variant, library, root)
+    const runtime = new VariantRuntime(variant.id, variant, library, root, keyProviderFactory)
     runtimes.set(variant.id, runtime)
   }
   for (const runtime of runtimes.values()) await runtime.shim.ready
@@ -479,8 +582,10 @@ async function main() {
     }
     if (req.method === 'GET' && url.pathname === '/control/app') {
       // The account signs in through the desktop app, so the host needs to
-      // know which app that is. Both the name and the resolved bundle come
-      // from the upstream library: this file embeds no product knowledge.
+      // know which app that is: this product's own bundle, from the descriptor
+      // the library publishes, and its name either way.  The descriptor is the
+      // one source of product identity -- this file embeds no product
+      // knowledge, so a third product would be a data change upstream.
       const id = url.searchParams.get('provider') ?? ''
       const variant = library.WORKBUDDY_VARIANTS.find(candidate => candidate.id === id)
       if (!variant) {
@@ -490,7 +595,7 @@ async function main() {
       let bundle
       let version
       try {
-        const installed = await library.installedAppVersion(variant)
+        const installed = await installedDesktopApp(library, variant)
         bundle = installed?.bundle
         version = installed?.version
       } catch {

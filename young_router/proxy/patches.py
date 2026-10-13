@@ -338,6 +338,18 @@ def _request_local_cooling_only_candidate_deployment(
     *,
     target_order: Any,
 ) -> Optional[dict]:
+    """Hand a fresh request the least-cooling route when the pool is all cooling.
+
+    A model group whose every candidate is quarantined has no route at all, so
+    LiteLLM answers ``no deployments available`` for a group that is plainly
+    configured -- the failure mode the cooldown must never produce.  The route
+    whose cooldown ends first is the one that has waited longest, so it is the
+    one handed back; the request then either succeeds or fails over through the
+    ordinary peer machinery.  Only a request that is neither a recovery poll
+    nor a fallback attempt reaches here, so the deliberate cooldown wait and
+    the ordered peer chain keep their own semantics.
+    """
+
     if not isinstance(model, str) or not model.strip():
         return None
     request_kwargs = request_kwargs if isinstance(request_kwargs, dict) else {}
@@ -365,7 +377,7 @@ def _request_local_cooling_only_candidate_deployment(
         list(configured or []),
         constraints,
     )
-    if len(candidates) != 1:
+    if not candidates:
         return None
     available, cooldown_deployments, cooldown_filtered = (
         _routing_module._with_active_deployment_cooldowns(
@@ -376,7 +388,10 @@ def _request_local_cooling_only_candidate_deployment(
     if available or not cooldown_filtered:
         return None
 
-    deployment = candidates[0]
+    deployment = min(
+        candidates,
+        key=lambda item: _cooldown_until_for_deployment(item, cooldown_deployments),
+    )
     _trace_module._route_trace(
         "request_local_cooling_only_candidate_selected",
         request_id=_routing_module._trace_request_id(request_kwargs),
@@ -384,10 +399,34 @@ def _request_local_cooling_only_candidate_deployment(
         model_group=model,
         target_order=target_order,
         deployment=_routing_module._trace_deployment(deployment),
+        cooling_pool_size=len(candidates),
         cooldown_deployments=cooldown_deployments,
         request=_trace_module._trace_request_summary(request_kwargs),
     )
     return deployment
+
+
+def _cooldown_until_for_deployment(
+    deployment: dict,
+    cooldown_deployments: list[dict[str, Any]],
+) -> float:
+    """When a deployment's own cooldown ends, for choosing the longest-waiting route.
+
+    A deployment matches on more than one key (its id and its route), so the
+    earliest end wins: that is the moment this route becomes eligible again.
+    """
+
+    until_by_key = {
+        str(entry.get("cooldown_key", "")): float(entry.get("cooldown_until") or 0.0)
+        for entry in cooldown_deployments
+        if isinstance(entry, dict)
+    }
+    ends = [
+        until_by_key[cooldown_key]
+        for cooldown_key in _routing_module._deployment_cooldown_keys_from_deployment(deployment)
+        if cooldown_key in until_by_key
+    ]
+    return min(ends) if ends else float("inf")
 
 
 def _install_routing_constraint_patch() -> None:

@@ -424,6 +424,178 @@ class RelayModelBindingTests(unittest.TestCase):
             self.assertEqual([], rematerialized["issues"])
             self.assertNotIn("replace-rematerialized-credential", json.dumps(rematerialized))
 
+    def test_a_key_the_station_no_longer_serves_is_refused_instead_of_riding_its_stored_value(self) -> None:
+        """A key that is gone upstream is not revived by the value left on its slot.
+
+        The decoupling above says a station nobody could read is no verdict
+        about a key this document already holds.  The opposite answer means the
+        opposite thing: the station *was* read, and this key is not among the
+        keys it serves.  The stored credential is then the residue of a key the
+        user cannot revoke, and materializing it keeps a dead route looking
+        linked — the pane shows a resolved key, the Apply reports success, and
+        every request fails upstream.  That case resolves as a failed binding
+        the pane can mark.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            domain = ProvidersModelsDomain(Path(directory) / "config.yaml")
+            source = relay_source(models=["upstream-chat"])
+            domain.stage_relay_import([source])
+            domain.materialize_relay_bindings(
+                {"resources": [{**source, "api_key": "replace-materialized-credential"}]}
+            )
+            domain.apply()
+            key = next(
+                item
+                for item in domain.snapshot()["providers"][0]["key_states"]
+                if item["source"]["kind"] == "relay"
+            )
+            self.assertTrue(key["configured"])
+
+            # The station answered about this source and does not list it.
+            result = domain.materialize_relay_bindings(
+                {
+                    "resources": [],
+                    "issues": [
+                        {
+                            "code": "resource_removed",
+                            "account_id": source["account_id"],
+                            "resource_id": source["resource_id"],
+                        }
+                    ],
+                }
+            )
+
+            self.assertEqual(
+                {"resource_removed"}, {item["code"] for item in result["issues"]}
+            )
+            self.assertEqual(0, result["materialized_provider_keys"])
+            # The coordinator records what materialization refused, and that is
+            # what the pane marks its rows by.
+            domain.record_binding_issues(result["issues"])
+            rows = domain.snapshot()["binding_issues"]
+            self.assertEqual({key["id"]}, {row["provider_key_id"] for row in rows})
+            # The route says so too, and the leftover value never crosses the
+            # snapshot boundary either way.
+            self.assertEqual(
+                "resource_missing",
+                domain.snapshot()["providers"][0]["models"][0]["binding_health"]["status"],
+            )
+            self.assertNotIn("replace-materialized-credential", json.dumps(domain.snapshot()))
+
+    def test_an_absence_the_station_never_confirmed_still_resolves_from_the_document(self) -> None:
+        """Only the station's own answer refuses a binding, never code alone.
+
+        The same issue code arrives from a read that never happened, and that
+        one must not be read as "this key is gone" — it would refuse the write
+        for a route whose credential is perfectly current, which is what the
+        relay's own Apply does the instant a model is added.  The relay domain
+        is what tells the two apart, and this pins the fact it decides on: the
+        account's own resource list.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            domain = ProvidersModelsDomain(Path(directory) / "config.yaml")
+            source = relay_source(models=["upstream-chat"])
+            domain.stage_relay_import([source])
+            domain.materialize_relay_bindings(
+                {"resources": [{**source, "api_key": "replace-materialized-credential"}]}
+            )
+            domain.apply()
+
+            # A station that could not be reached reports its own codes; none of
+            # them says the key is gone, so the document still resolves it.
+            for code in ("refresh_failed", "resource_key_unavailable"):
+                with self.subTest(code=code):
+                    result = domain.materialize_relay_bindings(
+                        {
+                            "resources": [],
+                            "issues": [
+                                {
+                                    "code": code,
+                                    "account_id": source["account_id"],
+                                    "resource_id": source["resource_id"],
+                                }
+                            ],
+                        }
+                    )
+                    self.assertEqual([], result["issues"])
+                    self.assertEqual(1, result["materialized_provider_keys"])
+
+    def test_a_dead_slot_nothing_routes_through_does_not_refuse_an_unrelated_edit(self) -> None:
+        """A stale key is the user's to delete, not a reason to fail every save.
+
+        The coordinator fails the whole Apply on any issue materialization
+        reports, so an issue about a key no route uses would break every edit
+        in every pane — a stale row in one provider refusing an unrelated model
+        rename in another.  A slot nothing routes through is reported as
+        nothing at all, and only a route that actually depends on the missing
+        key is refused.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            domain = ProvidersModelsDomain(Path(directory) / "config.yaml")
+            # One slot a route uses, and one stale slot nothing uses.
+            used = relay_source(resource_id="resource-used", models=["upstream-chat"])
+            # The stale slot serves no model, so the import binds no route to it:
+            # that is exactly the slot nothing routes through.
+            stale = {**relay_source(resource_id="resource-stale"), "models": []}
+            domain.stage_relay_import([used, stale])
+            domain.materialize_relay_bindings(
+                {
+                    "resources": [
+                        {**used, "api_key": "replace-used-credential"},
+                        {**stale, "api_key": "replace-stale-credential"},
+                    ]
+                }
+            )
+            domain.apply()
+            provider = domain.snapshot()["providers"][0]
+            stale_slot = next(
+                item
+                for item in provider["key_states"]
+                if item["source"]["resource_id"] == "resource-stale"
+            )
+            # The stale slot is the one nothing routes through.
+            self.assertEqual(0, stale_slot["model_count"])
+            # ... and the used slot is the one that does.
+            self.assertEqual(
+                1,
+                next(
+                    item
+                    for item in provider["key_states"]
+                    if item["source"]["resource_id"] == "resource-used"
+                )["model_count"],
+            )
+
+            result = domain.materialize_relay_bindings(
+                {
+                    "resources": [],
+                    "issues": [
+                        {
+                            "code": "resource_removed",
+                            "account_id": stale["account_id"],
+                            "resource_id": "resource-stale",
+                        }
+                    ],
+                }
+            )
+
+            self.assertEqual([], result["issues"])
+            domain.record_binding_issues(result["issues"])
+            self.assertEqual([], domain.snapshot()["binding_issues"])
+            # The stale slot keeps its value: nothing here destroys a
+            # credential, it only declines to route through one.
+            written = domain.export(include_sensitive=True)["providers"][0]
+            self.assertEqual(
+                "replace-stale-credential",
+                next(
+                    item
+                    for item in written["api_keys"]
+                    if item["name"] == stale_slot["name"]
+                )["value"],
+            )
+
     def test_a_route_that_names_no_key_is_not_adopted_by_the_linked_key(self) -> None:
         """The pane's “no key” choice survives Apply and the relay keeps its own routes.
 
@@ -700,6 +872,68 @@ model_list:
             # Another account's failure marks nothing here.
             domain.record_binding_issues([{"code": "refresh_failed", "account_id": "account-other"}])
             self.assertEqual([], domain.snapshot()["binding_issues"])
+
+    def test_a_discarded_draft_takes_its_binding_marks_with_it(self) -> None:
+        """A brown row must always have a reason on screen.
+
+        The relay-binding marks are how the pane shows which key or route
+        refused a write, and they paint their rows in the warning ink.  They
+        describe a staged draft, so discarding that draft has to take them: a
+        mark left behind painted a row brown for a refusal the user had already
+        abandoned, with no message anywhere left to say why — a colour with no
+        explanation, which is exactly what an unexplained warning reads as.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            domain = ProvidersModelsDomain(root / "config.yaml")
+            provider = domain.dispatch(
+                "provider.add",
+                {
+                    "provider": {
+                        "name": "provider-a",
+                        "enabled": True,
+                        "api_base": "https://relay.example.test/v1",
+                        "models": [],
+                    }
+                },
+            )["providers"][0]
+            provider_id = provider["id"]
+            domain.dispatch(
+                "model.select_relay_resource",
+                {
+                    "provider_id": provider_id,
+                    "model_id": domain.dispatch(
+                        "model.add",
+                        {
+                            "provider_id": provider_id,
+                            "model": {"name": "public-chat", "upstream_model": "upstream-chat"},
+                        },
+                    )["providers"][0]["models"][0]["id"],
+                    "source": relay_source(),
+                },
+            )
+            state = domain.snapshot()["providers"][0]
+            key = next(item for item in state["key_states"] if item["source"]["kind"] == "relay")
+            issue = {
+                "code": "resource_key_unavailable",
+                "provider_key_id": key["id"],
+                "provider_id": state["editor_id"],
+            }
+
+            for action in ("cancel", "reset", "reload"):
+                domain.record_binding_issues([issue])
+                self.assertEqual(
+                    ["resource_key_unavailable"],
+                    [row["code"] for row in domain.snapshot()["binding_issues"]],
+                    action,
+                )
+                domain.dispatch(action, {})
+                self.assertEqual(
+                    [],
+                    domain.snapshot()["binding_issues"],
+                    f"{action} left a marked row behind",
+                )
 
     def test_a_key_with_its_own_persisted_value_materializes_without_the_station(self) -> None:
         """Model management stays decoupled from relay sign-in.

@@ -44,6 +44,108 @@ class HookPatchTests(HookTestCase):
             deployment,
         )
 
+    def test_a_group_whose_every_route_is_cooling_keeps_serving_a_fresh_request(self) -> None:
+        """A configured group must never answer "no deployments available".
+
+        Two routes in one model group (production shape: the same public model
+        on two providers at different orders) each reach the cooldown threshold
+        for unrelated upstream failures.  The pool is then empty at the moment
+        a fresh request arrives, so LiteLLM reports no healthy deployments for
+        a group that is configured and healthy enough to route.  The route
+        whose cooldown ends first has waited longest and is handed back, so the
+        request is attempted instead of being refused before it starts.
+        """
+
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+        soon = {
+            "litellm_params": {"order": 0, "model": "openai/x", "api_base": "https://a.example.test/v1"},
+            "model_info": {"id": "route-soon", "provider": "provider-a"},
+        }
+        later = {
+            "litellm_params": {"order": 0.11, "model": "openai/x", "api_base": "https://b.example.test/v1"},
+            "model_info": {"id": "route-later", "provider": "provider-b"},
+        }
+        deployments = [soon, later]
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return deployments
+
+        for deployment in deployments:
+            error = RuntimeError("temporary upstream failure")
+            error.status_code = 503
+            hooks._mark_exception_for_deployment_failover(
+                error,
+                {
+                    "model": "public-model",
+                    "litellm_params": deployment["litellm_params"],
+                    "model_info": deployment["model_info"],
+                },
+            )
+        # The second route was cooled later, so its cooldown ends later too.
+        cooldown_keys = hooks._deployment_cooldown_keys_from_deployment(later)
+        with hooks._DEPLOYMENT_COOLDOWN_LOCK:
+            for cooldown_key in cooldown_keys:
+                state = hooks._DEPLOYMENT_COOLDOWNS.get(cooldown_key)
+                if isinstance(state, dict):
+                    state["cooldown_until"] = float(state.get("cooldown_until") or 0.0) + 60
+
+        available, cooled, cooldown_filtered = hooks._with_active_deployment_cooldowns(
+            deployments,
+            request_kwargs={},
+        )
+        self.assertEqual([], available)
+        self.assertTrue(cooldown_filtered)
+        self.assertEqual(2, len(cooled))
+
+        selected = hooks._request_local_cooling_only_candidate_deployment(
+            Router(),
+            "public-model",
+            {},
+            target_order=None,
+        )
+
+        self.assertIsNotNone(selected)
+        self.assertEqual("route-soon", selected["model_info"]["id"])
+
+    def test_a_single_route_group_still_keeps_its_only_route_while_cooling(self) -> None:
+        """The one-route case is the same promise, stated for the smallest pool."""
+
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+        deployment = {
+            "litellm_params": {"order": 0, "model": "openai/only"},
+            "model_info": {"id": "only-route", "provider": "provider-a"},
+        }
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [deployment]
+
+        error = RuntimeError("temporary upstream failure")
+        error.status_code = 503
+        hooks._mark_exception_for_deployment_failover(
+            error,
+            {
+                "model": "public-model",
+                "litellm_params": deployment["litellm_params"],
+                "model_info": deployment["model_info"],
+            },
+        )
+
+        self.assertIs(
+            hooks._request_local_cooling_only_candidate_deployment(
+                Router(),
+                "public-model",
+                {},
+                target_order=None,
+            ),
+            deployment,
+        )
+
     async def test_public_model_fallback_is_suppressed_to_preserve_model_identity(self) -> None:
         hooks, _ = load_hook_module()
         router_module = types.ModuleType("litellm.router")
@@ -2687,6 +2789,65 @@ class HookPatchTests(HookTestCase):
         )
 
         self.assertEqual(selected["model_info"]["id"], "only-route")
+
+    async def test_async_selection_of_an_all_cooling_group_serves_the_router_a_route(self) -> None:
+        """The patched selector is what LiteLLM actually calls, so pin it here.
+
+        LiteLLM raises "no healthy deployments" for a group whose every route
+        is cooling, and that exception is what the request log records as the
+        routing state.  The patch is the one place that can answer it, so the
+        selector is exercised through ``async_get_available_deployment`` for a
+        fresh request and must return a route from the cooling pool instead of
+        letting the router raise.
+        """
+
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+        router_module = types.ModuleType("litellm.router")
+        deployments = [
+            {
+                "litellm_params": {"order": 0, "model": "openai/x"},
+                "model_info": {"id": "route-a", "provider": "provider-a"},
+            },
+            {
+                "litellm_params": {"order": 0.11, "model": "openai/x"},
+                "model_info": {"id": "route-b", "provider": "provider-b"},
+            },
+        ]
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return deployments
+
+            async def async_get_available_deployment(self, model, request_kwargs):
+                error = RuntimeError(
+                    "You passed in model=default-chat. There are no healthy deployments for this model"
+                )
+                error.status_code = 400
+                raise error
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_routing_constraint_patch()
+        for deployment in deployments:
+            cooldown_error = RuntimeError("upstream route failure")
+            cooldown_error.status_code = 503
+            hooks._mark_exception_for_deployment_failover(
+                cooldown_error,
+                {
+                    "model": "default-chat",
+                    "litellm_params": deployment["litellm_params"],
+                    "model_info": deployment["model_info"],
+                },
+            )
+
+        selected = await Router().async_get_available_deployment(
+            "default-chat",
+            {"model": "default-chat"},
+        )
+
+        self.assertIn(selected["model_info"]["id"], {"route-a", "route-b"})
 
     async def test_async_selection_does_not_bypass_unique_cooling_candidate_for_route_recovery_poll(self) -> None:
         hooks, _ = load_hook_module()

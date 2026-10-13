@@ -52,6 +52,7 @@ _SECRET_FIELDS: dict[tuple[str, str], bool] = {
     ("runtime", "setting"): True,
     ("webdav", "password"): False,
     ("relay_accounts", "api_key"): True,
+    ("relay_accounts", "password"): True,
 }
 
 _PLAINTEXT_SECRET_FIELDS = {
@@ -61,6 +62,7 @@ _PLAINTEXT_SECRET_FIELDS = {
     ("claude", "deployment_token"),
     ("claude", "desktop_gateway_api_key"),
     ("relay_accounts", "api_key"),
+    ("relay_accounts", "password"),
     ("runtime", "setting"),
 }
 
@@ -2143,21 +2145,52 @@ class CoreStore:
                     # ``RelayTransportError`` is raised exactly by a read that
                     # never reached an answer.
                     unreachable = False
+                    # The station answered and refused the sign-in itself,
+                    # because the account already holds as many concurrent
+                    # sessions as the site allows.  The remembered password is
+                    # not what was rejected, so recording 未登录 here would state
+                    # a login the station never stated and would bury the one
+                    # reason the user can act on.  The observation is left as it
+                    # was and the caller names the refusal.
+                    refused: CoreError | None = None
                     if public is None:
-                        from .domains.relay_accounts import RelayTransportError
+                        from .domains.relay_accounts import (
+                            RelayLoginRefusedError,
+                            RelaySessionLimitError,
+                            RelayTransportError,
+                        )
 
-                        if login_status == "signed_out":
-                            try:
-                                public = session_restorer(str(account_id))
-                            except RelayTransportError:
-                                unreachable = True
-                            except Exception:
-                                public = None
+                        # A stored credential is asked whether it still works
+                        # before any sign-in is attempted -- for ``expired``
+                        # exactly as for ``signed_out``.  The ``expired`` branch
+                        # used to go straight to the remembered password, so a
+                        # cookie that still worked was thrown away and every entry
+                        # made the station mint another session; an account at the
+                        # site's session cap then could not sign in at all, from a
+                        # password nobody had changed.  Probing costs one
+                        # authenticated read and mints nothing, so a working
+                        # cookie is simply reused and the count never grows.
+                        try:
+                            public = session_restorer(str(account_id))
+                        except RelayTransportError:
+                            unreachable = True
+                        except Exception:
+                            public = None
                         if public is None and not unreachable:
                             try:
                                 public = password_restorer(str(account_id))
                             except RelayTransportError:
                                 unreachable = True
+                            except RelaySessionLimitError:
+                                refused = CoreError(
+                                    "relay_login_session_limit",
+                                    "The station refused a new session, so the login was left unchanged",
+                                )
+                            except RelayLoginRefusedError:
+                                refused = CoreError(
+                                    "relay_login_backoff",
+                                    "A recent sign-in was refused, so this one was not attempted yet",
+                                )
                             except Exception:
                                 public = status_setter(str(account_id), str(login_status))
                         # ``expired`` is the station's own rejection of its
@@ -2170,6 +2203,8 @@ class CoreStore:
                                 "relay_restore_unavailable",
                                 "The station could not be reached, so the login was not re-checked",
                             )
+                        if refused is not None and public is None:
+                            raise refused
                     if public is None:
                         public = status_settler(str(account_id), str(login_status))
                 elif login_status in {"signed_out", "expired"}:
@@ -2815,15 +2850,20 @@ class CoreStore:
                 if adapter is None:
                     raise DomainNotFound(name)
                 before = copy.deepcopy(self._baselines.get(name))
-                action_draft_before = (
-                    self._adapter_draft_state(name)
-                    if name == "providers_models"
-                    and normalized_action in {
-                        "provider_auth_status",
-                        "service_provider_auth_status",
-                    }
-                    else None
-                )
+                # What this dispatch leaves staged.  ``after`` is read once at
+                # the end of the transaction, so this single capture answers
+                # both questions the response depends on: whether the draft
+                # moved away from its baseline (a real staged edit, which must
+                # advance the shared revision) and whether the action changed
+                # the draft at all.  Capturing it for every action is what lets
+                # a live read that mutates nothing -- an account question, a
+                # catalog fetch, an authorization poll, a probe -- answer
+                # without advancing the revision every other window keys its
+                # Apply on.  Advancing it there is not harmless bookkeeping:
+                # the pane's own debounced Apply then reads a revision it never
+                # caused and reports the user's work back as "settings changed
+                # outside this window".
+                action_draft_before = self._adapter_draft_state(name)
                 payload = data.get("payload")
                 if name == "providers_models" and action_type.replace("-", "_").replace(".", "_") in {
                     "providers_import_selected",
@@ -2926,7 +2966,25 @@ class CoreStore:
                                     "domain_error",
                                     "Relay API key material is unavailable",
                                 )
-                            materials = materializer({"resources": [source]})
+                            # The durable half of "a key this Core already holds".
+                            # A linked slot persists its value in the provider
+                            # document, while the relay domain's in-process cache
+                            # does not survive a restart -- and an account whose
+                            # dashboard session has expired cannot hand its keys
+                            # over at all.  Passing the slots is what makes 获取模型
+                            # work from the credential already on disk instead of
+                            # reporting the key unresolvable, exactly as an Apply
+                            # resolves it; the station is still read for any
+                            # source the slots do not cover.  The provider domain
+                            # is looked up here rather than reusing the
+                            # dependency-transaction local below, which is None
+                            # for this action.
+                            providers_domain = self._domains.get("providers_models")
+                            slot_reader = getattr(providers_domain, "relay_slot_credentials", None)
+                            materials = materializer(
+                                {"resources": [source]},
+                                slot_credentials=slot_reader() if callable(slot_reader) else None,
+                            )
                             rows = materials.get("resources") if isinstance(materials, Mapping) else None
                             material = next(
                                 (
@@ -3060,8 +3118,11 @@ class CoreStore:
                     # discard a change that altered nothing visible.
                     self._baselines[name] = copy.deepcopy(after)
                 dirty = False if cosmetic_binding else after != before
-                action_mutated = action_draft_before is None or after != action_draft_before
-                if action_mutated:
+                # Only a dispatch that left the draft somewhere new is a state
+                # change.  A read whose answer travels as this response's own
+                # ``action_summary`` staged nothing, so it publishes no new
+                # revision for other windows to reconcile against.
+                if after != action_draft_before:
                     self._revision += 1
                     self._mark_domain(
                         name,
@@ -3699,6 +3760,52 @@ class CoreStore:
         binding_materials = getattr(relay, "binding_materials", None)
         if not all(callable(method) for method in (prepare, execute, reconcile, commit, finalize, binding_materials)):
             raise CoreError("relay_apply_unavailable", "Relay synchronization is unavailable")
+        # The journal runs four passes over the same accounts, and only a pass
+        # that actually writes a key changes what the station reports.  Opening
+        # one read memo for the whole Apply is what keeps a routine edit from
+        # paying a full dashboard round trip plus one gateway catalog per key
+        # once per pass, with the store lock held throughout.  The domain drops
+        # an account's entry as soon as a write lands on it.
+        begin_reads = getattr(relay, "begin_apply_reads", None)
+        end_reads = getattr(relay, "end_apply_reads", None)
+        try:
+            if callable(begin_reads):
+                begin_reads()
+            return self._apply_relay_transaction(
+                names,
+                adapters,
+                confirm_codes,
+                overwrite_codes,
+                relay=relay,
+                relay_dependency_only=relay_dependency_only,
+                prepare=prepare,
+                execute=execute,
+                reconcile=reconcile,
+                commit=commit,
+                finalize=finalize,
+                binding_materials=binding_materials,
+            )
+        finally:
+            if callable(end_reads):
+                end_reads()
+
+    def _apply_relay_transaction(
+        self,
+        names: Sequence[str],
+        adapters: Mapping[str, DomainAdapter],
+        confirm_codes: Sequence[str],
+        overwrite_codes: set[str],
+        *,
+        relay: DomainAdapter,
+        relay_dependency_only: bool,
+        prepare: Any,
+        execute: Any,
+        reconcile: Any,
+        commit: Any,
+        finalize: Any,
+        binding_materials: Any,
+    ) -> dict[str, Any]:
+        """The coordinated relay transaction, inside one Apply's read memo."""
 
         transaction_adapters = dict(adapters)
         adapter_checkpoints = {

@@ -1887,6 +1887,22 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("rememberPassword: Bool?,", mac_leaf)
         self.assertIn("let capturedPassword = self.capturedPassword", mac_leaf)
         self.assertIn("password: rememberPassword == true ? capturedPassword : nil", mac_leaf)
+        # A remembered account has both fields filled from what the app already
+        # knows: the password Core keeps for this account is read through the
+        # native plaintext lease, typed into the station's own form beside the
+        # username, and the completed form is submitted once.
+        prefill = mac_leaf.split("private func prefillLoginWhenReady()", 1)[1].split("private func jsonLiteral", 1)[0]
+        self.assertIn("field: \"password\"", mac_leaf)
+        self.assertIn("const password = document.querySelector('input[type=password], input[autocomplete=current-password]');", prefill)
+        self.assertIn("set(password, \\(safePassword));", prefill)
+        self.assertIn("requestSubmit", prefill)
+        self.assertIn("private var restoredPassword: String?", mac_leaf)
+        self.assertIn("private var didAutoSubmitSavedPassword = false", mac_leaf)
+        self.assertIn("private func restoreRememberedPassword()", mac_leaf)
+        self.assertIn("didAutoSubmitSavedPassword = false", mac_leaf)
+        # A password the app filled back in is not a new keep-or-not decision.
+        persist = mac_leaf.split("private func persistVerifiedLogin(", 1)[1].split("/// The post-login question", 1)[0]
+        self.assertIn("restoredPassword == capturedPassword", persist)
         self.assertNotIn("autoLoginAttempt", mac_leaf)
         self.assertIn("private var automaticCheckProbe: DispatchWorkItem?", mac_leaf)
         self.assertIn("private var loginFormRevealProbe: DispatchWorkItem?", mac_leaf)

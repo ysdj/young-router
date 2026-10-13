@@ -179,6 +179,31 @@ def _anchor_scalar(value: Any, anchor: str) -> str:
     return f"&{anchor} {_plain_scalar(value)}"
 
 
+def _unique_anchor(anchor: str, seen: set[str]) -> str:
+    """One anchor name that no earlier name in this document already uses.
+
+    YAML requires an anchor to be unique, and the names this file derives from
+    user labels are not: ``_anchor_part`` keeps only ``[A-Za-z0-9_]``, so a
+    label written entirely in Chinese -- which is ordinary for a relay key --
+    contributes nothing and two of them become the same anchor.  YAML then
+    rejects the whole document as a duplicate anchor, which surfaced in the
+    pane as its newly added key being "unavailable".  A collision is therefore
+    disambiguated here, at the one place anchors are minted, instead of failing
+    the write.  The first name to claim an anchor keeps it, so every document
+    that already loads keeps byte-identical anchors.
+    """
+
+    if anchor not in seen:
+        seen.add(anchor)
+        return anchor
+    suffix = 2
+    while f"{anchor}_{suffix}" in seen:
+        suffix += 1
+    unique = f"{anchor}_{suffix}"
+    seen.add(unique)
+    return unique
+
+
 def _alias_scalar(anchor: str) -> str:
     return f"*{anchor}"
 
@@ -208,10 +233,9 @@ def _normalized_api_keys(provider: dict[str, Any]) -> list[dict[str, Any]]:
     seen_anchors: set[str] = set()
     provider_name = str(provider.get("name", "")).strip()
     for item in keys:
-        anchor = _provider_key_anchor(provider_name, item["name"])
-        if anchor in seen_anchors:
-            raise ValueError(f"API key labels in provider {provider_name} produce duplicate YAML anchors")
-        seen_anchors.add(anchor)
+        # A label that reduces to an anchor another label already claimed is
+        # disambiguated rather than rejected; see ``_unique_anchor``.
+        item["anchor"] = _unique_anchor(_provider_key_anchor(provider_name, item["name"]), seen_anchors)
 
     return keys
 
@@ -285,7 +309,7 @@ def _dump_providers_section(providers: list[dict[str, Any]]) -> str:
             lines.append("    api_keys:")
             for item in keys:
                 lines.append(f"      - name: {_plain_scalar(item['name'])}")
-                lines.append(f"        value: {_anchor_scalar(item['value'], _provider_key_anchor(name, item['name']))}")
+                lines.append(f"        value: {_anchor_scalar(item['value'], item['anchor'])}")
         extra = dict(_as_dict(provider.get("extra")))
         extra[MENU_RELAY_KEYS_KEY] = _provider_key_metadata(keys)
         raw_source = extra.get(MENU_PROVIDER_SOURCE_KEY)
@@ -386,7 +410,6 @@ def _entry_from_editor(
         else _api_key_by_name(provider, key_name)
     )
     api_key = ""
-    resolved_key_name = api_key_item["name"] if api_key_item else ""
     if api_key_item is None and (key_name or provider_key_id):
         # The model names a key — or a slot — this provider does not offer.  An
         # enabled route is refused by name instead of falling back to another
@@ -415,10 +438,13 @@ def _entry_from_editor(
         model_info[MENU_KEY_BINDING_KEY] = "unbound"
         # Reference the key that carries this credential when one does, so a
         # rotated credential keeps flowing into an unbound route too; a
-        # credential no key carries stays literal.
-        resolved_key_name = next(
-            (item["name"] for item in keys if api_key and item["value"] == api_key),
-            "",
+        # credential no key carries stays literal.  The matched slot is kept as
+        # ``api_key_item`` so the alias below can point at the anchor that slot
+        # actually owns -- a provider whose labels collide resolves theirs here,
+        # and re-deriving the anchor from the name would name the wrong one.
+        api_key_item = next(
+            (item for item in keys if api_key and item["value"] == api_key),
+            None,
         )
     else:
         api_key = api_key_item["value"] if api_key_item else ""
@@ -434,8 +460,8 @@ def _entry_from_editor(
         params["api_base"] = {"__alias__": _make_anchor_name(provider_name, "api_base")} if use_provider_aliases else api_base
     if api_key:
         params["api_key"] = (
-            {"__alias__": _provider_key_anchor(provider_name, resolved_key_name)}
-            if use_provider_aliases and resolved_key_name
+            {"__alias__": api_key_item["anchor"]}
+            if use_provider_aliases and api_key_item is not None
             else api_key
         )
 

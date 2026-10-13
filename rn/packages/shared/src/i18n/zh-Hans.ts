@@ -227,7 +227,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "logs.originalRecord": "日志原文",
   "error.generic": "发生错误",
   "error.confirmationRequired": "需要明确确认。",
-  "error.revisionConflict": "设置已在窗口外变更，请重新加载后重试。",
+  "error.revisionConflict": "设置已在变更中，本次仍按最新状态提交。",
   "error.relayNotReady": "中转站还有待处理的操作，本次更改未生效。请在“供应商与模型”中刷新资源或重新登录后重试。",
   "error.relayBindingFailed": "已链接的中转密钥无法解析该路由（资源、域名或上游模型），本次更改未生效。请刷新资源并核对该路由的上游模型。",
   "error.validationFailed": "校验未通过，更改未生效。",
@@ -547,18 +547,18 @@ export const zhHans: Record<TranslationKey, string> = {
   "providers.keyOrderColumn": "密钥名 / 顺序",
   "providers.order": "顺序",
   "providers.publicModelTitle": "公开模型",
-  // The label names the client the number reaches, not the limit it imposes: the
-  // value is a declaration the managed catalog hands to Codex, which compacts
-  // at 95% of it.  Calling it plain 上下文 next to a route table read as a
-  // proxy-side ceiling the proxy never enforces, so the label keeps Codex in it.
-  "providers.contextWindow": "Codex 上下文",
+  // The field is the one number this app hands Codex as this public model's
+  // window, so it is named for what it is rather than for the client that
+  // reads it: the pair beside it in the model detail already says which client
+  // the numbers reach, and 上下文 is the word the row's own help title uses.
+  "providers.contextWindow": "上下文",
   "providers.publicModelDefaultHint": "留空默认 {value}",
   // The button opens the public-model pane, which owns the write: the window
   // is one number for the whole group, so the model detail never edits it.
   "providers.publicModelSettings": "设置",
-  "providers.publicModelSettingsHint": "在公开模型设置中修改该模型的 Codex 上下文",
-  "providers.contextWindowHelpTitle": "Codex 压缩窗口是什么",
-  "providers.contextWindowHelp": "告知启用了模型目录的 Codex 这个模型能吃多少对话，超出后它自行压缩。这不是代理的限制：请求本身不受限，只是 Codex 会提前开始压缩。填写会覆盖上游元数据的最大窗口与有效百分比。",
+  "providers.publicModelSettingsHint": "在公开模型设置中修改该模型的上下文",
+  "providers.contextWindowRowHelpTitle": "上下文这两个数是什么",
+  "providers.contextWindowRowHelp": "左边是 Codex 当前使用的上下文窗口：客户端按它判断对话能吃多长，超出后自行压缩；右边是上限，也就是这个模型最多能被提到多少。这两个数由本机模型元数据解析而来：公开模型没有自定义上下文时，右边就是元数据给出的最大窗口，Codex 会把自定义值限在这个数以内；一旦你填写了自定义值，本应用会把它同时写进当前窗口与上限，两个数因此相同，行内只显示一个。",
   "providers.followMultiplier": "跟随倍率",
   "providers.addWizard": "添加向导...",
   "providers.wizard.title": "配置供应商",
@@ -606,6 +606,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "providers.keys": "密钥",
   "providers.keysCustom": "自定义密钥",
   "providers.keysProvided": "供应商提供",
+  "providers.orphanKeyHint": "该密钥在中转站上已不存在，只在本地保留。删除它不会影响中转站。",
   "providers.providedKeysNeedAccount": "还没有已登录账号。在右侧“账号管理”中添加并登录账号后，供应商提供的密钥会显示在这里。",
   "providers.accounts": "中转站关联",
   "providers.detail": "详情",
@@ -744,6 +745,8 @@ export const zhHans: Record<TranslationKey, string> = {
   "relay.loginComplete": "登录成功。基础 URL 匹配的供应商会自动显示这些 API 密钥。",
   "relay.loginResourcesUnavailable": "登录成功，但无法加载 API 资源。请点击“刷新资源”重试。",
   "relay.loginNotCompleted": "登录已取消，或未检测到有效登录状态。",
+  "relay.loginRefusedElsewhere": "中转站拒绝签发新的登录会话（该账号的同时在线会话数已达上限，多次重复登录也会累积占满）。已保存的会话仍会被优先复用，不会因此被清除；请先在已登录的设备上退出其他登录会话，或重置站点密码。",
+  "relay.loginBackoff": "刚被中转站拒绝过登录，暂不重复尝试，稍后会自动重试。已保存的会话仍会被优先复用。",
   "relay.operationFailed": "操作失败，请重试。",
   "relay.credentialsCleanupPending": "账号已删除，但仍需清除“{label}”的本机凭据。",
   "relay.retryCleanup": "重试清理本机凭据",

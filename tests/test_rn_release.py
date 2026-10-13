@@ -592,6 +592,31 @@ class ReactNativeReleaseTests(unittest.TestCase):
         install = install[:install.index("\n\n")] if "\n\n" in install else install
         self.assertIn("--target", install)
 
+    def test_the_build_proves_the_staged_workbuddy_key_factory_is_still_reachable(self) -> None:
+        # A WorkBuddy variant's store can only open a 5.6-era sealed desktop
+        # credential through the library's per-variant at-rest key factory, and
+        # that factory is the one name upstream builds internally without
+        # exporting from its entry point.  The worker resolves it by name from
+        # the sibling chunks, so the build must prove that name is still
+        # reachable: without this check a release that moved it would ship, and
+        # every signed-in account would read as 未登录 with
+        # `electron-binary-unavailable` -- the exact failure this guard exists
+        # to catch.
+        script = (ROOT / "scripts" / "build-and-install-macos.sh").read_text(encoding="utf-8")
+        self.assertIn("atRestKeyProviderFor", script)
+        self.assertIn("no longer resolvable from the staged package", script)
+        # The published surface stays checked in the same smoke test.
+        self.assertIn("WorkBuddyCredentialStore", script)
+        # The build's resolution must mirror the worker's, or the check would
+        # pass while the worker itself failed to find the factory.
+        worker = (ROOT / "young_router" / "adapters" / "workbuddy_worker.mjs").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("atRestKeyProviderFor", worker)
+        for name in ("WorkBuddyCredentialStore", "WorkBuddyUpstreamClient", "WorkBuddyCatalog"):
+            self.assertIn(name, script)
+            self.assertIn(name, worker)
+
     def test_windows_build_checks_085_codegen_before_msbuild(self) -> None:
         package = (ROOT / "rn/package.json").read_text(encoding="utf-8")
         script = (ROOT / "rn/scripts/build-windows.ps1").read_text(encoding="utf-8")

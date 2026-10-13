@@ -227,7 +227,7 @@ export const en: Record<TranslationKey, string> = {
   "logs.originalRecord": "Original Log Record",
   "error.generic": "Something went wrong",
   "error.confirmationRequired": "Explicit confirmation is required.",
-  "error.revisionConflict": "Settings changed outside this window. Reload and try again.",
+  "error.revisionConflict": "Settings were already changed; the change was applied again.",
   "error.relayNotReady": "The relay still has work pending, so the change was not applied. Refresh its resources or sign in again under Providers & Models, then try again.",
   "error.relayBindingFailed": "The linked relay key could not be resolved for this route (its resource, base URL, or upstream model), so the change was not applied. Refresh the relay resources and check this route's upstream model.",
   "error.validationFailed": "Validation failed; changes not applied.",
@@ -547,18 +547,18 @@ export const en: Record<TranslationKey, string> = {
   "providers.keyOrderColumn": "Key / Order",
   "providers.order": "Order",
   "providers.publicModelTitle": "Public model",
-  // The label names the client the number reaches, not the limit it imposes: the
-  // value is a declaration the managed catalog hands to Codex, which compacts
-  // at 95% of it.  Calling it plain "Context" next to a route table read as a
-  // proxy-side ceiling the proxy never enforces, so the label keeps Codex in it.
-  "providers.contextWindow": "Codex context",
+  // The field is the one number this app hands Codex as this public model's
+  // window, so it is named for what it is rather than for the client that
+  // reads it: the pair beside it in the model detail already says which client
+  // the numbers reach, and "Context" is the word the row's own help title uses.
+  "providers.contextWindow": "Context",
   "providers.publicModelDefaultHint": "Default {value}",
   // The button opens the public-model pane, which owns the write: the window
   // is one number for the whole group, so the model detail never edits it.
   "providers.publicModelSettings": "Set",
-  "providers.publicModelSettingsHint": "Change this model's Codex context in the public model's own settings",
-  "providers.contextWindowHelpTitle": "What the Codex compaction window is",
-  "providers.contextWindowHelp": "Tells a Codex client with the model catalog enabled how much conversation this model can hold, and it compacts on its own past that. This is not a proxy limit: requests are not capped, Codex simply compacts earlier. A value here also overrides the upstream metadata's maximum window and effective percentage.",
+  "providers.publicModelSettingsHint": "Change this model's context in the public model's own settings",
+  "providers.contextWindowRowHelpTitle": "What the two context numbers are",
+  "providers.contextWindowRowHelp": "The left number is the context window Codex runs this model with: the client reads it to decide how long a conversation may get, and compacts on its own past that. The right number is the ceiling, how far that window may be raised. Both come from this machine's model metadata: while a public model carries no context of its own, the ceiling is the maximum window that metadata declares and Codex clamps any override to it; once you set a value of your own, this app writes it to both fields, so the two numbers are equal and the row shows only one.",
   "providers.followMultiplier": "Follow multiplier",
   "providers.addWizard": "Add with wizard",
   "providers.wizard.title": "Configure provider",
@@ -606,6 +606,7 @@ export const en: Record<TranslationKey, string> = {
   "providers.keys": "Keys",
   "providers.keysCustom": "Custom keys",
   "providers.keysProvided": "Provider-provided",
+  "providers.orphanKeyHint": "The relay no longer lists this key; it exists only in this configuration now. Deleting it touches nothing on the station.",
   "providers.providedKeysNeedAccount": "No signed-in account yet. Add and sign in to an account under Accounts on the right, then provider-provided keys appear here.",
   "providers.accounts": "Relay links",
   "providers.detail": "Detail",
@@ -744,6 +745,8 @@ export const en: Record<TranslationKey, string> = {
   "relay.loginComplete": "Signed in. Matching providers now show these API keys automatically.",
   "relay.loginResourcesUnavailable": "Signed in, but API resources could not be loaded. Select Refresh Resources to retry.",
   "relay.loginNotCompleted": "Sign-in was cancelled or no valid sign-in was detected.",
+  "relay.loginRefusedElsewhere": "The station refused to issue a new session: this account already holds as many concurrent sessions as the site allows, and repeated sign-ins add to that count. The saved session is still probed first and is not cleared by this; sign out of the other sessions, or reset the station password.",
+  "relay.loginBackoff": "A sign-in was just refused, so this app is not retrying yet. The saved session is still probed first in the meantime.",
   "relay.operationFailed": "The operation failed. Try again.",
   "relay.credentialsCleanupPending": "The account was deleted, but local credentials for {label} still need to be cleared.",
   "relay.retryCleanup": "Retry Local Cleanup",

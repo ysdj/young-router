@@ -5,7 +5,7 @@ import { createTranslator } from "../i18n";
 import { assistantSettingOptions, type AssistantSettingOption } from "../i18n/assistantSettingsI18n";
 import { runtimeCategoryLabel, runtimeFieldHelp, runtimeFieldLabel, runtimeOptionLabel, runtimeUnitLabel } from "../i18n/runtimeSettingsI18n";
 import { canonicalWindowRoute, isSettingsPaneRoute, isSettingsShellRoute, LOG_TABS, routeMenuActions, ROUTES, SETTINGS_PANES, SETTINGS_PANE_PRESENTATION } from "../routes";
-import { NativeButton, NativeCheckbox, NativePersistentScrollIndicator, NativePicker, NativeSecureTextInput, NativeSegmentedControl, NativeTable, NativeTextField, NativeToggle } from "./NativeControls";
+import { NativeButton, NativeBusySpinner, NativeCheckbox, NativePersistentScrollIndicator, NativePicker, NativeSecureTextInput, NativeSegmentedControl, NativeTable, NativeTextField, NativeToggle } from "./NativeControls";
 import { CodeEditorWebView, editorMenuLabels, readOnlyCodeEditorHtml } from "./code-editor/CodeEditorWebView";
 import { usePendingAction } from "./pendingAction";
 import {
@@ -20,6 +20,7 @@ import {
   type ProvidedKeyRow,
   pendingCredentialCleanups,
   relaySessionRecheckSeconds,
+  serviceAccountRecheckSeconds,
   StationAccountsPanel,
   stationDisplayName,
   stationOriginKey,
@@ -189,8 +190,8 @@ function providerService(provider: UnknownRecord | undefined): ServiceID | undef
 
 /**
  * One service's catalog, keyed by model id and refreshed on a short interval.
- * The rate the picker shows has to survive into the detail pane without a
- * fetch per selected model.
+ * The rate the picker shows has to survive into the detail pane and the model
+ * list without a fetch per selected or painted model.
  */
 const SERVICE_RATE_TTL_MS = 5 * 60 * 1000;
 const serviceRates = new Map<string, { at: number; rates: Record<string, string> }>();
@@ -318,6 +319,24 @@ function workbuddyAccountFacts(live: UnknownRecord, observed: UnknownRecord): Un
 }
 
 /**
+ * Whether Core's own account read is still inside its window.
+ *
+ * A WorkBuddy entry reads the desktop-app account and its credit, and each of
+ * those may start a worker and read a credential, so the pane applies the same
+ * window Core applies (运行时 adjusts it) before it asks: an account Core read
+ * seconds ago is not a question to ask again.  The section's own 刷新 button
+ * bypasses this, because a user's click is exactly the request to read for
+ * real.  An observation with no age — nothing was ever read — is never fresh.
+ */
+function workbuddyObservationIsFresh(provider: UnknownRecord, windowSeconds: number | undefined): boolean {
+  if (typeof windowSeconds !== "number" || !(windowSeconds > 0)) return false;
+  const age = provider.auth_observed_seconds_ago;
+  if (typeof age !== "number" || !Number.isFinite(age)) return false;
+  if (!stringValue(asRecord(provider.auth_observed).state)) return false;
+  return age < windowSeconds;
+}
+
+/**
  * One catalog rate as a number, or `undefined` when the row shows none.
  *
  * The displayed value keeps the catalog's own spelling (`x0.79`, or the free
@@ -330,6 +349,23 @@ function serviceRateNumber(value: string): number | undefined {
   if (!text) return undefined;
   const parsed = Number(text);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
+/**
+ * One route's 倍率, as the list column states it next to the order it feeds.
+ *
+ * The number is the one the route's own 跟随倍率 switch already follows: a
+ * relay key's group multiplier, or the rate an account-backed service states
+ * for the model this route calls.  Both are read from the same cache the
+ * detail pane reads, so the column and the pane can never disagree about the
+ * rate a row is following.  A route whose rate is not known prints nothing —
+ * an em dash would read as a zero, and this column is compared read down like
+ * the order beside it.
+ */
+function modelRateText(service: ServiceID | undefined, upstreamModelID: string, relayMultiplier: number | undefined, translate: Translate): string {
+  if (relayMultiplier !== undefined) return `×${relayMultiplier}`;
+  const rate = peekServiceRate(service, upstreamModelID);
+  return rate === undefined ? "" : serviceRateNumber(rate) !== undefined ? rate : translate("common.none");
 }
 
 /** The shared busy word, or nothing when the read has settled. */
@@ -888,6 +924,11 @@ function errorMessage(reason: unknown, translate: Translate): string {
     // A linked relay key that could not be resolved names its own cause: the
     // route's resource, base URL, or upstream model, never a bare rollback.
     relay_binding_failed: "error.relayBindingFailed",
+    // A sign-in the station refused, and one this app is deliberately not
+    // retrying yet, are not bad passwords: each names its own reason so the
+    // user acts on the cause instead of retyping a credential that is fine.
+    relay_login_session_limit: "relay.loginRefusedElsewhere",
+    relay_login_backoff: "relay.loginBackoff",
     // A write that rolled back: name the outcome the pane can show, never the
     // relay step that raised it.
     apply_failed: "common.notApplied",
@@ -2977,6 +3018,8 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   type WizardStep = "provider" | "keys" | "model";
   type WizardType = "api" | "openai" | "claude" | "workbuddy" | "workbuddyAI";
   const [step, setStep] = useState<WizardStep>("provider");
+  // The step the last advance left, so one press cannot advance twice.
+  const stepRef = useRef<WizardStep | undefined>("provider");
   const [providerType, setProviderType] = useState<WizardType>("api");
   const [providerMode, setProviderMode] = useState<"new" | "existing">("new");
   const [providerSelection, setProviderSelection] = useState(PROVIDER_WIZARD_NEW_PROVIDER);
@@ -2995,6 +3038,17 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   const [keySelection, setKeySelection] = useState("");
   const [keyName, setKeyName] = useState("");
   const [keyReady, setKeyReady] = useState(false);
+  // The key value belongs to the native field, which stages it on blur or when
+  // it is asked to.  A press on 下一步 is also the press that blurs that field,
+  // so its staging is still on the wire when this step's handler runs and the
+  // readiness flag has not flipped yet: the first press reported
+  // 请填写必填项后继续 for a key the user had already typed, and only the second
+  // press — after the answer had arrived — went on.  `flushStagedKey` is what
+  // waits for that answer instead of reading the flag too early.
+  const stagedKeyField = useRef<{ identity: string; status: string; present: boolean }>({ identity: "", status: "ready", present: false });
+  const keyCommitRequest = useRef(0);
+  const [keyCommitToken, setKeyCommitToken] = useState(0);
+  const keyCommitWaiter = useRef<((present: boolean) => void) | undefined>(undefined);
   // The key the wizard will give the provider it creates, and the token its
   // value is staged under until then.  The value's target never moves while
   // the user types: it carries this session's token and this session's key
@@ -3016,6 +3070,15 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   const [selectedManualModelIDs, setSelectedManualModelIDs] = useState<string[]>([]);
   const [modelFetchState, setModelFetchState] = useState<"idle" | "loading" | "ready" | "empty" | "unavailable">("idle");
   const modelFetchRequest = useRef(0);
+  // One listing owns the step at a time.  This is a ref rather than
+  // `modelFetchState` so a caller that just set that state still reads the
+  // truth here.
+  const modelFetchInFlight = useRef(false);
+  // A step change asks for the listing once the model step is the one
+  // rendering: the keys step's own closure cannot see the model step's values.
+  // It is distinct from `modelFetchRequest` below, which sequences the
+  // listings themselves.
+  const [modelFetchTicket, setModelFetchTicket] = useState(0);
   const manualModelID = useRef(0);
   const [processing, setProcessing] = useState(false);
   const [validation, setValidation] = useState("");
@@ -3079,6 +3142,57 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   // staged under the wizard's own token (see `providerWizardKeyTarget`).
   const creatingProvider = providerMode === "new" && !providerID;
   const stagedKeyTarget = providerWizardKeyTarget(pendingKeyToken, stagedKeyName);
+  // The field's identity is the secret target it stages under: a different
+  // selection is a different field, whose own state starts empty.  Written
+  // during the render that first sees the new identity, so no press can read
+  // the previous field's answer.
+  const stagedKeyFieldIdentity = creatingProvider ? stagedKeyTarget : `${providerID}\u001f${selectedKeyChoice?.name ?? ""}`;
+  if (stagedKeyField.current.identity !== stagedKeyFieldIdentity) {
+    stagedKeyField.current = { identity: stagedKeyFieldIdentity, status: "ready", present: false };
+  }
+  /**
+   * Wait for the value the key field holds to reach Core.
+   *
+   * The native field stages on blur, and the press that runs this step's own
+   * handler is the same press that blurred it — so the field is either dirty
+   * (never staged) or saving (staging right now), and either way the answer
+   * comes from Core.  A field that is neither is already settled and answers
+   * at once, which is what keeps the 完成 path from waiting on nothing.
+   */
+  const flushStagedKey = (): Promise<boolean> => {
+    if (stagedKeyField.current.status !== "dirty" && stagedKeyField.current.status !== "saving") {
+      return Promise.resolve(stagedKeyField.current.present);
+    }
+    return new Promise<boolean>((resolve) => {
+      keyCommitWaiter.current = resolve;
+      keyCommitRequest.current += 1;
+      setKeyCommitToken(keyCommitRequest.current);
+    });
+  };
+  const handleKeyFieldState = (state: SecretState): void => {
+    stagedKeyField.current = { ...stagedKeyField.current, status: state.status, present: state.present };
+    setKeyReady(state.present);
+    if (state.status === "saved" || state.status === "ready" || state.status === "error") {
+      const waiter = keyCommitWaiter.current;
+      keyCommitWaiter.current = undefined;
+      waiter?.(state.present);
+    }
+    onSecretState(state);
+  };
+  // Every path that retargets the key field clears what the previous field
+  // said: a value staged for one selection must never answer for another.
+  const resetStagedKeyField = (): void => {
+    const waiter = keyCommitWaiter.current;
+    keyCommitWaiter.current = undefined;
+    waiter?.(false);
+    stagedKeyField.current = { identity: stagedKeyField.current.identity, status: "ready", present: false };
+    setKeyReady(false);
+  };
+  // The wait the keys step hands to the model step, and the rename that wait
+  // makes worth doing.  Both are read once, on the model step, so the step
+  // change itself never waits on Core.
+  const pendingKeyFlush = useRef<Promise<boolean> | undefined>(undefined);
+  const pendingKeyRename = useRef<string | undefined>(undefined);
   const finishedProviderKeyName = keyName.trim() || stagedKeyName;
   const selectedProvidedChoice = providedChoices.find((source) => `relay:${relaySourceSelectionID(source)}` === providedKeySelection) ?? providedChoices[0];
   const manualSelectedKeyName = selectedKeyChoice?.name ?? (activeKeySelection === PROVIDER_WIZARD_NEW_KEY ? keyName.trim() : "");
@@ -3136,7 +3250,11 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     }
   };
   useEffect(() => {
-    if (step === "keys" && isWorkBuddyType) void loadWorkBuddyAccount(true);
+    // Reaching the keys step asks the account question; it does not force a
+    // new one.  Core's own window answers it from the read this pane just made
+    // (运行时 adjusts the window), so walking back and forth through the wizard
+    // costs no worker round trip and never repaints the account.
+    if (step === "keys" && isWorkBuddyType) void loadWorkBuddyAccount(false);
     // The selected type and the reached step are the only triggers: a reload
     // on every render would fight the refresh button beside the account.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -3213,7 +3331,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   useEffect(() => {
     if (!selectedProvider || processing || keySelection === PROVIDER_WIZARD_NEW_KEY || keyOptions.some((choice) => choice.value === keySelection)) return;
     setKeySelection(keyOptions[1]?.value ?? PROVIDER_WIZARD_NEW_KEY);
-    setKeyReady(false);
+    resetStagedKeyField();
   }, [keyOptions, keySelection, processing, selectedProvider]);
 
   // Seed the editable key-name field once per key selection: the name the
@@ -3252,7 +3370,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     setProviderSelection(PROVIDER_WIZARD_NEW_PROVIDER);
     setKeySelection("");
     setKeyName("");
-    setKeyReady(false);
+    resetStagedKeyField();
     // The keys step re-seeds its own fields for the type just chosen.
     keyNameSeedSelection.current = "";
     setValidation("");
@@ -3298,7 +3416,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     setKeyPath(path);
     setKeySelection("");
     setKeyName("");
-    setKeyReady(false);
+    resetStagedKeyField();
     keyNameSeedSelection.current = "";
     setValidation("");
     setProviderName(path === "login"
@@ -3315,7 +3433,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     setKeySelection("");
     keyNameSeedSelection.current = "";
     setKeyName("");
-    setKeyReady(false);
+    resetStagedKeyField();
     setValidation("");
     setSignedInAccountID(undefined);
     setProvidedKeySelection("");
@@ -3327,7 +3445,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     setKeyPath(value === "new" ? (providerType === "api" ? "manual" : "login") : first && providerAuthKind(first) === "api_key" ? "manual" : "login");
     setKeySelection("");
     setKeyName("");
-    setKeyReady(false);
+    resetStagedKeyField();
     keyNameSeedSelection.current = "";
     setValidation("");
     setSignedInAccountID(undefined);
@@ -3399,9 +3517,45 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     setManualModels((current) => current.filter((model) => model.id !== id));
     setSelectedManualModelIDs((current) => current.filter((modelID) => modelID !== id));
   };
+  /**
+   * The model step's own entry work, run after the step is already on screen.
+   *
+   * 下一步 no longer waits for the key field to reach Core, so the answer it is
+   * waiting for arrives here.  A key that never landed is the one thing that
+   * still has to stop the user, and it stops the model step with 密钥值's own
+   * message instead of delaying the press that asked for the step.
+   */
+  const advanceToModels = async (keyFlush: Promise<boolean>): Promise<void> => {
+    // Whatever the step is showing, it is waiting on this: the wheel turns
+    // until the key answer has settled.
+    setModelFetchState("loading");
+    const keyPresent = await keyFlush.catch(() => false);
+    if (!keyPresent) {
+      setModelFetchState("idle");
+      setValidation(translate("providers.wizard.required"));
+      return;
+    }
+    const rename = pendingKeyRename.current;
+    pendingKeyRename.current = undefined;
+    if (rename && providerID && selectedKeyChoice?.kind === "independent") {
+      const renamed = await dispatchWithOutcome("provider.key_patch", { provider_id: providerID, old_name: selectedKeyChoice.name, name: rename });
+      if (!renamed) {
+        setModelFetchState("idle");
+        return;
+      }
+    }
+    // The step is on screen by now, so the render that owns the model step
+    // performs the listing: this closure was built before the step changed and
+    // its own `serviceBaseURL`/`manualSelectedKeyName` are the keys step's.
+    setModelFetchState("loading");
+    setModelFetchTicket((current) => current + 1);
+  };
   const fetchWizardModels = async (): Promise<void> => {
     if (keyPath !== "manual") return;
-    if (modelFetchState === "loading") return;
+    // The in-flight guard reads the request counter, not the render's
+    // `modelFetchState`: a caller that just set that state (see
+    // `advanceToModels`) would hold a stale closure and re-enter.
+    if (modelFetchInFlight.current) return;
     const keyChoice = selectedKeyChoice;
     const keyNameValue = manualSelectedKeyName;
     // A provider this wizard has not created yet is addressed by the wizard's
@@ -3411,6 +3565,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     const fetchIdentity = creatingProvider ? pendingKeyToken : providerID;
     if (!keyNameValue || (creatingProvider ? !pendingAddress : !providerID)) return;
     const request = ++modelFetchRequest.current;
+    modelFetchInFlight.current = true;
     setModelFetchState("loading");
     setFetchedModelCapabilities({});
     const relaySource = !creatingProvider && keyChoice?.kind === "relay" ? keyChoice.source : undefined;
@@ -3468,8 +3623,22 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       if (request === modelFetchRequest.current) {
         setModelFetchState("unavailable");
       }
+    } finally {
+      // Only the newest listing owns the guard, so a superseded request never
+      // clears the flag its replacement is holding.
+      if (request === modelFetchRequest.current) modelFetchInFlight.current = false;
     }
   };
+  useEffect(() => {
+    // One listing per ticket, and only while the model step is the surface.
+    // This sits after the listing's own declaration so calling it here is not
+    // a temporal-dead-zone reference.
+    if (modelFetchTicket === 0 || step !== "model") return;
+    void fetchWizardModels();
+    // The ticket is the trigger; the listing's own inputs are read from this
+    // render, which is the model step's.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [modelFetchTicket, step]);
   /**
    * The wizard's one create — 完成 is what mints the provider.
    *
@@ -3556,7 +3725,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       const nextProvider = snapshotProviderRecords(next).find((entry) => editorIdentifier(entry) === providerID);
       const addedKey = nextProvider ? providerKeyStates(nextProvider).find((entry) => entry.name === name) : undefined;
       setKeySelection(addedKey?.id ?? PROVIDER_WIZARD_NEW_KEY);
-      setKeyReady(false);
+      resetStagedKeyField();
       setValidation("");
       return true;
     } finally {
@@ -3685,10 +3854,26 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     if (!providerID) return;
     await dispatchWithOutcome("service_provider.auth_logout", { provider_id: providerID }, "providers_models");
   };
+  /** One place that moves the wizard onto the model step, so the
+   * duplicate-press guard's ref can never disagree with the render. */
+  const advanceStepToModel = (): void => {
+    stepRef.current = "model";
+    setStep("model");
+  };
   const goNext = async (): Promise<void> => {
     // The primary button keeps reporting its own progress, so the guard that
     // used to come from `disabled` lives here.
-    if (processing) return;
+    //
+    // One advance per rendered step, and the step is read from a ref: 下一步 is
+    // the window's default button, so a single press can deliver both its own
+    // action and the Return key equivalent, and the second delivery would
+    // otherwise run against the stale `step` of the render that is already
+    // gone — walking 供应商 → 密钥 → 模型 in one press and skipping 密钥 entirely.
+    if (processing || stepRef.current !== step) return;
+    // The guard's ref moves with the step this call is about to take.  A
+    // deferred branch still names its own value through `advanceStepToModel`,
+    // so both routes leave the ref equal to the step that will render.
+    stepRef.current = step === "provider" ? "keys" : "model";
     setValidation("");
     if (step === "provider") {
       if (providerMode === "new") {
@@ -3711,14 +3896,20 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       if (isWorkBuddyType) {
         // Nothing is typed here: the desktop app owns the sign-in, and the
         // account is associated in the provider's 「服务商关联」 section.
-        setStep("model");
+        advanceStepToModel();
         return;
       }
       if (creatingProvider) {
         // The provider does not exist yet, so this step states the field its
         // own create will carry: a custom key that is staged, or the provided
         // key this provider's models will route through.
-        if (!usingProvidedKeyPath(keyPath) && (!keyName.trim() || !keyReady)) {
+        //
+        // The advance is immediate.  The key field stages on the very press
+        // that runs this handler, so waiting for Core here would put an HTTP
+        // round trip between the press and the next step.  `pendingKeyFlush`
+        // carries that wait to the model step instead, where the step change is
+        // already behind us and the model list is the work being reported.
+        if (!usingProvidedKeyPath(keyPath) && !keyName.trim()) {
           setValidation(translate("providers.wizard.required"));
           return;
         }
@@ -3726,8 +3917,17 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
           setValidation(translate("providers.wizard.loginRequired"));
           return;
         }
-        setStep("model");
-        if (!usingProvidedKeyPath(keyPath) && modelCandidates.length === 0) void fetchWizardModels();
+        if (usingProvidedKeyPath(keyPath)) {
+          advanceStepToModel();
+          return;
+        }
+        pendingKeyFlush.current = flushStagedKey();
+        advanceStepToModel();
+        void advanceToModels(pendingKeyFlush.current).catch(() => {
+          // The step is already on screen: a rejected listing reports itself on
+          // the step, and an escaping rejection here would be an unhandled one.
+          setModelFetchState("unavailable");
+        });
         return;
       }
       if (!selectedProvider) {
@@ -3739,7 +3939,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
           setValidation(translate("providers.wizard.loginRequired"));
           return;
         }
-        setStep("model");
+        advanceStepToModel();
         return;
       }
       if (keyPath === "login") {
@@ -3747,7 +3947,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
           setValidation(translate("providers.wizard.loginRequired"));
           return;
         }
-        setStep("model");
+        advanceStepToModel();
         if (modelCandidates.length === 0) setModelFetchState("idle");
         return;
       }
@@ -3755,12 +3955,29 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         if (await createKey()) return;
         return;
       }
-      if (!selectedKeyChoice || (!selectedKeyReady && selectedKeyChoice.kind === "independent")) {
+      // An independent key this provider already carries needs nothing from the
+      // field; an unconfigured one is the same race as the create path, and it
+      // is settled after the step changes for the same reason.
+      const independentKeyConfigured = Boolean(selectedKeyChoice && selectedKeyChoice.kind === "independent" && selectedKeyChoice.state?.configured);
+      const editedName = keyName.trim();
+      if (selectedKeyChoice?.kind === "independent" && !independentKeyConfigured) {
+        if (!editedName) {
+          setValidation(translate("providers.wizard.required"));
+          return;
+        }
+        pendingKeyFlush.current = flushStagedKey();
+        pendingKeyRename.current = editedName !== selectedKeyChoice.name ? editedName : undefined;
+        advanceStepToModel();
+        void advanceToModels(pendingKeyFlush.current).catch(() => {
+          setModelFetchState("unavailable");
+        });
+        return;
+      }
+      if (!selectedKeyChoice) {
         setValidation(translate("providers.wizard.required"));
         return;
       }
       if (selectedKeyChoice.kind === "independent") {
-        const editedName = keyName.trim();
         if (!editedName) {
           setValidation(translate("providers.wizard.required"));
           return;
@@ -3775,7 +3992,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
           }
         }
       }
-      setStep("model");
+      advanceStepToModel();
       if (modelCandidates.length === 0) void fetchWizardModels();
       return;
     }
@@ -3882,8 +4099,13 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       cancelRelaySignIn();
       return;
     }
-    if (step === "model") setStep("keys");
-    else if (step === "keys") setStep("provider");
+    if (step === "model") {
+      setStep("keys");
+      stepRef.current = "keys";
+    } else if (step === "keys") {
+      setStep("provider");
+      stepRef.current = "provider";
+    }
   };
   const providerPickerLabels = providerOptions.map((option) => option.label);
   const selectedProviderPickerLabel = providerOptions.find((option) => option.value === providerSelection)?.label ?? providerPickerLabels[0] ?? "";
@@ -3972,17 +4194,17 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
                 <NativeButton title={translate("relay.login")} primary compact busy={loginBusy} disabled={(wizardBusy && !loginBusy) || !activeProviderBaseURL.trim()} onPress={() => { void beginRelayLogin(); }} />
               </>}
             </> : <>
-              <NativeFormRow required label={translate("providers.wizard.selectApiKey")}><NativePicker labels={keyPickerLabels} selectedValue={selectedKeyPickerLabel} disabled={wizardBusy} onChange={({ nativeEvent }) => { const option = keyOptions[nativeEvent.index]; if (!option) return; setKeySelection(option.value); setKeyReady(false); setKeyName(""); setValidation(""); }} style={styles.providerWizardPicker} /></NativeFormRow>
+              <NativeFormRow required label={translate("providers.wizard.selectApiKey")}><NativePicker labels={keyPickerLabels} selectedValue={selectedKeyPickerLabel} disabled={wizardBusy} onChange={({ nativeEvent }) => { const option = keyOptions[nativeEvent.index]; if (!option) return; setKeySelection(option.value); resetStagedKeyField(); setKeyName(""); setValidation(""); }} style={styles.providerWizardPicker} /></NativeFormRow>
               {activeKeySelection === PROVIDER_WIZARD_NEW_KEY ? <>
                 <NativeFormRow required label={translate("providers.wizard.apiKeyName")}><NativeTextField value={keyName} placeholder={translate("providers.wizard.apiKeyNamePlaceholder")} editable={!wizardBusy} autoCapitalize="none" autoCorrect={false} onChangeText={setKeyName} accessibilityLabel={translate("providers.wizard.apiKeyName")} style={styles.providerWizardInput} /></NativeFormRow>
                 {creatingProvider ? (keyReady
                   ? <Text style={styles.providerWizardHint}>{finishedProviderKeyName}</Text>
-                  : <NativeFormRow required label={translate("providers.wizard.apiKeyValue")}><NativeSecureTextInput label={translate("providers.wizard.apiKeyValue")} domain="providers_models" field="api_key" target={stagedKeyTarget} plainText autoCommit disabled={wizardBusy} onSecretState={(state) => { setKeyReady(state.present); onSecretState(state); }} style={styles.providerWizardSecretInput} /></NativeFormRow>) : null}
+                  : <NativeFormRow required label={translate("providers.wizard.apiKeyValue")}><NativeSecureTextInput label={translate("providers.wizard.apiKeyValue")} domain="providers_models" field="api_key" target={stagedKeyTarget} plainText autoCommit disabled={wizardBusy} commitRequest={keyCommitToken} onSecretState={handleKeyFieldState} style={styles.providerWizardSecretInput} /></NativeFormRow>) : null}
               </>
                 : selectedKeyChoice?.kind === "independent" ? <>
                     <NativeFormRow required label={translate("providers.wizard.apiKeyName")}><NativeTextField value={keyName} placeholder={translate("providers.wizard.apiKeyNamePlaceholder")} editable={!wizardBusy} autoCapitalize="none" autoCorrect={false} onChangeText={setKeyName} accessibilityLabel={translate("providers.wizard.apiKeyName")} style={styles.providerWizardInput} /></NativeFormRow>
                     {selectedKeyReady ? <Text style={styles.providerWizardHint}>{selectedKeyChoice.name}</Text>
-                      : <NativeFormRow required label={translate("providers.wizard.apiKeyValue")}><NativeSecureTextInput label={translate("providers.wizard.apiKeyValue")} domain="providers_models" field="api_key" target={`${providerID}\u001f${selectedKeyChoice.name}`} plainText autoCommit disabled={wizardBusy} onSecretState={(state) => { setKeyReady(state.present); onSecretState(state); }} style={styles.providerWizardSecretInput} /></NativeFormRow>}
+                      : <NativeFormRow required label={translate("providers.wizard.apiKeyValue")}><NativeSecureTextInput label={translate("providers.wizard.apiKeyValue")} domain="providers_models" field="api_key" target={`${providerID}\u001f${selectedKeyChoice.name}`} plainText autoCommit disabled={wizardBusy} commitRequest={keyCommitToken} onSecretState={handleKeyFieldState} style={styles.providerWizardSecretInput} /></NativeFormRow>}
                   </> : <Text style={styles.providerWizardHint}>{translate("providers.wizard.selectApiKey")}</Text>}
             </>}
           </>}
@@ -4007,11 +4229,23 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
           <View style={styles.providerWizardFormSection}>
             <View style={styles.providerWizardSectionHeader}><Text style={styles.providerWizardPanelTitle}>{translate("providers.wizard.models")}</Text><Text numberOfLines={1} style={styles.providerWizardHint}>{selectedProviderName}</Text></View>
             {!usingProvidedKeyPath(keyPath) ? <View style={styles.providerWizardModelToolbar}>
-              <Text numberOfLines={2} style={styles.providerWizardHint}>{modelFetchState === "loading" ? translate("providers.wizard.fetchingModels") : modelCandidates.length > 0 ? translate("providers.wizard.modelsFound", { count: modelCandidates.length }) : modelFetchState === "unavailable" ? translate("providers.wizard.modelsUnavailable") : modelFetchState === "empty" ? translate("providers.wizard.modelsEmpty") : translate("providers.wizard.noModels")}</Text>
+              <View style={styles.providerWizardModelStatusRow}>
+                {modelFetchState === "loading" ? <NativeBusySpinner label={translate("providers.wizard.fetchingModels")} /> : null}
+                <Text numberOfLines={2} style={styles.providerWizardHint}>{modelFetchState === "loading" ? translate("providers.wizard.fetchingModels") : modelCandidates.length > 0 ? translate("providers.wizard.modelsFound", { count: modelCandidates.length }) : modelFetchState === "unavailable" ? translate("providers.wizard.modelsUnavailable") : modelFetchState === "empty" ? translate("providers.wizard.modelsEmpty") : translate("providers.wizard.noModels")}</Text>
+              </View>
               <NativeButton title={translate("providers.wizard.refreshModels")} compact link busy={modelFetchState === "loading"} disabled={(wizardBusy && modelFetchState !== "loading") || !manualSelectedKeyName || (creatingProvider ? !serviceBaseURL.trim() : !providerID)} onPress={() => { void fetchWizardModels(); }} />
             </View> : <View style={styles.providerWizardModelToolbar}>
               <Text numberOfLines={2} style={styles.providerWizardHint}>{modelCandidates.length > 0 ? translate("providers.wizard.modelsFound", { count: modelCandidates.length }) : translate("relay.resourcesNoModels")}</Text>
-            </View>}
+            </View>}{
+              /* The step has arrived and is working: the wheel says so in the
+                 body the user is looking at instead of leaving a still pane. */
+              modelFetchState === "loading"
+                ? <View style={styles.providerWizardModelLoading}>
+                    <NativeBusySpinner label={translate("providers.wizard.fetchingModels")} />
+                    <Text style={styles.providerWizardHint}>{translate("providers.wizard.fetchingModels")}</Text>
+                  </View>
+                : null
+            }
             {modelCandidates.length > 0 ? <View style={styles.providerWizardModelGroup}>
               <View style={styles.providerWizardModelGroupHeader}><Text style={styles.providerWizardPanelTitle}>{translate(usingProvidedKeyPath(keyPath) ? "providers.wizard.providedModels" : "providers.wizard.discoveredModels")}</Text><Text style={styles.providerWizardHint}>{translate("providers.wizard.selectedModels", { count: selectedModels.length })}</Text></View>
               <View style={styles.providerWizardModelList}>
@@ -4230,18 +4464,26 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     [fetchKeyChoices, translate],
   );
   const selectedFetchKey = fetchKeyID ?? fetchKeyChoices[0]?.id ?? "";
-  const selectedService = provider ? providerService(provider) : undefined;
+  const workspaceService = provider ? providerService(provider) : undefined;
+  // The 倍率 column reads the catalog through `peekServiceRate`, which is a
+  // cache lookup rather than a subscription: a catalog that lands after this
+  // render is in the cache but not yet on screen, so the read reports the fact
+  // that repaints the list.  Without it the column would keep the blanks it
+  // painted while the catalog was still being fetched.
+  const [serviceRateRevision, setServiceRateRevision] = useState(0);
   useEffect(() => {
     // Read the service's catalog as soon as its provider is selected, so every
-    // model switch paints its rate from the cache instead of asking mid-switch.
-    if (!selectedService || hasFreshServiceRates(selectedService)) return;
-    void serviceModelRate(selectedService, (providerId) => dispatchWithOutcome("workbuddy_models", { provider: providerId }, "providers_models", true))
+    // model switch and every list row paints its rate from the cache instead
+    // of asking mid-switch.
+    if (!workspaceService || hasFreshServiceRates(workspaceService)) return;
+    void serviceModelRate(workspaceService, (providerId) => dispatchWithOutcome("workbuddy_models", { provider: providerId }, "providers_models", true))
+      .then((rates) => { if (rates) setServiceRateRevision((value) => value + 1); })
       .catch(() => undefined);
     // A read that produced no catalog staged nothing, so this effect is free
     // to be re-entered: selecting another model of the same service, or the
     // same one again, asks again instead of waiting out the interval.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedService]);
+  }, [workspaceService]);
   async function probeModel(targetProviderId: string, targetModelId: string, inputs: string, options?: { confirmRecommendation?: boolean }): Promise<void> {
     const key = modelProbeKey(targetProviderId, targetModelId);
     if (probingModelKeys.current.has(key)) return;
@@ -4816,6 +5058,18 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     // one sequence between them.  The value is edited where it belongs (the
     // inspector's own 顺序 field) and read where its group is the list: the
     // routes table, whose rows are the public model's routes in that order.
+    // 倍率 is the other way round and therefore is a column here: a rate is a
+    // property of the row itself — its key's group, or its own entry in the
+    // account's catalog — so two rates read down this pane are two prices that
+    // can be compared, and the model the row names is the thing being priced.
+    // A row whose rate is not known states nothing rather than a placeholder:
+    // an em dash in a numeric column reads as zero, and the reader of this
+    // column is comparing numbers.  The three widths are sized for the pane
+    // this table is actually drawn in: the model list keeps ~280 pt at the
+    // settings window's own default size, and a fourth of that is not room to
+    // spare — a trailing column that does not fit is reduced to nothing by the
+    // native layout, which is how 倍率 would read as a column that never
+    // existed rather than one that is merely narrow.
     const rows: Array<{ key: string; cells: string[]; spanning?: boolean }> = [];
     const ungrouped: UnknownRecord[] = [];
     const grouped = new Map<string, { label: string; models: UnknownRecord[] }>();
@@ -4832,17 +5086,21 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       }
       grouped.set(key.id, { label: modelProviderKeyLabel(item, provider ?? {}, translate, undefined, relaySources), models: [item] });
     }
-    for (const item of ungrouped) {
-      rows.push({ key: editorIdentifier(item), cells: [`\t${modelUpstreamDisplay(providerId, item)}`, modelDisplayName(providerId, item)] });
-    }
+    const modelCells = (item: UnknownRecord): string[] => {
+      const multiplier = relaySourceForKey(modelProviderKeyState(item, provider ?? {}), relaySources)?.multiplier;
+      return [
+        `\t${modelUpstreamDisplay(providerId, item)}`,
+        modelDisplayName(providerId, item),
+        modelRateText(workspaceService, stringValue(item.upstream_model).trim(), multiplier, translate),
+      ];
+    };
+    for (const item of ungrouped) rows.push({ key: editorIdentifier(item), cells: modelCells(item) });
     for (const [keyID, group] of grouped) {
       rows.push({ key: `key:${keyID}`, cells: [group.label], spanning: true });
-      for (const item of group.models) {
-        rows.push({ key: editorIdentifier(item), cells: [`\t${modelUpstreamDisplay(providerId, item)}`, modelDisplayName(providerId, item)] });
-      }
+      for (const item of group.models) rows.push({ key: editorIdentifier(item), cells: modelCells(item) });
     }
     return rows;
-  }, [modelDisplayName, modelUpstreamDisplay, models, provider, providerId, relaySources, translate]);
+  }, [modelDisplayName, modelUpstreamDisplay, models, provider, providerId, relaySources, serviceRateRevision, translate, workspaceService]);
   const disabledModelKeys = useMemo(
     () => models.filter((item) => !booleanValue(provider?.enabled, true) || !booleanValue(item.model_enabled, booleanValue(item.enabled, true))).map(editorIdentifier),
     [models, provider?.enabled],
@@ -5019,7 +5277,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
           </TablePane>
           <View style={styles.providerMiddlePane}>
             <TablePane style={[styles.modelListPane]} title={translate("providers.models")} actions={<>{provider && providerKindSelected !== "openai" && providerKindSelected !== "claude" ? <IconButton label="+" title={translate("providers.newModel")} disabled={busy} onPress={addModel} /> : null}{model ? <IconButton label="⧉" title={translate("common.copy")} disabled={busy} onPress={duplicateModel} /> : null}{model ? <IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteModel} /> : null}</>}>
-              <NativeTable columns={[{ label: translate("providers.upstream"), width: 120 }, { label: translate("providers.publicModel"), width: 160 }]} rows={modelRows} disabledRowKeys={disabledModelKeys} alertRowKeys={alertModelKeys} selectedKey={selectedModel ?? ""} compact firstColumnHorizontalPadding={0} onSelectionChange={(key) => { setSelectedModel(key); setProviderSourceModel(undefined); }} style={styles.nativeModelTable} />
+              <NativeTable columns={[{ label: translate("providers.upstream"), width: 104 }, { label: translate("providers.publicModel"), width: 120 }, { label: translate("providers.modelRate"), width: 56 }]} rows={modelRows} disabledRowKeys={disabledModelKeys} alertRowKeys={alertModelKeys} selectedKey={selectedModel ?? ""} compact firstColumnHorizontalPadding={0} onSelectionChange={(key) => { setSelectedModel(key); setProviderSourceModel(undefined); }} style={styles.nativeModelTable} />
               {provider && providerKindSelected !== "openai" && providerKindSelected !== "claude" ? <View style={styles.tableBottomRow}><NativePicker labels={fetchKeyOptions.length > 0 ? fetchKeyOptions.map((option) => option.label) : [translate("common.default")]} selectedValue={fetchKeyOptions.find((option) => option.value === selectedFetchKey)?.label ?? translate("common.default")} disabled={busy || fetchKeyChoices.length === 0} onChange={({ nativeEvent }) => { const option = fetchKeyOptions[nativeEvent.index]; if (option) setFetchKeyID(option.value); }} style={styles.fetchKeyPicker} /><ActionButton title={translate("providers.fetch")} busy={fetchModelsBusy} disabled={(busy && !fetchModelsBusy) || !selectedFetchKey} onPress={() => { void fetchModels(); }} /></View> : null}
             </TablePane>
           </View>
@@ -5050,7 +5308,18 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
   const customKeys = useMemo(() => provider ? providerKeyStates(provider).filter((key) => key.source.kind === "independent") : [], [provider]);
   const customKeyNames = useMemo(() => stringList(provider?.api_key_names), [provider?.api_key_names]);
   const providedRows = useMemo(() => providedKeyRows(stationAccounts, translate), [stationAccounts, translate]);
-  const firstSelectable = customKeys[0] ? `custom:${customKeys[0].id}` : providedRows[0] ? `provided:${providedRows[0].key}` : "";
+  // A relay slot whose station no longer lists its source is in no account's
+  // key list, so `providedRows` cannot show it, and it is not an independent
+  // slot, so the custom rows exclude it.  Without a row of its own the user
+  // could see the dead binding nowhere and delete it from nowhere: the slot
+  // stays in the document and keeps its route's row marked forever.  It is its
+  // own kind of row — one that exists only locally, and can therefore only be
+  // deleted locally.
+  const orphanSlots = useMemo(() => provider
+    ? providerKeyStates(provider).filter((key) => key.source.kind === "relay"
+      && !stationAccounts.some((account) => account.resources.some((resource) => resource.id === key.source.resourceID)))
+    : [], [provider, stationAccounts]);
+  const firstSelectable = customKeys[0] ? `custom:${customKeys[0].id}` : providedRows[0] ? `provided:${providedRows[0].key}` : orphanSlots[0] ? `orphan:${orphanSlots[0].id}` : "";
   const [selectedKey, setSelectedKey] = useState<string>(firstSelectable);
   // A cleared key selection (a click below the key rows) survives the repair
   // below: the panel keeps no key selected, hides the −, and leaves its editor
@@ -5073,6 +5342,9 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
   const selectedProvided = selectedKey.startsWith("provided:")
     ? providedRows.find((row) => `provided:${row.key}` === selectedKey)
     : undefined;
+  const selectedOrphan = selectedKey.startsWith("orphan:")
+    ? orphanSlots.find((slot) => `orphan:${slot.id}` === selectedKey)
+    : undefined;
   // A relay key is one row in this table and one slot in the provider: the
   // issue Core reported is keyed by the slot, so the row is matched back
   // through the relay source the slot carries, and the reason is stated
@@ -5085,7 +5357,7 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
     if (!slot) return undefined;
     return bindingIssues.find((issue) => stringValue(issue.provider_key_id) === slot.id);
   }, [bindingIssues, provider]);
-  const selectedGroup: "custom" | "provided" = selectedProvided ? "provided" : "custom";
+  const selectedGroup: "custom" | "provided" = selectedProvided || selectedOrphan ? "provided" : "custom";
   const autoGrouping = stationAccounts.some((account) => account.autoGrouping);
   const controlsBusy = busy || formBusy;
   const tableRows = useMemo(() => {
@@ -5103,7 +5375,8 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
     // public model: spanning account rows, indented key rows beneath.
     for (const account of stationAccounts) {
       const accountProvidedRows = providedRows.filter((row) => row.account.id === account.id);
-      if (accountProvidedRows.length === 0) continue;
+      const accountOrphans = orphanSlots.filter((slot) => slot.source.accountID === account.id);
+      if (accountProvidedRows.length === 0 && accountOrphans.length === 0) continue;
       rows.push({ key: `account:${account.id}`, cells: [accountDisplayName(account, translate)], spanning: true });
       for (const row of accountProvidedRows) {
         rows.push({
@@ -5111,9 +5384,14 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
           cells: [`\t${providedNameDrafts[row.key] ?? row.label}`],
         });
       }
+      // The account's own row still names where these keys came from: an
+      // orphan is a slot of *this* account whose station answer dropped it.
+      for (const slot of accountOrphans) {
+        rows.push({ key: `orphan:${slot.id}`, cells: [`\t${slot.name}`] });
+      }
     }
     return rows;
-  }, [customKeys, providedNameDrafts, providedRows, stationAccounts, translate]);
+  }, [customKeys, orphanSlots, providedNameDrafts, providedRows, stationAccounts, translate]);
   const secondaryCellKeys: string[] = [];
   const runProvidedAction = async (action: () => Promise<void>, feedbackKey: string): Promise<void> => {
     setFormBusy(true);
@@ -5187,8 +5465,8 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
     // selection verbatim or every click would snap back to the first row.
     const valid = new Set(tableRows.filter((row) => !row.spanning).map((row) => row.key));
     if (valid.has(selectedKey)) return;
-    setSelectedKey(customKeys[0] ? `custom:${customKeys[0].id}` : providedRows[0] ? `provided:${providedRows[0].key}` : "");
-  }, [customKeys, providedRows, selectedKey, selectionCleared, tableRows]);
+    setSelectedKey(customKeys[0] ? `custom:${customKeys[0].id}` : providedRows[0] ? `provided:${providedRows[0].key}` : orphanSlots[0] ? `orphan:${orphanSlots[0].id}` : "");
+  }, [customKeys, orphanSlots, providedRows, selectedKey, selectionCleared, tableRows]);
   const addKey = (): void => {
     if (selectedGroup === "provided" && isRelay) {
       if (autoGrouping || stationAccounts.length === 0) return;
@@ -5231,10 +5509,15 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
       setRemoteDelete({ account: selectedProvided.account, resource: selectedProvided.resource, label: selectedProvided.label });
       return;
     }
-    if (!selectedCustom) return;
-    const selectedKeyName = selectedCustom.name;
+    // A custom key and an orphan relay slot are both slots of this document:
+    // neither has a station resource left to delete, so the same local removal
+    // serves both and neither needs a dependency policy.  They differ only in
+    // how the user reached the row.
+    const localSlot = selectedCustom ?? selectedOrphan;
+    if (!localSlot) return;
+    const selectedKeyName = localSlot.name;
     const affectedModelLines = asRecords(provider?.models)
-      .filter((model) => stringValue(model.api_key_name).trim() === selectedKeyName)
+      .filter((model) => stringValue(model.api_key_name).trim() === selectedKeyName || stringValue(model.provider_key_id).trim() === localSlot.id)
       .map((model, index) => {
         const publicName = displayLabel(model.model_name ?? model.name, translate("providers.unnamedModel")).trim();
         const upstreamName = upstreamModelLabel(model).trim();
@@ -5256,7 +5539,7 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
   // A + / − the current state cannot use is hidden instead of greyed out: the
   // list header keeps only the actions that apply to what is selected.
   const canAddKey = !(selectedGroup === "provided" && (autoGrouping || stationAccounts.length === 0 || !relay.apiKeyActions.create));
-  const canDeleteKey = Boolean(selectedCustom) || Boolean(selectedProvided && !autoGrouping);
+  const canDeleteKey = Boolean(selectedCustom) || Boolean(selectedOrphan) || Boolean(selectedProvided && !autoGrouping);
   const toolbar = <>
     {canAddKey ? <IconButton label="+" title={translate("providers.addKey")} disabled={controlsBusy} onPress={addKey} /> : null}
     {canDeleteKey ? <IconButton label="−" title={translate("common.delete")} disabled={controlsBusy} onPress={deleteSelected} /> : null}
@@ -5274,7 +5557,7 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
       rows={tableRows}
       selectedKey={selectedCustom ? `custom:${selectedCustom.id}` : selectedProvided ? `provided:${selectedProvided.key}` : ""}
       disabledRowKeys={providedRows.filter((row) => row.unavailable).map((row) => `provided:${row.key}`)}
-      alertRowKeys={providedRows.filter((row) => Boolean(bindingIssueForProvidedRow(row))).map((row) => `provided:${row.key}`)}
+      alertRowKeys={[...providedRows.filter((row) => Boolean(bindingIssueForProvidedRow(row))).map((row) => `provided:${row.key}`), ...orphanSlots.filter((slot) => bindingIssues?.some((issue) => stringValue(issue.provider_key_id) === slot.id)).map((slot) => `orphan:${slot.id}`)]}
       compact
       cellHorizontalPadding={6}
       firstColumnHorizontalPadding={6}
@@ -5373,6 +5656,31 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
           })();
         }} style={styles.panelActionButton} />)}
         {selectedProvidedIssue ? <Text style={styles.fieldHint}>{relayBindingIssueText(selectedProvidedIssue, selectedProvided.label, translate)}</Text> : null}
+      </> : selectedOrphan ? <>
+        {/* The slot is real but only local: its name and its value are this
+            document's own, and the station has nothing left to say about
+            either, so both are stated rather than edited. */}
+        {keysEditorField("orphan-key-name", translate("providers.keyName"), <TextField
+          labelVisible={false}
+          label={translate("providers.keyName")}
+          value={selectedOrphan.name}
+          disabled
+          onCommit={() => undefined}
+        />)}
+        {keysEditorField("orphan-key-value", translate("providers.keyValue"), <View style={styles.keysEditorValueRow}>
+          <View style={styles.keysEditorValueField}><NativeSecretField labelVisible={false} plainText autoCommit disabled label={translate("providers.keyValue")} hint={booleanValue(selectedOrphan.configured) ? translate("providers.apiKeySavedHint") : translate("common.none")} busy={controlsBusy} domain="providers_models" field="api_key" target={`${providerId}\u001f${selectedOrphan.name}`} onSecretState={onSecretState} /></View>
+          <NativeButton title="" symbol="copy" compact disabled={controlsBusy || !booleanValue(selectedOrphan.configured)} toolTip={translate("relay.apiKeyCopy")} accessibilityLabel={translate("relay.apiKeyCopy")} onPress={() => {
+            void (async () => {
+              try {
+                const copied = await native.copySecret({ domain: "providers_models", field: "api_key", target: `${providerId}\u001f${selectedOrphan.name}` });
+                if (!copied) onStatus?.(translate("relay.operationFailed"));
+              } catch {
+                onStatus?.(translate("relay.operationFailed"));
+              }
+            })();
+          }} style={styles.panelActionButton} />
+        </View>)}
+        <Text style={styles.fieldHint}>{translate("providers.orphanKeyHint")}</Text>
       </> : null}
     </View>;
   // 新建密钥 creates on the account the user is looking at: this pane's key
@@ -5490,11 +5798,15 @@ function PublicModelInspector({ group, modelContexts, backLabel, busy, translate
   // shows what every route can honour and a commit writes it to all of them.
   const customContext = publicModelCustomLimit(providers, group.name, "max_input_tokens");
   const defaultContext = publicModelDefault(modelContexts, group.name);
-  // This pane is where the Codex window is *set*: it is the public model's own
-  // declaration, written to every route of the group in one staged action, and
-  // the model detail states it read-only with a 设置 button that lands here.
-  const contextHint = translate("providers.publicModelDefaultHint", { value: publicModelTokensText(defaultContext, translate) });
-  const [contextTipOpen, setContextTipOpen] = useState(false);
+  const defaultCeiling = publicModelCeiling(modelContexts, group.name);
+  // This pane is where the context window is *set*: it is the public model's
+  // own declaration, written to every route of the group in one staged action,
+  // and the model detail states it read-only with a 设置 button that lands
+  // here.  The hint states the registry's resolved pair, so an empty field
+  // says what the group would fall back to and whether that fallback can be
+  // raised — the same two numbers the model detail shows when the field is
+  // empty, read from the side that can change them.
+  const contextHint = translate("providers.publicModelDefaultHint", { value: contextWindowPairText(defaultContext, defaultCeiling, translate) });
   return <View style={styles.inspectorContent}>
     {/* The provider editor's own header shape: the title takes the row and the
         return link sits on the trailing edge, never in front of the title.  A
@@ -5515,7 +5827,7 @@ function PublicModelInspector({ group, modelContexts, backLabel, busy, translate
         if (!renamed || renamed === group.name) return undefined;
         return dispatchSnapshot("public.model_patch", { public_model: group.name, changes: { name: renamed } }).then((snapshot) => { if (snapshot) onRenamed(renamed); });
       }} />
-      <TextField label={translate("providers.contextWindow")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} value={customContext !== undefined ? String(customContext) : ""} placeholder={contextHint} keyboardType="numeric" disabled={busy} onCommit={(next) => dispatch("public.model_patch", { public_model: group.name, changes: { max_input_tokens: next.trim() } })} accessory={<HelpTip open={contextTipOpen} text={translate("providers.contextWindowHelp")} title={translate("providers.contextWindowHelpTitle")} onToggle={() => setContextTipOpen((current) => !current)} />} />
+      <TextField label={translate("providers.contextWindow")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} value={customContext !== undefined ? String(customContext) : ""} placeholder={contextHint} keyboardType="numeric" disabled={busy} onCommit={(next) => dispatch("public.model_patch", { public_model: group.name, changes: { max_input_tokens: next.trim() } })} accessory={<ContextWindowHelp translate={translate} />} />
     </View>
   </View>;
 }
@@ -5575,11 +5887,15 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
   // declared wins, otherwise the registry default the managed catalog
   // resolves.  It is the *group's* declaration — one number for every route
   // that serves the name — so this pane states it and hands the edit to the
-  // public-model pane, which writes it to all of them at once.
+  // public-model pane, which writes it to all of them at once.  The registry's
+  // own ceiling travels beside it, because that is the number a declaration is
+  // clamped to and the pair is what Core resolves for this row.
   const publicModelName = modelFieldName.trim();
   const publicModelWindow = publicModelDefault(modelContexts ?? {}, publicModelName);
+  const publicModelMaxWindow = publicModelCeiling(modelContexts ?? {}, publicModelName);
   const customWindow = publicModelCustomLimit(providers, publicModelName, "max_input_tokens");
   const resolvedWindow = customWindow !== undefined ? customWindow : publicModelWindow;
+  const resolvedCeiling = customWindow !== undefined ? customWindow : publicModelMaxWindow;
   const keyStates = providerAuthKind(provider) === "api_key" ? providerKeyStates(provider) : [];
   const selectedProviderKey = keyStates.find((key) => key.id === stringValue(model.provider_key_id))
     ?? keyStates.find((key) => key.name === stringValue(model.api_key_name));
@@ -5600,6 +5916,11 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
     : drafts?.modelOrderText(providerId, model) ?? String(manualOrder);
   const matchingRelaySources = providerAuthKind(provider) === "api_key" ? relaySourcesForBaseUrl(providerBaseUrl, relaySources) : [];
   const persistedRelaySourceIDs = new Set(keyStates.filter((key) => key.source.kind === "relay").map((key) => relaySourceSelectionID(key.source)));
+  // Every key this provider holds is offered, including a relay slot the
+  // station no longer lists: the picker is how a route says which credential
+  // it uses, and hiding an entry would leave a route that names one showing
+  // nothing.  What an entry says about itself belongs to the row it draws, not
+  // to whether it may be chosen.
   const providerKeyOptions = [...keyStates.map((key) => ({
     value: key.id,
     label: providerKeyChoiceLabel({ name: drafts?.providerKeyDisplayName(providerId, key.id, key.name) ?? key.name, kind: key.source.kind, source: relaySourceForKey(key, relaySources) }, translate),
@@ -5688,16 +6009,22 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
     <View style={styles.inspectorBody}>
       <View style={styles.inspectorEnabledRow}><View style={styles.inspectorEnableControl}><NativeCheckbox label={translate("common.enable")} value={booleanValue(model.model_enabled, booleanValue(model.enabled, true))} disabled={busy} onValueChange={(model_enabled) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { model_enabled } })} /></View><ActionButton title={probeTitle} titleWidth="tight" busy={probing} toolTip={(probePresentation.compact ? probePresentation.tooltip : "") || (degradationIncluded ? translate("providers.deepTestHint") : undefined)} disabled={(busy && !probing) || !probeReady} onPress={probe} />{probePresentation.compactSentence ? <Pressable style={styles.inspectorProbeFinding} onPress={openProbeDetails} accessibilityRole="link" accessibilityLabel={probePresentation.compactSentence}><TooltipText numberOfLines={1} ellipsizeMode="tail" tooltip={probePresentation.tooltip} style={styles.inspectorProbeFindingText}>{probePresentation.compactSentence}</TooltipText></Pressable> : null}</View>
       <TextField label={translate("providers.publicModel")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} value={modelFieldName} onDraftChange={onNameDraftChange} onCommit={(name) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { name } })} />
-      {/* The Codex window belongs to the *public name* on the row above, so it
-          is stated directly under it: one number for the whole group, written
-          by the public-model pane that 设置 opens.  This pane never commits it
-          — a route that carried a window of its own would make the group's
-          number depend on which route happened to answer. */}
+      {/* The context window belongs to the *public name* on the row above, so it
+          is stated directly under it, and both halves of the pair the registry
+          resolves are shown: the window in force, then the ceiling a config
+          override is clamped to.  The two differ only while the group carries
+          no declaration of its own — a declared value is written to both
+          fields of the catalog, so a group that has one reads as a single
+          number.  This pane commits neither: one number for the whole group is
+          written by the public-model pane that 设置 opens, and a route that
+          carried a window of its own would make the group's number depend on
+          which route happened to answer. */}
       {publicModelName ? <View style={styles.formRow}>
         <Text numberOfLines={1} style={styles.modelInspectorLabel}>{translate("providers.contextWindow")}</Text>
         <View style={styles.modelWindowValue}>
-          <Text numberOfLines={1} style={styles.modelWindowText}>{publicModelTokensText(resolvedWindow, translate)}</Text>
+          <Text numberOfLines={1} style={styles.modelWindowText}>{contextWindowPairText(resolvedWindow, resolvedCeiling, translate)}</Text>
           <NativeButton title={translate("providers.publicModelSettings")} toolTip={translate("providers.publicModelSettingsHint")} accessibilityLabel={translate("providers.publicModelSettingsHint")} compact disabled={busy || !onOpenPublicModel} onPress={() => onOpenPublicModel?.()} style={styles.modelWindowLink} />
+          <ContextWindowHelp translate={translate} />
         </View>
       </View> : null}
       <PickerField label={translate("providers.provider")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} allowShrink value={providerLabel} values={providerLabels} disabled={busy || providers.length <= 1} onSelect={(label) => { const next = providers[providerLabels.indexOf(label)]; if (next) onProviderChange(editorIdentifier(next)); }} />
@@ -5751,6 +6078,21 @@ function HelpTip({ open, text, title, onToggle }: { open: boolean; text: string;
     <NativeButton title="" symbol="help" link plainLink toolTip={title} accessibilityLabel={title} onPress={onToggle} style={styles.helpTipButton} />
     {open ? <View style={styles.helpTipPopup}><Text style={styles.helpTipText}>{text}</Text></View> : null}
   </View>;
+}
+
+/**
+ * The 上下文 pair's own help mark.
+ *
+ * It owns the state its panel opens with, and it is a component rather than
+ * another `HelpTip` call site because the row is drawn by two panes — the
+ * model detail that states the pair and the public-model pane that sets it —
+ * and one `useState` shared by both would leave a mark on screen that no row
+ * toggled.  The panel opens toward the right edge of its own row instead of
+ * over the field: the row's text is the thing the tip explains.
+ */
+function ContextWindowHelp({ translate }: { translate: Translate }): React.JSX.Element {
+  const [open, setOpen] = useState(false);
+  return <HelpTip open={open} text={translate("providers.contextWindowRowHelp")} title={translate("providers.contextWindowRowHelpTitle")} onToggle={() => setOpen((current) => !current)} />;
 }
 
 function ProtocolPicker({ providerId, model, busy, translate, dispatch }: { providerId: string; model: UnknownRecord; busy: boolean; translate: Translate; dispatch: Dispatch }): React.JSX.Element {
@@ -5933,6 +6275,25 @@ function publicModelTokensText(value: number | null | undefined, translate: Tran
   return Math.round(value).toLocaleString("en-US");
 }
 
+/**
+ * The pair the 上下文 row states: the window Codex runs with, then the ceiling
+ * it may be raised to.
+ *
+ * The two are separate numbers because they answer different questions, and
+ * {@link ContextWindowHelp} names both under the row's own help mark: a bare
+ * `272,000 / 1,000,000` reads as a range or as a fraction until the reader is
+ * told which half is in force and which is only a limit.  They are equal
+ * whenever the value is the user's own (this app writes one number to both
+ * fields of the catalog), and a pair of equal numbers states nothing beyond
+ * the number itself, so it collapses to one.
+ */
+function contextWindowPairText(current: number | null | undefined, ceiling: number | null | undefined, translate: Translate): string {
+  const running = publicModelTokensText(current, translate);
+  if (ceiling === null || ceiling === undefined || !Number.isFinite(ceiling) || ceiling <= 0) return running;
+  if (current !== null && current !== undefined && Math.round(current) === Math.round(ceiling)) return running;
+  return `${running} / ${publicModelTokensText(ceiling, translate)}`;
+}
+
 // One public model's declared limit: the smallest value its routes carry, so a
 // group never promises more than every route behind it can deliver.  Absent
 // means the registry default stands.
@@ -5954,6 +6315,19 @@ function publicModelCustomLimit(providers: UnknownRecord[], publicModel: string,
 function publicModelDefault(contexts: UnknownRecord, publicModel: string): number | undefined {
   const record = asRecord(contexts[publicModel]);
   return numberValue(record.context_window, 0) || undefined;
+}
+
+/**
+ * The largest window the same projection lets this public model declare.
+ *
+ * Codex clamps a config override to this number, so it is what makes the
+ * 上下文 row's pair two numbers instead of one: a route whose registry entry
+ * says 272,000 / 1,000,000 can be raised, and one whose entry says
+ * 272,000 / 272,000 cannot.
+ */
+function publicModelCeiling(contexts: UnknownRecord, publicModel: string): number | undefined {
+  const record = asRecord(contexts[publicModel]);
+  return numberValue(record.max_context_window, 0) || undefined;
 }
 
 function identifier(record: UnknownRecord): string {
@@ -6230,11 +6604,18 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
     // ``credits`` record at all, which rendered as an account row and no积分
     // row however many times the pane was opened.  The section's own 刷新
     // button re-reads both on demand.
+    //
+    // The read itself honours Core's account window (运行时 offers it), so
+    // re-entering the pane inside the window costs no worker round trip and
+    // never repaints the account: Core's projection already states the account
+    // and its credit.  Outside it the read is the credit-carrying one, and the
+    // one forced re-read below is the exception it is there for -- a worker
+    // that was just started can answer before it has the desktop credential in
+    // hand, so an answer that is still not signed in is asked for for real,
+    // once and never in a loop.
     if (!workbuddyProviderIDFor(kind)) return;
+    if (workbuddyObservationIsFresh(provider, serviceAccountRecheckSeconds(snapshotForCleanups))) return;
     void loadWorkBuddyAccount(true).then((account) => {
-      // A worker that was just started can answer its first read before it has
-      // the desktop credential in hand; re-read once so the block never states
-      // a stale “not signed in”.
       if (account && stringValue(account.state) !== "signed-in") void loadWorkBuddyAccount(true);
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -6454,7 +6835,12 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
     }
   };
   return <PersistentScrollView style={styles.providerEditorContent} contentContainerStyle={styles.providerEditorScrollContent} showsVerticalScrollIndicator nestedScrollEnabled>
-    <View style={styles.providerEditorHeader}><Text numberOfLines={1} style={styles.providerEditorHeading}>{translate("providers.provider")}: {providerName}</Text>{sourceModel ? <NativeButton title={translate("providers.backToModel", { model: sourceModelLabel })} link disabled={busy} onPress={onReturnToModel} style={styles.providerReturnToModel} /> : null}</View>
+    {/* The public-model pane's own header shape, for the same reason: this pane
+        is 290 pt wide, the heading is a flexBasis-0 row that only takes what is
+        left, and the full sentence as the link's label is 246 pt of it.  The
+        label is the action in two words and the model it returns to rides the
+        tooltip, so the provider name the header exists to show keeps its room. */}
+    <View style={styles.providerEditorHeader}><Text numberOfLines={1} style={styles.providerEditorHeading}>{translate("providers.provider")}: {providerName}</Text>{sourceModel ? <NativeButton title={translate("providers.backToModelShort")} toolTip={translate("providers.backToModel", { model: sourceModelLabel })} link disabled={busy} onPress={onReturnToModel} style={styles.providerReturnToModel} /> : null}</View>
     <View style={styles.providerEditorSection}>
     <ProviderIdentityFields
       provider={provider}
@@ -10017,7 +10403,7 @@ const styles = StyleSheet.create({
   providerAuthLine: { color: systemColors.label, fontSize: UI_FONT_SIZE },
   officialActiveHint: { color: systemColors.green, fontSize: UI_TIP_FONT_SIZE, fontWeight: "600" },
   officialActionsRow: { minHeight: 28, flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 6 },
-  providerWizardHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerWizardDescription: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 17 }, providerWizardSectionHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardPanelTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerWizardFormSection: { width: "100%", maxWidth: 520, paddingVertical: 0, gap: 10 }, providerWizardModelScroll: { flex: 1, minHeight: 0, width: "100%" }, providerWizardModelScrollContent: { width: "100%", paddingBottom: 8 }, providerWizardModelToolbar: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 8 }, providerWizardModelGroup: { gap: 6, paddingTop: 4 }, providerWizardModelGroupHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }, providerWizardModelList: { borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground, paddingHorizontal: 8, paddingVertical: 5, gap: 1 }, providerWizardModelCheckbox: { width: "100%", minHeight: 24 }, providerWizardManualModelRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardManualModelCheckbox: { flex: 1, minWidth: 0 }, providerWizardManualModelUpstream: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE }, providerWizardModelSummary: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "500", paddingTop: 4 }, providerWizardModeControl: { width: "100%", height: 26, flexShrink: 0 }, providerWizardPicker: { width: "100%", minWidth: 0, height: 26 }, providerWizardInput: { width: "100%", minHeight: 26, color: systemColors.label, fontSize: UI_FONT_SIZE }, providerWizardSecretInput: { width: "100%", minHeight: 26 }, providerWizardHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15, paddingVertical: 2 }, providerWizardFooter: { minHeight: 46, paddingHorizontal: 20, paddingVertical: 8, flexDirection: "row", alignItems: "center", gap: 6, borderTopWidth: 0, backgroundColor: systemColors.window }, providerWizardFooterSpacer: { flex: 1 }, providerWizardFooterStatus: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, providerWizardFooterActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 },
+  providerWizardHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerWizardDescription: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 17 }, providerWizardSectionHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardPanelTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerWizardFormSection: { width: "100%", maxWidth: 520, paddingVertical: 0, gap: 10 }, providerWizardModelScroll: { flex: 1, minHeight: 0, width: "100%" }, providerWizardModelScrollContent: { width: "100%", paddingBottom: 8 }, providerWizardModelToolbar: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 8 }, providerWizardModelStatusRow: { flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardModelLoading: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardModelGroup: { gap: 6, paddingTop: 4 }, providerWizardModelGroupHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }, providerWizardModelList: { borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground, paddingHorizontal: 8, paddingVertical: 5, gap: 1 }, providerWizardModelCheckbox: { width: "100%", minHeight: 24 }, providerWizardManualModelRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardManualModelCheckbox: { flex: 1, minWidth: 0 }, providerWizardManualModelUpstream: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE }, providerWizardModelSummary: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "500", paddingTop: 4 }, providerWizardModeControl: { width: "100%", height: 26, flexShrink: 0 }, providerWizardPicker: { width: "100%", minWidth: 0, height: 26 }, providerWizardInput: { width: "100%", minHeight: 26, color: systemColors.label, fontSize: UI_FONT_SIZE }, providerWizardSecretInput: { width: "100%", minHeight: 26 }, providerWizardHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15, paddingVertical: 2 }, providerWizardFooter: { minHeight: 46, paddingHorizontal: 20, paddingVertical: 8, flexDirection: "row", alignItems: "center", gap: 6, borderTopWidth: 0, backgroundColor: systemColors.window }, providerWizardFooterSpacer: { flex: 1 }, providerWizardFooterStatus: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, providerWizardFooterActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 },
   routeTablePane: { flex: 1, minWidth: 0, minHeight: 0 },
   // The model detail's own label column, so every row in that pane — the
   // fields, the rate row, the protocol pickers, and the window row — draws its

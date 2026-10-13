@@ -19,6 +19,7 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 import re
 import ssl
+import time
 from typing import Any
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 import urllib.error
@@ -136,6 +137,60 @@ class RelayTransportError(RelayAccountsError):
 
     def __init__(self) -> None:
         super().__init__("Relay is unavailable")
+
+
+class RelayLoginRefusedError(RelayAccountsError):
+    """A sign-in this app must not retry, and must not record as 未登录.
+
+    Two very different situations share this shape, and both mean the same
+    thing to a caller: the station never rejected a *credential*, so the login
+    observation on disk must stand exactly as it is and the pane has to name
+    the reason instead of claiming the account is signed out.
+
+    * the station caps this account's concurrent sessions and refused to mint
+      another one (see :class:`RelaySessionLimitError`);
+    * this app is deliberately not asking again yet (see
+      :class:`RelayLoginBackoffError`).
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+
+class RelaySessionLimitError(RelayLoginRefusedError):
+    """A station that refused a sign-in because the account is already signed in.
+
+    The credential is not what the station rejected: the account holds as many
+    concurrent sessions as the site allows, so re-authenticating from a
+    remembered password can only be refused the same way.  Callers keep the
+    login state they already have instead of recording a 未登录 the station
+    never stated, and the pane names the reason rather than sending the user to
+    retype a password that is fine.
+
+    Repeated sign-ins are the usual way an account *reaches* the cap, so this
+    refusal also starts the wait below: the one response that cannot help is
+    asking again on the next entry, which is what a stuck pane would do.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("Relay login was refused because the account is signed in elsewhere")
+
+
+class RelayLoginBackoffError(RelayLoginRefusedError):
+    """A sign-in this app is holding back after one recent refusal.
+
+    A refused sign-in says nothing new a second later: the station's own answer
+    was just taken, and every retry costs another session issuance on an
+    account whose session count is the thing that ran out.  The wait is a
+    throttle on this app's own eagerness, never a verdict about the password.
+    """
+
+    def __init__(self, seconds: float | None = None) -> None:
+        self.seconds = seconds
+        message = "Relay login is waiting out a recent refusal before asking again"
+        if isinstance(seconds, (int, float)) and seconds > 0:
+            message = f"Relay login is waiting {math.ceil(seconds)}s before asking again"
+        super().__init__(message)
 
 
 def _runtime_root(value: Path | str | None) -> Path:
@@ -744,6 +799,34 @@ def _public_pending_operation(operation: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _raise_login_refusal(exc: urllib.error.HTTPError) -> None:
+    """Raise the station's own reason for refusing one sign-in.
+
+    A password form is answered by more than "wrong password": a New API fork
+    caps concurrent sessions (409 ``AUTH_SESSION_LIMIT``), a locked account
+    refuses, and a two-factor account asks for its code.  Each is a different
+    next step for the user, so the code the station sent is named when this app
+    knows it, and the generic refusal covers everything else -- never "the
+    password is wrong" when the station said otherwise.
+    """
+
+    code = ""
+    try:
+        body = exc.read(MAX_RESPONSE_BYTES + 1)
+        payload = json.loads(body.decode("utf-8"))
+        if isinstance(payload, Mapping):
+            code = str(payload.get("code", "")).strip().upper()
+    except Exception:
+        code = ""
+    if code == "AUTH_SESSION_LIMIT":
+        raise RelaySessionLimitError() from None
+    if code in {"AUTH_2FA_REQUIRED", "AUTH_TOTP_REQUIRED"}:
+        raise RelayAccountsError("Relay login requires verification") from None
+    if exc.code in {401, 403}:
+        raise RelayAccountsError("Relay username or password is invalid") from None
+    raise RelayAccountsError("Relay login was rejected") from None
+
+
 def _json_data(payload: object) -> object:
     if not isinstance(payload, Mapping):
         return payload
@@ -1002,8 +1085,15 @@ class RelayHTTPClient:
                 status = getattr(response, "status", response.getcode())
                 body = response.read(MAX_RESPONSE_BYTES + 1)
                 set_cookie_headers = response.headers.get_all("Set-Cookie") or []
-        except urllib.error.HTTPError:
-            raise RelayAccountsError("Relay username or password is invalid") from None
+        except urllib.error.HTTPError as exc:
+            # The station answered and refused the sign-in.  Its own reason is
+            # read before the status is flattened: a New API fork that caps
+            # concurrent sessions answers 409 ``AUTH_SESSION_LIMIT``, and
+            # reporting that as "the password is invalid" sent the user to
+            # retype a password the station had never rejected -- the account
+            # was already signed in elsewhere, and only the caller can decide
+            # what to do about that.
+            _raise_login_refusal(exc)
         except Exception:
             # The station was never reached, so this is not an answer about the
             # account: the transport error is kept as its own type so a caller
@@ -1151,6 +1241,13 @@ class RelayAccountsDomain:
         # Raw API keys remain process-local. They are populated from an
         # authenticated refresh/read and never enter snapshots or storage.
         self._resource_secret_cache: dict[str, str] = {}
+        # When this app last had a sign-in refused, per account.  A refused
+        # sign-in is the station's answer about this moment, and asking again a
+        # second later cannot change it -- while each attempt asks the station
+        # to mint another session, on an account whose session count is exactly
+        # what ran out.  Process-local on purpose: a restart is a new reason to
+        # ask.  See ``_renew_remembered_session``.
+        self._login_refusals: dict[str, float] = {}
         # A native browser-session erase can fail after account deletion. Keep
         # only an opaque tombstone so the UI can retry after a restart.
         self._pending_credential_cleanups: list[dict[str, str]] = []
@@ -1163,6 +1260,19 @@ class RelayAccountsDomain:
         # Apply must undo the local alignment preview; after Apply the baseline
         # is discarded so manual edits continue from the current grouping.
         self._auto_grouping_draft_baselines: dict[str, dict[str, Any]] = {}
+        # One Apply's account reads, keyed by account id.  A journal with
+        # several operations on one account ran a full station round trip for
+        # each of them *plus* one per reconcile pass, all inside the store lock
+        # every window reads through; nothing local is written between those
+        # calls, so they can share the first read.  Every remote write drops
+        # the account's entry, so a pass that changed a key observes the change.
+        self._apply_read_memo: dict[str, dict[str, Any]] = {}
+        # Every account this Apply has already written to.  A write is what
+        # makes the memo stale, so the entry is dropped when the *write* lands,
+        # not when a pass begins: an Apply runs four passes (execute and
+        # reconcile, once per phase) and only a pass that actually mutated a key
+        # changes what the station would report.
+        self._apply_written_accounts: set[str] = set()
         self._draft_staged = False
         self._import_staged = False
         # Binding counts are derived by the provider/model domain. They are
@@ -2573,6 +2683,8 @@ class RelayAccountsDomain:
                 body={"name": key_name},
             )
         updates: dict[str, Any] = {"state": "remote_applied"}
+        # The station's key list changed: later passes must observe it.
+        self._mark_account_written(str(account.get("id", "")))
         remote_resource_id = self._response_resource_id(account, payload)
         if remote_resource_id:
             updates["remote_resource_id"] = remote_resource_id
@@ -2580,6 +2692,9 @@ class RelayAccountsDomain:
         self._persist_journal()
 
     def _execute_existing_operation(self, account: Mapping[str, Any], operation: dict[str, Any]) -> None:
+        # A key this pass renames, re-groups, disables, or deletes changes the
+        # very list the memo holds, so a read from before it is stale.
+        self._mark_account_written(str(account.get("id", "")))
         resource_id = str(operation.get("resource_id", ""))
         remote_id = self._api_key_remote_id(account, resource_id)
         changes = operation.get("changes", {})
@@ -2699,6 +2814,71 @@ class RelayAccountsDomain:
             return False
         return True
 
+    def _refresh_resources_for_apply(self, account_id: str, *, keys_only: bool = True) -> dict[str, Any]:
+        """Read one account once per Apply, remembering which read it was.
+
+        Two callers ask this domain for account facts during an Apply, and they
+        need different things:
+
+        * the journal's *reconciliation* — "did my write land?" — needs each
+          key's id, name, group, and enabled flag, which is one page;
+        * ``binding_materials`` needs each key's *catalog*, because a linked
+          route is judged against what its key can call.
+
+        The key-only read exists because the full one also fetches the channel
+        catalog, the group list, the per-group rates, the balance, and one
+        gateway catalog per uncovered group — measured at 10.6s for the channel
+        page alone on a real account — and none of that can answer whether a
+        write landed.  All of it used to run inside Core's store lock, so a user
+        pressing ＋ in the model chooser waited for reads that could not change
+        the answer.
+
+        The memo is keyed by the *kind* of read, so a reconciliation can never
+        be answered with a key list whose catalogs another caller fetched (or
+        the reverse).  A full read satisfies either caller: it contains
+        everything the key-only read does.  Every remote writer drops the
+        account's entries, so a pass after a mutation still observes the change.
+        """
+
+        memo = self._apply_read_memo
+        entry = memo.get(account_id)
+        if entry is not None and (entry.get("keys_only") is False or keys_only):
+            return entry["value"]
+        value = self.refresh_resources(
+            account_id,
+            _for_apply=True,
+            keys_only=keys_only,
+        )
+        memo[account_id] = {"keys_only": keys_only, "value": value}
+        return value
+
+    def _mark_account_written(self, account_id: str) -> None:
+        """Drop an account's remembered read, because a write just changed it."""
+
+        self._apply_read_memo.pop(account_id, None)
+        self._apply_written_accounts.add(account_id)
+
+    def begin_apply_reads(self) -> None:
+        """Start one Apply's read memo.
+
+        The journal runs four passes over the same accounts — execute and
+        reconcile, once per phase — and only a pass that actually writes a key
+        changes what the station reports.  Every pass therefore reuses the
+        first read of the account, and a write drops exactly that account's
+        entry.  Without this the same key list was fetched once per pass, so a
+        routine Apply paid two full dashboard round trips plus one gateway
+        catalog per key *per pass*, all inside the store lock.
+        """
+
+        self._apply_read_memo.clear()
+        self._apply_written_accounts.clear()
+
+    def end_apply_reads(self) -> None:
+        """Drop the memo so the next Apply observes fresh station facts."""
+
+        self._apply_read_memo.clear()
+        self._apply_written_accounts.clear()
+
     def execute_pending_operations(
         self,
         prepared: Mapping[str, Any] | None = None,
@@ -2776,7 +2956,7 @@ class RelayAccountsDomain:
                     continue
                 _, account = account_result
                 try:
-                    self.refresh_resources(account_id, _for_apply=True)
+                    self._refresh_resources_for_apply(account_id)
                     account_result = self._operation_account(operation)
                     if account_result is None or not self._reconcile_created_resource(account_result[1], operation):
                         self._update_pending_operation(
@@ -2788,6 +2968,10 @@ class RelayAccountsDomain:
                         continue
                     account = account_result[1]
                     self._apply_create_metadata(account, operation)
+                    # The metadata write just changed this key (its name, group,
+                    # or enabled flag), so the key list read before it no longer
+                    # describes the account: a later pass must read again.
+                    self._mark_account_written(account_id)
                     self._update_pending_operation(operation, state="remote_applied", error="")
                     self._persist_journal()
                 except Exception:
@@ -2854,7 +3038,7 @@ class RelayAccountsDomain:
         issues: list[dict[str, str]] = []
         for account_id in affected_account_ids:
             try:
-                public = self.refresh_resources(account_id, _for_apply=True)
+                public = self._refresh_resources_for_apply(account_id)
             except Exception:
                 issues.append(self._apply_issue("refresh_failed", account_id=account_id))
                 continue
@@ -3072,6 +3256,12 @@ class RelayAccountsDomain:
             account = self._accounts[self._index(account_id)]
             resource = self._selected_resource(account, resource_id)
             return bool(resource.get("key_hint"))
+        if field == "password":
+            # The remembered password the host's own sign-in page fills back
+            # in.  It is a per-account value, not a per-resource one, so the
+            # target is the account id itself.
+            account = self._accounts[self._index(target)]
+            return bool(account.get("remember_password")) and bool(account.get("password"))
         if field != "session":
             raise RelayAccountsError("The requested relay credential is unavailable")
         self._index(target)
@@ -3125,6 +3315,19 @@ class RelayAccountsDomain:
         its own and fails only when no key or no dashboard session exists.
         """
 
+        if field == "password":
+            # The remembered password is handed only to the host that owns the
+            # sign-in page it was saved from, through the same one-time native
+            # lease as a key: an account that stopped remembering has none.
+            if target is None:
+                raise RelayAccountsError("The requested relay credential is unavailable")
+            account = self._accounts[self._index(target)]
+            if not account.get("remember_password"):
+                raise RelayAccountsError("The requested relay credential is unavailable")
+            password = account.get("password", "")
+            if not isinstance(password, str) or not password:
+                raise RelayAccountsError("The requested relay credential is unavailable")
+            return password
         if field != "api_key" or target is None:
             raise RelayAccountsError("The requested relay credential is unavailable")
         account_id, resource_id = self._secret_target(target)
@@ -3299,6 +3502,10 @@ class RelayAccountsDomain:
             account["session"] = {}
         self._accounts[index] = _private_account(account)
         self._session_secrets[account_id] = secrets
+        # A login just proved itself, so any refusal this account was waiting
+        # out is answered: the wait only ever meant "this app is not asking
+        # again yet", and there is nothing left to ask.
+        self.clear_login_refusal(account_id)
         # The sign-in and the session it proved persist here.  ``_persist``
         # applies its own gate, so a login that lands while the panes hold an
         # unrelated draft defers its write with every other non-CRUD transition
@@ -3392,7 +3599,19 @@ class RelayAccountsDomain:
         return _public_account(self._accounts[index])
 
     def restore_saved_password(self, account_id: str) -> dict[str, Any]:
-        """Attempt a non-UI login from an explicitly remembered password."""
+        """Attempt a non-UI login from an explicitly remembered password.
+
+        This is the one place in Core that asks a station to mint a session, so
+        it is also the one place the post-refusal wait has to be enforced: every
+        caller — the pane's restore, a renewal that already probed its cookie,
+        and an Apply's own read — passes through here, and a throttle anywhere
+        else would leave a path that still asks once per entry.  Asking again is
+        exactly what an account at the site's session cap must not do.
+
+        ``force`` is the explicit-sign-in override: a user who has just signed
+        in through the account pane, or whose credentials have changed, is a new
+        fact rather than a repeat of the refusal.
+        """
 
         index = self._index(account_id)
         account = copy.deepcopy(self._accounts[index])
@@ -3408,8 +3627,31 @@ class RelayAccountsDomain:
             or not callable(login)
         ):
             return self.set_login_status(account_id, "signed_out")
-        result = login(account["origin"], account["type"], username, password)
+        remaining = self._login_refusal_remaining(account_id)
+        if remaining > 0:
+            raise RelayLoginBackoffError(remaining)
+        try:
+            result = login(account["origin"], account["type"], username, password)
+        except RelayTransportError:
+            # The station was never reached, so nothing was refused and there is
+            # nothing to wait out.
+            raise
+        except RelayLoginRefusedError:
+            # The station answered and would not mint a session.  Waiting before
+            # the next attempt is what stops a capped account from being asked
+            # once per pane entry.
+            self._note_login_refusal(account_id)
+            raise
+        except Exception:
+            # Any other rejection (a remembered password the station no longer
+            # accepts, a locked account) is answered the same way: repeat the
+            # attempt after the wait rather than on every entry.  A user who
+            # fixes the credential signs in through the account pane, which
+            # clears the wait.
+            self._note_login_refusal(account_id)
+            raise
         if not isinstance(result, Mapping):
+            self._note_login_refusal(account_id)
             raise RelayAccountsError("Relay login was rejected")
         return self.accept_login_result(
             account_id,
@@ -3422,17 +3664,21 @@ class RelayAccountsDomain:
         )
 
     def set_login_status(self, account_id: str, status: str) -> dict[str, Any]:
-        """Record a native session check that did not yield usable credentials.
+        """Record one station outcome that did not yield a usable session.
 
         This deliberately accepts only terminal, secret-free outcomes. A
         ``signed_in`` state must still pass through :meth:`accept_login_result`
         so the Core has the verified session in memory for a later relay
         import.
 
-        The result is one account observation, never a statement about the
-        station's API keys: the last verified key list and its resource state
-        stay exactly as they were, so locally known keys keep loading while
-        the account reads signed out or expired.
+        The result is one account *observation*, never a statement about the
+        station's API keys and never a verdict about the credential.  Both the
+        last verified key list and the remembered session therefore survive it:
+        the cookie is the only thing that can be *asked* whether it still works,
+        so discarding it on a note this app wrote itself left the next read with
+        nothing to probe and made it ask the station to mint a brand-new
+        session.  A session the station actually refuses is retired by the probe
+        that received that refusal, not by a bookkeeping call here.
         """
 
         if status not in {"signed_out", "expired"}:
@@ -3450,8 +3696,6 @@ class RelayAccountsDomain:
         # empty, or downgrade that list.
         self._accounts[index] = _private_account(account)
         self._session_secrets.pop(account_id, None)
-        if status == "expired":
-            self._accounts[index]["session"] = {}
         self._persist()
         self.revision += 1
         return _public_account(self._accounts[index])
@@ -3730,23 +3974,48 @@ class RelayAccountsDomain:
         except RelayAccountsError:
             return []
 
-    def _newapi_resources(self, account: Mapping[str, Any]) -> list[dict[str, Any]]:
+    def _newapi_resources(
+        self,
+        account: Mapping[str, Any],
+        *,
+        keys_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        """The token page, plus each group's catalog unless only the keys are asked.
+
+        ``keys_only`` is what a journal reconciliation needs: which tokens
+        exist, what they are called, and whether they are enabled.  It skips the
+        account-wide model list, one catalog read per group, and the per-token
+        value reads — all of which describe what a key *serves* rather than
+        whether it exists.
+        """
+
         headers = self._headers(account)
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            models_future = executor.submit(
-                self._http.json,
-                account["origin"],
-                "/api/user/models",
-                headers=headers,
+        if keys_only:
+            tokens = _json_data(
+                self._http.json(
+                    account["origin"],
+                    "/api/token/?p=1&size=100",
+                    headers=headers,
+                )
             )
-            tokens_future = executor.submit(
-                self._http.json,
-                account["origin"],
-                "/api/token/?p=1&size=100",
-                headers=headers,
-            )
-            models = _model_names(models_future.result())
-            tokens = _json_data(tokens_future.result())
+            models: list[str] = []
+            groups: dict[str, list[str]] = {}
+        else:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                models_future = executor.submit(
+                    self._http.json,
+                    account["origin"],
+                    "/api/user/models",
+                    headers=headers,
+                )
+                tokens_future = executor.submit(
+                    self._http.json,
+                    account["origin"],
+                    "/api/token/?p=1&size=100",
+                    headers=headers,
+                )
+                models = _model_names(models_future.result())
+                tokens = _json_data(tokens_future.result())
         if isinstance(tokens, Mapping):
             tokens = tokens.get("items", [])
         if not isinstance(tokens, Sequence) or isinstance(tokens, (str, bytes, bytearray)):
@@ -3754,13 +4023,14 @@ class RelayAccountsDomain:
         # One read per distinct group, never one per key: the keys in a group
         # share its catalog, so a station with ten keys across ten groups costs
         # ten reads and not one per key.
-        groups: dict[str, list[str]] = {}
-        for item in tokens:
-            if not isinstance(item, Mapping):
-                continue
-            group_id = _group_id(item.get("group"))
-            if group_id and group_id not in groups:
-                groups[group_id] = []
+        if not keys_only:
+            groups = {}
+            for item in tokens:
+                if not isinstance(item, Mapping):
+                    continue
+                group_id = _group_id(item.get("group"))
+                if group_id and group_id not in groups:
+                    groups[group_id] = []
         if groups:
             # One pool for every read this key list still needs: the group
             # catalogs and the key values New API does not carry in the list
@@ -3813,42 +4083,65 @@ class RelayAccountsDomain:
             )
         return resources
 
-    def _sub2api_resources(self, account: Mapping[str, Any], *, for_apply: bool = False) -> list[dict[str, Any]]:
+    def _sub2api_resources(
+        self,
+        account: Mapping[str, Any],
+        *,
+        for_apply: bool = False,
+        keys_only: bool = False,
+    ) -> list[dict[str, Any]]:
         """Load the key list and each group's models.
 
         The channel page answers for every group it describes, so the
         ordinary read costs one page per concern.  A group it omits keeps the
         list that key read earlier; an Apply-time read (``for_apply``) still
         re-reads that key so materialization never uses a stale catalog.
+
+        ``keys_only`` reads the key page alone: a reconciliation needs to know
+        which keys exist and what they are called, not what each one serves.
+        The channel page this skips is the single slowest request this station
+        answers (measured at 10.6s), so asking for it to learn a key's name is
+        what made a model add wait.
         """
 
         headers = self._headers(account)
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            keys_future = executor.submit(
-                self._http.json,
-                account["origin"],
-                "/api/v1/keys?page=1&page_size=100",
-                headers=headers,
+        if keys_only:
+            keys = _json_data(
+                self._http.json(
+                    account["origin"],
+                    "/api/v1/keys?page=1&page_size=100",
+                    headers=headers,
+                )
             )
-            channels_future = executor.submit(
-                self._http.json,
-                account["origin"],
-                "/api/v1/channels/available",
-                headers=headers,
-            )
-            keys = _json_data(keys_future.result())
-            try:
-                channels = channels_future.result()
-                group_models = _sub2api_group_models(channels)
-                models = _sub2api_channel_models(channels)
-            except RelayAccountsError:
-                # The key list above is the dashboard-session authentication
-                # check. A deployment may protect, omit, or disable this
-                # dashboard-only channel catalog while its OpenAI-compatible
-                # gateway remains usable; discover models from each active key
-                # below instead of falsely expiring the account.
-                group_models = {}
-                models = []
+            group_models: dict[str, list[str]] = {}
+            models: list[str] = []
+        else:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                keys_future = executor.submit(
+                    self._http.json,
+                    account["origin"],
+                    "/api/v1/keys?page=1&page_size=100",
+                    headers=headers,
+                )
+                channels_future = executor.submit(
+                    self._http.json,
+                    account["origin"],
+                    "/api/v1/channels/available",
+                    headers=headers,
+                )
+                keys = _json_data(keys_future.result())
+                try:
+                    channels = channels_future.result()
+                    group_models = _sub2api_group_models(channels)
+                    models = _sub2api_channel_models(channels)
+                except RelayAccountsError:
+                    # The key list above is the dashboard-session authentication
+                    # check. A deployment may protect, omit, or disable this
+                    # dashboard-only channel catalog while its OpenAI-compatible
+                    # gateway remains usable; discover models from each active key
+                    # below instead of falsely expiring the account.
+                    group_models = {}
+                    models = []
         if isinstance(keys, Mapping):
             keys = keys.get("items", [])
         if not isinstance(keys, Sequence) or isinstance(keys, (str, bytes, bytearray)):
@@ -3893,7 +4186,7 @@ class RelayAccountsDomain:
         # fallback); once a page describes groups, only a group it omits and a
         # key with no list of its own needs a read.
         stable_group_catalog = bool(group_models) and not for_apply
-        gateway_items = [
+        gateway_items = [] if keys_only else [
             entry for entry in key_items
             if entry[2] and entry[5] not in group_models
             and (not stable_group_catalog or entry[3] not in previous_models)
@@ -4018,31 +4311,119 @@ class RelayAccountsDomain:
             raise RelayAccountsError("Relay account balance is unavailable")
         return quota / quota_per_unit
 
+    # After one refused sign-in, this app waits before asking the station
+    # again.  A refusal is the station's answer about *this* moment, and asking
+    # again a second later cannot change it -- while every attempt costs one
+    # session issuance on an account whose session count is exactly what ran
+    # out.  The wait is per account and process-local: a restart, a fresh user
+    # action (a real sign-in, which clears it), and an origin change each get to
+    # ask immediately, because those are new facts rather than a repeat.
+    LOGIN_REFUSAL_BACKOFF_SECONDS = 60.0
+    LOGIN_REFUSAL_BACKOFF_KEY = "YOUNG_ROUTER_RELAY_LOGIN_BACKOFF_SECONDS"
+
+    def _login_refusal_seconds(self) -> float:
+        """The configured wait after a refused sign-in, in seconds.
+
+        Read per use rather than cached, so a change applies to the next
+        refusal, and a settings file that cannot be read leaves the default in
+        place instead of disabling the throttle.
+        """
+
+        from ._shared import _default_runtime_settings_path
+
+        try:
+            from ..runtime_settings_io import load_specs, read_settings_file
+
+            values = read_settings_file(_default_runtime_settings_path(), load_specs())
+            raw = str(values.get(self.LOGIN_REFUSAL_BACKOFF_KEY, "")).strip()
+            seconds = float(raw) if raw else self.LOGIN_REFUSAL_BACKOFF_SECONDS
+        except Exception:
+            seconds = self.LOGIN_REFUSAL_BACKOFF_SECONDS
+        if not math.isfinite(seconds) or seconds < 0:
+            return self.LOGIN_REFUSAL_BACKOFF_SECONDS
+        return seconds
+
+    def _login_refusal_remaining(self, account_id: str) -> float:
+        """Seconds left of this account's post-refusal wait, or ``0``."""
+
+        stamped = self._login_refusals.get(str(account_id))
+        if not isinstance(stamped, (int, float)) or isinstance(stamped, bool):
+            return 0.0
+        remaining = self._login_refusal_seconds() - (time.monotonic() - float(stamped))
+        return remaining if remaining > 0 else 0.0
+
+    def _note_login_refusal(self, account_id: str) -> None:
+        """Start this account's wait, so the next entry does not re-ask."""
+
+        self._login_refusals[str(account_id)] = time.monotonic()
+
+    def clear_login_refusal(self, account_id: str) -> None:
+        """Forget a refusal because the login itself succeeded."""
+
+        self._login_refusals.pop(str(account_id), None)
+
     def _renew_remembered_session(self, account_id: str) -> bool:
-        """Mint a new station session from the account's remembered password.
+        """Make one station session usable again, probing before signing in.
 
         A station session lives about two days while a window can stay open for
         longer, and every authenticated read — a resource refresh, a key
-        materialization, and the Apply that binds them — depends on it.  A
-        rejected read is therefore a fact about the session, not about the
-        account's keys, and the one credential that can always mint a new
-        session is the remembered password.  This never guesses a replacement:
-        it re-authenticates the same saved account on the same origin, and a
-        station that refuses the password simply keeps the expired observation.
+        materialization, and the Apply that binds them — depends on it.
+
+        The order here is the whole point, and it used to be wrong.  A session
+        is first *asked* whether it still works (:meth:`restore_saved_session`),
+        and only a credential the station explicitly refuses is replaced by a
+        remembered-password sign-in.  Signing in is the expensive, one-way step:
+        it asks the station to mint another session, so an account at the site's
+        concurrent-session cap can never sign in again -- including this app
+        itself, and including from the password that the user never changed.
+        Probing costs one authenticated read and mints nothing, so a cookie that
+        still works is reused and the account's session count never grows.
+
+        ``False`` means "this did not produce a usable session"; the caller
+        reports the read it could not make and the login observation stays as it
+        was.
         """
 
         index = self._index(account_id)
         account = self._accounts[index]
+        # One probe first, whatever the recorded observation says: a recorded
+        # ``expired`` is this app's own last note, and the credential may have
+        # been replaced (or the station's session restored) since.  A transport
+        # failure propagates -- it is not an answer about the session.
+        if self._has_session_credentials(account):
+            try:
+                restored = self.restore_saved_session(account_id)
+            except RelayTransportError:
+                raise
+            except Exception:
+                restored = None
+            if isinstance(restored, Mapping) and restored.get("login_status") == "signed_in":
+                self.clear_login_refusal(account_id)
+                return True
+        # The credential was refused, or there is none to ask with.  Only now is
+        # a sign-in considered, and only when the last refusal has been waited
+        # out: that is what keeps a capped account from being asked once per
+        # pane entry, which is how the cap is reached in the first place.
         if not account.get("remember_password"):
             return False
         if not account.get("password") or not account.get("username"):
             return False
         try:
             restored = self.restore_saved_password(account_id)
+        except RelayTransportError:
+            raise
+        except RelaySessionLimitError:
+            # The station refused to mint a session.  Report the refusal rather
+            # than a login state the station never stated; the wait it started
+            # is what keeps the next entry from asking again.
+            raise
+        except RelayLoginRefusedError:
+            # Still inside the wait a previous refusal started.
+            raise
         except Exception:
-            # A station that is unreachable, or that rejects the saved
-            # password, leaves the expired observation in place; the caller
-            # reports the read it could not make.
+            # A station that rejects the remembered password leaves the expired
+            # observation in place; the caller reports the read it could not
+            # make.
             return False
         return isinstance(restored, Mapping) and restored.get("login_status") == "signed_in"
 
@@ -4053,7 +4434,9 @@ class RelayAccountsDomain:
         aged out mid-session must not make the group manager's key read and the
         Apply's own binding resolution disagree about whether the same key
         exists.  Bounded to one renewal — a session the station rejects even
-        after that is the account's real answer.
+        after that is the account's real answer.  Renewal itself probes before
+        it signs in, and a refusal propagates so the caller reports the reason
+        instead of a login state nobody established.
         """
 
         try:
@@ -4063,21 +4446,47 @@ class RelayAccountsDomain:
                 raise
         return read()
 
-    def refresh_resources(self, account_id: str, *, _for_apply: bool = False) -> dict[str, Any]:
+    def refresh_resources(
+        self,
+        account_id: str,
+        *,
+        _for_apply: bool = False,
+        keys_only: bool = False,
+    ) -> dict[str, Any]:
         """Load selectable metadata after native login without staging providers.
 
         A session the station rejected is renewed from the remembered password
         and the read is sent once more, because an aged-out session used to end
         here as `login_expired` — which the Apply path then reported as the
         linked key being unavailable, discarding the very session it needed.
+
+        ``keys_only`` asks for the one page a journal reconciliation needs —
+        which keys exist, what they are called, which group each sits in, and
+        whether it is enabled.  The catalogs, the per-group rates, and the
+        balance are what the *panes* render, and paying for them here held
+        Core's store lock for the ten seconds a channel page can take while the
+        user was pressing ＋ in the model chooser.
         """
 
-        result = self._refresh_resources_once(account_id, _for_apply=_for_apply)
+        # A read replaces this account's whole resource list, so any read a
+        # journal already remembered for it is superseded.  Without this an
+        # Apply's memo could hand a *later* reconciliation the state from
+        # before a pane refresh the user made in between — the reconciliation
+        # would then compare a staged change against a key list that predates
+        # it and report a write as not applied.
+        self._apply_read_memo.pop(str(self._accounts[self._index(account_id)]["id"]), None)
+        result = self._refresh_resources_once(account_id, _for_apply=_for_apply, keys_only=keys_only)
         if result.get("resource_error") == "login_expired" and self._renew_remembered_session(account_id):
-            result = self._refresh_resources_once(account_id, _for_apply=_for_apply)
+            result = self._refresh_resources_once(account_id, _for_apply=_for_apply, keys_only=keys_only)
         return result
 
-    def _refresh_resources_once(self, account_id: str, *, _for_apply: bool = False) -> dict[str, Any]:
+    def _refresh_resources_once(
+        self,
+        account_id: str,
+        *,
+        _for_apply: bool = False,
+        keys_only: bool = False,
+    ) -> dict[str, Any]:
         """Read the station's key list and group catalog in one round.
 
         The key list and the group catalog are what the caller waits for; the
@@ -4085,6 +4494,11 @@ class RelayAccountsDomain:
         documentary read policy, so a station that stalls on one of them delays
         the round by seconds instead of holding the key list for a write-sized
         timeout.
+
+        ``keys_only`` reads the key page alone.  It is what a journal
+        reconciliation needs — see ``refresh_resources`` — and it keeps the
+        catalogs the account already carries, because a key's model list is not
+        part of the question "did my write land?".
         """
 
         index = self._index(account_id)
@@ -4092,52 +4506,79 @@ class RelayAccountsDomain:
         previous_resources = copy.deepcopy(account.get("resources", []))
         previous_groups = copy.deepcopy(account.get("groups", []))
         previous_balance = account.get("balance")
+        carried_models = {
+            str(resource.get("id", "")): list(resource.get("models") or [])
+            for resource in previous_resources
+            if isinstance(resource, Mapping)
+        }
         # A refresh needs usable credentials, not a fresh browser sign-in: a
         # remembered session still reads the station, and an account without
         # any session fails in the first read below with the same unavailable
         # result instead of refusing here on its login observation.
         try:
             self._clear_resource_cache(account_id)
-            with ThreadPoolExecutor(max_workers=3) as executor:
-                balance_future = executor.submit(self._account_balance, account)
-                groups_future = executor.submit(
-                    self._newapi_groups if account["type"] == "newapi" else self._sub2api_groups,
-                    account,
-                )
-                resources_future = executor.submit(
-                    lambda: self._newapi_resources(account)
+            if keys_only:
+                private_resources = (
+                    self._newapi_resources(account, keys_only=True)
                     if account["type"] == "newapi"
-                    else self._sub2api_resources(account, for_apply=_for_apply)
+                    else self._sub2api_resources(account, keys_only=True)
                 )
-                try:
-                    account["balance"] = balance_future.result()
-                except Exception:
-                    # Balance is an independent account summary. A station
-                    # that omits its profile endpoint must not hide usable
-                    # API keys, and a documentary read the station drops
-                    # leaves the last known balance in place instead of
-                    # blanking it for every other round trip.
-                    account["balance"] = previous_balance
-                try:
-                    groups = groups_future.result()
-                except RelayAccountsError:
-                    # Group selection is an enhancement to a usable key list.
-                    # Keep the last verified choices when an older relay omits
-                    # this optional dashboard endpoint.
-                    groups = previous_groups
-                private_resources = resources_future.result()
-            resources = _safe_resources(private_resources)
-            if not resources:
-                raise RelayAccountsError("Relay has no API keys")
-            enabled_resources = [resource for resource in resources if resource["enabled"]]
-            if enabled_resources and not any(resource["models"] for resource in enabled_resources):
-                raise RelayAccountsError("Relay API keys have no available models")
+                resources = _safe_resources(private_resources)
+                for resource in resources:
+                    models = carried_models.get(str(resource.get("id", "")))
+                    if models and not resource.get("models"):
+                        resource["models"] = list(models)
+                groups = previous_groups
+                if not resources:
+                    raise RelayAccountsError("Relay has no API keys")
+            else:
+                with ThreadPoolExecutor(max_workers=3) as executor:
+                    balance_future = executor.submit(self._account_balance, account)
+                    groups_future = executor.submit(
+                        self._newapi_groups if account["type"] == "newapi" else self._sub2api_groups,
+                        account,
+                    )
+                    resources_future = executor.submit(
+                        lambda: self._newapi_resources(account)
+                        if account["type"] == "newapi"
+                        else self._sub2api_resources(account, for_apply=_for_apply)
+                    )
+                    try:
+                        account["balance"] = balance_future.result()
+                    except Exception:
+                        # Balance is an independent account summary. A station
+                        # that omits its profile endpoint must not hide usable
+                        # API keys, and a documentary read the station drops
+                        # leaves the last known balance in place instead of
+                        # blanking it for every other round trip.
+                        account["balance"] = previous_balance
+                    try:
+                        groups = groups_future.result()
+                    except RelayAccountsError:
+                        # Group selection is an enhancement to a usable key list.
+                        # Keep the last verified choices when an older relay omits
+                        # this optional dashboard endpoint.
+                        groups = previous_groups
+                    private_resources = resources_future.result()
+                resources = _safe_resources(private_resources)
+                if not resources:
+                    raise RelayAccountsError("Relay has no API keys")
+                enabled_resources = [resource for resource in resources if resource["enabled"]]
+                if enabled_resources and not any(resource["models"] for resource in enabled_resources):
+                    raise RelayAccountsError("Relay API keys have no available models")
         except RelayAccountsError as exc:
             message = str(exc).lower()
             if "expired" in message:
+                # The station answered and refused this session -- but the
+                # credential itself is kept.  Retiring it here was the defect
+                # that made every later entry mint a brand-new station session:
+                # with the cookie gone, the renewal path had nothing left to
+                # probe, so it fell straight through to a password sign-in and
+                # consumed one more session on an account whose session count is
+                # the very thing that runs out.  Keeping the credential lets the
+                # next read (and :meth:`_renew_remembered_session`) ask whether
+                # it still works, which is the only question that can retire it.
                 account["login_status"] = "expired"
-                account["session"] = {}
-                self._session_secrets.pop(account_id, None)
                 resource_error = "login_expired"
             elif "no api keys" in message:
                 resource_error = "no_api_keys"
@@ -5027,7 +5468,9 @@ class RelayAccountsDomain:
         refreshed = 0
         for account_id in account_ids:
             try:
-                result = self.refresh_resources(account_id, _for_apply=True)
+                # A binding is judged against what its key can call, so this
+                # caller needs the catalogs the reconciliation skips.
+                result = self._refresh_resources_for_apply(account_id, keys_only=False)
             except Exception:
                 issues.append(self._apply_issue("refresh_failed", account_id=account_id))
                 continue
@@ -5114,6 +5557,8 @@ class RelayAccountsDomain:
         *,
         refresh: bool = False,
         slot_credentials: object | None = None,
+        # Retained for the caller's own vocabulary (a dependency-only Apply).
+        # Whether the station is read follows from ``slot_credentials`` alone.
         local_only: bool = False,
     ) -> dict[str, Any]:
         """Resolve private relay binding material for the Core Apply coordinator.
@@ -5126,18 +5571,32 @@ class RelayAccountsDomain:
         Model management therefore stays decoupled from relay sign-in — only the
         key value itself is shared, and it needs no sign-in to be used.
 
-        ``local_only`` marks the dependency-only Apply: it needs the key the
-        draft already binds and nothing else.  When ``slot_credentials`` covers
-        every source it named, the resolution then needs no station round trip at
-        all, and it takes none — the read could not change an answer already on
-        disk, and an account refresh plus one catalog per key is what a model
-        edit used to spend inside the store lock.  A source the slots do not
-        cover still reads the station, exactly as it does for every other
-        caller, because a key only it could reveal has to come from somewhere.
+        A source ``slot_credentials`` covers resolves from the document, and the
+        station is not asked about it: the credential is the only thing a
+        binding needs from the relay, so the read could not change an answer
+        already on disk.  That is what keeps an Apply off the station — an
+        account refresh plus one gateway catalog per key is what an edit used to
+        spend inside the store lock, once per linked key in the whole document.
+        A source the slots do not cover still reads the station, because a key
+        only it could reveal has to come from somewhere.
+
+        ``local_only`` names the dependency-only Apply and is kept for its
+        caller's vocabulary; it no longer decides whether the station is read.
+        That follows from whether the slots cover the sources, so the relay's
+        own Apply gets the same answer a model edit does.
 
         This method is intentionally *not* used by ``snapshot`` or generic
         actions. Its return value can contain ``api_key`` and must remain
         inside Core while it is passed straight to provider materialization.
+
+        One failure is deliberately *not* softened by the fallback below.  When
+        the account was read and does not list a requested source, the source is
+        reported as ``resource_removed`` and the credential this Core holds is
+        left unused: it is the residue of a key the station no longer serves, so
+        reusing it would mark a dead route as linked and let every Apply about it
+        report success while its requests fail upstream.  A station that could
+        not be *read* stays deferred, exactly as before, because an answer
+        nobody received is not evidence that a key is gone.
         """
 
         raw_sources = self._binding_source_rows(sources)
@@ -5185,15 +5644,15 @@ class RelayAccountsDomain:
                 except (TypeError, ValueError):
                     continue
                 held_sources.add((str(account_id), str(resource_id)))
-        # A local-only caller that already holds every source named resolves
-        # from the document itself.  A source the slots do not cover still reads
-        # the station below — a key only it could reveal has to come from
-        # somewhere.
-        resolve_locally = local_only and bool(held_sources)
-        if resolve_locally:
+        # Whether every source this caller named is carried by a slot.  The
+        # document is then the whole answer: the credential is the only thing a
+        # binding needs from the relay, and the slot persists it, so a station
+        # round trip could not change an answer already on disk.
+        covered_by_slots = bool(held_sources)
+        if covered_by_slots:
             for raw in raw_sources:
                 if not isinstance(raw, Mapping):
-                    resolve_locally = False
+                    covered_by_slots = False
                     break
                 try:
                     source_key = (
@@ -5201,21 +5660,35 @@ class RelayAccountsDomain:
                         _resource_id(raw.get("resource_id")),
                     )
                 except Exception:
-                    resolve_locally = False
+                    covered_by_slots = False
                     break
                 if source_key not in held_sources:
-                    resolve_locally = False
+                    covered_by_slots = False
                     break
         refresh_issues: list[dict[str, str]] = []
-        # The account refresh is also the read that renews an aged-out session,
-        # so a caller that is not purely local still makes it: an uncovered
-        # source has to come from the station, and an expired session has to be
-        # minted again for that read to succeed.  A resolution that is entirely
-        # local skips it — the refresh could not change an answer already on
-        # disk, and it is the wait a model edit used to pay inside the lock.
-        if refresh and not resolve_locally:
+        # A source the document already covers needs nothing from the station.
+        # Asking anyway is what made an Apply a station transaction: the caller
+        # resolves *every* linked key in the document, so one model edit — or
+        # the shell's own debounced Apply after any relay edit — re-read the
+        # whole account set, a dashboard refresh plus one gateway catalog per
+        # key, all inside the store lock.  Only the sources the slots do not
+        # cover are read; a key only the station could reveal still comes from
+        # it, and a station that refuses one states its own outcome below.
+        uncovered = [
+            raw
+            for raw in raw_sources
+            if not (
+                isinstance(raw, Mapping)
+                and (
+                    _account_id(raw.get("account_id")),
+                    _resource_id(raw.get("resource_id")),
+                )
+                in held_sources
+            )
+        ]
+        if refresh and uncovered:
             try:
-                refresh_result = self.refresh_binding_sources(sources)
+                refresh_result = self.refresh_binding_sources(uncovered)
             except Exception:
                 # A station that cannot be read is not a verdict about a key the
                 # app already holds; each source below states its own outcome.
@@ -5224,6 +5697,40 @@ class RelayAccountsDomain:
                 raw_issues = refresh_result.get("issues")
                 if isinstance(raw_issues, Sequence) and not isinstance(raw_issues, (str, bytes, bytearray)):
                     refresh_issues = [dict(item) for item in raw_issues if isinstance(item, Mapping)]
+        # A source the station itself answered about: the account was read and
+        # this key is not among its resources.  Derived from the account's own
+        # resource list rather than from an issue code, because that list is
+        # the fact — the read that produced it succeeded.
+        unlisted_sources: set[tuple[str, str]] = set()
+        for raw in raw_sources:
+            if not isinstance(raw, Mapping):
+                continue
+            try:
+                account_id = _account_id(raw.get("account_id"))
+                resource_id = _resource_id(raw.get("resource_id"))
+            except Exception:
+                continue
+            account_result = self._operation_account(
+                {"station_id": raw.get("station_id"), "account_id": account_id}
+            )
+            if account_result is None:
+                # No account to answer with, so nothing was read about this
+                # source and its absence is not established either.
+                continue
+            _, read_account = account_result
+            if read_account.get("resource_status") != "ready":
+                # A read that did not succeed cannot tell "this key is gone"
+                # apart from "the station was never reached".
+                continue
+            resources = read_account.get("resources")
+            if not isinstance(resources, Sequence) or isinstance(resources, (str, bytes, bytearray)):
+                continue
+            if any(
+                isinstance(item, Mapping) and item.get("id") == resource_id
+                for item in resources
+            ):
+                continue
+            unlisted_sources.add((account_id, resource_id))
         materials: list[dict[str, Any]] = []
         issues: list[dict[str, str]] = []
         # A source that resolved has nothing to report, whatever the station
@@ -5249,15 +5756,31 @@ class RelayAccountsDomain:
                     raise RelayAccountsError("Relay account is unavailable")
                 resource = self._selected_resource(account, resource_id)
             except Exception:
+                if (account_id, resource_id) in unlisted_sources:
+                    # The station answered and does not serve this key.  That is
+                    # a different fact from a selection that could not be made,
+                    # and it has its own code because the two lead to opposite
+                    # answers further out: the document's own value is a fine
+                    # substitute for a key nobody could read about, and the
+                    # residue of a key the station has dropped.  Naming it here
+                    # is what refuses the write and marks the pane's row.
+                    issues.append(
+                        self._apply_issue(
+                            "resource_removed",
+                            account_id=account_id,
+                            resource_id=resource_id,
+                        )
+                    )
+                    continue
                 issues.append(self._apply_issue("resource_unavailable", account_id=account_id, resource_id=resource_id))
                 continue
             if resource_id.startswith("pending-"):
                 issues.append(self._apply_issue("created_resource_unresolved", account_id=account_id, resource_id=resource_id))
                 continue
-            # A source this Core already holds needs nothing from the station,
-            # and a caller that resolved locally reads nothing else: its whole
-            # point is that the edit binds a credential the document persists.
-            reads_allowed = not resolve_locally
+            # A source this Core already holds needs nothing from the station:
+            # its credential is the document's own persisted data.  Only a
+            # source the slots do not cover is read from the station.
+            reads_allowed = (account_id, resource_id) not in held_sources
             try:
                 if not reads_allowed:
                     raise RelayTransportError()

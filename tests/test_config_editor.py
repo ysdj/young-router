@@ -20,6 +20,8 @@ from young_router.config import api as config_api  # noqa: E402
 from young_router.config import load as config_load  # noqa: E402
 from young_router.config import schema as config_schema  # noqa: E402
 
+import yaml  # noqa: E402
+
 
 class ConfigEditorProviderKeyTests(unittest.TestCase):
     def write_config(self, text: str) -> Path:
@@ -323,6 +325,108 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
 
         self.assertEqual(["renamed"], [key["name"] for key in reloaded["api_keys"]])
         self.assertEqual("renamed", reloaded["models"][0]["api_key_name"])
+
+    def test_two_key_labels_that_are_not_ascii_get_distinct_anchors(self) -> None:
+        """A Chinese key label must not collide with another one on write.
+
+        The YAML anchor for a key is derived from its label, and the derivation
+        keeps only ``[A-Za-z0-9_]``: a label written entirely in Chinese, which
+        is ordinary for a relay key, contributed nothing and reduced to the
+        provider's bare ``api_key`` anchor.  The second such label then hit
+        ``duplicate YAML anchors``, so the whole write was refused -- which the
+        pane reported as the key the user had just added being "unavailable".
+        Two distinct labels must therefore stay two distinct anchors, and a
+        label that already produced an anchor must keep producing that same one
+        so existing documents round-trip unchanged.
+        """
+
+        from young_router.config import dump as config_dump
+
+        provider = {
+            "name": "collider",
+            "api_base": "https://example.com/v1",
+            "api_keys": [
+                {"id": "provider-slot-00000000000000000000000000000201", "name": "混合分组", "value": "sk-a"},
+                {"id": "provider-slot-00000000000000000000000000000202", "name": "国产模型", "value": "sk-b"},
+                {"id": "provider-slot-00000000000000000000000000000203", "name": "生图分组", "value": "sk-c"},
+            ],
+            "models": [],
+            "extra": {},
+        }
+
+        text = config_dump._dump_providers_section([provider])
+        document = yaml.safe_load(text)
+
+        # Every label survives with its own credential, and the document is
+        # readable YAML -- the duplicate-anchor failure would have raised first.
+        self.assertEqual(
+            ["混合分组", "国产模型", "生图分组"],
+            [item["name"] for item in document["providers"]["collider"]["api_keys"]],
+        )
+        self.assertEqual(
+            ["sk-a", "sk-b", "sk-c"],
+            [item["value"] for item in document["providers"]["collider"]["api_keys"]],
+        )
+        anchors = re.findall(r"&([A-Za-z0-9_]+)", text)
+        key_anchors = [anchor for anchor in anchors if "api_key" in anchor]
+        self.assertEqual(len(key_anchors), len(set(key_anchors)))
+        # The first label to claim the shared anchor keeps it, so a document
+        # that already loaded is rewritten with the anchors it already had.
+        self.assertEqual("collider_api_key", key_anchors[0])
+
+    def test_a_route_bound_to_a_non_ascii_label_reloads_with_that_key(self) -> None:
+        """The write must not only succeed; the route must still find its key.
+
+        A model's key is written as an alias pointing at that key's anchor, so
+        the alias has to be the anchor the *matched slot* actually owns.  A
+        provider whose labels collide is exactly where re-deriving the anchor
+        from the label names the wrong one -- the route would then reference a
+        credential that is not its own.
+        """
+
+        from young_router.config import dump as config_dump
+
+        provider = {
+            "name": "collider",
+            "api_base": "https://example.com/v1",
+            "api_keys": [
+                {"id": "provider-slot-00000000000000000000000000000301", "name": "混合分组", "value": "sk-first"},
+                {"id": "provider-slot-00000000000000000000000000000302", "name": "国产模型", "value": "sk-second"},
+            ],
+            "models": [],
+            "extra": {},
+        }
+        model = {
+            "model_name": "deepseek-v4.1-flash",
+            "litellm_model": "openai/deepseek-v4.1-flash",
+            "enabled": True,
+            "model_enabled": True,
+            "api_key_name": "国产模型",
+            "provider_key_id": "provider-slot-00000000000000000000000000000302",
+            "order": 0,
+        }
+
+        _enabled, entry = config_dump._entry_from_editor(
+            model,
+            provider,
+            0,
+            True,
+            True,
+        )
+
+        # The route's credential is the second slot's, resolved through the
+        # anchor that slot actually owns rather than the provider's first one.
+        # Re-deriving the anchor from the label would have named
+        # ``collider_api_key`` -- the *other* slot, and the wrong credential.
+        text = config_dump._dump_providers_section([provider])
+        declared = set(re.findall(r"&([A-Za-z0-9_]+)", text))
+        aliased = entry["litellm_params"]["api_key"]
+        self.assertEqual("collider_api_key_2", aliased["__alias__"])
+        self.assertIn(aliased["__alias__"], declared)
+        first_anchor, second_anchor = [
+            anchor for anchor in re.findall(r"&([A-Za-z0-9_]+)", text) if "api_key" in anchor
+        ][:2]
+        self.assertEqual(("collider_api_key", "collider_api_key_2"), (first_anchor, second_anchor))
 
     def test_load_keeps_a_key_whose_credential_another_key_already_carries(self) -> None:
         """One name is one key; one value is not.

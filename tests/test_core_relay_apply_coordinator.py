@@ -932,6 +932,94 @@ class RelayApplyCoordinatorIntegrationTests(unittest.TestCase):
             self.assertEqual([("https://relay.example.test", "/api/token/7/key")], http.post_calls)
             self.assertNotEqual({}, restarted_relay._session_secrets)
 
+    def test_a_logged_out_station_still_lists_models_from_the_slots_key(self) -> None:
+        """A linked key's own value is not the station's to withhold.
+
+        The pane's 获取模型 resolved the key by asking the station for it, so an
+        account whose dashboard session had expired answered
+        ``resource_key_unavailable`` — reported as 「无法解析该 API 密钥」 — even
+        though the applied document already persists that exact credential on
+        the slot.  Reading the station is what a *link* needs, not what an
+        already-linked key needs: the slot resolves it, exactly as an Apply
+        does, and the station is still read for a source no slot covers.
+        """
+
+        class ModelListResponse:
+            status = 200
+
+            def __enter__(self) -> "ModelListResponse":
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                return None
+
+            def getcode(self) -> int:
+                return self.status
+
+            def read(self, _: int) -> bytes:
+                return b'{"data":[{"id":"model-a"},{"id":"model-b"}]}'
+
+        class ModelListOpener:
+            def __init__(self) -> None:
+                self.requests: list[Any] = []
+
+            def open(self, request: Any, *, timeout: float) -> ModelListResponse:
+                del timeout
+                self.requests.append(request)
+                return ModelListResponse()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            core, relay, providers, http, account_id, resource_id = self._linked_core(root)
+            account = relay.snapshot()["accounts"][0]
+            # The commit every linked key gets: the Apply resolves the station
+            # credential and writes it onto the slot, so the document — not the
+            # station — is what holds the key from here on.
+            applied = core.apply(domains=["relay_accounts", "providers_models"], revision=core.revision)
+            self.assertEqual("applied", applied["status"])
+            persisted = providers.relay_slot_credentials()
+            self.assertIn((account_id, resource_id), persisted)
+
+            # The station is now unreachable for keys: the dashboard session
+            # expired and this Core holds no in-process key cache at all.
+            relay.set_login_status(account_id, "expired")
+            relay._resource_secret_cache.clear()
+            self.assertEqual({}, relay._resource_secret_cache)
+            http.calls.clear()
+
+            provider_id = providers.snapshot()["providers"][0]["id"]
+            opener = ModelListOpener()
+            with patch(
+                "young_router.core.domains.providers_models.isolated_http_opener",
+                return_value=opener,
+            ):
+                fetched = core.dispatch(
+                    {
+                        "domain": "providers_models",
+                        "type": "provider.fetch_relay_resource_models",
+                        "payload": {
+                            "provider_id": provider_id,
+                            "station_id": account["station_id"],
+                            "account_id": account_id,
+                            "resource_id": resource_id,
+                        },
+                    },
+                    expected_revision=core.revision,
+                )
+
+            summary = fetched["action_summary"]
+            self.assertEqual("fetch_models", summary["operation"])
+            self.assertEqual(["model-a", "model-b"], summary["models"])
+            # The slot's own persisted credential is what called the gateway.
+            self.assertEqual(1, len(opener.requests))
+            self.assertEqual(
+                f"Bearer {persisted[(account_id, resource_id)]}",
+                opener.requests[0].get_header("Authorization"),
+            )
+            # No secret crossed the response or the snapshot.
+            self.assertNotIn("replace-secret", json.dumps(fetched))
+            self.assertNotIn("replace-secret", json.dumps(core.snapshot()))
+
     def test_linked_import_materializes_only_during_coordinated_apply(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1353,6 +1441,99 @@ class LinkedEditResolvesFromTheKeyItAlreadyHolds(unittest.TestCase):
             # No station read at all: the answer was already on the slot.
             self.assertEqual([], http.calls)
             del account_id, provider, key
+
+    def test_a_relay_edits_own_apply_does_not_re_read_held_linked_keys(self) -> None:
+        """The relay's own Apply reads a held key from the document, not the station.
+
+        A window's relay draft (分组管理's 保存并关闭, 自动分组's own alignment)
+        makes ``relay_accounts`` dirty, and the shell's immediate Apply then
+        carries *both* domains.  The linked-key resolution used to notice only a
+        dependency-only Apply and re-read every key in the document otherwise —
+        a dashboard refresh plus one gateway catalog per key, all inside Core's
+        store lock.  Because the credential a binding needs is already persisted
+        on its slot, the read could not change an answer, and the whole app
+        waited tens of seconds for it: a relay edit made the next ＋ in the model
+        chooser look frozen.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            http = RelayCoordinatorHTTP()
+            relay = RelayAccountsDomain(root, http_client=http)
+            providers = ProvidersModelsDomain(root / "config.yaml")
+            core = CoreStore(domains=[relay, providers])
+            account_id = self._linked_provider_core(core, relay)
+            self._add_linked_model(core, providers, "model-a", "model-a")
+            core.apply("providers_models", revision=core.revision)
+            # The first Apply materialized the key onto its slot.
+            self.assertTrue(providers.relay_slot_credentials())
+
+            # A relay edit leaves its own draft staged for the next Apply.
+            core.dispatch(
+                {
+                    "domain": "relay_accounts",
+                    "type": "api_key.auto_group_align",
+                    "payload": {"account_id": account_id},
+                },
+                expected_revision=core.revision,
+            )
+            self.assertTrue(core.snapshot()["drafts"]["relay_accounts"]["dirty"])
+
+            http.calls.clear()
+            result = core.apply(domains=["providers_models", "relay_accounts"], revision=core.revision)
+
+            self.assertTrue(result["applied"], result)
+            # The key's own catalog read is the only station traffic this Apply
+            # owes; reading the key list again is what made it slow.
+            gateway_reads = [call for call in http.calls if call[1] == "/api/user/models"]
+            self.assertEqual([], gateway_reads, http.calls)
+
+    def test_a_reconciles_read_is_the_key_list_not_the_catalogs(self) -> None:
+        """A journal check reads what it needs, and only that.
+
+        ``reconcile_apply`` answers one question — did my write land? — and the
+        answer is each key's id, name, group, and enabled flag, all on the key
+        page.  It used to call the full pane refresh, which also fetches the
+        channel catalog (measured at 10.6s on a real account), the group list,
+        the per-group rates, the balance, and one gateway catalog per group the
+        channel page omits.  None of that can answer the question, and all of it
+        ran inside Core's store lock, so pressing ＋ in the model chooser waited
+        for it.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            http = RelayCoordinatorHTTP()
+            relay = RelayAccountsDomain(root, http_client=http)
+            providers = ProvidersModelsDomain(root / "config.yaml")
+            core = CoreStore(domains=[relay, providers])
+            self._linked_provider_core(core, relay)
+            self._add_linked_model(core, providers, "model-a", "model-a")
+            core.apply("providers_models", revision=core.revision)
+
+            # Stage one relay edit so the journal has work to reconcile.
+            core.dispatch(
+                {
+                    "domain": "relay_accounts",
+                    "type": "api_key.update",
+                    "payload": {
+                        "account_id": relay.snapshot()["accounts"][0]["id"],
+                        "resource_id": relay.snapshot()["accounts"][0]["resources"][0]["id"],
+                        "name": "Renamed",
+                    },
+                },
+                expected_revision=core.revision,
+            )
+            http.calls.clear()
+            result = core.apply(domains=["relay_accounts"], revision=core.revision)
+
+            self.assertTrue(result["applied"], result)
+            # The reconciliation read the token page — this fixture's key list —
+            # and did not pay for the catalogs, which answer a different
+            # question and are what made a model add wait.
+            self.assertIn(("GET", "/api/token/?p=1&size=100"), http.calls)
+            catalog_reads = [call for call in http.calls if call[1] == "/api/user/models"]
+            self.assertEqual([], catalog_reads, [c[1] for c in http.calls])
 
     def test_an_unfinished_draft_row_does_not_refuse_a_linked_apply(self) -> None:
         """A row the user has not finished is never reported as an error.
