@@ -1165,59 +1165,59 @@ async def _yield_downstream_keepalive_stream(
             yield chunk
         return
 
+    # One resident reader task drives the wrapped generator and publishes every
+    # outcome to a queue; the heartbeat below only reads that queue with its own
+    # wait.  Ticking must not touch the reader: awaiting ``iterator.__anext__()``
+    # under ``asyncio.wait_for`` hands the tick's cancel straight to the
+    # generator, which then ends on its next iteration (``anext(): asynchronous
+    # generator is already running`` / a bare ``StopAsyncIteration``).  The read
+    # is instead cancelled once, when this wrapper is closed.
+    #
+    # The generator's own start/idle deadline therefore runs between real
+    # chunks, exactly as the docstring above says, and a route that stalls
+    # after partial answer text is timed out here and advanced to a peer
+    # instead of being held open by the heartbeat until the turn is truncated
+    # with ``response.failed``.
     iterator = delivery.__aiter__()
-    pending: Optional[asyncio.Task[Any]] = asyncio.create_task(iterator.__anext__())
-    sequence = 0
+    outcomes: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
 
-    async def cancel_pending_read() -> None:
-        nonlocal pending
-        task = pending
-        pending = None
-        if task is None:
-            return
-        if not task.done():
-            task.cancel()
+    async def read_delivery() -> None:
         try:
-            await task
+            while True:
+                chunk = await iterator.__anext__()
+                outcomes.put_nowait(("chunk", chunk))
+        except StopAsyncIteration:
+            outcomes.put_nowait(("end", None))
+        except asyncio.CancelledError:
+            outcomes.put_nowait(("end", None))
+            raise
+        except BaseException as exception:  # noqa: BLE001 - replayed below.
+            outcomes.put_nowait(("error", exception))
+
+    reader = asyncio.create_task(read_delivery())
+    sequence = 0
+    try:
+        while True:
+            try:
+                kind, payload = await asyncio.wait_for(outcomes.get(), timeout=interval)
+            except asyncio.TimeoutError:
+                sequence += 1
+                yield _streaming_module._stream_keepalive_chunk(request_data, sequence)
+                continue
+            if kind == "end":
+                return
+            if kind == "error":
+                raise payload
+            yield payload
+    finally:
+        if not reader.done():
+            reader.cancel()
+        try:
+            await reader
         except (asyncio.CancelledError, StopAsyncIteration):
             pass
         except Exception:
             pass
-
-    try:
-        while True:
-            task = pending
-            if task is None:
-                return
-            if task.done():
-                try:
-                    chunk = task.result()
-                except StopAsyncIteration:
-                    pending = None
-                    return
-                pending = asyncio.create_task(iterator.__anext__())
-                yield chunk
-                continue
-            try:
-                chunk = await asyncio.wait_for(
-                    asyncio.shield(task),
-                    timeout=interval,
-                )
-            except asyncio.TimeoutError:
-                # The pending read may complete exactly at the timeout; resolve
-                # it through the done-task branch instead of dropping a chunk.
-                if task.done():
-                    continue
-                sequence += 1
-                yield _streaming_module._stream_keepalive_chunk(request_data, sequence)
-                continue
-            except StopAsyncIteration:
-                pending = None
-                return
-            pending = asyncio.create_task(iterator.__anext__())
-            yield chunk
-    finally:
-        await cancel_pending_read()
         await _streaming_module._close_async_iterator_safely(delivery)
 
 async def _sleep_route_recovery_poll_interval(

@@ -203,6 +203,71 @@ class DownstreamKeepaliveStreamTests(HookTestCase):
         await stream.aclose()
         await asyncio.sleep(0)
 
+    async def test_stalled_delivery_keeps_ticking_instead_of_ending(self) -> None:
+        # A keepalive tick must not end the wrapped delivery: an earlier
+        # implementation cancelled the pending read to emit its tick, which
+        # reached the delivery at its own suspension point and made the next
+        # iteration report the upstream as finished.  A relay that goes silent
+        # mid-answer was then never replaced, because the heartbeat also reset
+        # the delivery's own idle deadline, so the turn was truncated with
+        # ``response.failed`` instead of advancing to a peer route.
+        hooks, _ = load_hook_module()
+        request = {
+            "input": "hello",
+            "stream": True,
+            "metadata": {"stream_keepalive_interval_seconds": 0.05},
+        }
+
+        async def stalled_stream():
+            yield {"type": "response.output_text.delta", "delta": "one"}
+            await asyncio.sleep(30)
+            yield {"type": "response.output_text.delta", "delta": "two"}
+
+        stream = hooks._yield_downstream_keepalive_stream(stalled_stream(), request)
+        first = await stream.__anext__()
+        self.assertEqual(first["delta"], "one")
+        for _ in range(3):
+            tick = await asyncio.wait_for(stream.__anext__(), timeout=1.0)
+            self.assertTrue(hooks._is_stream_keepalive_chunk(tick))
+        await stream.aclose()
+
+    async def test_delivery_that_keeps_talking_is_never_ended_by_a_tick(self) -> None:
+        # A delivery whose sleep straddles the tick boundary must still deliver
+        # every chunk: the heartbeat may report a tick, but the read it
+        # interrupted has to resume rather than end.
+        hooks, _ = load_hook_module()
+        request = {
+            "input": "hello",
+            "stream": True,
+            "metadata": {"stream_keepalive_interval_seconds": 0.05},
+        }
+
+        async def steady_stream():
+            for index in range(4):
+                await asyncio.sleep(0.08)
+                yield {"type": "response.output_text.delta", "delta": str(index)}
+            await asyncio.sleep(0.08)
+            yield {"type": "response.completed", "response": {"id": "resp-1"}}
+
+        chunks = [
+            chunk
+            async for chunk in hooks._yield_downstream_keepalive_stream(
+                steady_stream(),
+                request,
+            )
+        ]
+        real = [c for c in chunks if not hooks._is_stream_keepalive_chunk(c)]
+        self.assertEqual(
+            real,
+            [
+                {"type": "response.output_text.delta", "delta": "0"},
+                {"type": "response.output_text.delta", "delta": "1"},
+                {"type": "response.output_text.delta", "delta": "2"},
+                {"type": "response.output_text.delta", "delta": "3"},
+                {"type": "response.completed", "response": {"id": "resp-1"}},
+            ],
+        )
+
 
 class HookKeepaliveIntegrationTests(HookTestCase):
     async def test_hook_delivers_keepalive_during_buffered_start_silence(self) -> None:
