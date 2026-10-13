@@ -1900,6 +1900,14 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("private var didAutoSubmitSavedPassword = false", mac_leaf)
         self.assertIn("private func restoreRememberedPassword()", mac_leaf)
         self.assertIn("didAutoSubmitSavedPassword = false", mac_leaf)
+        # A station that draws its shell first and its form later is not ready
+        # when the document commits, so the fill is a bounded probe that keeps
+        # asking rather than a single delayed pass.
+        self.assertIn("private var loginPrefillProbe: DispatchWorkItem?", mac_leaf)
+        self.assertIn("private static let loginPrefillMaxAttempts = 20", mac_leaf)
+        self.assertIn("private func scheduleLoginPrefill()", mac_leaf)
+        self.assertIn("self.scheduleLoginPrefill()", mac_leaf)
+        self.assertIn("private var didFillLoginFields = false", mac_leaf)
         # A password the app filled back in is not a new keep-or-not decision.
         persist = mac_leaf.split("private func persistVerifiedLogin(", 1)[1].split("/// The post-login question", 1)[0]
         self.assertIn("restoredPassword == capturedPassword", persist)

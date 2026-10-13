@@ -6050,6 +6050,12 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     private var loginFormRevealProbe: DispatchWorkItem?
     private var loginFormRevealAttempts = 0
     private var didRevealLoginField = false
+    private var loginPrefillProbe: DispatchWorkItem?
+    private var loginPrefillAttempts = 0
+    /// The username this flow owns is in the page, so the probe has no more to
+    /// do — a station that re-renders its form is not asked to fill it again.
+    private var didFillLoginFields = false
+    private static let loginPrefillMaxAttempts = 20
     private var agreementRevealProbe: DispatchWorkItem?
     private var agreementRevealAttempts = 0
     private var embeddedResizeProbe: DispatchWorkItem?
@@ -6216,6 +6222,10 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         signInProbeAttempts = 0
         clearCapturedCredentials()
         didAutoSubmitSavedPassword = false
+        loginPrefillProbe?.cancel()
+        loginPrefillProbe = nil
+        loginPrefillAttempts = 0
+        didFillLoginFields = false
         restoreRememberedPassword()
     }
 
@@ -6649,6 +6659,8 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         // password read is likewise settled before the form is touched, so the
         // fill never races a second pass against a page that is still loading.
         guard restoredSession == nil || didRestoreSession, didRestorePassword else { return }
+        guard !didFillLoginFields, loginPrefillAttempts < Self.loginPrefillMaxAttempts else { return }
+        loginPrefillAttempts += 1
         let safeUser = jsonLiteral(username)
         let password = restoredPassword
         let safePassword = jsonLiteral(password ?? "")
@@ -6685,14 +6697,36 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
           return false;
         })();
         """
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
-            guard let self, self.isBrowserFlowLive else { return }
+        // A station that renders its shell first and its form later (a client
+        // -side /login → /sign-in route is the common shape) is not ready when
+        // the document commits, so one delayed pass can look for a field that
+        // has not been drawn yet and give up.  The probe keeps asking while the
+        // budget lasts, exactly as the field-reveal probe does, and stops for
+        // good once the username it owns is actually in the page.
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.isBrowserFlowLive, !self.didFillLoginFields else { return }
             self.webView.evaluateJavaScript(script) { [weak self] value, _ in
                 guard let self, self.isBrowserFlowLive else { return }
                 if value as? Bool == true {
                     self.didAutoSubmitSavedPassword = true
+                    self.didFillLoginFields = true
+                    return
                 }
+                // The password the app holds is what makes the form complete;
+                // a page whose username filled but whose password did not is
+                // still unfinished, so the probe asks again rather than
+                // declaring the form done.
+                self.scheduleLoginPrefill()
             }
+        }
+        loginPrefillProbe = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
+    }
+
+    private func scheduleLoginPrefill() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self else { return }
+            self.prefillLoginWhenReady()
         }
     }
 
@@ -7762,6 +7796,10 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         loginFormRevealProbe = nil
         loginFormRevealAttempts = 0
         didRevealLoginField = false
+        loginPrefillProbe?.cancel()
+        loginPrefillProbe = nil
+        loginPrefillAttempts = 0
+        didFillLoginFields = false
         agreementRevealProbe?.cancel()
         agreementRevealProbe = nil
         agreementRevealAttempts = 0
