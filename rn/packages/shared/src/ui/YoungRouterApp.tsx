@@ -5798,15 +5798,18 @@ function PublicModelInspector({ group, modelContexts, backLabel, busy, translate
   // shows what every route can honour and a commit writes it to all of them.
   const customContext = publicModelCustomLimit(providers, group.name, "max_input_tokens");
   const defaultContext = publicModelDefault(modelContexts, group.name);
-  const defaultCeiling = publicModelCeiling(modelContexts, group.name);
   // This pane is where the context window is *set*: it is the public model's
   // own declaration, written to every route of the group in one staged action,
   // and the model detail states it read-only with a 设置 button that lands
-  // here.  The hint states the registry's resolved pair, so an empty field
-  // says what the group would fall back to and whether that fallback can be
-  // raised — the same two numbers the model detail shows when the field is
-  // empty, read from the side that can change them.
-  const contextHint = translate("providers.publicModelDefaultHint", { value: contextWindowPairText(defaultContext, defaultCeiling, translate) });
+  // here.  The hint names the pair — the declaration this field writes, and
+  // the value pi.dev recommends — so an empty field says both the number that
+  // stands in for it and the one it is measured against.
+  // The pane's hint carries only the number an empty field falls back to: the
+  // recommendation the pair used to spell out is already the mark's own line
+  // (`providers.contextWindowRecommendedLine`), and the tagged pair in this
+  // placeholder needed ~241 pt where the field's control column has ~175, so
+  // it truncated mid-number.
+  const contextHint = translate("providers.publicModelDefaultHint", { value: publicModelTokensText(customContext ?? defaultContext, translate) });
   return <View style={styles.inspectorContent}>
     {/* The provider editor's own header shape: the title takes the row and the
         return link sits on the trailing edge, never in front of the title.  A
@@ -5827,7 +5830,7 @@ function PublicModelInspector({ group, modelContexts, backLabel, busy, translate
         if (!renamed || renamed === group.name) return undefined;
         return dispatchSnapshot("public.model_patch", { public_model: group.name, changes: { name: renamed } }).then((snapshot) => { if (snapshot) onRenamed(renamed); });
       }} />
-      <TextField label={translate("providers.contextWindow")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} value={customContext !== undefined ? String(customContext) : ""} placeholder={contextHint} keyboardType="numeric" disabled={busy} onCommit={(next) => dispatch("public.model_patch", { public_model: group.name, changes: { max_input_tokens: next.trim() } })} accessory={<ContextWindowHelp translate={translate} />} />
+      <TextField label={translate("providers.contextWindow")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} value={customContext !== undefined ? String(customContext) : ""} placeholder={contextHint} keyboardType="numeric" disabled={busy} onCommit={(next) => dispatch("public.model_patch", { public_model: group.name, changes: { max_input_tokens: next.trim() } })} accessory={<ContextWindowHelp recommended={defaultContext} translate={translate} />} />
     </View>
   </View>;
 }
@@ -5883,19 +5886,17 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
   // only labels the list row and the breadcrumb, so the pane never looks like a
   // name is set while validation still reports it missing.
   const modelFieldName = stringValue(model.model_name, stringValue(model.name));
-  // The public model's client-facing context window: the value the user
-  // declared wins, otherwise the registry default the managed catalog
-  // resolves.  It is the *group's* declaration — one number for every route
-  // that serves the name — so this pane states it and hands the edit to the
-  // public-model pane, which writes it to all of them at once.  The registry's
-  // own ceiling travels beside it, because that is the number a declaration is
-  // clamped to and the pair is what Core resolves for this row.
+  // The public model's client-facing context window, stated as the pair it
+  // is: what this group declares, and what pi.dev recommends for the name.
+  // The declaration is the *group's* — one number for every route that
+  // serves the name — so this pane states it and hands the edit to the
+  // public-model pane, which writes it to all of them at once.  The
+  // recommendation stands in for a declaration the user has not made, which
+  // is why the two agree by default and differ only once one is written.
   const publicModelName = modelFieldName.trim();
-  const publicModelWindow = publicModelDefault(modelContexts ?? {}, publicModelName);
-  const publicModelMaxWindow = publicModelCeiling(modelContexts ?? {}, publicModelName);
+  const recommendedWindow = publicModelDefault(modelContexts ?? {}, publicModelName);
   const customWindow = publicModelCustomLimit(providers, publicModelName, "max_input_tokens");
-  const resolvedWindow = customWindow !== undefined ? customWindow : publicModelWindow;
-  const resolvedCeiling = customWindow !== undefined ? customWindow : publicModelMaxWindow;
+  const declaredWindow = customWindow !== undefined ? customWindow : recommendedWindow;
   const keyStates = providerAuthKind(provider) === "api_key" ? providerKeyStates(provider) : [];
   const selectedProviderKey = keyStates.find((key) => key.id === stringValue(model.provider_key_id))
     ?? keyStates.find((key) => key.name === stringValue(model.api_key_name));
@@ -6020,11 +6021,17 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
           carried a window of its own would make the group's number depend on
           which route happened to answer. */}
       {publicModelName ? <View style={styles.formRow}>
+        {/* One row of the pane's own grid: the label, then the value as the
+            control with 设置 and the help mark beside it — the shape every
+            neighbouring row already has.  The value is one number, not the
+            tagged pair, so it fits the control column beside those two
+            controls; the recommendation the pair used to carry rides the mark
+            itself (`推荐上下文：…`), which is what keeps this a single row. */}
         <Text numberOfLines={1} style={styles.modelInspectorLabel}>{translate("providers.contextWindow")}</Text>
         <View style={styles.modelWindowValue}>
-          <Text numberOfLines={1} style={styles.modelWindowText}>{contextWindowPairText(resolvedWindow, resolvedCeiling, translate)}</Text>
+          <Text numberOfLines={1} style={styles.modelWindowText}>{publicModelTokensText(declaredWindow, translate)}</Text>
           <NativeButton title={translate("providers.publicModelSettings")} toolTip={translate("providers.publicModelSettingsHint")} accessibilityLabel={translate("providers.publicModelSettingsHint")} compact disabled={busy || !onOpenPublicModel} onPress={() => onOpenPublicModel?.()} style={styles.modelWindowLink} />
-          <ContextWindowHelp translate={translate} />
+          <ContextWindowHelp recommended={recommendedWindow} translate={translate} />
         </View>
       </View> : null}
       <PickerField label={translate("providers.provider")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} allowShrink value={providerLabel} values={providerLabels} disabled={busy || providers.length <= 1} onSelect={(label) => { const next = providers[providerLabels.indexOf(label)]; if (next) onProviderChange(editorIdentifier(next)); }} />
@@ -6081,18 +6088,24 @@ function HelpTip({ open, text, title, onToggle }: { open: boolean; text: string;
 }
 
 /**
- * The 上下文 pair's own help mark.
+ * The 上下文 row's own help mark, which is also where the recommendation is
+ * stated.
  *
- * It owns the state its panel opens with, and it is a component rather than
- * another `HelpTip` call site because the row is drawn by two panes — the
- * model detail that states the pair and the public-model pane that sets it —
- * and one `useState` shared by both would leave a mark on screen that no row
- * toggled.  The panel opens toward the right edge of its own row instead of
- * over the field: the row's text is the thing the tip explains.
+ * The row itself holds only this public model's own window, because that is
+ * the number the row is about and the only one of the two that can change
+ * here; the value pi.dev recommends is fixed metadata and rides the mark
+ * instead, so the row stays short enough to state its number in full without
+ * a compact form.  It owns the state its panel opens with, and it is a
+ * component rather than another `HelpTip` call site because the row is drawn
+ * by two panes — the model detail that states the number and the public-model
+ * pane that sets it — and one `useState` shared by both would leave a mark on
+ * screen that no row toggled.  The panel opens toward the right edge of its
+ * own row instead of over the field: the row's text is what the tip explains.
  */
-function ContextWindowHelp({ translate }: { translate: Translate }): React.JSX.Element {
+function ContextWindowHelp({ recommended, translate }: { recommended: number | null | undefined; translate: Translate }): React.JSX.Element {
   const [open, setOpen] = useState(false);
-  return <HelpTip open={open} text={translate("providers.contextWindowRowHelp")} title={translate("providers.contextWindowRowHelpTitle")} onToggle={() => setOpen((current) => !current)} />;
+  const text = `${translate("providers.contextWindowRecommendedLine", { value: publicModelTokensText(recommended, translate) })}\n${translate("providers.contextWindowRowHelp")}`;
+  return <HelpTip open={open} text={text} title={translate("providers.contextWindowRowHelpTitle")} onToggle={() => setOpen((current) => !current)} />;
 }
 
 function ProtocolPicker({ providerId, model, busy, translate, dispatch }: { providerId: string; model: UnknownRecord; busy: boolean; translate: Translate; dispatch: Dispatch }): React.JSX.Element {
@@ -6270,28 +6283,18 @@ function routePublicModelRowKey(publicModel: string): string {
   return `${ROUTE_PUBLIC_MODEL_PREFIX}${publicModel}`;
 }
 
+/**
+ * One context window as the row states it: the number itself, grouped.
+ *
+ * The number is not shortened to a compact form — `1,000,000` is the window,
+ * and an approximation of it is not the value the user set or the metadata
+ * declares.  The row holds it in full because it states only this one number:
+ * the recommended value rides the help mark beside the row rather than the
+ * line, which is what kept the full number from having to be abbreviated.
+ */
 function publicModelTokensText(value: number | null | undefined, translate: Translate): string {
   if (value === null || value === undefined || !Number.isFinite(value) || value <= 0) return translate("common.none");
   return Math.round(value).toLocaleString("en-US");
-}
-
-/**
- * The pair the 上下文 row states: the window Codex runs with, then the ceiling
- * it may be raised to.
- *
- * The two are separate numbers because they answer different questions, and
- * {@link ContextWindowHelp} names both under the row's own help mark: a bare
- * `272,000 / 1,000,000` reads as a range or as a fraction until the reader is
- * told which half is in force and which is only a limit.  They are equal
- * whenever the value is the user's own (this app writes one number to both
- * fields of the catalog), and a pair of equal numbers states nothing beyond
- * the number itself, so it collapses to one.
- */
-function contextWindowPairText(current: number | null | undefined, ceiling: number | null | undefined, translate: Translate): string {
-  const running = publicModelTokensText(current, translate);
-  if (ceiling === null || ceiling === undefined || !Number.isFinite(ceiling) || ceiling <= 0) return running;
-  if (current !== null && current !== undefined && Math.round(current) === Math.round(ceiling)) return running;
-  return `${running} / ${publicModelTokensText(ceiling, translate)}`;
 }
 
 // One public model's declared limit: the smallest value its routes carry, so a
@@ -6315,19 +6318,6 @@ function publicModelCustomLimit(providers: UnknownRecord[], publicModel: string,
 function publicModelDefault(contexts: UnknownRecord, publicModel: string): number | undefined {
   const record = asRecord(contexts[publicModel]);
   return numberValue(record.context_window, 0) || undefined;
-}
-
-/**
- * The largest window the same projection lets this public model declare.
- *
- * Codex clamps a config override to this number, so it is what makes the
- * 上下文 row's pair two numbers instead of one: a route whose registry entry
- * says 272,000 / 1,000,000 can be raised, and one whose entry says
- * 272,000 / 272,000 cannot.
- */
-function publicModelCeiling(contexts: UnknownRecord, publicModel: string): number | undefined {
-  const record = asRecord(contexts[publicModel]);
-  return numberValue(record.max_context_window, 0) || undefined;
 }
 
 function identifier(record: UnknownRecord): string {

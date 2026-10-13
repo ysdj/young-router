@@ -551,14 +551,22 @@ export const zhHans: Record<TranslationKey, string> = {
   // window, so it is named for what it is rather than for the client that
   // reads it: the pair beside it in the model detail already says which client
   // the numbers reach, and 上下文 is the word the row's own help title uses.
-  "providers.contextWindow": "上下文",
+  /**
+   * 公开上下文 labels this public model's own window; 推荐上下文 is the line the
+   * 问号 beside it states, naming the value pi.dev recommends for the same
+   * name. The two are separate keys because they are drawn in different
+   * places — the row states its number, the mark states the recommendation —
+   * and the mark's line carries the number as {value}.
+   */
+  "providers.contextWindow": "公开上下文",
+  "providers.contextWindowRecommendedLine": "推荐上下文：{value}",
   "providers.publicModelDefaultHint": "留空默认 {value}",
   // The button opens the public-model pane, which owns the write: the window
   // is one number for the whole group, so the model detail never edits it.
   "providers.publicModelSettings": "设置",
   "providers.publicModelSettingsHint": "在公开模型设置中修改该模型的上下文",
-  "providers.contextWindowRowHelpTitle": "上下文这两个数是什么",
-  "providers.contextWindowRowHelp": "左边是 Codex 当前使用的上下文窗口：客户端按它判断对话能吃多长，超出后自行压缩；右边是上限，也就是这个模型最多能被提到多少。这两个数由本机模型元数据解析而来：公开模型没有自定义上下文时，右边就是元数据给出的最大窗口，Codex 会把自定义值限在这个数以内；一旦你填写了自定义值，本应用会把它同时写进当前窗口与上限，两个数因此相同，行内只显示一个。",
+  "providers.contextWindowRowHelpTitle": "公开上下文与推荐值",
+  "providers.contextWindowRowHelp": "未自定义公开上下文时，该值取上面的推荐值。自定义后两者分离，推荐值仍单独保留。",
   "providers.followMultiplier": "跟随倍率",
   "providers.addWizard": "添加向导...",
   "providers.wizard.title": "配置供应商",

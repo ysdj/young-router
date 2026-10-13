@@ -1127,11 +1127,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # which route happened to answer.
         self.assertIn('dispatch("public.model_patch", { public_model: group.name, changes: { max_input_tokens: next.trim() } })', inspector)
         self.assertIn('placeholder={contextHint}', inspector)
-        # The hint and the mark state the same resolved pair: the ceiling the
-        # placeholder reports is the one a blank field would fall back to.
-        self.assertIn('contextWindowPairText(defaultContext, defaultCeiling, translate)', inspector)
-        self.assertIn('publicModelCeiling(modelContexts, group.name)', inspector)
-        self.assertIn('accessory={<ContextWindowHelp translate={translate} />}', inspector)
+        # The hint states only the number an empty field falls back to: the
+        # recommendation is the mark's own line, and the tagged pair this
+        # placeholder used to spell out needed ~241 pt where the control column
+        # has ~175, so it truncated mid-number.
+        self.assertIn('translate("providers.publicModelDefaultHint", { value: publicModelTokensText(customContext ?? defaultContext, translate) })', inspector)
+        self.assertIn('publicModelDefault(modelContexts, group.name)', inspector)
+        self.assertNotIn("publicModelCeiling", inspector)
+        self.assertIn('accessory={<ContextWindowHelp recommended={defaultContext} translate={translate} />}', inspector)
         self.assertNotIn("max_output_tokens", inspector)
         # Arriving from a model detail keeps a link back to that model, and the
         # header is the provider editor's own shape: the title takes the row and
@@ -1161,23 +1164,37 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # route of a group disagree with the others.
         model_detail = self.ui.split("function ModelInspector(", 1)[1].split("// The protocol-mode sentence is a tip", 1)[0]
         self.assertIn('publicModelCustomLimit(providers, publicModelName, "max_input_tokens")', model_detail)
-        # Two numbers, two sources: the registry's own resolved window and the
-        # ceiling Codex clamps an override to.  A user's own declaration is
-        # written to both fields, so it stays a single number.
-        self.assertIn('publicModelCeiling(modelContexts ?? {}, publicModelName)', model_detail)
-        self.assertIn('contextWindowPairText(resolvedWindow, resolvedCeiling, translate)', model_detail)
-        self.assertIn('const resolvedCeiling = customWindow !== undefined ? customWindow : publicModelMaxWindow;', model_detail)
+        # The row states one number — this public model's own window, falling
+        # back to the recommendation while it declares nothing — and the value
+        # pi.dev recommends rides the help mark beside it.
+        self.assertIn('publicModelDefault(modelContexts ?? {}, publicModelName)', model_detail)
+        self.assertIn('{publicModelTokensText(declaredWindow, translate)}', model_detail)
+        self.assertIn('const declaredWindow = customWindow !== undefined ? customWindow : recommendedWindow;', model_detail)
+        self.assertNotIn('contextWindowPairText', self.ui)
         self.assertIn('title={translate("providers.publicModelSettings")}', model_detail)
         self.assertIn('toolTip={translate("providers.publicModelSettingsHint")}', model_detail)
         self.assertIn('disabled={busy || !onOpenPublicModel} onPress={() => onOpenPublicModel?.()} style={styles.modelWindowLink}', model_detail)
-        # The row's own mark names both halves; the pane that always edits the
-        # number is where the help lives, so the read-only copy states the pair
-        # and explains it with the same control.  It rides the value row rather
-        # than a field's accessory slot: this row is a read-only statement, not
-        # an input with a mark beside it.
-        self.assertIn('<ContextWindowHelp translate={translate} />', model_detail)
+        # The row's own mark carries the recommendation the line no longer
+        # states; the pane that always edits the number is where the help
+        # lives, so the read-only copy explains it with the same control.  It
+        # rides the value row rather than a field's accessory slot: this row is
+        # a read-only statement, not an input with a mark beside it.
+        self.assertIn('<ContextWindowHelp recommended={recommendedWindow} translate={translate} />', model_detail)
         self.assertNotIn('accessory={<ContextWindowHelp', model_detail)
-        self.assertIn('function ContextWindowHelp({ translate }', self.ui)
+        self.assertIn('function ContextWindowHelp({ recommended, translate }', self.ui)
+        # One row of the pane's own grid, like every neighbouring field: the
+        # label, then the value as the control with 设置 and the mark beside it.
+        # The value is short enough (one number, not a tagged pair) to share the
+        # control column with those two, so splitting it onto a row of its own —
+        # which left the number unlabelled under the label and pushed the two
+        # controls to the pane's far edge — is the regression this guards.
+        window_row = model_detail.split('{publicModelName ? ', 1)[1].split('<PickerField label={translate("providers.provider")}', 1)[0]
+        self.assertEqual(1, window_row.count('styles.formRow'))
+        self.assertIn('<Text numberOfLines={1} style={styles.modelInspectorLabel}>{translate("providers.contextWindow")}</Text>', window_row)
+        self.assertIn('<View style={styles.modelWindowValue}>', window_row)
+        self.assertLess(window_row.index('modelInspectorLabel'), window_row.index('modelWindowValue'))
+        for absent in ("modelWindowHeader", "modelWindowHeaderActions"):
+            self.assertNotIn(absent, self.ui)
         # No commit and no input: the window is one number for the whole group.
         self.assertNotIn("max_input_tokens: next.trim()", model_detail)
         self.assertNotIn('placeholder={windowHint}', model_detail)

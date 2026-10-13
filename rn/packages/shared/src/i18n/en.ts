@@ -551,14 +551,22 @@ export const en: Record<TranslationKey, string> = {
   // window, so it is named for what it is rather than for the client that
   // reads it: the pair beside it in the model detail already says which client
   // the numbers reach, and "Context" is the word the row's own help title uses.
-  "providers.contextWindow": "Context",
+  /**
+   * 公开上下文 labels this public model's own window; the recommended line is
+   * what the question mark beside it states, naming the value pi.dev
+   * recommends for the same name. They are separate keys because they are
+   * drawn in different places — the row states its number, the mark states the
+   * recommendation — and the mark's line carries the number as {value}.
+   */
+  "providers.contextWindow": "Public context",
+  "providers.contextWindowRecommendedLine": "Recommended context: {value}",
   "providers.publicModelDefaultHint": "Default {value}",
   // The button opens the public-model pane, which owns the write: the window
   // is one number for the whole group, so the model detail never edits it.
   "providers.publicModelSettings": "Set",
   "providers.publicModelSettingsHint": "Change this model's context in the public model's own settings",
-  "providers.contextWindowRowHelpTitle": "What the two context numbers are",
-  "providers.contextWindowRowHelp": "The left number is the context window Codex runs this model with: the client reads it to decide how long a conversation may get, and compacts on its own past that. The right number is the ceiling, how far that window may be raised. Both come from this machine's model metadata: while a public model carries no context of its own, the ceiling is the maximum window that metadata declares and Codex clamps any override to it; once you set a value of your own, this app writes it to both fields, so the two numbers are equal and the row shows only one.",
+  "providers.contextWindowRowHelpTitle": "Public context and the recommendation",
+  "providers.contextWindowRowHelp": "An unset public context takes the recommended value above. Once set, the two are separate, and the recommendation is retained alongside it.",
   "providers.followMultiplier": "Follow multiplier",
   "providers.addWizard": "Add with wizard",
   "providers.wizard.title": "Configure provider",

@@ -549,6 +549,7 @@ export type TranslationKey =
   | "providers.order"
   | "providers.publicModelTitle"
   | "providers.contextWindow"
+  | "providers.contextWindowRecommendedLine"
   | "providers.publicModelDefaultHint"
   | "providers.publicModelSettings"
   | "providers.publicModelSettingsHint"
