@@ -133,6 +133,163 @@ class HookRoutingTests(HookTestCase):
         )
         self.assertTrue(hooks._should_count_deployment_failure_for_cooldown(rate_limit))
 
+    def test_rate_limit_that_names_a_closed_window_cools_the_route(self) -> None:
+        """A 429 stating a reset beyond the horizon is a closed window.
+
+        Retrying such a route first on every request buys only the same refusal
+        and a failed round trip, which is why the route is parked.  The message
+        below is an upstream's own wording: it states an absolute reset with an
+        offset, not a duration.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        self.set_env(hooks._RECOVERY_POLICY_RATE_LIMIT_ENV, None)
+        self.set_env(hooks._QUOTA_RESET_COOLDOWN_HORIZON_SECONDS_ENV, None)
+
+        reset_at = datetime.now(timezone(timedelta(hours=8))) + timedelta(hours=6)
+        window_closed = RuntimeError(
+            "RateLimitError: upstream soft_rate (http 429): usage exceeds "
+            "frequency limit, but don't worry, your usage will reset at "
+            f"{reset_at.strftime('%Y-%m-%d %H:%M:%S')} UTC+8, alternatively, "
+            "you can switch to the other models"
+        )
+        window_closed.status_code = 429
+
+        self.assertTrue(hooks._is_quota_window_rate_limit_error(window_closed))
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(window_closed), "recovery_cooldown"
+        )
+        self.assertTrue(
+            hooks._should_count_deployment_failure_for_cooldown(window_closed)
+        )
+        self.assertEqual(
+            hooks._recovery_diagnostic(window_closed)["kind"], "rate_limit_window"
+        )
+
+    def test_transient_rate_limit_keeps_the_configured_recovery_policy(self) -> None:
+        """An answer that never said when it would be ready is still retried.
+
+        Only a named reset beyond the horizon is a closed window; a bare burst
+        limit, a reset inside the horizon, and a non-429 upstream error all keep
+        the configured policy so the default stays honest.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        self.set_env(hooks._RECOVERY_POLICY_RATE_LIMIT_ENV, None)
+        self.set_env(hooks._QUOTA_RESET_COOLDOWN_HORIZON_SECONDS_ENV, None)
+
+        bare_burst = RuntimeError("RateLimitError: rate limit exceeded, retry later")
+        bare_burst.status_code = 429
+        self.assertFalse(hooks._is_quota_window_rate_limit_error(bare_burst))
+        self.assertEqual(hooks._recovery_policy_for_exception(bare_burst), "recovery")
+        self.assertFalse(
+            hooks._should_count_deployment_failure_for_cooldown(bare_burst)
+        )
+
+        soon = datetime.now(timezone.utc) + timedelta(seconds=5)
+        inside_horizon = RuntimeError(
+            "rate limit: your usage will reset at "
+            f"{soon.strftime('%Y-%m-%d %H:%M:%S')} UTC, retry later"
+        )
+        inside_horizon.status_code = 429
+        self.assertFalse(hooks._is_quota_window_rate_limit_error(inside_horizon))
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(inside_horizon), "recovery"
+        )
+
+        server_error = RuntimeError(
+            "rate limit reset at 2030-01-01 00:00:00 UTC"
+        )
+        server_error.status_code = 500
+        self.assertFalse(hooks._is_quota_window_rate_limit_error(server_error))
+        self.assertEqual(hooks._recovery_policy_for_exception(server_error), "recovery")
+
+    def test_quota_reset_horizon_is_runtime_configurable(self) -> None:
+        """The horizon is the boundary between busy-now and closed-window."""
+
+        hooks, _proxy_server = load_hook_module()
+        self.set_env(hooks._RECOVERY_POLICY_RATE_LIMIT_ENV, None)
+        reset_at = datetime.now(timezone.utc) + timedelta(seconds=120)
+        error = RuntimeError(
+            "rate limit: your usage will reset at "
+            f"{reset_at.strftime('%Y-%m-%d %H:%M:%S')} UTC"
+        )
+        error.status_code = 429
+
+        self.set_env(hooks._QUOTA_RESET_COOLDOWN_HORIZON_SECONDS_ENV, None)
+        self.assertTrue(hooks._is_quota_window_rate_limit_error(error))
+        self.set_env(hooks._QUOTA_RESET_COOLDOWN_HORIZON_SECONDS_ENV, "600")
+        self.assertFalse(hooks._is_quota_window_rate_limit_error(error))
+        self.set_env(hooks._QUOTA_RESET_COOLDOWN_HORIZON_SECONDS_ENV, "0")
+        self.assertTrue(hooks._is_quota_window_rate_limit_error(error))
+
+    def test_explicit_rate_limit_policy_outranks_the_window_rule(self) -> None:
+        """A user's own 429 policy is never refined by the window rule."""
+
+        hooks, _proxy_server = load_hook_module()
+        reset_at = datetime.now(timezone.utc) + timedelta(hours=6)
+        error = RuntimeError(
+            "rate limit: your usage will reset at "
+            f"{reset_at.strftime('%Y-%m-%d %H:%M:%S')} UTC"
+        )
+        error.status_code = 429
+
+        self.set_env(hooks._RECOVERY_POLICY_RATE_LIMIT_ENV, "error")
+        self.assertEqual(hooks._recovery_policy_for_exception(error), "error")
+        self.set_env(hooks._RECOVERY_POLICY_RATE_LIMIT_ENV, "recovery_cooldown")
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(error), "recovery_cooldown"
+        )
+        self.set_env(hooks._RECOVERY_POLICY_RATE_LIMIT_ENV, None)
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(error), "recovery_cooldown"
+        )
+
+    def test_quota_reset_time_parses_offsets_and_rejects_nonsense(self) -> None:
+        """The stated offset is honored; unreadable text is never guessed.
+
+        A station that answers in local time would otherwise be read as UTC, and
+        the wait would be wrong by the offset. An unreadable statement must
+        return None rather than fall back to a duration the message never gave.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        for label, tz in (
+            ("UTC+8", timezone(timedelta(hours=8))),
+            ("UTC-5", timezone(timedelta(hours=-5))),
+            ("Z", timezone.utc),
+        ):
+            with self.subTest(offset=label):
+                wall_clock = datetime(2030, 10, 14, 0, 24, 9)
+                seconds = hooks._quota_reset_absolute_seconds(
+                    f"reset at {wall_clock.strftime('%Y-%m-%d %H:%M:%S')} {label}"
+                )
+                expected = (
+                    wall_clock.replace(tzinfo=tz) - datetime.now(timezone.utc)
+                ).total_seconds()
+                self.assertIsNotNone(seconds)
+                self.assertAlmostEqual(seconds, expected, delta=1.0)
+
+        for text in (
+            "reset at tomorrow",
+            "reset at 2030-13-45 99:99:99 UTC",
+            "rate limit exceeded",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(hooks._quota_reset_absolute_seconds(text))
+
+        # A reset already in the past never extends a cooldown.
+        self.assertEqual(
+            hooks._quota_reset_absolute_seconds("reset at 2020-01-01 00:00:00 UTC"),
+            0.0,
+        )
+
+        # A duration-only statement is still read, because it states the wait.
+        duration = RuntimeError("rate limit: your usage will reset, retry after 30 minutes")
+        duration.status_code = 429
+        self.assertEqual(hooks._exception_quota_reset_seconds(duration), 1800.0)
+        self.assertTrue(hooks._is_quota_window_rate_limit_error(duration))
+
     def test_deterministic_request_error_never_enters_recovery_even_when_marked_failed(self) -> None:
         hooks, _proxy_server = load_hook_module()
         error = RuntimeError("OpenAIException invalid_request_error: invalid input[89].id")

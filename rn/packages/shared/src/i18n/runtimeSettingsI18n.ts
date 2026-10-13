@@ -78,6 +78,7 @@ const zh: Record<string, RuntimeCopy> = {
   YOUNG_ROUTER_CATALOG_BASE_PROFILE: { label: "模型目录基础配置", help: "内部记录：第三方 Codex 模型别名继承的原生配置。由 Core 写入，仅当已安装客户端不再提供该配置时才会更新；请勿手动修改。" },
   YOUNG_ROUTER_DEPLOYMENT_COOLDOWN_FAILURES: { label: "冷却失败阈值", help: "同一部署 / 协议对连续失败多少次后临时跳过。该部署的其他已配置协议仍可使用。设为 0 可关闭冷却。" },
   YOUNG_ROUTER_DEPLOYMENT_COOLDOWN_SECONDS: { label: "冷却时长", help: "失败部署 / 协议对达到阈值后被跳过的时长。仅当所有已配置协议都在冷却时，才会排除该部署。设为 0 可关闭冷却。" },
+  YOUNG_ROUTER_QUOTA_RESET_COOLDOWN_HORIZON_SECONDS: { label: "限流恢复时长阈值", help: "当 429 说明了自己多久后恢复时，等待超过这个时长就直接停用（冷却）该路由，不再每次都先试它。说明的恢复时间比它长，说明该路由暂时用不了，会按「冷却时长」跳过它，由健康路由接手；更短、或完全没说明恢复时间的 429，仍按「限流 / 过载」处理。例：设为 60 时，说“30 分钟后恢复”的 429 会停用该路由，说“10 秒后再试”的不会。设为 0 表示只要说明了恢复时间就停用。" },
   YOUNG_ROUTER_SESSION_DEPLOYMENT_AFFINITY: { label: "会话部署亲和", help: "让同一会话继续使用首次成功服务的部署，使提示缓存复用与路由黏性在多轮之间保持稳定。关闭后每轮完全按路由策略选择。" },
   YOUNG_ROUTER_PROTOCOL_FALLBACK_TTL_SECONDS: { label: "备用协议记忆", help: "某部署的备用协议成功后，在此时长内，同一种客户端协议直接复用该备用协议，不再重试原协议。设为 0 可关闭记忆。" },
   YOUNG_ROUTER_CODEX_COMPACTION_CAPABILITY_TTL_SECONDS: { label: "压缩能力记忆", help: "Responses 路由能否返回加密 Codex 压缩结果的记忆时长。新建任务默认使用 Codex 本地检查点摘要（LiteLLM 选择保持中性 provider 名）；只有 model_info 显式声明 supports_responses_compaction opt-in 的模型才会公布精确的 OpenAI 名，其路由在转发签名历史前仍会用不带历史的小探测验证（官方 OpenAI 主机跳过探测）。明确不支持的 deployment 会让请求切换到其他候选；当所有候选都拒绝加密压缩时返回明确的协议错误。已在运行的任务保留任务创建时缓存的能力，无法在协议中途切换。设为 0 时每次压缩都重新探测。" },

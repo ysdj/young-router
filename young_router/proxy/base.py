@@ -6,7 +6,7 @@ import binascii
 import contextvars
 import copy
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 import inspect
 import io
@@ -315,6 +315,45 @@ _RECOVERY_POLICY_STREAM_IDLE_TIMEOUT_ENV = (
     "YOUNG_ROUTER_RECOVERY_POLICY_STREAM_IDLE_TIMEOUT"
 )
 _RECOVERY_POLICY_REQUEST_ERROR_ENV = "YOUNG_ROUTER_RECOVERY_POLICY_REQUEST_ERROR"
+# A rate-limit answer that names its own reset far enough ahead is not the
+# transient burst the ``recovery`` default exists for: the route cannot answer
+# anything until that window closes, so retrying it first on every request only
+# buys a failed round trip.  This horizon is where the two stop being the same
+# event, and it is a runtime setting because "far enough" depends on how long
+# the user is willing to keep a route parked.  A reset inside the horizon stays
+# ``recovery`` and is retried.
+_QUOTA_RESET_COOLDOWN_HORIZON_SECONDS_ENV = (
+    "YOUNG_ROUTER_QUOTA_RESET_COOLDOWN_HORIZON_SECONDS"
+)
+_QUOTA_RESET_COOLDOWN_HORIZON_DEFAULT_SECONDS = 60.0
+# Vocabulary for a 429 that states its own reset rather than only refusing the
+# moment.  Each marker is paired with an absolute reset time or a stated wait in
+# the same text; a message that only says "rate limit" never matches these and
+# keeps its ``recovery`` policy.  Both shapes appear in the wild — a station
+# states a wall-clock window ("will reset at 2030-01-02 03:04:05 utc+8") and a
+# gateway states a wait ("quota resets in 30 minutes") — so both are listed.
+_UPSTREAM_QUOTA_RESET_MARKERS = (
+    "reset at",
+    "resets at",
+    "will reset at",
+    "reset on",
+    "resets on",
+    "reset time",
+    "reset in",
+    "resets in",
+    "will reset in",
+    "quota resets",
+    "usage resets",
+    "usage will reset",
+    "limit resets",
+    "limit will reset",
+    "available again at",
+    "available again in",
+    "try again at",
+    "try again in",
+    "retry at",
+    "available after",
+)
 _BROWSER_COMPATIBLE_HEADER_HOSTS = {"headers.example"}
 _BROWSER_COMPATIBLE_HEADERS_RETRY_METADATA_KEY = (
     "_browser_compatible_headers_retry"

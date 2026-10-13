@@ -71,6 +71,9 @@ from .base import (
     _PROTOCOL_FALLBACK_RELAX_TOOL_CHOICE_KEY,
     _PROTOCOL_FALLBACKS,
     _PROTOCOL_FALLBACK_TTL_SECONDS_ENV,
+    _QUOTA_RESET_COOLDOWN_HORIZON_DEFAULT_SECONDS,
+    _QUOTA_RESET_COOLDOWN_HORIZON_SECONDS_ENV,
+    _UPSTREAM_QUOTA_RESET_MARKERS,
     _EXTERNAL_WEB_SEARCH_STARTED_REQUESTS,
     _EXTERNAL_WEB_SEARCH_STARTED_REQUESTS_LOCK,
     _EXTERNAL_WEB_SEARCH_STARTED_REQUESTS_MAX,
@@ -158,6 +161,7 @@ from .base import (
     _is_local_shutdown_exception,
     asyncio,
     datetime,
+    timedelta,
     json,
     litellm,
     math,
@@ -808,10 +812,21 @@ def _recovery_policy_for_exception(exception: Exception) -> str:
     if status_code == 429 or any(
         marker in text for marker in _UPSTREAM_TEMPORARY_ERROR_MARKERS
     ):
-        return _recovery_policy_setting(
+        rate_limit_policy = _recovery_policy_setting(
             _RECOVERY_POLICY_RATE_LIMIT_ENV,
             _RECOVERY_POLICY_RECOVERY,
         )
+        # An explicit policy is never overridden: a user who set ``error`` wants
+        # a terminal answer, and one who set ``recovery_cooldown`` already has
+        # every 429 cooled.  Only the default is refined, and only for an
+        # answer that named a reset beyond the retry horizon — the route cannot
+        # serve before then, so retrying it first on every request buys nothing
+        # but a failed round trip and a log full of the same refusal.
+        if rate_limit_policy == _RECOVERY_POLICY_RECOVERY and _is_quota_window_rate_limit_error(
+            exception
+        ):
+            return _RECOVERY_POLICY_COOLDOWN
+        return rate_limit_policy
 
     if (
         status_code == 408
@@ -4688,11 +4703,22 @@ def _recovery_diagnostic(exception: Exception) -> dict[str, Any]:
             "try again later",
         )
     ):
-        result = {
-            "kind": "rate_limit",
-            "title": "Rate limited",
-            "detail": "The upstream is asking LiteLLM to wait before trying again.",
-        }
+        if _is_quota_window_rate_limit_error(exception):
+            result = {
+                "kind": "rate_limit_window",
+                "title": "Rate limit window closed",
+                "detail": (
+                    "The upstream named a reset beyond the retry horizon, so this "
+                    "route is parked until that window closes instead of being "
+                    "retried first on every request."
+                ),
+            }
+        else:
+            result = {
+                "kind": "rate_limit",
+                "title": "Rate limited",
+                "detail": "The upstream is asking LiteLLM to wait before trying again.",
+            }
     elif _is_local_stream_timeout_error(exception) or _exception_indicates_timeout_or_long_wait(exception):
         result = {
             "kind": "timeout",
@@ -4784,6 +4810,150 @@ def _parse_retry_after_seconds(value: Any) -> Optional[float]:
         return None
     seconds = _duration_unit_seconds(float(match.group(1)), match.group(2))
     return seconds if seconds >= 0 and seconds < float("inf") else None
+
+
+def _quota_reset_cooldown_horizon_seconds() -> float:
+    value = os.getenv(_QUOTA_RESET_COOLDOWN_HORIZON_SECONDS_ENV, "").strip()
+    if not value:
+        return _QUOTA_RESET_COOLDOWN_HORIZON_DEFAULT_SECONDS
+    try:
+        parsed = float(value)
+    except ValueError:
+        return _QUOTA_RESET_COOLDOWN_HORIZON_DEFAULT_SECONDS
+    return max(0.0, parsed)
+
+
+def _quota_reset_absolute_seconds(text: str) -> Optional[float]:
+    """Seconds until the absolute reset time a 429 names, if it names one.
+
+    Providers state a window reset as a wall-clock moment ("reset at 2030-01-02
+    03:04:05 utc+8"), which is not a duration: the same message means a
+    different wait at every second it is read.  The offset is honored when the
+    message carries one, because a station that answers in local time would
+    otherwise be read as UTC and the wait would be wrong by the offset — the
+    difference between parking a route for the stated window and parking it for
+    hours.  A time already in the past is returned as 0.0 so a stale cached
+    message never extends a cooldown.
+    """
+
+    match = re.search(
+        r"(\d{4})-(\d{2})-(\d{2})"
+        r"[ tT]+"
+        r"(\d{1,2}):(\d{2})(?::(\d{2}))?"
+        r"\s*(utc|gmt|z)?\s*([+-]\s*\d{1,2}(?::?\d{2})?)?",
+        text,
+        re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    hour, minute = int(match.group(4)), int(match.group(5))
+    second = int(match.group(6) or 0)
+    if hour > 23 or minute > 59 or second > 59:
+        return None
+    offset = match.group(8)
+    tzinfo = timezone.utc
+    if offset:
+        normalized = offset.replace(" ", "")
+        sign = -1 if normalized.startswith("-") else 1
+        digits = normalized.lstrip("+-")
+        if ":" in digits:
+            offset_hours, _, offset_minutes = digits.partition(":")
+        elif len(digits) > 2:
+            offset_hours, offset_minutes = digits[:-2], digits[-2:]
+        else:
+            offset_hours, offset_minutes = digits, "0"
+        try:
+            delta = timedelta(
+                hours=int(offset_hours or 0), minutes=int(offset_minutes or 0)
+            )
+        except ValueError:
+            delta = timedelta(0)
+        tzinfo = timezone(sign * delta)
+    try:
+        reset_at = datetime(
+            int(match.group(1)),
+            int(match.group(2)),
+            int(match.group(3)),
+            hour,
+            minute,
+            second,
+            tzinfo=tzinfo,
+        )
+    except ValueError:
+        return None
+    try:
+        remaining = (reset_at - datetime.now(timezone.utc)).total_seconds()
+    except (OverflowError, OSError, ValueError):
+        return None
+    return max(0.0, remaining)
+
+
+def _quota_reset_relative_seconds(text: str) -> Optional[float]:
+    """Seconds a 429 states as a wait for its own reset, if it states one.
+
+    A gateway states the same window as a duration ("quota resets in 30
+    minutes") rather than a wall-clock moment.  Both say when the route is
+    ready again, so both are read here; only the wall-clock form needs the
+    offset arithmetic in :func:`_quota_reset_absolute_seconds`.
+    """
+
+    match = re.search(
+        r"(?:reset|resets|available\s+again|try\s+again|retry)\s*"
+        r"(?:at|in|after|on)?\s*[:=]?\s*"
+        r"(\d+(?:\.\d+)?)\s*"
+        r"(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)\b",
+        text,
+        re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    value = float(match.group(1))
+    unit = match.group(2).lower()
+    if unit.startswith("h"):
+        value *= 3600.0
+    elif unit.startswith("m"):
+        value *= 60.0
+    return value if value >= 0 and value < float("inf") else None
+
+
+def _exception_quota_reset_seconds(exception: Exception) -> Optional[float]:
+    """How long a 429 that states its own window reset says the route is out.
+
+    Returns ``None`` when the answer refuses only this moment (a plain burst
+    limit with no reset statement), which is what keeps the ``recovery``
+    default honest: an answer that never said when it would be ready is still
+    retried rather than parked.
+    """
+
+    text = _exception_text(exception)
+    if not text:
+        return None
+    lowered = text.lower()
+    if not any(marker in lowered for marker in _UPSTREAM_QUOTA_RESET_MARKERS):
+        return None
+    absolute = _quota_reset_absolute_seconds(text)
+    if absolute is not None:
+        return absolute
+    relative = _quota_reset_relative_seconds(text)
+    if relative is not None:
+        return relative
+    return _exception_retry_after_seconds(exception)
+
+
+def _is_quota_window_rate_limit_error(exception: Exception) -> bool:
+    """Whether a rate-limit answer named a reset beyond the retry horizon.
+
+    The horizon is the boundary between "busy right now" and "out until the
+    window rolls": inside it the route is retried as before, beyond it the
+    route is cooled so the next request does not pay the same refusal first.
+    """
+
+    if _exception_status_code(exception) != 429:
+        return False
+    reset_seconds = _exception_quota_reset_seconds(exception)
+    if reset_seconds is None:
+        return False
+    return reset_seconds > _quota_reset_cooldown_horizon_seconds()
 
 
 def _header_retry_after_seconds(headers: Any) -> Optional[float]:
