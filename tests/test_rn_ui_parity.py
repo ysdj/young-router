@@ -3053,6 +3053,48 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn("refreshSnapshot(!background)", self.ui)
         self.assertNotIn("runServiceOperation(\"health\", true)", self.ui)
 
+    def test_online_usage_is_a_select_driven_log_view_not_a_child_browser(self) -> None:
+        # The 在线用量 tab is a log view: a dropdown chooses which configured
+        # relay to read, the read goes through Core's own log-format reader, and
+        # the rows land in the table this window already draws. Opening the
+        # station's dashboard in a native browser is deliberately not a path.
+        logs = self.ui.split("function LogsWorkspace(", 1)[1]
+        self.assertNotIn("openRelayUsageLogs", logs)
+        self.assertNotIn("native.openRelayLogs", logs)
+        self.assertNotIn("native.restoreRelaySession", logs)
+
+        refresh = logs.split("const refreshOnlineUsage = useCallback", 1)[1].split("const refreshOnlineUsageRef", 1)[0]
+        self.assertIn('dispatch("logs.refresh_online_usage", { tab, source: sourceId }, "logs")', refresh)
+
+        # The dropdown offers the aggregate read first, then each relay.
+        self.assertIn("const onlineUsageSourceValues = useMemo(", logs)
+        self.assertIn('() => ["", ...onlineUsageSources.map((source) => source.id)],', logs)
+        self.assertIn('translate("logs.onlineUsageAllSources")', logs)
+        # It is the shared native picker (the chevron dropdown), and its
+        # selection is what scopes the read.
+        self.assertIn('<NativePicker labels={onlineUsageSourceLabels}', logs)
+        self.assertIn("refreshOnlineUsage(source)", logs)
+        # Entering the tab reads it, so it is never an empty surface waiting on
+        # a dropdown nobody touched.
+        self.assertIn('if (selected === "online-usage") void refreshOnlineUsageRef.current(onlineUsageSourceIdRef.current);', logs)
+
+        self.assertIn('"logs.onlineUsageAllSources": "All relays"', self.en)
+        self.assertIn('"logs.onlineUsageAllSources": "全部中转站"', self.zh)
+        translation_keys = (ROOT / "rn/packages/shared/src/i18n/types.ts").read_text(encoding="utf-8")
+        for key in ("logs.onlineUsageAllSources", "logs.onlineUsageSource"):
+            self.assertIn(f'| "{key}"', translation_keys)
+
+        # The view's own shape carries the selection, and the IPC schema beside
+        # it declares the same two fields: the contract moves with the client.
+        types = (ROOT / "rn/packages/shared/src/types.ts").read_text(encoding="utf-8")
+        self.assertIn("export interface LogSource {", types)
+        self.assertIn("sources?: LogSource[];", types)
+        self.assertIn("source_id?: string;", types)
+        schema = (ROOT / "young_router/core/ipc-v1.schema.json").read_text(encoding="utf-8")
+        self.assertIn('"logSource"', schema)
+        self.assertIn('"sources": {"type": "array", "maxItems": 32', schema)
+        self.assertIn('"source_id": {"type": "string", "maxLength": 64}', schema)
+
     def test_settings_disk_polling_ignores_unrelated_snapshot_revisions(self) -> None:
         self.assertIn("const latestSnapshot = useRef<CoreSnapshot | undefined>(snapshot);", self.ui)
         self.assertIn("const SETTINGS_DISK_POLL_MS = 5_000;", self.ui)

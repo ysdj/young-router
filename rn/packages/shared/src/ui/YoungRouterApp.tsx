@@ -9272,6 +9272,11 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
   const selectedTabRef = useRef(selected);
   selectedTabRef.current = selected;
   const active = activeState?.tab === selected ? activeState.log : undefined;
+  // The tab-entry read happens inside the poll effect, which must not
+  // re-subscribe on every view change, so the selection it continues from is
+  // read through a ref rather than captured in that effect's closure.
+  const onlineUsageSourceIdRef = useRef("");
+  onlineUsageSourceIdRef.current = selected === "online-usage" ? active?.source_id ?? "" : "";
   useEffect(() => {
     if (appliedTabRequestKey.current === requestedTabKey) return;
     appliedTabRequestKey.current = requestedTabKey;
@@ -9320,6 +9325,10 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
       : selected === "requests" ? REQUEST_LOG_POLL_MS
       : selected === "online-usage" ? ONLINE_USAGE_POLL_MS : LOG_VIEW_POLL_MS;
     const interval = setInterval(() => { void poll(); }, intervalMs);
+    // Entering the tab is itself the request to read it: the rows are fetched
+    // from the relays the window already has, so the tab shows the current
+    // usage instead of an empty surface waiting on a dropdown nobody touched.
+    if (selected === "online-usage") void refreshOnlineUsageRef.current(onlineUsageSourceIdRef.current);
     return () => { mounted = false; clearInterval(interval); };
   }, [ipc, selected]);
   const clearing = clearIntent?.tab === selected;
@@ -9445,9 +9454,8 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
     [onlineUsageSources, translate],
   );
   const onlineUsageSourceIndex = Math.max(0, onlineUsageSourceValues.indexOf(onlineUsageSourceId));
-  const refreshOnlineUsage = (sourceId: string): void => {
-    const tab = selected;
-    if (tab !== "online-usage") return;
+  const refreshOnlineUsage = useCallback((sourceId: string): void => {
+    const tab = "online-usage" as const;
     void dispatch("logs.refresh_online_usage", { tab, source: sourceId }, "logs").then(async () => {
       try {
         const result = await ipc.logs(tab);
@@ -9458,7 +9466,12 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
         // The tab's own poll reconciles the confirmed Core view.
       }
     }).catch(() => undefined);
-  };
+  }, [dispatch, ipc]);
+  // The tab-entry effect runs before this callback exists in source order, so
+  // it reaches the current one through a ref instead of capturing a stale
+  // closure or re-subscribing the poll whenever the callback identity changes.
+  const refreshOnlineUsageRef = useRef(refreshOnlineUsage);
+  refreshOnlineUsageRef.current = refreshOnlineUsage;
   return <View style={styles.logsWindow}>
     <View style={styles.logsToolbar}>
       <View style={styles.logFilterRow}><Text style={styles.toolbarLabel}>{translate("common.filter")}</Text><NativeTextField style={styles.logFilterInput} value={filterDraft} placeholder={translate("logs.filterCurrent")} onChangeText={(filter) => { filterDirty.current = true; setFilterDraft(filter); if (filterTimer.current) clearTimeout(filterTimer.current); filterTimer.current = setTimeout(() => { void dispatch("logs.set_filter", { tab: selected, filter }, "logs"); }, 250); }} accessibilityLabel={translate("common.filter")} /></View>

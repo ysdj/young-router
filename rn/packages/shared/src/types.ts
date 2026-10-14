@@ -372,10 +372,16 @@ export interface LogSummary {
   limit: number;
 }
 
+/** One selectable online-usage relay, as the log view's dropdown names it. */
+export interface LogSource {
+  id: string;
+  label: string;
+}
+
 export interface LogView extends LogSummary {
   records: Array<Record<string, unknown> | string>;
   /** The online-usage tab's selectable relays. Present only on that tab. */
-  sources?: Array<{ id: string; label: string }>;
+  sources?: LogSource[];
   /** The relay whose rows this view carries; "" reads every configured relay. */
   source_id?: string;
 }
