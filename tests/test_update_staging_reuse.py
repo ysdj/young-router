@@ -373,5 +373,58 @@ class PiWebAccessReuseTests(unittest.TestCase):
         self.assertTrue(pi_web_access._carries_the_shared_user_agent(self.directory))
 
 
+class PiWebAccessNodeStagingTests(unittest.TestCase):
+    """The Node runtime is copied from the installed bundle without rewriting it.
+
+    Every artifact build hands ``--node-source`` the Node executable the
+    installed app already carries.  Writing those 90 MB back out on each run
+    would move the staged file's mtime, and the packed Core would then treat an
+    unchanged runtime as changed on every build.  The copy is skipped only when
+    the staged bytes are already the source's bytes, so a different source
+    still replaces what is there.
+    """
+
+    def setUp(self) -> None:
+        self.directory = Path(tempfile.mkdtemp(prefix="young-router-node-stage-test-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.directory, ignore_errors=True))
+        self.output = self.directory / "node-output"
+        self.source = self.directory / "source-node"
+        # Larger than the 1 MiB floor ``_install_node`` enforces, so a real copy
+        # is not rejected as a placeholder.
+        self.source.write_bytes(b"\x7fELF" + b"n" * (1024 * 1024 + 8))
+        self.source.chmod(0o755)
+
+    def install(self) -> None:
+        pi_web_access._install_node(
+            self.output,
+            source=str(self.source),
+            index_url="https://node.invalid/index.json",
+            archive_url=None,
+        )
+
+    def test_an_unchanged_source_leaves_the_staged_binary_in_place(self) -> None:
+        self.install()
+        target = self.output / "node"
+        before = target.stat().st_mtime_ns
+        self.install()
+        # The mtime is the whole point: a rewrite would move it and make the
+        # packed Core see a change that is not one.
+        self.assertEqual(target.stat().st_mtime_ns, before)
+        self.assertEqual(target.read_bytes(), self.source.read_bytes())
+
+    def test_a_different_source_replaces_the_staged_binary(self) -> None:
+        self.install()
+        target = self.output / "node"
+        replacement = self.source.read_bytes()[:-1] + b"X"
+        self.source.write_bytes(replacement)
+        self.install()
+        self.assertEqual(target.read_bytes(), replacement)
+
+    def test_the_staged_binary_is_executable(self) -> None:
+        self.install()
+        mode = (self.output / "node").stat().st_mode
+        self.assertTrue(mode & 0o111, "the staged Node must stay executable")
+
+
 if __name__ == "__main__":
     unittest.main()

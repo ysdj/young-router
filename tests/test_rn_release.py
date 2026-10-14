@@ -504,6 +504,59 @@ class ReactNativeReleaseTests(unittest.TestCase):
             self.assertIn(updater, macos)
             self.assertIn(updater, windows)
 
+    def test_the_core_runtime_is_assembled_once_per_release_and_architecture(self) -> None:
+        # Assembling the portable runtime is the longest step a build cannot
+        # overlap with anything else: uv unpacks a standalone CPython and then
+        # resolves a hundred-odd wheels for the pinned LiteLLM release.  Neither
+        # half reads the checkout, so a repeat build must reuse the assembled
+        # tree rather than redo it.  The cache is keyed on exactly the two
+        # inputs that decide the result, so a release bump or an architecture
+        # change rebuilds it rather than serving a stale one.
+        script = (ROOT / "scripts/build-and-install-macos.sh").read_text(encoding="utf-8")
+
+        self.assertIn('RUNTIME_CACHE_KEY="$UV_RUNTIME-litellm-$LITELLM_VERSION"', script)
+        self.assertIn('RUNTIME_CACHE_ENTRY="$RUNTIME_CACHE/$RUNTIME_CACHE_KEY"', script)
+        self.assertIn('if [[ ! -x "$RUNTIME_CACHE_ENTRY/python/bin/python3.12"', script)
+        self.assertIn('Reusing cached Core runtime:', script)
+        # A miss rebuilds from scratch, so the cached entry is never repaired in
+        # place -- a half-written tree can only be replaced, not trusted.
+        self.assertIn('rm -rf "$RUNTIME_CACHE_ENTRY"', script)
+        # The cache holds the interpreter and the wheels; the release lock is
+        # written into the bundle after the copy, so a cached entry never
+        # carries the claim for a release it was not built from.
+        build = script.index('if [[ ! -x "$RUNTIME_CACHE_ENTRY/python/bin/python3.12"')
+        copy_into_bundle = script.index('copy_tree "$RUNTIME_CACHE_ENTRY" "$CORE/runtime"')
+        lock_into_bundle = script.index(
+            'cp "$PROJECT_ROOT/LITELLM_VERSION" "$CORE/runtime/LITELLM_VERSION"', build
+        )
+        self.assertLess(build, copy_into_bundle)
+        self.assertLess(copy_into_bundle, lock_into_bundle)
+        # The cache entry itself never carries the lock file.
+        self.assertNotIn(
+            'cp "$PROJECT_ROOT/LITELLM_VERSION" "$RUNTIME_CACHE_ENTRY/LITELLM_VERSION"', script
+        )
+
+    def test_the_node_runtime_is_reused_independently_of_the_python_runtime(self) -> None:
+        # The pinned LiteLLM release moves far more often than the Node 22
+        # runtime does.  Reusing the Node binary through the Python-runtime
+        # decision would throw away a 108 MB download every time the release
+        # moved, even though the bytes are identical -- so the Node source is
+        # resolved from the installed bundle on its own.
+        script = (ROOT / "scripts/build-and-install-macos.sh").read_text(encoding="utf-8")
+
+        self.assertIn('INSTALLED_RUNTIME="$DESTINATION/Contents/Resources/Core/runtime"', script)
+        self.assertIn('NODE_SOURCE_PATH="$INSTALLED_RUNTIME/bin/node"', script)
+        self.assertIn('NODE_SOURCE_ARGS=(--node-source "$NODE_SOURCE_PATH")', script)
+        # The reuse must be reachable when the Python runtime was not reused:
+        # the branch that reads the installed Node sits outside the Python
+        # reuse gate, not inside it.
+        python_gate = script.index('if [[ -z "$RUNTIME_SOURCE" ]]; then')
+        python_gate_end = script.index(
+            'NODE_MAJOR="$(node -p', python_gate
+        )
+        node_selection = script.index('elif [[ -x "$INSTALLED_RUNTIME/bin/node" ]]; then')
+        self.assertGreater(node_selection, python_gate_end)
+
     def test_the_generated_code_editor_bundle_is_not_rewritten_when_unchanged(self) -> None:
         # This file is a source input to the type check and to Metro, so
         # republishing identical bytes still moves its mtime and makes every

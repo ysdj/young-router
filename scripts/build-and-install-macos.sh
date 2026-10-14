@@ -68,6 +68,11 @@ STOP_DRAIN_SECONDS="${YOUNG_ROUTER_PROXY_DRAIN_SECONDS:-14400}"
 REQUIRED_HEALTH_CHECKS=3
 LAUNCH_RETRY_SECONDS=1
 LAST_STARTUP_STATE=""
+# Set when the Core runtime this build copies came from the assembled cache
+# entry rather than from a caller-supplied runtime source.  The cached entry
+# was completed with the staged Veridrop revision's dependencies when it was
+# assembled, so the assembly step below only has to re-verify them.
+RUNTIME_FROM_CACHE=0
 
 cleanup() {
   [[ -z "$RUNTIME_WORK" ]] || rm -rf "$RUNTIME_WORK"
@@ -416,8 +421,8 @@ fi
 # pinned LiteLLM version matches this checkout, and the portable launchers are
 # present. The macOS host, project Python sources, smoke tests, signing,
 # replacement, and readiness checks still run on every build.
+INSTALLED_RUNTIME="$DESTINATION/Contents/Resources/Core/runtime"
 if [[ -z "$RUNTIME_SOURCE" ]]; then
-  INSTALLED_RUNTIME="$DESTINATION/Contents/Resources/Core/runtime"
   if [[ -x "$INSTALLED_RUNTIME/python/bin/python3.12" \
     && -x "$INSTALLED_RUNTIME/bin/python" \
     && -x "$INSTALLED_RUNTIME/bin/litellm" \
@@ -460,10 +465,23 @@ mkdir -p "$STAGING_CACHE"
 # it keeps the mandatory upstream re-checks below unchanged — only the Node
 # binary avoids a second trip over the network.  A caller that supplied another
 # runtime, or a build with no installed app, still downloads it.
+#
+# This reads the installed bundle directly rather than following the Python
+# runtime above: the pinned LiteLLM release moves far more often than Node 22,
+# and a version bump would otherwise throw away a Node runtime that is the
+# same bytes.  `pi-web-access`'s own `--node-source` copies whatever executable
+# it is handed, so the version that satisfies the pinned release is checked
+# here, before the argument is built.
 NODE_SOURCE_ARGS=()
+NODE_SOURCE_PATH=""
 if [[ -n "$RUNTIME_SOURCE" && -x "$RUNTIME_SOURCE/bin/node" ]]; then
-  NODE_SOURCE_ARGS=(--node-source "$RUNTIME_SOURCE/bin/node")
-  printf 'Reusing installed Node runtime: %s\n' "$RUNTIME_SOURCE/bin/node"
+  NODE_SOURCE_PATH="$RUNTIME_SOURCE/bin/node"
+elif [[ -x "$INSTALLED_RUNTIME/bin/node" ]]; then
+  NODE_SOURCE_PATH="$INSTALLED_RUNTIME/bin/node"
+fi
+if [[ -n "$NODE_SOURCE_PATH" ]]; then
+  NODE_SOURCE_ARGS=(--node-source "$NODE_SOURCE_PATH")
+  printf 'Reusing installed Node runtime: %s\n' "$NODE_SOURCE_PATH"
 fi
 STAGING_PIDS=()
 # `set -u` treats an empty array expansion as unbound on the bash 3.2 that
@@ -607,6 +625,16 @@ if [[ -z "$APP" ]]; then
 fi
 
 RNMACOS_CLI="$RN_ROOT/vendor/react-native-macos-0.85/packages/react-native/cli.js"
+# The vendored CLI runs `xcodebuild` with no `-destination`, and a build with no
+# destination cannot pick an active architecture: it resolves `ARCHS` from the
+# project (both `arm64` and `x86_64` here) and compiles every slice, even though
+# the app target's own `ONLY_ACTIVE_ARCH = YES` asks for one.  That second slice
+# is never shipped -- the bundle this same script installs is a single-arch
+# binary -- so the whole non-host pass is discarded work costing roughly half
+# the native build.  Pinning `ARCHS` in the environment makes xcodebuild build
+# exactly the slice `$ARCH` already selects for the runtime below.
+export ARCHS="$ARCH"
+export ONLY_ACTIVE_ARCH=YES
 (
   cd "$APP_ROOT"
   node "$RNMACOS_CLI" build-macos --project-path macos --mode Release
@@ -663,26 +691,62 @@ else
       ;;
   esac
   mkdir -p "$RUNTIME_WORK/python-installs" "$CORE/runtime/bin" "$CORE/runtime/site-packages"
-  UV_PYTHON_INSTALL_DIR="$RUNTIME_WORK/python-installs" \
-    "$UV_BIN" python install "$UV_RUNTIME" --no-bin >/dev/null
-  PYTHON_SOURCE="$(printf '%s\n' "$RUNTIME_WORK"/python-installs/cpython-3.12.*-macos-*64-none | head -n 1)"
-  if [[ ! -x "$PYTHON_SOURCE/bin/python3.12" ]]; then
-    echo "uv did not install the expected standalone macOS Python 3.12 runtime." >&2
-    exit 5
-  fi
-  mv "$PYTHON_SOURCE" "$CORE/runtime/python"
   LITELLM_VERSION="$(tr -d '[:space:]' < "$PROJECT_ROOT/LITELLM_VERSION")"
-  "$UV_BIN" pip install \
-    --python "$CORE/runtime/python/bin/python3.12" \
-    --target "$CORE/runtime/site-packages" \
-    "litellm[proxy]==$LITELLM_VERSION" \
-    "fastapi==0.140.3" \
-    Pillow \
-    PyYAML >/dev/null
-  cp "$PROJECT_ROOT/scripts/runtime/python-wrapper.sh" "$CORE/runtime/bin/python"
-  cp "$PROJECT_ROOT/scripts/runtime/litellm-wrapper.sh" "$CORE/runtime/bin/litellm"
-  cp "$PROJECT_ROOT/LITELLM_VERSION" "$CORE/runtime/LITELLM_VERSION"
-  chmod 0755 "$CORE/runtime/bin/python" "$CORE/runtime/bin/litellm"
+  # Assembling the portable runtime is the longest step a build cannot overlap
+  # with anything else: uv unpacks a standalone CPython and then resolves and
+  # installs a hundred-odd wheels for the pinned LiteLLM release.  Neither half
+  # depends on the checkout, only on the interpreter variant and the release
+  # lock, so the assembled tree is cached under exactly those two values.  A
+  # release bump or an architecture change misses the cache and rebuilds it;
+  # `YOUNG_ROUTER_STAGING_CACHE` is disposable either way because a miss is
+  # always a rebuild rather than a repair.
+  RUNTIME_CACHE="${YOUNG_ROUTER_RUNTIME_CACHE:-$STAGING_CACHE/runtime}"
+  RUNTIME_CACHE_KEY="$UV_RUNTIME-litellm-$LITELLM_VERSION"
+  RUNTIME_CACHE_ENTRY="$RUNTIME_CACHE/$RUNTIME_CACHE_KEY"
+  if [[ ! -x "$RUNTIME_CACHE_ENTRY/python/bin/python3.12" \
+    || ! -d "$RUNTIME_CACHE_ENTRY/site-packages" ]]; then
+    rm -rf "$RUNTIME_CACHE_ENTRY"
+    mkdir -p "$RUNTIME_CACHE_ENTRY/bin" "$RUNTIME_CACHE_ENTRY/site-packages"
+    UV_PYTHON_INSTALL_DIR="$RUNTIME_WORK/python-installs" \
+      "$UV_BIN" python install "$UV_RUNTIME" --no-bin >/dev/null
+    PYTHON_SOURCE="$(printf '%s\n' "$RUNTIME_WORK"/python-installs/cpython-3.12.*-macos-*64-none | head -n 1)"
+    if [[ ! -x "$PYTHON_SOURCE/bin/python3.12" ]]; then
+      echo "uv did not install the expected standalone macOS Python 3.12 runtime." >&2
+      exit 5
+    fi
+    mv "$PYTHON_SOURCE" "$RUNTIME_CACHE_ENTRY/python"
+    "$UV_BIN" pip install \
+      --python "$RUNTIME_CACHE_ENTRY/python/bin/python3.12" \
+      --target "$RUNTIME_CACHE_ENTRY/site-packages" \
+      "litellm[proxy]==$LITELLM_VERSION" \
+      "fastapi==0.140.3" \
+      Pillow \
+      PyYAML >/dev/null
+    cp "$PROJECT_ROOT/scripts/runtime/python-wrapper.sh" "$RUNTIME_CACHE_ENTRY/bin/python"
+    cp "$PROJECT_ROOT/scripts/runtime/litellm-wrapper.sh" "$RUNTIME_CACHE_ENTRY/bin/litellm"
+    chmod 0755 "$RUNTIME_CACHE_ENTRY/bin/python" "$RUNTIME_CACHE_ENTRY/bin/litellm"
+    # The staged scan program is imported into the Core's own interpreter, so
+    # whatever it imports and the runtime does not already carry is added to
+    # that runtime - and only that: a dependency the runtime already has is
+    # never upgraded under the release's own pins.  Doing it here, before the
+    # entry is finished, is what lets the entry be the whole answer: the same
+    # resolve was previously re-run against every build's Core copy, because
+    # the result lived in the copy and not in the cache it came from.
+    "$RUNTIME_CACHE_ENTRY/python/bin/python3.12" "$PROJECT_ROOT/scripts/update_veridrop.py" \
+      --output "$VERIDROP_WORK" \
+      --install-deps "$RUNTIME_CACHE_ENTRY/site-packages" \
+      --python "$RUNTIME_CACHE_ENTRY/python/bin/python3.12" || {
+      echo "Could not complete the bundled Veridrop dependencies." >&2
+      exit 5
+    }
+  else
+    printf 'Reusing cached Core runtime: %s\n' "$RUNTIME_CACHE_ENTRY"
+  fi
+  RUNTIME_FROM_CACHE=1
+  # The cache holds the interpreter and the wheels; the release lock is written
+  # from the checkout below, so a cached entry never carries the claim for a
+  # release it was not built from.
+  copy_tree "$RUNTIME_CACHE_ENTRY" "$CORE/runtime"
 fi
 cp "$PROJECT_ROOT/LITELLM_VERSION" "$CORE/runtime/LITELLM_VERSION"
 mkdir -p "$CORE/runtime/bin"
@@ -691,14 +755,28 @@ copy_tree "$PI_WEB_ACCESS_NODE_WORK" "$CORE/runtime/bin"
 # The staged scan program is imported into the Core's own interpreter, so what
 # it imports and the bundled runtime does not already carry is added to that
 # runtime here - and only that: a dependency the runtime already has is never
-# upgraded under the release's own pins.
-"$CORE/runtime/python/bin/python3.12" "$PROJECT_ROOT/scripts/update_veridrop.py" \
-  --output "$VERIDROP_WORK" \
-  --install-deps "$CORE/runtime/site-packages" \
-  --python "$CORE/runtime/python/bin/python3.12" || {
-  echo "Could not complete the bundled Veridrop dependencies." >&2
-  exit 5
-}
+# upgraded under the release's own pins.  The cached runtime was completed with
+# these dependencies when it was assembled, so this build only has to prove the
+# copied Core still carries them; a caller-supplied runtime that was never
+# through that step is completed here.
+if [[ "$RUNTIME_FROM_CACHE" == "1" ]]; then
+  MISSING_VERIDROP_DEPS="$("$CORE/runtime/python/bin/python3.12" \
+    "$PROJECT_ROOT/scripts/update_veridrop.py" \
+    --output "$VERIDROP_WORK" \
+    --missing-deps "$CORE/runtime/site-packages" 2>/dev/null)"
+  if [[ -n "$MISSING_VERIDROP_DEPS" ]]; then
+    echo "The cached Core runtime is missing dependencies the staged Veridrop revision imports: $MISSING_VERIDROP_DEPS" >&2
+    exit 5
+  fi
+else
+  "$CORE/runtime/python/bin/python3.12" "$PROJECT_ROOT/scripts/update_veridrop.py" \
+    --output "$VERIDROP_WORK" \
+    --install-deps "$CORE/runtime/site-packages" \
+    --python "$CORE/runtime/python/bin/python3.12" || {
+    echo "Could not complete the bundled Veridrop dependencies." >&2
+    exit 5
+  }
+fi
 # The dependency pass operates on the staged tree and may replace its package
 # payload while resolving missing wheels; restore the upstream license beside
 # the copied package before the bundle checks inspect the assembled Core.

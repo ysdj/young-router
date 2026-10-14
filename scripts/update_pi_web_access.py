@@ -337,11 +337,22 @@ def _copy_node_source(source: Path) -> bytes:
 
 def _install_node(node_output: Path, *, source: str | None, index_url: str, archive_url: str | None) -> str:
     _, _, executable = _node_target()
+    target = node_output / executable
     if source:
-        node_bytes = _copy_node_source(Path(source).expanduser())
+        node_source = Path(source).expanduser()
+        # A repeat build stages the same Node binary from the installed bundle
+        # every run, and writing 90 MB only moves the output's mtime: whatever
+        # packs the Core would then see the runtime as changed on every build.
+        # Compare by size and content first, so an unchanged source leaves the
+        # staged file exactly as it is.
+        node_bytes = _copy_node_source(node_source)
+        if target.is_file() and target.stat().st_size == len(node_bytes) \
+           and target.read_bytes() == node_bytes:
+            return "copied"
         version = "copied"
     else:
         version, filename, executable = _node_release(index_url)
+        target = node_output / executable
         if archive_url:
             url = archive_url
         else:
@@ -350,7 +361,6 @@ def _install_node(node_output: Path, *, source: str | None, index_url: str, arch
     if len(node_bytes) < 1024 * 1024:
         raise UpdateError("Downloaded Node executable is unexpectedly small")
     node_output.mkdir(parents=True, exist_ok=True)
-    target = node_output / executable
     temporary = target.with_name(f".{target.name}.staged")
     temporary.write_bytes(node_bytes)
     if executable == "node":
