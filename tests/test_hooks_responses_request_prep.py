@@ -2515,6 +2515,70 @@ class HookResponsesRequestPrepTests(HookTestCase):
         original_call = dict(call, arguments='{"path":"/tmp/yr_shot.png","detail":"original"}')
         self.assertTrue(hooks._codex_view_image_call_requests_original(original_call))
 
+    def test_unsigned_native_view_image_is_previewed_not_elided(self) -> None:
+        """A path-backed native image keeps a preview and a re-openable path.
+
+        The note the elision writes invites a re-capture loop; a path-backed
+        image never needs it, because the same preview budget plus the matching
+        path keeps both the model's view and the replay small.
+        """
+
+        import base64
+        import io
+        import os
+
+        from PIL import Image
+
+        hooks, _ = load_hook_module()
+        self.use_replay_image_cache()
+        self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
+        image = Image.frombytes("RGB", (1400, 1100), os.urandom(1400 * 1100 * 3))
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=95)
+        oversized_url = (
+            "data:image/jpeg;base64,"
+            + base64.b64encode(buffer.getvalue()).decode("ascii")
+        )
+        request = {
+            "call_type": "aresponses",
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+            },
+            "input": [
+                {
+                    "type": "function_call",
+                    "id": "fc_native",
+                    "name": "view_image",
+                    "namespace": "functions",
+                    "arguments": '{"path":"/tmp/yr_shot.png"}',
+                    "call_id": "call-native",
+                },
+                {
+                    "type": "function_call_output",
+                    "id": "fco_native",
+                    "call_id": "call-native",
+                    "output": [
+                        {"type": "input_image", "image_url": oversized_url},
+                    ],
+                },
+            ],
+        }
+
+        modified = hooks._with_prefix_image_previews(request)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        output = modified["input"][1]["output"]
+        self.assertIn(hooks._CODEX_VIEW_IMAGE_REFERENCE_MARKER, output[0]["text"])
+        self.assertNotIn("elided", output[0]["text"])
+        self.assertLess(
+            hooks._image_data_url_size(output[1]["image_url"]),
+            hooks._image_data_url_size(oversized_url),
+        )
+        advertised = self.reference_paths(output[0]["text"])
+        self.assertEqual(len(advertised), 1)
+        self.assertTrue(Path(advertised[0]).is_file())
+
     def test_codex_view_image_reopen_marks_repeated_path_as_original(self) -> None:
         hooks, _ = load_hook_module()
         path = "/tmp/original.png"
@@ -2778,7 +2842,12 @@ class HookResponsesRequestPrepTests(HookTestCase):
             hooks._image_data_url_size(output[1]["image_url"]),
             16_384,
         )
-        self.assertIn(path, output[0]["text"])
+        # The named file does not exist on this checkout, so the reference is a
+        # durable copy of the same bytes rather than a path the client could
+        # never open; the reference still arms an on-demand re-open.
+        advertised = self.reference_paths(output[0]["text"])
+        self.assertEqual(len(advertised), 1)
+        self.assertTrue(advertised[0].endswith(".original.jpg"))
         self.assertEqual(original["input"][2]["output"][0]["image_url"], original_url)
 
     async def test_iterative_original_image_is_bounded_after_encrypted_boundary(self) -> None:

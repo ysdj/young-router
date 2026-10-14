@@ -3424,25 +3424,34 @@ def _with_prefix_image_previews(request_kwargs: dict) -> Optional[dict]:
         ),
         default=-1,
     )
+    elision_result: Optional[dict] = None
     if last_encrypted_index < 0:
-        # Without a signed prefix there is nothing to keep byte-exact, and the
-        # history is still replayed in full on every turn.  A conversation that
-        # carried a few screenshots then grows past the upstream gateway's
-        # limit while the client's own window accounting still shows headroom,
-        # because base64 image bytes are what the gateway counts and what the
-        # client discounts.  The path-reference treatment below cannot help
-        # here: an image produced by ``js`` or any exec-shaped tool has no
-        # local path to reopen.  Those oversized inline bytes are therefore
-        # dropped for a note stating what they were, which is the same
-        # treatment an oversized tool output already receives.
+        # Without a signed prefix nothing must stay byte-exact, and the history
+        # is still replayed in full on every turn.  A conversation that carried
+        # a few screenshots then grows past the upstream gateway's limit while
+        # the client's own window accounting still shows headroom, because
+        # base64 image bytes are what the gateway counts and what the client
+        # discounts.
+        #
+        # An image whose producing call names a local path is bounded below by
+        # the same preview-plus-reference treatment the signed prefix gets: the
+        # model keeps a readable preview and a path it can re-open, which costs
+        # the gateway a fraction of the original bytes.  Only an image with no
+        # path behind it -- a ``js`` screenshot or any exec-shaped tool dump --
+        # is beyond recovery, and those are dropped for a note stating what
+        # they were.
+        #
+        # The note is a last resort, never the treatment for a path-backed
+        # image: telling the model an image it still needs "is no longer
+        # current, run the tool again" invites exactly the re-capture loop this
+        # pass exists to prevent, because a fresh capture is elided on the next
+        # turn in the same way.
+        last_encrypted_index = len(input_items) - 1
         elided = _with_elided_oversized_history_images(request_kwargs, input_items)
         if elided is not None:
-            return elided
-        # Nothing was droppable under that rule.  The path-reference pass below
-        # works on the frozen prefix only, so an unsigned history that reaches
-        # here has nothing left for either treatment.
-        _trace_prefix_image_preview_gate(request_kwargs, "no-encrypted-boundary")
-        return None
+            elision_result = elided
+            request_kwargs = elided
+            input_items = request_kwargs["input"]
     min_bytes = _prefix_image_preview_min_bytes()
     call_paths: dict[str, list[str]] = {}
     original_calls: set[str] = set()
@@ -3518,11 +3527,15 @@ def _with_prefix_image_previews(request_kwargs: dict) -> Optional[dict]:
                     "arguments_sample": arguments_sample,
                 },
             )
-        return None
+        # No path-backed call survives in the history.  An unsigned history may
+        # still have had a path-less image dropped above, and that rewrite is
+        # the whole result.
+        return elision_result
 
     recent_count = _prefix_image_recent_count() if mode == "path-recent" else 0
     candidate_indices: list[int] = []
     candidate_paths: dict[int, list[str]] = {}
+    candidate_is_original: dict[int, bool] = {}
     claimed_call_ids: set[str] = set()
     skipped_referenced = 0
     skipped_original = 0
@@ -3571,6 +3584,7 @@ def _with_prefix_image_previews(request_kwargs: dict) -> Optional[dict]:
             continue
         candidate_indices.append(index)
         candidate_paths[index] = paths
+        candidate_is_original[index] = is_original
 
     # The most recent image outputs keep their preview treatment so the model
     # retains visual continuity near the current turn; older ones fall back to
@@ -3654,14 +3668,29 @@ def _with_prefix_image_previews(request_kwargs: dict) -> Optional[dict]:
             continue
         updated_item = item.copy()
         if paired and reopenable:
-            reference_part = {
-                "type": "input_text",
-                "text": (
+            if candidate_is_original.get(index):
+                # A re-open explicitly asked for the original resolution, so
+                # the preview must keep that promise and name the matching
+                # path the same way the mutable-suffix pass does.
+                reference_text = (
+                    f"{_CODEX_VIEW_IMAGE_ORIGINAL_REFERENCE_MARKER}\n"
+                    "Original-resolution image requested for this explicit re-open; "
+                    "the inline image below carries the highest resolution this "
+                    "route forwards. For the original file, call view_image on the "
+                    "matching local path:\n"
+                    f"{_CODEX_VIEW_IMAGE_REFERENCE_MARKER}\n"
+                    f"{references}"
+                )
+            else:
+                reference_text = (
                     f"{_CODEX_VIEW_IMAGE_REFERENCE_MARKER}\n"
                     "Inline images below are reduced previews. For full detail, call "
                     "view_image again on the matching local path:\n"
                     f"{references}"
-                ),
+                )
+            reference_part = {
+                "type": "input_text",
+                "text": reference_text,
             }
             updated_item["output"] = [reference_part, *new_parts]
         else:
@@ -3701,7 +3730,9 @@ def _with_prefix_image_previews(request_kwargs: dict) -> Optional[dict]:
                 "skipped_unpaired": skipped_unpaired,
             },
         )
-        return None
+        # An unsigned history with no path-backed image may still have had a
+        # path-less one dropped above; that rewrite is the whole result.
+        return elision_result
     modified_kwargs = request_kwargs.copy()
     modified_kwargs["input"] = updated_items
     return modified_kwargs
