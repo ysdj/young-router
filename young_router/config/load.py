@@ -216,6 +216,7 @@ def _model_to_editor(
     provider_by_base: dict[str, str],
     provider_keys: dict[str, list[dict[str, Any]]],
     provider_by_key_id: dict[str, tuple[str, str]],
+    provider_bases: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     entry = _as_dict(model)
     params = _as_dict(entry.get("litellm_params"))
@@ -241,6 +242,18 @@ def _model_to_editor(
         provider = provider_by_base.get(api_base, "")
     if not provider and len(known_providers) == 1:
         provider = next(iter(known_providers))
+    # A route that states exactly its provider's base has inherited it, not
+    # overridden it.  ``config.dump`` emits the provider's own anchor for a
+    # route that states none, so keeping the resolved literal here would
+    # re-create on every load the redundant copy the dumper just collapsed —
+    # and that copy goes stale the moment the provider's base moves, at which
+    # point the dumper reads it as a per-route override and the config sends
+    # the route to the address the provider no longer uses.  Only a route
+    # pointing somewhere other than its provider is a real override.
+    if api_base and provider and provider_bases:
+        provider_base = str(provider_bases.get(provider, "")).strip()
+        if provider_base and api_base.strip() == provider_base:
+            api_base = ""
     # A route whose entry names no key stays unbound.  Its credential is the
     # provider's default (the entry carries it so the runtime has something to
     # answer with), and matching that value against the key list would bind the
@@ -512,9 +525,13 @@ def load_config_document(document: Any) -> dict[str, Any]:
     provider_by_base: dict[str, str] = {}
     provider_keys: dict[str, list[dict[str, Any]]] = {}
     provider_by_key_id: dict[str, tuple[str, str]] = {}
+    # The base each provider states, so a route that merely repeats it is read
+    # back as the inheritance it is rather than as an override of it.
+    provider_bases: dict[str, str] = {}
 
     for name, provider in provider_index.items():
         api_base = _string_value(provider.get("api_base"))
+        provider_bases[name] = api_base.strip()
         keys = [
             {
                 "id": _string_value(_as_dict(item).get("id")).strip(),
@@ -549,6 +566,7 @@ def load_config_document(document: Any) -> dict[str, Any]:
             provider_by_base,
             provider_keys,
             provider_by_key_id,
+            provider_bases,
         )
         _append_model_to_provider(providers, provider_index, model)
 
@@ -567,6 +585,7 @@ def load_config_document(document: Any) -> dict[str, Any]:
                 provider_by_base,
                 provider_keys,
                 provider_by_key_id,
+                provider_bases,
             )
             _append_model_to_provider(providers, provider_index, model)
 

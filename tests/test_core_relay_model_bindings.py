@@ -1061,6 +1061,112 @@ model_list:
             self.assertEqual({"multiplier_missing"}, {item["code"] for item in result["issues"]})
             self.assertNotIn("replace-materialized-credential", json.dumps(result))
 
+    def test_a_provider_holds_one_base_url_and_its_routes_inherit_it(self) -> None:
+        """A route never carries a second copy of its provider's address.
+
+        The pane offers no per-route Base URL, so a route repeating its
+        provider's base holds no information the document did not already
+        have.  The copy was the defect: a station binding stamped the base it
+        read *before* the same Apply's materialization rewrote the provider's
+        base, so the literal outlived the address it was copied from and the
+        dumper then kept it as a per-route override — sending the route to the
+        host the user had already left.  The provider holds the base; its
+        routes inherit it.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            domain = ProvidersModelsDomain(path)
+            source = relay_source()
+            source["order_mode"] = "relay_multiplier"
+            domain.stage_relay_import([source])
+            domain.materialize_relay_bindings(
+                {"resources": [{**source, "api_key": "replace-materialized-credential"}], "issues": []}
+            )
+
+            old_base = "https://relay.example.test/v1"
+            new_base = "https://relay-new.example.test/v1"
+            provider = domain._draft["providers"][0]
+            self.assertEqual(old_base, provider["api_base"])
+
+            # Binding the provider to its own station must not stamp the
+            # provider's base onto its routes.
+            domain.dispatch(
+                "provider.select_relay_station",
+                {
+                    "provider_id": provider["name"],
+                    "source": {"station_id": "station-a", "name": provider["name"], "api_base": old_base},
+                },
+            )
+            self.assertEqual([""], [model["api_base"] for model in domain._draft["providers"][0]["models"]])
+
+            # The station moves: the provider follows it and the routes keep
+            # inheriting, so the old address cannot survive anywhere.
+            result = domain.materialize_relay_bindings(
+                {"resources": [{**source, "api_key": "replace-materialized-credential", "api_base": new_base}], "issues": []}
+            )
+            self.assertEqual([], result["issues"])
+
+            staged = domain._draft["providers"][0]
+            self.assertEqual(new_base, staged["api_base"])
+            self.assertEqual([""], [model["api_base"] for model in staged["models"]])
+
+            domain.apply()
+            saved = path.read_text(encoding="utf-8")
+            self.assertNotIn("relay.example.test", saved)
+            self.assertIn("relay-new.example.test", saved)
+
+    def test_a_real_route_override_survives_a_reload_and_a_provider_move(self) -> None:
+        """A route pointed elsewhere keeps its own address through both.
+
+        Only a route whose base differs from its provider's is an override;
+        the loader must not mistake the provider's own address for one, and it
+        must not discard a genuine one.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            domain = ProvidersModelsDomain(path)
+            domain.dispatch(
+                "provider.add",
+                {
+                    "provider": {
+                        "name": "p",
+                        "enabled": True,
+                        "api_base": "https://provider.example.test/v1",
+                        "api_keys": [{"name": "k", "value": "sk-1"}],
+                    }
+                },
+            )
+            domain.dispatch(
+                "model.add",
+                {
+                    "provider_id": "p",
+                    "model": {
+                        "name": "override",
+                        "upstream_model": "openai/override",
+                        "api_key_name": "k",
+                        "api_base": "https://override.example.test/v1",
+                    },
+                },
+            )
+            domain.apply()
+
+            reloaded = ProvidersModelsDomain(path)
+            self.assertEqual(
+                "https://override.example.test/v1",
+                reloaded._draft["providers"][0]["models"][0]["api_base"],
+            )
+            # Moving the provider does not rewrite a route that never pointed
+            # at the address the provider used to have.
+            reloaded.materialize_relay_bindings(
+                {"resources": [], "issues": []}
+            )
+            self.assertEqual(
+                "https://override.example.test/v1",
+                reloaded._draft["providers"][0]["models"][0]["api_base"],
+            )
+
     def test_dependency_policy_detaches_or_disables_without_reusing_relay_key(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             domain = ProvidersModelsDomain(Path(directory) / "config.yaml")

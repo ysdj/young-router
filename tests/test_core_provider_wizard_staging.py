@@ -425,6 +425,113 @@ class ProviderWizardStagingTests(unittest.TestCase):
             domain.dispatch("provider.discard_pending_key", {"pending_api_key": "wizard-8"})
             self.assertFalse(domain.secret_present("api_key", target))
 
+    def test_a_dropped_listing_connection_is_retried_instead_of_reported_unreachable(self) -> None:
+        """An edge that drops a fresh TLS connection must not read as unreachable.
+
+        The same edge that resets a probe's connection resets a ``/v1/models``
+        read, and a listing that answered on its second attempt is the same
+        answer as one that answered on its first: pressing 获取模型 twice must
+        not be how a user learns their provider is fine.  Only the transport is
+        retried — an HTTP status is the upstream's verdict and is reported as
+        such on the first answer.
+        """
+
+        attempts: list[int] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                attempts.append(1)
+                if len(attempts) == 1:
+                    # A dropped connection, exactly as a relay edge drops one.
+                    self.close_connection = True
+                    self.wfile.close()
+                    return
+                body = json.dumps({"object": "list", "data": [{"id": "model-a"}]}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "config.yaml"
+                path.write_text(textwrap.dedent(EMPTY_CONFIG).lstrip(), encoding="utf-8")
+                domain = ProvidersModelsDomain(path)
+                domain.stage_secret("api_key", wizard_target("wizard-9", "quartz"), "replace-staged-secret")
+
+                fetched = domain.dispatch(
+                    "providers.fetch_models",
+                    {
+                        "pending_provider": {
+                            "pending_api_key": "wizard-9",
+                            "name": "Flaky Edge",
+                            "api_base": f"http://127.0.0.1:{port}/v1",
+                            "api_key_name": "quartz",
+                        }
+                    },
+                )["operation_summary"]
+
+                self.assertTrue(fetched["available"], fetched.get("detail"))
+                self.assertEqual(["model-a"], fetched["models"])
+                self.assertEqual(2, len(attempts))
+        finally:
+            server.shutdown()
+
+    def test_a_refused_listing_is_a_verdict_and_is_not_retried(self) -> None:
+        """An HTTP status is the upstream's answer, not a lost connection."""
+
+        attempts: list[int] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                attempts.append(1)
+                body = json.dumps({"error": {"message": "refused"}}).encode("utf-8")
+                self.send_response(401)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "config.yaml"
+                path.write_text(textwrap.dedent(EMPTY_CONFIG).lstrip(), encoding="utf-8")
+                domain = ProvidersModelsDomain(path)
+                domain.stage_secret("api_key", wizard_target("wizard-10", "quartz"), "replace-staged-secret")
+
+                fetched = domain.dispatch(
+                    "providers.fetch_models",
+                    {
+                        "pending_provider": {
+                            "pending_api_key": "wizard-10",
+                            "name": "Refusing",
+                            "api_base": f"http://127.0.0.1:{port}/v1",
+                            "api_key_name": "quartz",
+                        }
+                    },
+                )["operation_summary"]
+
+                self.assertFalse(fetched["available"])
+                self.assertEqual("The provider model endpoint rejected the request", fetched["detail"])
+                self.assertEqual(1, len(attempts))
+        finally:
+            server.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

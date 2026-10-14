@@ -206,7 +206,9 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             self.assertEqual("relay", selected["provider_type"])
             self.assertEqual(station["id"], selected["relay_station_id"])
             self.assertEqual("Relay Station", selected["models"][0]["provider"])
-            self.assertEqual("https://relay.example.test", selected["models"][0]["api_base"])
+            # The route inherits its provider's address instead of carrying a
+            # second copy of it: one provider, one base URL.
+            self.assertEqual("", selected["models"][0]["api_base"])
 
             with self.assertRaisesRegex(CoreError, "set by its station"):
                 core.dispatch(
@@ -277,7 +279,9 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             self.assertEqual("Custom Provider", custom["name"])
             self.assertEqual("https://custom.example.test/v1", custom["api_base"])
             self.assertEqual("Custom Provider", custom["models"][0]["provider"])
-            self.assertEqual("https://custom.example.test/v1", custom["models"][0]["api_base"])
+            # The route inherits its provider's address instead of carrying a
+            # second copy of it: one provider, one base URL.
+            self.assertEqual("", custom["models"][0]["api_base"])
 
             providers.apply()
             saved = config_path.read_text(encoding="utf-8")

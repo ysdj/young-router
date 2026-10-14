@@ -237,6 +237,16 @@ class ProvidersModelsDomain:
     # timeout are verdicts.
     _MODEL_PROBE_ATTEMPTS = 3
     _MODEL_PROBE_RETRY_DELAY_SECONDS = 0.4
+    # A dropped connection is not only the probe's problem.  ``/v1/models`` on
+    # the same edge is reset just as often, and a listing that answered on its
+    # second attempt is the same answer as one that answered on its first: the
+    # button must report the provider's catalog, not how many TLS handshakes
+    # this host happened to lose first.  The listing is a read, so it spends a
+    # smaller budget than a probe and gives a request refused before it was
+    # read a moment to clear.  Only the transport is retried - an HTTP status
+    # (401, 404, 429) is the upstream's verdict and is returned as such.
+    _MODEL_LIST_ATTEMPTS = 3
+    _MODEL_LIST_RETRY_DELAY_SECONDS = 0.25
     # A relay that answers its first byte slowly still answers; deployments can
     # raise this without a rebuild when their edge is consistently slower.
     _MODEL_PROBE_TIMEOUT_ENV = "YOUNG_ROUTER_MODEL_PROBE_TIMEOUT_SECONDS"
@@ -334,6 +344,13 @@ class ProvidersModelsDomain:
         # route set to follow its rate reads this at Apply time instead of
         # spending a live catalog read while it writes.
         self._published_rates: dict[str, dict[str, float]] = {}
+        # The context window each managed account's own catalog states, per
+        # variant, keyed by model id.  An upstream that publishes a window is
+        # the authority for its own route: the same public name is served by
+        # routes whose windows differ, and the group has to be planned around
+        # the smallest of them.  Remembered from the same explicit catalog
+        # read the 倍率 column comes from, so no projection ever pays for one.
+        self._published_windows: dict[str, dict[str, int]] = {}
         self.revision = 0
         self.reload()
 
@@ -1315,30 +1332,42 @@ class ProvidersModelsDomain:
         if credential:
             headers["Authorization"] = f"Bearer {credential}"
         request = urllib.request.Request(endpoint, headers=headers, method="GET")
-        try:
-            # Keep credential-bearing requests isolated from ambient proxies
-            # and reject redirects before an Authorization header can travel.
-            with isolated_http_opener().open(request, timeout=self._MODEL_LIST_TIMEOUT_SECONDS) as response:
-                status = getattr(response, "status", None)
-                if status is None:
-                    status = response.getcode()
-                body = response.read(self._MAX_MODEL_LIST_BYTES + 1)
-        except urllib.error.HTTPError:
-            return {
-                **summary,
-                "available": False,
-                "detail": "The provider model endpoint rejected the request",
-                "models": [],
-                "model_count": 0,
-            }
-        except Exception:
-            return {
-                **summary,
-                "available": False,
-                "detail": "The provider model endpoint is unavailable",
-                "models": [],
-                "model_count": 0,
-            }
+        # An edge that drops a fresh connection answers the retry, so a single
+        # reset must not be reported as an unreachable provider: the same
+        # retry policy the probe uses, with the listing's own budget.
+        status: int | None = None
+        body = b""
+        for attempt in range(self._MODEL_LIST_ATTEMPTS):
+            try:
+                # Keep credential-bearing requests isolated from ambient proxies
+                # and reject redirects before an Authorization header can travel.
+                with isolated_http_opener().open(request, timeout=self._MODEL_LIST_TIMEOUT_SECONDS) as response:
+                    status = getattr(response, "status", None)
+                    if status is None:
+                        status = response.getcode()
+                    body = response.read(self._MAX_MODEL_LIST_BYTES + 1)
+                break
+            except urllib.error.HTTPError:
+                return {
+                    **summary,
+                    "available": False,
+                    "detail": "The provider model endpoint rejected the request",
+                    "models": [],
+                    "model_count": 0,
+                }
+            except Exception as exc:
+                if (
+                    attempt + 1 >= self._MODEL_LIST_ATTEMPTS
+                    or not self._probe_transport_retryable(exc)
+                ):
+                    return {
+                        **summary,
+                        "available": False,
+                        "detail": "The provider model endpoint is unavailable",
+                        "models": [],
+                        "model_count": 0,
+                    }
+                time.sleep(self._MODEL_LIST_RETRY_DELAY_SECONDS)
 
         if not isinstance(status, int) or status < 200 or status >= 300 or len(body) > self._MAX_MODEL_LIST_BYTES:
             return {
@@ -2259,14 +2288,13 @@ class ProvidersModelsDomain:
             model_id = str(entry.get("id", "")).strip()
             if not model_id:
                 continue
-            models.append(
-                {
-                    "name": model_id,
-                    "upstream_model": model_id,
-                    "enabled": True,
-                    "order": order,
-                }
-            )
+            model: dict[str, Any] = {
+                "name": model_id,
+                "upstream_model": model_id,
+                "enabled": True,
+                "order": order,
+            }
+            models.append(model)
         if not models:
             raise DomainError("The WorkBuddy account reported no models")
         return models
@@ -2347,6 +2375,7 @@ class ProvidersModelsDomain:
         # status rides that response.
         self._workbuddy_remember({"providers": {provider_id: document.get("status")}})
         self._remember_published_rates(provider_id, document.get("models"))
+        self._remember_published_windows(provider_id, document.get("models"))
         self._last_operation = {
             "operation": action,
             "provider": provider_id,
@@ -2436,6 +2465,7 @@ class ProvidersModelsDomain:
         except Exception:
             return
         self._remember_published_rates(provider_id, document.get("models"))
+        self._remember_published_windows(provider_id, document.get("models"))
 
     def _remember_published_rates(self, provider_id: str, models: object) -> None:
         """Remember the rate one account's catalog states for each model.
@@ -2457,6 +2487,56 @@ class ProvidersModelsDomain:
                 rates[model_id] = float(rate)
         if rates:
             self._published_rates[provider_id] = rates
+
+    def _remember_published_windows(self, provider_id: str, models: object) -> None:
+        """Remember the context window one account's catalog states per model.
+
+        The window a route will actually read is the upstream's own number,
+        and two variants of one public name state different ones.  Recording
+        them together lets the group be planned around its narrowest route
+        instead of the widest, which is what turns an oversized turn into a
+        length refusal.
+        """
+
+        windows: dict[str, int] = {}
+        if isinstance(models, Sequence) and not isinstance(models, (str, bytes, bytearray)):
+            for entry in models:
+                if not isinstance(entry, Mapping):
+                    continue
+                model_id = str(entry.get("id", "")).strip()
+                if not model_id:
+                    continue
+                # ``defaultContextWindow`` is the budget the upstream actually
+                # requests; ``contextWindow`` is what it states outright.  The
+                # larger ``supportedContextWindows`` value is only a ceiling,
+                # so it is deliberately not consulted here.
+                window = _positive_int(
+                    entry.get("defaultContextWindow") or entry.get("contextWindow")
+                )
+                if window is None:
+                    continue
+                windows[model_id] = window
+        if windows:
+            self._published_windows[provider_id] = windows
+
+    def _published_window(
+        self,
+        provider: Mapping[str, Any],
+        model: Mapping[str, Any],
+    ) -> int | None:
+        """The window this route's own upstream states for it, if it states one."""
+
+        auth_kind = self._provider_auth_state(provider)["kind"]
+        if auth_kind not in managed_adapters.rate_publishing_auth_kinds():
+            return None
+        provider_id = managed_adapters.rate_provider_id(auth_kind)
+        if not provider_id:
+            return None
+        model_id = self._wire_model_name(model)
+        if not model_id:
+            return None
+        stored = self._published_windows.get(provider_id)
+        return stored.get(model_id) if isinstance(stored, Mapping) else None
 
     def _published_rate(
         self,
@@ -2804,12 +2884,6 @@ class ProvidersModelsDomain:
                     }
                 ],
             )
-        if auth_kind in {"openai_login", "claude_login", "workbuddy_login", "workbuddy_ai_login"}:
-            models = provider.get("models")
-            if isinstance(models, list):
-                for model in models:
-                    if isinstance(model, dict):
-                        model["api_base"] = provider.get("api_base", "")
         return auth
 
     @classmethod
@@ -2844,21 +2918,26 @@ class ProvidersModelsDomain:
             model["litellm_model"] = cls._canonical_upstream_model(
                 model.get("litellm_model"), model, provider
             )
-            if auth_kind in workbuddy_module.WORKBUDDY_AUTH_KINDS:
-                # The provider's loopback base is inherited by every model: a
-                # model added after the provider was configured must carry the
-                # same reference, or the dumper would leave the route without
-                # a base URL.
-                model["api_base"] = str(provider.get("api_base", ""))
             model["provider_key_id"] = selected_key["id"] if selected_key else ""
             model["api_key_name"] = selected_key["name"] if selected_key else ""
 
     @staticmethod
     def _sync_provider_identity_to_models(provider: dict[str, Any]) -> None:
-        """Keep every staged model on its provider's URL and name."""
+        """Keep every staged model on its provider's name.
+
+        The provider's base URL is deliberately *not* copied onto its routes.
+        A route inherits its provider's address (``config.dump`` emits the
+        provider's anchor for a route that states none), so the copy carried
+        no information the document did not already have — and it went stale
+        the moment the provider moved.  A station binding stamps the base it
+        read *before* the same Apply's materialization rewrites the provider's
+        base from the station, so the copied literal outlived the address it
+        was copied from and the dumper then kept it as a per-route override.
+        One provider, one base URL: the provider holds it, its routes inherit
+        it.
+        """
 
         name = str(provider.get("name", "")).strip()
-        api_base = str(provider.get("api_base", "")).strip()
         models = provider.get("models")
         if not isinstance(models, list):
             return
@@ -2866,7 +2945,6 @@ class ProvidersModelsDomain:
             if not isinstance(model, dict):
                 continue
             model["provider"] = name
-            model["api_base"] = api_base
 
     @staticmethod
     def _order_value(value: object, *, label: str = "Route order") -> int | float:
@@ -4917,6 +4995,49 @@ class ProvidersModelsDomain:
                     )
             if provider_base is not None:
                 provider["api_base"] = provider_base
+            # A slot's name is the station key's name, and a station rename is a
+            # rename of the key the slot binds.  The relay domain resolves the
+            # name from the station's own answer, so a slot still carrying the
+            # name a rename replaced is a link that no longer points at the key
+            # it names — the pane reads it as a dangling key while the routes
+            # bound to that slot keep working.  The slot therefore follows the
+            # station, and the routes that name it follow the slot.  A rename
+            # this Core has staged and not yet written is not the station's
+            # answer, so it never moves the slot; that write rewrites it after
+            # the station accepted it.
+            for key in keys:
+                if key["source"].get("kind") != "relay":
+                    continue
+                resource = materials.get(
+                    (
+                        key["source"]["station_id"],
+                        key["source"]["account_id"],
+                        key["source"]["resource_id"],
+                    )
+                )
+                if not isinstance(resource, Mapping):
+                    continue
+                station_name = str(resource.get("api_key_name", "")).strip()
+                if not station_name or station_name == key["name"]:
+                    continue
+                try:
+                    station_name = self._api_key_name(station_name)
+                except DomainError:
+                    continue
+                keys = self._provider_api_keys(
+                    {
+                        **provider,
+                        "api_keys": [
+                            item for item in keys if item["id"] != key["id"]
+                        ]
+                        + [{**key, "name": station_name}],
+                    }
+                )
+                for model in models:
+                    if not isinstance(model, dict):
+                        continue
+                    if str(model.get("provider_key_id", "")).strip() == key["id"]:
+                        model["api_key_name"] = station_name
             self._sync_primary_api_key(provider, keys)
             providers[provider_index] = provider
         # Report the station read only where it left a binding unresolved.  An
