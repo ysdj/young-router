@@ -397,6 +397,50 @@ class HookRouteRecoveryTests(HookTestCase):
         self.assertFalse(hooks._is_route_recovery_poll_error(exc))
         self.assertFalse(hooks._should_return_route_recovery_stream(exc, request_data))
 
+    def test_cn_length_refusal_is_recognized_and_earns_the_truncation_retry(self) -> None:
+        """The CN endpoint states this refusal without any English marker.
+
+        Every marker the recognizer carried was English, so this sentence fell
+        through to the bare 400 rule.  That made the turn end as an
+        unclassified client error (traced as ``other``) and, worse, denied it
+        the same-deployment ``truncation: auto`` retry every English spelling
+        of this refusal already earns — which is the retry that exists to make
+        an over-large turn fit.  A 4.7M-character turn on a CN route failed
+        four times this way while another route served the identical turn.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+
+        class CnLengthRefusal(Exception):
+            status_code = 400
+
+        exc = CnLengthRefusal(
+            "litellm.BadRequestError: OpenAIException - workbuddy upstream "
+            "client (http 400): 对话内容超出模型长度上限，请精简对话或减少附件后重试。"
+        )
+        exc.failed_deployment_id = "order1-a"
+        request_data = {
+            "call_type": "aresponses",
+            "input": [{"type": "message", "role": "user", "content": "Continue."}],
+            "stream": True,
+        }
+
+        self.assertTrue(hooks._is_context_size_error(exc))
+        self.assertEqual(
+            hooks._trace_exception(exc)["reason"],
+            "context-size-refused",
+        )
+        # The refusal must still not fail a route over: the retry happens on
+        # the same deployment, and a failover here would exclude it first.
+        self.assertFalse(hooks._is_priority_deployment_failover_error(exc))
+        retry = hooks._responses_context_truncation_fallback_kwargs(
+            exc,
+            request_data,
+        )
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        self.assertEqual(retry["truncation"], "auto")
+
     def test_failed_responses_terminal_preserves_context_error_and_stops_polling(self) -> None:
         hooks, _proxy_server = load_hook_module()
         request_data = {

@@ -4595,6 +4595,12 @@ def _trace_exception(exception: Exception) -> dict[str, Any]:
         reason = "upstream-gateway-bad-request"
     elif _is_upstream_request_body_storage_capacity_error(exception):
         reason = "upstream-request-body-capacity"
+    elif _is_context_size_error(exception):
+        # Name the branch.  A reader triaging from the trace cannot tell this
+        # refusal from ``other``, and ``other`` is exactly how the CN sentence
+        # read while it was still unmatched — which is what hid the missing
+        # truncation retry behind an apparently generic client error.
+        reason = "context-size-refused"
     elif _is_request_body_size_rejection_error(exception):
         reason = "upstream-request-body-too-large"
     elif _is_responses_schema_unsupported_error(exception):
@@ -5657,6 +5663,13 @@ def _is_context_size_error(exception: Exception) -> bool:
             "reduce your input",
             "tokens exceeds the model",
             "tokens exceed the model",
+            # A CN endpoint states the same refusal in its own words.  The
+            # English markers above never matched it, so the sentence fell
+            # through to the bare ``status_code in {400, ...}`` rule and the
+            # turn ended as an unclassified client error (traced as ``other``)
+            # instead of advancing to a peer route.
+            "超出模型长度上限",
+            "精简对话",
         )
     ):
         return True
@@ -6047,6 +6060,11 @@ def _is_priority_deployment_failover_error(exception: Exception) -> bool:
         # instead of ending the turn on the first gateway.
         return True
     if _is_context_size_error(exception):
+        # A length refusal keeps its own handling: the same deployment is
+        # retried once with native ``truncation: auto`` before the turn is
+        # allowed to end.  That retry is why this branch returns False — a
+        # failover here would exclude the route before it could truncate, and
+        # would let a second refusal advance to a peer and loop.
         return False
     if _is_terminal_prompt_or_policy_error(exception):
         return False

@@ -128,6 +128,7 @@ class YoungRouterHook(CustomLogger):
             _responses_request_module._with_codex_function_call_arguments_repaired,
             _responses_request_module._with_neutral_attachment_paths,
             _responses_request_module._with_prefix_image_previews,
+            _responses_request_module._with_elided_oversized_tool_outputs,
             _responses_request_module._with_codex_view_image_output_paths,
             _responses_request_module._with_codex_function_call_output_text,
             _image_inputs_module._with_bounded_image_inputs,

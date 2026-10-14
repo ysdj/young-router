@@ -446,6 +446,20 @@ _PREFIX_IMAGE_MODE_VALUES = ("preview", "path-recent", "off")
 _PREFIX_IMAGE_MODE_DEFAULT = "path-recent"
 _PREFIX_IMAGE_RECENT_COUNT_ENV = "YOUNG_ROUTER_PREFIX_IMAGE_RECENT_COUNT"
 _PREFIX_IMAGE_RECENT_COUNT_DEFAULT = 6
+# A history with no signed prefix is replayed in full on every turn, so an
+# oversized inline image in it is pure dead weight: the client discounts the
+# bytes in its own window accounting while the gateway counts every one of
+# them.  Bytes below this floor are left alone; the newest few image outputs
+# are kept regardless, since the model is working from one of them.
+_HISTORY_IMAGE_ELISION_MIN_BYTES_ENV = "YOUNG_ROUTER_HISTORY_IMAGE_ELISION_MIN_BYTES"
+_HISTORY_IMAGE_ELISION_DEFAULT_MIN_BYTES = 64_000
+_HISTORY_IMAGE_ELISION_KEEP_ENV = "YOUNG_ROUTER_HISTORY_IMAGE_ELISION_KEEP"
+_HISTORY_IMAGE_ELISION_DEFAULT_KEEP = 0
+# The same treatment for a tool output that is a snapshot or a file dump
+# rather than an image: bytes the gateway counts and the client discounts.
+_HISTORY_TOOL_OUTPUT_MIN_CHARS_ENV = "YOUNG_ROUTER_HISTORY_TOOL_OUTPUT_MIN_CHARS"
+_HISTORY_TOOL_OUTPUT_DEFAULT_MIN_CHARS = 20_000
+_HISTORY_TOOL_OUTPUT_KEPT = 8
 _PREFIX_IMAGE_ORIGINAL_PATH_ENV = "YOUNG_ROUTER_PREFIX_IMAGE_ORIGINAL_PATH"
 _PREFIX_IMAGE_ORIGINAL_PATH_DEFAULT = True
 # A replayed image may only be replaced by a path reference when the client can

@@ -25,7 +25,6 @@ from .base import (
 )
 
 
-
 def _responses_chat_bridge_tool_schema(value: Any) -> Any:
     """Sanitize one JSON-schema fragment for the bridged tool surface.
 

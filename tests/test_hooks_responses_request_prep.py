@@ -2402,14 +2402,25 @@ class HookResponsesRequestPrepTests(HookTestCase):
             self.assertIsNone(hooks._with_prefix_image_previews(request))
             resize_mock.assert_not_called()
 
-    def test_prefix_image_previews_skip_requests_without_frozen_prefix(self) -> None:
+    def test_unsigned_history_drops_an_oversized_inline_image(self) -> None:
+        """No signed prefix means nothing must stay byte-exact.
+
+        The history still replays in full on every turn, so an oversized
+        inline image in it is dead weight: the gateway counts those bytes and
+        the client discounts them, which is how a request grows past the
+        gateway's ceiling while the client still shows headroom.  An image
+        whose call names no path cannot be replayed by reference, so its bytes
+        become a note.
+        """
+
         hooks, _ = load_hook_module()
         self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
         call = {
             "type": "custom_tool_call",
             "call_id": "call-fresh",
-            "name": "exec",
-            "input": 'await tools.view_image({path:"/tmp/fresh.png"});',
+            # A ``js`` screenshot names no path, so nothing can reopen it.
+            "name": "js",
+            "input": "await page.screenshot();",
         }
         output = {
             "type": "custom_tool_call_output",
@@ -2428,12 +2439,54 @@ class HookResponsesRequestPrepTests(HookTestCase):
             },
             "input": [call, output],
         }
-        # No encrypted item: the mutable-suffix pipeline owns this request.
         with mock.patch.object(
             hooks._image_inputs_module, "_resize_data_url"
         ) as resize_mock:
-            self.assertIsNone(hooks._with_prefix_image_previews(request))
+            updated = hooks._with_prefix_image_previews(request)
             resize_mock.assert_not_called()
+        self.assertIsNotNone(updated)
+        assert updated is not None
+        parts = updated["input"][1]["output"]
+        self.assertEqual(parts[0]["type"], "input_text")
+        self.assertIn("elided", parts[0]["text"])
+
+    def test_unsigned_history_keeps_an_image_a_path_can_reopen(self) -> None:
+        """An image with a path behind it belongs to the path-reference pass.
+
+        Eliding it here would throw away an original the model can still open.
+        """
+
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
+        path = "/tmp/reopenable.png"
+        request = {
+            "call_type": "aresponses",
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+            },
+            "input": [
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call-path",
+                    "name": "exec",
+                    "input": f'await tools.view_image({{path:"{path}"}});',
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call-path",
+                    "output": [
+                        {
+                            "type": "input_image",
+                            "image_url": "data:image/png;base64," + ("C" * 150_000),
+                        }
+                    ],
+                },
+            ],
+        }
+        elided = hooks._with_elided_oversized_history_images(
+            request, request["input"]
+        )
+        self.assertIsNone(elided)
 
     def test_codex_view_image_reopen_marks_repeated_path_as_original(self) -> None:
         hooks, _ = load_hook_module()

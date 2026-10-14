@@ -34,6 +34,13 @@ from .base import (
     _PREFIX_IMAGE_PREVIEW_ENABLED_ENV,
     _PREFIX_IMAGE_PREVIEW_MIN_BYTES_DEFAULT,
     _PREFIX_IMAGE_PREVIEW_MIN_BYTES_ENV,
+    _HISTORY_IMAGE_ELISION_DEFAULT_KEEP,
+    _HISTORY_IMAGE_ELISION_DEFAULT_MIN_BYTES,
+    _HISTORY_IMAGE_ELISION_KEEP_ENV,
+    _HISTORY_IMAGE_ELISION_MIN_BYTES_ENV,
+    _HISTORY_TOOL_OUTPUT_DEFAULT_MIN_CHARS,
+    _HISTORY_TOOL_OUTPUT_KEPT,
+    _HISTORY_TOOL_OUTPUT_MIN_CHARS_ENV,
     _PREFIX_IMAGE_MODE_DEFAULT,
     _PREFIX_IMAGE_MODE_ENV,
     _PREFIX_IMAGE_MODE_VALUES,
@@ -3044,6 +3051,230 @@ def _resolve_output_call_paths(
     return None, False
 
 
+def _history_tool_output_min_chars() -> int:
+    """Tool-output size above which a replayed output is dropped."""
+
+    value = os.getenv(_HISTORY_TOOL_OUTPUT_MIN_CHARS_ENV, "").strip()
+    if not value:
+        return _HISTORY_TOOL_OUTPUT_DEFAULT_MIN_CHARS
+    try:
+        parsed = int(value)
+    except ValueError:
+        return _HISTORY_TOOL_OUTPUT_DEFAULT_MIN_CHARS
+    return max(0, parsed)
+
+
+def _with_elided_oversized_tool_outputs(request_kwargs: dict) -> Optional[dict]:
+    """Drop oversized payloads from old tool outputs on every Responses turn.
+
+    A screenshot, a page snapshot or a file dump is consumed once and then
+    replayed on every later turn.  Measured on one session, four image outputs
+    and eleven snapshots held 72% of a 2.1M-character tool-output total that
+    had grown the request past the gateway's ceiling while the client still
+    reported 80% of its own window.  The item keeps its type, its identity and
+    its position, so the model still sees that the tool ran and can ask for the
+    content again; only the payload is dropped.
+    """
+
+    input_items = request_kwargs.get("input")
+    if not isinstance(input_items, list):
+        return None
+    min_chars = _history_tool_output_min_chars()
+    if min_chars <= 0:
+        return None
+    positions = [
+        index
+        for index, item in enumerate(input_items)
+        if isinstance(item, dict)
+        and item.get("type") in {"custom_tool_call_output", "function_call_output"}
+    ]
+    elidable = set(
+        positions[: max(0, len(positions) - _HISTORY_TOOL_OUTPUT_KEPT)]
+    )
+    if not elidable:
+        return None
+    rewritten: list[Any] = []
+    elided_outputs = 0
+    elided_chars = 0
+    for index, item in enumerate(input_items):
+        if index in elidable and isinstance(item, dict):
+            encoded = json.dumps(item.get("output"), ensure_ascii=False)
+            if len(encoded) > min_chars:
+                note = (
+                    f"[{len(encoded)} characters elided: this tool output was a "
+                    "large screenshot, page snapshot, or file dump that is no "
+                    "longer current. Run the tool again if its contents are "
+                    "needed.]"
+                )
+                updated = dict(item)
+                updated["output"] = [{"type": "input_text", "text": note}]
+                rewritten.append(updated)
+                elided_outputs += 1
+                elided_chars += len(encoded) - len(note)
+                continue
+        rewritten.append(item)
+    if not elided_outputs:
+        return None
+    result = dict(request_kwargs)
+    result["input"] = rewritten
+    _trace_module._route_trace(
+        "responses_tool_output_elided",
+        request_id=_routing_module._trace_request_id(request_kwargs),
+        session=_routing_module._trace_session_context(request_kwargs),
+        request=_trace_module._trace_request_summary(request_kwargs),
+        elided_tool_outputs=elided_outputs,
+        elided_tool_output_chars=elided_chars,
+    )
+    return result
+
+
+def _history_image_elision_min_bytes() -> int:
+    """Inline image bytes above which a replayed history image is dropped."""
+
+    value = os.getenv(_HISTORY_IMAGE_ELISION_MIN_BYTES_ENV, "").strip()
+    if not value:
+        return _HISTORY_IMAGE_ELISION_DEFAULT_MIN_BYTES
+    try:
+        parsed = int(value)
+    except ValueError:
+        return _HISTORY_IMAGE_ELISION_DEFAULT_MIN_BYTES
+    return max(0, parsed)
+
+
+def _history_image_elision_keep_recent() -> int:
+    """How many of the newest image outputs are always kept whole."""
+
+    value = os.getenv(_HISTORY_IMAGE_ELISION_KEEP_ENV, "").strip()
+    if not value:
+        return _HISTORY_IMAGE_ELISION_DEFAULT_KEEP
+    try:
+        parsed = int(value)
+    except ValueError:
+        return _HISTORY_IMAGE_ELISION_DEFAULT_KEEP
+    return max(0, parsed)
+
+
+def _with_elided_oversized_history_images(
+    request_kwargs: dict,
+    input_items: list,
+) -> Optional[dict]:
+    """Drop oversized inline images from a history that cannot be reopened.
+
+    Only reached when the history carries no signed prefix.  The newest image
+    outputs are left alone -- the model is working from one of them -- and an
+    image whose bytes are already small is not worth a rewrite.  Each dropped
+    image becomes a text note naming its size, so the model can still see that
+    an image was produced and can reproduce it with another tool call.
+    """
+
+    min_bytes = _history_image_elision_min_bytes()
+    if min_bytes <= 0:
+        return None
+    # The newest image outputs are the ones the model may still be reasoning
+    # from, so a fixed count of them is kept whole.  Everything else is judged
+    # by weight: an oversized inline image in an unsigned history is replayed
+    # in full on every turn, and the client discounts bytes the gateway counts.
+    keep_recent = _history_image_elision_keep_recent()
+    # An image whose producing call names a path can still be reopened, so the
+    # path-reference pass below owns it and eliding it here would throw away a
+    # recoverable original.  Only an image with no path behind it -- a ``js``
+    # screenshot or any exec-shaped tool dump -- is beyond recovery.
+    path_backed = _outputs_with_reopenable_paths(input_items)
+    image_positions = [
+        index
+        for index, item in enumerate(input_items)
+        if isinstance(item, dict)
+        and item.get("type") in {"custom_tool_call_output", "function_call_output"}
+        and index not in path_backed
+        and isinstance(item.get("output"), list)
+        and any(
+            isinstance(part, dict) and part.get("type") == "input_image"
+            for part in item["output"]
+        )
+    ]
+    keep_positions = set(image_positions[max(0, len(image_positions) - keep_recent):])
+    elided_bytes = 0
+    elided_images = 0
+    rewritten: list[Any] = []
+    for index, item in enumerate(input_items):
+        if (
+            index not in keep_positions
+            and index not in path_backed
+            and isinstance(item, dict)
+            and item.get("type") in {"custom_tool_call_output", "function_call_output"}
+            and isinstance(item.get("output"), list)
+            and any(
+                isinstance(part, dict) and part.get("type") == "input_image"
+                for part in item["output"]
+            )
+        ):
+            new_parts: list[Any] = []
+            elided_here = 0
+            for part in item["output"]:
+                if not isinstance(part, dict) or part.get("type") != "input_image":
+                    new_parts.append(part)
+                    continue
+                url = part.get("image_url")
+                if isinstance(url, str) and len(url) >= min_bytes:
+                    elided_bytes += len(url)
+                    elided_images += 1
+                    elided_here += 1
+                    new_parts.append(
+                        {
+                            "type": "input_text",
+                            "text": (
+                                f"[image elided: {len(url)} bytes of inline "
+                                "image data from this tool output are no longer "
+                                "current. Run the tool again if the image is "
+                                "needed.]"
+                            ),
+                        }
+                    )
+                else:
+                    new_parts.append(part)
+            if elided_here:
+                updated = dict(item)
+                updated["output"] = new_parts
+                rewritten.append(updated)
+                continue
+        rewritten.append(item)
+    if not elided_images:
+        return None
+    result = dict(request_kwargs)
+    result["input"] = rewritten
+    _trace_prefix_image_preview_gate(request_kwargs, "history-images-elided")
+    return result
+
+
+def _outputs_with_reopenable_paths(input_items: list) -> set[int]:
+    """Indices of image outputs whose producing call names a local path.
+
+    Such an output is replayable by reference, so it belongs to the
+    path-preview pass rather than to the elision above.
+    """
+
+    path_call_ids: set[str] = set()
+    for item in input_items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") not in {"custom_tool_call", "function_call"}:
+            continue
+        if not _codex_view_image_paths_from_call(item):
+            continue
+        path_call_ids.update(_item_pair_identifiers(item))
+    if not path_call_ids:
+        return set()
+    indices: set[int] = set()
+    for index, item in enumerate(input_items):
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") not in {"custom_tool_call_output", "function_call_output"}:
+            continue
+        if path_call_ids.intersection(_item_pair_identifiers(item)):
+            indices.add(index)
+    return indices
+
+
 def _with_prefix_image_previews(request_kwargs: dict) -> Optional[dict]:
     """Serve signed-prefix ``view_image`` outputs as previews plus paths.
 
@@ -3122,6 +3353,22 @@ def _with_prefix_image_previews(request_kwargs: dict) -> Optional[dict]:
         default=-1,
     )
     if last_encrypted_index < 0:
+        # Without a signed prefix there is nothing to keep byte-exact, and the
+        # history is still replayed in full on every turn.  A conversation that
+        # carried a few screenshots then grows past the upstream gateway's
+        # limit while the client's own window accounting still shows headroom,
+        # because base64 image bytes are what the gateway counts and what the
+        # client discounts.  The path-reference treatment below cannot help
+        # here: an image produced by ``js`` or any exec-shaped tool has no
+        # local path to reopen.  Those oversized inline bytes are therefore
+        # dropped for a note stating what they were, which is the same
+        # treatment an oversized tool output already receives.
+        elided = _with_elided_oversized_history_images(request_kwargs, input_items)
+        if elided is not None:
+            return elided
+        # Nothing was droppable under that rule.  The path-reference pass below
+        # works on the frozen prefix only, so an unsigned history that reaches
+        # here has nothing left for either treatment.
         _trace_prefix_image_preview_gate(request_kwargs, "no-encrypted-boundary")
         return None
     min_bytes = _prefix_image_preview_min_bytes()
