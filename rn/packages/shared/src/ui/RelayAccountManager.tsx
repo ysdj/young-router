@@ -1424,9 +1424,16 @@ export function StationAccountsPanel({
       style={styles.accountsTable}
     /> : <View style={styles.accountsEmpty}><Text style={styles.accountsEmptyText}>{translate("relay.stationNoAccounts")}</Text></View>}
     {selected ? <View style={styles.accountEditor}>
+      {/* One row: 账号 and its value, then the session controls.  刷新 and 分组
+          sit on the account's right side instead of a row of their own.  The
+          name is never clipped — the row wraps the controls to the next line
+          when a full address needs the room.  Both controls act on a station
+          session — 刷新 reads the station and 分组 writes its keys — so neither
+          is offered while the row does not read 已登录; a row that states
+          未登录 carries 去登录 alone. */}
       <View style={styles.fieldRow}>
-        <Text style={[styles.fieldLabel, { width: 44 }]}>{translate("relay.accountField")}</Text>
-        <Text numberOfLines={1} style={styles.accountNameValue}>{accountDisplayName(selected, translate)}</Text>
+        <Text style={styles.fieldLabel}>{translate("relay.accountField")}</Text>
+        <Text style={styles.accountNameValue}>{accountDisplayName(selected, translate)}</Text>
         {/* 去登录 is offered by a row that states 未登录, and only by one: a row
             already reading 登录中 — the pane's own sign-in or the mount check
             still fetching its answer — has no second sign-in to hand the user,
@@ -1434,11 +1441,6 @@ export function StationAccountsPanel({
             start".  A check that settles to 未登录 brings the button back; a
             verified account never needed it. */}
         {selectedLoginState === "signed_out" ? <NativeButton title={translate("relay.goLogin")} compact busy={pendingAction === "login"} disabled={controlsBusy && pendingAction !== "login"} onPress={() => { void loginSelected(); }} /> : null}
-      </View>
-      <View style={styles.accountActionsRow}>
-        {/* Both controls act on a station session — 刷新资源 reads the station
-            and 分组管理 writes its keys — so neither is offered while the row
-            does not read 已登录.  A row that states 未登录 carries 去登录 alone. */}
         {selectedLoginState === "signed_in" ? <NativeButton title={translate("relay.refreshResources")} symbol="refresh" compact busy={pendingAction === "refresh"} disabled={controlsBusy && pendingAction !== "refresh"} onPress={() => { void refreshSelected(); }} /> : null}
         {selectedLoginState === "signed_in" ? <NativeButton title={translate("relay.groupManager")} compact disabled={controlsBusy || !native.showGroupManager} onPress={() => { void openGroupManager(); }} /> : null}
       </View>
@@ -1536,10 +1538,16 @@ const styles = StyleSheet.create({
   accountsEmpty: { minHeight: 40, alignItems: "center", justifyContent: "center", paddingHorizontal: 10, paddingVertical: 8, borderWidth: 1, borderColor: colors.separator, backgroundColor: colors.panel },
   accountsEmptyText: { color: colors.secondary, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15, textAlign: "center" },
   accountEditor: { minWidth: 0, gap: 5 },
-  accountNameValue: { flex: 1, minWidth: 0, color: colors.text, fontSize: UI_FONT_SIZE },
-  accountActionsRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6, flexWrap: "wrap" },
-  fieldRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 },
-  fieldLabel: { width: 64, flexShrink: 0, color: colors.text, fontSize: UI_FONT_SIZE },
+  // The value takes the width it needs and never ellipsizes: the account name
+  // is the row's fact, and a clipped address cannot be told from a different
+  // one.  The session controls give way instead — the row wraps below the name
+  // when both no longer fit — so nothing here sets minWidth or flexShrink.
+  accountNameValue: { minWidth: 0, color: colors.text, fontSize: UI_FONT_SIZE },
+  // Compact and wrappable: 账号, its full value, and the session controls share
+  // one row until they no longer fit, then 刷新 / 分组 flow to the next line
+  // instead of overlapping the name.
+  fieldRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6, flexWrap: "wrap" },
+  fieldLabel: { flexShrink: 0, color: colors.text, fontSize: UI_FONT_SIZE },
   setupProgress: { width: "100%", flexDirection: "row", alignItems: "center", minHeight: 22, gap: 18 },
   setupProgressStep: { flexDirection: "row", alignItems: "center", gap: 7, flexShrink: 0 },
   setupProgressBadge: { width: 20, height: 20, borderRadius: 10, borderWidth: 1, borderColor: colors.separator, alignItems: "center", justifyContent: "center", backgroundColor: colors.window },

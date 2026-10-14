@@ -4638,7 +4638,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('title={translate("relay.refreshResources")} symbol="refresh" compact busy={pendingAction === "refresh"}', relay)
         self.assertIn('const refreshSelected = async (): Promise<void> => {', relay)
         self.assertIn('await refreshAccountResources({ id: account.id }, { force: true });', relay)
-        for locale, copy in ((self.zh, '刷新资源'), (self.en, 'Refresh Resources')):
+        # 刷新 states the control that used to be 刷新资源; its own message
+        # 登录成功，但无法加载 API 资源… still names it the same way.
+        for locale, copy in ((self.zh, '刷新'), (self.en, 'Refresh Resources')):
             self.assertIn(f'"relay.refreshResources": "{copy}"', locale)
         # 去登录 opens the login page at once: the silent session probe must not
         # delay the sheet the user explicitly asked for.
@@ -4854,6 +4856,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('discardConfirm: translate("common.discard"),', relay)
         self.assertIn('"relay.groupManagerDiscardTitle": "放弃未保存的更改？"', self.zh)
         self.assertIn('"relay.groupManagerDiscardBody": "关闭分组管理会丢弃尚未保存的密钥更改。"', self.zh)
+        # 分组 is the pane's own label; the sheet keeps its full name where the
+        # sentence needs it.
+        self.assertIn('"relay.groupManager": "分组"', self.zh)
+        self.assertIn('"relay.groupManager": "Group Manager"', self.en)
         # Close drops the draft, so a sheet that would lose edits asks through the
         # app's own decision panel — one surface, one destructive answer — and the
         # answer decides whether the draft goes away.
@@ -5520,10 +5526,16 @@ class ReactNativeUiParityTests(unittest.TestCase):
         relay = self.relay
         for marker in (
             'formRow: { width: "100%", minHeight: 30, flexDirection: "column", alignItems: "stretch", gap: 5 }',
-            'accountActionsRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6, flexWrap: "wrap" }',
+            # 刷新 and 分组 sit on the account row itself, so the relay pane has
+            # no separate action row.  The name is never clipped and owns its
+            # width; the row wraps the controls to the next line when a full
+            # address needs the room.
+            'accountNameValue: { minWidth: 0, color: colors.text, fontSize: UI_FONT_SIZE }',
+            'fieldRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6, flexWrap: "wrap" }',
             'accountsEmpty: { minHeight: 40, alignItems: "center", justifyContent: "center", paddingHorizontal: 10, paddingVertical: 8, borderWidth: 1, borderColor: colors.separator, backgroundColor: colors.panel }',
         ):
             self.assertIn(marker, relay, marker)
+        self.assertNotIn('accountActionsRow:', relay)
         for marker in (
             'keysEditorFieldHeader: { height: 22, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 4 }',
             'panelActionButton: { width: 22, minWidth: 22, height: 22 }',
