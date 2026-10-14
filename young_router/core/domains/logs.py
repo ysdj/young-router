@@ -1601,6 +1601,12 @@ class LogsDomain:
         self._online_usage_records: list[str] = []
         self._online_usage_refreshed = False
         self._online_usage_revision = 0
+        # The dropdown's selection, and the list it selects from. Both are
+        # owned here rather than by the pane so a window that reconnects to a
+        # replaced Core still names the relay its rows came from.
+        self._online_usage_sources: list[dict[str, str]] = []
+        self._online_usage_sources_revision = -1
+        self._online_usage_source_id = ""
         runtime = self.root / ".litellm-runtime"
         self._recovery_path = Path(
             os.environ.get("YOUNG_ROUTER_ROUTE_RECOVERY_STATE_FILE", runtime / "route-recovery-state.json")
@@ -1792,6 +1798,37 @@ class LogsDomain:
             "filter": self._filters.get(tab, ""),
             "limit": self._line_limit(tab),
         }
+
+    def _online_usage_reader_instance(self) -> object:
+        reader = self._online_usage_reader
+        if reader is None:
+            from ..operations import OnlineUsageReader
+
+            reader = OnlineUsageReader(self.config_path)
+        return reader
+
+    def _online_usage_source_list(self) -> list[dict[str, str]]:
+        """Read the selectable relays once per source-configuration revision.
+
+        The list costs a config parse and a credential walk, and the pane asks
+        for it on every poll, so it is cached against the configuration file's
+        own cursor instead of being rebuilt per view.
+        """
+
+        cursor = self._file_cursor(self.config_path)
+        if cursor == self._online_usage_sources_revision:
+            return self._online_usage_sources
+        self._online_usage_sources_revision = cursor
+        try:
+            sources = self._online_usage_reader_instance().sources()
+        except Exception:
+            sources = []
+        self._online_usage_sources = [
+            {"id": str(item.get("id", "")), "label": str(item.get("label", ""))}
+            for item in sources
+            if isinstance(item, Mapping) and str(item.get("id", ""))
+        ]
+        return self._online_usage_sources
 
     def _refresh_runtime_settings(self) -> None:
         """Reload cached Runtime Settings values when their file changes."""
@@ -2322,7 +2359,7 @@ class LogsDomain:
         if not force and self._source_signatures.get(tab) == signature:
             return
         available, records = self._records(tab)
-        self._store_tab(tab, self._fit_view_records({
+        value: dict[str, Any] = {
             "tab": tab,
             "available": available,
             "paused": tab in self._paused,
@@ -2330,7 +2367,14 @@ class LogsDomain:
             "records": records,
             "filter": self._filters.get(tab, ""),
             "limit": self._line_limit(tab),
-        }))
+        }
+        if tab == "online-usage":
+            # The tab's own dropdown is part of its view: the pane renders the
+            # choices and the chosen one from the same snapshot its rows came
+            # from, so a refresh can never label rows with another relay.
+            value["sources"] = self._online_usage_source_list()
+            value["source_id"] = self._online_usage_source_id
+        self._store_tab(tab, self._fit_view_records(value))
         self._source_signatures[tab] = signature
 
     def _store_tab(self, tab: str, value: dict[str, Any]) -> None:
@@ -2443,14 +2487,24 @@ class LogsDomain:
         elif operation in {"refresh", "reload", "refresh_online_usage"}:
             self._discard_clear(str(tab))
             if tab == "online-usage":
+                # A refresh may name the relay whose rows it wants. An absent
+                # scope keeps the current selection, so the pane's idle poll
+                # never re-reads a relay the user did not choose.
+                requested = data.get("source", data.get("source_id"))
+                source_id = self._online_usage_source_id
+                if isinstance(requested, str) and requested.strip():
+                    source_id = requested.strip()[:64]
+                self._online_usage_source_id = source_id
                 try:
-                    reader = self._online_usage_reader
-                    if reader is None:
-                        from ..operations import OnlineUsageReader
-
-                        reader = OnlineUsageReader(self.config_path)
+                    reader = self._online_usage_reader_instance()
                     refresh = getattr(reader, "refresh", None)
-                    values = refresh() if callable(refresh) else []
+                    # Only an actual selection narrows the read, so a reader
+                    # that takes no scope still answers the aggregate view.
+                    values = (
+                        refresh(source_id)
+                        if callable(refresh) and source_id
+                        else refresh() if callable(refresh) else []
+                    )
                     self._online_usage_records = [
                         REDACT_TEXT(str(value))[:512]
                         for value in values

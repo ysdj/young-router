@@ -1361,11 +1361,21 @@ class OnlineUsageReader:
     def __init__(self, config_path: Path) -> None:
         self.config_path = config_path
 
-    def refresh(self) -> list[str]:
+    def sources(self) -> list[dict[str, str]]:
+        """The relays this configuration can read, for the tab's own dropdown."""
+
         from . import remote_usage_logs
 
         try:
-            text = remote_usage_logs.render(self.config_path, 5.0)
+            return remote_usage_logs.usage_sources(self.config_path)
+        except Exception:
+            return []
+
+    def refresh(self, source_id: str | None = None) -> list[str]:
+        from . import remote_usage_logs
+
+        try:
+            text = remote_usage_logs.render(self.config_path, 5.0, source_id)
         except Exception:
             return ["Online usage logs are unavailable."]
         lines = [REDACT_TEXT(line)[:512] for line in str(text).splitlines() if line.strip()]

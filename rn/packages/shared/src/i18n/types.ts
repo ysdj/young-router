@@ -450,6 +450,8 @@ export type TranslationKey =
   | "logs.filterCurrent"
   | "logs.latestLinesAtLimit"
   | "logs.onlineUsageSummary"
+  | "logs.onlineUsageAllSources"
+  | "logs.onlineUsageSource"
   | "common.set"
   | "common.empty"
   | "common.loading"

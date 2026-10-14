@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import datetime as dt
+import hashlib
 import json
 import math
 import os
@@ -102,6 +103,19 @@ class UsageTarget:
     provider: str
     api_base: str
     api_key: str
+
+    @property
+    def source_id(self) -> str:
+        """A stable, non-secret handle for one configured read target.
+
+        The id names the *route*, never the credential: it is derived from the
+        control-plane root plus the provider label, so the React side can hand
+        a selection back without ever seeing the API key it selects.
+        """
+
+        root = service_root(self.api_base) or self.api_base
+        digest = hashlib.sha256(f"{root}\u0000{self.provider}".encode("utf-8")).hexdigest()
+        return digest[:16]
 
 
 def _utc_now_iso() -> str:
@@ -438,11 +452,41 @@ def _fetch_target_safely(
         return "", []
 
 
-def render(path: pathlib.Path, timeout: float) -> str:
+def usage_sources(path: pathlib.Path) -> list[dict[str, str]]:
+    """List the selectable read targets without exposing any credential.
+
+    The dropdown that names them is what decides the scope of a refresh, so the
+    list must be safe to render: an id, the relay label the user configured,
+    and the credential's own name.  A source that yields no usable credential
+    is simply absent, which is how the UI says there is nothing to read.
+    """
+
+    try:
+        targets = active_usage_targets(path)
+    except UsageConfigError:
+        return []
+    return [
+        {"id": target.source_id, "label": target.provider}
+        for target in targets
+    ]
+
+
+def render(
+    path: pathlib.Path,
+    timeout: float,
+    source_id: str | None = None,
+) -> str:
     try:
         targets = active_usage_targets(path)
     except UsageConfigError:
         return "Configured relay logs are unavailable because the local configuration could not be read."
+    if source_id:
+        # An unknown id is not an error the user can fix: the configuration may
+        # have moved under a dropdown whose selection is one refresh old. Read
+        # nothing rather than silently answering for a different relay.
+        targets = [target for target in targets if target.source_id == source_id]
+        if not targets:
+            return "No configured relay matches the selected online usage source."
     if not targets:
         return "No configured relay exposes a usable credential for online usage logs."
 
@@ -468,9 +512,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Print sanitized online relay usage logs.")
     parser.add_argument("--config", default=str(default_config_path()))
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
+    parser.add_argument("--source", default="", help="Read only the relay whose source id this is.")
     args = parser.parse_args()
     timeout = max(0.5, min(float(args.timeout), 15.0))
-    print(render(pathlib.Path(args.config).expanduser(), timeout))
+    print(
+        render(
+            pathlib.Path(args.config).expanduser(),
+            timeout,
+            _string(args.source) or None,
+        )
+    )
     return 0
 
 

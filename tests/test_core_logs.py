@@ -26,6 +26,23 @@ class _ChangingUsageReader:
         return [f"Updated 2026-01-01T00:00:0{self.calls}Z", f"default-chat tokens={self.calls}"]
 
 
+class _ScopedUsageReader:
+    """A usage reader that reports which relay each refresh asked for."""
+
+    def __init__(self) -> None:
+        self.scopes: list[str] = []
+
+    def sources(self) -> list[dict[str, str]]:
+        return [
+            {"id": "one", "label": "relay-one"},
+            {"id": "two", "label": "relay-two"},
+        ]
+
+    def refresh(self, source_id: str | None = None) -> list[str]:
+        self.scopes.append(source_id or "")
+        return [f"{source_id or 'all'} rows"]
+
+
 class LogsDomainTests(unittest.TestCase):
     def test_reads_all_tabs_without_exposing_bodies_secrets_or_paths(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1946,6 +1963,37 @@ model_list:
 
             self.assertEqual(2, len(records))
             self.assertIn("00:00:02Z", "\n".join(records))
+
+
+    def test_online_usage_names_its_sources_and_reads_the_selected_one(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            reader = _ScopedUsageReader()
+            domain = LogsDomain(directory, online_usage_reader=reader)
+
+            tab = domain.view("online-usage")["log"]
+            self.assertEqual(
+                [{"id": "one", "label": "relay-one"}, {"id": "two", "label": "relay-two"}],
+                tab["sources"],
+            )
+            self.assertEqual("", tab["source_id"])
+
+            domain.dispatch("logs.refresh_online_usage", {"tab": "online-usage", "source": "two"})
+
+            tab = domain.view("online-usage")["log"]
+            self.assertEqual("two", tab["source_id"])
+            self.assertEqual(["two"], sorted(set(reader.scopes)))
+            self.assertIn("two rows", "\n".join(tab["records"]))
+
+    def test_online_usage_refresh_without_a_scope_keeps_the_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            reader = _ScopedUsageReader()
+            domain = LogsDomain(directory, online_usage_reader=reader)
+
+            domain.dispatch("logs.refresh_online_usage", {"tab": "online-usage", "source": "two"})
+            domain.dispatch("logs.refresh_online_usage", {"tab": "online-usage"})
+
+            self.assertEqual(["two"], sorted(set(reader.scopes)))
+            self.assertEqual("two", domain.view("online-usage")["log"]["source_id"])
 
 
 if __name__ == "__main__":

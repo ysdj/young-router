@@ -9427,84 +9427,47 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
     paused ? translate("logs.paused") : "",
   ].filter(Boolean).join(" | ");
   useEffect(() => { onStatus?.(statusLine); }, [onStatus, statusLine]);
-  const openRelayUsageLogs = (): void => {
-    const relayDomain = asRecord(snapshot?.domains.relay_accounts);
-    const relayState = Object.keys(asRecord(relayDomain.state)).length > 0 ? asRecord(relayDomain.state) : relayDomain;
-    const accounts = asRecords(relayState.accounts).flatMap((value) => {
-      const accountId = stringValue(value.id).trim();
-      const type: "newapi" | "sub2api" | undefined = value.type === "newapi"
-        ? "newapi"
-        : value.type === "sub2api" ? "sub2api" : undefined;
-      const origin = stringValue(value.origin).trim();
-      if (!accountId || !type || !origin) return [];
-      return [{
-        accountId,
-        type,
-        origin,
-        label: stringValue(value.label, origin),
-        username: stringValue(value.username).trim(),
-        signedIn: value.login_status === "signed_in",
-      }];
-    }).sort((left, right) => Number(right.signedIn) - Number(left.signedIn));
-    if (accounts.length === 0) return;
-    const open = (index: number): void => {
-      const account = accounts[index];
-      if (!account) return;
-      void (async () => {
-        const session = await native.restoreRelaySession({
-          accountId: account.accountId,
-          type: account.type,
-          label: account.label,
-          origin: account.origin,
-          username: account.username || undefined,
-        });
-        if (session?.loginStatus !== "signed_in") {
-          const login = await native.relayLogin({
-            accountId: account.accountId,
-            type: account.type,
-            label: account.label,
-            origin: account.origin,
-            language: snapshot?.language ?? "system",
-            username: account.username || undefined,
-          });
-          if (!login) return;
-        }
-        await native.openRelayLogs({
-          accountId: account.accountId,
-          type: account.type,
-          label: account.label,
-          origin: account.origin,
-          language: snapshot?.language ?? "system",
-        });
-      })();
-    };
-    if (accounts.length === 1) {
-      open(0);
-      return;
-    }
-    const tabs = tabsRef.current;
-    if (!tabs) {
-      open(0);
-      return;
-    }
-    tabs.measureInWindow((x, y, width, height) => {
-      void native.showActionMenu({
-        title: translate("logs.onlineUsageSummary"),
-        items: accounts.map((account) => `${account.label} - ${account.type === "newapi" ? "NewAPI" : "Sub2API"}`),
-        anchor: { x, y, width, height },
-      }).then((index) => { if (index !== undefined) open(index); });
-    });
+  // The online-usage tab reads through Core's own log-format reader: the
+  // dropdown picks which configured relay to read, and the rows land in the
+  // table this window already draws. Opening the station's dashboard in a
+  // child browser is deliberately not a path here — the tab is a log view.
+  const onlineUsageSources = selected === "online-usage" ? active?.sources ?? [] : [];
+  const onlineUsageSourceId = active?.source_id ?? "";
+  // The dropdown always offers the aggregate read first, so a user who has not
+  // chosen anything still sees every configured relay's rows instead of an
+  // empty table waiting on a selection.
+  const onlineUsageSourceValues = useMemo(
+    () => ["", ...onlineUsageSources.map((source) => source.id)],
+    [onlineUsageSources],
+  );
+  const onlineUsageSourceLabels = useMemo(
+    () => [translate("logs.onlineUsageAllSources"), ...onlineUsageSources.map((source) => source.label)],
+    [onlineUsageSources, translate],
+  );
+  const onlineUsageSourceIndex = Math.max(0, onlineUsageSourceValues.indexOf(onlineUsageSourceId));
+  const refreshOnlineUsage = (sourceId: string): void => {
+    const tab = selected;
+    if (tab !== "online-usage") return;
+    void dispatch("logs.refresh_online_usage", { tab, source: sourceId }, "logs").then(async () => {
+      try {
+        const result = await ipc.logs(tab);
+        if (selectedTabRef.current !== tab) return;
+        viewRevisionRef.current = result.revision;
+        if (result.log) setActiveState({ tab, log: result.log });
+      } catch {
+        // The tab's own poll reconciles the confirmed Core view.
+      }
+    }).catch(() => undefined);
   };
   return <View style={styles.logsWindow}>
     <View style={styles.logsToolbar}>
       <View style={styles.logFilterRow}><Text style={styles.toolbarLabel}>{translate("common.filter")}</Text><NativeTextField style={styles.logFilterInput} value={filterDraft} placeholder={translate("logs.filterCurrent")} onChangeText={(filter) => { filterDirty.current = true; setFilterDraft(filter); if (filterTimer.current) clearTimeout(filterTimer.current); filterTimer.current = setTimeout(() => { void dispatch("logs.set_filter", { tab: selected, filter }, "logs"); }, 250); }} accessibilityLabel={translate("common.filter")} /></View>
       <View style={styles.logToolbarSpacer} />
-      <View style={styles.logActionsRow}>{selected === "recovery" ? <NativeButton title={translate("logs.clearRecoveryCooldown")} accessibilityLabel={translate("logs.clearRecoveryCooldown")} compact busy={cooldownClearPending} disabled={busy && !cooldownClearPending} onPress={clearCooldowns} style={styles.clearCooldownButton} /> : null}<IconButton label="" symbol={paused ? "play" : "pause"} title={paused ? translate("common.resume") : translate("common.pause")} disabled={busy} onPress={togglePaused} /><IconButton label="" symbol="trash" title={translate("common.clearView")} disabled={busy} onPress={clearLogs} /></View>
+      <View style={styles.logActionsRow}>{selected === "online-usage" ? <NativePicker labels={onlineUsageSourceLabels} selectedValue={onlineUsageSourceLabels[onlineUsageSourceIndex] ?? ""} disabled={busy || onlineUsageSourceLabels.length === 0} onChange={({ nativeEvent }) => { const source = onlineUsageSourceValues[nativeEvent.index]; if (source !== undefined) refreshOnlineUsage(source); }} style={styles.onlineUsageSourcePicker} /> : null}{selected === "recovery" ? <NativeButton title={translate("logs.clearRecoveryCooldown")} accessibilityLabel={translate("logs.clearRecoveryCooldown")} compact busy={cooldownClearPending} disabled={busy && !cooldownClearPending} onPress={clearCooldowns} style={styles.clearCooldownButton} /> : null}<IconButton label="" symbol={paused ? "play" : "pause"} title={paused ? translate("common.resume") : translate("common.pause")} disabled={busy} onPress={togglePaused} /><IconButton label="" symbol="trash" title={translate("common.clearView")} disabled={busy} onPress={clearLogs} /></View>
     </View>
     <WindowTabs nativeRef={tabsRef} values={tabOptions} selected={selected} disabled={busy} onSelect={(tab) => {
       if (clearTabRef.current) return;
       setSelected(tab as LogTab);
-      if (tab === "online-usage") openRelayUsageLogs();
     }} style={styles.logsTabs} />
     {rows.length > 0 ? selected === "route-trace"
       ? <RouteTraceWorkspace requests={routeTraceRequests} selectedKey={selectedKey} native={native} translate={translate} onSelect={(key) => setSelectedKeys((current) => ({ ...current, [selected]: key }))} />
@@ -10420,7 +10383,7 @@ inspectorProbeFinding: { flexShrink: 1, minWidth: 0, cursor: "pointer" }, inspec
   // The WebDAV tab is fields of the same grid the other panes draw, so its
   // list is the shared list rather than a form of its own.
   webdavFieldList: { ...SETTINGS_FIELD_LIST }, webdavPasswordInput: { width: SETTINGS_FIELD_VALUE_WIDTH, minHeight: 26 }, webdavFieldUnit: { width: 68, flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
-  logsWindow: { flex: 1, minHeight: 0, gap: 4 }, logsToolbar: { height: 28, minHeight: 28, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, logFilterRow: { width: 360, minWidth: 220, maxWidth: 360, height: 26, flexDirection: "row", alignItems: "center", gap: 8 }, logToolbarSpacer: { flex: 1, minWidth: 0 }, logActionsRow: { height: 26, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, clearCooldownButton: { minWidth: 96, height: 22 }, toolbarLabel: { color: systemColors.label, fontSize: UI_FONT_SIZE, flexShrink: 0 }, logFilterInput: { flex: 1, minWidth: 0, height: 26 }, logsTabs: { width: 640, maxWidth: "100%", minWidth: 0, height: 28, flexShrink: 0 }, logTableFrame: { flex: 1, minHeight: 0, minWidth: 0 }, logTable: { flex: 1, minHeight: 0 }, logEmptySurface: { flex: 1, minHeight: 0, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, logEmptyText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textAlign: "center", paddingHorizontal: 20 }, fieldLabel: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "500" }, fieldHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, fieldError: { color: systemColors.red, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, input: { width: "100%", minHeight: 26, color: systemColors.label, fontSize: UI_FONT_SIZE }, inputInvalid: { borderWidth: 1, borderColor: systemColors.red, borderRadius: 4 }, textArea: { minHeight: 108, textAlignVertical: "top", fontFamily: "Menlo" }, compactTextArea: { minHeight: 56, maxHeight: 56 }, secretFieldActions: { flexDirection: "row", alignItems: "center", gap: 6 }, secretFieldButtons: { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 4 }, secretFieldButton: { flex: 1, minWidth: 0, height: 26 }, nativeSecretControl: { flex: 1, minWidth: 0, minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, nativeSecretInput: { flex: 1, minWidth: 86, minHeight: 26 }, rawEditor: { flex: 1, minHeight: 180, gap: 4 }, rawEditorHeader: { minHeight: 28, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }, rawNativeEditorFrame: { flex: 1, minHeight: 160, position: "relative" }, rawNativeEditor: { flex: 1, minHeight: 160 }, rawEditorOverlay: { position: "absolute", left: 0, right: 0, top: 0, bottom: 0, justifyContent: "center", alignItems: "center", gap: 8, paddingHorizontal: 12, backgroundColor: systemColors.textBackground }, rawEditorLoading: { flex: 1, minHeight: 160, justifyContent: "center", paddingHorizontal: 8, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, empty: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, paddingVertical: 12 }, cardHint: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, marginTop: 2 },
+  logsWindow: { flex: 1, minHeight: 0, gap: 4 }, logsToolbar: { height: 28, minHeight: 28, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, logFilterRow: { width: 360, minWidth: 220, maxWidth: 360, height: 26, flexDirection: "row", alignItems: "center", gap: 8 }, logToolbarSpacer: { flex: 1, minWidth: 0 }, logActionsRow: { height: 26, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, onlineUsageSourcePicker: { width: 240, height: 24, flexShrink: 0 }, clearCooldownButton: { minWidth: 96, height: 22 }, toolbarLabel: { color: systemColors.label, fontSize: UI_FONT_SIZE, flexShrink: 0 }, logFilterInput: { flex: 1, minWidth: 0, height: 26 }, logsTabs: { width: 640, maxWidth: "100%", minWidth: 0, height: 28, flexShrink: 0 }, logTableFrame: { flex: 1, minHeight: 0, minWidth: 0 }, logTable: { flex: 1, minHeight: 0 }, logEmptySurface: { flex: 1, minHeight: 0, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, logEmptyText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textAlign: "center", paddingHorizontal: 20 }, fieldLabel: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "500" }, fieldHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, fieldError: { color: systemColors.red, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, input: { width: "100%", minHeight: 26, color: systemColors.label, fontSize: UI_FONT_SIZE }, inputInvalid: { borderWidth: 1, borderColor: systemColors.red, borderRadius: 4 }, textArea: { minHeight: 108, textAlignVertical: "top", fontFamily: "Menlo" }, compactTextArea: { minHeight: 56, maxHeight: 56 }, secretFieldActions: { flexDirection: "row", alignItems: "center", gap: 6 }, secretFieldButtons: { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 4 }, secretFieldButton: { flex: 1, minWidth: 0, height: 26 }, nativeSecretControl: { flex: 1, minWidth: 0, minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, nativeSecretInput: { flex: 1, minWidth: 86, minHeight: 26 }, rawEditor: { flex: 1, minHeight: 180, gap: 4 }, rawEditorHeader: { minHeight: 28, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }, rawNativeEditorFrame: { flex: 1, minHeight: 160, position: "relative" }, rawNativeEditor: { flex: 1, minHeight: 160 }, rawEditorOverlay: { position: "absolute", left: 0, right: 0, top: 0, bottom: 0, justifyContent: "center", alignItems: "center", gap: 8, paddingHorizontal: 12, backgroundColor: systemColors.textBackground }, rawEditorLoading: { flex: 1, minHeight: 160, justifyContent: "center", paddingHorizontal: 8, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, empty: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, paddingVertical: 12 }, cardHint: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, marginTop: 2 },
   nativeSecretMultilineControl: { alignItems: "flex-start", minHeight: 108 },
   nativeSecretTextArea: { minHeight: 108, height: 108, alignSelf: "stretch" },
   secretActionButton: { width: 64, minWidth: 64, height: 26, flexShrink: 0 },

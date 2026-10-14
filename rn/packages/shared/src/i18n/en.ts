@@ -436,6 +436,8 @@ export const en: Record<TranslationKey, string> = {
   "logs.filterCurrent": "Filter current tab",
   "logs.latestLinesAtLimit": "Latest {count} lines (view limit)",
   "logs.onlineUsageSummary": "Online usage summary",
+  "logs.onlineUsageAllSources": "All relays",
+  "logs.onlineUsageSource": "Online usage source",
   "common.set": "Set",
   "common.empty": "(Empty)",
   "common.loading": "Loading...",

@@ -1501,8 +1501,12 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("showActionMenu(title: string, items: string[], anchor: NativeMenuAnchor)", bridge)
         self.assertIn("showActionMenu?: (title: string, items: string[], anchor: NativeMenuAnchor)", platform)
         self.assertNotIn("transferButtonRef", ui)
-        self.assertIn("tabs.measureInWindow", ui)
+        # The anchor is the triggering control's own window rectangle, measured
+        # at the site that opens the menu (the saved-model chooser) rather than
+        # a pointer location.
+        self.assertIn("anchor.measureInWindow", ui)
         self.assertIn("anchor: { x, y, width, height }", ui)
+        self.assertNotIn("tabs.measureInWindow", ui)
         self.assertIn("func showActionMenu(title: String, items: [String], anchor: [String: NSNumber])", mac)
         self.assertIn("menu.popUp(positioning: nil, at: point, in: contentView)", mac)
         self.assertIn("let pointY = contentView.isFlipped ? y + height : y", mac)
@@ -2113,10 +2117,17 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("NativeRelaySessionProbe.verify", mac_leaf)
         self.assertIn("sawAuthenticationRejection && !sawNonAuthenticationFailure", mac_leaf)
         self.assertIn("NativeRelaySessionMemoryStore.writeSession(refreshedSession, accountID: accountID)", mac_leaf)
-        usage_logs = logs_ui.split("const openRelayUsageLogs", 1)[1].split("return <View style={styles.logsWindow}", 1)[0]
-        self.assertLess(usage_logs.index("native.restoreRelaySession"), usage_logs.index("native.openRelayLogs"))
-        self.assertIn('session?.loginStatus !== "signed_in"', usage_logs)
-        self.assertIn("native.relayLogin", usage_logs)
+        # The online-usage tab reads through Core's own log-format reader and
+        # draws its rows in this window's table: it never opens the station's
+        # dashboard in a child browser, so a dropdown selection is what scopes
+        # the read.
+        usage_logs = logs_ui.split("const refreshOnlineUsage", 1)[1].split("return <View style={styles.logsWindow}", 1)[0]
+        self.assertNotIn("native.openRelayLogs", usage_logs)
+        self.assertIn('dispatch("logs.refresh_online_usage", { tab, source: sourceId }, "logs")', usage_logs)
+        self.assertNotIn("openRelayUsageLogs", logs_ui)
+        self.assertIn("const onlineUsageSources = selected === \"online-usage\" ? active?.sources ?? [] : [];", logs_ui)
+        self.assertIn("const onlineUsageSourceValues = useMemo(", logs_ui)
+        self.assertIn('translate("logs.onlineUsageAllSources")', logs_ui)
         self.assertIn('route: "host/relay/restore"', mac_core)
         self.assertIn('REACT_METHOD(RestoreRelaySession, L"restoreRelaySession")', windows_header)
         self.assertIn("void WinUI3NativeLeafModule::RestoreRelaySession(", windows_module)

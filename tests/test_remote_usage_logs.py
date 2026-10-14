@@ -252,5 +252,51 @@ class RemoteUsageLogsTests(unittest.TestCase):
         )
 
 
+    def test_usage_sources_name_each_relay_without_exposing_a_credential(self) -> None:
+        path = self.write_config()
+
+        sources = remote_usage_logs.usage_sources(path)
+
+        self.assertEqual(["relay"], [source["label"] for source in sources])
+        self.assertTrue(sources[0]["id"])
+        self.assertNotIn("replace-me", sources[0]["id"])
+
+    def test_a_scoped_refresh_reads_only_the_named_relay(self) -> None:
+        path = self.write_config()
+        target = remote_usage_logs.active_usage_targets(path)[0]
+        seen: list[str] = []
+
+        def opener(request, timeout):
+            seen.append(request.full_url)
+            return FakeResponse(
+                {
+                    "success": True,
+                    "data": {"items": [{"model_name": "scoped-model", "total_tokens": 7}]},
+                }
+            )
+
+        with patch("young_router.core.remote_usage_logs.isolated_http_opener") as opener_factory:
+            opener_factory.return_value.open.side_effect = opener
+            output = remote_usage_logs.render(path, 1, target.source_id)
+
+        self.assertIn("scoped-model", output)
+        self.assertTrue(seen)
+
+    def test_an_unknown_source_reads_no_relay_at_all(self) -> None:
+        path = self.write_config()
+        seen: list[str] = []
+
+        def opener(request, timeout):
+            seen.append(request.full_url)
+            return FakeResponse({"success": True, "data": {"items": []}})
+
+        with patch("young_router.core.remote_usage_logs.isolated_http_opener") as opener_factory:
+            opener_factory.return_value.open.side_effect = opener
+            output = remote_usage_logs.render(path, 1, "0" * 16)
+
+        self.assertEqual([], seen)
+        self.assertIn("selected online usage source", output)
+
+
 if __name__ == "__main__":
     unittest.main()
