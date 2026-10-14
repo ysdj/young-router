@@ -26,6 +26,13 @@ from .base import (
     _value_has_encrypted_content,
 )
 
+# The two wire shapes a tool result arrives in.  ``custom_tool_call_output`` is
+# the exec-shaped call the client stores locally; ``function_call_output`` is
+# the dedicated ``view_image`` (and other function) call it replays on the
+# wire.  Both carry inline images, so every image pass keys on the pair.
+_VIEW_IMAGE_OUTPUT_TYPES = ("custom_tool_call_output", "function_call_output")
+
+
 def _value_has_image_input(value: Any) -> bool:
     if isinstance(value, dict):
         item_type = value.get("type")
@@ -383,7 +390,7 @@ def _bound_image_data_urls(value: Any, *, target_bytes: int, max_edge: int) -> t
         return (updated_items if changed else value), changed
     if isinstance(value, dict):
         if (
-            value.get("type") == "custom_tool_call_output"
+            value.get("type") in _VIEW_IMAGE_OUTPUT_TYPES
             and _output_has_codex_view_image_original_references(value.get("output"))
         ):
             return value, False
@@ -433,7 +440,7 @@ def _codex_view_image_preview_count(value: Any) -> int:
     if not isinstance(value, dict):
         return 0
     if (
-        value.get("type") == "custom_tool_call_output"
+        value.get("type") in _VIEW_IMAGE_OUTPUT_TYPES
         and _output_has_codex_view_image_references(value.get("output"))
         and not _output_has_codex_view_image_original_references(value.get("output"))
     ):
@@ -496,7 +503,7 @@ def _bound_codex_view_image_previews(
     if not isinstance(value, dict):
         return value, False
     if (
-        value.get("type") == "custom_tool_call_output"
+        value.get("type") in _VIEW_IMAGE_OUTPUT_TYPES
         and _output_has_codex_view_image_references(value.get("output"))
     ):
         if _output_has_codex_view_image_original_references(value.get("output")):
@@ -526,7 +533,7 @@ def _bound_codex_view_image_previews(
 def _collect_compressible_image_data_url_sizes(value: Any, sizes: List[int]) -> None:
     if (
         isinstance(value, dict)
-        and value.get("type") == "custom_tool_call_output"
+        and value.get("type") in _VIEW_IMAGE_OUTPUT_TYPES
         and _output_has_codex_view_image_original_references(value.get("output"))
     ):
         return
@@ -556,7 +563,7 @@ def _bound_codex_view_image_originals(value: Any) -> tuple[Any, bool]:
         return (updated_items if changed else value), changed
     if not isinstance(value, dict):
         return value, False
-    if value.get("type") == "custom_tool_call_output" and (
+    if value.get("type") in _VIEW_IMAGE_OUTPUT_TYPES and (
         _output_has_codex_view_image_original_references(value.get("output"))
     ):
         updated_output, changed = _bound_image_data_urls(

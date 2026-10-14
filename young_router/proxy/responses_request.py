@@ -2013,7 +2013,72 @@ def _codex_view_image_path_literal_value(literal: str) -> Optional[str]:
     return value if isinstance(value, str) else None
 
 
+def _codex_view_image_native_call_arguments(item: Any) -> Optional[dict]:
+    """Return the JSON arguments of a native ``view_image`` function call.
+
+    The client ships two shapes for the same capability.  The older one is a
+    script run through ``exec``; the current one is a dedicated ``view_image``
+    function call whose ``arguments`` carry ``{"path": ..., "detail": ...}``.
+    Only the ``exec`` shape was recognized here, so the current shape's path
+    never reached the replay passes: the image it produced looked like one with
+    nobody able to reopen it, and an unsigned history dropped it for a note
+    telling the model to run the tool again -- which the model did, forever.
+    """
+
+    if (
+        not isinstance(item, dict)
+        or item.get("name") != "view_image"
+        or item.get("type") not in {"custom_tool_call", "function_call"}
+    ):
+        return None
+    for key in ("arguments", "input"):
+        value = item.get(key)
+        if isinstance(value, dict):
+            return value
+        if not isinstance(value, str) or not value.strip():
+            continue
+        stripped = value.strip()
+        if stripped.startswith('"'):
+            try:
+                unwrapped = json.loads(stripped)
+            except (TypeError, ValueError):
+                unwrapped = None
+            if isinstance(unwrapped, str):
+                stripped = unwrapped.strip()
+        if not stripped.startswith("{"):
+            continue
+        try:
+            parsed = json.loads(stripped)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _codex_view_image_argument_paths(item: Any) -> list[str]:
+    """Absolute image paths named by a native ``view_image`` function call."""
+
+    arguments = _codex_view_image_native_call_arguments(item)
+    if not arguments:
+        return []
+    value = arguments.get("path")
+    if not isinstance(value, str) or not value:
+        return []
+    normalized = value.replace("\\\\", "\\")
+    if not (
+        normalized.startswith("/") or re.match(r"^[A-Za-z]:[\\\\/]", normalized)
+    ):
+        return []
+    if not normalized.lower().endswith(_CODEX_VIEW_IMAGE_EXTENSIONS):
+        return []
+    return [normalized]
+
+
 def _codex_view_image_paths_from_call(item: Any) -> list[str]:
+    native_paths = _codex_view_image_argument_paths(item)
+    if native_paths:
+        return native_paths
     source = _codex_view_image_call_source(item)
     if source is None or "view_image" not in source:
         return []
@@ -2036,6 +2101,10 @@ def _codex_view_image_paths_from_call(item: Any) -> list[str]:
 
 
 def _codex_view_image_call_requests_original(item: Any) -> bool:
+    arguments = _codex_view_image_native_call_arguments(item)
+    if arguments is not None:
+        detail = arguments.get("detail")
+        return isinstance(detail, str) and detail.strip().lower() == "original"
     source = _codex_view_image_call_source(item)
     if source is None:
         return False
@@ -2121,7 +2190,7 @@ def _with_codex_view_image_output_paths(request_kwargs: dict) -> Optional[dict]:
     for index, item in enumerate(input_items):
         if not isinstance(item, dict):
             continue
-        if item.get("type") == "custom_tool_call":
+        if item.get("type") in {"custom_tool_call", "function_call"}:
             call_id = item.get("call_id") or item.get("id")
             paths = _codex_view_image_paths_from_call(item)
             if isinstance(call_id, str) and paths:
@@ -2133,7 +2202,10 @@ def _with_codex_view_image_output_paths(request_kwargs: dict) -> Optional[dict]:
                         path for path in paths if path in referenced_paths
                     ]
             continue
-        if index <= last_encrypted_index or item.get("type") != "custom_tool_call_output":
+        if index <= last_encrypted_index or item.get("type") not in {
+            "custom_tool_call_output",
+            "function_call_output",
+        }:
             referenced_paths.update(_codex_view_image_referenced_paths(item))
             continue
         output = item.get("output")

@@ -2488,6 +2488,33 @@ class HookResponsesRequestPrepTests(HookTestCase):
         )
         self.assertIsNone(elided)
 
+    def test_native_view_image_call_exposes_its_path(self) -> None:
+        """The current client ships ``view_image`` as its own function call.
+
+        Only the older ``exec`` script shape was parsed, so a native call's
+        ``{"path": ...}`` arguments were invisible to every replay pass: the
+        image looked un-reopenable and an unsigned history replaced it with a
+        note telling the model to run the tool again -- which the model did, on
+        every later turn, because the fresh capture was elided the same way.
+        """
+
+        hooks, _ = load_hook_module()
+        call = {
+            "type": "function_call",
+            "id": "fc_native",
+            "name": "view_image",
+            "namespace": "functions",
+            "arguments": '{"path":"/tmp/yr_shot.png"}',
+            "call_id": "call-native",
+        }
+        self.assertEqual(
+            hooks._codex_view_image_paths_from_call(call),
+            ["/tmp/yr_shot.png"],
+        )
+        self.assertFalse(hooks._codex_view_image_call_requests_original(call))
+        original_call = dict(call, arguments='{"path":"/tmp/yr_shot.png","detail":"original"}')
+        self.assertTrue(hooks._codex_view_image_call_requests_original(original_call))
+
     def test_codex_view_image_reopen_marks_repeated_path_as_original(self) -> None:
         hooks, _ = load_hook_module()
         path = "/tmp/original.png"
