@@ -20,6 +20,11 @@ class RelayCoordinatorHTTP:
         self.calls: list[tuple[str, str]] = []
         self.deleted = False
         self.resource_name = "Primary"
+        self.group_name = "default"
+        self.resource_group = "default"
+        self.extra_group = ""
+        self.created_ids = 0
+        self.created: list[dict[str, object]] = []
         self.lose_next_update_response = False
 
     def json(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
@@ -28,21 +33,28 @@ class RelayCoordinatorHTTP:
         if path == "/api/user/models":
             return {"data": ["model-a"]}
         if path == "/api/user/self/groups":
-            return {"data": {"default": {"ratio": 1.25}}}
+            # A station renames a group in place: the group it used to offer is
+            # simply absent from this answer, while the key that served it still
+            # names the old group.  ``extra_group`` lets a case state a second
+            # group, so an orphan matches no group at all.
+            offered = {self.group_name: {"ratio": 1.25}}
+            if self.extra_group:
+                offered[self.extra_group] = {"ratio": 0.5}
+            return {"data": offered}
         if path == "/api/token/?p=1&size=100":
-            return {
-                "data": {
-                    "items": [] if self.deleted else [
-                        {
-                            "id": 7,
-                            "name": self.resource_name,
-                            "status": 1,
-                            "key": "replace-secret",
-                            "group": "default",
-                        }
-                    ]
+            items = [] if self.deleted else [
+                {
+                    "id": 7,
+                    "name": self.resource_name,
+                    "status": 1,
+                    "key": "replace-secret",
+                    "group": self.resource_group,
                 }
-            }
+            ]
+            # A create answers with the id the station assigned, and the station
+            # then lists it: reconciliation matches the created key by name.
+            items.extend(self.created)
+            return {"data": {"items": items}}
         if path == "/api/token/7":
             return {
                 "data": {
@@ -56,7 +68,7 @@ class RelayCoordinatorHTTP:
                     "model_limits_enabled": False,
                     "model_limits": "",
                     "allow_ips": "",
-                    "group": "default",
+                    "group": self.resource_group,
                     "cross_group_retry": False,
                 }
             }
@@ -70,10 +82,25 @@ class RelayCoordinatorHTTP:
         headers: dict[str, str],
         body: dict[str, object] | None = None,
     ) -> object:
-        del origin, headers, body
+        del origin, headers
         self.calls.append(("POST", path))
         if path == "/api/token/7/key":
             return {"data": {"key": "replace-materialized-key"}}
+        if path == "/api/token/" and isinstance(body, dict):
+            # A create answers with the id the station assigned, and the station
+            # serves the key it just made from then on.
+            self.created_ids += 1
+            created_id = 1000 + self.created_ids
+            self.created.append(
+                {
+                    "id": created_id,
+                    "name": str(body.get("name", "")),
+                    "status": 1,
+                    "key": "replace-created-secret",
+                    "group": str(body.get("group", "")),
+                }
+            )
+            return {"success": True, "data": {"id": created_id}}
         raise AssertionError(f"unexpected POST {path}")
 
     def put(
@@ -88,6 +115,8 @@ class RelayCoordinatorHTTP:
         self.calls.append(("PUT", path))
         if path == "/api/token/" and isinstance(body, dict) and isinstance(body.get("name"), str):
             self.resource_name = body["name"]
+            if isinstance(body.get("group"), str):
+                self.resource_group = body["group"]
             if self.lose_next_update_response:
                 self.lose_next_update_response = False
                 raise TimeoutError("simulated response loss")
@@ -98,6 +127,13 @@ class RelayCoordinatorHTTP:
         self.calls.append(("DELETE", path))
         if path == "/api/token/7":
             self.deleted = True
+        if path.startswith("/api/token/"):
+            try:
+                removed = int(path.rsplit("/", 1)[-1])
+            except ValueError:
+                removed = None
+            if removed is not None:
+                self.created = [item for item in self.created if item.get("id") != removed]
         return {"success": True}
 
 
@@ -1586,6 +1622,136 @@ class LinkedEditResolvesFromTheKeyItAlreadyHolds(unittest.TestCase):
                 {"catalog_model_missing"},
                 {item["code"] for item in providers.snapshot()["binding_issues"]},
             )
+
+    def test_a_station_rename_renames_the_provider_slot_that_binds_the_key(self) -> None:
+        """A key the station renamed is the same key, under the station's name.
+
+        The station is where a relay key is renamed — its own group page, or a
+        group renamed upstream.  A provider slot is named after the key it
+        binds, so a slot left on the name a rename replaced is a link that no
+        longer points at the key it names: the pane reads a dangling key while
+        the routes bound to that slot keep answering, and the group's multiplier
+        never reaches the route.  The read that revisits the station is where
+        the slot follows it.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            http = RelayCoordinatorHTTP()
+            relay = RelayAccountsDomain(root, http_client=http)
+            providers = ProvidersModelsDomain(root / "config.yaml")
+            core = CoreStore(domains=[relay, providers])
+            self._linked_provider_core(core, relay)
+            self._add_linked_model(core, providers, "public-chat", "model-a")
+            core.apply("providers_models", revision=core.revision)
+            provider = providers.snapshot()["providers"][0]
+            slot = provider["key_states"][0]
+            self.assertEqual("Primary", slot["name"])
+            self.assertEqual("Primary", provider["models"][0]["api_key_name"])
+
+            # The station now serves the key under a new name.  The read that
+            # observes it is the relay's own Apply — its refresh revisits the
+            # station — and the slot follows what that answer states.
+            http.resource_name = "Primary (禁蒸馏)"
+            core.dispatch(
+                {
+                    "domain": "relay_accounts",
+                    "type": "api_key.set_enabled",
+                    "payload": {
+                        "account_id": relay.snapshot()["accounts"][0]["id"],
+                        "resource_id": "newapi-7",
+                        "enabled": True,
+                    },
+                },
+                expected_revision=core.revision,
+            )
+            result = core.apply("relay_accounts", revision=core.revision)
+            self.assertEqual("applied", result["status"])
+
+            renamed = providers.snapshot()["providers"][0]
+            self.assertEqual("Primary (禁蒸馏)", renamed["key_states"][0]["name"])
+            # The routes that named the slot follow it, and the key they resolve
+            # to is still the one the document holds.
+            self.assertEqual("Primary (禁蒸馏)", renamed["models"][0]["api_key_name"])
+            self.assertEqual(slot["id"], renamed["models"][0]["provider_key_id"])
+            self.assertTrue(renamed["key_states"][0]["configured"])
+            self.assertEqual(
+                "linked", renamed["models"][0]["binding_health"]["status"]
+            )
+            written = (root / "config.yaml").read_text(encoding="utf-8")
+            self.assertIn("Primary (禁蒸馏)", written)
+
+    def test_alignment_retires_the_linked_slot_of_a_key_it_deletes(self) -> None:
+        """The keys 自动分组 retires take their linked slots and routes with them.
+
+        Alignment is a remote delete like any other, and the coordinator applies
+        the dependency policy from what the action *reports*.  Only an explicit
+        ``api_key.delete`` reported it, so a key alignment retired was deleted on
+        the station while its provider slot and its route stayed in the document
+        — the pane listed a dangling key, and the route kept answering with a
+        credential the station had already revoked.  A rename is the exception
+        and is covered above: a group that still exists adopts its own key.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            http = RelayCoordinatorHTTP()
+            relay = RelayAccountsDomain(root, http_client=http)
+            providers = ProvidersModelsDomain(root / "config.yaml")
+            core = CoreStore(domains=[relay, providers])
+            self._linked_provider_core(core, relay)
+            self._add_linked_model(core, providers, "public-chat", "model-a")
+            core.apply("providers_models", revision=core.revision)
+            provider = providers.snapshot()["providers"][0]
+            self.assertTrue(provider["models"])
+
+            account_id = relay.snapshot()["accounts"][0]["id"]
+            relay.set_auto_grouping(account_id, True)
+            core.apply("relay_accounts", revision=core.revision)
+
+            # The station stops serving the key's group, and the group it does
+            # serve carries another name entirely — so there is no successor for
+            # this key to be re-homed into and it is genuinely retired.
+            http.group_name = "Somewhere else"
+            http.extra_group = "A third group"
+            http.resource_group = "Retired"
+            core.refresh_relay_resources(account_id, revision=core.revision)
+            account = relay.snapshot()["accounts"][0]
+            self.assertEqual(
+                ["A third group", "Somewhere else"],
+                sorted(group["id"] for group in account["groups"]),
+            )
+            self.assertEqual(
+                ["Retired"],
+                [resource["group_id"] for resource in account["resources"]],
+            )
+
+            core.dispatch(
+                {
+                    "domain": "relay_accounts",
+                    "type": "api_key.auto_group_align",
+                    "payload": {"account_id": account_id},
+                },
+                expected_revision=core.revision,
+            )
+            # Alignment reports the key it retires, with the policy that governs
+            # it, so the coordinator releases the slot before the station call.
+            details = relay.snapshot()["last_action"]
+            self.assertEqual("delete_models", details["dependency_policy"])
+            self.assertEqual(
+                [{"resource_id": "newapi-7"}],
+                [{"resource_id": row["resource_id"]} for row in details["resources"]],
+            )
+
+            result = core.apply("relay_accounts", revision=core.revision)
+            self.assertEqual("applied", result["status"])
+
+            # The slot is gone with the key, and so is the route that named it:
+            # neither can outlive the credential the station revoked.  That key
+            # was this provider's only key, so the row itself is gone with them.
+            self.assertEqual([], providers.snapshot()["providers"])
+            written = (root / "config.yaml").read_text(encoding="utf-8")
+            self.assertNotIn("newapi-7", written)
 
     def _linked_provider_core(self, core: CoreStore, relay: RelayAccountsDomain) -> str:
         """Sign in, refresh, and import the station's one key as a linked provider."""

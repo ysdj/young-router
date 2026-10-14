@@ -4877,7 +4877,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # holds and loads the rest in place: it appears at once behind its
         # loading line, and the aligned draft arrives through the native update
         # instead of holding the window closed for the station round trip.  A
-        # host without that update keeps the pre-load ordering.
+        # host without that update keeps the pre-load ordering.  The read runs
+        # whenever 自动分组 is on, not only when the pane holds no list: a
+        # checked switch is Core keeping one key per group, and a station
+        # rename is exactly the stale list a user opens this window to see.
         self.assertIn("updateGroupManager?(options: RelayGroupManagerSnapshot): Promise<boolean>;", types)
         self.assertIn("export type RelayGroupManagerSnapshot = {", types)
         self.assertIn("updateGroupManager?(options: RelayGroupManagerSnapshot): Promise<boolean>;", native_bridge)
@@ -4886,7 +4889,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("loadingLabel: translate(\"relay.groupManagerLoading\"),", relay)
         self.assertIn('"relay.groupManagerLoading": "正在读取中转站…"', self.zh)
         self.assertIn('"relay.groupManagerLoading": "Reading the station…"', self.en)
-        self.assertIn("const pending = update && !groupManagerHasUsableFacts(account) ? loadGroupManagerAccount(account) : undefined;", relay)
+        self.assertIn("const shouldRead = !groupManagerHasUsableFacts(account) || Boolean(account.autoGrouping && alignAutoGroupingAction);", relay)
+        self.assertIn("const pending = update && shouldRead ? loadGroupManagerAccount(account) : undefined;", relay)
+        # Opening the window is where a checked switch is made true: the read
+        # asks the station for the account's keys and then asks Core to align
+        # to them, so the rows and the switch can never disagree.
+        self.assertIn("const align = current.autoGrouping ? alignAutoGroupingAction : undefined;", relay)
+        self.assertIn("const readsStation = !groupManagerHasUsableFacts(current) || Boolean(align);", relay)
+        self.assertIn("if (align) await align(current.id);", relay)
         self.assertIn("const shown = native.showGroupManager({ ...groupManagerRequest(current), loading: Boolean(pending) });", relay)
         self.assertIn("if (!update) current = await loadGroupManagerAccount(account);", relay)
         # The update carries the sheet's content alone, which is exactly the
@@ -5044,15 +5054,17 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("controls::Grid::SetColumn(footer_status, 1);", windows_leaf)
         # 自动分组 is a *preview* inside the sheet: the switch stages the layout
         # over the rows already on screen, and the groups with no key yet are
-        # listed as draft rows.  The window reads the station only when the
-        # account has no usable key list to draw at all — never to run Core's
-        # alignment behind the user's back, which happens when the switch is
-        # saved (and on the workspace's own interval).
+        # listed as draft rows.  The window reads the station whenever the
+        # account's 自动分组 is on — a checked switch is Core keeping one key per
+        # group, so this window opens on the station's own keys and aligns to
+        # them; drawing the pane's last reading instead is the stale list a user
+        # sees after the station renamed a group.  An account with the switch off
+        # has no layout to be wrong about and keeps the cheap opening.
         self.assertIn("const groupManagerHasUsableFacts = (current: RelayAccount): boolean =>", relay)
         self.assertIn('current.resourceStatus === "ready" && current.resources.length > 0;', relay)
         self.assertIn('if (await refreshResources(current.id) !== "ready") return current;', relay)
-        self.assertIn("if (groupManagerHasUsableFacts(current)) return current;", relay)
-        self.assertNotIn("await alignAutoGroupingAction(current.id);", relay)
+        self.assertIn("if (!readsStation) return current;", relay)
+        self.assertIn("if (align) await align(current.id);", relay)
         self.assertIn("pendingDelete: entry.pending_delete === true,", relay)
         # The list is the account's own keys and only those; 自动分组 checked is
         # a *preview* the window draws over them itself, and unchecking it puts

@@ -42,6 +42,7 @@ class FakeRelayHTTPClient:
         self.post_requests: list[tuple[str, str, dict[str, str]]] = []
         self.probes: list[tuple[str, str]] = []
         self.password_logins: list[tuple[str, str, str, str]] = []
+        self.put_bodies: dict[str, list[dict[str, object]]] = {}
 
     def json(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
         self.requests.append((origin, path, dict(headers)))
@@ -63,6 +64,24 @@ class FakeRelayHTTPClient:
     def post(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
         self.post_requests.append((origin, path, dict(headers)))
         return self.json(origin, path, headers=headers)
+
+    def put(
+        self,
+        origin: str,
+        path: str,
+        *,
+        headers: dict[str, str],
+        body: dict[str, object] | None = None,
+    ) -> object:
+        del origin, headers
+        # A station that accepted a mutation answers with what it now serves.
+        renames = self.put_bodies.setdefault(path, [])
+        renames.append(dict(body or {}))
+        return {"success": True}
+
+    def delete(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
+        del origin, path, headers
+        return {"success": True}
 
     def probe(self, origin: str, path: str) -> tuple[int, object | None]:
         self.probes.append((origin, path))
@@ -4142,6 +4161,101 @@ class RelayReadPolicyTests(unittest.TestCase):
                 "" if not isinstance(allow_ips, str) else allow_ips,
                 domain._newapi_update_payload(nullish, {})["allow_ips"],
             )
+
+    def test_a_provider_slot_reports_the_stations_name_not_the_staged_rename(self) -> None:
+        """A staged rename is not a fact about the station's key.
+
+        自动分组 stages one rename per group and the sheet previews it, so the
+        account's own row carries the new name until Apply.  A refresh folds
+        that preview back over the station's answer, and the provider slot's
+        name is resolved from the row it is handed — so a rename the station
+        never accepted was written onto the provider slot as though it had, and
+        the key then read under a name the station does not serve.  The
+        credential's name is the station's, always; the preview belongs to the
+        row the sheet draws, and the staged change belongs to the command that
+        writes it.
+        """
+
+        client = FakeRelayHTTPClient(
+            {
+                "/api/v1/user/profile": {"data": {"balance": 4.5}},
+                "/api/v1/keys?page=1&page_size=100": {
+                    "data": {
+                        "items": [
+                            {
+                                "id": "key-one",
+                                "name": "pro",
+                                "status": "active",
+                                "key": "replace-key-one",
+                                "group_id": 2,
+                                "group": {"name": "Claude Max"},
+                            }
+                        ]
+                    }
+                },
+                "/api/v1/groups/available": {
+                    "data": [{"id": 2, "name": "Claude Max", "rate_multiplier": 1.05}]
+                },
+                "/api/v1/groups/rates": {"data": {}},
+                "/api/v1/channels/available": {
+                    "data": [{"platforms": [{"groups": [{"id": 2}], "supported_models": ["claude-sonnet"]}]}]
+                },
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RelayAccountsDomain(directory, http_client=client)
+            account = domain.dispatch(
+                "account.add",
+                {"type": "sub2api", "label": "Relay", "origin": "https://relay.example.test"},
+            )["accounts"][0]
+            domain.accept_login_result(account["id"], username="person@example.test", cookie="session=fixture")
+            domain.refresh_resources(account["id"])
+
+            domain.update_api_key(account["id"], "sub2api-key-one", "Claude Max (禁蒸馏)")
+            # The preview the sheet draws carries the staged name...
+            self.assertEqual(
+                "Claude Max (禁蒸馏)",
+                domain.snapshot()["accounts"][0]["resources"][0]["name"],
+            )
+            # ...and the source reads the station's own name, never the preview
+            # a staged rename paints over the row.  A provider slot is named
+            # after the key it binds, so a slot resolved from the preview would
+            # carry a rename the station has not accepted, and the pane would
+            # read a dangling key while the routes bound to that slot kept
+            # working.
+            staged = domain._relay_source(domain._accounts[0], domain._accounts[0]["resources"][0])
+            self.assertEqual("pro", staged["name"])
+            self.assertEqual("pro", staged["api_key_name"])
+
+            # A read folds the preview back over the station's answer, and the
+            # station's own name is still the one it stated — the fold paints
+            # the row, never the fact.
+            domain.refresh_resources(account["id"])
+            refreshed = domain._accounts[0]["resources"][0]
+            self.assertEqual("Claude Max (禁蒸馏)", refreshed["name"])
+            self.assertEqual("pro", domain._relay_source(domain._accounts[0], refreshed)["name"])
+
+            # Once the station itself serves the new name, that name is the
+            # fact, and the slot follows it.
+            client.responses["/api/v1/keys?page=1&page_size=100"] = {
+                "data": {
+                    "items": [
+                        {
+                            "id": "key-one",
+                            "name": "Claude Max (禁蒸馏)",
+                            "status": "active",
+                            "key": "replace-key-one",
+                            "group_id": 2,
+                            "group": {"name": "Claude Max"},
+                        }
+                    ]
+                }
+            }
+            domain.refresh_resources(account["id"])
+            accepted = domain._relay_source(
+                domain._accounts[0], domain._accounts[0]["resources"][0]
+            )
+            self.assertEqual("Claude Max (禁蒸馏)", accepted["name"])
 
     def test_a_remembered_account_id_survives_a_restart_and_a_session_check(self) -> None:
         """The id is durable session material, and it is what the probe sends.

@@ -629,6 +629,22 @@ def _private_account(raw: Mapping[str, Any]) -> dict[str, Any]:
         "resource_status": resource_status,
         "resource_error": resource_error,
         "resources": _safe_resources(raw.get("resources", [])),
+        # The names the station's own last answer stated per key, kept apart
+        # from ``resources`` because that list also carries the work staged onto
+        # it.  Only Core holds it: a pane reads the row, and a provider slot
+        # reads the name here so a staged rename never becomes the slot's own.
+        "station_resource_names": {
+            str(key): str(value)
+            for key, value in (raw.get("station_resource_names") or {}).items()
+            if isinstance(key, str)
+            and key.strip()
+            and isinstance(value, str)
+            and value.strip()
+            and len(value.encode("utf-8")) <= 160
+            and not any(char in value for char in "\x00\r\n")
+        }
+        if isinstance(raw.get("station_resource_names"), Mapping)
+        else {},
         "groups": _safe_groups(raw.get("groups", [])),
     }
 
@@ -1260,6 +1276,9 @@ class RelayAccountsDomain:
         # Apply must undo the local alignment preview; after Apply the baseline
         # is discarded so manual edits continue from the current grouping.
         self._auto_grouping_draft_baselines: dict[str, dict[str, Any]] = {}
+        # The remote deletes one alignment pass staged, published to dispatchers
+        # so the coordinator can retire the linked slots they belonged to.
+        self._last_alignment_dependencies: dict[str, Any] = {}
         # One Apply's account reads, keyed by account id.  A journal with
         # several operations on one account ran a full station round trip for
         # each of them *plus* one per reconcile pass, all inside the store lock
@@ -2423,7 +2442,11 @@ class RelayAccountsDomain:
         elif name in {"api_key_auto_group_align", "relay_api_key_auto_group_align", "account_auto_group_align", "relay_account_auto_group_align"}:
             account_id = str(data.get("account_id", data.get("id", "")))
             self.align_auto_grouping(account_id)
-            details = {"kind": "api_key_auto_group_align", "account_id": account_id}
+            # The alignment stages remote deletes like any other API-key write,
+            # so it reports them the same way: the coordinator applies the
+            # dependency policy to the keys it retires before it calls the
+            # station, instead of leaving their provider slots dangling.
+            details = dict(self._last_alignment_dependencies) or {"kind": "api_key_auto_group_align", "account_id": account_id}
         elif name in {"api_key_delete", "relay_api_key_delete", "account_api_key_delete"}:
             account_id = str(data.get("account_id", data.get("id", "")))
             resource_id = _resource_id(data.get("resource_id", data.get("key_id")))
@@ -3875,6 +3898,27 @@ class RelayAccountsDomain:
         account_id, resource_id = target.split(":", 1)
         return _account_id(account_id), _resource_id(resource_id)
 
+    def _station_key_name(self, account: Mapping[str, Any], resource: Mapping[str, Any]) -> str:
+        """The name the station's own last answer stated for one key.
+
+        The account's key list is not that answer.  It is the station's reading
+        *plus* the work this Core has staged onto it: 自动分组's alignment
+        rewrites the key's own row with the name it is about to write, so a
+        lookup by id in that list answers with the name the app is asking for.
+        A rename is a change to the key itself, and a provider slot is named
+        after the key it binds — so the slot must follow what the station said,
+        never what this app is asking it to say.  The station's own spellings
+        are therefore kept apart from the list (``station_resource_names``),
+        captured from the read that produced it and replaced by the next one.
+        """
+
+        recorded = account.get("station_resource_names")
+        if isinstance(recorded, Mapping):
+            name = recorded.get(str(resource.get("id", "")))
+            if isinstance(name, str) and name.strip():
+                return name.strip()
+        return _resource_name(resource.get("name"), "API")
+
     @staticmethod
     def _resource_label(item: Mapping[str, Any], index: int, *, prefix: str) -> tuple[str, str]:
         raw_id = item.get("id", item.get("key_id", item.get("name", index + 1)))
@@ -4603,6 +4647,17 @@ class RelayAccountsDomain:
             return _public_account(self._accounts[index])
         account["resources"] = resources
         account["groups"] = groups
+        # The station's own names, before the fold below paints this Core's
+        # staged edits over the rows: a rename staged for a key is not the
+        # station's answer, and only the station's answer may rename the
+        # provider slot that binds the key.
+        account["station_resource_names"] = {
+            str(resource.get("id", "")): str(resource.get("name", ""))
+            for resource in resources
+            if isinstance(resource, Mapping)
+            and str(resource.get("id", ""))
+            and str(resource.get("name", ""))
+        }
         account["resource_status"] = "ready"
         account["last_updated_at"] = _utc_now_iso()
         account["resource_error"] = "none"
@@ -4975,6 +5030,41 @@ class RelayAccountsDomain:
             _allow_auto_grouping=_allow_auto_grouping,
         )
 
+    @staticmethod
+    def _orphan_for_group(
+        orphans: Sequence[Mapping[str, Any]], group_name: str
+    ) -> Mapping[str, Any] | None:
+        """Pick the orphan a group's own key was renamed into, if any.
+
+        The station renames a group in place, so the key that used to serve it
+        still carries the name it had under the old group.  The evidence for
+        that is the *name*: the group was renamed, so its key reads as the name
+        the group had, and the group's new name begins with it (``Claude Max``
+        for ``Claude Max（禁蒸馏）``).
+
+        A group the station renamed in place therefore adopts its own key.  A
+        group the station has genuinely added adopts nothing — its own key is
+        minted — and the orphans left over are retired, which is what keeps a
+        key whose group is gone from being parked on an unrelated group.  An
+        unconditional fallback to the first orphan read as "any orphan fills any
+        gap", so a dead key was adopted by whichever group came first in the
+        station's list: the layout looked aligned while a route behind it served
+        a group no user chose, and nothing was ever retired.
+        """
+
+        if not orphans:
+            return None
+        target = group_name.strip().casefold()
+        if not target:
+            return None
+        for orphan in orphans:
+            name = str(orphan.get("name", "")).strip().casefold()
+            # ``Claude Max`` -> ``Claude Max（禁蒸馏）``: the key carries the name
+            # the group was renamed away from.
+            if name and target.startswith(name):
+                return orphan
+        return None
+
     def align_auto_grouping(self, account_id: str) -> dict[str, Any]:
         """Stage one enabled, group-named key for every current relay group.
 
@@ -4985,6 +5075,18 @@ class RelayAccountsDomain:
         for deletion. Keys without a current group are not useful to the
         automatic one-key-per-group layout either, so they are staged for
         deletion at the same time.
+
+        A group whose key is gone — the station renamed the group, so the key
+        still names the group it used to be in — is filled by *re-homing* an
+        orphan rather than by deleting the orphan and creating a replacement.
+        The two are the same layout and not the same key: the resource id is the
+        identity a provider slot binds, so deleting the key a slot holds and
+        creating a fresh one leaves that slot pointing at a key the station no
+        longer serves.  The route then reads as a dangling key while its group's
+        multiplier never arrives, and the credential the station issued for that
+        group is thrown away for a new one.  An orphan is therefore preferred
+        over a create, and the one whose own name already reads as the group's
+        name goes first: that is the key the rename happened to.
 
         An account with no current group list has no layout to align to: every
         key would look ungrouped and be staged for deletion, so alignment waits
@@ -5024,22 +5126,20 @@ class RelayAccountsDomain:
             for operation in self._pending_operations
         )
         valid_group_ids = {str(group.get("id", "")) for group in groups}
-        for resource in resources:
-            resource_id = str(resource.get("id", ""))
-            resource_group_id = str(resource.get("group_id", ""))
-            if not resource_id or resource_group_id in valid_group_ids:
-                continue
-            if any(
+        # Every key whose group the station no longer offers.  These are the
+        # candidates a group with no key of its own is filled from, and only
+        # what is left over afterwards is retired.
+        orphans = [
+            resource for resource in resources
+            if str(resource.get("id", ""))
+            and str(resource.get("group_id", "")) not in valid_group_ids
+            and not any(
                 operation.get("kind") == "api_key_delete"
-                for operation in self._pending_for_resource(account["id"], resource_id)
-            ):
-                continue
-            self.delete_api_key(
-                account_id,
-                resource_id,
-                dependency_policy="delete_models",
-                _allow_auto_grouping=True,
+                for operation in self._pending_for_resource(
+                    account["id"], str(resource.get("id", ""))
+                )
             )
+        ]
         for group in groups:
             group_id = str(group.get("id", ""))
             group_name = _resource_name(group.get("name"), group_id)
@@ -5048,13 +5148,41 @@ class RelayAccountsDomain:
                 if str(resource.get("group_id", "")) == group_id
             ]
             if not matching:
-                self.create_api_key(
+                # Re-home an orphan before minting a key: the orphan already
+                # holds the credential this group's routes were answered with,
+                # and its resource id is what a provider slot binds.
+                adopted = self._orphan_for_group(orphans, group_name)
+                if adopted is None:
+                    self.create_api_key(
+                        account_id,
+                        group_name,
+                        group_id=group_id,
+                        enabled=True,
+                        _allow_auto_grouping=True,
+                    )
+                    continue
+                orphans.remove(adopted)
+                matching = [adopted]
+                resource_id = str(adopted.get("id", ""))
+                self.set_api_key_group(
                     account_id,
-                    group_name,
-                    group_id=group_id,
-                    enabled=True,
+                    resource_id,
+                    group_id,
                     _allow_auto_grouping=True,
                 )
+                self.update_api_key(
+                    account_id,
+                    resource_id,
+                    group_name,
+                    _allow_auto_grouping=True,
+                )
+                if adopted.get("enabled") is not True:
+                    self.set_api_key_enabled(
+                        account_id,
+                        resource_id,
+                        True,
+                        _allow_auto_grouping=True,
+                    )
                 continue
             pending_deletes = {
                 str(operation.get("resource_id", ""))
@@ -5098,6 +5226,41 @@ class RelayAccountsDomain:
                     True,
                     _allow_auto_grouping=True,
                 )
+        # Whatever no group adopted is retired: a key filed under a group the
+        # station no longer offers is not part of a one-key-per-group layout, and
+        # leaving it would put a row in the pane that no group can explain.
+        # Each of these is a remote delete, so the account records the resource
+        # and the dependency policy that governs it: the coordinator reads that
+        # record to retire the linked provider slot and its routes before the
+        # station call, and a deletion this Core stages without it leaves the
+        # document pointing at a key the station no longer serves — the pane
+        # shows the dangling key and its route keeps a credential that was
+        # revoked upstream.
+        retired: list[dict[str, str]] = []
+        for orphan in orphans:
+            resource_id = str(orphan.get("id", ""))
+            if not resource_id:
+                continue
+            self.delete_api_key(
+                account_id,
+                resource_id,
+                dependency_policy="delete_models",
+                _allow_auto_grouping=True,
+            )
+            retired.append(
+                {
+                    "station_id": str(account.get("station_id", "")),
+                    "account_id": str(account.get("id", "")),
+                    "resource_id": resource_id,
+                }
+            )
+        self._last_alignment_dependencies = {
+            "kind": "api_key_auto_group_align",
+            "account_id": str(account.get("id", "")),
+            "station_id": str(account.get("station_id", "")),
+            "dependency_policy": "delete_models",
+            "resources": retired,
+        }
         self._accounts[index]["auto_grouping"] = True
         self._accounts[index] = _private_account(self._accounts[index])
         after_resources = tuple(
@@ -5376,8 +5539,12 @@ class RelayAccountsDomain:
             "provider_name": f"relay-{_station_id(account.get('station_id'))}",
             "api_base": _api_base(resource.get("api_base")),
             "enabled": resource.get("enabled") is not False,
-            "name": _resource_name(resource.get("name"), "API"),
-            "api_key_name": _resource_name(resource.get("name"), "API"),
+            # The name is the station's own last answer, never the preview of a
+            # rename this Core has staged: a provider slot is named after the key
+            # it binds, and the name a user is asking for is not yet a fact about
+            # the station.  A rename that lands renames the slot with it.
+            "name": self._station_key_name(account, resource),
+            "api_key_name": self._station_key_name(account, resource),
             "models": _model_names(resource.get("models", [])),
             "source_models": _model_names(resource.get("models", [])),
         }

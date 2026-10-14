@@ -294,6 +294,84 @@ class RelayApiKeyDomainTests(unittest.TestCase):
                 client.calls,
             )
 
+    def test_auto_grouping_rehomes_a_key_whose_group_was_renamed(self) -> None:
+        """A renamed group is a re-homed key, not a deleted and recreated one.
+
+        On a New API station a group's identifier *is* its name, so renaming a
+        group leaves every key that served it naming a group the station no
+        longer offers.  Reading that as "this key's group is gone" and answering
+        with a delete plus a create stages the layout the user asked for while
+        destroying the key: the resource id is the identity a provider slot
+        binds, so the slot is left pointing at a key the station no longer
+        serves — the pane reads a dangling key, its routes never get the group's
+        multiplier, and the credential the station issued for that group is
+        thrown away for a new one.
+        """
+
+        client = RelayMutationHTTPClient(
+            {
+                "/api/user/models": {"data": ["gpt-test"]},
+                "/api/user/self/groups": {
+                    "data": {
+                        "Claude Max（禁蒸馏）": {"ratio": 1.05},
+                        "福利国模": {"ratio": 0.1},
+                    }
+                },
+                "/api/token/?p=1&size=100": {
+                    "data": {
+                        "items": [
+                            {"id": 1, "name": "Claude Max", "status": 1, "key": "replace-renamed", "group": "Claude Max"},
+                            {"id": 2, "name": "福利国模", "status": 1, "key": "replace-kept", "group": "福利国模"},
+                            {"id": 3, "name": "retired", "status": 1, "key": "replace-retired", "group": "已下线"},
+                        ]
+                    }
+                },
+                "/api/user/self": {"data": {"quota": 500_000}},
+                "/api/status": {"data": {"quota_per_unit": 500_000}},
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RelayAccountsDomain(directory, http_client=client)
+            account = domain.dispatch(
+                "account.add",
+                {"type": "newapi", "label": "Relay", "origin": "https://relay.example.test"},
+            )["accounts"][0]
+            domain.accept_login_result(account["id"], username="person", access_token="replace-token")
+            domain.refresh_resources(account["id"])
+
+            aligned = domain.dispatch(
+                "api_key.set_auto_grouping",
+                {"account_id": account["id"], "enabled": True},
+            )["accounts"][0]
+
+            # The group's key is the same key: its id survives, and it now
+            # serves the group under the group's own name.
+            rehomed = next(item for item in aligned["resources"] if item["id"] == "newapi-1")
+            self.assertEqual("Claude Max（禁蒸馏）", rehomed["name"])
+            self.assertEqual("Claude Max（禁蒸馏）", rehomed["group_id"])
+            # No key was created for it.
+            self.assertFalse(any(
+                resource["id"].startswith("pending-") for resource in aligned["resources"]
+            ))
+            prepared = domain.prepare_apply()
+            self.assertNotIn("api_key_create", [operation["kind"] for operation in prepared["operations"]])
+            self.assertEqual(
+                {"api_key_set_group", "api_key_update"},
+                {
+                    operation["kind"]
+                    for operation in prepared["operations"]
+                    if operation["resource_id"] == "newapi-1"
+                },
+            )
+            # A group no key of its own was renamed into keeps its key, and the
+            # one key that really is under a group the station dropped is the
+            # only thing retired.
+            self.assertIn("newapi-2", [resource["id"] for resource in aligned["resources"]])
+            self.assertEqual(
+                ["newapi-3"],
+                sorted(operation["resource_id"] for operation in prepared["destructive"]),
+            )
+
     def test_auto_grouping_disable_after_apply_keeps_the_applied_grouping(self) -> None:
         client = RelayMutationHTTPClient(
             {

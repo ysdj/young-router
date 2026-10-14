@@ -1060,23 +1060,44 @@ export function StationAccountsPanel({
   // hand, unchecking it puts that preview away, and the layout itself is Core's
   // own alignment — reached by saving the switch.
   //
-  // The station is therefore read only when the account has no usable key list
-  // yet, so the usual opening never pays for a station round trip it does not
-  // need and the window's wheel only states a read that is really running.
+  // The station is read whenever the window opens on an account whose 自动分组
+  // is on, even when the pane already holds a key list.  A checked switch is
+  // the user telling Core to keep one key per group, and this window is where
+  // they go to look at that layout — so it must show the layout the station
+  // actually has, not the reading some earlier pane action left behind.  That
+  // is the whole symptom of a rename: the station renames a group, the keys
+  // list it has not been re-read still shows the old shape, and the window says
+  // 自动分组 is on while showing a list that plainly is not aligned.  An account
+  // with the switch off is a different question — there is no layout to be
+  // wrong about — so it keeps the cheap opening that draws what the pane holds.
   const alignAutoGroupingAction = apiKeyActions?.alignAutoGrouping;
   const groupManagerHasUsableFacts = (current: RelayAccount): boolean =>
     current.resourceStatus === "ready" && current.resources.length > 0;
   // 分组管理's own list is the account's real keys: 自动分组 checked is a
   // *preview* in the window, and unchecking it puts that preview away. So the
-  // window never reads or stages an aligned draft of its own — the one place the
-  // layout is applied is Core's own alignment, which the switch is saved into
-  // (and which the workspace also re-runs on its own interval). The station is
-  // read only when the account has no usable key list at all, because the list
-  // the window shows has to be one the station actually reported.
+  // window never stages an aligned draft of its own — the one place the layout
+  // is applied is Core's own alignment, which the switch is saved into (and
+  // which the workspace also re-runs on its own interval).  What the window
+  // does own is the *reading*: it asks the station for the account's current
+  // keys, and it asks Core to align to them, so the rows it draws are the ones
+  // the station serves and the layout matches the checked switch beside them.
   const loadGroupManagerAccount = async (current: RelayAccount): Promise<RelayAccount> => {
-    if (groupManagerHasUsableFacts(current)) return current;
+    // A checked switch is Core's standing instruction to keep one key per
+    // group, so opening the window is the moment to make that true — a station
+    // rename leaves the keys filed under a group that no longer exists, which
+    // is exactly the state a user opens this window to notice.  Aligning here
+    // is the same call the workspace's own interval makes, so a window opened
+    // between two ticks does not wait up to half an hour to show the layout it
+    // already claims to be keeping.
+    const align = current.autoGrouping ? alignAutoGroupingAction : undefined;
+    const readsStation = !groupManagerHasUsableFacts(current) || Boolean(align);
+    if (!readsStation) return current;
     try {
       if (await refreshResources(current.id) !== "ready") return current;
+      // The refresh reported what the station serves; alignment then stages the
+      // one-key-per-group layout against those keys, and the read below carries
+      // both back as one account shape.
+      if (align) await align(current.id);
       const snapshot = await refreshAccounts();
       return (snapshot ? accountsFromSnapshot(snapshot) : []).find((entry) => entry.id === current.id) ?? current;
     } catch {
@@ -1175,16 +1196,19 @@ export function StationAccountsPanel({
   const openGroupManager = async (): Promise<void> => {
     const account = selected;
     if (!account || !native.showGroupManager) return;
-    // The window appears first and loads second.  The read is no longer an
-    // alignment pass — the list is the account's own keys, and 自动分组 is a
-    // preview inside the window — so it only runs when the pane holds no key
-    // list to draw.  The window opens on the facts this pane already holds,
-    // keeps its rows read-only while that read is in flight, and takes the
-    // account's own keys through the native update when they land.  A host
-    // without that update opens the window on the loaded facts instead: the
-    // window there can only ever show data that is already loaded.
+    // The window appears first and loads second, so a station round trip never
+    // delays the sheet.  The rows open on the facts this pane holds, stay
+    // read-only while the read is in flight, and take the account's own keys
+    // through the native update when they land.  The read runs whenever the
+    // account's 自动分组 is on: a checked switch means the layout Core is keeping
+    // is what this window exists to show, so the window asks the station for it
+    // even when the pane already holds a list — that list is what went stale
+    // when the station renamed a group.  A host without that update opens the
+    // window on the loaded facts instead: the window there can only ever show
+    // data that is already loaded.
     const update = native.updateGroupManager;
-    const pending = update && !groupManagerHasUsableFacts(account) ? loadGroupManagerAccount(account) : undefined;
+    const shouldRead = !groupManagerHasUsableFacts(account) || Boolean(account.autoGrouping && alignAutoGroupingAction);
+    const pending = update && shouldRead ? loadGroupManagerAccount(account) : undefined;
     let current = account;
     if (!update) current = await loadGroupManagerAccount(account);
     if (pending) {

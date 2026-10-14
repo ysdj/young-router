@@ -321,6 +321,14 @@ def _relay_binding_projection(state: object) -> list[tuple[str, ...]]:
     multiplier is a value only the station's group states, so the edit that asks
     for it needs the relay domain to resolve it — the same dependency a new
     model on that key already carries.
+
+    A key's *name* is deliberately not part of the projection.  The station owns
+    that name and renames it whenever a group is renamed, and the slot that
+    binds the key follows the rename on the read which observes it — the relay's
+    own Apply, whose refresh revisits the station.  Comparing the name here
+    would only make every providers edit re-read the station for a change it
+    does not make, and would refuse an unrelated model edit for a rename that is
+    the relay's own work to apply.
     """
 
     providers = state.get("providers") if isinstance(state, Mapping) else None
@@ -2933,6 +2941,22 @@ class CoreStore:
                     "api_key_detach",
                     "relay_api_key_detach",
                     "account_api_key_detach",
+                    # Alignment retires the keys whose group the station dropped,
+                    # exactly as an explicit delete does, so the linked provider
+                    # slots and their routes have to be released before the
+                    # station is called.  Without this the remote key was gone
+                    # while the document still pointed at it: the pane listed the
+                    # dangling key and its route kept answering with a credential
+                    # the station had already revoked.
+                    "api_key_set_auto_grouping",
+                    "relay_api_key_set_auto_grouping",
+                    "account_api_key_set_auto_grouping",
+                    "account_set_auto_grouping",
+                    "relay_account_set_auto_grouping",
+                    "api_key_auto_group_align",
+                    "relay_api_key_auto_group_align",
+                    "account_auto_group_align",
+                    "relay_account_auto_group_align",
                 }
                 providers = self._domains.get("providers_models") if relay_dependency_action else None
                 provider_before = self._adapter_draft_state("providers_models") if providers is not None else None
@@ -4204,7 +4228,20 @@ class CoreStore:
                     count = dependency_state.get("provider_key_count")
                     if type(count) is int and count > 0:
                         linked_provider_key_count = count
-            if relay_coordinator_available and linked_provider_key_count:
+            # A relay edit can *empty* the provider draft before this point: the
+            # dependency policy runs while the relay action is dispatched, and
+            # retiring the last linked key leaves nothing for the summary above
+            # to count.  The baseline is what asks whether this Apply has relay
+            # work at all, so a provider draft the relay just changed is still
+            # carried into the coordinated transaction — reading only the draft
+            # left ``providers_models`` out of it, and the released slot was
+            # never written to disk: the document kept the dangling key while
+            # the pane read it from memory as gone.
+            provider_draft_bound_relay = linked_provider_key_count > 0 or (
+                provider_candidate is not None
+                and _relay_binding_projection(self._baselines.get("providers_models"))
+            )
+            if relay_coordinator_available and provider_draft_bound_relay:
                 if "providers_models" in names and "relay_accounts" not in names:
                     # Only a draft that actually binds relay material has relay
                     # work to do.  A plain local edit — a new model on an
