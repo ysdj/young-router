@@ -12,15 +12,6 @@
 set -uo pipefail
 
 APP="/Applications/Young Router.app"
-# The bundle's own host process, not every process whose command line happens to
-# contain the app name.  A blunt match also catches the Core, the managed
-# proxy's sixteen workers, and the credential-holding WorkBuddy worker, and
-# signalling that whole tree together inverts the ordered teardown the host
-# performs: the workers die in the same instant as the proxy they feed, so a
-# turn that was mid-answer loses its upstream.  The stop below therefore
-# addresses the host and lets it unwind its own tree, exactly as the build
-# script's installer does.
-HOST_PATTERN='/Contents/MacOS/YoungRouter$'
 # The pids this stop replaces are that host and its descendants, resolved from
 # the bundle before the quit below because the host's children are reparented
 # the moment it exits and the tree cannot be re-derived afterwards.  Resolving
@@ -50,47 +41,82 @@ relaunch() {
   # running app or lingers as a daemon.
   (
     sleep 4
-    pgrep -f "$HOST_PATTERN" >/dev/null 2>&1 || open -a "$APP" >/dev/null 2>&1 || true
+    [[ -n "$("$APP_PROCESSES" hosts "$APP")" ]] || open -a "$APP" >/dev/null 2>&1 || true
   ) >/dev/null 2>&1 &
   disown 2>/dev/null || true
 }
 trap relaunch EXIT INT TERM
 
-if pgrep -f "$HOST_PATTERN" >/dev/null 2>&1; then
+if [[ -n "$("$APP_PROCESSES" hosts "$APP")" ]]; then
   echo "Young Router: stopping (restart armed)"
-  # The pids that exist *now* are the ones being replaced.  Waiting on a name
- # pattern instead would also match a host that something else starts while
-  # this stop is in progress, so the loop would sit out its whole budget
-  # against an app that is already running and healthy.
   STOPPING_PIDS="$("$APP_PROCESSES" tree "$APP" | tr '\n' ' ')"
-  # Ask the app to quit rather than signalling it.  AppKit only runs
-  # ``applicationShouldTerminate`` -- the one path that reaches the Core's
-  # ``host/shutdown`` route -- on a real quit request; a SIGTERM skips it, so
-  # the Core falls back to its parent watchdog and stops the proxy on the
-  # full drain, which is what kept a restart waiting for the longest turn it
-  # had accepted.  Both clients reconnect, so this costs one reconnect and
-  # nothing is cut without the client being told.
+  STOPPING_HOSTS="$("$APP_PROCESSES" hosts "$APP" | tr '\n' ' ')"
+  STOPPING_CORE="$("$APP_PROCESSES" core "$APP" | tr '\n' ' ')"
+  # What the replacement has to take over is three things and nothing else: the
+  # host, which owns the window and the Core beneath it; the Core, which owns
+  # the state root; and the recorded loopback port, because a new proxy that
+  # cannot bind it steps forward to the next one while every client -- each one
+  # pointed at the configured port by hand -- is left talking to a port nothing
+  # listens on.  The proxy's own shutdown spine -- its launcher, the forkserver,
+  # the resource tracker, a worker still finishing a turn it accepted -- holds
+  # none of the three.  Measured on this app: the port is released about a
+  # second into the stop, that spine lives on for another thirty, and the
+  # launcher writes no state file.  Waiting for it was most of a restart.
   #
-  # The request is answered asynchronously: AppKit returns ``NSTerminateLater``
-  # and does the Core's stop on a background queue, so the host is still alive
-  # for a moment after ``osascript`` returns.  Signalling on the next line
-  # killed the host before it could run that path, which is why the marker was
-  # never written and the restart fell back to the drain this exists to avoid.
-  # The request is therefore given the time the host itself allows for it
-  # before the signal is used as the backstop.
-  osascript -e 'tell application id "young.router.app" to quit' >/dev/null 2>&1 || true
-  for _ in $(seq 1 60); do
-    pgrep -f "$HOST_PATTERN" >/dev/null 2>&1 || break
-    sleep 0.1
-  done
-  pgrep -f "$HOST_PATTERN" >/dev/null 2>&1 && pkill -TERM -f "$HOST_PATTERN" 2>/dev/null || true
-  # The host's teardown is a few seconds; poll at a tenth of a second so an
-  # ordinary restart starts again the moment it is genuinely done instead of
-  # sitting out a fixed budget, and bound it by the same drain limit the Core
-  # reads rather than by a guess.  Liveness is asked of the captured pids
-  # themselves, and a zombie -- a pid the kernel still lists after its exit,
-  # which nothing here will ever reap -- is not one of them.
-  STOP_POLLS=600
+  # The Core is captured for the graceful path, which waits for the pids that
+  # own the window and the state root instead of for the whole tree.
+  if [[ -n "$STOPPING_CORE" ]]; then
+    GATING_PIDS="$STOPPING_HOSTS $STOPPING_CORE"
+  else
+    GATING_PIDS="$STOPPING_PIDS"
+  fi
+  RUNTIME_ROOT="${LITELLM_RUNTIME_ROOT:-$HOME/.young-router/.litellm-runtime}"
+  recorded_port="$(cat "$RUNTIME_ROOT/litellm.port" 2>/dev/null || true)"
+  [[ "$recorded_port" =~ ^[0-9]{1,5}$ ]] || recorded_port=12390
+  port_taken() {
+    [[ -n "$(lsof -nP -iTCP:"$recorded_port" -sTCP:LISTEN -t 2>/dev/null)" ]]
+  }
+  # The stop is one shot: every pid captured above goes at once.  What that
+  # gives up is a turn that is still being written -- its upstream dies with the
+  # worker, so the client reconnects instead of being handed a completed answer
+  # -- and the app's own orderly teardown, which is the point.  Measured here:
+  # the host's quit path and the Core's shutdown need ten to thirty seconds
+  # under load, and the only thing the replacement actually has to wait for is
+  # the loopback listener those processes hold.  Killing them together releases
+  # it in the same instant, so the stop costs the poll below instead of the
+  # drain above.
+  #
+  # YOUNG_ROUTER_RESTART_GRACEFUL=1 keeps the other policy: ask the app to quit
+  # and let it unwind its own tree, for the case where a turn must not be cut.
+  # AppKit only runs ``applicationShouldTerminate`` -- the one path that reaches
+  # the Core's ``host/shutdown`` route -- on a real quit request, and the request
+  # is answered asynchronously, so the host is still alive for a moment after
+  # ``osascript`` returns and gets only that long before the signal is used as
+  # the backstop.
+  if [[ "${YOUNG_ROUTER_RESTART_GRACEFUL:-$([[ "${1:-}" == "--stop" ]] && echo 1 || echo 0)}" == "1" ]]; then
+    osascript -e 'tell application id "young.router.app" to quit' >/dev/null 2>&1 || true
+    host_alive() {
+      [[ -n "$("$APP_PROCESSES" alive $STOPPING_HOSTS)" ]]
+    }
+    for _ in $(seq 1 60); do
+      host_alive || break
+      sleep 0.1
+    done
+    if host_alive; then
+      for pid in $("$APP_PROCESSES" alive $STOPPING_HOSTS); do
+        kill -TERM "$pid" 2>/dev/null || true
+      done
+    fi
+  else
+    for pid in $STOPPING_PIDS; do
+      kill -KILL "$pid" 2>/dev/null || true
+    done
+  fi
+  # The replacement may start as soon as those pids are gone: they are what
+  # holds the listener, and a killed process holds nothing else that outlives
+  # it.  A zombie is not one of them, which is why liveness is asked of the
+  # captured pids rather than of a name.
+  STOP_POLLS=100
   stopping_any() {
     [[ -n "$("$APP_PROCESSES" alive $STOPPING_PIDS)" ]]
   }
@@ -99,10 +125,10 @@ if pgrep -f "$HOST_PATTERN" >/dev/null 2>&1; then
     sleep 0.1
   done
   if stopping_any; then
-    # Anything the host did not unwind -- a descendant it never owned, or a
-    # wedged process holding the loopback port the replacement needs -- still
-    # has to go before the new instance can bind.  Signalled through the pids
-    # this stop captured, so a process that is not this app's is never touched.
+    # Something survived the signal: a process the kernel kept alive, or the
+    # graceful path's host that never answered its quit.  Signalled through the
+    # pids this stop captured, so a process that is not this app's is never
+    # touched.
     for pid in $("$APP_PROCESSES" alive $STOPPING_PIDS); do
       kill -TERM "$pid" 2>/dev/null || true
     done
@@ -116,13 +142,30 @@ if pgrep -f "$HOST_PATTERN" >/dev/null 2>&1; then
       done
     fi
   fi
+  # One check, not a wait: the new proxy binds the recorded port, and clients
+  # are pointed at that port by hand, so a listener that somehow outlived the
+  # pids above would send it forward to the next one.  A held port here is
+  # reported rather than waited out; a second is enough for a listener that was
+  # already closing to finish.
+  for _ in $(seq 1 10); do
+    port_taken || break
+    sleep 0.1
+  done
+  if port_taken; then
+    echo "Young Router: port $recorded_port is still held; the new proxy will step forward" >&2
+  fi
+  still_running="$("$APP_PROCESSES" alive $STOPPING_PIDS | tr '\n' ' ')"
+  if [[ -n "$still_running" ]]; then
+    echo "Young Router: replacing with $(wc -w <<<"$still_running" | tr -d ' ') process(es) still running" >&2
+  fi
 else
   echo "Young Router: not running"
 fi
 
 if [[ "${1:-}" == "--stop" ]]; then
   # A deliberate stop disarms the relaunch, so this is the only path that may
-  # leave the app down.
+  # leave the app down -- and it is also the one stop that is not in a hurry, so
+  # it asks the app to quit unless the caller chose otherwise.
   ARMED=0
   echo "Young Router: stopped on request"
   exit 0
@@ -138,7 +181,7 @@ echo "Young Router: starting"
 START_TIMEOUT_SECONDS="${YOUNG_ROUTER_START_TIMEOUT_SECONDS:-70}"
 deadline=$(( SECONDS + START_TIMEOUT_SECONDS ))
 while (( SECONDS < deadline )); do
-  if pgrep -f "$HOST_PATTERN" >/dev/null 2>&1; then
+  if [[ -n "$("$APP_PROCESSES" hosts "$APP")" ]]; then
     code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:12390/health/liveliness 2>/dev/null || echo 000)"
     if [[ "$code" == "200" ]]; then
       echo "Young Router: running (proxy health check passed)"
