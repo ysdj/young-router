@@ -242,11 +242,19 @@ class CoreServiceController:
         # Set by ``attach_workbuddy`` when Core owns a WorkBuddy worker; a
         # bare controller (tests, CLI probes) simply has none.
         self._workbuddy: object | None = None
+        # Set by ``attach_opencode2dsh`` when Core owns an OpenCode Zen
+        # worker; a bare controller (tests, CLI probes) simply has none.
+        self._opencode2dsh: object | None = None
 
     def attach_workbuddy(self, runtime: object | None) -> None:
         """Share the Core-owned WorkBuddy worker with this controller."""
 
         self._workbuddy = runtime
+
+    def attach_opencode2dsh(self, runtime: object | None) -> None:
+        """Share the Core-owned OpenCode Zen worker with this controller."""
+
+        self._opencode2dsh = runtime
 
     def _runtime_config_references_workbuddy(self) -> bool:
         """Whether the staged config routes anything through a managed worker.
@@ -290,6 +298,44 @@ class CoreServiceController:
             # A missing Node runtime or an unstaged package leaves the
             # WorkBuddy routes unusable; every other provider must still start.
             return {}
+
+    def _opencode2dsh_environment(self, *, autostart: bool) -> dict[str, str]:
+        """The loopback base URL and bearer the proxy child resolves.
+
+        ``autostart`` is only for the proxy launch: a status poll or a preview
+        must never spawn a Node worker on its own, and a config that routes
+        nothing through OpenCode Zen never starts one either.
+        """
+
+        runtime = self._opencode2dsh
+        if runtime is None:
+            return {}
+        try:
+            if autostart:
+                if self._runtime_config_references_workbuddy():
+                    return runtime.environment(autostart=True)
+                # Removing every managed route releases the worker instead of
+                # leaving a process behind an unused port.
+                runtime.stop()
+                return {}
+            return runtime.environment_values()
+        except Exception:
+            # A missing Node runtime or an unstaged package leaves the
+            # OpenCode Zen routes unusable; every other provider must still
+            # start.
+            return {}
+
+    def _managed_worker_environment(self, *, autostart: bool) -> dict[str, str]:
+        """Every managed worker's environment fragment, merged.
+
+        Both workers publish their own loopback address under distinct variable
+        names, so the fragments never collide and the proxy child can resolve
+        whichever route's ``os.environ/`` reference a config names.
+        """
+
+        environment = self._workbuddy_environment(autostart=autostart)
+        environment.update(self._opencode2dsh_environment(autostart=autostart))
+        return environment
 
     def _invalidate_status_cache(self) -> None:
         self._status_cache = None
@@ -703,7 +749,7 @@ class CoreServiceController:
         # WorkBuddy routes resolve their loopback base URL and bearer from the
         # proxy's own environment; an already-running worker supplies them and
         # a configured route starts one at proxy launch (see ``start``).
-        env.update(self._workbuddy_environment(autostart=False))
+        env.update(self._managed_worker_environment(autostart=False))
         return env
 
     def _configured_port(self, env: Mapping[str, str] | None = None) -> int:
@@ -925,7 +971,16 @@ class CoreServiceController:
         # pass force=True and retain real-time ownership checks.
         now = time.monotonic()
         cached = self._status_cache
-        if not force and cached is not None and now - cached[0] < SERVICE_STATUS_CACHE_SECONDS:
+        # A settled answer is shared by every open window for a moment.  A
+        # transitional one is not reused: serving "starting" again from this
+        # cache is exactly what leaves a window stating it for up to the cache's
+        # whole lifetime after the service has already come up.
+        if (
+            not force
+            and cached is not None
+            and cached[1].get("state") == "running"
+            and now - cached[0] < SERVICE_STATUS_CACHE_SECONDS
+        ):
             return copy.deepcopy(cached[1])
         pid = self._pid()
         port = self._effective_port()
@@ -1019,7 +1074,7 @@ class CoreServiceController:
         # The proxy resolves the WorkBuddy base URLs and the loopback bearer
         # from its own environment, so the worker has to be listening before
         # the child launches and its port must never enter config.yaml.
-        environment.update(self._workbuddy_environment(autostart=True))
+        environment.update(self._managed_worker_environment(autostart=True))
         owner_token = secrets.token_urlsafe(OWNER_TOKEN_BYTES)
         environment[OWNER_TOKEN_ENV] = owner_token
         # An occupied configured port steps forward to the next free port; the

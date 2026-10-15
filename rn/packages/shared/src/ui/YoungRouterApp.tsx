@@ -98,7 +98,7 @@ const SERVICE_STARTUP_RETRY_DELAYS_MS = [0, 5_000, 20_000, 60_000];
 // clears it; without this a restart that outlives the request budget leaves the
 // pane stating "启动中" forever. It costs one loopback read every interval and
 // only while the state is transitional.
-const SERVICE_STATE_RECONCILE_MS = 5_000;
+const SERVICE_STATE_RECONCILE_MS = 1_000;
 type EditableDiskDomain = "codex" | "claude" | "clients" | "providers_models" | "runtime" | "webdav";
 type RawEditorConflictResolution = "reload" | "keep";
 type AssistantSettingsDomain = "codex" | "claude" | "clients";
@@ -116,7 +116,8 @@ type WebDavSyncAction = "sync" | "push" | "pull";
  */
 type ResultMessage = string | null | ((value: unknown) => string | null);
 
-const PROVIDER_AUTH_OPTIONS = ["api_key", "openai_login", "claude_login", "workbuddy_login", "workbuddy_ai_login"] as const satisfies readonly ProviderAuthKind[];
+const PROVIDER_AUTH_OPTIONS = ["api_key", "openai_login", "claude_login", "workbuddy_login", "workbuddy_ai_login", "opencode2dsh_login"] as const satisfies readonly ProviderAuthKind[];
+
 
 function providerAuthKind(provider: UnknownRecord | undefined): ProviderAuthKind {
   const value = stringValue(provider?.auth_kind, "api_key");
@@ -130,7 +131,7 @@ function providerAuthStatus(provider: UnknownRecord | undefined): ProviderAuthSt
 }
 
 /** The merged workspace shows every provider kind; this drives row labels. */
-type ProviderKind = "relay" | "openai" | "claude" | "workbuddy" | "workbuddyAI" | "apiKey";
+type ProviderKind = "relay" | "openai" | "claude" | "workbuddy" | "workbuddyAI" | "opencode2dsh" | "apiKey";
 
 function providerKind(provider: UnknownRecord | undefined): ProviderKind {
   const auth = providerAuthKind(provider);
@@ -138,6 +139,7 @@ function providerKind(provider: UnknownRecord | undefined): ProviderKind {
   if (auth === "claude_login") return "claude";
   if (auth === "workbuddy_login") return "workbuddy";
   if (auth === "workbuddy_ai_login") return "workbuddyAI";
+  if (auth === "opencode2dsh_login") return "opencode2dsh";
   return stringValue(provider?.provider_type, "custom") === "relay" ? "relay" : "apiKey";
 }
 
@@ -151,7 +153,7 @@ function providerKind(provider: UnknownRecord | undefined): ProviderKind {
  * which address a provider carries, and whether its association section reads
  * as a service link rather than a relay station link.
  */
-type ServiceID = "openai" | "claude" | "workbuddy" | "workbuddyAI";
+type ServiceID = "openai" | "claude" | "workbuddy" | "workbuddyAI" | "opencode2dsh";
 
 /** The address each service is addressed by, used for the wizard's URL field. */
 const SERVICE_BASE_URLS: Record<ServiceID, string> = {
@@ -159,6 +161,7 @@ const SERVICE_BASE_URLS: Record<ServiceID, string> = {
   claude: "https://api.anthropic.com",
   workbuddy: "https://copilot.tencent.com",
   workbuddyAI: "https://www.workbuddy.ai",
+  opencode2dsh: "https://opencode.ai/zen",
 };
 
 /** Service origins, so a hand-typed provider URL is recognized the same way. */
@@ -176,6 +179,7 @@ function serviceFromURL(value: string): ServiceID | undefined {
   const matches = (suffix: string): boolean => host === suffix || host.endsWith(`.${suffix}`);
   if (matches("workbuddy.ai")) return "workbuddyAI";
   if (matches("codebuddy.ai") || matches("codebuddy.cn") || matches("copilot.tencent.com")) return "workbuddy";
+  if (matches("opencode.ai")) return "opencode2dsh";
   if (matches("api.openai.com") || matches("openai.com") || matches("chatgpt.com")) return "openai";
   if (matches("api.anthropic.com") || matches("anthropic.com") || matches("claude.ai")) return "claude";
   return undefined;
@@ -184,7 +188,7 @@ function serviceFromURL(value: string): ServiceID | undefined {
 /** The service behind one provider entry: its kind first, then its address. */
 function providerService(provider: UnknownRecord | undefined): ServiceID | undefined {
   const kind = providerKind(provider ?? {});
-  if (kind === "openai" || kind === "claude" || kind === "workbuddy" || kind === "workbuddyAI") return kind;
+  if (kind === "openai" || kind === "claude" || kind === "workbuddy" || kind === "workbuddyAI" || kind === "opencode2dsh") return kind;
   return serviceFromURL(stringValue(provider?.endpoint, stringValue(provider?.api_base)));
 }
 
@@ -384,14 +388,16 @@ function providerKindLabel(kind: ProviderKind, translate: Translate): string {
           ? translate("providers.type.workbuddy")
           : kind === "workbuddyAI"
             ? translate("providers.type.workbuddyAI")
-            : translate("providers.type.apiKey");
+            : kind === "opencode2dsh"
+              ? translate("providers.type.opencode2dsh")
+              : translate("providers.type.apiKey");
 }
 
 /** Whether this provider kind is one of the account-backed login services, whose
  * name, address, and key all belong to the service surface rather than to the
  * provider editor. */
 function isLoginProviderKind(kind: ProviderKind): boolean {
-  return kind === "openai" || kind === "claude" || kind === "workbuddy" || kind === "workbuddyAI";
+  return kind === "openai" || kind === "claude" || kind === "workbuddy" || kind === "workbuddyAI" || kind === "opencode2dsh";
 }
 
 const DATA_PACKAGE_SECTIONS: ReadonlyArray<{ domain: ConfigDomain; labelKey: string }> = [
@@ -975,6 +981,8 @@ const TRANSIENT_READ_ACTIONS: ReadonlySet<string> = new Set([
   "workbuddy_status",
   "workbuddy_models",
   "workbuddy_login",
+  "opencode2dsh_status",
+  "opencode2dsh_models",
   "service_provider_auth_status",
   "provider_auth_status",
 ]);
@@ -2964,7 +2972,7 @@ function providerWizardKeyTarget(token: string, keyName: string): string {
   return `${WIZARD_PENDING_KEY_PREFIX}${token}\u001f${keyName}`;
 }
 
-type ServiceProviderKind = "openai_login" | "claude_login" | "workbuddy_login" | "workbuddy_ai_login";
+type ServiceProviderKind = "openai_login" | "claude_login" | "workbuddy_login" | "workbuddy_ai_login" | "opencode2dsh_login";
 
 /**
  * Every provider the snapshot carries, whatever its kind.
@@ -3006,7 +3014,8 @@ function nextServiceProviderName(providers: UnknownRecord[], kind: ServiceProvid
   const base = kind === "openai_login" ? "OpenAI"
     : kind === "claude_login" ? "Claude"
       : kind === "workbuddy_login" ? "WorkBuddy"
-        : "WorkBuddy AI";
+        : kind === "workbuddy_ai_login" ? "WorkBuddy AI"
+          : "OpenCode Zen Free";
   const names = new Set(providers.map((provider) => stringValue(provider.display_name, stringValue(provider.name)).trim().toLocaleLowerCase()).filter(Boolean));
   if (!names.has(base.toLocaleLowerCase())) return base;
   let suffix = 2;
@@ -3016,7 +3025,7 @@ function nextServiceProviderName(providers: UnknownRecord[], kind: ServiceProvid
 
 function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayStations, busy, translate, dispatchWithOutcome, onSecretState, onStatus, onClose, onKeyToken, relay, addOfficialAccount, status }: { snapshot?: CoreSnapshot; native: NativeLeafAdapter; providers: UnknownRecord[]; relaySources: RelaySourceOption[]; relayStations: RelayStationOption[]; busy: boolean; translate: Translate; dispatchWithOutcome: (type: string, payload?: UnknownRecord, domain?: ConfigDomain, keepControlsEnabled?: boolean) => Promise<CoreSnapshot | undefined>; onSecretState: (state: SecretState) => void; onStatus: (status?: string) => void; onClose: () => void; onKeyToken: (token: string) => void; relay: RelayWorkspaceBridge; addOfficialAccount: (kind: ServiceProviderKind, name?: string) => Promise<string>; /** The window's own result: a child window keeps no strip, so its footer states it. */ status?: string }): React.JSX.Element {
   type WizardStep = "provider" | "keys" | "model";
-  type WizardType = "api" | "openai" | "claude" | "workbuddy" | "workbuddyAI";
+  type WizardType = "api" | "openai" | "claude" | "workbuddy" | "workbuddyAI" | "opencode2dsh";
   const [step, setStep] = useState<WizardStep>("provider");
   // The step the last advance left, so one press cannot advance twice.
   const stepRef = useRef<WizardStep | undefined>("provider");
@@ -3102,7 +3111,11 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
 
   const isOfficialLoginType = providerType === "openai" || providerType === "claude";
   const isWorkBuddyType = providerType === "workbuddy" || providerType === "workbuddyAI";
-  const isLoginType = isOfficialLoginType || isWorkBuddyType;
+  // OpenCode Zen has no sign-in and no user secret at all: its provider is
+  // created straight from the provider step, so it shares neither the key
+  // step's fields nor the official services' web login.
+  const isOpenCode2DSHType = providerType === "opencode2dsh";
+  const isLoginType = isOfficialLoginType || isWorkBuddyType || isOpenCode2DSHType;
   const workbuddyProvider = providerType === "workbuddyAI" ? "workbuddy-ai" : "workbuddy";
   const workbuddyAuthKind: ServiceProviderKind = providerType === "workbuddyAI" ? "workbuddy_ai_login" : "workbuddy_login";
   const selectedProvider = providers.find((entry) => editorIdentifier(entry) === providerSelection);
@@ -3188,10 +3201,8 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     stagedKeyField.current = { identity: stagedKeyField.current.identity, status: "ready", present: false };
     setKeyReady(false);
   };
-  // The wait the keys step hands to the model step, and the rename that wait
-  // makes worth doing.  Both are read once, on the model step, so the step
-  // change itself never waits on Core.
-  const pendingKeyFlush = useRef<Promise<boolean> | undefined>(undefined);
+  // The rename that the key step's wait makes worth doing, read once on the
+  // model step after that wait has settled.
   const pendingKeyRename = useRef<string | undefined>(undefined);
   const finishedProviderKeyName = keyName.trim() || stagedKeyName;
   const selectedProvidedChoice = providedChoices.find((source) => `relay:${relaySourceSelectionID(source)}` === providedKeySelection) ?? providedChoices[0];
@@ -3220,6 +3231,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     { type: "claude", label: translate("providers.type.claude") },
     { type: "workbuddy", label: translate("providers.type.workbuddy") },
     { type: "workbuddyAI", label: translate("providers.type.workbuddyAI") },
+    { type: "opencode2dsh", label: translate("providers.type.opencode2dsh") },
   ];
   const servicePickerLabels = servicePickerItems.map((item) => item.label);
   // A service provider always carries its own address; only the custom entry
@@ -3386,9 +3398,10 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     // same account has to stay distinguishable.
     setProviderName(value === "workbuddy" ? nextServiceProviderName(providers, "workbuddy_login")
       : value === "workbuddyAI" ? nextServiceProviderName(providers, "workbuddy_ai_login")
-        : value === "openai" ? nextServiceProviderName(providers, "openai_login")
-          : value === "claude" ? nextServiceProviderName(providers, "claude_login")
-            : "");
+        : value === "opencode2dsh" ? nextServiceProviderName(providers, "opencode2dsh_login")
+          : value === "openai" ? nextServiceProviderName(providers, "openai_login")
+            : value === "claude" ? nextServiceProviderName(providers, "claude_login")
+              : "");
     setWorkbuddyAccount(undefined);
     setSelectedModels([]);
     setModelFetchState("idle");
@@ -3403,8 +3416,9 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     if (step !== "provider" || providerMode !== "new" || providerType === "api") return;
     const kind: ServiceProviderKind = providerType === "workbuddy" ? "workbuddy_login"
       : providerType === "workbuddyAI" ? "workbuddy_ai_login"
-        : providerType === "claude" ? "claude_login"
-          : "openai_login";
+        : providerType === "opencode2dsh" ? "opencode2dsh_login"
+          : providerType === "claude" ? "claude_login"
+            : "openai_login";
     const baseName = nextServiceProviderName([], kind);
     const suggested = nextServiceProviderName(providers, kind);
     setProviderName((current) => (current.trim() === "" || current.trim() === baseName ? suggested : current));
@@ -3518,32 +3532,45 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     setSelectedManualModelIDs((current) => current.filter((modelID) => modelID !== id));
   };
   /**
-   * The model step's own entry work, run after the step is already on screen.
+   * The keys step's exit work: settle its key field, then move on.
    *
-   * 下一步 no longer waits for the key field to reach Core, so the answer it is
-   * waiting for arrives here.  A key that never landed is the one thing that
-   * still has to stop the user, and it stops the model step with 密钥值's own
-   * message instead of delaying the press that asked for the step.
+   * 下一步 is the press that blurs 密钥值, so the staging answer is asked for
+   * here, and a key that never landed is the one thing that still stops the
+   * user — it reports 密钥值's own message on the step it was asked from.
    */
   const advanceToModels = async (keyFlush: Promise<boolean>): Promise<void> => {
-    // Whatever the step is showing, it is waiting on this: the wheel turns
-    // until the key answer has settled.
+    // The key value belongs to the 密钥 field, and 下一步 is the press that
+    // blurs it: the answer is asked for here, while the field that carries it
+    // is still mounted, and the step only moves once that answer has landed.
+    // Moving first recycled the field, and a wait on a recycled field never
+    // settles — the model step then spun on 正在自动获取可用模型 forever, for
+    // every provider including one whose endpoint answers.
     setModelFetchState("loading");
-    const keyPresent = await keyFlush.catch(() => false);
-    if (!keyPresent) {
-      setModelFetchState("idle");
-      setValidation(translate("providers.wizard.required"));
-      return;
-    }
-    const rename = pendingKeyRename.current;
-    pendingKeyRename.current = undefined;
-    if (rename && providerID && selectedKeyChoice?.kind === "independent") {
-      const renamed = await dispatchWithOutcome("provider.key_patch", { provider_id: providerID, old_name: selectedKeyChoice.name, name: rename });
-      if (!renamed) {
+    // The wait happens on the step that owns the field, so the wait is stated
+    // there: 下一步 carries the wheel the whole time it is outstanding.
+    setProcessing(true);
+    try {
+      const keyPresent = await keyFlush.catch(() => false);
+      if (!keyPresent) {
         setModelFetchState("idle");
+        setValidation(translate("providers.wizard.required"));
         return;
       }
+      const rename = pendingKeyRename.current;
+      pendingKeyRename.current = undefined;
+      if (rename && providerID && selectedKeyChoice?.kind === "independent") {
+        const renamed = await dispatchWithOutcome("provider.key_patch", { provider_id: providerID, old_name: selectedKeyChoice.name, name: rename });
+        if (!renamed) {
+          setModelFetchState("idle");
+          return;
+        }
+      }
+    } finally {
+      setProcessing(false);
     }
+    // The step changes only now, while the field that answered the wait above
+    // was still mounted.
+    advanceStepToModel();
     // The step is on screen by now, so the render that owns the model step
     // performs the listing: this closure was built before the step changed and
     // its own `serviceBaseURL`/`manualSelectedKeyName` are the keys step's.
@@ -3657,6 +3684,24 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         kind: workbuddyAuthKind,
         name,
         models: [],
+      });
+      if (!next) return undefined;
+      const summary = asRecord(asRecord(next.action_summaries?.providers_models).operation_summary);
+      const added = snapshotProviderRecords(next).find((entry) => editorIdentifier(entry) === stringValue(summary.provider_id))
+        ?? snapshotProviderRecords(next).find((entry) => stringValue(entry.display_name, stringValue(entry.name)).trim() === name);
+      if (!added) return undefined;
+      const createdServiceID = editorIdentifier(added);
+      setProviderMode("existing");
+      setProviderSelection(createdServiceID);
+      return createdServiceID;
+    }
+    if (isOpenCode2DSHType) {
+      // The lane owns no account and no user secret, so the create carries the
+      // name alone: Core reads the staged adapter's live free roster and
+      // imports it as this entry's models.
+      const next = await dispatchWithOutcome("service_provider.add", {
+        kind: "opencode2dsh_login",
+        name,
       });
       if (!next) return undefined;
       const summary = asRecord(asRecord(next.action_summaries?.providers_models).operation_summary);
@@ -3899,16 +3944,16 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         advanceStepToModel();
         return;
       }
+      if (isOpenCode2DSHType) {
+        // Nothing is typed here either: the lane signs itself in, and its
+        // free roster is imported by the create on 完成.
+        advanceStepToModel();
+        return;
+      }
       if (creatingProvider) {
         // The provider does not exist yet, so this step states the field its
         // own create will carry: a custom key that is staged, or the provided
         // key this provider's models will route through.
-        //
-        // The advance is immediate.  The key field stages on the very press
-        // that runs this handler, so waiting for Core here would put an HTTP
-        // round trip between the press and the next step.  `pendingKeyFlush`
-        // carries that wait to the model step instead, where the step change is
-        // already behind us and the model list is the work being reported.
         if (!usingProvidedKeyPath(keyPath) && !keyName.trim()) {
           setValidation(translate("providers.wizard.required"));
           return;
@@ -3921,11 +3966,12 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
           advanceStepToModel();
           return;
         }
-        pendingKeyFlush.current = flushStagedKey();
-        advanceStepToModel();
-        void advanceToModels(pendingKeyFlush.current).catch(() => {
-          // The step is already on screen: a rejected listing reports itself on
-          // the step, and an escaping rejection here would be an unhandled one.
+        // The key field belongs to this step alone, and the step change
+        // recycles it: its staging answer is dropped on the way out, so a
+        // wait that started here could never settle and the model step would
+        // spin forever.  The value is therefore flushed before the step moves,
+        // so the listing below reads a key Core already holds.
+        void advanceToModels(flushStagedKey()).catch(() => {
           setModelFetchState("unavailable");
         });
         return;
@@ -3965,10 +4011,10 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
           setValidation(translate("providers.wizard.required"));
           return;
         }
-        pendingKeyFlush.current = flushStagedKey();
         pendingKeyRename.current = editedName !== selectedKeyChoice.name ? editedName : undefined;
-        advanceStepToModel();
-        void advanceToModels(pendingKeyFlush.current).catch(() => {
+        // Same rule as the create path: the key field lives on this step, so
+        // its answer has to be asked for before the step change recycles it.
+        void advanceToModels(flushStagedKey()).catch(() => {
           setModelFetchState("unavailable");
         });
         return;
@@ -4006,6 +4052,20 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     // the provider's own association section, and 完成 is what creates its
     // service entry.
     if (isWorkBuddyType) {
+      setProcessing(true);
+      try {
+        const created = providerID || await commitWizardProvider();
+        if (!created) return;
+        onStatus(translate("providers.wizard.complete"));
+        onClose();
+      } finally {
+        setProcessing(false);
+      }
+      return;
+    }
+    // OpenCode Zen imported its roster with the create too, so 完成 only has
+    // to mint the entry; nothing is selected or typed on this step.
+    if (isOpenCode2DSHType) {
       setProcessing(true);
       try {
         const created = providerID || await commitWizardProvider();
@@ -4125,7 +4185,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         </View> : <>
         {step === "provider" ? <View style={styles.providerWizardFormSection}>
           <NativeFormRow label={translate("providers.wizard.providerType")}>
-            <NativePicker labels={servicePickerLabels} selectedValue={selectedServiceLabel} disabled={wizardBusy} onChange={({ nativeEvent }) => { const kinds: WizardType[] = ["api", "openai", "claude", "workbuddy", "workbuddyAI"]; chooseProviderType(kinds[nativeEvent.index] ?? "api"); }} style={styles.providerWizardPicker} />
+            <NativePicker labels={servicePickerLabels} selectedValue={selectedServiceLabel} disabled={wizardBusy} onChange={({ nativeEvent }) => { const kinds: WizardType[] = ["api", "openai", "claude", "workbuddy", "workbuddyAI", "opencode2dsh"]; chooseProviderType(kinds[nativeEvent.index] ?? "api"); }} style={styles.providerWizardPicker} />
           </NativeFormRow>
           {providerMode === "new" && isOfficialLoginType ? <NativeFormRow label={translate("providers.wizard.authPath")}>
             <NativePicker labels={[translate("providers.wizard.pathWebLogin"), translate("providers.wizard.pathCustomKey")]} selectedValue={keyPath === "login" ? translate("providers.wizard.pathWebLogin") : translate("providers.wizard.pathCustomKey")} disabled={wizardBusy} onChange={({ nativeEvent }) => { chooseOfficialAuthPath(nativeEvent.index === 1 ? "manual" : "login"); }} style={styles.providerWizardPicker} />
@@ -4141,6 +4201,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
           {providerMode === "new" && providerType !== "api" ? <Text style={styles.providerWizardHint}>{translate("providers.wizard.serviceUrlFixed")}</Text> : null}
           {providerMode === "new" && isOfficialLoginType && keyPath === "login" ? <Text style={styles.providerWizardHint}>{providerType === "openai" ? translate("relay.officialProviderWebViewHint") : translate("relay.officialProviderBrowserHint")}</Text> : null}
           {providerMode === "new" && isWorkBuddyType ? <Text style={styles.providerWizardHint}>{translate("providers.wizard.workbuddyAppHint")}</Text> : null}
+          {providerMode === "new" && isOpenCode2DSHType ? <Text style={styles.providerWizardHint}>{translate("providers.wizard.opencode2dshHint")}</Text> : null}
           {providerMode === "existing" && selectedProvider ? <Text numberOfLines={1} style={styles.providerWizardHint}>{activeProviderBaseURL || translate("common.notAvailable")}</Text> : null}
         </View> : null}
         {step === "keys" ? <View style={styles.providerWizardFormSection}>
@@ -4155,6 +4216,10 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
                   ? <NativeButton title={translate("relay.officialProviderCancel")} compact disabled={wizardBusy} onPress={() => { void cancelOfficialLogin(); }} />
                   : <NativeButton title={translate("relay.officialProviderLogin")} primary compact disabled={wizardBusy} onPress={() => { void startOfficialLogin(); }} />}
             </View>
+          </> : isOpenCode2DSHType ? <>
+            {/* The lane signs itself in and its free roster is imported by the
+                create, so this step states that and asks for nothing. */}
+            <Text style={styles.providerWizardHint}>{translate("providers.wizard.opencode2dshHint")}</Text>
           </> : isWorkBuddyType ? <>
             {/* The account is associated in the provider's own 「服务商关联」
                 section, so this step only states the desktop app's sign-in and
@@ -4225,6 +4290,11 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         </View> : isWorkBuddyType ? <View style={styles.providerWizardFormSection}>
           <View style={styles.providerWizardSectionHeader}><Text style={styles.providerWizardPanelTitle}>{translate("providers.wizard.models")}</Text><Text numberOfLines={1} style={styles.providerWizardHint}>{selectedProviderName}</Text></View>
           <Text style={styles.providerWizardHint}>{translate("providers.wizard.workbuddyAssociationHint")}</Text>
+        </View> : isOpenCode2DSHType ? <View style={styles.providerWizardFormSection}>
+          {/* The roster is imported with the create, so this step states that
+              instead of showing an empty picker it never had anything to fill. */}
+          <View style={styles.providerWizardSectionHeader}><Text style={styles.providerWizardPanelTitle}>{translate("providers.wizard.models")}</Text><Text numberOfLines={1} style={styles.providerWizardHint}>{selectedProviderName}</Text></View>
+          <Text style={styles.providerWizardHint}>{translate("providers.wizard.opencode2dshModelsHint")}</Text>
         </View> : <PersistentScrollView style={styles.providerWizardModelScroll} contentContainerStyle={styles.providerWizardModelScrollContent} showsVerticalScrollIndicator keyboardShouldPersistTaps="handled">
           <View style={styles.providerWizardFormSection}>
             <View style={styles.providerWizardSectionHeader}><Text style={styles.providerWizardPanelTitle}>{translate("providers.wizard.models")}</Text><Text numberOfLines={1} style={styles.providerWizardHint}>{selectedProviderName}</Text></View>
@@ -4982,7 +5052,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     if (!provider) return;
     const label = providerDisplayName(provider);
     const kind = providerKindSelected;
-    const action = kind === "openai" || kind === "claude" || workbuddyProviderIDFor(kind) !== undefined
+    const action = isLoginProviderKind(kind)
       ? "service_provider.delete"
       : "provider.delete";
     const stationBeingRemoved = kind === "relay" ? stationForProvider(provider) : undefined;
@@ -8263,6 +8333,8 @@ type RenderedLogRecord = {
   action: string;
   duration: string;
   tokens: string;
+  /** The relay's control plane (NewAPI / Sub2API), kept apart from its name. */
+  family: string;
   detail: string;
   original: string;
 };
@@ -8279,7 +8351,16 @@ type RouteTraceRequest = {
 
 type ActiveLogView = { tab: LogTab; log: LogView };
 
-type LogColumn = { label: string; width: number; flex?: boolean; value: (row: RenderedLogRecord) => string };
+type LogColumn = {
+  label: string;
+  width: number;
+  flex?: boolean;
+  /** This flexible column is the row's detail message, so it keeps the shared floor. */
+  detailFlex?: boolean;
+  /** A data column's own ceiling: it absorbs slack only up to this width. */
+  maxWidth?: number;
+  value: (row: RenderedLogRecord) => string;
+};
 
 function shortLogTimestamp(value: unknown): string {
   const raw = stringValue(value);
@@ -8766,14 +8847,108 @@ function parseTextLogRecord(record: string, tab: LogTab, _index: number, transla
     action,
     duration: "",
     tokens,
+    family: "",
     detail,
     original: record,
+  };
+}
+
+function logTokenPair(record: UnknownRecord): string {
+  const prompt = compactLogValue(record.prompt_tokens);
+  const completion = compactLogValue(record.completion_tokens);
+  if (prompt && completion) return `${formatLogTokens(prompt)} / ${formatLogTokens(completion)}`;
+  return formatLogTokens(compactLogValue(record.total_tokens));
+}
+
+/**
+ * The online-usage tab renders each relay row by its own fields.
+ *
+ * The record arrives already projected by Core, so the column that names the
+ * relay shows the station's full identity and every other value is one the
+ * reader chose to expose.  The remaining keys travel in the detail so a
+ * double-click can state the whole row without the pane inventing a second
+ * shape for it.
+ */
+/**
+ * How a relay's usage read ended, in the user's own language.
+ *
+ * Core reports the outcome as a stable code so the pane is the one that
+ * phrases it; an unrecognized code is answered with the neutral empty state
+ * rather than shown raw.
+ */
+function onlineUsageReasonLabel(reason: string, translate: Translate): string {
+  const labels: Record<string, Parameters<Translate>[0]> = {
+    config_unreadable: "logs.onlineUsageConfigUnreadable",
+    unknown_source: "logs.onlineUsageUnknownSource",
+    no_credential: "logs.onlineUsageNoCredential",
+    unsupported: "logs.onlineUsageUnsupported",
+    no_rows: "logs.onlineUsageNoRows",
+    unavailable: "logs.onlineUsageUnavailable",
+  };
+  const key = labels[reason];
+  return key ? translate(key) : "";
+}
+
+function renderOnlineUsageRecord(record: unknown, value: UnknownRecord, translate: Translate): RenderedLogRecord {
+  const time = shortLogTimestamp(value.timestamp ?? value.created_at ?? value.time);
+  // The relay's own name is the source; the control plane that answered is the
+  // type. They are two facts and two columns, so neither one widens the other.
+  const source = compactLogValue(value.source_label) || translate("logs.onlineUsageSource");
+  const family = compactLogValue(value.source_family);
+  const model = compactLogValue(value.model);
+  // A per-request log feed reports its own outcome; a credential-scoped usage
+  // summary has none, and an empty cell says that honestly instead of
+  // inventing a state the station never stated.
+  const rawStatus = compactLogValue(value.status);
+  const status = rawStatus ? requestStatusLabel(rawStatus, translate) : "";
+  const tokens = logTokenPair(value);
+  const detailFields: Array<[string, string]> = [
+    [translate("logs.source"), source],
+    [translate("logs.type"), family],
+    [translate("providers.publicModel"), model],
+    [translate("logs.status"), status],
+    [translate("logs.tokenCount"), tokens],
+    [translate("logs.promptTokens"), compactLogValue(value.prompt_tokens)],
+    [translate("logs.completionTokens"), compactLogValue(value.completion_tokens)],
+    [translate("logs.cacheTokens"), compactLogValue(value.cache_tokens)],
+    [translate("logs.channel"), compactLogValue(value.channel)],
+    [translate("logs.group"), compactLogValue(value.group)],
+    [translate("logs.apiKeyName"), compactLogValue(value.key_name)],
+    [translate("logs.duration"), compactLogValue(value.duration)],
+    [translate("logs.cost"), compactLogValue(value.cost)],
+  ];
+  const details = detailFields.flatMap(([label, field]) => (field ? [`${label}: ${field}`] : []));
+  const directDetail = compactLogValue(value.detail);
+  if (directDetail) details.unshift(directDetail);
+  const requestKey = `online-usage:${time || "un-timed"}:${source}:${model}`;
+  return {
+    key: logRecordBaseKey("online-usage", time, requestKey, "", "", JSON.stringify(value)),
+    requestKey,
+    routeAttempts: [],
+    time,
+    source,
+    status,
+    model,
+    upstreamModel: "",
+    provider: "",
+    family,
+    apiKeyName: compactLogValue(value.key_name),
+    event: "",
+    action: "",
+    duration: compactLogValue(value.duration),
+    tokens,
+    detail: details.join(" | "),
+    // The double-click detail is the same labelled fields, one per line, so
+    // opening a row states the whole report without re-reading the record's
+    // own key spellings.
+    original: details.join("\n"),
   };
 }
 
 function renderLogRecord(record: unknown, tab: LogTab, index: number, translate: Translate): RenderedLogRecord {
   if (typeof record === "string") return parseTextLogRecord(record, tab, index, translate);
   const value = asRecord(record);
+  if (tab === "online-usage") return renderOnlineUsageRecord(record, value, translate);
   const time = shortLogTimestamp(value.ts ?? value.timestamp ?? value.time ?? value.created_at ?? value.updated_at ?? value.checked_at ?? value.heartbeat_at ?? value.started_at);
   const routingState = compactLogValue(value.routing_state);
   const provider = compactLogValue(value.provider)
@@ -8873,6 +9048,7 @@ function renderLogRecord(record: unknown, tab: LogTab, index: number, translate:
     action,
     duration,
     tokens,
+    family: "",
     detail: details.filter(Boolean).join(" | "),
     original,
   };
@@ -8974,10 +9150,10 @@ const LOG_DETAIL_COLUMN_FLOOR = 240;
 // 148, which clipped the tail of the widest digit runs into an ellipsis.
 const LOG_TIME_COLUMN_WIDTH = 168;
 
-function logColumns(tab: LogTab, translate: Translate): LogColumn[] {
+function logColumns(tab: LogTab, translate: Translate, hasStatus = true): LogColumn[] {
   const time = { label: translate("logs.localTime"), width: LOG_TIME_COLUMN_WIDTH, value: (row: RenderedLogRecord) => row.time };
   const status = { label: translate("common.status"), width: 68, value: (row: RenderedLogRecord) => row.status };
-  const detail = { label: translate("logs.detail"), width: 260, flex: true, value: (row: RenderedLogRecord) => row.detail };
+  const detail = { label: translate("logs.detail"), width: 260, flex: true, detailFlex: true, value: (row: RenderedLogRecord) => row.detail };
   if (tab === "requests") return [
     time,
     { label: translate("providers.publicModel"), width: 106, value: (row) => row.model },
@@ -9005,9 +9181,26 @@ function logColumns(tab: LogTab, translate: Translate): LogColumn[] {
   ];
   if (tab === "online-usage") return [
     time,
-    { label: translate("logs.source"), width: 142, value: (row) => row.source },
-    { label: translate("logs.tokenCount"), width: 96, value: (row) => row.tokens },
-    { ...detail, width: 420 },
+    // A usage row is read by name, type, model, tokens, and how long it took.
+    // Every other field is what the row's own double-click detail is for, so
+    // the table stays inside its frame instead of scrolling sideways.
+    //
+    // The widths are sized to the content these columns actually carry (a
+    // relay name, `Sub2API`, `gemini-3.1-pro-preview`, `34113.8 / 88.5`), not
+    // to a guess: the set has to total less than the pane's own width, and
+    // only the one flexible column may absorb what is left over.
+    // The relay's name is short (`sisct2`), so it takes slack only up to a
+    // name's own width and the model column — whose values are the longest on
+    // the row — absorbs the rest.
+    { label: translate("logs.source"), width: 118, maxWidth: 168, flex: true, value: (row) => row.source },
+    { label: translate("logs.type"), width: 64, value: (row) => row.family },
+    { label: translate("providers.publicModel"), width: 164, flex: true, value: (row) => row.model },
+    // A credential-scoped usage summary states no per-request outcome, so the
+    // column is drawn only when a row actually carries one instead of
+    // standing empty across the whole table.
+    ...(hasStatus ? [{ ...status, width: 64 }] : []),
+    { label: translate("logs.tokenPair"), width: 128, value: (row) => row.tokens },
+    { label: translate("logs.duration"), width: 62, value: (row) => row.duration },
   ];
   return [
     time,
@@ -9025,14 +9218,46 @@ function fitLogColumns(columns: LogColumn[], availableWidth: number): LogColumn[
   const fixedWidth = columns.reduce((total, column) => (column.flex ? total : total + column.width), 0);
   // Fixed columns keep their content-sized widths so timestamps, model names,
   // provider, key name, status, and the sent/received token pair stay fully
-  // visible. The detail column takes the remaining width, and anything that
+  // visible. The flexible column takes the remaining width, and anything that
   // still does not fit stays reachable through the table's horizontal scroller
   // instead of being squeezed into an ellipsis.
-  const flexFloor = LOG_DETAIL_COLUMN_FLOOR;
+  //
+  // The flex floor belongs to the detail column, whose whole job is to hold a
+  // long message. A tab whose flexible column is a *data* column declares its
+  // own width as the floor, so it shrinks to that instead of to a text-height
+  // that would push the table past its frame.
+  //
+  // A data column also keeps its declared width as a *ceiling*: the leftover
+  // space goes to the detail column, which is the one whose content grows, so
+  // a short value like a relay's name does not stretch across the window.
+  // Several flexible columns share the same leftover space, so it is divided
+  // once between them: giving each of them `remaining` would hand the table
+  // more width than it has and put the scroller back. A data column also stops
+  // at its own ceiling, and whatever it does not take is left with the detail
+  // column, which is the one whose content actually grows.
   const remaining = usableWidth - fixedWidth;
-  return columns.map((column) => column.flex
-    ? { ...column, width: Math.max(flexFloor, remaining) }
-    : column);
+  let pool = remaining;
+  const widened = columns.map((column) => {
+    if (!column.flex) return { ...column, width: column.width };
+    const ceiling = column.detailFlex ? Number.POSITIVE_INFINITY : column.maxWidth ?? column.width;
+    const floor = column.detailFlex ? LOG_DETAIL_COLUMN_FLOOR : column.width;
+    const width = Math.max(floor, Math.min(ceiling, pool));
+    pool -= width;
+    return { ...column, width };
+  });
+  const widenedFlexible = widened.filter((column) => column.flex ?? false);
+  const detail = widenedFlexible.find((column) => column.detailFlex);
+  if (detail && pool > 0) {
+    // Unclaimed space is the detail column's, so a row's message — not a short
+    // relay name — is what fills a wide window.
+    detail.width += pool;
+  } else if (pool < 0 && widenedFlexible.length > 0) {
+    // The frame is narrower than the set needs: the flexible columns give back
+    // what they can before the table resorts to its own horizontal scroller.
+    const give = Math.min(-pool, widenedFlexible.reduce((total, column) => total + column.width, 0));
+    widenedFlexible[0].width = Math.max(0, widenedFlexible[0].width - give);
+  }
+  return widened;
 }
 
 function routeTraceAttemptLabel(state: RouteTraceAttempt["state"], translate: Translate): string {
@@ -9325,10 +9550,12 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
       : selected === "requests" ? REQUEST_LOG_POLL_MS
       : selected === "online-usage" ? ONLINE_USAGE_POLL_MS : LOG_VIEW_POLL_MS;
     const interval = setInterval(() => { void poll(); }, intervalMs);
-    // Entering the tab is itself the request to read it: the rows are fetched
-    // from the relays the window already has, so the tab shows the current
-    // usage instead of an empty surface waiting on a dropdown nobody touched.
-    if (selected === "online-usage") void refreshOnlineUsageRef.current(onlineUsageSourceIdRef.current);
+    // Re-entering the tab resumes whatever relay was already chosen, so a
+    // window that comes back to a station keeps showing it. A tab with no
+    // selection reads nothing: the pane asks for one instead.
+    if (selected === "online-usage" && onlineUsageSourceIdRef.current) {
+      void refreshOnlineUsageRef.current(onlineUsageSourceIdRef.current);
+    }
     return () => { mounted = false; clearInterval(interval); };
   }, [ipc, selected]);
   const clearing = clearIntent?.tab === selected;
@@ -9337,8 +9564,13 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
     [active?.records, clearing, selected, translate],
   );
   const columns = useMemo(
-    () => fitLogColumns(logColumns(selected, translate), tableWidth),
-    [selected, tableWidth, translate],
+    // The online-usage tab draws its status column only when the relay it read
+    // reports one, so a summary endpoint does not leave an empty column.
+    () => fitLogColumns(
+      logColumns(selected, translate, selected !== "online-usage" || rows.some((row) => Boolean(row.status))),
+      tableWidth,
+    ),
+    [rows, selected, tableWidth, translate],
   );
   const nativeTableColumns = useMemo(
     () => columns.map(({ label, width }) => ({ label, width })),
@@ -9431,8 +9663,14 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
   const lineCount = clearing ? 0 : active?.line_count ?? rows.length;
   // The window keeps one permanent bottom status strip: the line count and the
   // pause state are that strip's idle text, never a second bar of their own.
+  // Rows the relay reported beyond the page on screen. Reading further is a
+  // view over rows already fetched, so it never re-asks the relay.
+  const onlineUsageRemaining = selected === "online-usage" ? numberValue(active?.remaining) : 0;
   const statusLine = [
     translate(active && lineCount >= active.limit ? "logs.latestLinesAtLimit" : "common.lines", { count: lineCount }),
+    // The strip is the one report surface, so the fact that more rows exist
+    // and how many is stated here rather than in a second bar of its own.
+    onlineUsageRemaining > 0 ? translate("logs.onlineUsageMore", { count: onlineUsageRemaining }) : "",
     paused ? translate("logs.paused") : "",
   ].filter(Boolean).join(" | ");
   useEffect(() => { onStatus?.(statusLine); }, [onStatus, statusLine]);
@@ -9441,21 +9679,56 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
   // table this window already draws. Opening the station's dashboard in a
   // child browser is deliberately not a path here — the tab is a log view.
   const onlineUsageSources = selected === "online-usage" ? active?.sources ?? [] : [];
+  // Why the chosen relay answered no rows. It is the pane's own message, so a
+  // station that exposes no usage feed says that instead of looking empty for
+  // no reason the user can act on.
+  // Core answers a read with which outcome it ended in, not with a sentence:
+  // the wording belongs to the pane, so the user's language owns it.
+  const onlineUsageReason = selected === "online-usage" && rows.length === 0
+    ? onlineUsageReasonLabel(stringValue(active?.reason).trim(), translate)
+    : "";
   const onlineUsageSourceId = active?.source_id ?? "";
-  // The dropdown always offers the aggregate read first, so a user who has not
-  // chosen anything still sees every configured relay's rows instead of an
-  // empty table waiting on a selection.
+  // The tab reads nothing until the user names a relay: the prompt stands in
+  // for a selection, and it is also what the picker shows while none is made.
+  const onlineUsageSourcePrompt = translate("logs.onlineUsageSelectSource");
+  // The prompt is the first entry, so a tab with no selection still shows a
+  // native picker with words in it instead of an empty control. Choosing it
+  // reads nothing, which is exactly the unselected state.
   const onlineUsageSourceValues = useMemo(
     () => ["", ...onlineUsageSources.map((source) => source.id)],
     [onlineUsageSources],
   );
   const onlineUsageSourceLabels = useMemo(
-    () => [translate("logs.onlineUsageAllSources"), ...onlineUsageSources.map((source) => source.label)],
+    () => [translate("logs.onlineUsageSelectSource"), ...onlineUsageSources.map((source) => source.label)],
     [onlineUsageSources, translate],
   );
   const onlineUsageSourceIndex = Math.max(0, onlineUsageSourceValues.indexOf(onlineUsageSourceId));
+  // Nothing is chosen, so the surface asks for a relay instead of claiming the
+  // relay reported no rows.
+  const onlineUsagePrompt = selected === "online-usage" && !onlineUsageSourceId;
+  // Selecting a relay is a remote read, so the pane says it is working instead
+  // of standing still: a station that answers slowly otherwise reads as a
+  // frozen window.
+  // Both carry ``undefined``: clearing the pending tab is how a poll that
+  // finishes reports that nothing is loading any more.
+  const [onlineUsageLoadingTab, setOnlineUsageLoadingTab] =
+    useState<typeof LOG_TABS[number] | undefined>();
+  const onlineUsageLoadingTabRef = useRef<typeof LOG_TABS[number] | undefined>(undefined);
+  const onlineUsageLoading = onlineUsageLoadingTab === selected;
+  // An answered read and a failed one both end the wait, and only the read that
+  // is still current may clear it: a stale answer must not hide the wait of a
+  // newer station the user has since chosen.
+  const settleOnlineUsageLoading = (tab: typeof LOG_TABS[number]): void => {
+    if (onlineUsageLoadingTabRef.current !== tab) return;
+    onlineUsageLoadingTabRef.current = undefined;
+    setOnlineUsageLoadingTab(undefined);
+  };
   const refreshOnlineUsage = useCallback((sourceId: string): void => {
     const tab = "online-usage" as const;
+    // Only the tab that started the read owns the wait, so switching away
+    // while a station answers does not leave another tab looking busy.
+    onlineUsageLoadingTabRef.current = tab;
+    setOnlineUsageLoadingTab(tab);
     void dispatch("logs.refresh_online_usage", { tab, source: sourceId }, "logs").then(async () => {
       try {
         const result = await ipc.logs(tab);
@@ -9464,19 +9737,41 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
         if (result.log) setActiveState({ tab, log: result.log });
       } catch {
         // The tab's own poll reconciles the confirmed Core view.
+      } finally {
+        settleOnlineUsageLoading(tab);
       }
-    }).catch(() => undefined);
+    }).catch(() => settleOnlineUsageLoading(tab));
   }, [dispatch, ipc]);
   // The tab-entry effect runs before this callback exists in source order, so
   // it reaches the current one through a ref instead of capturing a stale
   // closure or re-subscribing the poll whenever the callback identity changes.
   const refreshOnlineUsageRef = useRef(refreshOnlineUsage);
   refreshOnlineUsageRef.current = refreshOnlineUsage;
+  const loadMoreOnlineUsage = (): void => {
+    const tab = "online-usage" as const;
+    if (onlineUsageLoading) return;
+    onlineUsageLoadingTabRef.current = tab;
+    setOnlineUsageLoadingTab(tab);
+    // A page in flight must not queue another: the table stays live and the
+    // wheel says the next page is being prepared.
+    void dispatch("logs.load_more", { tab }, "logs").then(async () => {
+      try {
+        const result = await ipc.logs(tab);
+        if (selectedTabRef.current !== tab) return;
+        viewRevisionRef.current = result.revision;
+        if (result.log) setActiveState({ tab, log: result.log });
+      } catch {
+        // The tab's own poll reconciles the confirmed Core view.
+      } finally {
+        settleOnlineUsageLoading(tab);
+      }
+    }).catch(() => settleOnlineUsageLoading(tab));
+  };
   return <View style={styles.logsWindow}>
     <View style={styles.logsToolbar}>
       <View style={styles.logFilterRow}><Text style={styles.toolbarLabel}>{translate("common.filter")}</Text><NativeTextField style={styles.logFilterInput} value={filterDraft} placeholder={translate("logs.filterCurrent")} onChangeText={(filter) => { filterDirty.current = true; setFilterDraft(filter); if (filterTimer.current) clearTimeout(filterTimer.current); filterTimer.current = setTimeout(() => { void dispatch("logs.set_filter", { tab: selected, filter }, "logs"); }, 250); }} accessibilityLabel={translate("common.filter")} /></View>
       <View style={styles.logToolbarSpacer} />
-      <View style={styles.logActionsRow}>{selected === "online-usage" ? <NativePicker labels={onlineUsageSourceLabels} selectedValue={onlineUsageSourceLabels[onlineUsageSourceIndex] ?? ""} disabled={busy || onlineUsageSourceLabels.length === 0} onChange={({ nativeEvent }) => { const source = onlineUsageSourceValues[nativeEvent.index]; if (source !== undefined) refreshOnlineUsage(source); }} style={styles.onlineUsageSourcePicker} /> : null}{selected === "recovery" ? <NativeButton title={translate("logs.clearRecoveryCooldown")} accessibilityLabel={translate("logs.clearRecoveryCooldown")} compact busy={cooldownClearPending} disabled={busy && !cooldownClearPending} onPress={clearCooldowns} style={styles.clearCooldownButton} /> : null}<IconButton label="" symbol={paused ? "play" : "pause"} title={paused ? translate("common.resume") : translate("common.pause")} disabled={busy} onPress={togglePaused} /><IconButton label="" symbol="trash" title={translate("common.clearView")} disabled={busy} onPress={clearLogs} /></View>
+      <View style={styles.logActionsRow}>{selected === "online-usage" ? <NativePicker labels={onlineUsageSourceLabels} selectedValue={onlineUsageSourceIndex >= 0 ? onlineUsageSourceLabels[onlineUsageSourceIndex] ?? "" : ""} disabled={onlineUsageLoading || onlineUsageSourceLabels.length === 0} onChange={({ nativeEvent }) => { const source = onlineUsageSourceValues[nativeEvent.index]; if (source !== undefined) refreshOnlineUsage(source); }} style={styles.onlineUsageSourcePicker} /> : null}{selected === "recovery" ? <NativeButton title={translate("logs.clearRecoveryCooldown")} accessibilityLabel={translate("logs.clearRecoveryCooldown")} compact busy={cooldownClearPending} disabled={busy && !cooldownClearPending} onPress={clearCooldowns} style={styles.clearCooldownButton} /> : null}<IconButton label="" symbol={paused ? "play" : "pause"} title={paused ? translate("common.resume") : translate("common.pause")} disabled={busy} onPress={togglePaused} /><IconButton label="" symbol="trash" title={translate("common.clearView")} disabled={busy} onPress={clearLogs} /></View>
     </View>
     <WindowTabs nativeRef={tabsRef} values={tabOptions} selected={selected} disabled={busy} onSelect={(tab) => {
       if (clearTabRef.current) return;
@@ -9487,9 +9782,43 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
       : <View style={styles.logTableFrame} onLayout={({ nativeEvent }) => setTableWidth(nativeEvent.layout.width)}><NativeTable columns={nativeTableColumns} rows={nativeTableRows} selectedKey={selectedKey} compact preserveColumnWidths scrollTrailingColumnOverflow onSelectionChange={(key) => setSelectedKeys((current) => ({ ...current, [selected]: key }))} onRowDoublePress={(_key, index) => {
         const row = rows[index];
         if (!row) return;
-        void native.showReadOnlyText({ title: translate("logs.originalRecord"), text: row.original, closeLabel: translate("status.close"), language: "json", html: readOnlyCodeEditorHtml(editorMenuLabels(translate)) });
-      }} style={styles.logTable} /></View>
-      : <View style={styles.logEmptySurface}><Text style={styles.logEmptyText}>{clearing || active ? translate("logs.empty") : translate("logs.loading")}</Text></View>}
+        // A usage row's detail is the fields it carries, one per line, because
+        // the reader already reduced them: showing the raw record as JSON
+        // would ask the user to read a station's own key spellings. Every
+        // other tab keeps the original record verbatim.
+        const usageRow = selected === "online-usage";
+        void native.showReadOnlyText({
+          title: usageRow ? translate("logs.onlineUsageDetail") : translate("logs.originalRecord"),
+          text: row.original,
+          closeLabel: translate("status.close"),
+          language: usageRow ? "text" : "json",
+          html: readOnlyCodeEditorHtml(editorMenuLabels(translate)),
+        });
+      }} style={styles.logTable} />{onlineUsageRemaining > 0 ? <View style={styles.logMoreRow}>
+        {/* The button's own busy state draws the app's wheel, so the row does
+            not add a second one beside it. */}
+        <NativeButton
+          title={onlineUsageLoading ? translate("logs.onlineUsageLoadingMore") : translate("logs.onlineUsageLoadMore", { count: Math.min(onlineUsageRemaining, 100) })}
+          accessibilityLabel={translate("logs.onlineUsageLoadMore", { count: Math.min(onlineUsageRemaining, 100) })}
+          compact
+          busy={onlineUsageLoading}
+          disabled={onlineUsageLoading}
+          onPress={loadMoreOnlineUsage}
+        />
+        <Text style={styles.logEmptyText}>{translate("logs.onlineUsageMore", { count: onlineUsageRemaining })}</Text>
+      </View> : null}</View>
+      : <View style={styles.logEmptySurface}>
+        {onlineUsagePrompt && !onlineUsageLoading
+          ? <Text style={styles.logEmptyText}>{translate("logs.onlineUsageSelectSourceHint")}</Text>
+          : <View style={styles.logEmptyStatusRow}>
+            {onlineUsageLoading ? <NativeBusySpinner label={translate("logs.onlineUsageLoading")} /> : null}
+            <Text style={styles.logEmptyText}>{onlineUsageLoading
+              ? translate("logs.onlineUsageLoading")
+              : onlineUsageReason
+                ? onlineUsageReason
+                : clearing || active ? translate("logs.empty") : translate("logs.loading")}</Text>
+          </View>}
+      </View>}
   </View>;
 }
 
@@ -10023,10 +10352,15 @@ function modelProbePresentation(model: UnknownRecord, result: IpcResults["probe"
     original_request: surface.original_request ?? {},
   }));
   const degradation = asRecord(result?.degradation ?? probe.degradation);
+  // A route that answered nowhere was never measured, so its finding is never a
+  // verdict about what answers behind the name: dilution needs a response to
+  // judge (or a run that produced one), and the availability sentence already
+  // names the real failure.
+  const degradationMeasured = availableCount > 0 || Boolean(stringValue(degradation.verdict));
   // The row shows a word; the hover hint spells the same finding out.
-  const degradationLine = probeDegradationLine(degradation, translate);
-  const degradationSentence = probeDegradationLine(degradation, translate, true);
-  // The row reads "3/3 可用; 未降智": a plain count first, then the one finding
+  const degradationLine = degradationMeasured ? probeDegradationLine(degradation, translate) : "";
+  const degradationSentence = degradationMeasured ? probeDegradationLine(degradation, translate, true) : "";
+  // The row reads "3/3 可用; 未注水": a plain count first, then the one finding
   // worth knowing. Routes the staged engine cannot fingerprint carry no
   // degradation wording at all - not "no degradation", nothing.
   const deepTestIncluded = booleanValue(asRecord(model.deep_probe).includes_degradation);
@@ -10042,7 +10376,7 @@ function modelProbePresentation(model: UnknownRecord, result: IpcResults["probe"
     result?.detail ?? "",
     translate("providers.probeOriginalRequest", { request: JSON.stringify(requests, null, 2) }),
   ].filter(Boolean).join("\n\n");
-  // One line: "结果: 3/3 可用; 未降智". The row owns the width, the text
+  // One line: "结果: 3/3 可用; 未注水". The row owns the width, the text
   // ellipsizes instead of wrapping, and the hover hint repeats that line in full
   // before it spells the same finding out.
   const compactSentence = `${translate("providers.probeResultPrefix")} ${compact}`;
@@ -10396,7 +10730,7 @@ inspectorProbeFinding: { flexShrink: 1, minWidth: 0, cursor: "pointer" }, inspec
   // The WebDAV tab is fields of the same grid the other panes draw, so its
   // list is the shared list rather than a form of its own.
   webdavFieldList: { ...SETTINGS_FIELD_LIST }, webdavPasswordInput: { width: SETTINGS_FIELD_VALUE_WIDTH, minHeight: 26 }, webdavFieldUnit: { width: 68, flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
-  logsWindow: { flex: 1, minHeight: 0, gap: 4 }, logsToolbar: { height: 28, minHeight: 28, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, logFilterRow: { width: 360, minWidth: 220, maxWidth: 360, height: 26, flexDirection: "row", alignItems: "center", gap: 8 }, logToolbarSpacer: { flex: 1, minWidth: 0 }, logActionsRow: { height: 26, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, onlineUsageSourcePicker: { width: 240, height: 24, flexShrink: 0 }, clearCooldownButton: { minWidth: 96, height: 22 }, toolbarLabel: { color: systemColors.label, fontSize: UI_FONT_SIZE, flexShrink: 0 }, logFilterInput: { flex: 1, minWidth: 0, height: 26 }, logsTabs: { width: 640, maxWidth: "100%", minWidth: 0, height: 28, flexShrink: 0 }, logTableFrame: { flex: 1, minHeight: 0, minWidth: 0 }, logTable: { flex: 1, minHeight: 0 }, logEmptySurface: { flex: 1, minHeight: 0, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, logEmptyText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textAlign: "center", paddingHorizontal: 20 }, fieldLabel: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "500" }, fieldHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, fieldError: { color: systemColors.red, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, input: { width: "100%", minHeight: 26, color: systemColors.label, fontSize: UI_FONT_SIZE }, inputInvalid: { borderWidth: 1, borderColor: systemColors.red, borderRadius: 4 }, textArea: { minHeight: 108, textAlignVertical: "top", fontFamily: "Menlo" }, compactTextArea: { minHeight: 56, maxHeight: 56 }, secretFieldActions: { flexDirection: "row", alignItems: "center", gap: 6 }, secretFieldButtons: { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 4 }, secretFieldButton: { flex: 1, minWidth: 0, height: 26 }, nativeSecretControl: { flex: 1, minWidth: 0, minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, nativeSecretInput: { flex: 1, minWidth: 86, minHeight: 26 }, rawEditor: { flex: 1, minHeight: 180, gap: 4 }, rawEditorHeader: { minHeight: 28, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }, rawNativeEditorFrame: { flex: 1, minHeight: 160, position: "relative" }, rawNativeEditor: { flex: 1, minHeight: 160 }, rawEditorOverlay: { position: "absolute", left: 0, right: 0, top: 0, bottom: 0, justifyContent: "center", alignItems: "center", gap: 8, paddingHorizontal: 12, backgroundColor: systemColors.textBackground }, rawEditorLoading: { flex: 1, minHeight: 160, justifyContent: "center", paddingHorizontal: 8, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, empty: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, paddingVertical: 12 }, cardHint: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, marginTop: 2 },
+  logsWindow: { flex: 1, minHeight: 0, gap: 4 }, logsToolbar: { height: 28, minHeight: 28, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, logFilterRow: { width: 360, minWidth: 220, maxWidth: 360, height: 26, flexDirection: "row", alignItems: "center", gap: 8 }, logToolbarSpacer: { flex: 1, minWidth: 0 }, logActionsRow: { height: 26, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, onlineUsageSourcePicker: { width: 240, height: 24, flexShrink: 0 }, clearCooldownButton: { minWidth: 96, height: 22 }, toolbarLabel: { color: systemColors.label, fontSize: UI_FONT_SIZE, flexShrink: 0 }, logFilterInput: { flex: 1, minWidth: 0, height: 26 }, logsTabs: { width: 640, maxWidth: "100%", minWidth: 0, height: 28, flexShrink: 0 }, logTableFrame: { flex: 1, minHeight: 0, minWidth: 0 }, logTable: { flex: 1, minHeight: 0 }, logEmptySurface: { flex: 1, minHeight: 0, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, logEmptyText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textAlign: "center", paddingHorizontal: 20 }, logEmptyStatusRow: { flexDirection: "row", alignItems: "center", gap: 8 }, logMoreRow: { minHeight: 28, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, paddingTop: 4 }, fieldLabel: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "500" }, fieldHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, fieldError: { color: systemColors.red, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, input: { width: "100%", minHeight: 26, color: systemColors.label, fontSize: UI_FONT_SIZE }, inputInvalid: { borderWidth: 1, borderColor: systemColors.red, borderRadius: 4 }, textArea: { minHeight: 108, textAlignVertical: "top", fontFamily: "Menlo" }, compactTextArea: { minHeight: 56, maxHeight: 56 }, secretFieldActions: { flexDirection: "row", alignItems: "center", gap: 6 }, secretFieldButtons: { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 4 }, secretFieldButton: { flex: 1, minWidth: 0, height: 26 }, nativeSecretControl: { flex: 1, minWidth: 0, minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, nativeSecretInput: { flex: 1, minWidth: 86, minHeight: 26 }, rawEditor: { flex: 1, minHeight: 180, gap: 4 }, rawEditorHeader: { minHeight: 28, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }, rawNativeEditorFrame: { flex: 1, minHeight: 160, position: "relative" }, rawNativeEditor: { flex: 1, minHeight: 160 }, rawEditorOverlay: { position: "absolute", left: 0, right: 0, top: 0, bottom: 0, justifyContent: "center", alignItems: "center", gap: 8, paddingHorizontal: 12, backgroundColor: systemColors.textBackground }, rawEditorLoading: { flex: 1, minHeight: 160, justifyContent: "center", paddingHorizontal: 8, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, empty: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, paddingVertical: 12 }, cardHint: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, marginTop: 2 },
   nativeSecretMultilineControl: { alignItems: "flex-start", minHeight: 108 },
   nativeSecretTextArea: { minHeight: 108, height: 108, alignSelf: "stretch" },
   secretActionButton: { width: 64, minWidth: 64, height: 26, flexShrink: 0 },

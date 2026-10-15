@@ -1798,5 +1798,45 @@ class CoreOperationsTests(unittest.TestCase):
                 )
 
 
+class ServiceStatusProjectionTests(unittest.TestCase):
+    """What a window's snapshot read is allowed to reuse.
+
+    The service row draws whatever this answers, so a transitional answer must
+    never be served twice: doing that is what left a window stating "starting"
+    for seconds after the proxy had already answered.
+    """
+
+    def test_a_transitional_answer_is_not_served_from_the_cache(self) -> None:
+        from young_router.core.operations import CoreServiceController
+
+        with tempfile.TemporaryDirectory() as directory:
+            controller = CoreServiceController(Path(directory))
+            with mock.patch.object(controller, "_pid", return_value=None), mock.patch.object(
+                controller, "_health", return_value=False
+            ):
+                self.assertEqual("stopped", controller.status(force=False)["state"])
+
+            # The proxy comes up between two window reads.
+            with mock.patch.object(controller, "_pid", return_value=os.getpid()), mock.patch.object(
+                controller, "_health", return_value=True
+            ):
+                self.assertEqual("running", controller.status(force=False)["state"])
+
+    def test_a_settled_answer_is_reused_for_the_open_windows(self) -> None:
+        from young_router.core.operations import CoreServiceController
+
+        with tempfile.TemporaryDirectory() as directory:
+            controller = CoreServiceController(Path(directory))
+            health = mock.Mock(return_value=True)
+            with mock.patch.object(controller, "_pid", return_value=os.getpid()), mock.patch.object(
+                controller, "_health", health
+            ):
+                self.assertEqual("running", controller.status(force=False)["state"])
+                self.assertEqual("running", controller.status(force=False)["state"])
+
+            self.assertEqual(1, health.call_count)
+
+
 if __name__ == "__main__":
+
     unittest.main()

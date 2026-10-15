@@ -587,6 +587,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '? translate("providers.probeInlineAuthError")',
             '? translate("providers.probeInlineUnsupported")',
             'const compactReason = (deepTestIncluded ? degradationLine : "")',
+            'const degradationMeasured = availableCount > 0 || Boolean(stringValue(degradation.verdict));',
+            'const degradationLine = degradationMeasured ? probeDegradationLine(degradation, translate) : "";',
+            'const degradationSentence = degradationMeasured ? probeDegradationLine(degradation, translate, true) : "";',
             'const compact = [availabilityCount, compactReason].filter(Boolean).join("; ");',
             'translate("providers.probeResultPrefix")',
             'styles.inspectorProbeFinding}',
@@ -660,7 +663,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'translate("providers.degradationEngine", { engine: stringValue(engine.name), revision: revision || "?" })',
             'titleWidth="tight"',
             'accessibilityRole="link" accessibilityLabel={probePresentation.compactSentence}',
-            'const degradationSentence = probeDegradationLine(degradation, translate, true);',
+            'const degradationSentence = degradationMeasured ? probeDegradationLine(degradation, translate, true) : "";',
             'const tooltip = joinProbeSummary([compactSentence, availabilitySentence, degradationSentence]);',
             '? translate("providers.probeInlineReady")',
             '? translate("providers.probeInlinePartial")',
@@ -670,6 +673,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '? translate("providers.probeInlineAuthError")',
             '? translate("providers.probeInlineUnsupported")',
             'const compactReason = (deepTestIncluded ? degradationLine : "")',
+            'const degradationMeasured = availableCount > 0 || Boolean(stringValue(degradation.verdict));',
+            'const degradationLine = degradationMeasured ? probeDegradationLine(degradation, translate) : "";',
+            'const degradationSentence = degradationMeasured ? probeDegradationLine(degradation, translate, true) : "";',
             'const compact = [availabilityCount, compactReason].filter(Boolean).join("; ");',
             'translate("providers.probeResultPrefix")',
             'styles.inspectorProbeFinding}',
@@ -694,9 +700,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '"providers.probeAvailabilityCount": "{available}/{total} 可用"',
             '"providers.probeSummaryUnavailable": "不可用"',
             '"providers.probeSummaryUnreachable": "上游未响应"',
-            '"providers.degradationMatched": "未掺假"',
+            '"providers.degradationMatched": "未注水"',
             '"providers.degradationMatchedDetail": "核验通过（{target} 的真伪指纹一致）"',
-            '"providers.degradationMismatch": "疑似掺假"',
+            '"providers.degradationMismatch": "疑似注水"',
             '"providers.degradationMismatchDetail": "核验未通过：{target} 的响应更像 {label}"',
             '"providers.degradationUnknown": "核验存疑"',
             '"providers.degradationUnreachable": "上游未响应"',
@@ -3066,23 +3072,149 @@ class ReactNativeUiParityTests(unittest.TestCase):
         refresh = logs.split("const refreshOnlineUsage = useCallback", 1)[1].split("const refreshOnlineUsageRef", 1)[0]
         self.assertIn('dispatch("logs.refresh_online_usage", { tab, source: sourceId }, "logs")', refresh)
 
-        # The dropdown offers the aggregate read first, then each relay.
+        # The dropdown names the relays and nothing else: there is no aggregate
+        # entry, because the tab reads exactly the station the user picks.
         self.assertIn("const onlineUsageSourceValues = useMemo(", logs)
         self.assertIn('() => ["", ...onlineUsageSources.map((source) => source.id)],', logs)
-        self.assertIn('translate("logs.onlineUsageAllSources")', logs)
+        self.assertIn('translate("logs.onlineUsageSelectSource")', logs)
+        self.assertNotIn('translate("logs.onlineUsageAllSources")', logs)
+        self.assertNotIn('"logs.onlineUsageAllSources"', self.en)
+        self.assertNotIn('"logs.onlineUsageAllSources"', self.zh)
         # It is the shared native picker (the chevron dropdown), and its
         # selection is what scopes the read.
         self.assertIn('<NativePicker labels={onlineUsageSourceLabels}', logs)
         self.assertIn("refreshOnlineUsage(source)", logs)
-        # Entering the tab reads it, so it is never an empty surface waiting on
-        # a dropdown nobody touched.
-        self.assertIn('if (selected === "online-usage") void refreshOnlineUsageRef.current(onlineUsageSourceIdRef.current);', logs)
+        # Entering the tab reads nothing until a relay is chosen, so the surface
+        # can ask for one instead of reporting that no relay had rows.
+        self.assertIn('if (selected === "online-usage" && onlineUsageSourceIdRef.current) {', logs)
+        self.assertIn('translate("logs.onlineUsageSelectSourceHint")', logs)
+        # A remote read reports that it is working: a slow station must not look
+        # like a frozen window.
+        self.assertIn("const [onlineUsageLoadingTab, setOnlineUsageLoadingTab] =", logs)
+        self.assertIn("setOnlineUsageLoadingTab(tab);", logs)
+        self.assertIn("settleOnlineUsageLoading(tab);", logs)
+        # Reading further is a view over rows already fetched, so it never
+        # re-asks the relay, and the strip states how many rows are held back.
+        self.assertIn('dispatch("logs.load_more", { tab }, "logs")', logs)
+        self.assertIn("const onlineUsageRemaining = selected === \"online-usage\" ? numberValue(active?.remaining) : 0;", logs)
+        self.assertIn('translate("logs.onlineUsageMore", { count: onlineUsageRemaining })', logs)
+        self.assertIn("busy={onlineUsageLoading}", logs)
+        # One wait indicator per state, in the content area beside the sentence
+        # it explains (the provider wizard's shape) — never a second wheel in
+        # the toolbar next to the picker. The two are structurally exclusive:
+        # the first read owns the empty surface, a next page owns the row under
+        # the table, and the row under the table only exists once rows do.
+        self.assertEqual(1, logs.count("<NativeBusySpinner"))
+        table_branch, empty_branch = logs.split("styles.logTableFrame", 1)[1].split("styles.logEmptySurface", 1)
+        self.assertIn("<NativeBusySpinner", empty_branch)
+        self.assertNotIn("<NativeBusySpinner", table_branch)
+        # The next-page control reports its own wait through the button, which
+        # is what draws the app's wheel.
+        self.assertIn("styles.logEmptyStatusRow", logs)
+        # The wheel rides the same row as the sentence it explains.
+        self.assertIn(
+            'logEmptyStatusRow: { flexDirection: "row", alignItems: "center", gap: 8 }',
+            self.ui,
+        )
+        # It is the app's own wheel, not a second indicator drawn for this pane.
+        self.assertIn("<NativeBusySpinner label={translate(\"logs.onlineUsageLoading\")} />", logs)
+        self.assertIn(
+            '"logs.onlineUsageLoading": "正在读取中转站用量..."',
+            (ROOT / "rn/packages/shared/src/i18n/zh-Hans.ts").read_text(encoding="utf-8"),
+        )
+        # The wait belongs to the read, and only a current read ends it.
+        self.assertIn("const onlineUsageLoading = onlineUsageLoadingTab === selected;", logs)
+        self.assertIn("if (onlineUsageLoadingTabRef.current !== tab) return;", logs)
+        # A relay that answered no rows says why, instead of the table looking
+        # empty for no reason the user can act on.
+        self.assertIn("const onlineUsageReason =", logs)
+        self.assertIn("stringValue(active?.reason)", logs)
+        self.assertIn("? onlineUsageReason", logs)
 
-        self.assertIn('"logs.onlineUsageAllSources": "All relays"', self.en)
-        self.assertIn('"logs.onlineUsageAllSources": "全部中转站"', self.zh)
+        self.assertIn('"logs.onlineUsageSelectSource": "Select a relay"', self.en)
+        self.assertIn('"logs.onlineUsageSelectSourceHint": "Select a relay above to read its usage."', self.en)
+        self.assertIn('"logs.onlineUsageLoading": "Reading relay usage..."', self.en)
+        self.assertIn('"logs.onlineUsageSelectSource": "选择中转站"', self.zh)
+        self.assertIn('"logs.onlineUsageLoading": "正在读取中转站用量..."', self.zh)
         translation_keys = (ROOT / "rn/packages/shared/src/i18n/types.ts").read_text(encoding="utf-8")
-        for key in ("logs.onlineUsageAllSources", "logs.onlineUsageSource"):
+        for key in (
+            "logs.onlineUsageSelectSource",
+            "logs.onlineUsageSelectSourceHint",
+            "logs.onlineUsageLoading",
+            "logs.onlineUsageSource",
+            "logs.onlineUsageDetail",
+            "logs.promptTokens",
+            "logs.completionTokens",
+            "logs.cacheTokens",
+            "logs.channel",
+            "logs.group",
+            "logs.cost",
+            "logs.tokenPair",
+            "logs.type",
+            "logs.onlineUsageLoadMore",
+            "logs.onlineUsageLoadingMore",
+            "logs.onlineUsageMore",
+        ):
             self.assertIn(f'| "{key}"', translation_keys)
+        self.assertIn('"logs.type": "TYPE"', self.en)
+        self.assertIn('"logs.type": "类型"', self.zh)
+
+        # A row is rendered from the record's own fields, and the relay column
+        # carries the station's full name rather than an alias.
+        renderer = self.ui.split("function renderOnlineUsageRecord", 1)[1].split("function renderLogRecord", 1)[0]
+        self.assertIn('compactLogValue(value.source_label)', renderer)
+        self.assertIn("const family = compactLogValue(value.source_family);", renderer)
+        self.assertIn("[translate(\"logs.type\"), family],", renderer)
+        self.assertNotIn('value.source_label) || compactLogValue(value.source)', renderer)
+        self.assertIn('if (tab === "online-usage") return renderOnlineUsageRecord(record, value, translate);', self.ui)
+        columns = self.ui.split('if (tab === "online-usage") return [', 1)[1].split("];", 1)[0]
+        # The relay column names the station, and the token pair owns the
+        # leftover width so a large `in / out` pair is never clipped.
+        # The relay's name is its own column, and the control plane that
+        # answered is a separate narrow one: fusing them made the source column
+        # too wide and named a type as if it were the relay.
+        # The relay's name stops at its own ceiling, so a short name does not
+        # stretch across the window; the model column takes the slack.
+        self.assertIn('{ label: translate("logs.source"), width: 118, maxWidth: 168, flex: true, value: (row) => row.source }', columns)
+        self.assertIn('{ label: translate("logs.type"), width: 64, value: (row) => row.family }', columns)
+        self.assertIn('{ label: translate("providers.publicModel"), width: 164, flex: true, value: (row) => row.model }', columns)
+        self.assertIn('{ label: translate("logs.tokenPair"), width: 128, value: (row) => row.tokens }', columns)
+        # The set must total less than the pane's own width, so a row is read
+        # without scrolling sideways. The timestamp is the widest fixed column,
+        # and only the relay column absorbs what is left over.
+        widths = [168, 64, 164, 128, 62]
+        self.assertLess(sum(widths) + 118, 860)
+        # Several flexible columns share one pool of leftover width, so a data
+        # column may absorb only up to its ceiling and the rest is the detail
+        # column's: giving each flexible column `remaining` would hand the
+        # table more width than it has and put the scroller back.
+        self.assertIn("let pool = remaining;", self.ui)
+        self.assertIn("pool -= width;", self.ui)
+        # The row keeps its timestamp, and the fields a summary endpoint leaves
+        # empty share one detail column instead of standing blank beside it.
+        self.assertIn("    time,", columns)
+        # The detail column is declared at the shared flex floor, so the flex
+        # rule gives it exactly that width and the table never scrolls sideways.
+        # No detail column: the row's own double-click states every field, and
+        # a second flexible column is what pushed the table past its frame.
+        self.assertNotIn('{ ...detail, width: LOG_DETAIL_COLUMN_FLOOR }', columns)
+        self.assertIn('{ label: translate("logs.duration"), width: 62, value: (row) => row.duration }', columns)
+        # The flex floor belongs to the detail column alone, so a data column
+        # shrinks to its own declared width instead of to the text floor.
+        self.assertIn("column.detailFlex ? LOG_DETAIL_COLUMN_FLOOR : column.width", self.ui)
+        self.assertIn("flex: true, detailFlex: true, value: (row: RenderedLogRecord) => row.detail", self.ui)
+        # The status column is drawn only when a row carries one: a summary
+        # endpoint has no per-request outcome to report.
+        self.assertIn('...(hasStatus ? [{ ...status, width: 64 }] : []),', columns)
+        self.assertIn("function logColumns(tab: LogTab, translate: Translate, hasStatus = true): LogColumn[] {", self.ui)
+        # The row's own fields travel in the detail, one per line, rather than
+        # as a re-splitting of the joined string.
+        self.assertIn("const details = detailFields.flatMap", renderer)
+        self.assertIn("original: details.join(\"\\n\"),", renderer)
+        # Double-click states the row's labelled fields, not the raw record.
+        self.assertIn('const usageRow = selected === "online-usage";', logs)
+        self.assertIn('title: usageRow ? translate("logs.onlineUsageDetail") : translate("logs.originalRecord"),', logs)
+        self.assertIn('language: usageRow ? "text" : "json",', logs)
 
         # The view's own shape carries the selection, and the IPC schema beside
         # it declares the same two fields: the contract moves with the client.
@@ -3094,6 +3226,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('"logSource"', schema)
         self.assertIn('"sources": {"type": "array", "maxItems": 32', schema)
         self.assertIn('"source_id": {"type": "string", "maxLength": 64}', schema)
+        self.assertIn('"reason": {"type": "string", "maxLength": 512}', schema)
+        self.assertIn("reason?: string;", types)
 
     def test_settings_disk_polling_ignores_unrelated_snapshot_revisions(self) -> None:
         self.assertIn("const latestSnapshot = useRef<CoreSnapshot | undefined>(snapshot);", self.ui)
@@ -3825,7 +3959,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
     def test_workbuddy_provider_types_borrow_the_desktop_app_sign_in(self) -> None:
         """WorkBuddy keeps its sign-in and its model catalog in its own app."""
         for marker in (
-            'type WizardType = "api" | "openai" | "claude" | "workbuddy" | "workbuddyAI";',
+            'type WizardType = "api" | "openai" | "claude" | "workbuddy" | "workbuddyAI" | "opencode2dsh";',
             'const isWorkBuddyType = providerType === "workbuddy" || providerType === "workbuddyAI";',
             'const workbuddyAuthKind: ServiceProviderKind = providerType === "workbuddyAI" ? "workbuddy_ai_login" : "workbuddy_login";',
             'dispatchWithOutcome("workbuddy_status", { refresh }, "providers_models", true);',
@@ -3902,6 +4036,44 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('"providers.wizard.workbuddySignInRequired": "请先在 WorkBuddy 桌面 App 中登录。"', self.zh)
         self.assertIn('"providers.serviceLinks": "服务商关联"', self.zh)
         self.assertIn('"providers.wizard.pathCustomKey": "自定义 API 密钥"', self.zh)
+
+    def test_the_opencode_free_lane_is_offered_without_an_account_step(self) -> None:
+        """OpenCode Zen's free lane has no sign-in, so the wizard asks nothing.
+
+        The lane authenticates itself and its free roster is imported by the
+        create, so the type appears in the picker, the keys step only states
+        that, and 完成 mints the entry from the name alone.  Its name carries
+        the "Free" qualifier, because the same endpoint refuses a paid model
+        under the anonymous credential — an unqualified name would read as an
+        account for Zen's paid catalog.
+        """
+
+        for marker in (
+            '{ type: "opencode2dsh", label: translate("providers.type.opencode2dsh") },',
+            'const isOpenCode2DSHType = providerType === "opencode2dsh";',
+            'if (isOpenCode2DSHType) {',
+            'kind: "opencode2dsh_login",',
+            'translate("providers.wizard.opencode2dshHint")',
+            '"opencode2dsh_status",',
+            '"opencode2dsh_models",',
+            # The model step states that the roster arrives with the create,
+            # instead of showing an empty picker that was never going to fill.
+            'isOpenCode2DSHType ? <View style={styles.providerWizardFormSection}>',
+            'translate("providers.wizard.opencode2dshModelsHint")',
+            # Deleting the entry goes through the account-backed action, which
+            # is the only one Core accepts for a login provider; routing it to
+            # the ordinary provider action is an entry the user cannot remove.
+            'const action = isLoginProviderKind(kind)',
+        ):
+            self.assert_ui_has(marker)
+        # The keys step states the lane and asks for no secret or picker.
+        wizard = self.ui.split("function ProviderSetupWizard(", 1)[1].split("function ProviderWorkspace(", 1)[0]
+        lane_keys = wizard.split("isOpenCode2DSHType ? <>", 1)[1].split("</> : isWorkBuddyType ? <>", 1)[0]
+        self.assertNotIn("NativeSecureTextInput", lane_keys)
+        self.assertNotIn("NativePicker", lane_keys)
+        # Both languages name the lane for the free tier it actually reaches.
+        self.assertIn('"providers.type.opencode2dsh": "OpenCode Zen Free"', self.en)
+        self.assertIn('"providers.type.opencode2dsh": "OpenCode Zen 免费版"', self.zh)
 
     def test_a_workbuddy_entry_states_the_account_and_its_credit(self) -> None:
         """Opening a WorkBuddy provider shows the积分, not just the account.
@@ -3989,7 +4161,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '  | "openai_login"\n'
             '  | "claude_login"\n'
             '  | "workbuddy_login"\n'
-            '  | "workbuddy_ai_login";',
+            '  | "workbuddy_ai_login"\n'
+            '  | "opencode2dsh_login";',
             types,
         )
         self.assertIn("auth_status?: ProviderAuthStatus;", types)
@@ -4008,7 +4181,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         ):
             self.assert_ui_has(marker)
         # Deleting routes through the kind-specific core action.
-        self.assert_ui_has('const action = kind === "openai" || kind === "claude" || workbuddyProviderIDFor(kind) !== undefined')
+        self.assert_ui_has('const action = isLoginProviderKind(kind)')
         self.assert_ui_has('? "service_provider.delete"')
         self.assert_ui_has(': "provider.delete";')
         # Deleting the last provider of a station also removes the station
@@ -4227,7 +4400,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # that clears it; a window re-reads while it draws one, so a replacement
         # that outlives the request budget cannot leave the pane stating 启动中
         # with no control and no correction.
-        self.assertIn("const SERVICE_STATE_RECONCILE_MS = 5_000;", self.ui)
+        self.assertIn("const SERVICE_STATE_RECONCILE_MS = 1_000;", self.ui)
         self.assertIn('if (snapshot.service.state !== "starting") return;', self.ui)
         self.assertIn("const timer = setInterval(() => { void refreshSnapshot().catch(() => undefined); }, SERVICE_STATE_RECONCILE_MS);", self.ui)
         self.assertIn("return () => clearInterval(timer);", self.ui)
@@ -4347,7 +4520,6 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'translate("logs.duration")',
             'translate("logs.tokenCount")',
             "const columns = useMemo(",
-            "() => fitLogColumns(logColumns(selected, translate), tableWidth)",
             "const rows = useMemo(",
             "() => renderLogRecords(clearing ? [] : (active?.records ?? []), selected, translate)",
             "const active = activeState?.tab === selected ? activeState.log : undefined;",
@@ -4676,7 +4848,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # relay messages carry ("请点击刷新资源") therefore point at a button the
         # row shows once there is a session to refresh.
         self.assertIn('{selectedLoginState === "signed_in" ? <NativeButton title={translate("relay.refreshResources")} symbol="refresh" compact busy={pendingAction === "refresh"} disabled={controlsBusy && pendingAction !== "refresh"} onPress={() => { void refreshSelected(); }} /> : null}', relay)
-        self.assertIn('{selectedLoginState === "signed_in" ? <NativeButton title={translate("relay.groupManager")} compact disabled={controlsBusy || !native.showGroupManager} onPress={() => { void openGroupManager(); }} /> : null}', relay)
+        self.assertIn('{selectedLoginState === "signed_in" ? <NativeButton title={translate("relay.groupManager")} titleWidth="tight" compact disabled={controlsBusy || !native.showGroupManager} onPress={() => { void openGroupManager(); }} /> : null}', relay)
         self.assertIn('title={translate("relay.refreshResources")} symbol="refresh" compact busy={pendingAction === "refresh"}', relay)
         self.assertIn('const refreshSelected = async (): Promise<void> => {', relay)
         self.assertIn('await refreshAccountResources({ id: account.id }, { force: true });', relay)
@@ -5704,13 +5876,25 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertEqual(1, wizard.count("setKeyReady(false);"))
         self.assertIn("resetStagedKeyField();", wizard)
         # 下一步 reads the answered value, never the flag the same press would
-        # have left stale — and it reads it *after* the step has changed, so the
-        # press itself never waits on an HTTP round trip.
+        # have left stale.
         self.assertIn("const advanceToModels = async (keyFlush: Promise<boolean>): Promise<void> => {", wizard)
-        self.assertIn("pendingKeyFlush.current = flushStagedKey();", wizard)
-        self.assertEqual(2, wizard.count("void advanceToModels(pendingKeyFlush.current)"))
-        self.assertIn("void advanceToModels(pendingKeyFlush.current).catch(() => {", wizard)
-        self.assertIn('advanceStepToModel();\n        void advanceToModels(pendingKeyFlush.current)', wizard)
+        # The wait settles *before* the step moves.  密钥值 is mounted by the
+        # keys step alone and its native view is recycled on the way out, which
+        # drops the staging answer; a wait that outlived its field never
+        # resolved, so the model step spun on 正在自动获取可用模型 forever —
+        # for every provider, including ones whose endpoint answers.
+        self.assertNotIn("pendingKeyFlush", wizard)
+        self.assertEqual(2, wizard.count("void advanceToModels(flushStagedKey())"))
+        self.assertIn("void advanceToModels(flushStagedKey()).catch(() => {", wizard)
+        # The step change is the last thing the settle does, after the key is
+        # answered and its rename is staged.
+        self.assertLess(
+            wizard.index("const keyPresent = await keyFlush.catch(() => false);"),
+            wizard.index("advanceStepToModel();"),
+        )
+        # The wait is stated on the step that owns the field, because it now
+        # happens there instead of being hidden behind an instant step change.
+        self.assertIn("setProcessing(true);", wizard)
         # One press must advance one step: 下一步 is the window's default button,
         # so its Return key equivalent can deliver the action a second time and
         # would otherwise walk 供应商 → 密钥 → 模型 and skip 密钥.
