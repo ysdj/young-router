@@ -77,11 +77,33 @@ class MacOSProxyLauncherTests(unittest.TestCase):
         uvicorn_subprocess = SimpleNamespace(spawn=None)
         forkserver = object()
         settle = mock.Mock()
-        state_module = SimpleNamespace(settle_stale_recent_requests=settle)
+        # The order of these steps is the launcher's startup budget: the
+        # forkserver's preload is the complete LiteLLM runtime, and the app
+        # modules the launcher then imports reach that same runtime.  Starting
+        # the preload first is what lets the two imports overlap.
+        order: list[str] = []
+
+        class LauncherImport:
+            """Stub module that notes when the launcher's import reaches it."""
+
+            def __init__(self, name: str, value: object) -> None:
+                self._name = name
+                self._value = value
+
+            def __getattr__(self, item: str) -> object:
+                if item.startswith("__"):
+                    raise AttributeError(item)
+                order.append(self._name)
+                return self._value
+
         # Stub the launcher's base import so the assertion below pins the
         # default WebSocket frame limit without importing the real LiteLLM
         # runtime in this unit test.
-        base_module = SimpleNamespace(_websocket_max_frame_bytes=lambda: 67108864)
+        state_module = LauncherImport("state", settle)
+        base_module = LauncherImport("base", lambda: 67108864)
+
+        def prime_forkserver() -> None:
+            order.append("prime")
 
         def import_module(name: str) -> object:
             if name == "uvicorn":
@@ -100,6 +122,8 @@ class MacOSProxyLauncherTests(unittest.TestCase):
         ) as get_context, mock.patch.object(
             macos_proxy.importlib, "import_module", side_effect=import_module
         ), mock.patch.object(
+            macos_proxy, "_prime_forkserver", side_effect=prime_forkserver
+        ) as prime, mock.patch.object(
             macos_proxy,
             "_system_proxy_snapshot",
             return_value={"source": "macos", "proxies": {}, "settings": {}},
@@ -128,6 +152,10 @@ class MacOSProxyLauncherTests(unittest.TestCase):
         )
         set_preload.assert_called_once_with(["litellm.proxy.proxy_server"])
         get_context.assert_called_once_with("forkserver")
+        prime.assert_called_once_with()
+        # The preload starts before the launcher's own imports, which is what
+        # lets the two run at once instead of one after the other.
+        self.assertEqual(["prime", "base", "state"], order[:3])
         self.assertIs(forkserver, uvicorn_subprocess.spawn)
         # A new proxy process owns no in-flight requests, so it closes rows an
         # earlier process left unfinished before the workers start serving.

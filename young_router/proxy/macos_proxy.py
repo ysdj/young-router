@@ -86,6 +86,17 @@ def _system_proxy_snapshot() -> dict[str, Any]:
     }
 
 
+def _prime_forkserver() -> None:
+    """Start the forkserver so its preload imports while this process imports.
+
+    ``ensure_running`` returns as soon as the process exists; the preload is
+    read from the connection the first worker spawn opens, so a spawn later in
+    this same process reuses the forkserver started here.
+    """
+
+    multiprocessing.forkserver._forkserver.ensure_running()
+
+
 def run(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     os.environ["WORKER_CONFIG"] = json.dumps(
@@ -100,6 +111,14 @@ def run(argv: list[str] | None = None) -> int:
     multiprocessing.set_forkserver_preload([PROXY_MODULE])
     uvicorn_subprocess = importlib.import_module("uvicorn._subprocess")
     uvicorn_subprocess.spawn = multiprocessing.get_context("forkserver")
+    # Start the forkserver now, before the imports below.  Its preload is the
+    # complete LiteLLM runtime, and this launcher's own imports reach that same
+    # runtime through the app's modules; starting the preload first lets the two
+    # run at once instead of one after the other, which is where a restart's
+    # seconds go.  Nothing has been forked yet and no worker accepts anything
+    # until uvicorn starts them, so the work after this line is still finished
+    # before the first request can be served.
+    _prime_forkserver()
     uvicorn = importlib.import_module("uvicorn")
     from .base import _websocket_max_frame_bytes
     from .state import settle_stale_recent_requests
