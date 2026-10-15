@@ -19,15 +19,18 @@ import threading
 import time
 from urllib.parse import urlparse
 
-# ``state.py`` takes this name from here, and Windows has no ``fcntl``: the
-# advisory lock it guards is a cooperative one between this app's own
-# processes, and the platform without it already runs a single Core launcher.
+# Windows has no ``fcntl``: the advisory lock it guards is a cooperative one
+# between this app's own processes, and the platform without it already runs a
+# single Core launcher.  Each module that locks takes the name this way rather
+# than through this module, because ``state.py`` is imported by the launcher,
+# which must not load the workers' runtime to reach a name like this one.
 try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows does not provide POSIX flock.
     fcntl = None  # type: ignore[assignment]
 
 from .. import browser_identity as _browser_identity
+from . import launcher_settings as _launcher_settings
 from ..lifecycle import proxy_drain_grace_seconds
 from ..values import int_or_none as _int_or_none
 from typing import Any, AsyncIterator, Dict, List, Optional, Union
@@ -65,9 +68,7 @@ _STREAM_KEEPALIVE_INTERVAL_SECONDS_ENV = (
 )
 _STREAM_KEEPALIVE_DEFAULT_INTERVAL_SECONDS = 15.0
 _SESSION_DEPLOYMENT_AFFINITY_ENV = "YOUNG_ROUTER_SESSION_DEPLOYMENT_AFFINITY"
-_SESSION_DEPLOYMENT_AFFINITY_FILE_ENV = (
-    "YOUNG_ROUTER_SESSION_DEPLOYMENT_AFFINITY_FILE"
-)
+_SESSION_DEPLOYMENT_AFFINITY_FILE_ENV = _launcher_settings._SESSION_DEPLOYMENT_AFFINITY_FILE_ENV
 _SESSION_DEPLOYMENT_AFFINITY_MAX_ENTRIES = 512
 _SESSION_DEPLOYMENT_AFFINITY_TTL_SECONDS = 7 * 24 * 3600.0
 _STREAM_START_TIMEOUT_SECONDS_ENV = "YOUNG_ROUTER_STREAM_START_TIMEOUT_SECONDS"
@@ -80,32 +81,10 @@ _HEAVY_REPLAY_STREAM_START_THRESHOLD_BYTES_ENV = (
     "YOUNG_ROUTER_HEAVY_REPLAY_STREAM_START_THRESHOLD_BYTES"
 )
 _HEAVY_REPLAY_STREAM_START_DEFAULT_THRESHOLD_BYTES = 1024.0 * 1024.0
-_WEBSOCKET_MAX_FRAME_BYTES_ENV = "YOUNG_ROUTER_WEBSOCKET_MAX_FRAME_BYTES"
-_WEBSOCKET_MAX_FRAME_DEFAULT_BYTES = 64.0 * 1024.0 * 1024.0
+_WEBSOCKET_MAX_FRAME_BYTES_ENV = _launcher_settings._WEBSOCKET_MAX_FRAME_BYTES_ENV
+_WEBSOCKET_MAX_FRAME_DEFAULT_BYTES = _launcher_settings._WEBSOCKET_MAX_FRAME_DEFAULT_BYTES
+_websocket_max_frame_bytes = _launcher_settings._websocket_max_frame_bytes
 _WEBSOCKET_FRAME_LIMIT_PATCH_ATTR = "_young_router_websocket_frame_limit_patch"
-
-
-def _websocket_max_frame_bytes() -> int:
-    """Maximum inbound WebSocket frame size for the managed proxy.
-
-    Codex sends each Responses turn request -- including the immutable replay
-    prefix with its signed image bytes -- as one text frame.  uvicorn's default
-    16 MiB limit closes such connections with code 1009 before the request
-    reaches the pipeline, which Codex reports as ``websocket closed by server
-    before response.completed`` followed by its reconnect ladder.
-    """
-
-    import os
-
-    raw = os.getenv(_WEBSOCKET_MAX_FRAME_BYTES_ENV, "").strip()
-    if raw:
-        try:
-            parsed = int(raw)
-        except ValueError:
-            parsed = 0
-        if parsed > 0:
-            return parsed
-    return int(_WEBSOCKET_MAX_FRAME_DEFAULT_BYTES)
 
 
 _UVICORN_SHUTDOWN_PATCH_ATTR = "_young_router_shutdown_patch"
@@ -279,8 +258,8 @@ _DEPLOYMENT_COOLDOWN_ORDINARY_ENABLED_ENV = (
 _DEPLOYMENT_COOLDOWN_COMPACTION_ENABLED_ENV = (
     "YOUNG_ROUTER_DEPLOYMENT_COOLDOWN_COMPACTION_ENABLED"
 )
-_DEPLOYMENT_COOLDOWN_FILE_ENV = "YOUNG_ROUTER_DEPLOYMENT_COOLDOWN_FILE"
-_ROUTE_RECOVERY_STATE_FILE_ENV = "YOUNG_ROUTER_ROUTE_RECOVERY_STATE_FILE"
+_DEPLOYMENT_COOLDOWN_FILE_ENV = _launcher_settings._DEPLOYMENT_COOLDOWN_FILE_ENV
+_ROUTE_RECOVERY_STATE_FILE_ENV = _launcher_settings._ROUTE_RECOVERY_STATE_FILE_ENV
 _DEPLOYMENT_COOLDOWN_DEFAULT_FAILURES = 2
 _DEPLOYMENT_COOLDOWN_DEFAULT_SECONDS = 300.0
 _DEPLOYMENT_COOLDOWN_ORDINARY_DEFAULT_ENABLED = True
@@ -680,7 +659,7 @@ _ROUTE_TRACE_PREVIEW_CHARS_ENV = "YOUNG_ROUTER_ROUTE_TRACE_PREVIEW_CHARS"
 _ROUTE_TRACE_PREVIEW_DEFAULT_CHARS = 2000
 _ROUTE_TRACE_PREVIEW_MAX_CHARS = 2000
 _ROUTE_TRACE_LIST_SCAN_ITEMS = 40
-_RECENT_REQUESTS_LOG_ENV = "LITELLM_RECENT_REQUESTS_LOG"
+_RECENT_REQUESTS_LOG_ENV = _launcher_settings._RECENT_REQUESTS_LOG_ENV
 _EXTERNAL_WEB_SEARCH_MAX_RESULTS_ENV = "YOUNG_ROUTER_WEB_SEARCH_MAX_RESULTS"
 _EXTERNAL_WEB_SEARCH_READ_CHARS_ENV = "YOUNG_ROUTER_WEB_SEARCH_READ_CHARS"
 _EXTERNAL_WEB_FETCH_TIMEOUT_ENV = "YOUNG_ROUTER_WEB_FETCH_TIMEOUT_SECONDS"

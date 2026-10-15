@@ -111,16 +111,14 @@ def run(argv: list[str] | None = None) -> int:
     multiprocessing.set_forkserver_preload([PROXY_MODULE])
     uvicorn_subprocess = importlib.import_module("uvicorn._subprocess")
     uvicorn_subprocess.spawn = multiprocessing.get_context("forkserver")
-    # Start the forkserver now, before the imports below.  Its preload is the
-    # complete LiteLLM runtime, and this launcher's own imports reach that same
-    # runtime through the app's modules; starting the preload first lets the two
-    # run at once instead of one after the other, which is where a restart's
-    # seconds go.  Nothing has been forked yet and no worker accepts anything
-    # until uvicorn starts them, so the work after this line is still finished
-    # before the first request can be served.
+    # Start the forkserver now: its preload is the complete LiteLLM runtime,
+    # and it is the launcher's whole startup budget.  Everything this process
+    # imports below is deliberately kept out of that runtime (see
+    # ``launcher_settings``), so the preload runs while uvicorn is prepared and
+    # nothing has been forked or served yet when this line returns.
     _prime_forkserver()
     uvicorn = importlib.import_module("uvicorn")
-    from .base import _websocket_max_frame_bytes
+    from .launcher_settings import _websocket_max_frame_bytes
     from .state import settle_stale_recent_requests
 
     # Every new proxy process starts with an empty in-flight registry, so any

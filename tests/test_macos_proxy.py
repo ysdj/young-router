@@ -4,12 +4,16 @@ import json
 import multiprocessing
 import os
 from pathlib import Path
+import subprocess
 import sys
 from types import SimpleNamespace
 import unittest
 from unittest import mock
 
 from young_router.proxy import macos_proxy
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class MacOSProxyLauncherTests(unittest.TestCase):
@@ -96,11 +100,11 @@ class MacOSProxyLauncherTests(unittest.TestCase):
                 order.append(self._name)
                 return self._value
 
-        # Stub the launcher's base import so the assertion below pins the
-        # default WebSocket frame limit without importing the real LiteLLM
-        # runtime in this unit test.
+        # Stub the launcher's own modules so the assertions below pin the
+        # default WebSocket frame limit and the settle call without importing
+        # the real modules in this unit test.
         state_module = LauncherImport("state", settle)
-        base_module = LauncherImport("base", lambda: 67108864)
+        settings_module = LauncherImport("launcher_settings", lambda: 67108864)
 
         def prime_forkserver() -> None:
             order.append("prime")
@@ -114,7 +118,10 @@ class MacOSProxyLauncherTests(unittest.TestCase):
 
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.dict(
             sys.modules,
-            {"young_router.proxy.state": state_module, "young_router.proxy.base": base_module},
+            {
+                "young_router.proxy.state": state_module,
+                "young_router.proxy.launcher_settings": settings_module,
+            },
         ), mock.patch.object(
             multiprocessing, "set_forkserver_preload", create=True
         ) as set_preload, mock.patch.object(
@@ -153,9 +160,11 @@ class MacOSProxyLauncherTests(unittest.TestCase):
         set_preload.assert_called_once_with(["litellm.proxy.proxy_server"])
         get_context.assert_called_once_with("forkserver")
         prime.assert_called_once_with()
-        # The preload starts before the launcher's own imports, which is what
-        # lets the two run at once instead of one after the other.
-        self.assertEqual(["prime", "base", "state"], order[:3])
+        # The preload starts before the launcher's own imports, and those
+        # imports are the two modules that reach no further than the standard
+        # library, which is what keeps the runtime out of the launcher's own
+        # startup budget.
+        self.assertEqual(["prime", "launcher_settings", "state"], order[:3])
         self.assertIs(forkserver, uvicorn_subprocess.spawn)
         # A new proxy process owns no in-flight requests, so it closes rows an
         # earlier process left unfinished before the workers start serving.
@@ -169,6 +178,30 @@ class MacOSProxyLauncherTests(unittest.TestCase):
             ws_max_size=67108864,
             timeout_graceful_shutdown=14400.0,
         )
+
+    def test_launcher_modules_do_not_import_the_workers_runtime(self) -> None:
+        """The launcher's own imports must stay out of the workers' runtime.
+
+        Its startup budget is the forkserver's preload; importing that same
+        runtime in the launcher as well is what made a restart pay for it
+        twice.
+        """
+
+        script = (
+            "import sys, young_router.proxy.launcher_settings, young_router.proxy.state; "
+            "print('litellm' in sys.modules)"
+        )
+        env = {**os.environ, "PYTHONPATH": str(ROOT)}
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=str(ROOT),
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual("False", result.stdout.strip(), result.stderr[-400:])
 
 
 if __name__ == "__main__":

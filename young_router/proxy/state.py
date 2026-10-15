@@ -1,28 +1,32 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
+import os
 import threading
+import time
 from collections.abc import Mapping
+from datetime import datetime, timezone
+from typing import Any, Optional
 
-from . import trace as _trace_module
+# Windows has no ``fcntl``: the advisory lock it guards here is a cooperative
+# one between this app's own processes, and the platform without it already
+# runs a single Core launcher.  Taken with the same guard the other shipped
+# modules use, because this module is imported by the launcher, which must not
+# reach the workers' runtime for a name like this one.
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows does not provide POSIX flock.
+    fcntl = None  # type: ignore[assignment]
+
 from ..atomic_io import atomic_write_text
 from ..log_rotation import append_bounded_log, log_max_bytes
-
-
-from .base import (
-    Any,
-    Optional,
+from .launcher_settings import (
     _DEPLOYMENT_COOLDOWN_FILE_ENV,
     _RECENT_REQUESTS_LOG_ENV,
     _ROUTE_RECOVERY_STATE_FILE_ENV,
     _SESSION_DEPLOYMENT_AFFINITY_FILE_ENV,
-    datetime,
-    fcntl,
-    json,
-    os,
-    time,
-    timezone,
 )
 
 
@@ -409,6 +413,10 @@ def _append_recent_request(record: dict[str, Any]) -> Optional[str]:
 def _safe_log_text(value: Any, *, limit: int = 180) -> Optional[str]:
     if value is None:
         return None
+    # Imported here: this module is loaded by the launcher, which must not pull
+    # the workers' runtime into its own startup.
+    from . import trace as _trace_module
+
     text = _trace_module._sanitize_trace_text(str(value), limit=limit)
     return text or None
 
