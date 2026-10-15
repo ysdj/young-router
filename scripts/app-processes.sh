@@ -13,15 +13,15 @@
 #   app-processes.sh tree  <app-path>    the bundle's host process and every
 #                                        descendant of it, one pid per line
 #   app-processes.sh hosts <app-path>    the bundle's host processes alone
-#   app-processes.sh core  <app-path>    the Core: the bundle's interpreter
-#                                        running ``-m young_router.core``
-#                                        directly under a host process
+#   app-processes.sh stop  <pid>...      signal them together and wait for them
+#                                        to be gone; survivors are printed and
+#                                        the exit status is 1
 #   app-processes.sh alive <pid>...      those of them that are still running,
 #                                        one pid per line
 set -uo pipefail
 
 usage() {
-  echo "usage: $(basename "$0") tree <app-path> | alive <pid>..." >&2
+  echo "usage: $(basename "$0") tree <app-path> | hosts <app-path> | stop <pid>... | alive <pid>..." >&2
   exit 2
 }
 
@@ -60,28 +60,30 @@ descendants() {
   done
 }
 
-# The Core is the bundle's interpreter running ``-m young_router.core``, started
-# by the host.  Both halves are required.  The interpreter path alone would also
-# select the proxy's launcher -- the same interpreter running
-# ``-m young_router.proxy.macos_proxy`` -- which outlives the listeners by half a
-# minute while it drains the workers it started, and waiting for *that* is most
-# of a restart.  The marker alone would select any process that mentions the
-# module, which is the name-matching mistake this helper exists to avoid.
-core_pids() {
-  local prefix="$1/Contents/Resources/Core/runtime/python/"
-  ps -axo pid=,ppid=,command= | awk -v prefix="$prefix" -v hosts="$(host_pids "$1" | tr '\n' ' ')" '
-    BEGIN {
-      split(hosts, host, " ")
-      for (index_ in host) if (host[index_] != "") parented[host[index_]] = 1
-    }
-    {
-      pid = $1
-      ppid = $2
-      command = $0
-      sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+/, "", command)
-      if (parented[ppid] && index(command, prefix) == 1 && command ~ / -m young_router\.core( |$)/) print pid
-    }
-  '
+# Replacing a bundle's processes is one policy for every entry point, so it
+# lives here beside the rules that decide which processes those are: the
+# captured pids are signalled together, in one shot, and the caller waits only
+# for them to be gone.  Asking the host to quit first and letting it unwind its
+# own tree -- what this replace used to wait on, with a grace budget -- only
+# postponed the replacement: measured on this app, the host's quit path and the
+# Core's shutdown need ten to thirty seconds under load, while the loopback
+# listener the replacement needs is released in the same instant the processes
+# holding it die.  A caller with survivors to report gets them on stdout and a
+# non-zero status; SIGKILL cannot be escalated further, so there is no ladder.
+stop() {
+  local pid tries
+  [[ $# -ge 1 ]] || usage
+  for pid in "$@"; do
+    [[ -n "$pid" ]] || continue
+    kill -KILL "$pid" 2>/dev/null || true
+  done
+  tries="${APP_PROCESSES_STOP_POLLS:-100}"
+  for _ in $(seq 1 "$tries"); do
+    [[ -n "$(alive "$@")" ]] || return 0
+    sleep 0.05
+  done
+  alive "$@"
+  return 1
 }
 
 tree() {
@@ -118,10 +120,9 @@ case "$1" in
     [[ -n "${1:-}" ]] || usage
     host_pids "$1"
     ;;
-  core)
+  stop)
     shift
-    [[ -n "${1:-}" ]] || usage
-    core_pids "$1"
+    stop "$@"
     ;;
   alive)
     shift

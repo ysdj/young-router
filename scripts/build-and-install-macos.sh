@@ -19,6 +19,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RN_ROOT="$ROOT/rn"
 PROJECT_ROOT="$ROOT"
 APP_ROOT="$RN_ROOT/apps/macos"
+# The stop this installer performs is the same one a restart performs, so it
+# calls the same helper rather than carrying its own copy of the policy.
+APP_PROCESSES="$ROOT/scripts/app-processes.sh"
+if [[ ! -x "$APP_PROCESSES" ]]; then
+  echo "Young Router: $APP_PROCESSES is missing; not touching a running app" >&2
+  exit 1
+fi
 DEVELOPER_DIR="${DEVELOPER_DIR:-}"
 UV_BIN="${LITELLM_UV_BIN:-$(command -v uv 2>/dev/null || true)}"
 RUNTIME_SOURCE="${YOUNG_ROUTER_CORE_RUNTIME_SOURCE:-${LITELLM_RELEASE_RUNTIME_SOURCE:-}}"
@@ -58,13 +65,9 @@ RESTART_ARMED=0
 OLD_PIDS=""
 NEW_PIDS=""
 START_TIMEOUT_SECONDS="${YOUNG_ROUTER_START_TIMEOUT_SECONDS:-70}"
+# How long the stop below may spend waiting for a killed process to be gone
+# before it reports what survived; a SIGKILL cannot be escalated further.
 STOP_TIMEOUT_SECONDS="${YOUNG_ROUTER_STOP_TIMEOUT_SECONDS:-20}"
-STOP_GRACE_POLLS=20
-# How long the replacement host may wait for the running app to finish the
-# turns it already accepted before the stale tree is forced down.  It matches
-# the Core's own proxy-drain budget (same variable, same default) so the two
-# layers agree on when a slow drain has become a wedged one.
-STOP_DRAIN_SECONDS="${YOUNG_ROUTER_PROXY_DRAIN_SECONDS:-14400}"
 REQUIRED_HEALTH_CHECKS=3
 LAUNCH_RETRY_SECONDS=1
 LAST_STARTUP_STATE=""
@@ -158,73 +161,27 @@ installed_pids() {
 }
 
 stop_installed_app() {
-  local deadline bundle_pids="$1" grace_polls pid state roots descendants
+  local bundle_pids="$1" survivors
   [[ -n "$bundle_pids" ]] || return 0
 
   OLD_PIDS="$bundle_pids"
-  # Stop the host first and let it unwind, instead of signalling every
-  # descendant at once.
-  #
-  # Core owns an ordered teardown: it drains the proxy, then releases the
-  # upstream workers the proxy streams through.  Signalling the whole tree
-  # together inverted that order -- the workers died in the same instant as the
-  # proxy they feed, so a turn that was mid-answer lost its upstream before the
-  # proxy could finish it and the user had to resend.  The kill ladder below
-  # also used to pre-empt that drain after one second.
-  roots="$(bundle_roots)"
-  while read -r pid; do
-    [[ -n "$pid" ]] || continue
-    kill -TERM "$pid" 2>/dev/null || true
-  done <<<"$roots"
-
-  # The host's own end is immediate; the work it leaves behind is the drain.
-  # Wait for it, bounded by the same budget the Core reads, so an ordinary
-  # restart never cuts a turn that is still being written.
-  grace_polls=$(( STOP_DRAIN_SECONDS * 20 ))
-  while pids_are_alive "$bundle_pids" && (( grace_polls > 0 )); do
-    sleep 0.05
-    grace_polls=$((grace_polls - 1))
-  done
-
-  # Anything the host did not unwind -- a descendant it never owned, or one a
-  # wedged process is holding -- still has to go before the replacement can
-  # bind the same listener.
-  descendants="$(bundle_processes)"
-  while read -r pid; do
-    [[ -n "$pid" ]] || continue
-    kill -TERM "$pid" 2>/dev/null || true
-  done <<<"$descendants"
-
-  grace_polls=$STOP_GRACE_POLLS
-  while pids_are_alive "$bundle_pids" && (( grace_polls > 0 )); do
-    sleep 0.05
-    grace_polls=$((grace_polls - 1))
-  done
-  if pids_are_alive "$bundle_pids"; then
-    while read -r pid; do
-      [[ -n "$pid" ]] || continue
-      state="$(ps -p "$pid" -o stat= 2>/dev/null || true)"
-      [[ -n "$state" && "$state" != Z* ]] && kill -KILL "$pid" 2>/dev/null || true
-    done <<<"$bundle_pids"
+  # One policy, one implementation: ``app-processes.sh stop`` kills the captured
+  # pids together and waits for them to be gone, exactly as a restart does.  The
+  # installer used to signal the host and then wait out the proxy's drain -- a
+  # budget of hours, meant for a replacement that is not in a hurry -- which is
+  # what made an install appear to finish its copy and then sit there.  Nothing
+  # the listener needs is bought by that wait: the port comes free in the same
+  # instant the processes holding it die, and a turn that is cut here is one the
+  # client reconnects through.
+  APP_PROCESSES_STOP_POLLS=$(( STOP_TIMEOUT_SECONDS * 20 )) \
+  survivors="$("$APP_PROCESSES" stop $bundle_pids)" || true
+  if [[ -z "$survivors" ]]; then
+    return 0
   fi
-
-  deadline=$((SECONDS + STOP_TIMEOUT_SECONDS))
-  while pids_are_alive "$bundle_pids"; do
-    if (( SECONDS >= deadline )); then
-      echo "Young Router did not stop its captured process tree within ${STOP_TIMEOUT_SECONDS}s." >&2
-      return 1
-    fi
-    sleep 0.05
-  done
-}
-
-pids_are_alive() {
-  local pid state
   while read -r pid; do
     [[ -n "$pid" ]] || continue
-    state="$(ps -p "$pid" -o stat= 2>/dev/null || true)"
-    [[ -n "$state" && "$state" != Z* ]] && return 0
-  done <<<"$1"
+    echo "Young Router: process $pid did not stop" >&2
+  done <<<"$survivors"
   return 1
 }
 

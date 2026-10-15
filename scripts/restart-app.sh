@@ -8,12 +8,16 @@
 # same guarantee for the case where no rebuild is wanted.
 #
 #   scripts/restart-app.sh          restart
-#   scripts/restart-app.sh --stop   stop on purpose (asks first)
+#   scripts/restart-app.sh --stop   stop on purpose and leave it stopped
+#
+# The stop is one policy, shared with the build script's installer: the pids the
+# bundle is running are captured, killed together, and the replacement starts as
+# soon as they are gone.  See ``app-processes.sh stop``.
 set -uo pipefail
 
 APP="/Applications/Young Router.app"
 # The pids this stop replaces are that host and its descendants, resolved from
-# the bundle before the quit below because the host's children are reparented
+# the bundle before the stop below because the host's children are reparented
 # the moment it exits and the tree cannot be re-derived afterwards.  Resolving
 # it by the app's name instead also captures a process that merely mentions the
 # app -- another session's test run under the bundle's own interpreter, a probe
@@ -50,97 +54,29 @@ trap relaunch EXIT INT TERM
 if [[ -n "$("$APP_PROCESSES" hosts "$APP")" ]]; then
   echo "Young Router: stopping (restart armed)"
   STOPPING_PIDS="$("$APP_PROCESSES" tree "$APP" | tr '\n' ' ')"
-  STOPPING_HOSTS="$("$APP_PROCESSES" hosts "$APP" | tr '\n' ' ')"
-  STOPPING_CORE="$("$APP_PROCESSES" core "$APP" | tr '\n' ' ')"
-  # What the replacement has to take over is three things and nothing else: the
-  # host, which owns the window and the Core beneath it; the Core, which owns
-  # the state root; and the recorded loopback port, because a new proxy that
-  # cannot bind it steps forward to the next one while every client -- each one
-  # pointed at the configured port by hand -- is left talking to a port nothing
-  # listens on.  The proxy's own shutdown spine -- its launcher, the forkserver,
-  # the resource tracker, a worker still finishing a turn it accepted -- holds
-  # none of the three.  Measured on this app: the port is released about a
-  # second into the stop, that spine lives on for another thirty, and the
-  # launcher writes no state file.  Waiting for it was most of a restart.
-  #
-  # The Core is captured for the graceful path, which waits for the pids that
-  # own the window and the state root instead of for the whole tree.
-  if [[ -n "$STOPPING_CORE" ]]; then
-    GATING_PIDS="$STOPPING_HOSTS $STOPPING_CORE"
-  else
-    GATING_PIDS="$STOPPING_PIDS"
-  fi
   RUNTIME_ROOT="${LITELLM_RUNTIME_ROOT:-$HOME/.young-router/.litellm-runtime}"
   recorded_port="$(cat "$RUNTIME_ROOT/litellm.port" 2>/dev/null || true)"
   [[ "$recorded_port" =~ ^[0-9]{1,5}$ ]] || recorded_port=12390
   port_taken() {
     [[ -n "$(lsof -nP -iTCP:"$recorded_port" -sTCP:LISTEN -t 2>/dev/null)" ]]
   }
-  # The stop is one shot: every pid captured above goes at once.  What that
-  # gives up is a turn that is still being written -- its upstream dies with the
-  # worker, so the client reconnects instead of being handed a completed answer
-  # -- and the app's own orderly teardown, which is the point.  Measured here:
-  # the host's quit path and the Core's shutdown need ten to thirty seconds
-  # under load, and the only thing the replacement actually has to wait for is
-  # the loopback listener those processes hold.  Killing them together releases
-  # it in the same instant, so the stop costs the poll below instead of the
-  # drain above.
-  #
-  # YOUNG_ROUTER_RESTART_GRACEFUL=1 keeps the other policy: ask the app to quit
-  # and let it unwind its own tree, for the case where a turn must not be cut.
-  # AppKit only runs ``applicationShouldTerminate`` -- the one path that reaches
-  # the Core's ``host/shutdown`` route -- on a real quit request, and the request
-  # is answered asynchronously, so the host is still alive for a moment after
-  # ``osascript`` returns and gets only that long before the signal is used as
-  # the backstop.
-  if [[ "${YOUNG_ROUTER_RESTART_GRACEFUL:-$([[ "${1:-}" == "--stop" ]] && echo 1 || echo 0)}" == "1" ]]; then
-    osascript -e 'tell application id "young.router.app" to quit' >/dev/null 2>&1 || true
-    host_alive() {
-      [[ -n "$("$APP_PROCESSES" alive $STOPPING_HOSTS)" ]]
-    }
-    for _ in $(seq 1 60); do
-      host_alive || break
-      sleep 0.1
+  # The stop is one shot, and it is the same call the build script's installer
+  # makes: every pid captured above is killed together, and the replacement
+  # starts as soon as they are gone.  What that gives up is a turn that is still
+  # being written -- its upstream dies with the worker, so the client reconnects
+  # and finishes its answer -- and the app's own orderly teardown, which is the
+  # point.  Measured here: the host's quit path and the Core's shutdown need ten
+  # to thirty seconds under load, while the loopback listener the replacement
+  # needs is released in the same instant the processes holding it die, so
+  # waiting for that teardown was the whole of a restart's stop.
+  survivors="$("$APP_PROCESSES" stop $STOPPING_PIDS)" || true
+  if [[ -n "$survivors" ]]; then
+    # SIGKILL cannot be escalated, so there is no ladder left to climb: these
+    # are processes the kernel has not ended yet.  They are named rather than
+    # hidden, because one of them can be what makes the new proxy step forward.
+    for pid in $survivors; do
+      echo "Young Router: process $pid survived being stopped" >&2
     done
-    if host_alive; then
-      for pid in $("$APP_PROCESSES" alive $STOPPING_HOSTS); do
-        kill -TERM "$pid" 2>/dev/null || true
-      done
-    fi
-  else
-    for pid in $STOPPING_PIDS; do
-      kill -KILL "$pid" 2>/dev/null || true
-    done
-  fi
-  # The replacement may start as soon as those pids are gone: they are what
-  # holds the listener, and a killed process holds nothing else that outlives
-  # it.  A zombie is not one of them, which is why liveness is asked of the
-  # captured pids rather than of a name.
-  STOP_POLLS=100
-  stopping_any() {
-    [[ -n "$("$APP_PROCESSES" alive $STOPPING_PIDS)" ]]
-  }
-  for _ in $(seq 1 "$STOP_POLLS"); do
-    stopping_any || break
-    sleep 0.1
-  done
-  if stopping_any; then
-    # Something survived the signal: a process the kernel kept alive, or the
-    # graceful path's host that never answered its quit.  Signalled through the
-    # pids this stop captured, so a process that is not this app's is never
-    # touched.
-    for pid in $("$APP_PROCESSES" alive $STOPPING_PIDS); do
-      kill -TERM "$pid" 2>/dev/null || true
-    done
-    for _ in $(seq 1 20); do
-      stopping_any || break
-      sleep 0.1
-    done
-    if stopping_any; then
-      for pid in $("$APP_PROCESSES" alive $STOPPING_PIDS); do
-        kill -9 "$pid" 2>/dev/null || true
-      done
-    fi
   fi
   # One check, not a wait: the new proxy binds the recorded port, and clients
   # are pointed at that port by hand, so a listener that somehow outlived the
@@ -164,8 +100,8 @@ fi
 
 if [[ "${1:-}" == "--stop" ]]; then
   # A deliberate stop disarms the relaunch, so this is the only path that may
-  # leave the app down -- and it is also the one stop that is not in a hurry, so
-  # it asks the app to quit unless the caller chose otherwise.
+  # leave the app down.  It is the same stop as above: one process tree, one
+  # signal, no grace budget for a caller that has already decided.
   ARMED=0
   echo "Young Router: stopped on request"
   exit 0

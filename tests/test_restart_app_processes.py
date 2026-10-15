@@ -13,6 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / "scripts" / "app-processes.sh"
 RESTART = ROOT / "scripts" / "restart-app.sh"
+INSTALLER = ROOT / "scripts" / "build-and-install-macos.sh"
 
 
 class AppProcessesTests(unittest.TestCase):
@@ -57,10 +58,8 @@ class AppProcessesTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return [int(line) for line in result.stdout.split()]
 
-    def core(self) -> list[int]:
-        result = self.helper("core", str(self.app))
-        self.assertEqual(result.returncode, 0, result.stderr)
-        return [int(line) for line in result.stdout.split()]
+    def stop(self, *pids: int) -> subprocess.CompletedProcess:
+        return self.helper("stop", *(str(pid) for pid in pids))
 
     def interpreter(self) -> Path:
         """The bundle's interpreter path, as the Core and the launcher use it.
@@ -91,7 +90,10 @@ class AppProcessesTests(unittest.TestCase):
         def terminate() -> None:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):
+                # Already stopped by the test itself: a zombie group leader with
+                # nothing left in it answers EPERM, and there is nothing here to
+                # signal.
                 pass
             process.wait(timeout=10)
 
@@ -147,48 +149,6 @@ class AppProcessesTests(unittest.TestCase):
 
         self.assertEqual(self.hosts(), [host.pid])
 
-    def test_core_is_the_interpreters_young_router_core_child_of_the_host(self) -> None:
-        interpreter = self.interpreter()
-        # ``sleep`` keeps the shell alive so the helper has a command line to
-        # read; the module marker is what the Core is recognised by.
-        module = '"sleep 300 & wait # -m young_router.core"'
-        host = self.start(str(self.host), "-c", f"{shlex.quote(str(interpreter))} -c {module} & wait")
-        core = self.wait_for_child(host.pid)
-
-        self.assertEqual(self.core(), [core])
-        self.assertNotIn(host.pid, self.core())
-
-    def test_core_ignores_the_proxy_launcher(self) -> None:
-        # A launcher is the same interpreter under the same host, one level
-        # down: it drains the workers it started for half a minute, so waiting
-        # for it is the wait this helper exists to distinguish from the Core.
-        core_module = '"sleep 300 & wait # -m young_router.core"'
-        launcher_module = '"sleep 300 & wait # -m young_router.proxy.macos_proxy"'
-        interpreter = shlex.quote(str(self.interpreter()))
-        host = self.start(
-            str(self.host),
-            "-c",
-            f"{interpreter} -c {core_module} & {interpreter} -c {launcher_module} & wait",
-        )
-        children = {}  # type: dict[int, int]
-        for _ in range(200):
-            found = sorted(
-                int(line)
-                for line in subprocess.run(
-                    ["pgrep", "-P", str(host.pid)], text=True, capture_output=True, check=False
-                ).stdout.split()
-            )
-            if len(found) == 2:
-                children = {"core": found[0], "launcher": found[1]}
-                break
-            time.sleep(0.05)
-        self.assertEqual(len(children), 2, "the fake host never started both processes")
-
-        selected = self.core()
-
-        self.assertEqual(selected, [children["core"]])
-        self.assertNotIn(children["launcher"], selected)
-
     def test_tree_is_empty_once_the_app_is_gone(self) -> None:
         host = self.start(str(self.host), "-c", "sleep 300 & wait")
         self.assertIn(host.pid, self.tree())
@@ -236,6 +196,29 @@ class AppProcessesTests(unittest.TestCase):
 
         self.assertEqual(self.alive(pid), [])
 
+    # -- the stop --------------------------------------------------------
+
+    def test_stop_kills_the_captured_pids_and_reports_nothing(self) -> None:
+        host = self.start(str(self.host), "-c", "sleep 300 & wait")
+        child = self.wait_for_child(host.pid)
+
+        result = self.stop(host.pid, child)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.split(), [])
+        self.assertEqual(self.alive(host.pid, child), [])
+
+    def test_stop_is_at_peace_with_a_pid_that_is_already_gone(self) -> None:
+        host = self.start(str(self.host), "-c", "sleep 300 & wait")
+        pid = host.pid
+        os.killpg(pid, signal.SIGKILL)
+        host.wait(timeout=10)
+
+        result = self.stop(pid)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.split(), [])
+
     # -- the boundary the script keeps -----------------------------------
 
     def test_restart_selects_its_pids_from_the_bundle(self) -> None:
@@ -247,8 +230,6 @@ class AppProcessesTests(unittest.TestCase):
         )
 
         self.assertIn('STOPPING_PIDS="$("$APP_PROCESSES" tree "$APP"', script)
-        self.assertIn('STOPPING_HOSTS="$("$APP_PROCESSES" hosts "$APP"', script)
-        self.assertIn('STOPPING_CORE="$("$APP_PROCESSES" core "$APP"', script)
         # No unanchored name pattern may decide what a stop waits on or
         # signals: it cannot tell this app's processes from a foreign command
         # line that mentions it.
@@ -259,14 +240,25 @@ class AppProcessesTests(unittest.TestCase):
     def test_restart_stops_the_tree_in_one_shot(self) -> None:
         script = RESTART.read_text(encoding="utf-8")
 
-        # The default policy replaces the app without waiting for its own
-        # teardown, which is what made a restart take half a minute under load.
-        self.assertIn('kill -KILL "$pid"', script)
-        self.assertIn('for pid in $STOPPING_PIDS; do', script)
-        self.assertIn("stopping_any()", script)
-        # The orderly path stays reachable for a turn that must not be cut.
-        self.assertIn("YOUNG_ROUTER_RESTART_GRACEFUL", script)
-        self.assertIn("osascript -e 'tell application id \"young.router.app\" to quit'", script)
+        # One policy: the captured pids are handed to the helper's stop, which
+        # kills them together, and nothing here waits for the app's own
+        # teardown -- that wait was most of a restart.
+        self.assertIn('"$APP_PROCESSES" stop $STOPPING_PIDS', script)
+        self.assertNotIn("kill -TERM", script)
+        self.assertNotIn("osascript", script)
+        self.assertNotIn("GRACEFUL", script)
+        self.assertNotIn("stopping_any()", script)
+
+    def test_the_installer_uses_the_same_stop(self) -> None:
+        installer = INSTALLER.read_text(encoding="utf-8")
+
+        self.assertIn('"$APP_PROCESSES" stop $bundle_pids', installer)
+        self.assertIn("APP_PROCESSES=", installer)
+        # The grace budget this used to carry is gone with the policy it served.
+        self.assertNotIn("STOP_QUIT_GRACE_SECONDS", installer)
+        self.assertNotIn("STOP_GRACE_POLLS", installer)
+        self.assertNotIn("kill -TERM", installer)
+        self.assertNotIn("osascript", installer)
 
     def test_restart_checks_the_port_once_instead_of_waiting_on_it(self) -> None:
         script = RESTART.read_text(encoding="utf-8")
