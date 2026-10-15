@@ -888,6 +888,71 @@ class ModelCatalogTests(unittest.TestCase):
             cached = ModelContextRegistry(cache_path=cache, refresh_enabled=False)
             self.assertEqual(400_000, cached.record_for("vendor/new-agent").context_window)
 
+    def test_provider_fallback_answer_is_kept_for_the_next_start(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "contexts.json"
+            record = {
+                "context_window": 200_000,
+                "max_context_window": 200_000,
+                "effective_context_window_percent": 100,
+                "source": "litellm",
+                "priority": 15,
+            }
+            fallback = mock.Mock(return_value=dict(record))
+            with mock.patch(
+                "young_router.core.model_contexts._litellm_record", fallback
+            ), mock.patch(
+                "young_router.core.model_contexts._installed_litellm_version",
+                return_value="test-version",
+            ):
+                first = ModelContextRegistry(cache_path=cache, refresh_enabled=False)
+                self.assertEqual(200_000, first.default_record_for("openai/gpt-image-2.5").context_window)
+
+            stored = json.loads(cache.read_text(encoding="utf-8"))["provider_lookups"]
+            self.assertEqual("test-version", stored["litellm_version"])
+            # LiteLLM does not know this model, and that answer is kept too: the
+            # next start must not import the runtime to ask again.
+            self.assertIn("openai/gpt-image-2.5", stored["records"])
+
+            with mock.patch(
+                "young_router.core.model_contexts._litellm_record",
+                mock.Mock(side_effect=AssertionError("the runtime must not be imported again")),
+            ), mock.patch(
+                "young_router.core.model_contexts._installed_litellm_version",
+                return_value="test-version",
+            ):
+                second = ModelContextRegistry(cache_path=cache, refresh_enabled=False)
+                self.assertEqual(200_000, second.default_record_for("openai/gpt-image-2.5").context_window)
+
+    def test_provider_fallback_answers_are_dropped_when_litellm_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "contexts.json"
+            cache.write_text(
+                json.dumps(
+                    {
+                        "fetched_at": 1_000_000,
+                        "records": {},
+                        "provider_lookups": {
+                            "litellm_version": "previous-version",
+                            "records": {"openai/gpt-image-2.5": None},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            asked = mock.Mock(return_value=None)
+            with mock.patch(
+                "young_router.core.model_contexts._litellm_record", asked
+            ), mock.patch(
+                "young_router.core.model_contexts._installed_litellm_version",
+                return_value="test-version",
+            ):
+                registry = ModelContextRegistry(cache_path=cache, refresh_enabled=False)
+                registry.default_record_for("openai/gpt-image-2.5")
+
+            # A new LiteLLM may know a model the old one did not.
+            asked.assert_called_once_with(["openai/gpt-image-2.5"])
+
     def test_legacy_context_cache_refreshes_for_pi_profiles_immediately(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -573,6 +573,30 @@ def _litellm_record(model_ids: Sequence[str]) -> dict[str, Any] | None:
     return None
 
 
+_INSTALLED_LITELLM_VERSION: list[str | None] = []
+
+
+def _installed_litellm_version() -> str | None:
+    """Which LiteLLM the fallback lookup would answer from, without importing it.
+
+    Read from the installed distribution's metadata, so the answer costs a file
+    read instead of the runtime this module exists to keep out of the Core's
+    startup.
+    """
+
+    if _INSTALLED_LITELLM_VERSION:
+        return _INSTALLED_LITELLM_VERSION[0]
+    version_value: str | None = None
+    try:
+        from importlib.metadata import version
+
+        version_value = version("litellm")
+    except Exception:
+        version_value = None
+    _INSTALLED_LITELLM_VERSION.append(version_value)
+    return version_value
+
+
 class ModelContextRegistry:
     """Resolve model context policy and periodically refresh its metadata."""
 
@@ -610,6 +634,11 @@ class ModelContextRegistry:
         self._route_index_digest: str | None = None
         self._route_index_cache: dict[str, list[dict[str, Any]]] = {}
         self._cache_fetched_at: float | None = None
+        # Answers the provider-registry fallback already gave: a model id mapped
+        # to its record, or to None when LiteLLM does not know it either.  Kept
+        # in the same cache as the fetched profiles so a start that resolves the
+        # same routes does not import the runtime to repeat itself.
+        self._provider_lookups: dict[str, dict[str, Any] | None] = {}
         self._last_refresh_attempt: float | None = None
         self._runtime_values_key: tuple[int, int] | None = None
         self._runtime_values_cache: tuple[int, int] | None = None
@@ -673,6 +702,66 @@ class ModelContextRegistry:
                 return payload
         return {}
 
+    def _load_provider_lookups(self, payload: Mapping[str, Any]) -> None:
+        """Restore earlier fallback answers, unless LiteLLM itself changed."""
+
+        section = payload.get("provider_lookups")
+        if not isinstance(section, Mapping):
+            return
+        installed = _installed_litellm_version()
+        if installed is None or section.get("litellm_version") != installed:
+            return
+        cached = section.get("records")
+        if not isinstance(cached, Mapping):
+            return
+        self._provider_lookups = {
+            model_id: dict(record) if isinstance(record, Mapping) else None
+            for model_id, record in cached.items()
+            if isinstance(model_id, str)
+        }
+
+    def _cache_payload(self) -> dict[str, Any]:
+        """Everything the private cache holds, written by one place."""
+
+        return {
+            "fetched_at": self._cache_fetched_at,
+            "records": self._records,
+            "provider_lookups": {
+                "litellm_version": _installed_litellm_version(),
+                "records": self._provider_lookups,
+            },
+        }
+
+    def _write_cache(self) -> None:
+        if self.cache_path is None:
+            return
+        try:
+            atomic_write_json(self.cache_path, self._cache_payload())
+            self._remove_legacy_caches()
+        except PersistenceError:
+            pass
+
+    def _resolve_provider_record(self, model_id: str) -> dict[str, Any] | None:
+        """Answer the provider-registry fallback without paying for it twice.
+
+        ``_litellm_record`` imports the complete LiteLLM runtime to read one
+        registry, and this lookup runs while the Core is starting: every route
+        whose model the bundled profiles do not know used to wait for that
+        import before the settings windows could be drawn.  The answer -- the
+        record, or the fact that LiteLLM does not know the model either -- is
+        written beside the fetched profiles and dropped when the installed
+        LiteLLM changes, because that is what the answer depends on.
+        """
+
+        if model_id in self._provider_lookups:
+            cached = self._provider_lookups[model_id]
+            return dict(cached) if isinstance(cached, Mapping) else None
+        record = _litellm_record([model_id])
+        if _installed_litellm_version() is not None:
+            self._provider_lookups[model_id] = dict(record) if record is not None else None
+            self._write_cache()
+        return record
+
     def _load_cache(self) -> None:
         if self._cache_loaded:
             return
@@ -684,6 +773,7 @@ class ModelContextRegistry:
         fetched_at = payload.get("fetched_at")
         if isinstance(fetched_at, (int, float)) and not isinstance(fetched_at, bool):
             self._cache_fetched_at = float(fetched_at)
+        self._load_provider_lookups(payload)
         cached = payload.get("records")
         if not isinstance(cached, Mapping):
             return
@@ -899,15 +989,7 @@ class ModelContextRegistry:
         if not refreshed:
             return False
         self._cache_fetched_at = now
-        if self.cache_path is not None:
-            try:
-                atomic_write_json(
-                    self.cache_path,
-                    {"fetched_at": now, "records": self._records},
-                )
-                self._remove_legacy_caches()
-            except PersistenceError:
-                pass
+        self._write_cache()
         return True
 
     @staticmethod
@@ -1007,7 +1089,7 @@ class ModelContextRegistry:
                     if record is not None:
                         break
         if record is None:
-            record = _litellm_record([model_id])
+            record = self._resolve_provider_record(model_id)
         return record
 
     def reasoning_for_model_id(self, model_id: str) -> ReasoningCapability | None:
