@@ -1862,6 +1862,57 @@ class HookRoutingTests(HookTestCase):
             self.assertNotIn("function_call", request[key])
             self.assertTrue(request[key]["keep"])
 
+    def test_responses_surface_refusal_at_403_is_a_surface_failover(self) -> None:
+        """A station that cannot serve Responses must be recognized at its own 4xx.
+
+        Only 404/405 were read as refusing the current surface, so a station
+        answering 403 with the body it uses for a request it cannot serve was
+        treated as an ordinary request failure: the route stayed in place and
+        every later request paid the same round trip again, because a Chat
+        surface is never remembered as the fallback a Responses client wanted.
+        """
+
+        hooks, _ = load_hook_module()
+        error = RuntimeError(
+            'OpenAIException - {"error":{"message":"openai_error",'
+            '"type":"bad_response_status_code","param":"",'
+            '"code":"bad_response_status_code"}}'
+        )
+        error.status_code = 403
+        request_kwargs = {
+            "call_type": "aresponses",
+            hooks._CURRENT_UPSTREAM_URL_SURFACE_KEY: "openai/responses",
+            "model_info": {"id": "chatroute", "upstream_url_surface": "openai/chat"},
+        }
+
+        self.assertTrue(
+            hooks._is_current_upstream_surface_incompatible_error(
+                error, request_kwargs, None
+            )
+        )
+
+    def test_responses_surface_refusal_keeps_a_native_responses_route_on_spot(self) -> None:
+        """The same body on a native Responses route describes a real failure."""
+
+        hooks, _ = load_hook_module()
+        error = RuntimeError(
+            'OpenAIException - {"error":{"message":"openai_error",'
+            '"type":"bad_response_status_code","param":"",'
+            '"code":"bad_response_status_code"}}'
+        )
+        error.status_code = 403
+        request_kwargs = {
+            "call_type": "aresponses",
+            hooks._CURRENT_UPSTREAM_URL_SURFACE_KEY: "openai/responses",
+            "model_info": {"id": "responsesroute", "upstream_url_surface": "openai/responses"},
+        }
+
+        self.assertFalse(
+            hooks._is_current_upstream_surface_incompatible_error(
+                error, request_kwargs, None
+            )
+        )
+
     def test_fallback_mode_starts_with_the_client_protocol(self) -> None:
         hooks, _ = load_hook_module()
         deployment = {

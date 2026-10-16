@@ -6810,6 +6810,16 @@ def _is_current_upstream_surface_incompatible_error(
     status_code = _exception_status_code(exception)
     if status_code in {404, 405}:
         return True
+    # A route that answers with the body it uses for a request it cannot serve,
+    # whatever 4xx it chose for it, has refused this surface rather than this
+    # request. Reading it as anything else leaves the route in place for the
+    # next request and repeats the same failed round trip there.
+    if current_surface == _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES and _is_responses_surface_refusal_error(
+        exception,
+        request_kwargs,
+        outer_request_kwargs,
+    ):
+        return True
     if (
         current_surface == _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES
         and _is_responses_schema_unsupported_error(exception)
@@ -7168,19 +7178,21 @@ def _request_declares_responses_surface(request_kwargs: Optional[dict]) -> bool:
 
     ``openai/chat`` and its aliases are the surfaces the Chat bridge exists to
     reach; a route that names ``openai/responses`` is not being denied that
-    surface, so its refusal must not be read as one.
+    surface, so its refusal must not be read as one. Only the route's
+    configured surface decides this: the surface a request is currently being
+    sent on is the one under question, and asking it would make every in-flight
+    attempt answer yes.
     """
 
     request_kwargs = request_kwargs or {}
-    surface = _request_current_upstream_surface(request_kwargs)
-    if not surface:
-        model_info = _request_context_module._request_model_info(request_kwargs)
-        declared = model_info.get(_UPSTREAM_URL_SURFACE_KEY)
-        if isinstance(declared, str):
-            candidate = declared.strip().lower()
-            if candidate in _UPSTREAM_URL_SURFACES:
-                surface = candidate
-    return surface == _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES
+    model_info = _request_context_module._request_model_info(request_kwargs)
+    declared = model_info.get(_UPSTREAM_URL_SURFACE_KEY) if model_info else None
+    if not isinstance(declared, str):
+        return False
+    candidate = declared.strip().lower()
+    if candidate not in _UPSTREAM_URL_SURFACES:
+        return False
+    return candidate == _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES
 
 
 def _is_responses_surface_refusal_error(
