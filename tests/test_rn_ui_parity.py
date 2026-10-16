@@ -1233,6 +1233,24 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('selectRoute(publicModelReturn.routeKey);', self.ui)
         self.assert_ui_has('backLabel={publicModelReturn?.label} onBackToModel={returnToPublicModelOrigin}')
 
+        # 上游上下文 states the window the route's own upstream publishes,
+        # directly under the 上游模型 field it belongs to, and it is a reading:
+        # the number is the upstream's, so there is no input and no commit —
+        # only a mark that says where it came from.  A route whose upstream
+        # published nothing keeps no row, so a blank never reads as a zero.
+        upstream_row = model_detail.split('label={translate("providers.upstream")}', 1)[1].split('<View style={styles.orderEditorRow}>', 1)[0]
+        self.assertIn('const upstreamContextWindow = numberValue(model.upstream_context_window, 0) || undefined;', model_detail)
+        self.assertIn('{upstreamContextWindow !== undefined ? <View style={styles.formRow}>', upstream_row)
+        self.assertIn('<Text numberOfLines={1} style={styles.modelInspectorLabel}>{translate("providers.upstreamContextWindow")}</Text>', upstream_row)
+        self.assertIn('<Text numberOfLines={1} style={styles.modelWindowText}>{publicModelTokensText(upstreamContextWindow, translate)}</Text>', upstream_row)
+        self.assertIn('translate("providers.upstreamContextWindowHelp")', upstream_row)
+        # No field, no commit, and no edit affordance: the row is not a setting.
+        self.assertNotIn('TextField label={translate("providers.upstreamContextWindow")}', model_detail)
+        self.assertNotIn("upstream_context_window:", model_detail)
+        self.assertIn('"providers.upstreamContextWindow": "上游上下文"', self.zh)
+        self.assertIn('"providers.upstreamContextWindow": "Upstream context"', self.en)
+        self.assertIn('| "providers.upstreamContextWindow"', (ROOT / "rn/packages/shared/src/i18n/types.ts").read_text(encoding="utf-8"))
+
         # The AppKit wrapper forwards the prop: a wrapper that lists its props
         # by hand is where a new native prop silently disappears otherwise.
         appkit_controls = (ROOT / "rn/packages/shared/src/ui/AppKitControls.tsx").read_text(encoding="utf-8")
@@ -2935,7 +2953,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         schema = (ROOT / "young_router/core/runtime_settings_schema.py").read_text(encoding="utf-8")
         localized = (ROOT / "rn/packages/shared/src/i18n/runtimeSettingsI18n.ts").read_text(encoding="utf-8")
         keys = re.findall(r"'key': '([^']+)'", schema)
-        self.assertEqual(69, len(keys))
+        self.assertEqual(71, len(keys))
         self.assertEqual(len(keys), len(set(keys)))
         for key in keys:
             self.assertIn(f"  {key}: {{ label:", localized)
@@ -3553,7 +3571,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # becomes the persisted API-key identifier.
         for marker in (
             'function providerKeyChoices(provider: UnknownRecord, relaySources: RelaySourceOption[], baseURL?: string): ProviderKeyChoice[] {',
-            '() => provider && providerKindSelected !== "openai" && providerKindSelected !== "claude" ? providerKeyChoices(provider, relaySources, providerBaseURL(provider)) : [],',
+            'if (choices.length > 0) return choices;',
+            'const slot = providerKeyStates(provider).find((key) => key.managed && managedServiceForSlot(key.managed, providerAuthKind(provider)));',
+            'return slot ? [{ id: slot.id, name: slot.name, kind: "independent" as const, state: slot }] : [];',
             'label: providerKeyChoiceLabel({ ...choice, name: choice.name }, translate),',
             'const option = fetchKeyOptions[nativeEvent.index]; if (option) setFetchKeyID(option.value);',
             'const providerKeyOptions = [...keyStates.map((key) => ({',
@@ -3915,10 +3935,17 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "service_provider.auth_status",
             "provider_auth_status",
         )
+        # The catalog reads are addressed through `serviceCatalog`, which takes
+        # its action from `serviceCatalogRead`: the literal name lives in that
+        # table, so a scan for the name alone would stop seeing the reads this
+        # table exists to name.
+        self.assert_ui_has('if (service === "workbuddy") return { action: "workbuddy_models", providerId: "workbuddy" };')
+        self.assert_ui_has('if (service === "opencode2dsh") return { action: "opencode2dsh_models", providerId: "opencode2dsh" };')
         live_reads = 0
         for index, line in enumerate(self.ui.splitlines()):
             for helper in ("dispatchWithOutcome(", "dispatchSnapshot("):
-                if helper not in line or not any(f'"{action}"' in line for action in reads):
+                from_table = f"{helper}action," in line
+                if helper not in line or not (from_table or any(f'"{action}"' in line for action in reads)):
                     continue
                 live_reads += 1
                 arguments = self.call_arguments(line, line.index(helper) + len(helper) - 1)
@@ -3986,11 +4013,16 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'translate("providers.wizard.baseUrl")',
             # The model detail states the service's own rate.
             'translate("providers.modelRate")',
-            'async function serviceModelRate(',
+            'async function serviceCatalog(',
             'const SERVICE_RATE_TTL_MS = 5 * 60 * 1000;',
             # The rate is cached, so switching models never reflows the pane.
             'function peekServiceRate(service: ServiceID | undefined, modelID: string): string | undefined {',
             'const [serviceRate, setServiceRate] = useState<string>(() => peekServiceRate(service, upstreamModelID) ?? "");',
+            # The same cached catalog is what Core learns each model's window
+            # from, so the read is addressed through the one table that names
+            # both a service's action and the id its worker document uses.
+            'function serviceCatalogRead(service: ServiceID): { action: string; providerId: string } | undefined {',
+            'if (service === "opencode2dsh") return { action: "opencode2dsh_models", providerId: "opencode2dsh" };',
             # A service provider's type is an ordinary editable field: the
             # pane offers the same picker the wizard does, so WorkBuddy is
             # wired and retargeted like any other service.
@@ -4173,13 +4205,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
         for marker in (
             # The read's own summary is the only one this row accepts.
-            'if (summary.operation !== "workbuddy_models" || summary.available !== true) return undefined;',
-            '): Promise<Record<string, string> | undefined> {',
+            'if (summary.operation !== request.action || summary.available !== true) return undefined;',
+            '): Promise<UnknownRecord[] | undefined> {',
             # A read that named no catalog is not cached, and the row asks once
             # more instead of painting 无 until the interval expires.
-            'if (!options?.force && cached && Date.now() - cached.at < SERVICE_RATE_TTL_MS) return cached.rates;',
+            'if (!options?.force && cached && Date.now() - cached.at < SERVICE_RATE_TTL_MS) return cached.catalog;',
             'const readRates = (force: boolean): void => {',
-            'if (rates) { setServiceRate(rates[upstreamModelID] ?? ""); return; }',
+            'if (catalog) { setServiceRate(peekServiceRate(service, upstreamModelID) ?? ""); return; }',
             'if (!force) readRates(true);',
             'readRates(false);',
         ):
@@ -4187,10 +4219,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # An empty read is never stored as an answer: the cache write sits
         # behind the gate that accepts only this service's own catalog.
         self.assertLess(
-            self.ui.index('if (summary.operation !== "workbuddy_models" || summary.available !== true) return undefined;'),
-            self.ui.index("serviceRates.set(service, { at: Date.now(), rates });"),
+            self.ui.index('if (summary.operation !== request.action || summary.available !== true) return undefined;'),
+            self.ui.index("serviceRates.set(service, { at: Date.now(), catalog: models, rates: serviceCatalogRates(models) });"),
         )
-        self.assert_ui_has('if (rates) { setServiceRate(rates[upstreamModelID] ?? ""); return; }')
+        self.assert_ui_has('if (catalog) { setServiceRate(peekServiceRate(service, upstreamModelID) ?? ""); return; }')
 
     def test_unified_provider_workspace_lists_every_provider_kind(self) -> None:
         """服务商管理 is integrated: the provider table shows all kinds."""
@@ -5497,6 +5529,42 @@ class ReactNativeUiParityTests(unittest.TestCase):
         ):
             self.assertIn(marker, relay)
 
+    def test_no_key_editor_is_drawn_for_a_login_service(self) -> None:
+        """A login service owns its key, so its literal value is nobody's to edit.
+
+        The provider editor derived the predicate locally from the two kinds it
+        also branches on, which left the OpenCode Zen free lane out: the lane's
+        one slot is minted by Core and holds an ``os.environ/`` reference to the
+        loopback worker's bearer, and the 密钥 editor offered that reference as
+        an editable, copyable API key.  One predicate answers this for both the
+        identity block and the panel, so no kind can be added to one and missed
+        by the other.
+        """
+
+        editor = self.ui.split("function ProviderEditor(", 1)[1].split("\nfunction ", 1)[0]
+        self.assertIn("const isLogin = isLoginProviderKind(kind);", editor)
+        self.assertNotIn(
+            "const isLogin = isOfficialAccount || isWorkBuddyAccount;", editor
+        )
+        # The keys panel, the station-accounts panel, and the accounts header
+        # are the three surfaces that predicate gates.
+        self.assertIn("{!isLogin ? <ProviderKeysPanel", editor)
+        self.assertIn("{!isLogin && station ? <StationAccountsPanel", editor)
+        identity = self.ui.split("function ProviderIdentityFields(", 1)[1].split("\nfunction ", 1)[0]
+        self.assertIn("const isLogin = isLoginProviderKind(kind);", identity)
+        # The predicate itself names every login service, the lane included.
+        self.assert_ui_has(
+            'return kind === "openai" || kind === "claude" || kind === "workbuddy" || kind === "workbuddyAI" || kind === "opencode2dsh";'
+        )
+        # ...and the panel refuses Core's own slot itself, so the guarantee does
+        # not rest on every caller naming the service correctly.
+        self.assert_ui_has('!key.managed);')
+        self.assertNotIn(
+            'providerKeyStates(provider).filter((key) => key.source.kind === "independent") : []',
+            self.ui,
+        )
+        self.assert_ui_has('managed: booleanValue(value.managed),')
+
     def test_a_relay_key_is_named_by_its_account_and_group_everywhere(self) -> None:
         """One name for one relay key: 账号/分组, never the group alone.
 
@@ -5629,7 +5697,6 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'const nextStation = relayStationForBaseUrl(endpoint, relayStations);',
             'dispatch("provider.select_relay_station", { provider_id: providerID, station_id: station.id })',
             'const matchingRelaySources = relaySourcesForBaseUrl(',
-            '() => provider && providerKindSelected !== "openai" && providerKindSelected !== "claude" ? providerKeyChoices(provider, relaySources, providerBaseURL(provider)) : [],',
             'const keyChoices = selectedProvider ? providerKeyChoices(selectedProvider, relaySources, activeProviderBaseURL) : [];',
             'const action = relaySource ? "provider.fetch_relay_resource_models" : "providers.fetch_models";',
             'dispatch("model.select_relay_resource"',

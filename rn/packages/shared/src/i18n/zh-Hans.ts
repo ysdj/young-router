@@ -590,6 +590,12 @@ export const zhHans: Record<TranslationKey, string> = {
   "providers.publicModelSettingsHint": "在公开模型设置中修改该模型的上下文",
   "providers.contextWindowRowHelpTitle": "公开上下文与推荐值",
   "providers.contextWindowRowHelp": "未自定义公开上下文时，该值取上面的推荐值。自定义后两者分离，推荐值仍单独保留。",
+  // 上游上下文 is the window the route's own upstream states for it, so the row
+  // is a reading rather than a setting: the help line says where the number
+  // comes from, because there is no control beside it to explain the absence.
+  "providers.upstreamContextWindow": "上游上下文",
+  "providers.upstreamContextWindowHelpTitle": "上游上下文",
+  "providers.upstreamContextWindowHelp": "该上游在自己的模型目录里公布了这个窗口，本应用只读取它，不能修改。",
   "providers.followMultiplier": "跟随倍率",
   "providers.addWizard": "添加向导...",
   "providers.wizard.title": "配置供应商",

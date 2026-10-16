@@ -532,6 +532,88 @@ class ProviderWizardStagingTests(unittest.TestCase):
         finally:
             server.shutdown()
 
+    def test_a_listing_that_states_a_window_is_remembered_for_its_route(self) -> None:
+        """An upstream that publishes a window in its own listing is read once.
+
+        ``/v1/models`` is the one place an ordinary provider states how many
+        tokens each model accepts, and it answers with the same document that
+        names the models.  A route added from that answer reports the number
+        the listing stated, and a listing that states none leaves the route
+        without one instead of writing a zero.
+        """
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                body = json.dumps({
+                    "object": "list",
+                    "data": [
+                        {"id": "wide-model", "context_length": 1_048_576},
+                        {"id": "narrow-model", "limit": {"context": 200_000}},
+                        {"id": "silent-model"},
+                    ],
+                }).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "config.yaml"
+                path.write_text(textwrap.dedent(EMPTY_CONFIG).lstrip(), encoding="utf-8")
+                domain = ProvidersModelsDomain(path)
+                provider = domain.dispatch(
+                    "provider.add",
+                    {
+                        "provider": {
+                            "name": "Listing Provider",
+                            "api_base": f"http://127.0.0.1:{port}/v1",
+                            "api_keys": [{"name": "default", "value": "replace-listing-secret"}],
+                            "models": [],
+                        }
+                    },
+                )["providers"][0]
+                provider_id = provider["id"]
+
+                fetched = domain.dispatch(
+                    "providers.fetch_models",
+                    {"provider_id": provider_id, "api_key_name": "default"},
+                )["operation_summary"]
+                self.assertTrue(fetched["available"], fetched.get("detail"))
+                self.assertEqual(
+                    {"wide-model": 1_048_576, "narrow-model": 200_000},
+                    fetched["model_windows"],
+                )
+
+                added = domain.dispatch(
+                    "model.add_many",
+                    {
+                        "provider_id": provider_id,
+                        "models": [
+                            {"name": "wide-model", "upstream_model": "wide-model"},
+                            {"name": "silent-model", "upstream_model": "silent-model"},
+                        ],
+                    },
+                )
+                windows = {
+                    model["upstream_model"]: model["upstream_context_window"]
+                    for model in added["providers"][0]["models"]
+                }
+                self.assertEqual(
+                    {"wide-model": 1_048_576, "silent-model": None},
+                    windows,
+                )
+        finally:
+            server.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

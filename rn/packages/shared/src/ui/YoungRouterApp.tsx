@@ -167,6 +167,34 @@ type ServiceID = "openai" | "claude" | "workbuddy" | "workbuddyAI" | "opencode2d
 const OPENCODE2DSH_KEY_NAME = "opencode-zen-free";
 
 /**
+ * The auth kinds that own the key slot their provider mints.
+ *
+ * Every kind here is one of Core's own services (`PROVIDER_AUTH_KINDS` in
+ * `young_router/config/schema.py` minus the plain user-key kind), and each of
+ * those mints the one slot its routes answer with.  So this is the one table
+ * that says which slot belongs to a service: a surface that must know *why* a
+ * credential is unavailable to the user asks here rather than keeping a second
+ * list of login kinds in step with the schema.
+ */
+const MANAGED_SLOT_AUTH_KINDS = new Set<ProviderAuthKind>([
+  "workbuddy_login",
+  "workbuddy_ai_login",
+  "opencode2dsh_login",
+]);
+
+/**
+ * The Core service that owns one key slot, from the provider that holds it.
+ *
+ * A slot that Core mints belongs to the service that mints it, so this is the
+ * one place that names which login kinds own a slot: "is this slot Core's?"
+ * reads the slot, and "which service is it?" asks here.
+ */
+function managedServiceForSlot(managed: boolean, authKind: ProviderAuthKind): ServiceID | "" {
+  if (!managed || !MANAGED_SLOT_AUTH_KINDS.has(authKind)) return "";
+  return providerService({ auth_kind: authKind }) ?? "";
+}
+
+/**
  * The public name of one OpenCode Zen lane id.
  *
  * The lane marks its free ids with a ``-free`` suffix (``cat-jam-free``).  That
@@ -221,12 +249,13 @@ function providerService(provider: UnknownRecord | undefined): ServiceID | undef
 }
 
 /**
- * One service's catalog, keyed by model id and refreshed on a short interval.
- * The rate the picker shows has to survive into the detail pane and the model
- * list without a fetch per selected or painted model.
+ * One service's catalog, refreshed on a short interval.  The entries survive
+ * into the detail pane and the model list — the rate the picker shows, and the
+ * window a route's own upstream stated — without a fetch per selected or
+ * painted model.
  */
 const SERVICE_RATE_TTL_MS = 5 * 60 * 1000;
-const serviceRates = new Map<string, { at: number; rates: Record<string, string> }>();
+const serviceRates = new Map<string, { at: number; catalog: UnknownRecord[]; rates: Record<string, string> }>();
 
 function peekServiceRate(service: ServiceID | undefined, modelID: string): string | undefined {
   if (!service || !modelID) return undefined;
@@ -243,38 +272,69 @@ function hasFreshServiceRates(service: ServiceID | undefined): boolean {
 }
 
 /**
- * One service's rate per model, or `undefined` when no catalog answered.
+ * The catalog read one service's own document answers through, or `undefined`
+ * when this service publishes no catalog of its own.
+ *
+ * The action and the id it is addressed with belong together: the worker's
+ * document names its own variants (`workbuddy`, `workbuddy-ai`), which are not
+ * the auth kinds the configuration stores.
+ */
+function serviceCatalogRead(service: ServiceID): { action: string; providerId: string } | undefined {
+  if (service === "workbuddy") return { action: "workbuddy_models", providerId: "workbuddy" };
+  if (service === "workbuddyAI") return { action: "workbuddy_models", providerId: "workbuddy-ai" };
+  if (service === "opencode2dsh") return { action: "opencode2dsh_models", providerId: "opencode2dsh" };
+  return undefined;
+}
+
+/**
+ * One service's own catalog, or `undefined` when no catalog answered.
  *
  * The distinction is the whole point of the return type: an answer that named
- * no model is not a catalog of no rates.  A read that failed, ran before its
+ * no model is not a catalog of no models.  A read that failed, ran before its
  * worker was ready, or landed on a summary another window's read had already
  * replaced carries no catalog at all, and remembering that as this service's
- * answer would hide every 倍率 for the rest of the interval — the row could
- * not even ask again, because its own cache said the question was answered.
+ * answer would hide everything the catalog states — the row could not even ask
+ * again, because its own cache said the question was answered.
+ *
+ * The catalog is read for what it *states*, not for one field of it: Core
+ * records the window each model carries as the same answer arrives, so the
+ * pane that triggers this read is what makes a route's 上游上下文 row appear.
  */
-async function serviceModelRate(
+async function serviceCatalog(
   service: ServiceID,
-  read: (providerId: string) => Promise<CoreSnapshot | undefined>,
+  read: (action: string, providerId: string) => Promise<CoreSnapshot | undefined>,
   options?: { force?: boolean },
-): Promise<Record<string, string> | undefined> {
+): Promise<UnknownRecord[] | undefined> {
   const cached = serviceRates.get(service);
-  if (!options?.force && cached && Date.now() - cached.at < SERVICE_RATE_TTL_MS) return cached.rates;
-  const providerId = service === "workbuddyAI" ? "workbuddy-ai" : service === "workbuddy" ? "workbuddy" : "";
-  if (!providerId) return undefined;
-  const snapshot = await read(providerId);
+  if (!options?.force && cached && Date.now() - cached.at < SERVICE_RATE_TTL_MS) return cached.catalog;
+  const request = serviceCatalogRead(service);
+  if (!request) return undefined;
+  const snapshot = await read(request.action, request.providerId);
   const summary = asRecord(asRecord(snapshot?.action_summaries?.providers_models).operation_summary);
   // Only a named operation is this read's own answer: another action's
   // summary sitting in the slot says nothing about this service's catalog.
-  if (summary.operation !== "workbuddy_models" || summary.available !== true) return undefined;
+  if (summary.operation !== request.action || summary.available !== true) return undefined;
+  const models = asRecords(summary.models);
+  serviceRates.set(service, { at: Date.now(), catalog: models, rates: serviceCatalogRates(models) });
+  return models;
+}
+
+/**
+ * What one catalog states each model bills at.
+ *
+ * A catalog that states no billing leaves every entry empty rather than
+ * writing a zero: this lane's models are free because the lane serves them
+ * anonymously, and 无 is not a rate a route could follow.
+ */
+function serviceCatalogRates(models: UnknownRecord[]): Record<string, string> {
   const rates: Record<string, string> = {};
-  for (const entry of asRecords(summary.models)) {
+  for (const entry of models) {
     const modelID = stringValue(entry.id).trim();
     if (!modelID) continue;
     const billing = asRecord(entry.billing);
     const credits = stringValue(billing.credits).trim();
     rates[modelID] = credits ? credits.replace(/\s*credits?$/i, "") : billing.free === true ? "x0.00" : "";
   }
-  serviceRates.set(service, { at: Date.now(), rates });
   return rates;
 }
 
@@ -665,6 +725,10 @@ type ProviderKeyState = {
   configured: boolean;
   modelCount: number;
   source: { kind: "independent" | "relay"; stationID: string; accountID: string; resourceID: string };
+  /** Core's own slot: a reference it holds, not a secret the user can edit. */
+  managed: boolean;
+  /** The Core service that minted this slot, or `""` for a user's own. */
+  service: ServiceID | "";
 };
 
 type ProviderKeyChoice = {
@@ -749,6 +813,15 @@ function providerKeyStates(provider: UnknownRecord): ProviderKeyState[] {
       name,
       configured: booleanValue(value.configured),
       modelCount: numberValue(value.model_count),
+      // Core states which slot is its own.  A surface reads that fact instead
+      // of re-deriving it from the provider's auth kind, so a service that
+      // mints a slot is covered the moment Core says so — no second list of
+      // service names to keep in step.
+      managed: booleanValue(value.managed),
+      // A slot is also marked by the auth kind of the provider that holds it,
+      // so the surface can ask what a slot *is for* — which Core cannot state,
+      // because only the adapter knows which login kinds publish a catalog.
+      service: managedServiceForSlot(booleanValue(value.managed), providerAuthKind(provider)),
       source: {
         kind,
         stationID: stringValue(source.station_id),
@@ -769,7 +842,10 @@ function relaySourceSelectionID(source: Pick<RelaySourceOption, "stationID" | "a
 }
 
 function providerKeyChoices(provider: UnknownRecord, relaySources: RelaySourceOption[], baseURL?: string): ProviderKeyChoice[] {
-  const keyStates = providerKeyStates(provider);
+  // Neither a relay-bound slot nor one Core owns is a credential the user may
+  // pick, name, or replace: the wizard and the model inspector both read their
+  // "existing key" options here, so the exclusion belongs at this one funnel.
+  const keyStates = providerKeyStates(provider).filter((key) => !key.managed);
   const providerBaseURL = baseURL ?? stringValue(provider.endpoint, stringValue(provider.api_base));
   const matchingRelaySources = relaySourcesForBaseUrl(providerBaseURL, relaySources);
   const persistedRelaySourceIDs = new Set(
@@ -4629,10 +4705,19 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   // nothing until this pane measures the route it now has.
   const [droppedProbeResults, setDroppedProbeResults] = useState<Record<string, true>>({});
   const shownChallenge = useRef<Record<string, string>>({});
-  const fetchKeyChoices = useMemo(
-    () => provider && providerKindSelected !== "openai" && providerKindSelected !== "claude" ? providerKeyChoices(provider, relaySources, providerBaseURL(provider)) : [],
-    [provider, providerBaseURL, providerKindSelected, relaySources],
-  );
+  const fetchKeyChoices = useMemo(() => {
+    if (!provider || providerKindSelected === "openai" || providerKindSelected === "claude") return [];
+    const choices = providerKeyChoices(provider, relaySources, providerBaseURL(provider));
+    // A service that mints its own slot carries that slot nowhere in the
+    // list above, and this row is how a lane is asked for its roster — so a
+    // provider whose only key is the one Core owns has to be able to name it
+    // here even though the key table never offers it as a user credential.
+    // A provider that also holds keys of the user's keeps this row a user-key
+    // row: those fetches are the ones that can add a key of their own.
+    if (choices.length > 0) return choices;
+    const slot = providerKeyStates(provider).find((key) => key.managed && managedServiceForSlot(key.managed, providerAuthKind(provider)));
+    return slot ? [{ id: slot.id, name: slot.name, kind: "independent" as const, state: slot }] : [];
+  }, [provider, providerBaseURL, providerKindSelected, relaySources]);
   const fetchKeyOptions = useMemo(
     () => fetchKeyChoices.map((choice) => ({
       value: choice.id,
@@ -4651,10 +4736,12 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   useEffect(() => {
     // Read the service's catalog as soon as its provider is selected, so every
     // model switch and every list row paints its rate from the cache instead
-    // of asking mid-switch.
+    // of asking mid-switch.  The same read is what tells Core the window each
+    // of the service's models carries, which is what a route's 上游上下文 row
+    // states: a lane whose catalog nobody reads has nothing to report.
     if (!workspaceService || hasFreshServiceRates(workspaceService)) return;
-    void serviceModelRate(workspaceService, (providerId) => dispatchWithOutcome("workbuddy_models", { provider: providerId }, "providers_models", true))
-      .then((rates) => { if (rates) setServiceRateRevision((value) => value + 1); })
+    void serviceCatalog(workspaceService, (action, providerId) => dispatchWithOutcome(action, { provider: providerId }, "providers_models", true))
+      .then((catalog) => { if (catalog) setServiceRateRevision((value) => value + 1); })
       .catch(() => undefined);
     // A read that produced no catalog staged nothing, so this effect is free
     // to be re-entered: selecting another model of the same service, or the
@@ -4787,6 +4874,8 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   useEffect(() => {
     if (!fetchKeyChoices.some((choice) => choice.id === fetchKeyID)) setFetchKeyID(fetchKeyChoices[0]?.id);
   }, [fetchKeyChoices, fetchKeyID, providerId]);
+  // The model pane's own listing handler, for a provider whose models are read
+  // the generic ``/v1/models`` way.
   const handleFetchedModels = (summary: UnknownRecord): void => {
     const summaryProviderId = stringValue(summary.provider_id);
     const providerIdentity = provider ? identifier(provider) : "";
@@ -4831,6 +4920,41 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       });
     }).catch(() => undefined);
   };
+  /**
+   * Offer a lane's own roster, and file the pick through the account's catalog.
+   *
+   * A service that publishes a catalog answers with its own operation name and
+   * its own entries — no key name, no address, no model list request this app
+   * could make itself.  The pick goes back as one write against the account,
+   * because the public name a client sees, the upstream id the route addresses,
+   * and the minted slot it answers with are the adapter's facts, not this
+   * surface's.
+   */
+  const handleFetchedServiceModels = (summary: UnknownRecord, service: ServiceID): void => {
+    const candidates = asRecords(summary.models)
+      .map((entry) => stringValue(entry.id).trim())
+      .filter((value, index, all) => Boolean(value) && all.indexOf(value) === index);
+    if (summary.available === false) {
+      onStatus(translate("providers.fetchFailed", { detail: stringValue(summary.detail) || translate("providers.fetchKeyUnavailable") }));
+      return;
+    }
+    if (candidates.length === 0) {
+      onStatus(translate("providers.fetchEmpty"));
+      return;
+    }
+    onStatus(undefined);
+    const slot = providerKeyStates(provider ?? {}).find((key) => key.managed && key.service === service);
+    void native.chooseModelsToAdd({
+      models: candidates,
+      providerName: provider ? providerDisplayName(provider) : providerId,
+      keyName: providerKeyChoiceLabel({ name: slot?.name ?? stringValue(summary.api_key_name), kind: "independent" }, translate),
+    }).then((selection) => {
+      const chosen = (selection ?? []).filter((model, index, all) => candidates.includes(model) && all.indexOf(model) === index);
+      if (chosen.length === 0) return;
+      void dispatch("model.import_service_catalog", { provider_id: providerId, models: chosen })
+        .catch((reason: unknown) => { onStatus(errorMessage(reason, translate)); });
+    }).catch(() => undefined);
+  };
   const fetchModels = async (): Promise<void> => {
     // The fetch button reports its own progress instead of graying out, so a
     // second press must not run a parallel fetch.
@@ -4838,8 +4962,18 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     const choice = fetchKeyChoices.find((item) => item.id === selectedFetchKey);
     if (!provider || !choice) return;
     const relaySource = choice.kind === "relay" ? choice.source : undefined;
-    const action = relaySource ? "provider.fetch_relay_resource_models" : "providers.fetch_models";
-    const payload = relaySource ? {
+    // A service that mints its own slot has no user credential to address and
+    // no address this app may request: its roster is read through the catalog
+    // its own adapter publishes, exactly as the wizard's model step reads it,
+    // and the same read that paints the 倍率 column.
+    const laneService = choice.kind === "independent"
+      ? managedServiceForSlot(choice.state?.managed ?? false, providerAuthKind(provider))
+      : "";
+    const action = laneService
+      ? serviceCatalogRead(laneService)?.action ?? ""
+      : relaySource ? "provider.fetch_relay_resource_models" : "providers.fetch_models";
+    if (!action) return;
+    const payload = laneService ? { provider: serviceCatalogRead(laneService)?.providerId ?? "" } : relaySource ? {
       provider_id: providerId,
       station_id: relaySource.stationID,
       account_id: relaySource.accountID,
@@ -4876,6 +5010,10 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       }
       const slotID = stringValue(summary.slot_id);
       if (slotID) setFetchKeyID(slotID);
+      if (laneService && stringValue(summary.operation) === action) {
+        handleFetchedServiceModels(summary, laneService);
+        return;
+      }
       handleFetchedModels(summary);
     } finally {
       setFetchModelsBusy(false);
@@ -5433,7 +5571,6 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   }, [relayAccounts, stationForProvider]);
   const selectedStation = provider ? stationForProvider(provider) : undefined;
   const selectedStationAccounts = stationAccountsFor(provider);
-  const customKeyStates = useMemo(() => provider ? providerKeyStates(provider).filter((key) => key.source.kind === "independent") : [], [provider]);
   return <ProviderWorkspaceDraftContext.Provider value={providerDraftProjection}><View style={styles.providersLayout}>
     <View style={styles.providerLeftColumn}>
       <View style={styles.providerToolbar}>
@@ -5482,7 +5619,12 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
 function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native, busy, translate, dispatch, onSecretState, relay, onStatus, language, bindingIssues, variant = "pane" }: { provider?: UnknownRecord; providerId: string; kind: ProviderKind; stationAccounts: RelayAccount[]; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; relay: RelayWorkspaceBridge; onStatus: (status?: string) => void; language: "system" | "en" | "zh-Hans"; bindingIssues?: UnknownRecord[]; snapshotForCleanups?: CoreSnapshot; variant?: "pane" | "inline" }): React.JSX.Element {
   const drafts = useContext(ProviderWorkspaceDraftContext);
   const isRelay = kind === "relay";
-  const customKeys = useMemo(() => provider ? providerKeyStates(provider).filter((key) => key.source.kind === "independent") : [], [provider]);
+  // A slot Core owns is not a user key, whatever the provider's kind says.
+  // The provider editor hides this whole panel for a login service, but the
+  // panel is the surface that draws the editor, so it refuses the slot itself:
+  // a caller that forgot the service, or a second mount point, cannot make
+  // Core's own ``os.environ/`` reference look like an editable API key.
+  const customKeys = useMemo(() => provider ? providerKeyStates(provider).filter((key) => key.source.kind === "independent" && !key.managed) : [], [provider]);
   const customKeyNames = useMemo(() => stringList(provider?.api_key_names), [provider?.api_key_names]);
   const providedRows = useMemo(() => providedKeyRows(stationAccounts, translate), [stationAccounts, translate]);
   // A relay slot whose station no longer lists its source is in no account's
@@ -6044,9 +6186,9 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
     // clear depends on facts this row was already told.  The cache is written
     // only by a read that answered, so the retry is the last word either way.
     const readRates = (force: boolean): void => {
-      void serviceModelRate(service, (providerId) => dispatchSnapshot("workbuddy_models", { provider: providerId }, "providers_models", true), { force }).then((rates) => {
+      void serviceCatalog(service, (action, providerId) => dispatchSnapshot(action, { provider: providerId }, "providers_models", true), { force }).then((catalog) => {
         if (cancelled) return;
-        if (rates) { setServiceRate(rates[upstreamModelID] ?? ""); return; }
+        if (catalog) { setServiceRate(peekServiceRate(service, upstreamModelID) ?? ""); return; }
         if (!force) readRates(true);
       }).catch(() => undefined);
     };
@@ -6074,7 +6216,15 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
   const recommendedWindow = publicModelDefault(modelContexts ?? {}, publicModelName);
   const customWindow = publicModelCustomLimit(providers, publicModelName, "max_input_tokens");
   const declaredWindow = customWindow !== undefined ? customWindow : recommendedWindow;
-  const keyStates = providerAuthKind(provider) === "api_key" ? providerKeyStates(provider) : [];
+  // What the route's own upstream states for it, read from the last catalog
+  // read Core made.  Absent means this upstream published no window — not that
+  // the number is zero — so the row is drawn only when there is one.
+  const upstreamContextWindow = numberValue(model.upstream_context_window, 0) || undefined;
+  const [upstreamContextHelpOpen, setUpstreamContextHelpOpen] = useState(false);
+  // A managed slot is Core's own reference, so this route's key row answers
+  // with the user's keys only; the auth-kind gate above then narrows that to
+  // providers that have any.
+  const keyStates = providerAuthKind(provider) === "api_key" ? providerKeyStates(provider).filter((key) => !key.managed) : [];
   const selectedProviderKey = keyStates.find((key) => key.id === stringValue(model.provider_key_id))
     ?? keyStates.find((key) => key.name === stringValue(model.api_key_name));
   const usesRelayKey = selectedProviderKey?.source.kind === "relay";
@@ -6220,6 +6370,20 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
         <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{serviceRate.trim() || translate("common.none")}</Text>
       </View> : null}
       <TextField label={translate("providers.upstream")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} value={upstreamFieldValue} onDraftChange={(value) => drafts?.setModelUpstreamDraft(providerId, id, value)} onCommit={(upstream_model) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { upstream_model } })} />
+      {/* The window the route's own upstream publishes, stated directly under
+          the model it belongs to.  It is a reading, not a field: the number is
+          the upstream's own, so there is nothing here to type and no control
+          beside it — a row that offered an edit would promise a change the
+          upstream would overwrite on its next catalog read.  A route whose
+          upstream states no window keeps no row at all, so the pane never
+          shows a blank where a number would go. */}
+      {upstreamContextWindow !== undefined ? <View style={styles.formRow}>
+        <Text numberOfLines={1} style={styles.modelInspectorLabel}>{translate("providers.upstreamContextWindow")}</Text>
+        <View style={styles.modelWindowValue}>
+          <Text numberOfLines={1} style={styles.modelWindowText}>{publicModelTokensText(upstreamContextWindow, translate)}</Text>
+          <HelpTip open={upstreamContextHelpOpen} text={translate("providers.upstreamContextWindowHelp")} title={translate("providers.upstreamContextWindowHelpTitle")} onToggle={() => setUpstreamContextHelpOpen((current) => !current)} />
+        </View>
+      </View> : null}
       <View style={styles.orderEditorRow}>
         <TextField label={translate("providers.order")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} controlWidth={64} value={String(displayedOrder)} keyboardType="numeric" disabled={busy || followsMultiplier} onDraftChange={(value) => drafts?.setModelOrderDraft(providerId, id, value)} validate={(nextOrder) => {
           // The order is a number the user typed (decimals included).  A draft
@@ -6718,7 +6882,13 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
   const service = providerService(provider);
   const isOfficialAccount = kind === "openai" || kind === "claude";
   const isWorkBuddyAccount = kind === "workbuddy" || kind === "workbuddyAI";
-  const isLogin = isOfficialAccount || isWorkBuddyAccount;
+  // The one predicate, not a second spelling of it: a login service owns its
+  // key, so no key editor may be drawn for it.  Re-deriving this locally from
+  // the two kinds this pane also branches on left the OpenCode Zen free lane
+  // out, and its minted loopback slot — whose value is a Core-owned
+  // ``os.environ/`` reference, not a secret of the user's — was offered in the
+  // 密钥 editor as an editable, copyable API key.
+  const isLogin = isLoginProviderKind(kind);
   // Which account action is running, so only the button that started it shows
   // the spinner; every sibling stays disabled while one of them works.
   const [authPending, setAuthPending] = useState<"auth" | "activate" | "sibling">();

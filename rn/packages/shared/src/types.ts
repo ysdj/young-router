@@ -193,6 +193,8 @@ export interface ProviderKeySummary {
   configured: boolean;
   model_count: number;
   source: RelayKeySource;
+  /** Core's own slot: its value is a reference Core holds, never the user's. */
+  managed?: boolean;
   binding_status?: RelayBindingStatus;
 }
 
@@ -331,6 +333,8 @@ export interface ProviderModelSummary {
   effective_order?: number;
   /** The Codex context window the *public model* declares, written to every route of the group. Read-only here: `public.model_patch` owns the write. */
   max_input_tokens?: number | null;
+  /** The window this route's own upstream publishes for it, when its catalog states one. Read-only: the number is the upstream's, not this app's. */
+  upstream_context_window?: number | null;
   binding_health?: ModelBindingHealth;
   upstream_protocol_mode?: "fallback" | "fixed";
   upstream_url_surface?: ProbeSurfaceName;

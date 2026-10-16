@@ -48,6 +48,12 @@ OPENCODE2DSH_AUTH_KIND = "opencode2dsh_login"
 OPENCODE2DSH_AUTH_KINDS = (OPENCODE2DSH_AUTH_KIND,)
 AUTH_KIND_TO_PROVIDER = {OPENCODE2DSH_AUTH_KIND: OPENCODE2DSH_PROVIDER}
 PROVIDER_TO_AUTH_KIND = {value: key for key, value in AUTH_KIND_TO_PROVIDER.items()}
+# The lane's own catalog states each free model's context window, so a route on
+# it has an upstream-published window the same way a WorkBuddy account does.
+# Declaring the lane here is what lets Core remember those numbers instead of
+# naming this integration in its own rules.
+CATALOG_AUTH_KINDS = frozenset(OPENCODE2DSH_AUTH_KINDS)
+CATALOG_AUTH_KIND_TO_PROVIDER = dict(AUTH_KIND_TO_PROVIDER)
 
 # The lane this integration reaches is Zen's anonymous free tier, not Zen's
 # paid models: the same endpoint answers 401 AuthError for a paid id under the

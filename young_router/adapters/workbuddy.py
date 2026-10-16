@@ -55,8 +55,12 @@ AUTH_KIND_TO_PROVIDER = {
 PROVIDER_TO_AUTH_KIND = {value: key for key, value in AUTH_KIND_TO_PROVIDER.items()}
 # The desktop catalog states what each model bills at, so a route on either
 # variant can follow that rate the way a relay group's multiplier is followed.
-RATE_AUTH_KINDS = frozenset(WORKBUDDY_AUTH_KINDS)
-RATE_AUTH_KIND_TO_PROVIDER = dict(AUTH_KIND_TO_PROVIDER)
+# The same catalog also states each model's context window, so a route on this
+# account has an upstream-published window the pane reports read-only.
+CATALOG_AUTH_KINDS = frozenset(WORKBUDDY_AUTH_KINDS)
+CATALOG_AUTH_KIND_TO_PROVIDER = dict(AUTH_KIND_TO_PROVIDER)
+RATE_AUTH_KINDS = CATALOG_AUTH_KINDS
+RATE_AUTH_KIND_TO_PROVIDER = CATALOG_AUTH_KIND_TO_PROVIDER
 
 WORKBUDDY_DISPLAY_NAMES = {
     WORKBUDDY_PROVIDER: "WorkBuddy",

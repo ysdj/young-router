@@ -3131,6 +3131,7 @@ class CoreStore:
                             "workbuddy_login": "workbuddy_login",
                             "opencode2dsh_status": "opencode2dsh_status",
                             "opencode2dsh_models": "opencode2dsh_models",
+                            "model_import_service_catalog": "model_import_service_catalog",
                         }.get(normalized_action)
                         if (
                             name == "providers_models"

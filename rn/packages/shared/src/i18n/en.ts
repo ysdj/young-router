@@ -590,6 +590,12 @@ export const en: Record<TranslationKey, string> = {
   "providers.publicModelSettingsHint": "Change this model's context in the public model's own settings",
   "providers.contextWindowRowHelpTitle": "Public context and the recommendation",
   "providers.contextWindowRowHelp": "An unset public context takes the recommended value above. Once set, the two are separate, and the recommendation is retained alongside it.",
+  // The window the route's own upstream states for it. The row is a reading,
+  // not a setting, so the help line says where the number comes from: there is
+  // no control beside it that could explain the absence of one.
+  "providers.upstreamContextWindow": "Upstream context",
+  "providers.upstreamContextWindowHelpTitle": "Upstream context",
+  "providers.upstreamContextWindowHelp": "This upstream publishes this window in its own model catalog. The app only reads it; it cannot be changed here.",
   "providers.followMultiplier": "Follow multiplier",
   "providers.addWizard": "Add with wizard",
   "providers.wizard.title": "Configure provider",

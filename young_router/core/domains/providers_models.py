@@ -377,13 +377,17 @@ class ProvidersModelsDomain:
         # route set to follow its rate reads this at Apply time instead of
         # spending a live catalog read while it writes.
         self._published_rates: dict[str, dict[str, float]] = {}
-        # The context window each managed account's own catalog states, per
-        # variant, keyed by model id.  An upstream that publishes a window is
-        # the authority for its own route: the same public name is served by
-        # routes whose windows differ, and the group has to be planned around
-        # the smallest of them.  Remembered from the same explicit catalog
-        # read the 倍率 column comes from, so no projection ever pays for one.
-        self._published_windows: dict[str, dict[str, int]] = {}
+        # The context window an upstream publishes for a model, by the two
+        # identities such an answer arrives under.  A worker's own catalog
+        # states one window per model for every route that reads it, so it is
+        # keyed by the catalog variant; a provider's own ``/v1/models`` listing
+        # states one for this provider alone, so it is keyed by the provider's
+        # editor id.  An upstream that publishes a window is the authority for
+        # its own route — the same public name is served by routes whose
+        # windows differ — and both are remembered from a read the user asked
+        # for, so no projection ever pays for one.
+        self._catalog_windows: dict[str, dict[str, int]] = {}
+        self._listing_windows: dict[str, dict[str, int]] = {}
         self.revision = 0
         self.reload()
 
@@ -834,6 +838,11 @@ class ProvidersModelsDomain:
                         # here: the pane states the group's number and the
                         # public-model pane is where it is set.
                         "max_input_tokens": _positive_int(model.get("max_input_tokens")),
+                        # The window this route's own upstream states for it,
+                        # when its catalog published one.  Read-only for the
+                        # same reason it is worth showing: no one here decides
+                        # it, and it is what the route will actually accept.
+                        "upstream_context_window": self._published_window(provider, model),
                         "binding_health": self._binding_health(model, keys_by_id),
                         "enabled": model_enabled,
                         "model_enabled": model_enabled,
@@ -874,6 +883,13 @@ class ProvidersModelsDomain:
                         "configured": isinstance(key_value, str) and bool(key_value.strip()),
                         "model_count": model_counts.get(provider_key_id or key_name, 0),
                         "source": copy.deepcopy(item.get("source", {"kind": "independent"})),
+                        # Core states which of these slots is its own, so a
+                        # surface never has to re-derive it from the auth kind
+                        # and can never miss a service that mints one.  A
+                        # managed slot carries a reference Core holds, not a
+                        # secret of the user's: it is neither editable nor
+                        # copyable, whatever the provider's auth kind is.
+                        "managed": self._key_slot_is_managed(key_value),
                     }
                 )
         return {
@@ -1301,7 +1317,7 @@ class ProvidersModelsDomain:
     def _model_catalog(
         cls,
         payload: object,
-    ) -> tuple[list[str], dict[str, dict[str, bool]]] | None:
+    ) -> tuple[list[str], dict[str, dict[str, bool]], dict[str, int]] | None:
         if not isinstance(payload, Mapping):
             return None
         data = payload.get("data")
@@ -1309,6 +1325,7 @@ class ProvidersModelsDomain:
             return None
         candidates: list[str] = []
         capabilities: dict[str, dict[str, bool]] = {}
+        windows: dict[str, int] = {}
         seen: set[str] = set()
         for item in data:
             value = item.get("id") if isinstance(item, Mapping) else item
@@ -1317,6 +1334,9 @@ class ProvidersModelsDomain:
             candidate = REDACT_TEXT(value.strip())
             if not candidate or len(candidate) > 256 or any(ord(char) < 32 for char in candidate):
                 continue
+            window = cls._model_listing_window(item) if isinstance(item, Mapping) else None
+            if window is not None:
+                windows.setdefault(candidate, window)
             metadata = (
                 {
                     **cls._model_web_search_capabilities(item),
@@ -1339,7 +1359,28 @@ class ProvidersModelsDomain:
             candidates.append(candidate)
             if len(candidates) >= cls._MAX_MODEL_CANDIDATES:
                 break
-        return candidates, capabilities
+        return candidates, capabilities, windows
+
+    @classmethod
+    def _model_listing_window(cls, item: Mapping[str, Any]) -> int | None:
+        """The context window one ``/v1/models`` record states, if it states one.
+
+        The spellings are the ones the context registry already reads out of a
+        public model record, so one JSON vocabulary has one reading in this
+        app.  A listing that states nothing answers ``None``: an absent window
+        is not a zero, and the pane draws no row for it.
+        """
+
+        limits = item.get("limit")
+        limits = limits if isinstance(limits, Mapping) else {}
+        return (
+            _positive_int(item.get("context_window"))
+            or _positive_int(item.get("contextWindow"))
+            or _positive_int(item.get("context_length"))
+            or _positive_int(item.get("max_input_tokens"))
+            or _positive_int(limits.get("context"))
+            or _positive_int(limits.get("input"))
+        )
 
     def _fetch_provider_models(
         self,
@@ -1435,7 +1476,7 @@ class ProvidersModelsDomain:
                 "models": [],
                 "model_count": 0,
             }
-        candidates, model_capabilities = catalog
+        candidates, model_capabilities, model_windows = catalog
         result = {
             **summary,
             "available": True,
@@ -1445,6 +1486,13 @@ class ProvidersModelsDomain:
         }
         if model_capabilities:
             result["model_capabilities"] = model_capabilities
+        # A listing that states each model's window is a second place an
+        # upstream publishes one, and it arrives with the same answer that
+        # names the models.  Remembering it here lets the route report the
+        # number its own upstream stated instead of an inferred one.
+        if model_windows:
+            result["model_windows"] = model_windows
+            self._remember_listing_windows(provider_id, model_windows)
         return result
 
     def _fetch_models(self, data: Mapping[str, Any]) -> dict[str, Any]:
@@ -1456,6 +1504,20 @@ class ProvidersModelsDomain:
         provider = self._draft["providers"][index]
         if not isinstance(provider, Mapping):
             raise DomainError("The selected provider is unavailable")
+        auth_kind = str(self._provider_auth_state(provider).get("kind", ""))
+        if auth_kind in managed_adapters.catalog_auth_kinds():
+            # A service that mints its own slot owns its roster the same way it
+            # owns the models an account import brings: the adapter publishes the
+            # catalog, and a ``/v1/models`` read against a reference this Core
+            # holds is a read of the wrong address (it resolves only while this
+            # process has published the worker's port).  So this is that same
+            # catalog read, under the operation name the pane reads it by.
+            catalog_provider = managed_adapters.catalog_provider_id(auth_kind)
+            if catalog_provider:
+                self._service_catalog_operation(
+                    str(data.get("provider", "")) or catalog_provider, refresh=True
+                )
+                return self._last_operation
         api_key_name = self._api_key_name(data["api_key_name"]) if "api_key_name" in data else None
         summary = self._fetch_provider_models(
             provider,
@@ -2306,6 +2368,23 @@ class ProvidersModelsDomain:
             raise DomainError("Provider API key source is invalid") from None
 
     @staticmethod
+    def _key_slot_is_managed(value: object) -> bool:
+        """Whether one key slot's value is a reference this Core owns.
+
+        Such a slot belongs to the transport, not to the user: the auth
+        configuration minted it, the value is an ``os.environ/`` reference to a
+        bearer this process holds, and nothing in this app may edit it or hand
+        it out.  Ownership is read from the *value*, because that is what the
+        bundled worker declared — the stored source kind only says whether the
+        user's own key came from a relay.
+        """
+
+        if not isinstance(value, str):
+            return False
+        references = managed_adapters.managed_key_references()
+        return bool(references) and value.strip() in references
+
+    @staticmethod
     def _provider_source_state(provider: Mapping[str, Any]) -> dict[str, str]:
         """Read the explicit URL/name source; legacy providers are custom."""
 
@@ -2397,6 +2476,10 @@ class ProvidersModelsDomain:
             raise DomainError(
                 "The OpenCode Zen anonymous free lane could not be reached from this machine"
             )
+        # The import just read the lane's catalog, so the windows it states are
+        # known before the provider exists: a route added from this roster
+        # reports its upstream's number without paying for a second read.
+        self._remember_published_windows(provider_id, document.get("models"))
         models: list[dict[str, Any]] = []
         for entry in document.get("models") or []:
             if not isinstance(entry, Mapping):
@@ -2501,6 +2584,55 @@ class ProvidersModelsDomain:
             **document,
         }
 
+    def _service_catalog_operation(self, requested_provider: str, *, refresh: bool) -> None:
+        """Read one managed service's own catalog and answer under its own name.
+
+        Both bundled workers publish a catalog their account's routes follow,
+        and each one answers under the operation name its own adapter uses.
+        A surface that asks which catalog belongs to which service gets this
+        one dispatcher rather than naming a product, so a service that later
+        publishes a catalog is answered here too.
+        """
+
+        provider_id = requested_provider.strip()
+        if not provider_id:
+            raise DomainError("The requested service provider is unavailable")
+        workbuddy_ids = tuple(workbuddy_module.WORKBUDDY_DISPLAY_NAMES)
+        if provider_id in workbuddy_ids:
+            try:
+                document = self._workbuddy().models(
+                    workbuddy_module.validated_provider(provider_id), refresh=refresh
+                )
+            except ValueError:
+                raise DomainError("The requested WorkBuddy provider is unavailable") from None
+            except Exception:
+                raise DomainError("The WorkBuddy integration is unavailable") from None
+            self._workbuddy_remember({"providers": {provider_id: document.get("status")}})
+            self._remember_published_rates(provider_id, document.get("models"))
+            self._remember_published_windows(provider_id, document.get("models"))
+            self._last_operation = {
+                "operation": "workbuddy_models",
+                "provider": provider_id,
+                "display_name": workbuddy_module.WORKBUDDY_DISPLAY_NAMES[provider_id],
+                **document,
+            }
+            return
+        try:
+            provider_id = opencode2dsh_module.validated_provider(provider_id)
+        except ValueError:
+            raise DomainError("The requested OpenCode Zen provider is unavailable") from None
+        try:
+            document = self._opencode2dsh().models(provider_id, refresh=refresh)
+        except Exception:
+            raise DomainError("The OpenCode Zen integration is unavailable") from None
+        self._remember_published_windows(provider_id, document.get("models"))
+        self._last_operation = {
+            "operation": "opencode2dsh_models",
+            "provider": provider_id,
+            "display_name": opencode2dsh_module.OPENCODE2DSH_DISPLAY_NAME,
+            **document,
+        }
+
     def _opencode2dsh_operation(self, action: str, data: Mapping[str, Any]) -> None:
         """Answer the wizard's catalog and status questions.
 
@@ -2535,6 +2667,10 @@ class ProvidersModelsDomain:
             document = runtime.models(provider_id, refresh=bool(data.get("refresh", False)))
         except Exception:
             raise DomainError("The OpenCode Zen integration is unavailable") from None
+        # The lane's catalog is where its own window per free model is read, so
+        # the same answer that lists the roster also becomes what a projection
+        # reports for a route on it.
+        self._remember_published_windows(provider_id, document.get("models"))
         self._last_operation = {
             "operation": action,
             "provider": provider_id,
@@ -2650,11 +2786,10 @@ class ProvidersModelsDomain:
     def _remember_published_windows(self, provider_id: str, models: object) -> None:
         """Remember the context window one account's catalog states per model.
 
-        The window a route will actually read is the upstream's own number,
-        and two variants of one public name state different ones.  Recording
-        them together lets the group be planned around its narrowest route
-        instead of the widest, which is what turns an oversized turn into a
-        length refusal.
+        The window a route will actually read is the upstream's own number, and
+        two variants of one public name state different ones.  Recording them
+        together lets each route report the number its own upstream stated
+        instead of one inferred for the public name they share.
         """
 
         windows: dict[str, int] = {}
@@ -2676,25 +2811,48 @@ class ProvidersModelsDomain:
                     continue
                 windows[model_id] = window
         if windows:
-            self._published_windows[provider_id] = windows
+            self._catalog_windows[provider_id] = windows
+
+    def _remember_listing_windows(self, provider_id: str, windows: Mapping[str, int]) -> None:
+        """Remember the windows one provider's own ``/v1/models`` listing stated.
+
+        A listing answers for this provider alone, so it is remembered under
+        the provider's own editor id rather than under an integration's catalog
+        variant, which several providers can share.
+        """
+
+        if windows:
+            self._listing_windows[provider_id] = dict(windows)
 
     def _published_window(
         self,
         provider: Mapping[str, Any],
         model: Mapping[str, Any],
     ) -> int | None:
-        """The window this route's own upstream states for it, if it states one."""
+        """The window this route's own upstream states for it, if it states one.
 
-        auth_kind = self._provider_auth_state(provider)["kind"]
-        if auth_kind not in managed_adapters.rate_publishing_auth_kinds():
-            return None
-        provider_id = managed_adapters.rate_provider_id(auth_kind)
-        if not provider_id:
-            return None
+        Read from the numbers a live catalog read recorded, never from a read
+        of its own: the pane reports this beside the route it belongs to, and a
+        projection may not start a worker or reach the network.
+        """
+
         model_id = self._wire_model_name(model)
         if not model_id:
             return None
-        stored = self._published_windows.get(provider_id)
+        # A listing belongs to one provider, and a provider answers to both the
+        # name a fetch addresses it with and the editor id a nameless one falls
+        # back to.  Either identity finds the read that recorded the number.
+        for identity in {str(provider.get("name", "")).strip(), self._editor_id(provider)}:
+            listing = self._listing_windows.get(identity)
+            if isinstance(listing, Mapping) and model_id in listing:
+                return listing[model_id]
+        auth_kind = self._provider_auth_state(provider)["kind"]
+        if auth_kind not in managed_adapters.catalog_auth_kinds():
+            return None
+        provider_id = managed_adapters.catalog_provider_id(auth_kind)
+        if not provider_id:
+            return None
+        stored = self._catalog_windows.get(provider_id)
         return stored.get(model_id) if isinstance(stored, Mapping) else None
 
     def _published_rate(
@@ -3526,6 +3684,15 @@ class ProvidersModelsDomain:
             key_index = self._api_key_index(keys, key_name)
         if self._provider_key_source(keys[key_index].get("source"))["kind"] == "relay":
             raise DomainError("Relay provider key is managed by its source")
+        # The provenance rule, beside the relay one because it is the same kind
+        # of fact: a slot holding a reference this Core published belongs to the
+        # transport that publishes it.  The auth-kind check above already
+        # refuses an account-backed provider, but it answers only for the kinds
+        # that exist today; this refuses by what the value *is*, so a service
+        # that later mints a slot cannot be writable just because nobody added
+        # its name to a predicate.
+        if self._key_slot_is_managed(keys[key_index].get("value")):
+            raise DomainError("Provider key is owned by this deployment")
         keys[key_index]["value"] = value
         self._forget_key_probe_results(provider, keys[key_index])
         self._sync_primary_api_key(provider, keys)
@@ -4260,6 +4427,97 @@ class ProvidersModelsDomain:
             **({"verification_uri": str(result["verification_uri"])} if result.get("verification_uri") else {}),
             **({"user_code": str(result["user_code"])} if result.get("user_code") else {}),
             **({"redirect_uri": str(result["redirect_uri"])} if result.get("redirect_uri") else {}),
+        }
+
+    def _import_service_catalog_models(self, data: Mapping[str, Any]) -> None:
+        """Add picked models from one managed service's own catalog.
+
+        A service that publishes a catalog owns its routes' upstream names, its
+        public names (which drop the lane's own suffix), and the credential each
+        route answers with — the slot Core minted for the account.  A pane that
+        rebuilt those three from a listing it read would drift from the
+        adapter that owns them, so the pick arrives here and the catalog is
+        read once more, by the adapter, and every row is built from its own
+        entry.
+        """
+
+        provider_index = self._provider_index(data)
+        provider = self._draft["providers"][provider_index]
+        if not isinstance(provider, Mapping):
+            raise DomainError("The selected provider is unavailable")
+        auth_kind = str(self._provider_auth_state(provider).get("kind", ""))
+        if auth_kind not in managed_adapters.catalog_auth_kinds():
+            raise DomainError("The selected provider publishes no catalog of its own")
+        picked = data.get("models")
+        if not isinstance(picked, Sequence) or isinstance(picked, (str, bytes, bytearray)):
+            raise DomainError("Models must be a list")
+        requested = [str(item).strip() for item in picked if str(item).strip()]
+        if not requested:
+            self._last_operation = {
+                "operation": "model_import_service_catalog",
+                "provider_id": self._safe_provider(provider, provider_index)["id"],
+                "imported": 0,
+            }
+            return
+        provider_id = managed_adapters.catalog_provider_id(auth_kind)
+        if not provider_id:
+            raise DomainError("The selected provider publishes no catalog of its own")
+        self._service_catalog_operation(provider_id, refresh=True)
+        catalog = self._last_operation.get("models")
+        entries = {
+            str(entry.get("id", "")).strip(): entry
+            for entry in (catalog if isinstance(catalog, Sequence) and not isinstance(catalog, (str, bytes, bytearray)) else [])
+            if isinstance(entry, Mapping) and str(entry.get("id", "")).strip()
+        }
+        unknown = [model_id for model_id in requested if model_id not in entries]
+        if unknown:
+            raise DomainError("The service catalog no longer lists a selected model")
+        # A route the provider already carries is not added twice: a refresh
+        # that lists what is already there changes nothing and says so.  The
+        # document names an upstream with its adapter prefix, so the identity a
+        # row is compared by is the same one every other read here uses.
+        existing = {
+            self._wire_model_name(model)
+            for model in provider.get("models", [])
+            if isinstance(model, Mapping)
+        }
+        edited = self._copy_provider_for_edit(self._draft["providers"][provider_index])
+        models = edited.get("models")
+        if not isinstance(models, list):
+            models = []
+            edited["models"] = models
+        used_deployment_ids = {
+            str(model.get("deployment_id", "")).strip().lower()
+            for candidate in self._draft["providers"]
+            if isinstance(candidate, Mapping)
+            for model in candidate.get("models", [])
+            if isinstance(model, Mapping) and str(model.get("deployment_id", "")).strip()
+        }
+        added = 0
+        for model_id in requested:
+            if model_id in existing:
+                continue
+            entry = entries[model_id]
+            row = self._new_model(
+                edited,
+                {
+                    "name": _public_name_without_lane_suffix(model_id),
+                    "upstream_model": model_id,
+                    "enabled": True,
+                    "order": IMPORTED_MODEL_ORDER,
+                },
+                used_deployment_ids,
+            )
+            self._append_model_row(edited, models, row)
+            existing.add(model_id)
+            added += 1
+        self._apply_auth_to_models(edited, auth_kind)
+        self._draft["providers"][provider_index] = edited
+        self._last_operation = {
+            "operation": "model_import_service_catalog",
+            "provider_id": self._safe_provider(edited, provider_index)["id"],
+            "api_key_name": str(self._provider_auth_state(edited).get("kind", "")),
+            "imported": added,
         }
 
     def _append_model_row(
@@ -5822,6 +6080,9 @@ class ProvidersModelsDomain:
             return
         if action == "model_detach_relay_key":
             self._detach_model_from_relay(data)
+            return
+        if action in {"model_import_service_catalog", "model_import_catalog"}:
+            self._import_service_catalog_models(data)
             return
         providers = self._draft["providers"]
         provider_index = self._provider_index(data)

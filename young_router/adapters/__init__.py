@@ -46,6 +46,31 @@ def managed_base_references() -> frozenset[str]:
     return frozenset(references)
 
 
+def managed_key_references() -> frozenset[str]:
+    """Every ``os.environ/`` key reference a bundled worker publishes.
+
+    A worker that owns its own transport also owns the bearer that transport
+    authenticates with: the key slot the provider carries is a reference to a
+    value the *Core* holds, not a secret of the user's.  Such a slot is
+    minted by the auth configuration and must stay uneditable, so "is this
+    slot mine?" is answered by the same provenance rule the base reference
+    uses — the value is one of the references these workers declared.
+
+    This is deliberately not ``kind == "independent"``.  The stored source
+    vocabulary (``independent`` / ``relay``) says where a *user's* key came
+    from, and a minted loopback slot is stored as ``independent`` because it
+    belongs to no relay.  Reading ownership off the stored kind answered
+    "the user's" for a slot the user never owned, which is what offered an
+    ``os.environ/`` reference as an editable, copyable API key.
+    """
+
+    references: set[str] = set()
+    for module in _managed_modules():
+        for name in _base_env_names(getattr(module, "API_KEY_ENV", None)):
+            references.add(f"os.environ/{name}")
+    return frozenset(references)
+
+
 def managed_base_urls() -> tuple[str, ...]:
     """The addresses those references resolve to, as this process published them.
 
@@ -144,9 +169,40 @@ def rate_publishing_auth_kinds() -> frozenset[str]:
     instead of naming a product.
     """
 
+    return _declared_auth_kinds("RATE_AUTH_KINDS")
+
+
+def catalog_auth_kinds() -> frozenset[str]:
+    """Auth kinds whose own worker catalog states facts about each model.
+
+    Such a catalog is the authority for its own routes: it states the window
+    each model accepts, which no bundled profile can know as well as the
+    upstream that would refuse the turn.  A worker declares its catalog here,
+    so a projection asks this question instead of naming an integration.
+    """
+
+    return _declared_auth_kinds("CATALOG_AUTH_KINDS")
+
+
+def catalog_provider_id(auth_kind: str) -> str:
+    """The catalog id one such account kind is read through."""
+
+    for module in _managed_modules():
+        mapping = getattr(module, "CATALOG_AUTH_KIND_TO_PROVIDER", None)
+        if not isinstance(mapping, Mapping):
+            continue
+        candidate = mapping.get(str(auth_kind).strip())
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return ""
+
+
+def _declared_auth_kinds(attribute: str) -> frozenset[str]:
+    """Every auth kind the managed workers declare under one attribute name."""
+
     kinds: set[str] = set()
     for module in _managed_modules():
-        declared = getattr(module, "RATE_AUTH_KINDS", None)
+        declared = getattr(module, attribute, None)
         if isinstance(declared, (set, frozenset, tuple, list)):
             for kind in declared:
                 if isinstance(kind, str) and kind.strip():
