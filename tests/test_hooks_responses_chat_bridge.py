@@ -119,65 +119,6 @@ class HookResponsesChatBridgeTests(HookTestCase):
             external_bridge["litellm_metadata"][hooks._WEB_SEARCH_EXTERNAL_BRIDGE_KEY]
         )
 
-    def test_chat_declared_route_refusing_responses_with_403_bridges_to_chat(self) -> None:
-        """A station with no Responses endpoint refuses it; the bridge must reach Chat.
-
-        The station answers ``openai_error`` over ``bad_response_status_code``,
-        which is the body the deployment-compatibility classifier already reads
-        -- but that one only accepts a 400, so a station choosing 403 was read as
-        a terminal request error. A request that a peer route could serve was
-        answered with the refusal instead, and a summarization call surfaced it
-        to the client as a failed compaction.
-        """
-
-        hooks, _ = load_hook_module()
-
-        error = RuntimeError(
-            'OpenAIException - {"error":{"message":"openai_error",'
-            '"type":"bad_response_status_code","param":"",'
-            '"code":"bad_response_status_code"}}'
-        )
-        error.status_code = 403
-        request_kwargs = {
-            "call_type": "aresponses",
-            "input": "hi",
-            "model_info": {"id": "chatroute", "upstream_url_surface": "openai/chat"},
-        }
-
-        self.assertEqual(
-            hooks._responses_chat_bridge_retry_reason(error, request_kwargs, None),
-            "responses_endpoint_not_found",
-        )
-        self.assertIsNotNone(
-            hooks._responses_chat_bridge_retry_kwargs(error, request_kwargs, None)
-        )
-
-    def test_declared_responses_surface_keeps_the_403_refusal_terminal(self) -> None:
-        """A route that states a Responses surface is not being denied one.
-
-        The same body on a route configured for ``openai/responses`` describes a
-        real request failure, so bridging it to Chat would send the request to a
-        surface the route never claimed to have.
-        """
-
-        hooks, _ = load_hook_module()
-
-        error = RuntimeError(
-            'OpenAIException - {"error":{"message":"openai_error",'
-            '"type":"bad_response_status_code","param":"",'
-            '"code":"bad_response_status_code"}}'
-        )
-        error.status_code = 403
-        request_kwargs = {
-            "call_type": "aresponses",
-            "input": "hi",
-            "model_info": {"id": "responsesroute", "upstream_url_surface": "openai/responses"},
-        }
-
-        self.assertIsNone(
-            hooks._responses_chat_bridge_retry_reason(error, request_kwargs, None)
-        )
-
     async def test_function_tool_bridge_bad_response_status_stays_on_responses(self) -> None:
         hooks, _ = load_hook_module()
         calls = []

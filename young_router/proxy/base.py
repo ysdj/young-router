@@ -635,12 +635,6 @@ _HISTORY_IMAGE_ELISION_DEFAULT_KEEP = 0
 # rather than an image: bytes the gateway counts and the client discounts.
 _HISTORY_TOOL_OUTPUT_MIN_CHARS_ENV = "YOUNG_ROUTER_HISTORY_TOOL_OUTPUT_MIN_CHARS"
 _HISTORY_TOOL_OUTPUT_DEFAULT_MIN_CHARS = 20_000
-# The tail of the history is the part the client is still working from, so a
-# record sized for it is kept whole even when it exceeds the drop threshold
-# above; only the older replay is elided.  The env name is the one the reader
-# resolves, and the default is that reader's fallback when it is unset.
-_HISTORY_TOOL_OUTPUT_KEPT_CHARS_ENV = "YOUNG_ROUTER_HISTORY_TOOL_OUTPUT_KEPT_CHARS"
-_HISTORY_TOOL_OUTPUT_DEFAULT_KEPT_CHARS = 20_000
 _HISTORY_TOOL_OUTPUT_KEPT = 8
 _PREFIX_IMAGE_ORIGINAL_PATH_ENV = "YOUNG_ROUTER_PREFIX_IMAGE_ORIGINAL_PATH"
 _PREFIX_IMAGE_ORIGINAL_PATH_DEFAULT = True
