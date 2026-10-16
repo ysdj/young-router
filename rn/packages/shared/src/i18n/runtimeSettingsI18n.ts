@@ -44,6 +44,8 @@ const zh: Record<string, RuntimeCopy> = {
   YOUNG_ROUTER_CODEX_COMPACTION_START_TIMEOUT_SECONDS: { label: "压缩首事件超时", help: "结构化 Codex 压缩请求等待首个事件的最长时间。设为 0 时回退到请求超时。" },
   YOUNG_ROUTER_STALL_TIMEOUT_SECONDS: { label: "流空闲超时", help: "首个事件到达后，相邻流事件之间允许的最长间隔。设为 0 可取消本地流空闲上限。" },
   YOUNG_ROUTER_STREAM_KEEPALIVE_INTERVAL_SECONDS: { label: "流保活间隔", help: "交付流静默期间按此间隔发送一个客户端可解析的保活事件，避免客户端字节空闲计时器早于代理预算触发。设为 0 可关闭保活。" },
+  YOUNG_ROUTER_STREAM_CONTINUATION_ENABLED: { label: "截断回答自动续写", help: "路由撞到自己的输出上限时，会以 length 终止帧正常结束本轮，而不是报错，所以整篇翻译可能在中途停住。开启后路由器会向同一路由索取剩余内容，并把续写接进客户端正在阅读的同一条回答。默认关闭：客户端自己发送了输出上限时，应优先在客户端修正，只有无法修正时才由这里兜底。仅适用于纯文本的 Chat Completions 与 Anthropic 回答；带工具的轮次不受影响。" },
+  YOUNG_ROUTER_STREAM_CONTINUATION_MAX_ROUNDS: { label: "续写轮数上限", help: "一条回答因路由撞到自身输出上限而最多可被续写的次数。每轮都是一次完整的上游调用，从已交付内容继续。设为 0 时保留路由留下的截断结果。" },
   YOUNG_ROUTER_CODEX_DESCENDANT_CLEANUP: { label: "Codex 父线程屏障", help: "根任务结束前必须取得最新的完整后代线程快照。仍承担必要实现或测试的后代会被等待；已不影响交付的后代按最深层优先中断。关闭后仅使用 Codex 原生生命周期。" },
   YOUNG_ROUTER_RECOVERY_MAX_SECONDS: { label: "恢复最长时间", help: "路由恢复轮询的最长时间。所有路由冷却时保持连接和进度心跳，首个冷却结束后重试。设为 0 可关闭轮询。" },
   YOUNG_ROUTER_RECOVERY_INTERVAL_SECONDS: { label: "恢复探测间隔", help: "两次实际路由恢复探测之间的等待时间。" },
