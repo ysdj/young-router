@@ -4056,10 +4056,28 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'translate("providers.wizard.opencode2dshHint")',
             '"opencode2dsh_status",',
             '"opencode2dsh_models",',
-            # The model step states that the roster arrives with the create,
-            # instead of showing an empty picker that was never going to fill.
-            'isOpenCode2DSHType ? <View style={styles.providerWizardFormSection}>',
-            'translate("providers.wizard.opencode2dshModelsHint")',
+            # The model step lists the lane's own free roster, so the user picks
+            # what the entry carries instead of being handed the whole catalog.
+            'const fetchOpenCode2DSHModels = async (): Promise<void> => {',
+            'void (isOpenCode2DSHType ? fetchOpenCode2DSHModels() : fetchWizardModels());',
+            'void fetchOpenCode2DSHModels();',
+            'const OPENCODE2DSH_KEY_NAME = "opencode-zen-free";',
+            # The 密钥 step names the one slot the entry carries, never the
+            # provider name where a key name belongs.
+            '{isOpenCode2DSHType ? OPENCODE2DSH_KEY_NAME : selectedProviderName}',
+            # 完成 creates with the models the user kept.
+            'const kept = modelCandidates.filter((name) => selectedModels.includes(name));',
+            # The list carries the same two tools the model chooser offers:
+            # one press for everything, one for the complement.
+            'translate(selectedModels.length === modelCandidates.length ? "dataManagement.deselectAll" : "dataManagement.selectAll")',
+            'translate("modelChooser.invert")',
+            # The header names the provider for what it is, so a bare name
+            # beside 模型 is never read as a model id.
+            'translate("providers.wizard.providerName")}: {selectedProviderName}',
+            # The lane's own ``-free`` suffix is dropped from the public name
+            # while the route keeps the upstream's real id.
+            'function publicModelNameForLane(modelID: string): string {',
+            'models: kept.map((model_id) => ({ name: publicModelNameForLane(model_id), upstream_model: model_id, enabled: true, order: 0 })),',
             # Deleting the entry goes through the account-backed action, which
             # is the only one Core accepts for a login provider; routing it to
             # the ordinary provider action is an entry the user cannot remove.
@@ -4074,6 +4092,29 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # Both languages name the lane for the free tier it actually reaches.
         self.assertIn('"providers.type.opencode2dsh": "OpenCode Zen Free"', self.en)
         self.assertIn('"providers.type.opencode2dsh": "OpenCode Zen 免费版"', self.zh)
+
+    def test_the_lane_free_suffix_rule_agrees_with_core(self) -> None:
+        """The UI strips the lane's ``-free`` suffix exactly as Core does.
+
+        The wizard builds its create payload in TypeScript while Core also
+        imports the roster on its own, so the two must apply one rule: a public
+        name without the lane's suffix, and an upstream id that keeps it.  The
+        suffix-only id is the boundary — stripping it would leave a public name
+        that names no model.
+        """
+
+        from young_router.core.domains import providers_models as module
+
+        for model_id, expected in (
+            ("cat-jam-free", "cat-jam"),
+            ("big-pickle", "big-pickle"),
+            ("-free", "-free"),
+            ("free", "free"),
+        ):
+            self.assertEqual(module._public_name_without_lane_suffix(model_id), expected, model_id)
+        # The UI states the identical rule, so neither side can drift alone.
+        self.assert_ui_has('const suffix = "-free";')
+        self.assert_ui_has("modelID.endsWith(suffix) && modelID.length > suffix.length")
 
     def test_a_workbuddy_entry_states_the_account_and_its_credit(self) -> None:
         """Opening a WorkBuddy provider shows the积分, not just the account.

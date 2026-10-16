@@ -1997,3 +1997,76 @@ class HookResponsesChatBridgeTests(HookTestCase):
         )
         self.assertNotIn("web_search_options", calls[1])
         self.assertFalse(hasattr(error, "responses_endpoint_unsupported"))
+
+    def test_a_delegation_output_becomes_the_user_turn_it_stands_for(self) -> None:
+        """A thread started by ``create_thread`` is given its task as output.
+
+        Replayed as a tool result that task is something the model was told
+        rather than something it was asked, so the turn ends on "what would
+        you like me to work on" instead of starting the work.
+        """
+
+        hooks, _ = load_hook_module()
+        bridged, stats = hooks._responses_chat_bridge_input(
+            [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "AGENTS.md"}],
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call-created",
+                    "name": "create_thread",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call-created",
+                    "output": (
+                        "<codex_delegation>\n"
+                        "  <source_thread_id>01a138ab</source_thread_id>\n"
+                        "  <input>GOAL: make build-and-restart fast.</input>\n"
+                        "</codex_delegation>"
+                    ),
+                },
+            ],
+            [{"type": "function", "name": "create_thread"}],
+        )
+
+        self.assertEqual(stats.get("lifted_delegation_tasks"), 1)
+        user_messages = [
+            item
+            for item in bridged
+            if item.get("type") == "message" and item.get("role") == "user"
+        ]
+        self.assertEqual(len(user_messages), 2)
+        self.assertEqual(
+            user_messages[1]["content"][0]["text"],
+            "GOAL: make build-and-restart fast.",
+        )
+        # The lifted turn goes after the call and its result, never between
+        # them: a chat surface rejects a tool result that is not adjacent to
+        # its call.
+        types = [item.get("type") for item in bridged]
+        self.assertEqual(
+            types,
+            ["message", "function_call", "function_call_output", "message"],
+        )
+
+    def test_an_ordinary_tool_output_is_never_lifted(self) -> None:
+        hooks, _ = load_hook_module()
+        for output in (
+            "file listing:\nfoo.py",
+            "",
+            "<codex_delegation><source_thread_id>x</source_thread_id></codex_delegation>",
+            "<other><input>not a task</input></other>",
+        ):
+            with self.subTest(output=output):
+                bridged, stats = hooks._responses_chat_bridge_input(
+                    [{"type": "function_call_output", "call_id": "c1", "output": output}],
+                    [{"type": "function", "name": "create_thread"}],
+                )
+                self.assertNotIn("lifted_delegation_tasks", stats)
+                self.assertFalse(stats.get("changed"))
+                self.assertEqual(len(bridged), 1)

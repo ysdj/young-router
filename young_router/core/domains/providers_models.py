@@ -46,6 +46,7 @@ from ...config.schema import (
 )
 
 from ...adapters import veridrop
+from ...adapters import opencode2dsh as opencode2dsh_module
 from ...adapters import workbuddy as workbuddy_module
 from ... import adapters as managed_adapters
 from ...browser_identity import browser_request_headers
@@ -71,6 +72,32 @@ from ._shared import (
     _safe_problem,
     _selected_identifier,
 )
+
+
+# The order every route of an imported roster starts on.  A catalog import
+# brings peer routes, not a ranked list, so they all begin on the same slot and
+# the picker's ordering is the user's to set.  A ranked default would encode the
+# catalog's own enumeration into a routing decision nobody made.
+IMPORTED_MODEL_ORDER = 0
+
+# The suffix the anonymous Zen lane puts on its free ids (``cat-jam-free``).
+# It states the lane, not the model, and the public name a client sees must not
+# carry it: the same model reached through a paid route would then have two
+# public names for one thing.  Only the public name is stripped — the upstream
+# model keeps the lane's own id, which is what actually addresses it.
+OPENCODE2DSH_FREE_SUFFIX = "-free"
+
+
+def _public_name_without_lane_suffix(model_id: str) -> str:
+    """The public name of a lane id, with the lane's own suffix removed.
+
+    An id that is nothing but the suffix (``-free``) is left alone: stripping it
+    would leave an empty public name, which names no model at all.
+    """
+
+    if model_id.endswith(OPENCODE2DSH_FREE_SUFFIX) and len(model_id) > len(OPENCODE2DSH_FREE_SUFFIX):
+        return model_id[: -len(OPENCODE2DSH_FREE_SUFFIX)]
+    return model_id
 
 
 # The relay issue code that says the station answered and does not list this
@@ -195,7 +222,11 @@ def _environment_reference(name: str) -> str:
     value = os.environ.get(name, "").strip()
     if value:
         return value
-    return str(workbuddy_module.published_environment().get(name, "")).strip()
+    for module in (workbuddy_module, opencode2dsh_module):
+        published = str(module.published_environment().get(name, "")).strip()
+        if published:
+            return published
+    return ""
 
 
 def _model_is_live(provider: Mapping[str, Any], model: Mapping[str, Any]) -> bool:
@@ -305,10 +336,12 @@ class ProvidersModelsDomain:
         *,
         auth_manager: object | None = None,
         workbuddy: object | None = None,
+        opencode2dsh: object | None = None,
     ):
         self.config_path = Path(config_path).expanduser() if config_path else _default_provider_config_path()
         self.auth_manager = auth_manager
         self.workbuddy = workbuddy
+        self.opencode2dsh = opencode2dsh
         self._raw: dict[str, Any] = {}
         self._draft: dict[str, Any] = {}
         self._probe_overlay: dict[str, dict[str, dict[str, Any]]] = {}
@@ -369,6 +402,15 @@ class ProvidersModelsDomain:
 
             self.workbuddy = WorkBuddyRuntime(self.config_path.parent)
         return self.workbuddy
+
+    def _opencode2dsh(self):
+        """The OpenCode Zen worker owner; created on demand for a bare domain."""
+
+        if self.opencode2dsh is None:
+            from ...adapters.opencode2dsh import OpenCode2DSHRuntime
+
+            self.opencode2dsh = OpenCode2DSHRuntime(self.config_path.parent)
+        return self.opencode2dsh
 
     def _workbuddy_remember(self, document: Mapping[str, Any]) -> None:
         """Record what one live WorkBuddy read reported, per variant."""
@@ -609,6 +651,10 @@ class ProvidersModelsDomain:
         if auth_kind in workbuddy_module.WORKBUDDY_AUTH_KINDS:
             # The WorkBuddy worker mounts Chat Completions alone, so a route on
             # this account never probes a Responses endpoint that cannot exist.
+            return "openai/chat", "fixed"
+        if auth_kind in opencode2dsh_module.OPENCODE2DSH_AUTH_KINDS:
+            # The OpenCode Zen worker mounts Chat Completions alone, so a route
+            # on this lane never probes a Responses endpoint that cannot exist.
             return "openai/chat", "fixed"
         if auth_kind == "api_key":
             return "", "fallback"
@@ -1816,16 +1862,22 @@ class ProvidersModelsDomain:
         }
         if not plan.get("includes_degradation"):
             return result
-        if required_surface and surface_status != "ok":
-            # The route already failed its tiny surface probe, so a longer scan
-            # cannot tell the user anything new. The failure keeps its own name:
-            # rejected, silent, or a definitive rejection.
+        if surface_status != "ok":
+            # The route failed the surface its own protocol speaks, so the longer
+            # scan has nothing to measure. A protocol with no surface in this
+            # app's probe matrix (Gemini) carries no precondition and reports
+            # what the address answers; every other protocol is gated here. A
+            # route that answered nowhere is never a finding about what answers
+            # behind its name: the failure keeps its own name - rejected,
+            # silent, or a definitive rejection.
             result["status"] = (
                 "unreachable" if surface_status in {"refused", "timeout", "network_error"} else "error"
             )
             result["cause"] = surface_status
             result["detail"] = (
                 f"The {required_surface} surface did not answer the availability probe ({surface_status})"
+                if required_surface
+                else f"No surface answered the availability probe ({surface_status})"
             )
             return result
         result["status"] = "unavailable"
@@ -1854,6 +1906,18 @@ class ProvidersModelsDomain:
             return result
         result["verdict"] = str(decision.get("verdict") or "")
         result["score"] = decision.get("score")
+        run_error = str(decision.get("run_error") or "").strip()
+        if run_error:
+            # The suite ran but upstream refused to validate it (no balance, no
+            # channel for this name). Nothing was measured, so the zero score is
+            # the invalid run's and not the route's: the finding says the check
+            # could not be made instead of naming the model diluted.
+            result["verdict"] = ""
+            result["score"] = None
+            result["status"] = "unavailable"
+            result["cause"] = "run_error"
+            result["detail"] = run_error
+            return result
         detectors = decision.get("detectors")
         result["detectors"] = [
             {
@@ -2070,14 +2134,25 @@ class ProvidersModelsDomain:
         # answered there has nothing for the quick suite to measure, and the
         # other surfaces' statuses say nothing about that protocol.
         required_surface = str(deep_probe.get("surface", ""))
+        if required_surface:
+            # One protocol, one surface: the scan is gated on the surface it
+            # speaks, and the other surfaces' statuses say nothing about it.
+            surface_status = str(surface_results.get(required_surface, {}).get("status", "unavailable"))
+        elif available_surfaces:
+            # A protocol with no surface in this app's probe matrix (Gemini) has
+            # no precondition, and the staged program reports what the address
+            # answers. Something did answer, so the scan is worth running.
+            surface_status = "ok"
+        else:
+            # Nothing answered anywhere, so there is no endpoint to measure and
+            # no evidence about what answers behind the name.
+            surface_status = "unreachable" if unreachable_surfaces else "error"
         degradation = self._degradation_probe(
             plan=deep_probe,
             api_base=api_base,
             credential=credential,
             model_name=model_name,
-            surface_status=str(
-                surface_results.get(required_surface, {}).get("status", "unavailable")
-            ),
+            surface_status=surface_status,
         )
         probe_overlay = {
             "available": recommended is not None,
@@ -2282,7 +2357,7 @@ class ProvidersModelsDomain:
                 "Sign in to the WorkBuddy desktop app before adding this account"
             )
         models: list[dict[str, Any]] = []
-        for order, entry in enumerate(document.get("models") or [], start=1):
+        for entry in document.get("models") or []:
             if not isinstance(entry, Mapping):
                 continue
             model_id = str(entry.get("id", "")).strip()
@@ -2292,11 +2367,54 @@ class ProvidersModelsDomain:
                 "name": model_id,
                 "upstream_model": model_id,
                 "enabled": True,
-                "order": order,
+                # An imported roster is a set of peers, not a ranked list: every
+                # route starts on the same order, so the picker's order is the
+                # user's to set rather than an accident of the catalog's order.
+                "order": IMPORTED_MODEL_ORDER,
             }
             models.append(model)
         if not models:
             raise DomainError("The WorkBuddy account reported no models")
+        return models
+
+    def _opencode2dsh_catalog_models(self, auth_kind: str) -> list[dict[str, Any]]:
+        """Import the staged adapter's live free-model roster as this lane's models.
+
+        The upstream owns which ids the anonymous Zen lane serves and the
+        models.dev metadata behind their limits, so the roster is read from the
+        adapter rather than guessed here.  An empty roster is a real failure for
+        the user's own add action - the lane reaches Zen but served nothing -
+        and saying so is what lets the pane report it instead of creating an
+        account that routes nowhere.
+        """
+
+        provider_id = opencode2dsh_module.AUTH_KIND_TO_PROVIDER[auth_kind]
+        try:
+            document = self._opencode2dsh().models(provider_id, refresh=True)
+        except Exception:
+            raise DomainError("The OpenCode Zen free model list is unavailable") from None
+        if document.get("available") is not True:
+            raise DomainError(
+                "The OpenCode Zen anonymous free lane could not be reached from this machine"
+            )
+        models: list[dict[str, Any]] = []
+        for entry in document.get("models") or []:
+            if not isinstance(entry, Mapping):
+                continue
+            model_id = str(entry.get("id", "")).strip()
+            if not model_id:
+                continue
+            model: dict[str, Any] = {
+                # The public name drops the lane's own ``-free`` suffix; the
+                # route still addresses the upstream's real id.
+                "name": _public_name_without_lane_suffix(model_id),
+                "upstream_model": model_id,
+                "enabled": True,
+                "order": IMPORTED_MODEL_ORDER,
+            }
+            models.append(model)
+        if not models:
+            raise DomainError("The OpenCode Zen free lane reported no models")
         return models
 
     def _workbuddy_operation(self, action: str, data: Mapping[str, Any]) -> None:
@@ -2380,6 +2498,47 @@ class ProvidersModelsDomain:
             "operation": action,
             "provider": provider_id,
             "display_name": workbuddy_module.WORKBUDDY_DISPLAY_NAMES[provider_id],
+            **document,
+        }
+
+    def _opencode2dsh_operation(self, action: str, data: Mapping[str, Any]) -> None:
+        """Answer the wizard's catalog and status questions.
+
+        This lane has no account to report and no sign-in this app can start or
+        end, so both actions are catalog reads: the caller sees the result as
+        this domain's ``operation_summary``, and a snapshot never pays for one.
+        """
+
+        try:
+            provider_id = opencode2dsh_module.validated_provider(
+                data.get("provider", opencode2dsh_module.OPENCODE2DSH_PROVIDER)
+            )
+        except ValueError:
+            raise DomainError("The requested OpenCode Zen provider is unavailable") from None
+        runtime = self._opencode2dsh()
+        try:
+            if action == "opencode2dsh_status":
+                document = runtime.status(refresh=bool(data.get("refresh", False)))
+                providers = document.get("providers")
+                self._last_operation = {
+                    "operation": action,
+                    "available": document.get("available") is True,
+                    "detail": str(document.get("detail", "")),
+                    "providers": dict(providers) if isinstance(providers, Mapping) else {},
+                }
+                return
+            # The catalog is the same document for every route on this lane, so
+            # a read that did not ask to refresh is served from the worker
+            # client's remembered answer.  The pane's 刷新 button and the lane
+            # import pass ``refresh``, which reaches upstream; anything else
+            # would fetch the whole Zen directory again on every model switch.
+            document = runtime.models(provider_id, refresh=bool(data.get("refresh", False)))
+        except Exception:
+            raise DomainError("The OpenCode Zen integration is unavailable") from None
+        self._last_operation = {
+            "operation": action,
+            "provider": provider_id,
+            "display_name": opencode2dsh_module.OPENCODE2DSH_DISPLAY_NAME,
             **document,
         }
 
@@ -2690,6 +2849,12 @@ class ProvidersModelsDomain:
     ) -> bool:
         if auth.get("kind") in workbuddy_module.WORKBUDDY_AUTH_KINDS:
             return self._workbuddy_projection_status(auth, allow_live=allow_live)[1]
+        if auth.get("kind") in opencode2dsh_module.OPENCODE2DSH_AUTH_KINDS:
+            # This lane authenticates itself: there is no credential of the
+            # user's to be configured, so the lane is ready exactly when its
+            # worker owner is present -- the same owner every read goes through,
+            # which a bare domain supplies and a staged package backs.
+            return self.opencode2dsh is not None or opencode2dsh_module.available()
         if auth.get("kind") in {"openai_login", "claude_login"}:
             # The OpenAI status is a local file read plus a token-expiry check,
             # so a projection may take it.  Claude's device login is answered
@@ -2716,6 +2881,10 @@ class ProvidersModelsDomain:
             return self._workbuddy_projection_status(auth, allow_live=allow_live)[0] or (
                 "signed_out" if workbuddy_module.available() else "unsupported"
             )
+        if kind in opencode2dsh_module.OPENCODE2DSH_AUTH_KINDS:
+            # No sign-in exists for this lane, so there is no login this app can
+            # start or end: the state reports the integration, not an account.
+            return "signed_in" if self.opencode2dsh is not None or opencode2dsh_module.available() else "unsupported"
         if kind in {"openai_login", "claude_login"}:
             credential_ref = str(auth.get("credential_ref", "")).strip()
             if not credential_ref:
@@ -2871,6 +3040,25 @@ class ProvidersModelsDomain:
                     }
                 ],
             )
+        elif auth_kind in opencode2dsh_module.OPENCODE2DSH_AUTH_KINDS:
+            # The provider points at this Core's own loopback worker, never at
+            # the Zen upstream: the worker owns the request fingerprint and
+            # every wire quirk.  Both the base URL and the key stay environment
+            # references, so the worker port and its bearer never enter
+            # config.yaml.
+            provider_id = opencode2dsh_module.AUTH_KIND_TO_PROVIDER[auth_kind]
+            provider["api_base"] = opencode2dsh_module.api_base_reference(provider_id)
+            cls._sync_primary_api_key(
+                provider,
+                [
+                    {
+                        "id": cls._new_provider_key_id(),
+                        "name": opencode2dsh_module.API_KEY_NAME,
+                        "value": opencode2dsh_module.api_key_reference(provider_id),
+                        "source": {"kind": "independent"},
+                    }
+                ],
+            )
         elif auth_kind == "claude_login":
             provider["api_base"] = ""
             cls._sync_primary_api_key(
@@ -2894,7 +3082,11 @@ class ProvidersModelsDomain:
         keys = cls._provider_api_keys(provider)
         selected_key = (
             keys[0]
-            if auth_kind in {"claude_login", *workbuddy_module.WORKBUDDY_AUTH_KINDS} and keys
+            if auth_kind in {
+                "claude_login",
+                *workbuddy_module.WORKBUDDY_AUTH_KINDS,
+                *opencode2dsh_module.OPENCODE2DSH_AUTH_KINDS,
+            } and keys
             else None
         )
         for model in models:
@@ -3415,7 +3607,12 @@ class ProvidersModelsDomain:
     # compatible with the LiteLLM config writer and older installations that
     # already contain login metadata.
     _SERVICE_PROVIDER_KINDS = frozenset(
-        {"openai_login", "claude_login", *workbuddy_module.WORKBUDDY_AUTH_KINDS}
+        {
+            "openai_login",
+            "claude_login",
+            *workbuddy_module.WORKBUDDY_AUTH_KINDS,
+            *opencode2dsh_module.OPENCODE2DSH_AUTH_KINDS,
+        }
     )
     _SERVICE_PROVIDER_DEFAULTS: dict[str, dict[str, str]] = {
         "openai_login": {
@@ -3436,6 +3633,12 @@ class ProvidersModelsDomain:
         },
         workbuddy_module.WORKBUDDY_AI_AUTH_KIND: {
             "name": workbuddy_module.WORKBUDDY_DISPLAY_NAMES[workbuddy_module.WORKBUDDY_AI_PROVIDER],
+        },
+        # OpenCode Zen carries no default model: the staged adapter's own
+        # catalog is the roster, so a newly added lane imports exactly what the
+        # lane can call today.
+        opencode2dsh_module.OPENCODE2DSH_AUTH_KIND: {
+            "name": opencode2dsh_module.OPENCODE2DSH_DISPLAY_NAME,
         },
     }
 
@@ -3519,6 +3722,11 @@ class ProvidersModelsDomain:
             # live catalog is the source of truth, and importing it is the
             # whole point of adding the account.
             raw_models = self._workbuddy_catalog_models(kind)
+        if raw_models is None and kind in opencode2dsh_module.OPENCODE2DSH_AUTH_KINDS:
+            # The OpenCode Zen lane owns no free-text roster either: the staged
+            # adapter's live catalog is the source of truth, and importing it is
+            # the whole point of adding the lane.
+            raw_models = self._opencode2dsh_catalog_models(kind)
         if raw_models is None:
             raw_model = supplied.get("model")
             raw_models = [raw_model] if isinstance(raw_model, Mapping) else [
@@ -3526,7 +3734,7 @@ class ProvidersModelsDomain:
                     "name": defaults["model_name"],
                     "upstream_model": defaults["upstream_model"],
                     "enabled": True,
-                    "order": 1,
+                    "order": IMPORTED_MODEL_ORDER,
                 }
             ]
         if not isinstance(raw_models, Sequence) or isinstance(raw_models, (str, bytes, bytearray)):
@@ -4153,7 +4361,7 @@ class ProvidersModelsDomain:
         elif "enabled" in model:
             model["model_enabled"] = model["enabled"]
         if "order" not in model:
-            model["order"] = 0
+            model["order"] = IMPORTED_MODEL_ORDER
         if "catalog_mode" not in model:
             model["catalog_mode"] = "independent"
         if "order_mode" not in model:
@@ -5971,11 +6179,13 @@ class ProvidersModelsDomain:
         # numbers the user typed (decimals included) instead of renumbering
         # the group, so a move never rewrites a value it did not touch.  That is
         # the default; ``renumber`` is the user's answer to the pane's question
-        # and replaces the whole group with 0..n-1 in the requested order — the
-        # app's automatic order starts at 0, so the first route of a renumbered
-        # group sits in the same slot as a freshly created one.
+        # and replaces the whole group with consecutive slots starting at the
+        # app's automatic order, so the first route of a renumbered group sits
+        # in the same slot as a freshly created one.
         existing_orders = (
-            list(range(len(requested))) if renumber else sorted(orders)
+            list(range(IMPORTED_MODEL_ORDER, IMPORTED_MODEL_ORDER + len(requested)))
+            if renumber
+            else sorted(orders)
         )
         for order, route_id in zip(existing_orders, requested):
             provider_index, model_index = matched[route_id]
@@ -6215,6 +6425,8 @@ class ProvidersModelsDomain:
             self._delete_public_model(data)
         elif name in {"workbuddy_status", "workbuddy_models", "workbuddy_login"}:
             self._workbuddy_operation(name, data)
+        elif name in {"opencode2dsh_status", "opencode2dsh_models"}:
+            self._opencode2dsh_operation(name, data)
         elif name in {"provider_auth_start", "provider_auth_cancel", "provider_auth_logout", "provider_auth_status"}:
             self._provider_auth_operation(name, data)
         elif name.startswith("service_provider_") or name in {

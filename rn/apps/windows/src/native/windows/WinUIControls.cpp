@@ -1029,6 +1029,29 @@ struct TableComponentView final
             emitter->onRowDoublePress(std::move(args));
           }
         });
+        const int32_t selection_index = static_cast<int32_t>(row_index);
+        // Clicking the row the list already has selected changes no native
+        // selection, so SelectionChanged never fires and the shared view never
+        // learns the row was pressed.  A list whose panes are driven by more
+        // than the highlighted row — the provider list beside the model list,
+        // whose row click also returns the detail pane from a model to its
+        // provider — would then keep showing the pane the previous click
+        // opened.  SelectionChanged stays the one event for a row whose
+        // selection actually changed, so this reports only the row it did not.
+        row.PointerPressed([this, selection_index](auto const&, auto const&) {
+          if (syncing_ || !Props()) return;
+          if (selection_index < 0 || selection_index >= static_cast<int32_t>(Props()->rowKeys.size())) return;
+          auto const& key = Props()->rowKeys[static_cast<size_t>(selection_index)];
+          // A clickable spanning row is never the native selection either, so
+          // only the row the list already has selected is left to report.
+          if (Props()->selectedKey != key || list_.SelectedIndex() != selection_index) return;
+          if (auto emitter = EventEmitter()) {
+            winrt::YoungRouter::Codegen::LiteLLMWinUITableEventEmitter::OnSelectionChange args;
+            args.index = selection_index;
+            args.key = key;
+            emitter->onSelectionChange(std::move(args));
+          }
+        });
         if (spanning) {
           const auto cell_index = row_index * column_count;
           const auto spanning_text = cell_index < props.cells.size() ? props.cells[cell_index] : std::string{};

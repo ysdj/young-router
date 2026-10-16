@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from . import image_generation as _image_generation_module
 from . import image_inputs as _image_inputs_module
+from . import codex_contract as _codex_contract_module
 from . import responses_output as _responses_output_module
 from . import responses_request as _responses_request_module
 from . import request_context as _request_context_module
@@ -30,6 +31,42 @@ from .base import (
 
 
 class YoungRouterHook(CustomLogger):
+    async def async_pre_call_hook(
+        self,
+        user_api_key_dict: Any,
+        cache: Any,
+        data: dict,
+        call_type: Any,
+    ) -> Optional[dict]:
+        """Shrink a replayed Responses history before LiteLLM counts it.
+
+        ``Router._pre_call_checks`` refuses a request whose token count exceeds
+        a deployment's ``model_info.max_input_tokens``, and it runs at
+        deployment selection -- before ``async_pre_call_deployment_hook``,
+        where oversized replayed tool outputs are normally elided.  The limit
+        it compares against is the same number the Core publishes to the
+        client as that model's context budget, which the client has already
+        applied to its own window: a conversation the client measured as
+        fitting was refused locally, with no upstream contacted at all.
+
+        Eliding here is the only ordering in which the count describes the
+        request that is actually sent.
+        """
+
+        if not isinstance(data, dict):
+            return None
+        if not _responses_request_module._request_is_responses_api(data):
+            return None
+        elided = _responses_request_module._with_elided_oversized_tool_outputs(data)
+        if elided is None:
+            return None
+        # ``pre_call_hook`` replaces the request wholesale, so every field the
+        # elision pass did not carry over has to travel with it.
+        for key, value in data.items():
+            if key not in elided:
+                elided[key] = value
+        return elided
+
     def _record_recent_request_started(self, kwargs: Dict[str, Any]) -> None:
         """Publish a bounded progress row before the upstream call begins."""
         record = _routing_module._request_log_record("pending", kwargs)
@@ -136,9 +173,7 @@ class YoungRouterHook(CustomLogger):
             _responses_request_module._with_mcp_auto_approval,
             _responses_request_module._with_codex_openrouter_native_web_search_tool,
             _responses_request_module._with_codex_external_web_search_bridge_tool,
-            _responses_request_module._with_codex_tool_registry_instruction,
-            _responses_request_module._with_codex_descendant_cleanup_instruction,
-            _responses_request_module._with_codex_commentary_discipline_instruction,
+            *_codex_contract_module.CODEX_CONTRACT_REQUEST_STEPS,
             _responses_request_module._with_empty_tool_controls_removed,
             _responses_request_module._with_codex_compaction_controls,
             _responses_request_module._with_responses_native_extra_body,

@@ -36,6 +36,10 @@ MAX_READ_BYTES = 16 * 1024 * 1024
 # the response envelope while still returning the newest useful log rows.
 MAX_VIEW_BYTES = 3 * 1024 * 1024
 DEFAULT_LINES = 10_000
+# One page of online usage. A relay can report thousands of rows, so the view
+# carries this many and the pane asks for the next page as it scrolls: the
+# payload stays small while the relay's whole history stays reachable.
+ONLINE_USAGE_PAGE_ROWS = 100
 MAX_LINES = 100_000
 MAX_FILTER_CHARS = 256
 RECOVERY_HEARTBEAT_TTL_SECONDS = 45.0
@@ -1598,12 +1602,18 @@ class LogsDomain:
         # Cache the values here and pass them to the rotation writer.
         self._runtime_log_max_bytes: int | None = None
         self._runtime_log_backup_segments: int | None = None
-        self._online_usage_records: list[str] = []
+        self._online_usage_records: list[dict[str, Any]] = []
         self._online_usage_refreshed = False
         self._online_usage_revision = 0
         # The dropdown's selection, and the list it selects from. Both are
         # owned here rather than by the pane so a window that reconnects to a
         # replaced Core still names the relay its rows came from.
+        # Why the last read answered no rows, so the pane can say it instead of
+        # letting an empty table speak for a relay that never reported usage.
+        self._online_usage_reason = ""
+        # How many of the relay's rows the view currently carries. It grows by
+        # one page each time the pane reaches the end of what it has.
+        self._online_usage_window = ONLINE_USAGE_PAGE_ROWS
         self._online_usage_sources: list[dict[str, str]] = []
         self._online_usage_sources_revision = -1
         self._online_usage_source_id = ""
@@ -2109,18 +2119,29 @@ class LogsDomain:
         except OSError:
             raise LogsDomainError("Log source is unavailable") from None
 
+    def _online_usage_matching(self) -> list[object]:
+        """Every row the chosen relay reported, newest last."""
+
+        records: list[object] = list(self._online_usage_records)
+        cursor = self._clear_cursors.get("online-usage") if "online-usage" in self._cleared else None
+        if cursor and cursor[0] == "online":
+            current = self._source_cursor("online-usage")
+            if current[0] == "online" and current[1] == cursor[1] and current[2] >= cursor[2]:
+                records = records[int(cursor[2]) :]
+        needle = self._filters.get("online-usage", "").casefold()
+        if needle:
+            records = [record for record in records if needle in str(record).casefold()]
+        return _sort_records_by_time(records)
+
     def _records(self, tab: str) -> tuple[bool, list[object]]:
         if tab == "online-usage":
-            records: list[object] = list(self._online_usage_records)
-            cursor = self._clear_cursors.get(tab) if tab in self._cleared else None
-            if cursor and cursor[0] == "online":
-                current = self._source_cursor(tab)
-                if current[0] == "online" and current[1] == cursor[1] and current[2] >= cursor[2]:
-                    records = records[int(cursor[2]) :]
-            needle = self._filters.get(tab, "").casefold()
-            if needle:
-                records = [record for record in records if needle in str(record).casefold()]
-            return self._online_usage_refreshed, _sort_records_by_time(records)[-self._line_limit(tab) :]
+            # A relay can report thousands of rows, so the view carries a page
+            # of them and the pane asks for the next one as it scrolls. The
+            # rows themselves are all kept here: the page is a view over them,
+            # never the thing that decides how much usage exists.
+            records = self._online_usage_matching()
+            start = max(0, len(records) - self._online_usage_window)
+            return self._online_usage_refreshed, records[start:]
         path = self._path(tab)
         if path is None:
             return False, []
@@ -2374,6 +2395,10 @@ class LogsDomain:
             # from, so a refresh can never label rows with another relay.
             value["sources"] = self._online_usage_source_list()
             value["source_id"] = self._online_usage_source_id
+            value["reason"] = self._online_usage_reason
+            # The pane needs to know a next page exists before it offers to
+            # fetch one, so the count of rows held back travels with the page.
+            value["remaining"] = max(0, len(self._online_usage_matching()) - len(records))
         self._store_tab(tab, self._fit_view_records(value))
         self._source_signatures[tab] = signature
 
@@ -2484,6 +2509,15 @@ class LogsDomain:
                 raise LogsDomainError("Log line limit is invalid")
             self._limits[str(tab)] = value
             self._discard_clear(str(tab))
+        elif operation in {"load_more", "online_usage_more"}:
+            if tab != "online-usage":
+                raise LogsDomainError("Log tab is invalid")
+            # Reading further is a view over rows already fetched: the relay is
+            # not asked again just because the user scrolled.
+            self._online_usage_window = min(
+                MAX_LINES, self._online_usage_window + ONLINE_USAGE_PAGE_ROWS
+            )
+            self._discard_clear(str(tab))
         elif operation in {"refresh", "reload", "refresh_online_usage"}:
             self._discard_clear(str(tab))
             if tab == "online-usage":
@@ -2498,20 +2532,35 @@ class LogsDomain:
                 try:
                     reader = self._online_usage_reader_instance()
                     refresh = getattr(reader, "refresh", None)
-                    # Only an actual selection narrows the read, so a reader
-                    # that takes no scope still answers the aggregate view.
-                    values = (
-                        refresh(source_id)
-                        if callable(refresh) and source_id
-                        else refresh() if callable(refresh) else []
-                    )
+                    if not source_id:
+                        # Nothing is selected, so there is no relay to read.
+                        # Answering with every station's rows would be a
+                        # selection the user did not make; the pane asks for
+                        # one instead.
+                        values, reason = [], ""
+                    elif not callable(refresh):
+                        values, reason = [], "Online usage logs are unavailable."
+                    else:
+                        answered = refresh(source_id)
+                        # A reader may answer with rows alone or with the rows
+                        # plus the reason it has none; the reason is the pane's
+                        # own message and never a row shaped like a usage one.
+                        values, reason = answered if isinstance(answered, tuple) else (answered, "")
+                    # A plain string is still accepted as a row, so a reader
+                    # that only states one sentence produces something.
                     self._online_usage_records = [
-                        REDACT_TEXT(str(value))[:512]
+                        dict(value)
+                        if isinstance(value, Mapping)
+                        else {"detail": REDACT_TEXT(str(value))[:512]}
                         for value in values
-                        if isinstance(value, str) and value.strip()
+                        if (isinstance(value, Mapping) and value)
+                        or (isinstance(value, str) and value.strip())
                     ][-self._line_limit(str(tab)) :]
+                    self._online_usage_reason = str(reason)[:512]
                 except Exception:
-                    self._online_usage_records = ["Online usage logs are unavailable."]
+                    self._online_usage_records = []
+                    self._online_usage_reason = "Online usage logs are unavailable."
+                self._online_usage_window = ONLINE_USAGE_PAGE_ROWS
                 self._online_usage_refreshed = True
                 self._online_usage_revision += 1
         else:

@@ -36,6 +36,7 @@ HOOK_MODULE_NAMES = (
     "proxy.image_inputs",
     "proxy.responses_request",
     "proxy.responses_execution",
+    "proxy.codex_contract",
     "proxy.patches",
     "proxy.tools",
     "proxy.image_generation",

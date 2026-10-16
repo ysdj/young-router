@@ -1,5 +1,5 @@
 """Adapters and worker scripts for the third-party integrations this app
-bundles (pi-web-access, Veridrop, WorkBuddy, dsh-vision-router).
+bundles (pi-web-access, Veridrop, WorkBuddy, OpenCode Zen, dsh-vision-router).
 
 A staged worker that serves a model endpoint publishes the base URL it is
 reachable at as an ``os.environ/`` *reference*, never as a literal URL: the
@@ -17,7 +17,7 @@ from typing import Any, Iterable, Mapping
 
 # The bundled workers that serve a model endpoint, by adapter module name.  A
 # worker adds itself here; nothing else in the app has to name it.
-_MANAGED_ENDPOINT_MODULES = ("workbuddy",)
+_MANAGED_ENDPOINT_MODULES = ("workbuddy", "opencode2dsh")
 
 
 def _managed_modules() -> list[Any]:

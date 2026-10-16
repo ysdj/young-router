@@ -54,6 +54,10 @@ worker is asked to answer through the multiprocessing pipe.
 
 _IDLE_TICK_PATCH_ATTR = "_young_router_idle_tick_patch"
 _TICK_WAKE_ATTR = "_young_router_idle_tick_wake"
+# Set on each worker process once the supervisor begins stopping, so the
+# liveness pass stops waiting on a health-check round trip that a process which
+# is already exiting can no longer answer.
+_TEARDOWN_ATTR = "_young_router_teardown"
 # uvicorn counts tenths of a second, and refreshes the ``Date`` header when the
 # counter is divisible by ten.
 _TICK_COUNTER_STEP = 10
@@ -144,6 +148,15 @@ def _install_uvicorn_supervisor_healthcheck_patch() -> None:
         # A worker that is gone is reported on this pass, exactly as before.
         if not self.process.is_alive():
             return False
+        # During teardown the supervisor only needs to know whether each worker
+        # has exited, and it asks once per pass until they have.  A ping would
+        # block for ``timeout_worker_healthcheck`` (five seconds by default) on
+        # every pass, which is what made a quit's teardown swing between a
+        # second and fifteen.  The answer it waits for is the process's own
+        # exit, which ``self.process.is_alive()`` above already reports, so the
+        # round trip is skipped once the supervisor has begun stopping.
+        if getattr(self, _TEARDOWN_ATTR, False):
+            return True
         checked_at = getattr(self, "_young_router_healthcheck_at", None)
         now = time.monotonic()
         if checked_at is not None and now - checked_at < SUPERVISOR_HEALTHCHECK_INTERVAL_SECONDS:
@@ -156,11 +169,49 @@ def _install_uvicorn_supervisor_healthcheck_patch() -> None:
     Process.is_alive = is_alive  # type: ignore[method-assign]
 
 
+def _install_uvicorn_supervisor_teardown_patch() -> None:
+    """Mark workers as exiting before the supervisor asks whether they are alive.
+
+    ``Multiprocess.terminate_all`` signals every worker, and the supervisor
+    then polls ``Process.is_alive`` until each has gone.  That poll normally
+    asks the worker over the multiprocessing pipe, and a worker that has already
+    stopped answering blocks for ``timeout_worker_healthcheck`` -- five seconds
+    by default, per pass -- which is what made a quit's teardown swing between
+    a second and a minute.  Marking the worker before the signal tells the
+    liveness pass that its only remaining question is whether the process
+    object has exited, which it can answer without waiting on anyone.
+    """
+
+    try:
+        from uvicorn.supervisors.multiprocess import Multiprocess
+    except Exception:  # pragma: no cover - uvicorn is optional in tests
+        return
+
+    original_terminate_all = getattr(Multiprocess, "terminate_all", None)
+    if original_terminate_all is None:
+        return
+    if getattr(original_terminate_all, _IDLE_TICK_PATCH_ATTR, False):
+        return
+
+    def terminate_all(self: Any) -> None:
+        for process in getattr(self, "processes", ()):
+            try:
+                setattr(process, _TEARDOWN_ATTR, True)
+            except Exception:  # pragma: no cover - a process that forbids attributes
+                continue
+        original_terminate_all(self)
+
+    setattr(terminate_all, _IDLE_TICK_PATCH_ATTR, True)
+    setattr(terminate_all, "_original_terminate_all", original_terminate_all)
+    Multiprocess.terminate_all = terminate_all  # type: ignore[method-assign]
+
+
 def install_proxy_idle_patches() -> None:
     """Install every idle-loop patch.  Safe to call repeatedly."""
 
     _install_uvicorn_idle_tick_patch()
     _install_uvicorn_supervisor_healthcheck_patch()
+    _install_uvicorn_supervisor_teardown_patch()
 
 
 __all__ = [

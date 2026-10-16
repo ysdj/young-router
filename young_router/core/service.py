@@ -810,6 +810,7 @@ class CoreStore:
         file_capabilities: FileCapabilityRegistry | None = None,
         service_handlers: Mapping[str, Callable[[str], object]] | None = None,
         workbuddy_runtime: object | None = None,
+        opencode2dsh_runtime: object | None = None,
     ) -> None:
         self._lock = threading.RLock()
         self._metadata_store = AtomicJSONStore(metadata_path) if metadata_path else None
@@ -819,6 +820,9 @@ class CoreStore:
         # The WorkBuddy worker is Core-owned: it must not outlive the process
         # that keeps its credential copy and its loopback bearer.
         self._workbuddy_runtime = workbuddy_runtime
+        # The OpenCode Zen worker is Core-owned for the same reason: it must
+        # not outlive the process that holds its loopback bearer.
+        self._opencode2dsh_runtime = opencode2dsh_runtime
         self._domains: dict[str, DomainAdapter] = {}
         self._baselines: dict[str, object] = {}
         self._drafts: dict[str, dict[str, Any]] = {}
@@ -909,6 +913,7 @@ class CoreStore:
         from .operations import CoreServiceController
         from .provider_auth import ProviderAuthManager
         from ..adapters.workbuddy import WorkBuddyRuntime
+        from ..adapters.opencode2dsh import OpenCode2DSHRuntime
 
         controller = CoreServiceController(runtime_root)
         provider_auth = ProviderAuthManager(runtime_root)
@@ -928,6 +933,11 @@ class CoreStore:
         # so the proxy child receives the very base URLs it is serving.
         workbuddy_runtime = WorkBuddyRuntime(resolved_runtime_root)
         controller.attach_workbuddy(workbuddy_runtime)
+        # One worker per Core process serves every OpenCode Zen route; the
+        # service controller and the provider domain share that instance so the
+        # proxy child receives the very base URL it is serving.
+        opencode2dsh_runtime = OpenCode2DSHRuntime(resolved_runtime_root)
+        controller.attach_opencode2dsh(opencode2dsh_runtime)
         adapters: list[DomainAdapter] = []
         settings_factories: tuple[tuple[str, Callable[[], DomainAdapter]], ...] = (
             (
@@ -936,6 +946,7 @@ class CoreStore:
                     config_path,
                     auth_manager=provider_auth,
                     workbuddy=workbuddy_runtime,
+                    opencode2dsh=opencode2dsh_runtime,
                 ),
             ),
             (
@@ -1021,6 +1032,7 @@ class CoreStore:
             domains=adapters,
             service_handlers=service_handlers,
             workbuddy_runtime=workbuddy_runtime,
+            opencode2dsh_runtime=opencode2dsh_runtime,
         )
         if isinstance(initial_service, Mapping):
             store._set_service_from_result(initial_service, increment=False)
@@ -1042,7 +1054,7 @@ class CoreStore:
             handler = self._shutdown_handler
             if handler is None:
                 self._service = {"state": "stopped"}
-                self._stop_workbuddy_runtime()
+                self._stop_managed_workers()
                 return dict(self._service)
             try:
                 result = handler("stop")
@@ -1052,19 +1064,19 @@ class CoreStore:
                 raise CoreError("service_error", "LiteLLM service returned invalid status")
             self._set_service_from_result(result, increment=False)
             self._persist_metadata()
-            self._stop_workbuddy_runtime()
+            self._stop_managed_workers()
             return dict(self._service)
 
-    def _stop_workbuddy_runtime(self) -> None:
-        """Stop the Core-owned WorkBuddy worker; never fail Core shutdown."""
+    def _stop_managed_workers(self) -> None:
+        """Stop every Core-owned worker; never fail Core shutdown."""
 
-        runtime = self._workbuddy_runtime
-        if runtime is None:
-            return
-        try:
-            runtime.stop()
-        except Exception:
-            pass
+        for runtime in (self._workbuddy_runtime, self._opencode2dsh_runtime):
+            if runtime is None:
+                continue
+            try:
+                runtime.stop()
+            except Exception:
+                pass
 
     def _load_metadata(self) -> None:
         assert self._metadata_store is not None
@@ -3117,6 +3129,8 @@ class CoreStore:
                             "workbuddy_status": "workbuddy_status",
                             "workbuddy_models": "workbuddy_models",
                             "workbuddy_login": "workbuddy_login",
+                            "opencode2dsh_status": "opencode2dsh_status",
+                            "opencode2dsh_models": "opencode2dsh_models",
                         }.get(normalized_action)
                         if (
                             name == "providers_models"

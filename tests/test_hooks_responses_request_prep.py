@@ -15,6 +15,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_mcp_auto_approval_is_disabled_by_default(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         request = {
             "call_type": "responses",
             "input": "Use the MCP tool.",
@@ -26,6 +27,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_mcp_auto_approval_rewrites_only_responses_mcp_tools(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         self.set_env(hooks._MCP_AUTO_APPROVE_ENV, "1")
         request = {
             "call_type": "responses",
@@ -55,6 +57,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_mcp_auto_approval_does_not_touch_chat_completions(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         self.set_env(hooks._MCP_AUTO_APPROVE_ENV, "1")
         request = {
             "use_chat_completions_api": True,
@@ -66,6 +69,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_applies_mcp_auto_approval_patch(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         self.set_env(hooks._MCP_AUTO_APPROVE_ENV, "1")
         request = {
             "call_type": "aresponses",
@@ -117,27 +121,46 @@ class HookResponsesRequestPrepTests(HookTestCase):
             "tools": [],
         }
 
-    def test_codex_tool_registry_instruction_lists_only_declared_tools(self) -> None:
+    def test_codex_tool_registry_is_carried_by_the_request_not_a_prompt(self) -> None:
         hooks, _ = load_hook_module()
-        original = self._codex_collaboration_request()
+        contract = hooks._codex_contract_module
+        request = self._codex_collaboration_request()
 
-        modified = hooks._with_codex_tool_registry_instruction(original)
-
-        self.assertIsNotNone(modified)
-        assert modified is not None
-        instructions = modified["instructions"]
-        self.assertIn(hooks._CODEX_TOOL_REGISTRY_MARKER, instructions)
-        self.assertIn("tools.list_agents", instructions)
-        self.assertIn("collaboration.list_agents", instructions)
-        self.assertIn("tools.web__run` is unavailable", instructions)
+        # The declared set is request data the client already sends; nothing is
+        # appended to ``instructions`` to announce it.
+        self.assertIsNone(contract.with_tool_registry_contract(request))
         self.assertEqual(
-            original["instructions"],
+            request["instructions"],
             "Keep the requested implementation complete and tested.",
         )
-        self.assertIsNone(hooks._with_codex_tool_registry_instruction(modified))
+        self.assertIn("list_agents", contract.declared_tool_names(request))
+
+    def test_codex_undeclared_tool_call_is_a_protocol_error(self) -> None:
+        hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
+        request = self._codex_collaboration_request()
+
+        self.assertTrue(contract.is_undeclared_tool_call(request, "web__run"))
+        self.assertFalse(contract.is_undeclared_tool_call(request, "list_agents"))
+        # A request that declares nothing has no contract to enforce.
+        self.assertFalse(
+            contract.is_undeclared_tool_call({"input": []}, "web__run")
+        )
+
+    def test_codex_undeclared_tool_call_answers_with_a_stated_failure(self) -> None:
+        hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
+
+        event = contract.undeclared_tool_response_event("web__run", "call-1")
+
+        self.assertEqual(event["type"], "response.failed")
+        error = event["response"]["error"]
+        self.assertEqual(error["code"], contract.UNDECLARED_TOOL_CODE)
+        self.assertEqual(error["tool_name"], "web__run")
 
     def test_codex_external_web_search_bridge_is_advertised(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         original = self._codex_collaboration_request()
         original["model_info"] = {
             "supports_responses_web_search": False,
@@ -166,6 +189,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_codex_responses_unknown_search_capability_bridges_local_search(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         original = self._codex_collaboration_request()
         original["model_info"] = {
             "upstream_url_surface": "openai/responses",
@@ -188,6 +212,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_codex_non_gpt_route_bridges_explicit_search_capability(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         original = self._codex_collaboration_request()
         original["model_info"] = {
             "provider": "third-party",
@@ -206,6 +231,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_codex_gpt_responses_route_keeps_native_search(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         original = self._codex_collaboration_request()
         original["api_base"] = "https://api.openai.com/v1"
         original["model_info"] = {
@@ -220,6 +246,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_codex_gpt_family_model_with_unknown_capability_keeps_native_search(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         original = self._codex_collaboration_request()
         original["model"] = "gpt-5-test"
         original["model_info"] = {
@@ -237,6 +264,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_codex_gpt_family_model_with_explicit_unsupported_capability_uses_local_bridge(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         original = self._codex_collaboration_request()
         original["model"] = "gpt-5-test"
         original["model_info"] = {
@@ -256,6 +284,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_codex_gpt_family_model_cached_rejection_uses_local_bridge(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         original = self._codex_collaboration_request()
         original["model"] = "gpt-5-test"
         original["model_info"] = {
@@ -287,6 +316,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_codex_gpt_family_model_on_chat_surface_uses_local_bridge(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         original = self._codex_collaboration_request()
         original["model"] = "gpt-5-test"
         original["model_info"] = {
@@ -305,6 +335,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_codex_gpt_image_family_is_not_a_gpt_responses_route(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         original = self._codex_collaboration_request()
         original["model"] = "gpt-image-2"
         original["model_info"] = {
@@ -326,6 +357,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_codex_provider_switch_does_not_use_stale_custom_provider(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         original = self._codex_collaboration_request()
         original["custom_llm_provider"] = "openai"
         original["model_info"] = {
@@ -344,6 +376,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_codex_plain_non_gpt_turn_receives_local_search_tools(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         original = self._codex_collaboration_request()
         original["input"] = [{"role": "user", "content": "Search the web."}]
         original["tools"] = []
@@ -363,6 +396,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_codex_responses_native_search_capability_keeps_native_route(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         original = self._codex_collaboration_request()
         original["model_info"] = {
             "provider": "openai",
@@ -377,6 +411,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_codex_external_web_search_bridge_is_not_advertised_on_function_unsupported_route(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         original = self._codex_collaboration_request()
         original["model_info"] = {
             "supports_responses_function_tools": False,
@@ -388,6 +423,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_codex_provider_native_search_does_not_add_pi_bridge_tools(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         original = self._codex_collaboration_request()
         original["tools"] = [{"type": "openrouter:web_search"}]
         original["model_info"] = {
@@ -402,6 +438,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_codex_openrouter_search_capable_route_does_not_add_pi_bridge_tools(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         original = self._codex_collaboration_request()
         original["model_info"] = {
             "provider": "openrouter",
@@ -414,6 +451,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_codex_openrouter_route_injects_native_search_before_local_bridge(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         original = self._codex_collaboration_request()
         original["model_info"] = {
             "provider": "openrouter",
@@ -437,6 +475,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_codex_openrouter_hosted_search_is_converted_to_native_declaration(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         original = self._codex_collaboration_request()
         original["tools"] = [
             {"type": "web_search", "search_context_size": "high"},
@@ -464,6 +503,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_codex_openrouter_nested_native_search_is_promoted_without_duplicate(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         original = self._codex_collaboration_request()
         original["input"][0]["tools"].append(
             {"type": "openrouter:web_search"}
@@ -490,6 +530,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_codex_openrouter_pre_call_exposes_native_search_with_client_tools(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         original = self._codex_collaboration_request()
         original["model_info"] = {
             "provider": "openrouter",
@@ -518,6 +559,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_codex_openrouter_pre_call_injects_native_search_on_plain_turn(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         original = {
             "call_type": "aresponses",
             "model": "openrouter-model",
@@ -545,6 +587,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_codex_openrouter_cached_rejection_uses_local_bridge_without_native_tool(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         original = self._codex_collaboration_request()
         original["model_info"] = {
             "id": "openrouter-cached-search",
@@ -579,6 +622,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_codex_openrouter_chat_surface_cached_rejection_uses_local_bridge(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         original = self._codex_collaboration_request()
         original["model_info"] = {
             "id": "openrouter-cached-search-chat",
@@ -612,6 +656,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_codex_openrouter_explicit_search_unsupported_keeps_pi_fallback(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         original = self._codex_collaboration_request()
         original["model_info"] = {
             "provider": "openrouter",
@@ -628,8 +673,9 @@ class HookResponsesRequestPrepTests(HookTestCase):
             {"web_search", "fetch_content"},
         )
 
-    def test_codex_tool_registry_instruction_flattens_function_namespace(self) -> None:
+    def test_codex_declared_set_covers_a_function_namespace(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         request = self._codex_collaboration_request()
         request["input"][0]["tools"].insert(
             0,
@@ -643,24 +689,22 @@ class HookResponsesRequestPrepTests(HookTestCase):
             },
         )
 
-        modified = hooks._with_codex_tool_registry_instruction(request)
+        declared = contract.declared_tool_names(request)
 
-        self.assertIsNotNone(modified)
-        assert modified is not None
-        instructions = modified["instructions"]
-        self.assertIn("tools.exec", instructions)
-        self.assertIn("tools.wait", instructions)
-        self.assertIn("functions.exec", instructions)
-        self.assertIn("functions.wait", instructions)
+        self.assertIn("exec", declared)
+        self.assertIn("wait", declared)
+        self.assertFalse(contract.is_undeclared_tool_call(request, "exec"))
+        self.assertTrue(contract.is_undeclared_tool_call(request, "web__run"))
 
     def test_codex_tool_registry_instruction_ignores_non_codex_requests(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         request = self._codex_collaboration_request()
         request.pop("client_metadata")
 
-        self.assertIsNone(hooks._with_codex_tool_registry_instruction(request))
+        self.assertIsNone(contract.with_tool_registry_contract(request))
 
-    async def test_pre_call_injects_codex_tool_registry_instruction(self) -> None:
+    async def test_pre_call_never_injects_codex_rule_text(self) -> None:
         hooks, _ = load_hook_module()
         modified = await hooks.YoungRouterHook().async_pre_call_deployment_hook(
             self._codex_collaboration_request(),
@@ -669,165 +713,188 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
         self.assertIsNotNone(modified)
         assert modified is not None
-        self.assertIn(hooks._CODEX_TOOL_REGISTRY_MARKER, modified["instructions"])
-        self.assertNotIn("tools.web_search", modified["instructions"])
-        self.assertNotIn("tools.fetch_content", modified["instructions"])
-        self.assertNotIn("tools.private_web_search_bridge", modified["instructions"])
+        instructions = modified.get("instructions") or ""
+        for marker in (
+            "<young_router_codex_tool_registry>",
+            "<young_router_codex_descendant_cleanup>",
+            "<young_router_codex_commentary_discipline>",
+        ):
+            self.assertNotIn(marker, instructions)
         self.assertEqual(
             {tool.get("name") for tool in modified["tools"] if isinstance(tool, dict)},
             {"collaboration", "web_search", "fetch_content"},
         )
 
-    def test_codex_descendant_cleanup_instruction_is_enabled_by_default(self) -> None:
+    def test_codex_descendant_barrier_holds_the_turn_with_tool_choice(self) -> None:
         hooks, _ = load_hook_module()
-        original = self._codex_collaboration_request()
+        contract = hooks._codex_contract_module
+        request = self._as_root_collaboration_request(
+            self._codex_collaboration_request()
+        )
+        self._append_collaboration_call(
+            request,
+            call_id="call-list",
+            name="list_agents",
+            arguments='{"path_prefix":"/root"}',
+            output=json.dumps(
+                {
+                    "agents": [
+                        {"agent_name": "/root", "agent_status": "running"},
+                        {"agent_name": "/root/audit", "agent_status": "running"},
+                    ]
+                }
+            ),
+        )
 
-        modified = hooks._with_codex_descendant_cleanup_instruction(original)
+        modified = contract.with_descendant_cleanup_barrier(request)
 
         self.assertIsNotNone(modified)
         assert modified is not None
-        instructions = modified["instructions"]
-        self.assertIn("wait for it and incorporate its result", instructions)
-        self.assertIn("take ownership or reassign that work", instructions)
-        self.assertIn("never drop required work", instructions)
-        self.assertIn("code, file, test, or other work required", instructions)
-        self.assertIn("deepest-first", instructions)
-        self.assertIn("call list_agents again", instructions)
-        self.assertIn("never a sibling or ancestor", instructions)
-        self.assertIn("root agent owns the entire tree", instructions)
-        self.assertIn("Every assistant response without a real tool call terminates", instructions)
-        self.assertIn("full user-requested outcome", instructions)
-        self.assertIn("expression of dissatisfaction", instructions)
-        self.assertIn("evidence challenge", instructions)
-        self.assertIn("failed verification is not completion", instructions)
-        self.assertIn("future-tense commitment", instructions)
-        self.assertIn("concrete blocker after exhausting safe in-scope alternatives", instructions)
-        self.assertIn("progress-only response would terminate the turn", instructions)
-        self.assertIn("invalidates every earlier list_agents snapshot", instructions)
-        self.assertIn("clean descendant snapshot only accounts for descendants", instructions)
-        self.assertIn("it never proves the root task complete", instructions)
-        self.assertIn("every outstanding commentary commitment", instructions)
-        self.assertIn("If root work remains, call a real work tool", instructions)
-        self.assertIn("Visible answer text alone is not evidence", instructions)
+        # The barrier is the tool choice and the lifecycle state; the caller's
+        # own instructions pass through byte-for-byte, so no rule text can be
+        # misread as part of the task.
+        self.assertEqual(modified["tool_choice"], "required")
         self.assertEqual(
-            original["instructions"],
-            "Keep the requested implementation complete and tested.",
+            modified["instructions"],
+            request["instructions"],
+        )
+        self.assertEqual(
+            modified["litellm_metadata"][
+                hooks._CODEX_DESCENDANT_CLEANUP_METADATA_KEY
+            ]["state"],
+            "active_descendants",
         )
 
-        self.assertIsNone(
-            hooks._with_codex_descendant_cleanup_instruction(modified)
+    def test_codex_contract_steps_never_write_a_prompt(self) -> None:
+        hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
+        request = self._as_root_collaboration_request(
+            self._codex_collaboration_request()
         )
+
+        for step in contract.CODEX_CONTRACT_REQUEST_STEPS:
+            modified = step(request)
+            if modified is None:
+                continue
+            self.assertNotIn("instructions", modified, step.__name__)
 
     def test_codex_descendant_cleanup_instruction_can_be_disabled(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         self.set_env(hooks._CODEX_DESCENDANT_CLEANUP_ENV, "0")
 
         self.assertIsNone(
-            hooks._with_codex_descendant_cleanup_instruction(
+            contract.with_descendant_cleanup_barrier(
                 self._codex_collaboration_request()
             )
         )
 
     def test_codex_descendant_cleanup_requires_management_tools(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         request = self._codex_collaboration_request()
         request["input"][0]["tools"][0]["tools"] = [
             {"type": "function", "name": "spawn_agent"},
         ]
 
         self.assertIsNone(
-            hooks._with_codex_descendant_cleanup_instruction(request)
+            contract.with_descendant_cleanup_barrier(request)
         )
 
     def test_codex_descendant_cleanup_ignores_compaction_and_non_codex(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         compaction = self._codex_collaboration_request()
         compaction["input"].append({"type": "compaction_trigger"})
         self.assertIsNone(
-            hooks._with_codex_descendant_cleanup_instruction(compaction)
+            contract.with_descendant_cleanup_barrier(compaction)
         )
 
         non_codex = self._codex_collaboration_request()
         non_codex.pop("client_metadata")
         self.assertIsNone(
-            hooks._with_codex_descendant_cleanup_instruction(non_codex)
+            contract.with_descendant_cleanup_barrier(non_codex)
         )
 
-    async def test_pre_call_injects_codex_descendant_cleanup_instruction(self) -> None:
+    async def test_pre_call_applies_the_barrier_without_rule_text(self) -> None:
         hooks, _ = load_hook_module()
+        request = self._codex_collaboration_request()
+        request["input"].append(
+            {"role": "assistant", "content": [{"type": "output_text", "text": "I will."}]}
+        )
         hook = hooks.YoungRouterHook()
 
         modified = await hook.async_pre_call_deployment_hook(
-            self._codex_collaboration_request(),
+            request,
             call_type="aresponses",
         )
 
         self.assertIsNotNone(modified)
         assert modified is not None
-        self.assertIn(
-            hooks._CODEX_DESCENDANT_CLEANUP_MARKER,
-            modified["instructions"],
+        self.assertEqual(modified["tool_choice"], "required")
+        self.assertNotIn("<young_router_codex_descendant_cleanup>", modified.get("instructions") or "")
+
+    def test_codex_progress_message_contract_holds_the_turn_open(self) -> None:
+        hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
+        original = self._codex_collaboration_request()
+        request = json.loads(json.dumps(original))
+        request["input"].append(
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "output_text", "text": "I will now run the tests."}
+                ],
+            }
         )
 
-    def test_codex_commentary_discipline_instruction_is_enabled_by_default(self) -> None:
-        hooks, _ = load_hook_module()
-        original = self._codex_collaboration_request()
-
-        modified = hooks._with_codex_commentary_discipline_instruction(original)
+        modified = contract.with_progress_message_contract(request)
 
         self.assertIsNotNone(modified)
         assert modified is not None
-        instructions = modified["instructions"]
-        self.assertIn(hooks._CODEX_COMMENTARY_DISCIPLINE_MARKER, instructions)
-        self.assertIn("at most one progress message per assistant response", instructions)
-        self.assertIn("single short sentence", instructions)
-        self.assertIn("once per turn, never once per step", instructions)
-        self.assertIn("Once the plan is stated, do not state it again", instructions)
-        self.assertIn("call the tool instead of sending another message", instructions)
-        self.assertIn("repeats the same intent, skill, or promise", instructions)
+        self.assertEqual(modified["tool_choice"], "required")
         self.assertEqual(
+            modified["instructions"],
             original["instructions"],
-            "Keep the requested implementation complete and tested.",
-        )
-
-        self.assertIsNone(
-            hooks._with_codex_commentary_discipline_instruction(modified)
         )
 
     def test_codex_commentary_discipline_instruction_can_be_disabled(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         self.set_env(hooks._CODEX_COMMENTARY_DISCIPLINE_ENV, "0")
 
         self.assertIsNone(
-            hooks._with_codex_commentary_discipline_instruction(
+            contract.with_progress_message_contract(
                 self._codex_collaboration_request()
             )
         )
 
     def test_codex_commentary_discipline_needs_a_declared_tool(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         request = self._codex_collaboration_request()
         request["input"][0]["tools"] = []
 
         self.assertIsNone(
-            hooks._with_codex_commentary_discipline_instruction(request)
+            contract.with_progress_message_contract(request)
         )
 
     def test_codex_commentary_discipline_ignores_compaction_and_non_codex(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         compaction = self._codex_collaboration_request()
         compaction["input"].append({"type": "compaction_trigger"})
         self.assertIsNone(
-            hooks._with_codex_commentary_discipline_instruction(compaction)
+            contract.with_progress_message_contract(compaction)
         )
 
         non_codex = self._codex_collaboration_request()
         non_codex.pop("client_metadata")
         self.assertIsNone(
-            hooks._with_codex_commentary_discipline_instruction(non_codex)
+            contract.with_progress_message_contract(non_codex)
         )
 
-    async def test_pre_call_injects_codex_commentary_discipline_instruction(self) -> None:
+    async def test_pre_call_never_writes_a_rule_into_instructions(self) -> None:
         hooks, _ = load_hook_module()
         hook = hooks.YoungRouterHook()
 
@@ -838,21 +905,13 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
         self.assertIsNotNone(modified)
         assert modified is not None
-        self.assertIn(
-            hooks._CODEX_COMMENTARY_DISCIPLINE_MARKER,
-            modified["instructions"],
-        )
-        # The two Codex instructions keep their own order: the tool registry
-        # first, the completion barrier second, the commentary rule last.
-        instructions = modified["instructions"]
-        self.assertLess(
-            instructions.index(hooks._CODEX_TOOL_REGISTRY_MARKER),
-            instructions.index(hooks._CODEX_DESCENDANT_CLEANUP_MARKER),
-        )
-        self.assertLess(
-            instructions.index(hooks._CODEX_DESCENDANT_CLEANUP_MARKER),
-            instructions.index(hooks._CODEX_COMMENTARY_DISCIPLINE_MARKER),
-        )
+        instructions = modified.get("instructions") or ""
+        for marker in (
+            "<young_router_codex_tool_registry>",
+            "<young_router_codex_descendant_cleanup>",
+            "<young_router_codex_commentary_discipline>",
+        ):
+            self.assertNotIn(marker, instructions)
 
     @staticmethod
     def _as_root_collaboration_request(request: dict) -> dict:
@@ -900,6 +959,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_codex_root_with_active_descendant_must_make_a_tool_call(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         request = self._as_root_collaboration_request(
             self._codex_collaboration_request()
         )
@@ -921,7 +981,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
             ),
         )
 
-        modified = hooks._with_codex_descendant_cleanup_instruction(request)
+        modified = contract.with_descendant_cleanup_barrier(request)
 
         self.assertIsNotNone(modified)
         assert modified is not None
@@ -933,62 +993,84 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_codex_root_without_descendant_history_keeps_requested_choice(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         request = self._as_root_collaboration_request(
             self._codex_collaboration_request()
         )
 
-        modified = hooks._with_codex_descendant_cleanup_instruction(request)
-
-        self.assertIsNotNone(modified)
-        assert modified is not None
-        self.assertEqual(modified["tool_choice"], "auto")
-        self.assertEqual(
-            modified["litellm_metadata"][hooks._CODEX_DESCENDANT_CLEANUP_METADATA_KEY]["state"],
-            "snapshot_missing",
+        # A root that has never run a descendant-management call holds no
+        # barrier at all, so its own choice survives untouched.
+        self.assertIsNone(
+            hooks._codex_descendant_cleanup_runtime_state(request)
         )
+        self.assertIsNone(contract.with_descendant_cleanup_barrier(request))
+        self.assertEqual(request["tool_choice"], "auto")
 
     def test_codex_cleanup_does_not_reinject_forced_choice_after_protocol_relaxation(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         request = self._as_root_collaboration_request(
             self._codex_collaboration_request()
         )
+        # A lifecycle call with no snapshot after it is a real invalidated
+        # state, which is the state this relaxation rule exists for.
+        self._append_collaboration_call(
+            request,
+            call_id="call-spawn",
+            name="spawn_agent",
+            arguments='{"task_name":"audit","message":"check"}',
+            output='{"agent_name":"/root/audit"}',
+        )
         request["litellm_metadata"] = {
-            hooks._CODEX_DESCENDANT_CLEANUP_METADATA_KEY: {
-                "state": "snapshot_missing",
-                "tool_call_required": True,
-            },
             hooks._PROTOCOL_FALLBACK_RELAX_TOOL_CHOICE_KEY: True,
         }
 
-        modified = hooks._with_codex_descendant_cleanup_instruction(request)
+        modified = contract.with_descendant_cleanup_barrier(request)
 
         self.assertIsNotNone(modified)
         assert modified is not None
-        self.assertEqual(modified["tool_choice"], "auto")
+        # The state is recorded, but the refused named choice is not re-injected.
+        self.assertEqual(
+            modified["litellm_metadata"][
+                hooks._CODEX_DESCENDANT_CLEANUP_METADATA_KEY
+            ]["state"],
+            "snapshot_invalidated",
+        )
         self.assertNotEqual(
-            modified["tool_choice"],
+            modified.get("tool_choice"),
             {"type": "function", "name": "list_agents"},
         )
-        self.assertEqual(
-            modified["litellm_metadata"][hooks._CODEX_DESCENDANT_CLEANUP_METADATA_KEY],
-            {"state": "snapshot_missing", "tool_call_required": True},
-        )
 
-    def test_codex_root_missing_snapshot_preserves_existing_required_choice(self) -> None:
+    def test_codex_root_invalidated_snapshot_preserves_existing_required_choice(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         request = self._as_root_collaboration_request(
             self._codex_collaboration_request()
         )
+        self._append_collaboration_call(
+            request,
+            call_id="call-spawn",
+            name="spawn_agent",
+            arguments='{"task_name":"audit","message":"check"}',
+            output='{"agent_name":"/root/audit"}',
+        )
         request["tool_choice"] = "required"
 
-        modified = hooks._with_codex_descendant_cleanup_instruction(request)
+        modified = contract.with_descendant_cleanup_barrier(request)
 
         self.assertIsNotNone(modified)
         assert modified is not None
-        self.assertEqual(modified["tool_choice"], "required")
+        # Snapshot recovery has exactly one valid action, so the barrier names
+        # it rather than leaving a generic ``required`` the model can satisfy
+        # with an unrelated tool.
+        self.assertEqual(
+            modified["tool_choice"],
+            {"type": "function", "name": "list_agents"},
+        )
 
-    def test_codex_tool_registry_instruction_survives_promoted_top_level_tools(self) -> None:
+    def test_codex_declared_set_covers_promoted_top_level_tools(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         request = self._codex_collaboration_request()
         request["input"] = [{"role": "user", "content": "Implement the change."}]
         request["tools"] = [
@@ -997,21 +1079,18 @@ class HookResponsesRequestPrepTests(HookTestCase):
             {"type": "function", "name": "list_agents"},
         ]
 
-        modified = hooks._with_codex_tool_registry_instruction(request)
+        declared = contract.declared_tool_names(request)
 
-        self.assertIsNotNone(modified)
-        assert modified is not None
-        instructions = modified["instructions"]
-        self.assertIn("tools.exec", instructions)
-        self.assertIn("tools.list_agents", instructions)
-        self.assertIn("tools.web__run` is unavailable", instructions)
+        self.assertEqual(declared, {"exec", "wait", "list_agents"})
+        self.assertFalse(contract.is_undeclared_tool_call(request, "exec"))
+        self.assertTrue(contract.is_undeclared_tool_call(request, "web__run"))
 
     def test_codex_root_clean_snapshot_allows_tool_free_completion(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         request = self._as_root_collaboration_request(
             self._codex_collaboration_request()
         )
-        request["instructions"] = hooks._CODEX_DESCENDANT_CLEANUP_INSTRUCTION
         self._append_collaboration_call(
             request,
             call_id="call-list",
@@ -1031,16 +1110,16 @@ class HookResponsesRequestPrepTests(HookTestCase):
         )
 
         self.assertIsNone(
-            hooks._with_codex_descendant_cleanup_instruction(request)
+            contract.with_descendant_cleanup_barrier(request)
         )
         self.assertEqual(request["tool_choice"], "auto")
 
     def test_codex_root_lifecycle_call_invalidates_clean_snapshot(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         request = self._as_root_collaboration_request(
             self._codex_collaboration_request()
         )
-        request["instructions"] = hooks._CODEX_DESCENDANT_CLEANUP_INSTRUCTION
         self._append_collaboration_call(
             request,
             call_id="call-list",
@@ -1058,7 +1137,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
             output="",
         )
 
-        modified = hooks._with_codex_descendant_cleanup_instruction(request)
+        modified = contract.with_descendant_cleanup_barrier(request)
 
         self.assertIsNotNone(modified)
         assert modified is not None
@@ -1073,10 +1152,10 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_codex_root_full_snapshot_after_followup_releases_barrier(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         request = self._as_root_collaboration_request(
             self._codex_collaboration_request()
         )
-        request["instructions"] = hooks._CODEX_DESCENDANT_CLEANUP_INSTRUCTION
         self._append_collaboration_call(
             request,
             call_id="call-followup",
@@ -1103,16 +1182,16 @@ class HookResponsesRequestPrepTests(HookTestCase):
         )
 
         self.assertIsNone(
-            hooks._with_codex_descendant_cleanup_instruction(request)
+            contract.with_descendant_cleanup_barrier(request)
         )
         self.assertEqual(request["tool_choice"], "auto")
 
     def test_codex_root_narrow_snapshot_does_not_release_barrier(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         request = self._as_root_collaboration_request(
             self._codex_collaboration_request()
         )
-        request["instructions"] = hooks._CODEX_DESCENDANT_CLEANUP_INSTRUCTION
         self._append_collaboration_call(
             request,
             call_id="call-spawn",
@@ -1137,7 +1216,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
             ),
         )
 
-        modified = hooks._with_codex_descendant_cleanup_instruction(request)
+        modified = contract.with_descendant_cleanup_barrier(request)
 
         self.assertIsNotNone(modified)
         assert modified is not None
@@ -1148,10 +1227,10 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_codex_root_snapshot_called_before_parallel_followup_stays_invalid(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         request = self._as_root_collaboration_request(
             self._codex_collaboration_request()
         )
-        request["instructions"] = hooks._CODEX_DESCENDANT_CLEANUP_INSTRUCTION
         request["input"].extend(
             [
                 {
@@ -1187,7 +1266,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
             ]
         )
 
-        modified = hooks._with_codex_descendant_cleanup_instruction(request)
+        modified = contract.with_descendant_cleanup_barrier(request)
 
         self.assertIsNotNone(modified)
         assert modified is not None
@@ -1202,10 +1281,10 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_codex_root_snapshot_called_after_parallel_followup_stays_invalid(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         request = self._as_root_collaboration_request(
             self._codex_collaboration_request()
         )
-        request["instructions"] = hooks._CODEX_DESCENDANT_CLEANUP_INSTRUCTION
         request["input"].extend(
             [
                 {
@@ -1241,7 +1320,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
             ]
         )
 
-        modified = hooks._with_codex_descendant_cleanup_instruction(request)
+        modified = contract.with_descendant_cleanup_barrier(request)
 
         self.assertIsNotNone(modified)
         assert modified is not None
@@ -1256,10 +1335,10 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_codex_root_progress_text_does_not_split_parallel_batch(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         request = self._as_root_collaboration_request(
             self._codex_collaboration_request()
         )
-        request["instructions"] = hooks._CODEX_DESCENDANT_CLEANUP_INSTRUCTION
         request["input"].extend(
             [
                 {
@@ -1296,7 +1375,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
             ]
         )
 
-        modified = hooks._with_codex_descendant_cleanup_instruction(request)
+        modified = contract.with_descendant_cleanup_barrier(request)
 
         self.assertIsNotNone(modified)
         assert modified is not None
@@ -1307,10 +1386,10 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_codex_root_later_same_turn_snapshot_releases_barrier(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         request = self._as_root_collaboration_request(
             self._codex_collaboration_request()
         )
-        request["instructions"] = hooks._CODEX_DESCENDANT_CLEANUP_INSTRUCTION
         turn_metadata = {"turn_id": "turn-parallel"}
         request["input"].extend(
             [
@@ -1345,15 +1424,15 @@ class HookResponsesRequestPrepTests(HookTestCase):
             ]
         )
 
-        modified = hooks._with_codex_descendant_cleanup_instruction(request)
+        modified = contract.with_descendant_cleanup_barrier(request)
 
         self.assertIsNone(modified)
         self.assertEqual(request["tool_choice"], "auto")
 
     def test_codex_subagent_is_not_subject_to_root_completion_barrier(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         request = self._codex_collaboration_request()
-        request["instructions"] = hooks._CODEX_DESCENDANT_CLEANUP_INSTRUCTION
         request["input"].insert(
             1,
             {
@@ -1381,16 +1460,16 @@ class HookResponsesRequestPrepTests(HookTestCase):
         )
 
         self.assertIsNone(
-            hooks._with_codex_descendant_cleanup_instruction(request)
+            contract.with_descendant_cleanup_barrier(request)
         )
         self.assertEqual(request["tool_choice"], "auto")
 
     def test_codex_subagent_inheriting_root_history_is_not_root(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         request = self._as_root_collaboration_request(
             self._codex_collaboration_request()
         )
-        request["instructions"] = hooks._CODEX_DESCENDANT_CLEANUP_INSTRUCTION
         request["input"].insert(
             2,
             {
@@ -1404,12 +1483,13 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
         self.assertFalse(hooks._codex_request_is_root_agent(request))
         self.assertIsNone(
-            hooks._with_codex_descendant_cleanup_instruction(request)
+            contract.with_descendant_cleanup_barrier(request)
         )
         self.assertEqual(request["tool_choice"], "auto")
 
     async def test_pre_call_preserves_stale_wait_output(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         original = {
             "call_type": "aresponses",
             "model": "default-chat",
@@ -1464,6 +1544,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_flattens_text_only_wait_output_after_encrypted_history(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         encrypted_reasoning = {
             "type": "reasoning",
             "encrypted_content": "opaque-encrypted-reasoning",
@@ -1525,6 +1606,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_codex_function_output_patch_preserves_non_text_parts(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         original = {
             "call_type": "aresponses",
             "client_metadata": {
@@ -1548,6 +1630,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_repairs_stream_placeholder_arguments_only_in_mutable_suffix(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         signed_call = {
             "type": "function_call",
             "call_id": "call-signed",
@@ -1595,6 +1678,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_codex_view_image_output_keeps_reopenable_paths(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         paths = [
             "/Users/example/project/qa/first.png",
             "/Users/example/project/qa/second.png",
@@ -1647,6 +1731,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_codex_view_image_path_patch_skips_signed_prefix(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         signed_output = {
             "type": "custom_tool_call_output",
             "call_id": "call-signed",
@@ -1754,6 +1839,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_prefix_image_previews_replace_oversized_frozen_view_image_outputs(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         cache_dir = self.use_replay_image_cache()
         self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
         self.set_env(hooks._PREFIX_IMAGE_PREVIEW_MIN_BYTES_ENV, "1000")
@@ -1809,6 +1895,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_prefix_image_previews_preview_unpaired_images_without_reference_text(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
         self.set_env(hooks._PREFIX_IMAGE_PREVIEW_MIN_BYTES_ENV, "1000")
         oversized_url = "data:image/png;base64," + ("B" * 150_000)
@@ -1919,6 +2006,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_prefix_image_previews_handle_wire_function_call_shape(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         cache_dir = self.use_replay_image_cache()
         self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
         self.set_env(hooks._PREFIX_IMAGE_PREVIEW_MIN_BYTES_ENV, "1000")
@@ -1984,6 +2072,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_prefix_image_path_recent_mode_keeps_recent_previews_and_paths_older(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         cache_dir = self.use_replay_image_cache()
         self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
         self.set_env(hooks._PREFIX_IMAGE_PREVIEW_MIN_BYTES_ENV, "1000")
@@ -2119,6 +2208,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_prefix_image_path_reference_keeps_a_durable_client_path(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         cache_dir = self.use_replay_image_cache()
         self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
         self.set_env(hooks._PREFIX_IMAGE_PREVIEW_MIN_BYTES_ENV, "1000")
@@ -2142,6 +2232,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_prefix_image_path_reference_survives_temporary_file_cleanup(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         cache_dir = self.use_replay_image_cache()
         self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
         self.set_env(hooks._PREFIX_IMAGE_PREVIEW_MIN_BYTES_ENV, "1000")
@@ -2170,6 +2261,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_prefix_image_path_reference_falls_back_to_inline_preview(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         blocker = tempfile.NamedTemporaryFile(prefix="young-router-cache-blocker-")
         self.addCleanup(blocker.close)
         self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
@@ -2204,6 +2296,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_prefix_image_previews_pair_split_identifier_wire_shapes(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
         self.set_env(hooks._PREFIX_IMAGE_PREVIEW_MIN_BYTES_ENV, "1000")
         self.set_env(hooks._PREFIX_IMAGE_MODE_ENV, "path-recent")
@@ -2262,6 +2355,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_prefix_image_original_path_converts_aged_original_outputs_by_default(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         cache_dir = self.use_replay_image_cache()
         self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
         self.set_env(hooks._PREFIX_IMAGE_PREVIEW_MIN_BYTES_ENV, "1000")
@@ -2331,6 +2425,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_prefix_image_original_path_switch_off_preserves_original_outputs(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
         self.set_env(hooks._PREFIX_IMAGE_PREVIEW_MIN_BYTES_ENV, "1000")
         self.set_env(hooks._PREFIX_IMAGE_MODE_ENV, "path-recent")
@@ -2366,6 +2461,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_prefix_image_previews_skip_compaction_requests(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
         self.set_env(hooks._PREFIX_IMAGE_PREVIEW_MIN_BYTES_ENV, "1000")
         call = {
@@ -2414,6 +2510,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
         """
 
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
         call = {
             "type": "custom_tool_call",
@@ -2457,6 +2554,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
         """
 
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
         path = "/tmp/reopenable.png"
         request = {
@@ -2499,6 +2597,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
         """
 
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         call = {
             "type": "function_call",
             "id": "fc_native",
@@ -2530,6 +2629,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
         from PIL import Image
 
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         self.use_replay_image_cache()
         self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
         image = Image.frombytes("RGB", (1400, 1100), os.urandom(1400 * 1100 * 3))
@@ -2581,6 +2681,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_codex_view_image_reopen_marks_repeated_path_as_original(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         path = "/tmp/original.png"
         previous_output = {
             "type": "custom_tool_call_output",
@@ -2628,6 +2729,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_codex_view_image_original_detail_is_explicit(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
 
         self.assertTrue(
             hooks._codex_view_image_call_requests_original(
@@ -2685,6 +2787,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_codex_view_image_preview_target_scales_between_128_and_320_kb(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
 
         self.assertEqual(
             hooks._codex_view_image_preview_target(1),
@@ -2709,6 +2812,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
         from PIL import Image
 
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         image = Image.frombytes("RGB", (900, 900), os.urandom(900 * 900 * 3))
         buffer = io.BytesIO()
         image.save(buffer, format="JPEG", quality=95)
@@ -2769,6 +2873,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
         from PIL import Image
 
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         self.use_replay_image_cache()
         path = "/Users/example/project/qa/original.png"
         image = Image.frombytes("RGB", (1400, 1400), os.urandom(1400 * 1400 * 3))
@@ -2858,6 +2963,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
         from PIL import Image
 
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         self.use_replay_image_cache()
         path = "/Users/example/project/qa/iterative-original.png"
         image = Image.frombytes("RGB", (1400, 1400), os.urandom(1400 * 1400 * 3))
@@ -2991,6 +3097,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
         import base64
 
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         old_image = "data:image/png;base64," + base64.b64encode(
             b"x" * (hooks._INLINE_IMAGE_MANY_TOTAL_TARGET_BYTES + 1)
         ).decode("ascii")
@@ -3041,6 +3148,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_preserves_unavailable_request_user_input_history(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         hook = hooks.YoungRouterHook()
         original = {
             "call_type": "aresponses",
@@ -3101,6 +3209,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_deployment_hook_adds_compat_provider_browser_headers(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         hook = hooks.YoungRouterHook()
         original = {
             "api_base": "https://headers.example/v1",
@@ -3121,6 +3230,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_deployment_hook_forwards_codex_user_agent(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         hook = hooks.YoungRouterHook()
         original = {
             "api_base": "https://headers.example/v1",
@@ -3139,6 +3249,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_deployment_hook_replaces_our_own_proxy_user_agent(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         hook = hooks.YoungRouterHook()
         original = {
             "api_base": "https://example.com/v1",
@@ -3166,6 +3277,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_deployment_hook_preserves_explicit_litellm_headers(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         hook = hooks.YoungRouterHook()
         original = {
             "api_base": "https://example.com/v1",
@@ -3188,6 +3300,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_deployment_hook_codex_user_agent_overrides_old_extra_header(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         hook = hooks.YoungRouterHook()
         original = {
             "api_base": "https://headers.example/v1",
@@ -3208,6 +3321,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_deployment_hook_preserves_existing_user_agent(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         hook = hooks.YoungRouterHook()
         original = {
             "metadata": {"api_base": "https://api.headers.example/v1"},
@@ -3226,6 +3340,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_deployment_hook_reads_compat_provider_api_base_from_litellm_params(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         hook = hooks.YoungRouterHook()
         original = {
             "litellm_params": {
@@ -3247,6 +3362,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_deployment_hook_moves_metadata_internal_by_default(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         hook = hooks.YoungRouterHook()
         original = {
             "metadata": {"trace_id": "client-trace", "api_base": "https://example.com/v1"},
@@ -3265,6 +3381,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_deployment_hook_preserves_responses_client_metadata_upstream(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         hook = hooks.YoungRouterHook()
         client_metadata = {
             "thread_id": "thread-test-0001",
@@ -3299,6 +3416,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_deployment_hook_preserves_codex_compaction_headers_upstream(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         hook = hooks.YoungRouterHook()
         turn_metadata = (
             '{"session_id":"thread-test-0001",'
@@ -3362,6 +3480,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_deployment_hook_does_not_add_responses_client_metadata_to_chat_bridge(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         hook = hooks.YoungRouterHook()
         original = {
             "call_type": "aresponses",
@@ -3378,6 +3497,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_deployment_hook_preserves_codex_compaction_history_byte_for_byte(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         hook = hooks.YoungRouterHook()
         previous_compaction = {
             "type": "compaction",
@@ -3436,6 +3556,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_preserves_realistic_structured_compaction_request_shape(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         hook = hooks.YoungRouterHook()
         image_url = "data:image/png;base64," + "A" * 180_000
         original = {
@@ -3539,6 +3660,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_deployment_hook_keeps_ordinary_codex_turn_byte_for_byte(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         hook = hooks.YoungRouterHook()
         original = {
             "call_type": "aresponses",
@@ -3573,6 +3695,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_deployment_hook_restores_plaintext_agent_message_content(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         hook = hooks.YoungRouterHook()
         encrypted_value = "gAAAAABvalidopaqueagentmessage"
         plaintext_value = "补充一项对抗边界：同一轮并行工具调用不能提前放行。"
@@ -3636,6 +3759,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
         from PIL import Image
 
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         hook = hooks.YoungRouterHook()
         image = Image.frombytes("RGB", (1400, 1400), os.urandom(1400 * 1400 * 3))
         buffer = io.BytesIO()
@@ -3703,6 +3827,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
         from PIL import Image
 
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         hook = hooks.YoungRouterHook()
         image = Image.frombytes("RGB", (1400, 1400), os.urandom(1400 * 1400 * 3))
         buffer = io.BytesIO()
@@ -3770,6 +3895,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_deployment_hook_ignores_other_api_bases(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         hook = hooks.YoungRouterHook()
         original = {"api_base": "https://example.com/v1"}
 
@@ -3784,6 +3910,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_deployment_hook_uses_browser_header_retry_marker(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         hook = hooks.YoungRouterHook()
         original = {
             "api_base": "https://api.image.example/v1",
@@ -3806,6 +3933,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_responses_api_does_not_prefer_browser_compatible_deployments(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         hook = hooks.YoungRouterHook()
 
         def aresponses():
@@ -3837,6 +3965,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_generic_response_wrapper_marks_balance_error_without_403_for_failover(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
 
         class UpstreamBalanceError(Exception):
             status_code = 400
@@ -3860,6 +3989,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_generic_response_wrapper_marks_temporary_500_for_failover(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
 
         class UpstreamServerError(Exception):
             status_code = 500
@@ -3884,6 +4014,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_generic_response_wrapper_advances_capacity_error_when_default_budget_is_zero(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
 
         class UpstreamCapacityError(Exception):
             pass
@@ -3915,6 +4046,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_generic_response_wrapper_retries_responses_404_via_chat_bridge(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         calls = []
 
         class ResponsesNotFound(Exception):
@@ -3964,6 +4096,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
         """
 
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         cache_dir = self.use_replay_image_cache()
         self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
         self.set_env(hooks._PREFIX_IMAGE_PREVIEW_MIN_BYTES_ENV, "1000")
@@ -4059,6 +4192,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
         """
 
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         oversized_url = "data:image/png;base64," + ("D" * 1_400_000)
         reference_text = (
             f"{hooks._CODEX_VIEW_IMAGE_ORIGINAL_REFERENCE_MARKER}\n"
@@ -4118,6 +4252,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_bounded_image_inputs_leave_small_original_outputs_untouched(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         small_url = "data:image/png;base64," + ("E" * 400)
         output_item = {
             "type": "custom_tool_call_output",
@@ -4144,6 +4279,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
         """
 
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         self.set_env("YOUNG_ROUTER_IMAGE_CACHE_DIR", None)
         self.set_env("LITELLM_RUNTIME_ROOT", None)
         self.set_env("YOUNG_ROUTER_HOME", None)
@@ -4211,6 +4347,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_replay_image_cache_prunes_only_its_own_copies(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         cache_dir = self.use_replay_image_cache()
         self.set_env(hooks._PREFIX_IMAGE_CACHE_MAX_FILES_ENV, "1")
         self.set_env(hooks._PREFIX_IMAGE_CACHE_MAX_BYTES_ENV, "1000000")
@@ -4247,6 +4384,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
         """
 
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         cache_dir = self.use_replay_image_cache()
         legacy_root = tempfile.TemporaryDirectory(prefix="young-router-legacy-")
         self.addCleanup(legacy_root.cleanup)
@@ -4285,6 +4423,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
         """
 
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         cache_dir = self.use_replay_image_cache()
         legacy_root = tempfile.TemporaryDirectory(prefix="young-router-legacy-")
         self.addCleanup(legacy_root.cleanup)
@@ -4376,6 +4515,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
         """
 
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         temporary = tempfile.TemporaryDirectory(prefix="image-client-path-")
         self.addCleanup(temporary.cleanup)
         vanished = Path(temporary.name) / "codex-clipboard-1234.jpg"
@@ -4432,6 +4572,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
         """Command substitutions, output echoes, and notes follow the same rule."""
 
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         cache_dir = self.use_replay_image_cache()
         legacy_root = tempfile.TemporaryDirectory(prefix="young-router-legacy-")
         self.addCleanup(legacy_root.cleanup)
@@ -4517,6 +4658,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
         from PIL import Image
 
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         image = Image.frombytes("RGB", (4000, 2500), os.urandom(4000 * 2500 * 3))
         buffer = io.BytesIO()
         image.save(buffer, format="JPEG", quality=95)
@@ -4569,6 +4711,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_history_previews_still_use_the_shared_preview_edge(self) -> None:
         hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
         self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
         self.set_env(hooks._PREFIX_IMAGE_PREVIEW_MIN_BYTES_ENV, "1000")
         seen: list[tuple[int, int]] = []

@@ -13,17 +13,24 @@ from young_router.core.service import LOG_TABS as CORE_LOG_TABS
 
 
 class _UsageReader:
-    def refresh(self) -> list[str]:
-        return ["Updated 2026-01-01T00:00:00Z", "default-chat tokens=12"]
+    def refresh(self) -> list[dict[str, str]]:
+        return [
+            {"timestamp": "2026-01-01T00:00:00Z", "source": "newapi", "source_label": "relay", "model": "default-chat", "total_tokens": "12"},
+            {"timestamp": "2026-01-01T00:00:00Z", "source": "newapi", "source_label": "relay", "model": "other-chat", "total_tokens": "4"},
+        ]
 
 
 class _ChangingUsageReader:
     def __init__(self) -> None:
         self.calls = 0
 
-    def refresh(self) -> list[str]:
+    def refresh(self, source_id: str | None = None) -> list[dict[str, str]]:
         self.calls += 1
-        return [f"Updated 2026-01-01T00:00:0{self.calls}Z", f"default-chat tokens={self.calls}"]
+        stamp = f"2026-01-01T00:00:0{self.calls}Z"
+        return [
+            {"timestamp": stamp, "source": "newapi", "source_label": "relay", "model": "default-chat", "total_tokens": str(self.calls)},
+            {"timestamp": stamp, "source": "newapi", "source_label": "relay", "model": "other-chat", "total_tokens": str(self.calls)},
+        ]
 
 
 class _ScopedUsageReader:
@@ -38,9 +45,61 @@ class _ScopedUsageReader:
             {"id": "two", "label": "relay-two"},
         ]
 
-    def refresh(self, source_id: str | None = None) -> list[str]:
+    def refresh(self, source_id: str | None = None) -> list[dict[str, str]]:
         self.scopes.append(source_id or "")
-        return [f"{source_id or 'all'} rows"]
+        return [
+            {
+                "timestamp": "2026-01-01T00:00:00Z",
+                "source": "newapi",
+                "source_label": source_id or "all",
+                "model": f"{source_id or 'all'} rows",
+                "total_tokens": "1",
+            }
+        ]
+
+
+class _StructuredUsageReader:
+    """A usage reader answering with the record shape Core projects."""
+
+    def sources(self) -> list[dict[str, str]]:
+        return [
+            {"id": "one", "label": "flux-code"},
+            {"id": "two", "label": "tken"},
+        ]
+
+    def refresh(self, source_id: str | None = None) -> list[dict[str, str]]:
+        # Each relay answers only for itself, the way the real reader scopes.
+        rows = {
+            "one": {
+                "timestamp": "2026-07-18T10:00:00Z",
+                "source": "newapi",
+                "source_label": "flux-code",
+                "source_family": "NewAPI",
+                "model": "gpt-5",
+                "status": "success",
+                "channel": "channel-one",
+                "total_tokens": "300",
+            },
+            "two": {
+                "timestamp": "2026-07-18T11:00:00Z",
+                "source": "newapi",
+                "source_label": "tken",
+                "source_family": "NewAPI",
+                "model": "claude-opus",
+                "status": "success",
+                "total_tokens": "88",
+            },
+        }
+        return [rows[source_id]] if source_id in rows else []
+
+
+class _SilentUsageReader:
+    """A reader for a relay that exposes no usage feed at all."""
+
+    def refresh(self, source_id: str | None = None) -> tuple[list[dict[str, str]], str]:
+        from young_router.core.remote_usage_logs import USAGE_REASON_UNSUPPORTED
+
+        return [], USAGE_REASON_UNSUPPORTED
 
 
 class LogsDomainTests(unittest.TestCase):
@@ -1938,31 +1997,43 @@ model_list:
             self.assertFalse(second["changed"])
             self.assertIsNone(second["log"])
 
-    def test_online_usage_is_loaded_only_after_explicit_refresh(self) -> None:
+    def test_online_usage_reads_nothing_until_a_relay_is_named(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            domain = LogsDomain(directory, online_usage_reader=_UsageReader())
+            reader = _ScopedUsageReader()
+            domain = LogsDomain(directory, online_usage_reader=reader)
 
             self.assertFalse(domain.view("online-usage")["log"]["available"])
+
+            # A refresh with no selection is not a request to read every relay:
+            # the pane asks the user to choose one instead.
             domain.dispatch("logs.refresh_online_usage", {"tab": "online-usage"})
             tab = domain.view("online-usage")["log"]
 
+            self.assertEqual(0, tab["line_count"])
+            self.assertEqual([], reader.scopes)
+
+            domain.dispatch("logs.refresh_online_usage", {"tab": "online-usage", "source": "two"})
+            tab = domain.view("online-usage")["log"]
+
             self.assertTrue(tab["available"])
-            self.assertEqual(2, tab["line_count"])
+            self.assertEqual("two", tab["source_id"])
+            self.assertEqual(1, tab["line_count"])
 
     def test_clearing_online_usage_does_not_hide_the_next_refresh(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             reader = _ChangingUsageReader()
             domain = LogsDomain(directory, online_usage_reader=reader)
 
-            domain.dispatch("logs.refresh_online_usage", {"tab": "online-usage"})
+            domain.dispatch("logs.refresh_online_usage", {"tab": "online-usage", "source": "one"})
             domain.dispatch("logs.clear", {"tab": "online-usage"})
             self.assertEqual(0, domain.view("online-usage")["log"]["line_count"])
 
-            domain.dispatch("logs.refresh_online_usage", {"tab": "online-usage"})
+            domain.dispatch("logs.refresh_online_usage", {"tab": "online-usage", "source": "one"})
             records = domain.view("online-usage")["log"]["records"]
 
             self.assertEqual(2, len(records))
-            self.assertIn("00:00:02Z", "\n".join(records))
+            self.assertEqual("2026-01-01T00:00:02Z", records[0]["timestamp"])
+            self.assertEqual("2", records[0]["total_tokens"])
 
 
     def test_online_usage_names_its_sources_and_reads_the_selected_one(self) -> None:
@@ -1982,7 +2053,44 @@ model_list:
             tab = domain.view("online-usage")["log"]
             self.assertEqual("two", tab["source_id"])
             self.assertEqual(["two"], sorted(set(reader.scopes)))
-            self.assertIn("two rows", "\n".join(tab["records"]))
+            self.assertIn("two rows", "\n".join(str(record) for record in tab["records"]))
+
+    def test_online_usage_keeps_the_records_full_relay_name_and_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            domain = LogsDomain(directory, online_usage_reader=_StructuredUsageReader())
+            domain.dispatch("logs.refresh_online_usage", {"tab": "online-usage", "source": "one"})
+
+            records = domain.view("online-usage")["log"]["records"]
+
+            # The chosen relay answers for itself alone.
+            self.assertEqual(1, len(records))
+            first = records[0]
+            # The view carries the station's full identity and every field it
+            # reported, so the table can render a row without re-parsing text.
+            self.assertEqual("flux-code", first["source_label"])
+            self.assertEqual("NewAPI", first["source_family"])
+            self.assertEqual("gpt-5", first["model"])
+            self.assertEqual("300", first["total_tokens"])
+            self.assertEqual("channel-one", first["channel"])
+            # The detail a double-click opens is the same record, not a
+            # re-flattened line of it.
+            self.assertIsInstance(first, dict)
+
+    def test_a_relay_with_no_usage_feed_states_why_rather_than_reporting_a_row(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            domain = LogsDomain(directory, online_usage_reader=_SilentUsageReader())
+            domain.dispatch("logs.refresh_online_usage", {"tab": "online-usage", "source": "one"})
+
+            tab = domain.view("online-usage")["log"]
+
+            # No usage was reported, so the pane must show no rows at all: a
+            # row shaped like a usage record would read as usage the relay
+            # never reported.
+            self.assertEqual([], tab["records"])
+            self.assertEqual(0, tab["line_count"])
+            # The reason is a code the pane phrases, never a row and never a
+            # sentence that only reads correctly in English.
+            self.assertEqual("unsupported", tab["reason"])
 
     def test_online_usage_refresh_without_a_scope_keeps_the_selection(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

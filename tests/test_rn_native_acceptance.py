@@ -800,17 +800,49 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             "struct TableComponentView final", 1
         )[1].split("struct TextEditorComponentView final", 1)[0]
 
-        # AppKit's selection notification is enough for ordinary rows; its
-        # target/action is only needed for selectable group rows, which AppKit
-        # will not select itself.
+        # AppKit's selection notification carries an ordinary row whose
+        # selection changed; its target/action carries the selectable group
+        # rows AppKit will not select itself, and the already-selected row.
         self.assertIn("![self isSelectableSpanningRow:row]", mac_table)
         self.assertNotIn("([self isSpanningRow:row] && ![self isSelectableSpanningRow:row])", mac_table)
         self.assertIn("onSelectionChange(event);", mac_table)
-        # WinUI's SelectionChanged is the sole selection path. ItemClick used
-        # to send the same row again, and enabling it had no independent use.
+        # WinUI's SelectionChanged carries a row whose selection changed.
+        # ItemClick used to send the same row again, and enabling it had no
+        # independent use.
         self.assertIn("list_.SelectionChanged([this](auto const&, auto const&) {", windows_table)
         self.assertNotIn("list_.ItemClick", windows_table)
         self.assertNotIn("list_.IsItemClickEnabled(true);", windows_table)
+
+    def test_native_tables_report_a_click_on_the_already_selected_row(self) -> None:
+        """Clicking the selected row must still reach the shared view.
+
+        The provider list sits beside the model list, and its row click also
+        returns the detail pane from a model to its provider.  That press
+        changes no native selection, so a host that reported selection changes
+        only left the pane showing the model the previous click opened.
+        """
+        mac = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
+        windows = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
+        mac_table = mac.split(
+            "- (void)handleRowClick:", 1
+        )[1].split("- (void)handleDoubleClick:", 1)[0]
+        windows_table = windows.split(
+            "struct TableComponentView final", 1
+        )[1].split("struct TextEditorComponentView final", 1)[0]
+
+        # AppKit's action fires for every row click, so it reports the row only
+        # when the selection notification is not already coming for it.
+        self.assertIn("_tableView.selectedRow == row &&", mac_table)
+        self.assertIn("row == SegmentIndex(viewProps.rowKeys, viewProps.selectedKey)", mac_table)
+        self.assertIn("onSelectionChange(event);", mac_table)
+        # WinUI's ListView has no per-row press event, so the row carries one.
+        # PointerPressed runs before SelectionChanged, and the controlled
+        # selectedKey — not the live index — is what tells the two apart.
+        self.assertIn("row.PointerPressed([this, selection_index]", windows_table)
+        self.assertIn("if (Props()->selectedKey != key || list_.SelectedIndex() != selection_index) return;", windows_table)
+        self.assertIn("emitter->onSelectionChange(std::move(args));", windows_table)
+        # A press that syncs the controlled selection is not a user click.
+        self.assertIn("if (syncing_ || !Props()) return;", windows_table)
 
     def test_native_pickers_do_not_emit_change_for_controlled_props(self) -> None:
         mac = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
@@ -2127,7 +2159,10 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertNotIn("openRelayUsageLogs", logs_ui)
         self.assertIn("const onlineUsageSources = selected === \"online-usage\" ? active?.sources ?? [] : [];", logs_ui)
         self.assertIn("const onlineUsageSourceValues = useMemo(", logs_ui)
-        self.assertIn('translate("logs.onlineUsageAllSources")', logs_ui)
+        # The dropdown names the relays; there is no aggregate entry, because
+        # the tab reads exactly the station the user picks.
+        self.assertIn('translate("logs.onlineUsageSelectSource")', logs_ui)
+        self.assertNotIn('translate("logs.onlineUsageAllSources")', logs_ui)
         self.assertIn('route: "host/relay/restore"', mac_core)
         self.assertIn('REACT_METHOD(RestoreRelaySession, L"restoreRelaySession")', windows_header)
         self.assertIn("void WinUI3NativeLeafModule::RestoreRelaySession(", windows_module)
@@ -3380,7 +3415,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # viewport behavior is still covered by the settings editors above;
         # the log surface must not regress to a giant raw text editor.
         self.assertNotIn('documentKey={`logs:${selected}`}', ui)
-        self.assertIn("() => fitLogColumns(logColumns(selected, translate), tableWidth)", ui)
+        self.assertIn("logColumns(selected, translate, selected !== \"online-usage\" || rows.some((row) => Boolean(row.status)))", ui)
         self.assertIn("const nativeTableColumns = useMemo(", ui)
         self.assertIn("<NativeTable columns={nativeTableColumns}", ui)
         self.assertIn("REACT_FIELD(documentKey)", windows_codegen)

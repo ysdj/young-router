@@ -1040,10 +1040,16 @@ class WorkBuddyModuleTests(unittest.TestCase):
         """
 
         import young_router.adapters as adapters
+        from young_router.adapters import opencode2dsh as opencode2dsh_module
         from young_router.adapters import workbuddy as workbuddy_module
 
+        # Every bundled worker that serves a model endpoint publishes its own
+        # reference, and the registry is their union -- naming one product here
+        # would be exactly the coupling this rule exists to prevent.
         expected = frozenset(
-            f"os.environ/{name}" for name in workbuddy_module.API_BASE_ENV.values()
+            f"os.environ/{name}"
+            for module in (workbuddy_module, opencode2dsh_module)
+            for name in module.API_BASE_ENV.values()
         )
         self.assertEqual(adapters.managed_base_references(), expected)
         # The resolved half of the same fact is asked for by address, so a

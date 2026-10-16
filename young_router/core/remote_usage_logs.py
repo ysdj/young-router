@@ -33,13 +33,33 @@ from young_router.browser_identity import browser_request_headers
 MAX_TARGETS = 4
 MAX_WORKERS = 4
 PAGE_SIZE = 80
-MAX_ROWS_PER_TARGET = 100
+# How many rows one key of one station may contribute. The log view holds up
+# to MAX_LINES and states its own limit in the status strip, so a reader cap
+# below that would silently drop rows the view was willing to show. It stays
+# bounded because the response is third-party and must not grow without limit.
+MAX_ROWS_PER_TARGET = 2_000
 DEFAULT_TIMEOUT_SECONDS = 4.0
-MAX_RESPONSE_BYTES = 256 * 1024
+# A relay answers a log page as one JSON document, and a station's own page
+# size is often 1000 rows: a real, valid answer is routinely several hundred
+# kilobytes, so a small cap rejected the busiest keys as if they were broken.
+# The bound still exists, because the response is third-party and must not be
+# read without limit; it is stated in rows so it tracks what the reader uses.
+MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 
 
 class UsageConfigError(ValueError):
     """The current LiteLLM configuration could not be read safely."""
+
+# Which outcome a read ended in. The pane states each one in the user's own
+# language, so Core answers with a stable code rather than a sentence that only
+# ever reads correctly in English.
+USAGE_REASON_CONFIG_UNREADABLE = "config_unreadable"
+USAGE_REASON_UNKNOWN_SOURCE = "unknown_source"
+USAGE_REASON_NO_CREDENTIAL = "no_credential"
+USAGE_REASON_UNSUPPORTED = "unsupported"
+USAGE_REASON_NO_ROWS = "no_rows"
+USAGE_REASON_UNAVAILABLE = "unavailable"
+
 
 def _string(value: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
@@ -103,18 +123,51 @@ class UsageTarget:
     provider: str
     api_base: str
     api_key: str
+    # The station's other configured credentials, tried in order when the
+    # first cannot read the feed. A station keeps one identity in the dropdown
+    # however many keys it carries.
+    fallback_keys: tuple[str, ...] = ()
+
+    def credentials(self) -> tuple[str, ...]:
+        return (self.api_key, *self.fallback_keys)
+
+    @property
+    def origin(self) -> str:
+        """The station's own address, as the relay panes state it."""
+
+        return service_root(self.api_base) or self.api_base
+
+    def display(self) -> str:
+        """The relay's name as the user knows it.
+
+        ``provider`` is the name the user gave the station when they added it
+        (``sisct2``), which is what the relay panes list and what the user is
+        looking for in a dropdown.  The family that answered is carried
+        separately as ``source_family``, because it is its own column and
+        fusing it to the name only made the name column too wide to read.
+        """
+
+        return self.provider
+
+    @staticmethod
+    def family_label(family: str) -> str:
+        """The control plane that answered, named the way the panes name it."""
+
+        if not family:
+            return ""
+        return "Sub2API" if family == "sub2api" else "NewAPI"
 
     @property
     def source_id(self) -> str:
-        """A stable, non-secret handle for one configured read target.
+        """A stable, non-secret handle for one configured relay station.
 
-        The id names the *route*, never the credential: it is derived from the
-        control-plane root plus the provider label, so the React side can hand
-        a selection back without ever seeing the API key it selects.
+        The id names the *station*, never a credential: it is derived from the
+        control-plane root alone, so every route that points at one station
+        resolves to the same entry, and the React side hands a selection back
+        without ever seeing the API key it selects.
         """
 
-        root = service_root(self.api_base) or self.api_base
-        digest = hashlib.sha256(f"{root}\u0000{self.provider}".encode("utf-8")).hexdigest()
+        digest = hashlib.sha256(self.origin.encode("utf-8")).hexdigest()
         return digest[:16]
 
 
@@ -137,7 +190,14 @@ def default_config_path() -> pathlib.Path:
 
 
 def active_usage_targets(path: pathlib.Path) -> list[UsageTarget]:
-    """Return one safe read target for each configured model credential."""
+    """Return one safe read target for each configured relay station.
+
+    A station is reached by whichever of its credentials can read the usage
+    feed, so its keys are collected onto one target instead of becoming
+    several: reading the same station once per key would list the same rows
+    again, and a station with more keys than the target budget would crowd
+    every other station out of the dropdown.
+    """
     try:
         payload = load_config(path)
     except Exception as exc:
@@ -146,9 +206,13 @@ def active_usage_targets(path: pathlib.Path) -> list[UsageTarget]:
     if not isinstance(raw_providers, list):
         raise UsageConfigError("The LiteLLM configuration has no provider list.")
 
-    seen: set[tuple[str, str]] = set()
-    provider_counts: dict[str, int] = {}
-    targets: list[UsageTarget] = []
+    # The station's own root is its identity: several configured routes (and
+    # several keys within one route) that point at the same control plane are
+    # one relay to read and one entry to choose.
+    order: list[str] = []
+    roots: dict[str, str] = {}
+    labels: dict[str, str] = {}
+    credentials: dict[str, list[str]] = {}
     for raw_provider in raw_providers:
         if not isinstance(raw_provider, dict):
             continue
@@ -163,18 +227,33 @@ def active_usage_targets(path: pathlib.Path) -> list[UsageTarget]:
             api_base = _string(raw_model.get("api_base")) or provider_base
             api_key = _credential_for_model(raw_provider, raw_model)
             root = service_root(api_base)
-            if not root or not api_key:
+            if not root:
                 continue
-            key = (root, api_key)
-            if key in seen:
-                continue
-            seen.add(key)
-            provider_counts[provider_name] = provider_counts.get(provider_name, 0) + 1
-            suffix = provider_counts[provider_name]
-            label = provider_name if suffix == 1 else f"{provider_name} · Account {suffix}"
-            targets.append(UsageTarget(provider=label, api_base=api_base, api_key=api_key))
-            if len(targets) >= MAX_TARGETS:
-                return targets
+            if root not in roots:
+                order.append(root)
+                roots[root] = api_base
+                labels[root] = provider_name
+                credentials[root] = []
+            if api_key and api_key not in credentials[root]:
+                credentials[root].append(api_key)
+
+    targets: list[UsageTarget] = []
+    for root in order:
+        keys = credentials[root]
+        if not keys:
+            # A station with no readable credential has no usage to read, and
+            # offering it would be a dropdown entry that always answers empty.
+            continue
+        targets.append(
+            UsageTarget(
+                provider=labels[root],
+                api_base=roots[root],
+                api_key=keys[0],
+                fallback_keys=tuple(keys[1:]),
+            )
+        )
+        if len(targets) >= MAX_TARGETS:
+            break
     return targets
 
 
@@ -231,6 +310,12 @@ def _fetch_json(
             status = int(getattr(response, "status", response.getcode()))
             body = response.read(MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as exc:
+        # A refusal is not the same fact as a missing route: 401/403 says the
+        # endpoint exists and this credential may not read it, while 404 says
+        # the station does not install it.  The difference decides whether the
+        # next credential is worth trying.
+        if exc.code in {401, 403}:
+            return "refused", None
         return "unsupported", None
     except (socket.timeout, TimeoutError):
         return "timeout", None
@@ -391,19 +476,43 @@ def _summary_rows(payload: dict[str, Any]) -> list[dict[str, Any]] | None:
     return rows
 
 
-def _row_text(row: dict[str, Any], fallback_timestamp: str) -> str:
-    timestamp = _safe_timestamp(
-        row.get("created_at") or row.get("createdAt") or row.get("timestamp")
-    ) or fallback_timestamp
-    model = _safe_text(
-        row.get("model_name") or row.get("model") or row.get("requested_model"),
-        96,
-    )
-    status = _safe_text(row.get("status") or row.get("request_type"), 32)
-    if not status:
-        type_value = _safe_number(row.get("type"))
-        status = f"type={type_value}" if type_value else ""
-    tokens = _total_tokens(row)
+def _row_details(row: dict[str, Any]) -> dict[str, str]:
+    """Project one usage row into the fields the log view renders.
+
+    Only documented, presentational keys survive: a relay's response is
+    third-party data, and the pane must never show a request body, an IP, a
+    path, or anything else the station happened to include.  Every value is a
+    string so the record is the same shape whichever endpoint answered.
+    """
+
+    fields = {
+        "model": _safe_text(
+            row.get("model_name") or row.get("model") or row.get("requested_model"),
+            96,
+        ),
+        "status": _safe_text(row.get("status") or row.get("request_type"), 32),
+        "channel": _safe_text(row.get("channel_name") or row.get("channel"), 64),
+        "group": _safe_text(row.get("group_name") or row.get("group"), 64),
+        "key_name": _safe_text(row.get("token_name") or row.get("key_name"), 64),
+        "duration": _safe_number(row.get("use_time") or row.get("duration")),
+        "prompt_tokens": _safe_number(row.get("prompt_tokens") or row.get("input_tokens")),
+        "completion_tokens": _safe_number(
+            row.get("completion_tokens") or row.get("output_tokens")
+        ),
+        "cache_tokens": _safe_number(
+            row.get("cache_read_tokens") or row.get("cache_creation_tokens")
+        ),
+        "total_tokens": _total_tokens(row),
+        "cost": _safe_number(row.get("quota") or row.get("cost") or row.get("amount")),
+    }
+    return {key: value for key, value in fields.items() if value}
+
+
+def _row_text(record: dict[str, Any], fallback_timestamp: str) -> str:
+    timestamp = record.get("timestamp") or fallback_timestamp
+    model = record.get("model") or ""
+    status = record.get("status") or ""
+    tokens = record.get("total_tokens") or ""
     pieces = [
         part
         for part in [timestamp, model, status, f"tokens={tokens}" if tokens else ""]
@@ -412,37 +521,153 @@ def _row_text(row: dict[str, Any], fallback_timestamp: str) -> str:
     return "  ".join(pieces)
 
 
+def _row_record(
+    raw: dict[str, Any],
+    target: UsageTarget,
+    family: str,
+    fallback_timestamp: str,
+) -> dict[str, Any] | None:
+    """Build one usage record carrying its relay's full name and its fields."""
+
+    timestamp = _safe_timestamp(
+        raw.get("created_at") or raw.get("createdAt") or raw.get("timestamp")
+    ) or fallback_timestamp
+    details = _row_details(raw)
+    if not details.get("model") and not details.get("total_tokens"):
+        # A row that names neither a model nor a token count is the station's
+        # own placeholder; rendering it would be a blank line with a relay name.
+        return None
+    record: dict[str, Any] = {
+        "timestamp": timestamp,
+        "source": family,
+        "source_id": target.source_id,
+        "source_label": target.display(),
+        "source_family": target.family_label(family),
+    }
+    record.update(details)
+    return record
+
+
 def fetch_target(
     target: UsageTarget,
     timeout: float,
     fallback_timestamp: str | None = None,
-) -> tuple[str, list[str]]:
+) -> tuple[str, list[dict[str, Any]]]:
+    """Read every one of the station's keys and merge what they report.
+
+    A station scopes its log feed per key, so one key answers for the traffic
+    it served and nothing else: the key an account happens to list first can
+    legitimately answer zero rows while another is the busiest.  Reading only
+    the first key that answered therefore reported "no usage" for a station
+    the router was actively serving, which is why every key is read and their
+    rows are merged.
+
+    Which endpoint shape a station installs is a property of the *station*,
+    not of a key, so it is settled once and the keys are then read against
+    that one shape.  Probing every shape with every key multiplied the
+    requests a refresh costs by the number of keys, and each request is the
+    slow part.
+    """
+
     fallback_timestamp = fallback_timestamp or _utc_now_iso()
     for kind, endpoint, authorization_scheme in _endpoint_candidates(target.api_base):
-        result, payload = _fetch_json(
-            endpoint,
-            target.api_key,
-            timeout,
-            authorization_scheme,
-        )
-        if result != "ok" or payload is None:
+        credentials = target.credentials()
+        if not credentials:
             continue
-        rows = _items(payload)
-        if rows is None and kind == "sub2api":
-            rows = _summary_rows(payload)
-        if rows is None:
+        probe = (kind, endpoint, authorization_scheme)
+        # One key settles the shape.  A refusal settles it too: it proves the
+        # endpoint exists, and only tells us this particular key cannot read
+        # it, so the remaining keys are still worth spending on it.
+        first_result, _payload, first_rows = _fetch_key(credentials[0], probe, timeout, kind)
+        answered = first_result == "ok"
+        if not answered and first_result != "refused":
             continue
-        rendered = [_row_text(row, fallback_timestamp) for row in rows[:MAX_ROWS_PER_TARGET]]
-        rendered = [row for row in rendered if row]
-        return kind, rendered
+        records: list[dict[str, Any]] = []
+        if first_rows:
+            records.extend(_records_from(first_rows, target, kind, fallback_timestamp))
+        rest = credentials[1:]
+        if rest:
+            # The remaining keys are independent reads against one station, so
+            # they run together instead of one after another.
+            workers = min(MAX_WORKERS, len(rest))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [executor.submit(_fetch_key, key, probe, timeout, kind) for key in rest]
+                for future in futures:
+                    result, _payload, rows = future.result()
+                    if result == "ok" and rows:
+                        records.extend(_records_from(rows, target, kind, fallback_timestamp))
+        if answered or records:
+            return kind, _deduplicated_records(records)
     return "", []
+
+
+def _fetch_key(
+    api_key: str,
+    probe: tuple[str, str, str],
+    timeout: float,
+    kind: str,
+) -> tuple[str, dict[str, Any] | None, list[dict[str, Any]] | None]:
+    """Read one key's page: its result, the payload, and the recognized rows."""
+
+    _kind, endpoint, authorization_scheme = probe
+    result, payload = _fetch_json(endpoint, api_key, timeout, authorization_scheme)
+    if result != "ok" or payload is None:
+        return result, payload, None
+    rows = _items(payload)
+    if rows is None and kind == "sub2api":
+        rows = _summary_rows(payload)
+    return result, payload, rows
+
+
+def _records_from(
+    rows: list[dict[str, Any]],
+    target: UsageTarget,
+    kind: str,
+    fallback_timestamp: str,
+) -> list[dict[str, Any]]:
+    return [
+        record
+        for record in (
+            _row_record(row, target, kind, fallback_timestamp)
+            for row in rows[:MAX_ROWS_PER_TARGET]
+        )
+        if record
+    ]
+
+
+def _deduplicated_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop rows the station reported through more than one key.
+
+    A key-scoped feed can overlap, and the same request appearing twice would
+    read as two requests the user made.  Rows are identified by what the
+    station stated about them, so a genuine repeat (same model, same status,
+    same counts at the same instant) is the only thing collapsed.
+    """
+
+    seen: set[tuple[Any, ...]] = set()
+    unique: list[dict[str, Any]] = []
+    for record in records:
+        identity = (
+            record.get("timestamp"),
+            record.get("model"),
+            record.get("status"),
+            record.get("prompt_tokens"),
+            record.get("completion_tokens"),
+            record.get("total_tokens"),
+            record.get("key_name"),
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        unique.append(record)
+    return unique
 
 
 def _fetch_target_safely(
     target: UsageTarget,
     timeout: float,
     fallback_timestamp: str,
-) -> tuple[str, list[str]]:
+) -> tuple[str, list[dict[str, Any]]]:
     try:
         return fetch_target(target, timeout, fallback_timestamp)
     except Exception:
@@ -456,9 +681,9 @@ def usage_sources(path: pathlib.Path) -> list[dict[str, str]]:
     """List the selectable read targets without exposing any credential.
 
     The dropdown that names them is what decides the scope of a refresh, so the
-    list must be safe to render: an id, the relay label the user configured,
-    and the credential's own name.  A source that yields no usable credential
-    is simply absent, which is how the UI says there is nothing to read.
+    list must be safe to render: an id and the station's own name.  A source
+    that yields no usable credential is simply absent, which is how the UI says
+    there is nothing to read.
     """
 
     try:
@@ -466,29 +691,36 @@ def usage_sources(path: pathlib.Path) -> list[dict[str, str]]:
     except UsageConfigError:
         return []
     return [
-        {"id": target.source_id, "label": target.provider}
+        {"id": target.source_id, "label": target.display()}
         for target in targets
     ]
 
 
-def render(
+def collect(
     path: pathlib.Path,
     timeout: float,
     source_id: str | None = None,
-) -> str:
+) -> tuple[list[dict[str, Any]], str]:
+    """Gather every configured relay's usage rows as structured records.
+
+    Returns the records and a status sentence for the view to show when there
+    is nothing to list.  The caller renders the rows; this never formats the
+    station's data into prose, because the pane owns how a row looks.
+    """
+
     try:
         targets = active_usage_targets(path)
     except UsageConfigError:
-        return "Configured relay logs are unavailable because the local configuration could not be read."
+        return [], USAGE_REASON_CONFIG_UNREADABLE
     if source_id:
         # An unknown id is not an error the user can fix: the configuration may
         # have moved under a dropdown whose selection is one refresh old. Read
         # nothing rather than silently answering for a different relay.
         targets = [target for target in targets if target.source_id == source_id]
         if not targets:
-            return "No configured relay matches the selected online usage source."
+            return [], USAGE_REASON_UNKNOWN_SOURCE
     if not targets:
-        return "No configured relay exposes a usable credential for online usage logs."
+        return [], USAGE_REASON_NO_CREDENTIAL
 
     observed_at = _utc_now_iso()
     workers = min(MAX_WORKERS, len(targets))
@@ -498,14 +730,38 @@ def render(
         ]
         results = [future.result() for future in futures]
 
-    sections: list[str] = []
-    for target, (source, rows) in zip(targets, results):
-        if source:
-            body = "\n".join(rows) if rows else "No recent usage rows."
-            sections.append(f"{target.provider} ({source})\n{body}")
-    if not sections:
-        return "No configured relay exposed a supported online usage-log endpoint."
-    return f"Updated {observed_at}\n\n" + "\n\n".join(sections)
+    records: list[dict[str, Any]] = []
+    readable = False
+    for (source, rows) in results:
+        if not source:
+            continue
+        readable = True
+        records.extend(rows)
+    if not readable:
+        return [], USAGE_REASON_UNSUPPORTED
+    return records, ""
+
+
+def render(
+    path: pathlib.Path,
+    timeout: float,
+    source_id: str | None = None,
+) -> str:
+    """The CLI's own plain-text presentation of the same records."""
+
+    records, status = collect(path, timeout, source_id)
+    if status:
+        return status
+    if not records:
+        return "No recent usage rows."
+    groups: dict[str, list[str]] = {}
+    for record in records:
+        label = str(record.get("source_label") or "Relay")
+        kind = str(record.get("source_family") or "")
+        heading = f"{label} ({kind})" if kind else label
+        groups.setdefault(heading, []).append(_row_text(record, _utc_now_iso()))
+    sections = [f"{heading}\n" + "\n".join(rows) for heading, rows in groups.items()]
+    return f"Updated {_utc_now_iso()}\n\n" + "\n\n".join(sections)
 
 
 def main() -> int:

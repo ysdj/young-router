@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import {existsSync, mkdirSync, readFileSync} from 'node:fs';
+import {existsSync, mkdirSync, readFileSync, writeFileSync} from 'node:fs';
 import {spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import path from 'node:path';
@@ -42,7 +42,7 @@ function run(command, args, cwd) {
   }
 }
 
-function generateFBReactNativeSpec(packageDirectory) {
+function generateFBReactNativeSpec(packageDirectory, pinnedCommit) {
   const generator = path.join(
     packageDirectory,
     'scripts',
@@ -53,17 +53,35 @@ function generateFBReactNativeSpec(packageDirectory) {
   if (!existsSync(generator)) {
     fail(`FBReactNativeSpec generator is missing at ${path.relative(rnRoot, generator)}.`);
   }
-  const script = `require(${JSON.stringify(generator)}).generateFBReactNativeSpecIOS(${JSON.stringify(packageDirectory)});`;
-  run(process.execPath, ['-e', script], packageDirectory);
   const generated = path.join(
     packageDirectory,
     'React',
     'FBReactNativeSpec',
     'FBReactNativeSpecJSI.h',
   );
+  // The header is around 400 KB and a dozen pods include it.  The generator
+  // rewrites it unconditionally, so its mtime moves on every build even though
+  // its bytes are identical, and xcodebuild then rebuilds every one of those
+  // pods -- most of a repeat build's native time.  Its only input is the
+  // vendored package, which `verifyVendor` above has just proven is the pinned
+  // commit, so the header is reused only while it came from that same commit;
+  // a refreshed vendor or an absent header regenerates it.
+  const stamp = path.join(
+    packageDirectory,
+    'React',
+    'FBReactNativeSpec',
+    '.young-router-vendor-commit',
+  );
+  if (existsSync(generated) && existsSync(stamp) && readFileSync(stamp, 'utf8').trim() === pinnedCommit) {
+    console.log(`Reusing ${path.relative(rnRoot, generated)}.`);
+    return;
+  }
+  const script = `require(${JSON.stringify(generator)}).generateFBReactNativeSpecIOS(${JSON.stringify(packageDirectory)});`;
+  run(process.execPath, ['-e', script], packageDirectory);
   if (!existsSync(generated)) {
     fail(`Codegen did not produce ${path.relative(rnRoot, generated)}; the macOS host cannot compile without it.`);
   }
+  writeFileSync(stamp, `${pinnedCommit}\n`, 'utf8');
   console.log(`Generated ${path.relative(rnRoot, generated)}.`);
 }
 
@@ -107,7 +125,7 @@ function main() {
     result = verifyVendor();
   }
   console.log(`Bootstrapped react-native-macos 0.85 at ${path.relative(rnRoot, result.packageDirectory)}.`);
-  generateFBReactNativeSpec(result.packageDirectory);
+  generateFBReactNativeSpec(result.packageDirectory, manifest.commit);
   // Re-verify: the generator must not have touched a tracked file, and the
   // pinned checkout is what every later step trusts.
   verifyVendor();

@@ -1320,7 +1320,17 @@ class HookStreamingResponseEventTests(HookTestCase):
                 if isinstance(item, dict):
                     json.dumps(item.get("arguments", ""))
 
-    async def test_local_shutdown_after_visible_output_does_not_emit_restart_failure(self) -> None:
+    async def test_local_shutdown_after_visible_output_keeps_the_partial_turn(self) -> None:
+        """A replaced worker's teardown closes the turn; it never fails it.
+
+        The worker is stopped while it drains, so a turn still being written can
+        lose its upstream mid-answer.  No upstream refused, so there is nothing
+        for the user to act on -- but ending the stream with no terminal at all
+        is what the client renders as ``upstream_route_failure``, interrupting a
+        turn the user was already reading.  The answer text that did arrive is
+        real output, so the turn closes the way a finished one does and the
+        conversation continues.
+        """
         hooks, _proxy_server = load_hook_module()
 
         async def upstream_stream():
@@ -1346,13 +1356,81 @@ class HookStreamingResponseEventTests(HookTestCase):
             )
         ]
 
-        self.assertEqual(
-            [chunk.get("type") for chunk in chunks],
-            ["response.output_text.delta"],
-        )
+        types = [chunk.get("type") for chunk in chunks]
+        self.assertEqual(types[0], "response.output_text.delta")
+        # The turn ends as completed, not as an interruption the client has to
+        # answer.
+        self.assertEqual(types[-1], "response.completed")
         self.assertFalse(
             any(chunk.get("type") == "response.failed" for chunk in chunks)
         )
+        # The partial answer the user already saw is carried into the terminal,
+        # so nothing that arrived is dropped when the stream closes.
+        response = chunks[-1].get("response") or {}
+        output = response.get("output") or []
+        self.assertTrue(output, "the delivered answer must survive into the terminal")
+        self.assertIn(
+            "partial answer",
+            json.dumps(output, ensure_ascii=False),
+        )
+
+    async def test_a_cancelled_worker_still_closes_the_turn(self) -> None:
+        """This worker's own teardown cancels the stream; it must still close it.
+
+        Uvicorn cancels every task still running when its graceful timeout
+        expires, and a cancellation is a ``BaseException``: the ``except
+        Exception`` that closes a locally-cut stream never sees it.  A stream
+        destroyed that way closes its socket with no terminal, which the client
+        shows as a failed route and asks the user to send again -- so a
+        cancellation that belongs to this worker's app exit has to close the
+        turn the same way the error path does.
+        """
+        hooks, _proxy_server = load_hook_module()
+
+        async def upstream_stream():
+            for index in range(100):
+                yield {
+                    "type": "response.output_text.delta",
+                    "item_id": "msg_1",
+                    "output_index": 0,
+                    "delta": f"tok{index} ",
+                }
+                await asyncio.sleep(0.05)
+
+        async def drain() -> list[dict]:
+            chunks: list[dict] = []
+
+            async def collect() -> None:
+                async for chunk in hooks._yield_guarded_original_stream(
+                    [],
+                    upstream_stream(),
+                    {
+                        "model": "default-chat",
+                        "input": "continue",
+                        "stream": True,
+                        "proxy_server_request": {"path": "/v1/responses"},
+                    },
+                ):
+                    chunks.append(jsonable_stream_chunk(chunk))
+
+            task = asyncio.create_task(collect())
+            await asyncio.sleep(0.3)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            return chunks
+
+        hooks._begin_proxy_shutdown()
+        try:
+            chunks = await drain()
+        finally:
+            hooks._end_proxy_shutdown()
+
+        types = [chunk.get("type") for chunk in chunks]
+        self.assertEqual(types[-1], "response.completed")
+        self.assertFalse(any(kind == "response.failed" for kind in types))
 
 
 if __name__ == "__main__":

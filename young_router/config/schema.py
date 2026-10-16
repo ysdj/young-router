@@ -122,6 +122,7 @@ PROVIDER_AUTH_KINDS = {
     "claude_login",
     "workbuddy_login",
     "workbuddy_ai_login",
+    "opencode2dsh_login",
 }
 MODEL_CATALOG_MODES = {"independent", "relay_linked"}
 MODEL_ORDER_MODES = {"manual", "relay_multiplier"}

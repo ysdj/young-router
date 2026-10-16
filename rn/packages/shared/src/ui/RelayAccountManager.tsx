@@ -1430,7 +1430,10 @@ export function StationAccountsPanel({
           when a full address needs the room.  Both controls act on a station
           session — 刷新 reads the station and 分组 writes its keys — so neither
           is offered while the row does not read 已登录; a row that states
-          未登录 carries 去登录 alone. */}
+          未登录 carries 去登录 alone.  分组 takes the bezel-hugging width: its
+          label is a two-character noun, so the shared 72 dp reservation is
+          mostly padding around it, and that padding is what wrapped the button
+          onto a line of its own below the session controls. */}
       <View style={styles.fieldRow}>
         <Text style={styles.fieldLabel}>{translate("relay.accountField")}</Text>
         <Text style={styles.accountNameValue}>{accountDisplayName(selected, translate)}</Text>
@@ -1442,7 +1445,7 @@ export function StationAccountsPanel({
             verified account never needed it. */}
         {selectedLoginState === "signed_out" ? <NativeButton title={translate("relay.goLogin")} compact busy={pendingAction === "login"} disabled={controlsBusy && pendingAction !== "login"} onPress={() => { void loginSelected(); }} /> : null}
         {selectedLoginState === "signed_in" ? <NativeButton title={translate("relay.refreshResources")} symbol="refresh" compact busy={pendingAction === "refresh"} disabled={controlsBusy && pendingAction !== "refresh"} onPress={() => { void refreshSelected(); }} /> : null}
-        {selectedLoginState === "signed_in" ? <NativeButton title={translate("relay.groupManager")} compact disabled={controlsBusy || !native.showGroupManager} onPress={() => { void openGroupManager(); }} /> : null}
+        {selectedLoginState === "signed_in" ? <NativeButton title={translate("relay.groupManager")} titleWidth="tight" compact disabled={controlsBusy || !native.showGroupManager} onPress={() => { void openGroupManager(); }} /> : null}
       </View>
     </View> : null}
     {removalDialogHosted ? null : removalDialog}

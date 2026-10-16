@@ -1972,6 +1972,146 @@ class ProvidersModelsDomainTests(unittest.TestCase):
         )
         self.assertEqual(1, len([path for path in set(attempts) if attempts.count(path) == 2]))
 
+    def test_model_deep_test_never_calls_an_unreachable_route_diluted(self) -> None:
+        """Zero usable surfaces is a reachability finding, never a dilution one.
+
+        The scan never ran, because there was no endpoint to measure. Whatever
+        the suite would have said, this probe has no evidence about what
+        answers behind the name, and the row must not print a word about it.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(deep_test_config(), encoding="utf-8")
+            domain = ProvidersModelsDomain(path)
+
+            def surface_probe(*, surface: str, **_kwargs: object) -> dict[str, object]:
+                return {"surface": surface, "available": False, "status": "auth_error"}
+
+            with mock.patch.object(ProvidersModelsDomain, "_surface_probe", side_effect=surface_probe), degradation_engine(
+                decision={"verdict": "failed", "score": 0.0, "brands": ["Amazon Q"], "summary": "x"}
+            ) as staged:
+                result = domain.probe({"provider_id": "primary", "model_id": "00000071"})
+
+        self.assertEqual([], staged.call_args_list)
+        self.assertEqual(0, sum(1 for s in result["surfaces"] if s["available"]))
+        self.assertEqual("error", result["degradation"]["status"])
+        self.assertNotEqual("mismatch", result["degradation"]["status"])
+        # An unmeasured route carries no verdict and no brand at all, so no
+        # surface can turn it into "疑似注水".
+        self.assertEqual("", result["degradation"]["verdict"])
+        self.assertIsNone(result["degradation"]["label"])
+
+    def test_a_route_with_no_probe_transport_never_reports_a_brand(self) -> None:
+        """The protocol with no probe surface still may not invent a verdict.
+
+        A Gemini route carries no surface precondition, so the plan's surface is
+        empty and the other surfaces' statuses say nothing about that protocol.
+        The run itself is still unmeasured - the address never answered - so no
+        brand may be reported for it, however the suite's own zero score reads.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(deep_test_config(model_name="gemini-3.8-flash"), encoding="utf-8")
+            domain = ProvidersModelsDomain(path)
+
+            def run_quick(**_kwargs: object) -> dict[str, object]:
+                return {"verdict": "failed", "score": 0.0, "brands": ["Amazon Q"], "summary": "x"}
+
+            with mock.patch.object(veridrop, "engine", return_value={"name": "Veridrop", "available": True, "revision": "t"}), mock.patch.object(
+                veridrop, "run_quick", side_effect=run_quick
+            ) as staged:
+                finding = domain._degradation_probe(
+                    plan={"includes_degradation": True, "target": "gemini-3.8-flash", "protocol": "gemini", "surface": ""},
+                    api_base="https://example.test/v1",
+                    credential="replace-me-secret",
+                    model_name="gemini-3.8-flash",
+                    surface_status="network_error",
+                )
+
+        self.assertEqual([], staged.call_args_list)
+        self.assertEqual("unreachable", finding["status"])
+        self.assertNotEqual("mismatch", finding["status"])
+        self.assertIsNone(finding["label"])
+        self.assertEqual("", finding["verdict"])
+        self.assertIn("No surface answered", finding["detail"])
+
+    def test_a_reachable_route_without_a_probe_surface_is_still_scanned(self) -> None:
+        """The Gemini protocol has no gate, and gating it would drop its check.
+
+        Its plan carries no surface because this app's probe matrix has none to
+        require, so the scan is decided by what the address actually answered.
+        A route that answered anywhere is measured; only a route that answered
+        nowhere is left unscanned.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(deep_test_config(model_name="gemini-3.8-flash"), encoding="utf-8")
+            domain = ProvidersModelsDomain(path)
+
+            def surface_probe(*, surface: str, **_kwargs: object) -> dict[str, object]:
+                answered = surface == "openai/chat"
+                return {"surface": surface, "available": answered, "status": "ok" if answered else "network_error"}
+
+            def run_quick(**_kwargs: object) -> dict[str, object]:
+                return {"verdict": "failed", "score": 31.0, "brands": ["Amazon Q"], "summary": "x"}
+
+            with mock.patch.object(ProvidersModelsDomain, "_surface_probe", side_effect=surface_probe), mock.patch.object(
+                veridrop, "engine", return_value={"name": "Veridrop", "available": True, "revision": "t"}
+            ), mock.patch.object(veridrop, "run_quick", side_effect=run_quick) as staged:
+                result = domain.probe({"provider_id": "primary", "model_id": "00000071"})
+
+        # Something answered, so the scan ran and its real finding survives.
+        self.assertEqual(1, len(staged.call_args_list))
+        self.assertEqual("gemini", staged.call_args.kwargs["protocol"])
+        self.assertEqual("mismatch", result["degradation"]["status"])
+        self.assertEqual("Amazon Q", result["degradation"]["label"])
+
+    def test_a_run_upstream_refused_is_not_a_dilution_finding(self) -> None:
+        """A blocked run scored 0 by the suite must not read as a diluted route.
+
+        Veridrop reports its own run-level error when upstream has no balance or
+        no channel for the model, and its zero score belongs to that invalid run
+        rather than to the route. Scoring it as a dilution verdict is how an
+        unrunnable account produced a "diluted" finding for models that were
+        never measured.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(deep_test_config(model_name="gpt-5.5"), encoding="utf-8")
+            domain = ProvidersModelsDomain(path)
+            blocked = {
+                "verdict": "failed",
+                "score": 0.0,
+                "run_error": "检测无效: 上游返回余额不足或用量限制错误。",
+                "brands": ["Amazon Q"],
+                "summary": "检测无效",
+            }
+
+            def run_quick(**_kwargs: object) -> dict[str, object]:
+                return dict(blocked)
+
+            with mock.patch.object(veridrop, "engine", return_value={"name": "Veridrop", "available": True, "revision": "t"}), mock.patch.object(
+                veridrop, "run_quick", side_effect=run_quick
+            ):
+                finding = domain._degradation_probe(
+                    plan={"includes_degradation": True, "target": "gpt-5.5", "protocol": "openai", "surface": "openai/chat"},
+                    api_base="https://example.test/v1",
+                    credential="replace-me-secret",
+                    model_name="gpt-5.5",
+                    surface_status="ok",
+                )
+
+        self.assertEqual("unavailable", finding["status"])
+        self.assertNotEqual("mismatch", finding["status"])
+        self.assertEqual("", finding["verdict"])
+        self.assertIsNone(finding["score"])
+        self.assertIsNone(finding["label"])
+        self.assertIn("余额不足", finding["detail"])
+
     def test_model_deep_test_skips_the_scan_when_the_surface_never_answered(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.yaml"

@@ -51,22 +51,31 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertNotIn("open -n", installer)
         self.assertNotIn('tell application id "young.router.app" to quit', installer)
         self.assertIn("stop_installed_app", installer)
-        self.assertIn("pids_are_alive()", installer)
-        self.assertIn('kill -TERM "$pid"', installer)
-        self.assertIn('while pids_are_alive "$bundle_pids"; do', installer)
-        self.assertIn('done <<<"$bundle_pids"', installer)
+        # One stop policy for the whole repository: the installer hands the pids
+        # it captured to the same helper a restart calls, and keeps no signal
+        # ladder of its own -- a polite pass before the kill only postponed the
+        # replacement, because the listener is free the moment those processes
+        # die.
+        self.assertIn('"$APP_PROCESSES" stop $bundle_pids', installer)
+        self.assertIn("scripts/app-processes.sh", installer)
+        self.assertNotIn("pids_are_alive", installer)
+        self.assertNotIn("pid_is_alive", installer)
+        self.assertNotIn('kill -TERM "$pid"', installer)
         self.assertIn('line ~ /\\/Young ?Router[^\\/]*\\.app\\/Contents\\/MacOS\\/YoungRouter$/', installer)
         self.assertIn('*/Young*Router*.app/Contents/MacOS/YoungRouter', installer)
         self.assertIn('START_TIMEOUT_SECONDS="${YOUNG_ROUTER_START_TIMEOUT_SECONDS:-70}"', installer)
         self.assertIn('STOP_TIMEOUT_SECONDS="${YOUNG_ROUTER_STOP_TIMEOUT_SECONDS:-20}"', installer)
-        self.assertIn('STOP_GRACE_POLLS=20', installer)
+        self.assertNotIn("STOP_GRACE_POLLS", installer)
+        self.assertNotIn("STOP_DRAIN_SECONDS", installer)
         self.assertIn('REQUIRED_HEALTH_CHECKS=3', installer)
         self.assertIn('LAUNCH_RETRY_SECONDS=1', installer)
         self.assertNotIn("preserved_proxy_port", installer)
         self.assertNotIn("refuse_running_install", installer)
         build_replacement = installer.index('YOUNG_ROUTER_MACOS_OUTPUT="$STAGE_ROOT/Young Router.app"')
-        self.assertIn('kill -KILL "$pid"', installer)
-        self.assertLess(installer.index('kill -TERM "$pid"'), installer.index('kill -KILL "$pid"'))
+        # The kill itself lives in the helper the two entry points share, so the
+        # installer only has to prove it delegates; the replacement it starts is
+        # the one named above.
+        self.assertIn('"$APP_PROCESSES" stop $bundle_pids', installer)
         self.assertIn('start_installed_app "$OLD_PIDS"', installer)
         self.assertIn('curl --fail --silent --show-error --max-time 1', installer)
         self.assertIn('health/liveliness', installer)
@@ -184,7 +193,7 @@ class ReactNativeReleaseTests(unittest.TestCase):
         )
 
         self.assertLess(installer_update, installer.index("node scripts/bootstrap-rnmacos-085.mjs"))
-        self.assertLess(installer_update, installer.index("build-macos --project-path macos"))
+        self.assertLess(installer_update, installer.index('-scheme YoungRouter-macOS'))
 
         windows_update = windows.index('scripts\\update_litellm.py')
         self.assertLess(windows_update, windows.index("pnpm run build"))
@@ -288,7 +297,7 @@ class ReactNativeReleaseTests(unittest.TestCase):
         )
         self.assertLess(
             script.index('pod install --project-directory="$APP_ROOT/macos"'),
-            script.index('node "$RNMACOS_CLI" build-macos'),
+            script.index('-scheme YoungRouter-macOS'),
         )
         for assignment in (
             "RCT_USE_RN_DEP=0",
@@ -297,7 +306,17 @@ class ReactNativeReleaseTests(unittest.TestCase):
             "RCT_HERMES_V1_ENABLED=1",
         ):
             self.assertIn(assignment, script)
-        self.assertIn("vendor/react-native-macos-0.85/packages/react-native/cli.js", script)
+        # The native build passes the architecture as an xcodebuild argument.
+        # The vendored CLI only forwards `-configuration` and `-scheme`, and the
+        # Pods project pins ``ARCHS = "$(ARCHS_STANDARD_64_BIT)"`` in its own
+        # settings -- a value an environment variable cannot override, only a
+        # command-line argument can.  Without it every pod compiles an x86_64
+        # half the installed bundle never contains.
+        self.assertIn('ARCHS="$ARCH"', script)
+        # The argument belongs to the build invocation, not to the settings
+        # probe above it, so anchor on the build's own command line.
+        build_invocation = script.index("xcodebuild -workspace \"$APP_ROOT/macos/YoungRouter.xcworkspace\" \\")
+        self.assertLess(build_invocation, script.index('ARCHS="$ARCH"', build_invocation))
         self.assertIn("young_router", script)
         self.assertIn("sitecustomize.py", script)
         self.assertIn("VisionOCR.swift", script)
@@ -330,6 +349,12 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn("PYTHONDONTWRITEBYTECODE=0", script)
         self.assertIn("from litellm import run_server", script)
         self.assertIn("The bundled Core startup bytecode could not be generated.", script)
+        # The startup smoke proves the bytecode cache the shipped app reads:
+        # the compiled modules land in the cache the smoke names, and the signed
+        # bundle is asserted to have picked up no ``__pycache__`` of its own.
+        self.assertIn('YOUNG_ROUTER_PYCACHE_DIR="$PYCACHE_SMOKE_DIR"', script)
+        self.assertIn('find "$PYCACHE_SMOKE_DIR" -name \'__init__.cpython-312.pyc\' -path \'*litellm*\'', script)
+        self.assertIn("wrote bytecode into the signed Core bundle", script)
         final_cache_cleanup = script.rindex('find "$CORE"')
         self.assertGreater(final_cache_cleanup, script.index('copy_tree "$CORE" "$PORTABLE_SMOKE"'))
         self.assertLess(final_cache_cleanup, script.index('codesign --force --deep --sign - "$APP"'))
@@ -461,7 +486,7 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertNotIn('"${NODE_SOURCE_ARGS[@]}" &', script)
         # STAGING_PIDS is appended once per staging job before it is ever
         # expanded, so it cannot be empty at the point of use.
-        self.assertEqual(4, script.count('STAGING_PIDS+=("$!")'))
+        self.assertEqual(5, script.count('STAGING_PIDS+=("$!")'))
 
     def test_staging_caches_are_persistent_and_gated_by_the_staging_scripts(self) -> None:
 
@@ -479,7 +504,7 @@ class ReactNativeReleaseTests(unittest.TestCase):
 
         # Every staged integration resolves into the cache, and none of them
         # still points at the throwaway per-build tree.
-        for artifact in ("pi-web-access", "workbuddy-connect", "veridrop", "dsh-vision-router"):
+        for artifact in ("pi-web-access", "workbuddy-connect", "opencode2dsh", "veridrop", "dsh-vision-router"):
             self.assertIn(f'"$STAGING_CACHE/{artifact}"', macos)
             self.assertIn(f'Join-Path $StagingCache "{artifact}"', windows)
         self.assertNotIn('WORKBUDDY_CONNECT_WORK="$RUNTIME_WORK/', macos)
@@ -758,7 +783,7 @@ class ReactNativeReleaseTests(unittest.TestCase):
         bootstrap = (ROOT / "rn/scripts/bootstrap-rnmacos-085.mjs").read_text(encoding="utf-8")
 
         self.assertIn("generateFBReactNativeSpecIOS.js", bootstrap)
-        self.assertIn("generateFBReactNativeSpec(result.packageDirectory)", bootstrap)
+        self.assertIn("generateFBReactNativeSpec(result.packageDirectory, manifest.commit)", bootstrap)
         self.assertIn("FBReactNativeSpecJSI.h", bootstrap)
         # Only the codegen half may run: ``prepack`` also copies the monorepo
         # README over the package's own, which modifies a tracked file and makes
@@ -769,6 +794,37 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn("run(process.execPath, ['-e', script], packageDirectory)", bootstrap)
         # The checkout must still verify as the pinned commit after generating.
         self.assertGreaterEqual(bootstrap.count("verifyVendor()"), 3, "verify after generating too")
+        # The header is about 400 KB and a dozen pods include it, so its mtime
+        # moving is what makes a repeat build recompile all of them.  Its only
+        # input is the vendored package, which `verifyVendor` has just proven is
+        # the pinned commit, so a header stamped with that same commit is left
+        # alone; a refreshed vendor or a missing header regenerates it.
+        guard = bootstrap.index("if (existsSync(generated) && existsSync(stamp)")
+        generating = bootstrap.index("run(process.execPath, ['-e', script], packageDirectory)")
+        self.assertLess(guard, generating, "an existing header must short-circuit the generator")
+        # The stamp records the commit the header came from, which is what makes
+        # a vendor refresh regenerate instead of reusing a stale header.
+        self.assertIn("writeFileSync(stamp, `${pinnedCommit}\\n`, 'utf8')", bootstrap)
+
+    def test_the_macos_native_build_passes_the_architecture_as_an_argument(self) -> None:
+        # The Pods project pins ``ARCHS = "$(ARCHS_STANDARD_64_BIT)"`` in its own
+        # build settings, and a value written into a project is overridden only
+        # by a command-line argument -- an environment variable does not reach
+        # it.  Without the argument xcodebuild compiles an x86_64 slice for every
+        # pod that the installed bundle never contains, which was most of a
+        # repeat build's native time.  The vendored CLI forwards only
+        # `-configuration` and `-scheme`, so the script drives xcodebuild itself.
+        script = (ROOT / "scripts/build-and-install-macos.sh").read_text(encoding="utf-8")
+
+        self.assertNotIn('node "$RNMACOS_CLI" build-macos', script)
+        self.assertIn('ARCHS="$ARCH"', script)
+        self.assertIn("ONLY_ACTIVE_ARCH=YES", script)
+        build = script.index('xcodebuild -workspace "$APP_ROOT/macos/YoungRouter.xcworkspace" \\')
+        arch_argument = script.index('ARCHS="$ARCH"', build)
+        self.assertLess(build, arch_argument, "the architecture is an argument to the build")
+        # The architecture the bundle is built for is the same one its runtime
+        # and its Vision helper are built for.
+        self.assertIn('"$ARCH-apple-macosx14.0"', script)
 
 
 if __name__ == "__main__":

@@ -3685,12 +3685,28 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   }
   const auto &viewProps = *std::static_pointer_cast<const LiteLLMAppKitTableProps>(_props);
   const NSInteger row = _tableView.clickedRow;
-  // Ordinary rows report through tableViewSelectionDidChange. AppKit refuses
-  // to select group rows, so this action exists only to report the public
-  // model groups explicitly marked as selectable. Emitting ordinary rows here
-  // as well sent two selection events for every click.
-  if (row < 0 || static_cast<size_t>(row) >= viewProps.rowKeys.size() ||
-      ![self isSelectableSpanningRow:row]) {
+  if (row < 0 || static_cast<size_t>(row) >= viewProps.rowKeys.size()) {
+    return;
+  }
+  // A selectable group row is not a native selection at all: AppKit refuses
+  // to select group rows, so this action is its only report path.
+  //
+  // An ordinary row normally reports through tableViewSelectionDidChange, and
+  // re-reporting it here would reach React twice for one click.  Clicking the
+  // row that is already selected is the exception: that click changes no
+  // native selection, so the notification never fires and the shared view
+  // never learns the row was pressed.  A list whose panes are driven by more
+  // than the highlighted row — the provider list beside the model list, whose
+  // row click also returns the detail pane from a model to its provider —
+  // would then keep showing the pane the previous click opened.  Report the
+  // row only in that case, where the notification is not already coming.
+  if (_tableView.selectedRow == row && row == SegmentIndex(viewProps.rowKeys, viewProps.selectedKey)) {
+    LiteLLMAppKitTableEventEmitter::OnSelectionChange event{
+        viewProps.rowKeys[static_cast<size_t>(row)], static_cast<int>(row)};
+    std::static_pointer_cast<const LiteLLMAppKitTableEventEmitter>(_eventEmitter)->onSelectionChange(event);
+    return;
+  }
+  if (![self isSelectableSpanningRow:row]) {
     return;
   }
   LiteLLMAppKitTableEventEmitter::OnSelectionChange event{

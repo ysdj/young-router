@@ -219,7 +219,8 @@ export type ProviderAuthKind =
   | "openai_login"
   | "claude_login"
   | "workbuddy_login"
-  | "workbuddy_ai_login";
+  | "workbuddy_ai_login"
+  | "opencode2dsh_login";
 
 export type ProviderAuthStatus = "signed_out" | "authorizing" | "signed_in" | "expired" | "error" | "unsupported";
 
@@ -382,8 +383,12 @@ export interface LogView extends LogSummary {
   records: Array<Record<string, unknown> | string>;
   /** The online-usage tab's selectable relays. Present only on that tab. */
   sources?: LogSource[];
-  /** The relay whose rows this view carries; "" reads every configured relay. */
+  /** The relay whose rows this view carries; "" means none has been chosen. */
   source_id?: string;
+  /** Why the chosen relay answered no rows, when it answered none. */
+  reason?: string;
+  /** Rows the relay reported beyond the page this view carries. */
+  remaining?: number;
 }
 
 export interface CoreSnapshot {

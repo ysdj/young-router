@@ -543,5 +543,78 @@ class SiteCustomizeTests(unittest.TestCase):
             )
 
 
+
+    def test_the_bytecode_cache_is_written_under_the_app_state_root(self) -> None:
+        # The shipped bundle carries no ``.pyc`` files -- the build strips them
+        # for the signed resource contract -- so every launch reparses all of
+        # LiteLLM, which is the bulk of the proxy's cold start.  The interpreter
+        # writes its compiled bytecode under the app's own writable state root
+        # instead, and it must do that even on the production host, where the
+        # only runtime-root hint in the environment is HOME: the host passes the
+        # root through the private ``--metadata`` path, not the environment.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir)
+            result = self.run_probe(
+                runtime=home,
+                template=home,
+                pythonpath_extra=[],
+                code=textwrap.dedent(
+                    """
+                    import sys
+                    print(sys.pycache_prefix)
+                    print(sys.dont_write_bytecode)
+                    """
+                ),
+                extra_env={
+                    "HOME": str(home),
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                },
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        prefix, dont_write = result.stdout.strip().splitlines()
+        self.assertEqual(prefix, str(home / ".young-router" / "pycache"))
+        # The launcher exports PYTHONDONTWRITEBYTECODE so ``__pycache__`` never
+        # reaches the signed bundle.  CPython reads that variable into the flag
+        # before sitecustomize runs, so clearing the variable is not enough: the
+        # flag itself has to be turned off or the cache is never written.
+        self.assertEqual(dont_write, "False")
+
+    def test_an_explicit_cache_dir_wins_over_the_state_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            chosen = temp / "chosen-cache"
+            result = self.run_probe(
+                runtime=temp,
+                template=temp,
+                pythonpath_extra=[],
+                code="import sys; print(sys.pycache_prefix)",
+                extra_env={
+                    "HOME": str(temp),
+                    "YOUNG_ROUTER_PYCACHE_DIR": str(chosen),
+                },
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), str(chosen))
+
+    def test_the_cache_can_be_disabled_for_a_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            result = self.run_probe(
+                runtime=temp,
+                template=temp,
+                pythonpath_extra=[],
+                code="import sys; print(sys.pycache_prefix)",
+                extra_env={
+                    "HOME": str(temp),
+                    "YOUNG_ROUTER_DISABLE_PYCACHE": "1",
+                },
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "None")
+
+
 if __name__ == "__main__":
     unittest.main()

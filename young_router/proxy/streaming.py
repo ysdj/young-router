@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 
 from . import codex_fast_tier as _codex_fast_tier_module
+from . import codex_contract as _codex_contract_module
 from . import image_generation as _image_generation_module
 from . import image_inputs as _image_inputs_module
 from . import responses_request as _responses_request_module
@@ -1389,14 +1390,74 @@ def _stream_chunk_text_fragment(chunk: Any) -> tuple[str, bool]:
     return "", False
 
 
+def _local_shutdown_completed_response_event(
+    request_data: dict,
+    completion_state: Any,
+) -> Optional[_JSONStreamEvent]:
+    """Close a stream this worker itself cut, as a completed turn.
+
+    A replacement worker is stopped while it is draining, so a turn that is
+    still being written can lose its upstream mid-answer.  The upstream said
+    nothing, so there is no failure to report and nothing for the user to
+    answer: the only honest outcome is the part of the answer that already
+    arrived.  Whatever the completion state has recorded is emitted as the
+    turn's output, which is how the client keeps the conversation instead of
+    rendering ``upstream_route_failure`` and asking the user to send it again.
+
+    ``None`` means nothing usable had been produced yet, and the caller falls
+    back to ending the stream quietly rather than inventing an empty answer.
+    """
+
+    if completion_state is None:
+        return None
+    try:
+        completed_response = completion_state.completed_payload(request_data)
+    except Exception:  # pragma: no cover - a partial state that cannot be read
+        return None
+    if not isinstance(completed_response, dict):
+        return None
+    output = completed_response.get("output")
+    if not isinstance(output, list) or not output:
+        if not str(completed_response.get("output_text") or "").strip():
+            return None
+    completed_event: dict[str, Any] = {
+        "type": "response.completed",
+        "response": completed_response,
+    }
+    model = (
+        _responses_execution_module._request_model_group(request_data)
+        or request_data.get("model")
+    )
+    if isinstance(model, str) and model:
+        completed_event["model"] = model
+    _trace_module._request_route_trace(
+        "responses_stream_local_shutdown_completed_compat",
+        request_data,
+        output_items=len(output) if isinstance(output, list) else 0,
+    )
+    return _json_stream_event(completed_event)
+
+
 def _synthesized_failed_response_event(
     request_data: dict,
     exception: Exception,
+    completion_state: Any = None,
 ) -> _JSONStreamEvent:
     if _routing_module._is_local_shutdown_exception(exception):
-        # A synthetic ``response.failed`` is terminal to Pi/Codex and turns a
-        # worker teardown into a user-visible retry tip. The connection is
-        # already being closed by Uvicorn, so end the stream quietly.
+        # This worker truncated the stream because it is the one being replaced,
+        # not because the upstream refused.  A synthetic ``response.failed`` is
+        # terminal to Pi/Codex and turns that teardown into a user-visible
+        # ``upstream_route_failure`` the user has to answer by hand, so the
+        # stream is closed the way a completed turn is: whatever the model had
+        # already produced is delivered as the turn's output and the client
+        # keeps the conversation instead of rendering a retry tip.
+        completed = _local_shutdown_completed_response_event(request_data, completion_state)
+        if completed is not None:
+            return completed
+        # Nothing had been produced yet, so there is no partial turn to keep and
+        # no honest completion to report.  The connection is already being
+        # closed by Uvicorn, so end the stream quietly rather than naming a
+        # failure the user cannot act on.
         raise asyncio.CancelledError
     model = _responses_execution_module._request_model_group(request_data) or request_data.get("model") or "unknown"
     is_structured_compaction = (
@@ -2647,16 +2708,13 @@ def _build_streaming_error_fallback_payload(
         payload.setdefault("call_type", "aresponses")
     elif method_name == "anthropic_messages":
         payload.setdefault("call_type", "anthropic_messages")
-    descendant_cleanup_payload = (
-        _responses_request_module._with_codex_descendant_cleanup_instruction(payload)
-    )
-    if descendant_cleanup_payload is not None:
-        payload = descendant_cleanup_payload
-    commentary_discipline_payload = (
-        _responses_request_module._with_codex_commentary_discipline_instruction(payload)
-    )
-    if commentary_discipline_payload is not None:
-        payload = commentary_discipline_payload
+    # This fallback payload does not pass through the ordinary deployment
+    # pre-call hook, so the Codex contract steps run here too.  They set the
+    # lifecycle state and the tool choice; nothing is written into the prompt.
+    for contract_step in _codex_contract_module.CODEX_CONTRACT_REQUEST_STEPS:
+        contract_payload = contract_step(payload)
+        if contract_payload is not None:
+            payload = contract_payload
     compaction_payload = _responses_request_module._with_codex_compaction_controls(payload)
     if compaction_payload is not None:
         payload = compaction_payload
@@ -4236,6 +4294,38 @@ async def _yield_guarded_original_stream(
             request_data,
         )
 
+    def undeclared_tool_call_name(chunk: Any) -> Optional[str]:
+        """The name of a call naming a tool this request never declared.
+
+        The declared set is carried by the request itself, so a call outside it
+        is a protocol error rather than a capability gap: the client cannot
+        execute the name, and letting it through ends the turn on a call that
+        nothing will ever answer.
+        """
+
+        if not _codex_contract_module.declared_tool_names(request_data):
+            return None
+        dumped = _stream_chunk_dump(chunk)
+        if not isinstance(dumped, dict):
+            return None
+        chunk_type = _stream_chunk_type(dumped)
+        item: Any = None
+        if chunk_type in {"response.output_item.added", "response.output_item.done"}:
+            item = dumped.get("item")
+        elif chunk_type == "response.completed":
+            return None
+        elif isinstance(dumped.get("item"), dict):
+            item = dumped.get("item")
+        if not isinstance(item, dict) or item.get("type") != "function_call":
+            return None
+        name = _codex_contract_module._tool_definition_name(item)
+        if name is None or not _codex_contract_module.is_undeclared_tool_call(
+            request_data,
+            name,
+        ):
+            return None
+        return name
+
     def bridge_payload_for_chunk(chunk: Any) -> Optional[dict[str, Any]]:
         if not should_consume_bridge_calls():
             return None
@@ -5098,6 +5188,30 @@ async def _yield_guarded_original_stream(
             )
         if should_suppress_internal_bridge_chunk(chunk):
             continue
+        undeclared_name = undeclared_tool_call_name(chunk)
+        if undeclared_name is not None:
+            _trace_module._request_route_trace(
+                "codex_undeclared_tool_call_rejected", request_data,
+                include_route_identity=True,
+                tool_name=undeclared_name,
+                declared_tool_names=sorted(
+                    _codex_contract_module.declared_tool_names(request_data)
+                ),
+            )
+            terminal = _json_stream_event(
+                _codex_contract_module.undeclared_tool_response_event(
+                    undeclared_name,
+                    _stream_output_item_key(
+                        _stream_chunk_dump(chunk).get("item")
+                        if isinstance(_stream_chunk_dump(chunk), dict)
+                        else None
+                    ),
+                    request_data,
+                )
+            )
+            yield terminal
+            await _close_async_iterator_safely(response)
+            return
         yield deliver_client_chunk(chunk)
 
     try:
@@ -5251,10 +5365,30 @@ async def _yield_guarded_original_stream(
             if should_suppress_internal_bridge_chunk(chunk):
                 continue
             yield deliver_client_chunk(chunk)
-    except Exception as exc:
+    except (Exception, asyncio.CancelledError) as exc:
+        if isinstance(exc, asyncio.CancelledError) and not _routing_module._is_local_shutdown_exception(exc):
+            # A cancellation is the runtime taking this task down for its own
+            # reasons, so it stays cooperative and is never read as a finished
+            # turn.  Only a cancellation that belongs to this worker's own
+            # app-exit teardown is turned into a terminal below.
+            raise
         if _routing_module._is_local_shutdown_exception(exc):
-            # Do not turn the local worker teardown into a client-visible
-            # response.failed event after partial output was delivered.
+            # This worker is the one being replaced, so the failure says nothing
+            # about any upstream and there is no route to quarantine.  Ending
+            # the stream with no terminal is what the client renders as
+            # ``upstream_route_failure``, which interrupts a turn the user was
+            # already reading; the output that did arrive is delivered as a
+            # completed response so the conversation continues instead.
+            terminal_items = terminal_completed_output_items()
+            synthetic_completed = _synthesized_completed_response_event(
+                terminal_items,
+                completion_state.created_response,
+                completion_state.model,
+                fallback_text=synthesized_text(),
+            )
+            if synthetic_completed is not None:
+                remember(synthetic_completed)
+                yield synthetic_completed
             return
         if saw_image_generation_activity:
             completed = completed_image_generation_terminal_event(
@@ -5346,6 +5480,24 @@ async def _yield_guarded_original_stream(
                 request_data=request_data,
             )
             if _routing_module._is_local_shutdown_exception(incomplete_exception):
+                # This worker is being replaced, so the stream ended because the
+                # process did -- not because any upstream refused.  Ending with
+                # no terminal at all is what the client renders as
+                # ``upstream_route_failure``, interrupting a turn the user was
+                # already reading and asking them to send it again.  The answer
+                # text that did arrive is real output, so the turn is closed the
+                # way a finished one is: whatever was delivered becomes the
+                # response and the conversation continues.
+                terminal_items = terminal_completed_output_items()
+                synthetic_completed = _synthesized_completed_response_event(
+                    terminal_items,
+                    completion_state.created_response,
+                    completion_state.model,
+                    fallback_text=synthesized_text(),
+                )
+                if synthetic_completed is not None:
+                    remember(synthetic_completed)
+                    yield synthetic_completed
                 return
             if synthesize_completed_on_clean_eof_after_visible_output:
                 terminal_items = terminal_completed_output_items()

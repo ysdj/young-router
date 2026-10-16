@@ -4091,53 +4091,13 @@ def _codex_tool_choice_name(tool_choice: Any) -> Optional[str]:
     return name if isinstance(name, str) and name.strip() else None
 
 
-_CODEX_DESCENDANT_CLEANUP_ENV = "YOUNG_ROUTER_CODEX_DESCENDANT_CLEANUP"
 _MCP_AUTO_APPROVE_ENV = "YOUNG_ROUTER_MCP_AUTO_APPROVE"
-_CODEX_DESCENDANT_CLEANUP_MARKER = "<young_router_codex_descendant_cleanup>"
 _CODEX_DESCENDANT_CLEANUP_METADATA_KEY = "codex_descendant_cleanup"
 _CODEX_DESCENDANT_LIFECYCLE_TOOLS = {
     "followup_task",
     "interrupt_agent",
     "spawn_agent",
 }
-_CODEX_DESCENDANT_CLEANUP_INSTRUCTION = (
-    f"{_CODEX_DESCENDANT_CLEANUP_MARKER}\n"
-    "Every assistant response without a real tool call terminates the current "
-    "Codex turn, even when its text calls itself commentary, a progress update, "
-    "or promises future work. Never emit such a response while work remains. "
-    "Completion means the full user-requested outcome, not merely answering the "
-    "latest sentence. A correction, expression of dissatisfaction, evidence "
-    "challenge, status question, or follow-up during unfinished work adds context "
-    "or requirements unless the user clearly replaces the task. If your answer "
-    "would reveal that a promised action, implementation, screenshot, test, "
-    "verification, deployment, or other required result was not actually completed, "
-    "continue doing the work; an admission, apology, explanation, or failed "
-    "verification is not completion. Treat every future-tense commitment you make "
-    "in commentary as outstanding until later evidence establishes it, or until you "
-    "report a concrete blocker after exhausting safe in-scope alternatives. "
-    "Before any tool-free response, account for every live descendant with "
-    "list_agents, including descendants spawned by another agent in your subtree. "
-    "Use canonical agent paths: a subagent may manage only paths beneath its own path, "
-    "never a sibling or ancestor; the root agent owns the entire tree. If a descendant "
-    "still owns code, file, test, or other work required for the requested outcome, "
-    "wait for it and incorporate its result before finalizing. If required work is "
-    "stalled in an unusable descendant, take ownership or reassign that work, interrupt "
-    "the unusable descendant, and finish the work before finalizing; never drop required "
-    "work merely to clear the descendant. If the deliverable no "
-    "longer depends on a live descendant, interrupt it. Clean up unneeded descendants "
-    "deepest-first before their parents, then call list_agents again and do not "
-    "finalize while an unneeded descendant is still running. A spawn_agent, "
-    "followup_task, or interrupt_agent call invalidates every earlier list_agents "
-    "snapshot, so list the full subtree again afterwards. If a required descendant "
-    "is still active, make a real wait_agent or other work tool call in the same "
-    "response; a progress-only response would terminate the turn. A clean descendant "
-    "snapshot only accounts for descendants; it never proves the root task complete. "
-    "After obtaining one, independently compare the evidence against the full requested "
-    "outcome and every outstanding commentary commitment. If root work remains, call "
-    "a real work tool in the same response. Visible answer text alone is not evidence "
-    "that implementation work is complete.\n"
-    "</young_router_codex_descendant_cleanup>"
-)
 
 
 def _codex_message_text(item: Any) -> str:
@@ -4158,14 +4118,39 @@ def _codex_message_text(item: Any) -> str:
     return "\n".join(parts)
 
 
+_CODEX_ROOT_AGENT_MARKER = "You are `/root`, the primary agent"
+_CODEX_SUBAGENT_PATH_MARKER = "You are `/root/"
+_CODEX_GENERIC_AGENT_MARKER = (
+    "You are an agent in a team of agents collaborating to complete a task."
+)
+
+
+def _codex_agent_identity_in_text(text: str, is_root: Optional[bool]) -> Optional[bool]:
+    """Return the agent identity a block of Codex instructions declares.
+
+    The identity block is delivered either as a leading ``developer`` input
+    message or folded into the request's ``instructions`` string, depending on
+    the client's instruction layout.  Both shapes carry the same marker text,
+    so they are classified the same way: the last marker in a block wins, and
+    ``None`` means the block says nothing about the agent's identity.
+    """
+    if not text:
+        return is_root
+    markers = (
+        (text.rfind(_CODEX_ROOT_AGENT_MARKER), True),
+        (text.rfind(_CODEX_SUBAGENT_PATH_MARKER), False),
+        (text.rfind(_CODEX_GENERIC_AGENT_MARKER), False),
+    )
+    position, marker_is_root = max(markers, key=lambda marker: marker[0])
+    if position < 0:
+        return is_root
+    return marker_is_root
+
+
 def _codex_request_is_root_agent(request_kwargs: dict) -> bool:
     input_value = request_kwargs.get("input")
     if not isinstance(input_value, list):
         return False
-    root_marker = "You are `/root`, the primary agent"
-    generic_agent_marker = (
-        "You are an agent in a team of agents collaborating to complete a task."
-    )
     is_root: Optional[bool] = None
     for item in input_value:
         if (
@@ -4173,15 +4158,16 @@ def _codex_request_is_root_agent(request_kwargs: dict) -> bool:
             or str(item.get("role") or "").lower() not in {"developer", "system"}
         ):
             continue
-        text = _codex_message_text(item)
-        markers = (
-            (text.rfind(root_marker), True),
-            (text.rfind("You are `/root/"), False),
-            (text.rfind(generic_agent_marker), False),
-        )
-        position, marker_is_root = max(markers, key=lambda marker: marker[0])
-        if position >= 0:
-            is_root = marker_is_root
+        is_root = _codex_agent_identity_in_text(_codex_message_text(item), is_root)
+    if is_root is None:
+        # A resumed or continuation window replays the conversation tail without
+        # the leading identity message, but the client folds the same role block
+        # into ``instructions`` instead.  Only consulted when the input itself
+        # carries no identity, so the composed instruction string can never
+        # override a role block the request already declared.
+        instructions = request_kwargs.get("instructions")
+        if isinstance(instructions, str):
+            is_root = _codex_agent_identity_in_text(instructions, None)
     return is_root is True
 
 
@@ -4248,11 +4234,19 @@ def _codex_descendant_cleanup_runtime_state(request_kwargs: dict) -> Optional[st
     serialized order in ``input`` is not an execution-order guarantee, so a
     ``list_agents`` call from the same batch as a lifecycle mutation cannot
     release the barrier in either ordering.
+
+    Only a replay that already carries a descendant-management call can hold a
+    live descendant.  A root whose request merely declares the collaboration
+    namespace has never spawned anything, so its snapshot is not missing: there
+    is nothing to enumerate, and forcing a tool call here spends the whole
+    answer on an inventory of an empty tree.
     """
     if not _codex_request_is_root_agent(request_kwargs):
         return None
     input_value = request_kwargs.get("input")
     if not isinstance(input_value, list):
+        return None
+    if not _codex_descendant_cleanup_has_history(request_kwargs):
         return None
 
     calls: dict[str, tuple[str, bool, int]] = {}
@@ -4331,6 +4325,35 @@ def _codex_descendant_cleanup_has_history(request_kwargs: dict) -> bool:
     return False
 
 
+def _codex_replay_has_tool_free_progress_message(request_kwargs: dict) -> bool:
+    """Whether the replay already contains a progress message with no tool call.
+
+    Such a message was recorded as a completed turn outcome, so a client that
+    sends one mid-turn has already ended a turn it meant to continue.  The
+    next request is the model being asked to pick the work back up, and a
+    second tool-free response would end that one too -- which is how a long
+    investigation stops partway with its own progress sentence as the answer.
+    """
+
+    input_value = request_kwargs.get("input")
+    if not isinstance(input_value, list):
+        return False
+    saw_assistant_text = False
+    for item in input_value:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type in {"function_call", "custom_tool_call"}:
+            saw_assistant_text = False
+            continue
+        if item_type in {"function_call_output", "custom_tool_call_output"}:
+            continue
+        if str(item.get("role") or "").lower() != "assistant":
+            continue
+        saw_assistant_text = bool(_codex_message_text(item).strip())
+    return saw_assistant_text
+
+
 def _codex_declared_tool_names(request_kwargs: Optional[dict]) -> set[str]:
     names: set[str] = set()
 
@@ -4350,7 +4373,6 @@ def _codex_declared_tool_names(request_kwargs: Optional[dict]) -> set[str]:
     return names
 
 
-_CODEX_TOOL_REGISTRY_MARKER = "<young_router_codex_tool_registry>"
 _CODEX_TOOL_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _CODEX_TOOL_PATH_PATTERN = re.compile(
     r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$"
@@ -4406,194 +4428,11 @@ def _codex_declared_tool_registry(
     return direct_names, qualified_names
 
 
-def _with_codex_tool_registry_instruction(
-    request_kwargs: dict,
-) -> Optional[dict]:
-    """Tell Codex-backed models which callable tool keys exist in this request."""
-    if not _request_has_responses_shape(request_kwargs):
-        return None
-    if _request_is_codex_compaction(request_kwargs):
-        return None
-    if not _request_has_codex_client_evidence(request_kwargs):
-        return None
-    direct_names, qualified_names = _codex_declared_tool_registry(request_kwargs)
-    if not direct_names:
-        return None
-    instructions = request_kwargs.get("instructions")
-    if instructions is not None and not isinstance(instructions, str):
-        return None
-    instructions = instructions or ""
-    if _CODEX_TOOL_REGISTRY_MARKER in instructions:
-        return None
-
-    direct_text = ", ".join(f"tools.{name}" for name in direct_names)
-    qualified_text = ", ".join(qualified_names)
-    web_search_is_declared = any(
-        name.rsplit(".", 1)[-1] == "web__run"
-        for name in (*direct_names, *qualified_names)
-    )
-    unavailable_web_search_hint = (
-        " In particular, `tools.web__run` is unavailable in this request."
-        if not web_search_is_declared
-        else ""
-    )
-    note = (
-        f"{_CODEX_TOOL_REGISTRY_MARKER}\n"
-        "This request's complete callable tool registry is fixed by the tools "
-        f"declared below. The available direct keys are: {direct_text}. "
-        f"Their declared namespace paths are: {qualified_text}. "
-        "Only these keys exist on the `tools` object. Never call or invent an "
-        f"unlisted name.{unavailable_web_search_hint} Do not retry an "
-        "unlisted tool. If the required capability is absent, "
-        "say that it is unavailable or continue without it.\n"
-        f"</young_router_codex_tool_registry>"
-    )
-    modified_kwargs = request_kwargs.copy()
-    modified_kwargs["instructions"] = (
-        f"{instructions.rstrip()}\n\n{note}" if instructions.strip() else note
-    )
-    return modified_kwargs
-
-
-def _with_codex_descendant_cleanup_instruction(
-    request_kwargs: dict,
-) -> Optional[dict]:
-    """Enforce a root-agent completion barrier around nested Codex work."""
-    if not _routing_module._env_bool(_CODEX_DESCENDANT_CLEANUP_ENV, True):
-        return None
-    if not _request_has_responses_shape(request_kwargs):
-        return None
-    if not _request_has_codex_client_evidence(request_kwargs):
-        return None
-    if _request_is_codex_compaction(request_kwargs):
-        return None
-    if not {"list_agents", "interrupt_agent"}.issubset(
-        _codex_declared_tool_names(request_kwargs)
-    ):
-        return None
-
-    instructions = request_kwargs.get("instructions")
-    if instructions is not None and not isinstance(instructions, str):
-        return None
-    instructions = instructions or ""
-    modified_kwargs = request_kwargs.copy()
-    changed = False
-    if _CODEX_DESCENDANT_CLEANUP_MARKER not in instructions:
-        modified_kwargs["instructions"] = (
-            f"{instructions.rstrip()}\n\n{_CODEX_DESCENDANT_CLEANUP_INSTRUCTION}"
-            if instructions.strip()
-            else _CODEX_DESCENDANT_CLEANUP_INSTRUCTION
-        )
-        changed = True
-
-    runtime_state = _codex_descendant_cleanup_runtime_state(request_kwargs)
-    if runtime_state is not None:
-        metadata = (
-            _request_context_module._request_metadata_dict(
-                request_kwargs,
-                "litellm_metadata",
-            )
-            or {}
-        )
-        next_metadata = metadata.copy()
-        state_metadata = {"state": runtime_state, "tool_call_required": True}
-        if metadata.get(_CODEX_DESCENDANT_CLEANUP_METADATA_KEY) != state_metadata:
-            next_metadata[_CODEX_DESCENDANT_CLEANUP_METADATA_KEY] = state_metadata
-            modified_kwargs["litellm_metadata"] = next_metadata
-            changed = True
-
-        # A protocol fallback reaches this hook again after the surface
-        # adapter has deliberately relaxed a named choice that the upstream
-        # rejected.  Keep the cleanup instruction and its state metadata, but
-        # do not re-inject the rejected named choice on every lower-level
-        # pre-call hook.  The marker is request-scoped and is set only after
-        # the concrete compatibility error, so ordinary calls retain the
-        # strict cleanup barrier below.
-        barrier_required = runtime_state in {"active_descendants", "snapshot_invalidated"}
-        if runtime_state == "snapshot_missing":
-            barrier_required = _codex_descendant_cleanup_has_history(request_kwargs)
-        if (
-            barrier_required
-            and not _routing_module._protocol_fallback_relax_tool_choice(request_kwargs)
-            and _codex_tool_choice_name(request_kwargs.get("tool_choice")) is None
-        ):
-            # Snapshot recovery has one valid action. Generic ``required`` lets
-            # the model pick an unrelated tool and repeat the same turn.
-            required_tool_choice: Any = "required"
-            if runtime_state in {"snapshot_missing", "snapshot_invalidated"}:
-                required_tool_choice = {"type": "function", "name": "list_agents"}
-            if request_kwargs.get("tool_choice") != required_tool_choice:
-                modified_kwargs["tool_choice"] = required_tool_choice
-                changed = True
-
-    return modified_kwargs if changed else None
-
-
-_CODEX_COMMENTARY_DISCIPLINE_ENV = "YOUNG_ROUTER_CODEX_COMMENTARY_DISCIPLINE"
-_CODEX_COMMENTARY_DISCIPLINE_MARKER = "<young_router_codex_commentary_discipline>"
-_CODEX_COMMENTARY_DISCIPLINE_INSTRUCTION = (
-    f"{_CODEX_COMMENTARY_DISCIPLINE_MARKER}\n"
-    "Send at most one progress message per assistant response, and keep it to a "
-    "single short sentence. The client rule to announce a skill or to start with "
-    "a progress update is satisfied once per turn, never once per step, tool "
-    "call, or retry. Once the plan is stated, do not state it again: call the "
-    "tool instead of sending another message that repeats the same intent, "
-    "skill, or promise.\n"
-    f"</young_router_codex_commentary_discipline>"
-)
-
-
-def _with_codex_commentary_discipline_instruction(
-    request_kwargs: dict,
-) -> Optional[dict]:
-    """Keep a Codex client's progress updates from repeating in one response.
-
-    A relay-served Codex route can answer one client request with several
-    near-identical promissory messages ("I will ...") and no real tool call
-    between them.  The client stores every one of those messages and replays
-    them, so the model then imitates its own repetition -- the same
-    self-reinforcing shape the leaked-reasoning-wrapper filter removes from
-    message text.  This instruction is the request-side half of that guard: the
-    client's own rule (announce the skill, start with an update) is kept, but it
-    is spent once per turn rather than once per step.
-    """
-
-    if not _routing_module._env_bool(_CODEX_COMMENTARY_DISCIPLINE_ENV, True):
-        return None
-    if not _request_has_responses_shape(request_kwargs):
-        return None
-    if not _request_has_codex_client_evidence(request_kwargs):
-        return None
-    if _request_is_codex_compaction(request_kwargs):
-        return None
-    # A request that declares no tool cannot make a call instead of talking; its
-    # progress wording is the answer, not a preamble, so leave it alone.
-    if not _codex_declared_tool_names(request_kwargs):
-        return None
-
-    instructions = request_kwargs.get("instructions")
-    if instructions is not None and not isinstance(instructions, str):
-        return None
-    instructions = instructions or ""
-    if _CODEX_COMMENTARY_DISCIPLINE_MARKER in instructions:
-        return None
-
-    modified_kwargs = request_kwargs.copy()
-    modified_kwargs["instructions"] = (
-        f"{instructions.rstrip()}\n\n{_CODEX_COMMENTARY_DISCIPLINE_INSTRUCTION}"
-        if instructions.strip()
-        else _CODEX_COMMENTARY_DISCIPLINE_INSTRUCTION
-    )
-    return modified_kwargs
-
-
-# The ordered request adaptations every Codex-shaped request passes through.
+# The surface-level request adaptations shared by every Codex-shaped request.
 # The web-search bridge instructions are added ahead of these by the surfaces
-# that need them.
+# that need them, and ``young_router.proxy.codex_contract`` prepends the Codex
+# contract steps (tool registry, descendant barrier, progress-message rule).
 _CODEX_REQUEST_INSTRUCTION_STEPS = (
-    _with_codex_tool_registry_instruction,
-    _with_codex_descendant_cleanup_instruction,
-    _with_codex_commentary_discipline_instruction,
     _with_empty_tool_controls_removed,
     _with_codex_compaction_controls,
     _with_responses_native_extra_body,

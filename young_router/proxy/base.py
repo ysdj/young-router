@@ -19,19 +19,17 @@ import threading
 import time
 from urllib.parse import urlparse
 
-# Windows has no ``fcntl``: the advisory lock it guards is a cooperative one
-# between this app's own processes, and the platform without it already runs a
-# single Core launcher.  Each module that locks takes the name this way rather
-# than through this module, because ``state.py`` is imported by the launcher,
-# which must not load the workers' runtime to reach a name like this one.
+# ``state.py`` takes this name from here, and Windows has no ``fcntl``: the
+# advisory lock it guards is a cooperative one between this app's own
+# processes, and the platform without it already runs a single Core launcher.
 try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows does not provide POSIX flock.
     fcntl = None  # type: ignore[assignment]
 
 from .. import browser_identity as _browser_identity
-from . import launcher_settings as _launcher_settings
-from ..lifecycle import proxy_drain_grace_seconds
+from ..lifecycle import app_quit_grace_seconds
+from .. import lifecycle as _proxy_lifecycle_module
 from ..values import int_or_none as _int_or_none
 from typing import Any, AsyncIterator, Dict, List, Optional, Union
 import litellm
@@ -68,7 +66,9 @@ _STREAM_KEEPALIVE_INTERVAL_SECONDS_ENV = (
 )
 _STREAM_KEEPALIVE_DEFAULT_INTERVAL_SECONDS = 15.0
 _SESSION_DEPLOYMENT_AFFINITY_ENV = "YOUNG_ROUTER_SESSION_DEPLOYMENT_AFFINITY"
-_SESSION_DEPLOYMENT_AFFINITY_FILE_ENV = _launcher_settings._SESSION_DEPLOYMENT_AFFINITY_FILE_ENV
+_SESSION_DEPLOYMENT_AFFINITY_FILE_ENV = (
+    "YOUNG_ROUTER_SESSION_DEPLOYMENT_AFFINITY_FILE"
+)
 _SESSION_DEPLOYMENT_AFFINITY_MAX_ENTRIES = 512
 _SESSION_DEPLOYMENT_AFFINITY_TTL_SECONDS = 7 * 24 * 3600.0
 _STREAM_START_TIMEOUT_SECONDS_ENV = "YOUNG_ROUTER_STREAM_START_TIMEOUT_SECONDS"
@@ -81,13 +81,157 @@ _HEAVY_REPLAY_STREAM_START_THRESHOLD_BYTES_ENV = (
     "YOUNG_ROUTER_HEAVY_REPLAY_STREAM_START_THRESHOLD_BYTES"
 )
 _HEAVY_REPLAY_STREAM_START_DEFAULT_THRESHOLD_BYTES = 1024.0 * 1024.0
-_WEBSOCKET_MAX_FRAME_BYTES_ENV = _launcher_settings._WEBSOCKET_MAX_FRAME_BYTES_ENV
-_WEBSOCKET_MAX_FRAME_DEFAULT_BYTES = _launcher_settings._WEBSOCKET_MAX_FRAME_DEFAULT_BYTES
-_websocket_max_frame_bytes = _launcher_settings._websocket_max_frame_bytes
+_WEBSOCKET_MAX_FRAME_BYTES_ENV = "YOUNG_ROUTER_WEBSOCKET_MAX_FRAME_BYTES"
+_WEBSOCKET_MAX_FRAME_DEFAULT_BYTES = 64.0 * 1024.0 * 1024.0
 _WEBSOCKET_FRAME_LIMIT_PATCH_ATTR = "_young_router_websocket_frame_limit_patch"
 
 
+def _websocket_max_frame_bytes() -> int:
+    """Maximum inbound WebSocket frame size for the managed proxy.
+
+    Codex sends each Responses turn request -- including the immutable replay
+    prefix with its signed image bytes -- as one text frame.  uvicorn's default
+    16 MiB limit closes such connections with code 1009 before the request
+    reaches the pipeline, which Codex reports as ``websocket closed by server
+    before response.completed`` followed by its reconnect ladder.
+    """
+
+    import os
+
+    raw = os.getenv(_WEBSOCKET_MAX_FRAME_BYTES_ENV, "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = 0
+        if parsed > 0:
+            return parsed
+    return int(_WEBSOCKET_MAX_FRAME_DEFAULT_BYTES)
+
+
 _UVICORN_SHUTDOWN_PATCH_ATTR = "_young_router_shutdown_patch"
+
+# ``asyncio.wait_for`` never runs its coroutine when the timeout is zero, so the
+# patched timeout must stay above it for this patch to run at all.  The real
+# quit grace is zero; this is only the floor that keeps the coroutine alive.
+_MIN_SHUTDOWN_PATCH_GRACE_SECONDS = 0.001
+
+# LiteLLM drains its own in-flight requests inside the lifespan shutdown, which
+# runs before uvicorn ever reaches ``_wait_tasks_to_complete`` below.  That is a
+# second drain with its own fixed default of thirty seconds, so a quit with one
+# turn still streaming spent that whole window there regardless of what the
+# app-exit grace here says.  The bound is LiteLLM's own environment variable,
+# re-read on every drain, so the short grace has to be pushed into it.
+_LITELLM_DRAIN_TIMEOUT_ENV = "GRACEFUL_SHUTDOWN_TIMEOUT"
+
+# How long a marked app-exit worker stays alive so an open stream can write the
+# terminal that ends its turn.  This is not a wait for the answer: it is the
+# window in which the streaming task observes the shutdown marker and flushes
+# the one event the client needs before the process goes away.
+_APP_EXIT_TERMINAL_GRACE_SECONDS = 2.0
+
+
+async def _await_open_stream_terminals(server: Any) -> None:
+    """Give an open stream the moment it needs to write the terminal of its turn.
+
+    The response coroutine that owns a stream is not the thing being awaited
+    here: after its body ends it sits in Starlette's disconnect listener, which
+    never finishes while the client is still connected.  What matters is that
+    the streaming half runs once with the shutdown marker visible, so it takes
+    the marked branch that closes the turn as completed instead of falling
+    through to a bare socket close.  One scheduler turn is enough for that, and
+    the deadline only bounds the case where the loop is starved.
+    """
+
+    deadline = time.monotonic() + _APP_EXIT_TERMINAL_GRACE_SECONDS
+    while time.monotonic() < deadline:
+        await asyncio.sleep(0)
+        try:
+            pending = [
+                task for task in list(server.server_state.tasks) if not task.done()
+            ]
+        except Exception:  # pragma: no cover - uvicorn internals differ
+            return
+        if not pending:
+            return
+        break
+
+
+async def _close_connections_after_terminals(server: Any) -> None:
+    """Close every remaining connection once the terminals have been written.
+
+    Uvicorn closes connections itself a few lines later, so this only has to
+    make that close happen after the flush above rather than before it.
+    """
+
+    try:
+        connections = list(server.server_state.connections)
+    except Exception:  # pragma: no cover - uvicorn internals differ
+        return
+    for connection in connections:
+        try:
+            connection.shutdown()
+        except Exception:  # pragma: no cover - a connection that is already gone
+            continue
+    await asyncio.sleep(0.05)
+
+
+def _bind_litellm_drain_to_app_quit_grace() -> None:
+    """Point LiteLLM's own lifespan drain at the app-exit grace.
+
+    A deliberate proxy replacement keeps LiteLLM's default because its accepted
+    turns still have a client waiting on them; only a worker that the Core has
+    marked as an app exit is shortened, so a settings apply and a recovery
+    teardown keep the drain that was written for them.
+    """
+
+    if _proxy_lifecycle_module.app_exit_in_progress():
+        os.environ[_LITELLM_DRAIN_TIMEOUT_ENV] = repr(float(app_quit_grace_seconds()))
+    else:
+        # This worker is not part of an app exit, so a value an earlier
+        # generation left behind must not shorten a drain that is still owed.
+        os.environ.pop(_LITELLM_DRAIN_TIMEOUT_ENV, None)
+
+
+def _close_connections_without_a_request(server: Any) -> None:
+    """Close every listened connection that is not mid-response.
+
+    Uvicorn's shutdown marks each connection for closing and then waits for
+    ``server_state.connections`` to empty.  A connection leaves that set only
+    when its transport reports ``connection_lost``, and a keep-alive socket
+    whose peer has gone away -- an editor, a probe, or the app's own panes
+    after they let go -- can sit there for as long as the operating system
+    keeps the socket, which is why a quit with nothing in flight still spent
+    the whole drain budget on the last worker.
+
+    A connection with no active request has nothing to drain, so its transport
+    is closed outright: the response it would have carried is already sent, and
+    the only thing left is the half-open socket.  A connection that *is*
+    mid-response is left exactly as uvicorn left it, so an in-flight turn still
+    finishes.  The force flag is what makes this observably different from a
+    plain close for a transport that is already closing: without it the socket
+    stays in the set until the peer cooperates.
+    """
+
+    try:
+        connections = list(server.server_state.connections)
+    except Exception:  # pragma: no cover - uvicorn internals differ
+        return
+    for connection in connections:
+        # ``cycle`` is None before a request and after the response completed,
+        # and ``response_complete`` is set once the bytes are out.  Either means
+        # this socket holds no work for the drain to save.
+        if getattr(connection, "cycle", None) is not None and not getattr(
+            getattr(connection, "cycle", None), "response_complete", False
+        ):
+            continue
+        transport = getattr(connection, "transport", None)
+        if transport is None:
+            continue
+        try:
+            transport.abort()
+        except Exception:  # pragma: no cover - a transport that refuses to close
+            continue
 
 
 def _install_uvicorn_shutdown_marker_patch() -> None:
@@ -117,9 +261,40 @@ def _install_uvicorn_shutdown_marker_patch() -> None:
         original_instance_wait = self.__dict__.get("_wait_tasks_to_complete")
         original_timeout = self.config.timeout_graceful_shutdown
         shutdown_marked = False
+        # LiteLLM's own lifespan drain runs before this class's shutdown
+        # continues, so the app-exit bound has to be in place first or that
+        # drain would sit out its own full default.
+        _bind_litellm_drain_to_app_quit_grace()
+
+        # Uvicorn's own shutdown closes every client connection before it gives
+        # the in-flight work any grace at all, so a stream that is still
+        # answering has already lost its socket by the time the wait below runs
+        # -- which is why a quit with a turn streaming showed the client a bare
+        # close.  The marker and the flush therefore have to happen first: an
+        # open stream observes the marker, closes its own turn as completed
+        # carrying the output that arrived, and only then is the connection
+        # closed underneath it.
+        if app_quit_grace_seconds() <= 0:
+            _begin_proxy_shutdown()
+            shutdown_marked = True
+            await _await_open_stream_terminals(self)
+            await _close_connections_after_terminals(self)
 
         async def wait_for_active_requests() -> None:
             nonlocal shutdown_marked
+            # Uvicorn reaches this after it has marked every connection for
+            # closing.
+            _close_connections_without_a_request(self)
+            # A turn still being written is not waited for: the app is being
+            # replaced and both clients reconnect on their own.  Uvicorn's
+            # graceful timeout is zero for this case, so it would cancel the
+            # stream task the instant this returns and close the socket with no
+            # terminal at all -- which is what the client renders as
+            # ``upstream_route_failure``.  Marking the shutdown instead routes
+            # the cut through the stream's own end-of-response path, so the
+            # answer that did arrive is delivered and the client reconnects.
+            if app_quit_grace_seconds() <= 0:
+                return
             try:
                 await original_wait()
             except asyncio.CancelledError:
@@ -132,7 +307,27 @@ def _install_uvicorn_shutdown_marker_patch() -> None:
                 raise
 
         self._wait_tasks_to_complete = wait_for_active_requests
-        self.config.timeout_graceful_shutdown = proxy_drain_grace_seconds()
+        # This is the worker's own shutdown, reached when the app is being
+        # replaced.  Both clients the router serves reconnect on their own, so
+        # the long drain a deliberate proxy replacement needs buys nothing here
+        # and only postpones the replacement: a socket whose cycle has not
+        # finished keeps the worker alive long past the point where anything
+        # more can be written to it.  A turn cut by this bound is closed as a
+        # completed response carrying the output that already arrived, so the
+        # client keeps its partial answer rather than being shown an
+        # interruption, and then reconnects for the rest.
+        # ``asyncio.wait_for`` raises without running its coroutine when the
+        # timeout is zero, so a zero here would disable this patch rather than
+        # skip the wait.  Uvicorn also applies this value as the *outer* bound
+        # on ``_wait_tasks_to_complete``: a bound shorter than the terminal
+        # window inside would cancel the very tasks that window exists to let
+        # finish, and the client would see the truncated socket this patch is
+        # meant to prevent.  It therefore has to cover that window with room to
+        # spare, and the real bound stays inside ``wait_for_active_requests``.
+        self.config.timeout_graceful_shutdown = max(
+            app_quit_grace_seconds(),
+            _APP_EXIT_TERMINAL_GRACE_SECONDS + _MIN_SHUTDOWN_PATCH_GRACE_SECONDS,
+        )
         try:
             await original_shutdown(self, sockets)
         finally:
@@ -258,8 +453,8 @@ _DEPLOYMENT_COOLDOWN_ORDINARY_ENABLED_ENV = (
 _DEPLOYMENT_COOLDOWN_COMPACTION_ENABLED_ENV = (
     "YOUNG_ROUTER_DEPLOYMENT_COOLDOWN_COMPACTION_ENABLED"
 )
-_DEPLOYMENT_COOLDOWN_FILE_ENV = _launcher_settings._DEPLOYMENT_COOLDOWN_FILE_ENV
-_ROUTE_RECOVERY_STATE_FILE_ENV = _launcher_settings._ROUTE_RECOVERY_STATE_FILE_ENV
+_DEPLOYMENT_COOLDOWN_FILE_ENV = "YOUNG_ROUTER_DEPLOYMENT_COOLDOWN_FILE"
+_ROUTE_RECOVERY_STATE_FILE_ENV = "YOUNG_ROUTER_ROUTE_RECOVERY_STATE_FILE"
 _DEPLOYMENT_COOLDOWN_DEFAULT_FAILURES = 2
 _DEPLOYMENT_COOLDOWN_DEFAULT_SECONDS = 300.0
 _DEPLOYMENT_COOLDOWN_ORDINARY_DEFAULT_ENABLED = True
@@ -659,7 +854,7 @@ _ROUTE_TRACE_PREVIEW_CHARS_ENV = "YOUNG_ROUTER_ROUTE_TRACE_PREVIEW_CHARS"
 _ROUTE_TRACE_PREVIEW_DEFAULT_CHARS = 2000
 _ROUTE_TRACE_PREVIEW_MAX_CHARS = 2000
 _ROUTE_TRACE_LIST_SCAN_ITEMS = 40
-_RECENT_REQUESTS_LOG_ENV = _launcher_settings._RECENT_REQUESTS_LOG_ENV
+_RECENT_REQUESTS_LOG_ENV = "LITELLM_RECENT_REQUESTS_LOG"
 _EXTERNAL_WEB_SEARCH_MAX_RESULTS_ENV = "YOUNG_ROUTER_WEB_SEARCH_MAX_RESULTS"
 _EXTERNAL_WEB_SEARCH_READ_CHARS_ENV = "YOUNG_ROUTER_WEB_SEARCH_READ_CHARS"
 _EXTERNAL_WEB_FETCH_TIMEOUT_ENV = "YOUNG_ROUTER_WEB_FETCH_TIMEOUT_SECONDS"

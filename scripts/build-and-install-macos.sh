@@ -166,13 +166,11 @@ stop_installed_app() {
 
   OLD_PIDS="$bundle_pids"
   # One policy, one implementation: ``app-processes.sh stop`` kills the captured
-  # pids together and waits for them to be gone, exactly as a restart does.  The
-  # installer used to signal the host and then wait out the proxy's drain -- a
-  # budget of hours, meant for a replacement that is not in a hurry -- which is
-  # what made an install appear to finish its copy and then sit there.  Nothing
-  # the listener needs is bought by that wait: the port comes free in the same
-  # instant the processes holding it die, and a turn that is cut here is one the
-  # client reconnects through.
+  # pids together and waits for them to be gone, exactly as a restart does.  A
+  # polite signal first was tried here and answered the same question twice: the
+  # listener the replacement needs is free in the same instant the processes
+  # holding it die, and a turn that is cut is one the client reconnects through,
+  # so the grace only added a second to every install.
   APP_PROCESSES_STOP_POLLS=$(( STOP_TIMEOUT_SECONDS * 20 )) \
   survivors="$("$APP_PROCESSES" stop $bundle_pids)" || true
   if [[ -z "$survivors" ]]; then
@@ -475,6 +473,7 @@ STAGING_PIDS+=("$!")
 # down to the assembly that actually consumes it.
 WORKBUDDY_CONNECT_WORK="$STAGING_CACHE/workbuddy-connect"
 VERIDROP_WORK="$STAGING_CACHE/veridrop"
+OPENCODE2DSH_WORK="$STAGING_CACHE/opencode2dsh"
 DSH_VISION_ROUTER_WORK="$STAGING_CACHE/dsh-vision-router"
 # Each job is started in this shell, not inside a command substitution: a
 # substitution runs in a subshell, so a job it launches is not a child of the
@@ -487,6 +486,18 @@ STAGING_PIDS+=("$!")
 STAGING_PIDS+=("$!")
 "${PI_WEB_ACCESS_UPDATE_COMMAND[@]}" "$PROJECT_ROOT/scripts/update_dsh_vision_router.py" \
   --output "$DSH_VISION_ROUTER_WORK" &
+STAGING_PIDS+=("$!")
+# OpenCode Zen's free lane is reached through the published third-party plugin,
+# so it joins the same re-check: every artifact build resolves the current
+# release instead of shipping whichever version was reviewed last.
+# No ``--node-source`` here: that argument is ``pi-web-access``'s, because that
+# integration ships a Node of its own.  The opencode2dsh worker is a module the
+# Core imports and runs with the runtime it already installs
+# (``Core/runtime/bin/node``), so handing this stager a Node to copy would only
+# add a second 90 MB runtime to the bundle.
+OPENCODE2DSH_NODE_ARGS=("$PROJECT_ROOT/scripts/update_opencode2dsh.py"
+  --output "$OPENCODE2DSH_WORK")
+"${PI_WEB_ACCESS_UPDATE_COMMAND[@]}" "${OPENCODE2DSH_NODE_ARGS[@]}" &
 STAGING_PIDS+=("$!")
 
 export RCT_USE_RN_DEP=0
@@ -582,19 +593,23 @@ if [[ -z "$APP" ]]; then
 fi
 
 RNMACOS_CLI="$RN_ROOT/vendor/react-native-macos-0.85/packages/react-native/cli.js"
-# The vendored CLI runs `xcodebuild` with no `-destination`, and a build with no
-# destination cannot pick an active architecture: it resolves `ARCHS` from the
-# project (both `arm64` and `x86_64` here) and compiles every slice, even though
-# the app target's own `ONLY_ACTIVE_ARCH = YES` asks for one.  That second slice
-# is never shipped -- the bundle this same script installs is a single-arch
-# binary -- so the whole non-host pass is discarded work costing roughly half
-# the native build.  Pinning `ARCHS` in the environment makes xcodebuild build
-# exactly the slice `$ARCH` already selects for the runtime below.
-export ARCHS="$ARCH"
-export ONLY_ACTIVE_ARCH=YES
+# The native build passes the architecture as an xcodebuild argument instead of
+# going through the vendored CLI.  The Pods project pins
+# ``ARCHS = "$(ARCHS_STANDARD_64_BIT)"`` in its own build settings, and a value
+# written into a project is overridden only by a command-line argument -- an
+# environment variable does not reach it, which is why exporting ``ARCHS`` was
+# not enough.  Without the argument every pod compiles an x86_64 slice the
+# installed bundle never contains, and that is most of a repeat build's native
+# time.  The CLI itself forwards only ``-configuration`` and ``-scheme``.
 (
   cd "$APP_ROOT"
-  node "$RNMACOS_CLI" build-macos --project-path macos --mode Release
+  xcodebuild -workspace "$APP_ROOT/macos/YoungRouter.xcworkspace" \
+    -scheme YoungRouter-macOS \
+    -configuration Release \
+    "${XCODE_DESTINATION[@]}" \
+    ARCHS="$ARCH" \
+    ONLY_ACTIVE_ARCH=YES \
+    build
 )
 
 if [[ -z "$APP" || ! -d "$APP" ]]; then
@@ -627,6 +642,7 @@ copy_tree "$PI_WEB_ACCESS_PACKAGE_WORK" "$CORE/young_router/adapters/pi-web-acce
 copy_tree "$VERIDROP_WORK" "$CORE/young_router/adapters/veridrop"
 copy_tree "$WORKBUDDY_CONNECT_WORK" "$CORE/young_router/adapters/workbuddy-connect"
 copy_tree "$DSH_VISION_ROUTER_WORK" "$CORE/young_router/adapters/dsh-vision-router"
+copy_tree "$OPENCODE2DSH_WORK" "$CORE/young_router/adapters/opencode2dsh"
 
 if [[ -n "$RUNTIME_SOURCE" ]]; then
   if [[ ! -d "$RUNTIME_SOURCE/python" \
@@ -938,7 +954,15 @@ find "$CORE/young_router" "$CORE/runtime/site-packages" \
 # The package already carries LiteLLM's fallback cost map, so this must not
 # wait on a remote catalog refresh during a local build.
 export LITELLM_LOCAL_MODEL_COST_MAP=true
+# The smoke compiles the startup path into a cache this build owns and then
+# throws away, so the proof is a cache entry the run just wrote rather than one
+# a previous run left behind.  ``sitecustomize`` redirects every write to
+# ``PYTHONPYCACHEPREFIX``, so naming the directory here keeps the run's bytecode
+# out of both the build product and the user's own cache root.
+PYCACHE_SMOKE_DIR="$RUNTIME_WORK/pycache-smoke"
+rm -rf "$PYCACHE_SMOKE_DIR"
 PYTHONDONTWRITEBYTECODE=0 \
+YOUNG_ROUTER_PYCACHE_DIR="$PYCACHE_SMOKE_DIR" \
 PYTHONPATH="$CORE:$CORE/runtime/site-packages" \
 YOUNG_ROUTER_PROXY_PROCESS=1 \
 LITELLM_TEMPLATE_ROOT="$CORE" \
@@ -957,8 +981,21 @@ assert app is not None
 assert callback.__class__.__name__ == "YoungRouterHook"
 assert run_server is not None and BaseApplication is not None and UvicornWorker is not None
 '
-[[ -f "$CORE/runtime/site-packages/litellm/__pycache__/__init__.cpython-312.pyc" ]] || {
+# The interpreter writes its bytecode to the cache root ``sitecustomize``
+# resolves, never beside the signed sources, so the proof that the startup path
+# was really compiled is a cache entry under the run's own root: an in-bundle
+# ``__pycache__`` is exactly what the redirect exists to prevent.  The smoke
+# above already failed the build if the import itself could not run.
+find "$PYCACHE_SMOKE_DIR" -name '__init__.cpython-312.pyc' -path '*litellm*' -print -quit 2>/dev/null | grep -q . || {
   echo "The bundled Core startup bytecode could not be generated." >&2
+  exit 5
+}
+# The redirect is the whole point, so a cache of its own under the two trees the
+# smoke imports means the shipped app would carry unsealed files inside its
+# signature.  The bundled interpreter's own stdlib is not in scope: that tree
+# ships with the runtime, not from this build.
+[[ -z "$(find "$CORE/young_router" "$CORE/runtime/site-packages" -type d -name __pycache__ -print -quit 2>/dev/null)" ]] || {
+  echo "The Core startup smoke wrote bytecode into the signed Core bundle." >&2
   exit 5
 }
 

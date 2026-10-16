@@ -688,6 +688,44 @@ def _responses_chat_bridge_flat_tool_name(
     return tool_name
 
 
+#: The Codex tool whose own result is the delegated turn rather than an
+#: observation about one.  A thread is started by asking for it, and the task it
+#: was started with comes back in the call's output.
+_DELEGATION_TOOL_NAMES = frozenset({"create_thread"})
+
+#: The wrapper Codex puts around a started thread's payload.  Only a result the
+#: client marked as a delegation is read this way; an ordinary tool output that
+#: merely mentions the element is passed through untouched.
+_DELEGATION_ENVELOPE_TAG = "codex_delegation"
+
+_RE_DELEGATION_ENVELOPE = re.compile(
+    rf"<{_DELEGATION_ENVELOPE_TAG}\b[^>]*>(.*?)</{_DELEGATION_ENVELOPE_TAG}\s*>",
+    re.DOTALL,
+)
+_RE_DELEGATION_INPUT = re.compile(r"<input\b[^>]*>(.*?)</input\s*>", re.DOTALL)
+
+
+def _delegation_task_from_output(output: Any) -> Optional[str]:
+    """The task a delegation tool result stands for, or ``None``.
+
+    The envelope declares that this result is a started thread, and the task it
+    carries is what that thread was asked to do.  A result without both the
+    envelope and a non-empty ``<input>`` is not a delegation task, so it is
+    left exactly as it was replayed.
+    """
+
+    if not isinstance(output, str):
+        return None
+    envelope = _RE_DELEGATION_ENVELOPE.search(output)
+    if envelope is None:
+        return None
+    task = _RE_DELEGATION_INPUT.search(envelope.group(1))
+    if task is None:
+        return None
+    text = task.group(1).strip()
+    return text or None
+
+
 def _responses_chat_bridge_input(
     value: Any,
     tools: Any = None,
@@ -704,6 +742,12 @@ def _responses_chat_bridge_input(
     converted_custom_tool_calls = 0
     converted_custom_tool_outputs = 0
     flattened_namespace_calls = 0
+    lifted_delegation_tasks = 0
+    # The tool call each delegation result belongs to, so the lifted turn can be
+    # placed after the call and its result rather than between them: a chat
+    # surface rejects a tool result that is not adjacent to its call.
+    delegation_calls: dict[str, str] = {}
+    closing_delegations: list[Any] = []
     for item in value:
         if isinstance(item, dict) and item.get("type") in {
             "tool_search_call",
@@ -714,11 +758,31 @@ def _responses_chat_bridge_input(
         if isinstance(item, dict) and item.get("type") == "additional_tools":
             dropped_additional_tools += 1
             continue
+        # A delegation result is read before anything else touches it: the
+        # envelope and its task are what the replay is being judged on, and the
+        # conversions below rewrite the item they were found in.
+        if isinstance(item, dict) and item.get("type") == "function_call_output":
+            task = _delegation_task_from_output(item.get("output"))
+            call_id = item.get("call_id")
+            owner = delegation_calls.get(str(call_id))
+            if task is not None and owner in _DELEGATION_TOOL_NAMES:
+                closing_delegations.append(
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": task}],
+                    }
+                )
+                lifted_delegation_tasks += 1
         updated_item = copy.deepcopy(item)
         if (
             isinstance(updated_item, dict)
             and updated_item.get("type") in {"function_call", "custom_tool_call"}
         ):
+            if updated_item.get("name") in _DELEGATION_TOOL_NAMES:
+                call_id = updated_item.get("call_id") or updated_item.get("id")
+                if call_id is not None:
+                    delegation_calls[str(call_id)] = str(updated_item.get("name"))
             namespace = updated_item.get("namespace")
             namespace_name = namespace.strip() if isinstance(namespace, str) else ""
             item_was_flattened = False
@@ -779,12 +843,16 @@ def _responses_chat_bridge_input(
         and converted_custom_tool_calls == 0
         and converted_custom_tool_outputs == 0
         and flattened_namespace_calls == 0
+        and lifted_delegation_tasks == 0
     ):
         return value, {"changed": False, "dropped_tool_search_items": 0}
+    filtered.extend(closing_delegations)
     stats = {
         "changed": True,
         "dropped_tool_search_items": dropped_tool_search,
     }
+    if lifted_delegation_tasks:
+        stats["lifted_delegation_tasks"] = lifted_delegation_tasks
     if dropped_additional_tools:
         stats["dropped_additional_tools_items"] = dropped_additional_tools
     if converted_custom_tool_calls:
