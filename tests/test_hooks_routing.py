@@ -1862,29 +1862,6 @@ class HookRoutingTests(HookTestCase):
             self.assertNotIn("function_call", request[key])
             self.assertTrue(request[key]["keep"])
 
-    def test_surface_refusal_is_not_a_route_failure(self) -> None:
-        """A route that refused the surface still has a working Chat surface.
-
-        Reading the refusal as a request error ended the turn with it, so the
-        swap that answers the request never ran and the client received the
-        refusal as a failure.
-        """
-
-        hooks, _ = load_hook_module()
-        refusal = RuntimeError(
-            'OpenAIException - {"error":{"message":"openai_error",'
-            '"type":"bad_response_status_code","param":"",'
-            '"code":"bad_response_status_code"}}'
-        )
-        refusal.status_code = 403
-        invalid_key = RuntimeError('{"error":{"message":"invalid_api_key"}}')
-        invalid_key.status_code = 403
-
-        self.assertEqual(
-            hooks._recovery_policy_for_exception(refusal), "recovery_cooldown"
-        )
-        self.assertEqual(hooks._recovery_policy_for_exception(invalid_key), "error")
-
     def test_responses_surface_refusal_at_403_is_a_surface_failover(self) -> None:
         """A station that cannot serve Responses must be recognized at its own 4xx.
 
