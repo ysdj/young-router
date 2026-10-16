@@ -186,6 +186,24 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn(
             'xargs -0 -n 4 -P "$STRIP_SIGN_JOBS" bash -c "$STRIP_SIGN_FILES" _', script
         )
+        # A build does not wait for the previous Core to be deleted, and the
+        # worker smokes run while the strip/sign pass and the startup import do.
+        self.assertIn('retired_core="$(dirname "$APP")/.YoungRouter-retired-core.$$"', script)
+        self.assertIn('( rm -rf "$retired_core" ) &', script)
+        self.assertIn('WORKER_SMOKE_LOG="$RUNTIME_WORK/worker-smokes.log"', script)
+        self.assertIn('if ! wait "$WORKER_SMOKE_PID"; then', script)
+        self.assertIn(
+            "A bundled worker could not load its staged package; no artifact was produced.",
+            script,
+        )
+        self.assertLess(
+            script.index('STRIP_SIGN_FILES='),
+            script.index('if ! wait "$WORKER_SMOKE_PID"; then'),
+        )
+        self.assertLess(
+            script.index('if ! wait "$WORKER_SMOKE_PID"; then'),
+            script.index('codesign --force --deep --sign - "$APP"'),
+        )
         self.assertIn('if [[ "$STAGE_RENAMED" != "1" ]]; then', script)
         self.assertLess(
             script.index('STAGE_RENAMED=1'),

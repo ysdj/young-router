@@ -366,6 +366,61 @@ command -v pnpm >/dev/null 2>&1 || {
 # workspace themselves: scripts/package-release.sh calls it directly. Install
 # here so a caller only has to have the checkout, and let pnpm itself decide
 # when the store already satisfies the lockfile.
+# Four of the five staged integrations are re-checked against their upstreams on
+# every build, and that re-check is network wait rather than build work.  They
+# start here, before the workspace install and the release resolution below, and
+# always with the same arguments; pi-web-access follows once the build has
+# decided which runtime and Node it is staging against, so the gate that decides
+# those still runs first.  Nothing here is read until the Core is assembled.
+PI_WEB_ACCESS_UPDATE_COMMAND=()
+if [[ -n "${LITELLM_PI_WEB_ACCESS_PYTHON:-}" ]]; then
+  command -v "$LITELLM_PI_WEB_ACCESS_PYTHON" >/dev/null 2>&1 || {
+    echo "Configured LITELLM_PI_WEB_ACCESS_PYTHON was not found." >&2
+    exit 1
+  }
+  PI_WEB_ACCESS_UPDATE_COMMAND=("$LITELLM_PI_WEB_ACCESS_PYTHON")
+elif [[ -n "$UV_BIN" && -x "$UV_BIN" ]]; then
+  PI_WEB_ACCESS_UPDATE_COMMAND=("$UV_BIN" run --no-project --python 3.12)
+elif command -v python3 >/dev/null 2>&1 \
+  && python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)'; then
+  PI_WEB_ACCESS_UPDATE_COMMAND=(python3)
+else
+  echo "Python 3.11+ (or uv) is required to stage pi-web-access for the macOS Core runtime." >&2
+  exit 1
+fi
+PI_WEB_ACCESS_PACKAGE_WORK="$STAGING_CACHE/pi-web-access"
+PI_WEB_ACCESS_NODE_WORK="$RUNTIME_WORK/node"
+mkdir -p "$STAGING_CACHE"
+STAGING_PIDS=()
+WORKBUDDY_CONNECT_WORK="$STAGING_CACHE/workbuddy-connect"
+VERIDROP_WORK="$STAGING_CACHE/veridrop"
+OPENCODE2DSH_WORK="$STAGING_CACHE/opencode2dsh"
+DSH_VISION_ROUTER_WORK="$STAGING_CACHE/dsh-vision-router"
+# Each job is started in this shell, not inside a command substitution: a
+# substitution runs in a subshell, so a job it launches is not a child of the
+# shell that has to wait for it and its output would corrupt the captured pid.
+"${PI_WEB_ACCESS_UPDATE_COMMAND[@]}" "$PROJECT_ROOT/scripts/update_workbuddy_connect.py" \
+  --output "$WORKBUDDY_CONNECT_WORK" &
+STAGING_PIDS+=("$!")
+"${PI_WEB_ACCESS_UPDATE_COMMAND[@]}" "$PROJECT_ROOT/scripts/update_veridrop.py" \
+  --output "$VERIDROP_WORK" &
+STAGING_PIDS+=("$!")
+"${PI_WEB_ACCESS_UPDATE_COMMAND[@]}" "$PROJECT_ROOT/scripts/update_dsh_vision_router.py" \
+  --output "$DSH_VISION_ROUTER_WORK" &
+STAGING_PIDS+=("$!")
+# OpenCode Zen's free lane is reached through the published third-party plugin,
+# so it joins the same re-check: every artifact build resolves the current
+# release instead of shipping whichever version was reviewed last.
+# No ``--node-source`` here: that argument is ``pi-web-access``'s, because that
+# integration ships a Node of its own.  The opencode2dsh worker is a module the
+# Core imports and runs with the runtime it already installs
+# (``Core/runtime/bin/node``), so handing this stager a Node to copy would only
+# add a second 90 MB runtime to the bundle.
+OPENCODE2DSH_NODE_ARGS=("$PROJECT_ROOT/scripts/update_opencode2dsh.py"
+  --output "$OPENCODE2DSH_WORK")
+"${PI_WEB_ACCESS_UPDATE_COMMAND[@]}" "${OPENCODE2DSH_NODE_ARGS[@]}" &
+STAGING_PIDS+=("$!")
+
 pnpm install --frozen-lockfile
 
 if [[ "${YOUNG_ROUTER_LITELLM_VERSION_UPDATED:-}" != "1" ]]; then
@@ -397,25 +452,6 @@ if [[ "$NODE_MAJOR" -lt 22 ]]; then
   exit 1
 fi
 
-PI_WEB_ACCESS_UPDATE_COMMAND=()
-if [[ -n "${LITELLM_PI_WEB_ACCESS_PYTHON:-}" ]]; then
-  command -v "$LITELLM_PI_WEB_ACCESS_PYTHON" >/dev/null 2>&1 || {
-    echo "Configured LITELLM_PI_WEB_ACCESS_PYTHON was not found." >&2
-    exit 1
-  }
-  PI_WEB_ACCESS_UPDATE_COMMAND=("$LITELLM_PI_WEB_ACCESS_PYTHON")
-elif [[ -n "$UV_BIN" && -x "$UV_BIN" ]]; then
-  PI_WEB_ACCESS_UPDATE_COMMAND=("$UV_BIN" run --no-project --python 3.12)
-elif command -v python3 >/dev/null 2>&1 \
-  && python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)'; then
-  PI_WEB_ACCESS_UPDATE_COMMAND=(python3)
-else
-  echo "Python 3.11+ (or uv) is required to stage pi-web-access for the macOS Core runtime." >&2
-  exit 1
-fi
-PI_WEB_ACCESS_PACKAGE_WORK="$STAGING_CACHE/pi-web-access"
-PI_WEB_ACCESS_NODE_WORK="$RUNTIME_WORK/node"
-mkdir -p "$STAGING_CACHE"
 # The Node runtime this app ships is a 108 MB download and about half the
 # staging wall clock, and a repeat local build already has an identical copy:
 # the installed bundle carries the very runtime the package requires.  Reusing
@@ -440,7 +476,6 @@ if [[ -n "$NODE_SOURCE_PATH" ]]; then
   NODE_SOURCE_ARGS=(--node-source "$NODE_SOURCE_PATH")
   printf 'Reusing installed Node runtime: %s\n' "$NODE_SOURCE_PATH"
 fi
-STAGING_PIDS=()
 # `set -u` treats an empty array expansion as unbound on the bash 3.2 that
 # macOS ships, so the argument is added only when it exists.
 PI_WEB_ACCESS_NODE_ARGS=("$PROJECT_ROOT/scripts/update_pi_web_access.py"
@@ -473,35 +508,6 @@ STAGING_PIDS+=("$!")
 # does not reference the Python Core or a staged adapter at all — so the whole
 # group overlaps the native build instead of preceding it, and the wait moves
 # down to the assembly that actually consumes it.
-WORKBUDDY_CONNECT_WORK="$STAGING_CACHE/workbuddy-connect"
-VERIDROP_WORK="$STAGING_CACHE/veridrop"
-OPENCODE2DSH_WORK="$STAGING_CACHE/opencode2dsh"
-DSH_VISION_ROUTER_WORK="$STAGING_CACHE/dsh-vision-router"
-# Each job is started in this shell, not inside a command substitution: a
-# substitution runs in a subshell, so a job it launches is not a child of the
-# shell that has to wait for it and its output would corrupt the captured pid.
-"${PI_WEB_ACCESS_UPDATE_COMMAND[@]}" "$PROJECT_ROOT/scripts/update_workbuddy_connect.py" \
-  --output "$WORKBUDDY_CONNECT_WORK" &
-STAGING_PIDS+=("$!")
-"${PI_WEB_ACCESS_UPDATE_COMMAND[@]}" "$PROJECT_ROOT/scripts/update_veridrop.py" \
-  --output "$VERIDROP_WORK" &
-STAGING_PIDS+=("$!")
-"${PI_WEB_ACCESS_UPDATE_COMMAND[@]}" "$PROJECT_ROOT/scripts/update_dsh_vision_router.py" \
-  --output "$DSH_VISION_ROUTER_WORK" &
-STAGING_PIDS+=("$!")
-# OpenCode Zen's free lane is reached through the published third-party plugin,
-# so it joins the same re-check: every artifact build resolves the current
-# release instead of shipping whichever version was reviewed last.
-# No ``--node-source`` here: that argument is ``pi-web-access``'s, because that
-# integration ships a Node of its own.  The opencode2dsh worker is a module the
-# Core imports and runs with the runtime it already installs
-# (``Core/runtime/bin/node``), so handing this stager a Node to copy would only
-# add a second 90 MB runtime to the bundle.
-OPENCODE2DSH_NODE_ARGS=("$PROJECT_ROOT/scripts/update_opencode2dsh.py"
-  --output "$OPENCODE2DSH_WORK")
-"${PI_WEB_ACCESS_UPDATE_COMMAND[@]}" "${OPENCODE2DSH_NODE_ARGS[@]}" &
-STAGING_PIDS+=("$!")
-
 export RCT_USE_RN_DEP=0
 export RCT_USE_PREBUILT_RNCORE=0
 export RCT_BUILD_HERMES_FROM_SOURCE=true
@@ -632,7 +638,25 @@ if [[ "$STAGING_FAILED" == "1" ]]; then
 fi
 
 CORE="$APP/Contents/Resources/Core"
-rm -rf "$CORE"
+# Starting from an empty Core means deleting about fifty thousand files, and
+# nothing waits on that: the retired tree is renamed out of the way -- a rename
+# costs nothing and the new Core is assembled in its place -- and it is removed
+# on its own time, the way the retired bundle is after an install.  The renamed
+# tree lives beside the build product rather than inside it, so an interrupted
+# build can never leave it in an artifact; a stale one from such a build is
+# removed here, where the removal is rare enough to pay for.
+for retired in "$(dirname "$APP")"/.YoungRouter-retired-core.*; do
+  [[ -e "$retired" ]] || continue
+  rm -rf "$retired"
+done
+if [[ -e "$CORE" ]]; then
+  retired_core="$(dirname "$APP")/.YoungRouter-retired-core.$$"
+  if mv "$CORE" "$retired_core" 2>/dev/null; then
+    ( rm -rf "$retired_core" ) &
+  else
+    rm -rf "$CORE"
+  fi
+fi
 mkdir -p "$CORE"
 cp "$PROJECT_ROOT/sitecustomize.py" "$CORE/sitecustomize.py"
 rsync -a \
@@ -888,6 +912,12 @@ fi
   echo "The bundled Node.js runtime is missing." >&2
   exit 5
 }
+# Every worker smoke below reads what the assembly just wrote and shares nothing
+# with the pruning, the strip/sign pass, or the startup import that follow, so
+# the group runs while those do.  Each check still runs and still names itself:
+# this group's own output is what a failing build prints.
+WORKER_SMOKE_LOG="$RUNTIME_WORK/worker-smokes.log"
+(
 PI_WEB_ACCESS_SMOKE_CONFIG="$RUNTIME_WORK/pi-web-access-smoke-config"
 if ! printf '' | "$CORE/runtime/bin/node" \
   "$CORE/young_router/adapters/pi_web_access_worker.mjs" \
@@ -974,6 +1004,8 @@ case "$VERIDROP_SMOKE_OUTPUT" in
     exit 5
     ;;
 esac
+) > "$WORKER_SMOKE_LOG" 2>&1 &
+WORKER_SMOKE_PID=$!
 [[ "$(tr -d '[:space:]' < "$CORE/runtime/LITELLM_VERSION")" == "$(tr -d '[:space:]' < "$PROJECT_ROOT/LITELLM_VERSION")" ]] || {
   echo "The bundled Core runtime does not contain the pinned LiteLLM release lock." >&2
   exit 5
@@ -1184,6 +1216,14 @@ if [[ -n "${YOUNG_ROUTER_MACOS_DISPLAY_NAME:-}" \
     /usr/libexec/PlistBuddy -c "Delete :YoungRouterPreviewPort" "$APP/Contents/Info.plist" >/dev/null 2>&1 || true
     /usr/libexec/PlistBuddy -c "Add :YoungRouterPreviewPort string $PREVIEW_PORT" "$APP/Contents/Info.plist"
   fi
+fi
+# The worker smokes have been running while the strip/sign pass and the startup
+# import did their work.  A failing one reports itself here, before anything is
+# signed or installed.
+if ! wait "$WORKER_SMOKE_PID"; then
+  cat "$WORKER_SMOKE_LOG" >&2
+  echo "A bundled worker could not load its staged package; no artifact was produced." >&2
+  exit 5
 fi
 codesign --force --deep --sign - "$APP" >/dev/null
 codesign --verify --deep --strict --verbose=2 "$APP"
