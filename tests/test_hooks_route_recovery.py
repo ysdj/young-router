@@ -3190,3 +3190,79 @@ class RouteRecoveryKeepaliveWaitTests(HookTestCase):
                 offenders.append(task_name)
 
         self.assertTrue(offenders, "expected the recovery keepalive waits to be present")
+
+
+class HookNativeRouteRecoveryExhaustionTests(HookTestCase):
+    """An exhausted native recovery poll must name what the client waited on.
+
+    A Chat Completions or Anthropic client whose routes all failed used to be
+    answered with one hardcoded ``upstream_route_failure`` line, so a stalled
+    route, a relay channel outage, and a worker replacement were all reported
+    as the same unexplained stop at the text that had already streamed.
+    """
+
+    async def test_exhausted_native_poll_names_the_idle_timeout(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "0.05")
+        self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.01")
+        request_data = {
+            "model": "default-chat",
+            "messages": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/chat/completions"},
+        }
+
+        streaming_module = sys.modules["young_router.proxy.streaming"]
+        original_round = streaming_module._stream_native_route_recovery_poll_attempt
+        self.addCleanup(
+            setattr,
+            streaming_module,
+            "_stream_native_route_recovery_poll_attempt",
+            original_round,
+        )
+        poll_attempts: list[int] = []
+
+        async def exhausted_round(_request_data, _exception, *, attempt, **_kwargs):
+            poll_attempts.append(attempt)
+            exception = RuntimeError(
+                "Young Router stream idle timeout after 120s without a new chunk"
+            )
+            exception.status_code = 504
+            exception.body = {
+                "reason": "stream_idle_timeout",
+                "idle_seconds": 120.0,
+                "saw_chunk": True,
+            }
+            raise exception
+            yield None
+
+        streaming_module._stream_native_route_recovery_poll_attempt = exhausted_round
+        failure = RuntimeError("Young Router stream idle timeout after 120s without a new chunk")
+        failure.status_code = 504
+        failure.body = {
+            "reason": "stream_idle_timeout",
+            "idle_seconds": 120.0,
+            "saw_chunk": True,
+        }
+
+        chunks = [
+            chunk
+            async for chunk in hooks._stream_route_recovery_poll(request_data, failure)
+        ]
+
+        error_chunks = [
+            chunk
+            for chunk in chunks
+            if isinstance(chunk, dict) and isinstance(chunk.get("error"), dict)
+        ]
+        self.assertTrue(error_chunks, chunks)
+        self.assertEqual(
+            error_chunks[-1]["error"]["code"],
+            "upstream_stream_idle_timeout",
+        )
+        self.assertNotEqual(
+            error_chunks[-1]["error"]["code"],
+            "upstream_route_failure",
+        )
+        self.assertIn("stopped sending", error_chunks[-1]["error"]["message"])
+        self.assertTrue(poll_attempts)

@@ -3017,6 +3017,14 @@ class HookResponsesRequestPrepTests(HookTestCase):
             },
             "input": [dict(item) for item in client_items],
         }
+        self.addCleanup(
+            self.set_env, hooks._HISTORY_TOOL_OUTPUT_KEPT_CHARS_ENV, None
+        )
+        # Two multi-megabyte originals are a replayed tool-call tail larger
+        # than the window, so the window pass would empty the older one before
+        # the image pass ever saw it.  Raise the window for this test, which is
+        # about the image pass's own treatment of both halves.
+        self.set_env(hooks._HISTORY_TOOL_OUTPUT_KEPT_CHARS_ENV, "5000000")
         first = await hooks.YoungRouterHook().async_pre_call_deployment_hook(
             first_request,
             call_type="aresponses",
@@ -4737,3 +4745,108 @@ class HookResponsesRequestPrepTests(HookTestCase):
                 )
             ],
         )
+
+
+class HookResponsesToolOutputReplayWindowTests(HookTestCase):
+    """The replayed tool-call tail is bounded in characters, not in outputs."""
+
+    def _request(self, pairs: int, payload_chars: int) -> dict:
+        items: list[dict] = []
+        for index in range(pairs):
+            items.append(
+                {
+                    "type": "function_call",
+                    "id": f"fc_{index}",
+                    "name": "exec_command",
+                    "namespace": "functions",
+                    "arguments": '{"cmd":"ls"}',
+                    "call_id": f"call_{index}",
+                }
+            )
+            items.append(
+                {
+                    "type": "function_call_output",
+                    "id": f"fco_{index}",
+                    "call_id": f"call_{index}",
+                    "output": "x" * payload_chars,
+                }
+            )
+        return {
+            "call_type": "aresponses",
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+            },
+            "input": items,
+        }
+
+    def test_a_history_of_many_medium_outputs_is_trimmed_by_size(self) -> None:
+        """A light-output history must not replay whole.
+
+        Eleven snapshots once held 72% of one session's replayed tool output.
+        That history had few, heavy outputs, so a count of kept outputs bounded
+        it.  A thread whose outputs are many and medium -- forty-odd tool calls
+        of a few kilobytes each -- stayed under that count on every turn, so
+        nothing was elided at all and the upstream answered the request with
+        its incomplete-tool-record rejection no matter what the client did.
+        """
+
+        hooks, _ = load_hook_module()
+        # A snapshot-sized payload, so the default floor is not what decides.
+        self.set_env(hooks._HISTORY_TOOL_OUTPUT_KEPT_CHARS_ENV, "60000")
+        request = self._request(pairs=30, payload_chars=30_000)
+
+        updated = hooks._with_elided_oversized_tool_outputs(request)
+
+        self.assertIsNotNone(updated)
+        assert updated is not None
+        outputs = [
+            item
+            for item in updated["input"]
+            if item["type"] == "function_call_output"
+        ]
+        kept = [item for item in outputs if item["output"] == "x" * 30_000]
+        self.assertLessEqual(len(kept) * 30_000, 60_000)
+        self.assertEqual(len(kept), 2)
+        elided = [item for item in outputs if item["output"] != "x" * 30_000]
+        self.assertTrue(elided)
+        self.assertIn("elided", elided[0]["output"][0]["text"])
+        # The newest record survives whole, so the model still works from it.
+        self.assertEqual(outputs[-1]["output"], "x" * 30_000)
+
+    def test_a_dropped_output_leaves_no_incomplete_tool_record(self) -> None:
+        """A call whose output was elided is rewritten with it.
+
+        Keeping the call and dropping the record it introduced is exactly the
+        incomplete tool record the gateway rejects, and the client replays its
+        corrected transcript back to us on the next turn, so the position stays
+        wrong for the rest of the thread.
+        """
+
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._HISTORY_TOOL_OUTPUT_KEPT_CHARS_ENV, "60_000")
+        request = self._request(pairs=6, payload_chars=30_000)
+
+        updated = hooks._with_elided_oversized_tool_outputs(request)
+
+        self.assertIsNotNone(updated)
+        assert updated is not None
+        items = updated["input"]
+        for index, item in enumerate(items):
+            if item["type"] != "function_call":
+                continue
+            output = items[index + 1]
+            self.assertEqual(output["type"], "function_call_output")
+            if output["output"] == "x" * 30_000:
+                continue
+            self.assertIn("elided", item["arguments"])
+            # Identity, name and namespace travel with the placeholder.
+            self.assertEqual(item["call_id"], output["call_id"])
+            self.assertEqual(item["name"], "exec_command")
+            self.assertEqual(item["namespace"], "functions")
+
+    def test_a_history_that_fits_is_left_byte_for_byte(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._HISTORY_TOOL_OUTPUT_KEPT_CHARS_ENV, "1000000")
+        request = self._request(pairs=5, payload_chars=30_000)
+
+        self.assertIsNone(hooks._with_elided_oversized_tool_outputs(request))

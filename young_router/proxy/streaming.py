@@ -14,6 +14,7 @@ from . import responses_tools as _responses_tools_module
 from . import responses_web_search_bridge as _responses_web_search_bridge_module
 from . import routing as _routing_module
 from . import state as _state_module
+from . import stream_continuation as _stream_continuation_module
 from . import tools as _tools_module
 from . import trace as _trace_module
 
@@ -1585,9 +1586,21 @@ def _synthesized_native_stream_error_chunk(
     request_data: dict,
     exception: Exception,
 ) -> Any:
-    """Return a terminal error in the client's native streaming format."""
+    """Return a terminal error in the client's native streaming format.
 
-    message = "The upstream model route failed before a final assistant response was available."
+    The message and code come from the same classifiers the Responses event
+    uses.  A hardcoded "upstream_route_failure" told a Chat Completions client
+    nothing about which of the very different causes it was looking at, so an
+    idle timeout, a relay channel outage, and a restart all arrived as the same
+    unexplained stop at whatever text had already streamed.
+    """
+
+    model = (
+        _responses_execution_module._request_model_group(request_data)
+        or request_data.get("model")
+    )
+    error_code = _native_stream_error_code(exception)
+    message = _native_stream_error_message(model, exception, request_data)
     if _request_is_anthropic_messages_stream(request_data):
         payload = {
             "type": "error",
@@ -1601,10 +1614,70 @@ def _synthesized_native_stream_error_chunk(
     return {
         "error": {
             "type": "server_error",
-            "code": "upstream_route_failure",
+            "code": error_code,
             "message": message,
         }
     }
+
+
+def _native_stream_error_code(exception: Exception) -> str:
+    if _routing_module._is_local_shutdown_exception(exception):
+        return "router_restarting"
+    if _routing_module._is_context_size_error(exception):
+        return "upstream_context_too_large"
+    if _routing_module._is_terminal_prompt_or_policy_error(exception):
+        return "upstream_prompt_rejected"
+    if _routing_module._is_image_generation_all_deployments_unsupported_error(
+        exception
+    ):
+        return "image_generation_tool_unavailable"
+    if _routing_module._is_upstream_relay_capacity_error(exception):
+        return "upstream_relay_capacity"
+    if _routing_module._is_upstream_deployment_failover_error(exception):
+        return "upstream_auth_or_balance"
+    # The router's own timeout predicate answers for both reasons, so the
+    # narrower start timeout is read first.
+    if _routing_module._is_local_stream_start_timeout_error(exception):
+        return "upstream_stream_start_timeout"
+    if _routing_module._is_local_stream_timeout_error(exception):
+        return "upstream_stream_idle_timeout"
+    if getattr(exception, "stream_incomplete", False):
+        return "upstream_stream_incomplete"
+    return "upstream_route_failure"
+
+
+def _native_stream_error_message(
+    model: Optional[str],
+    exception: Exception,
+    request_data: dict,
+) -> str:
+    if _routing_module._is_local_shutdown_exception(exception):
+        return (
+            "The router was restarting while this turn was streaming, so the "
+            "response was cut short. Send the message again."
+        )
+    if _routing_module._is_local_stream_start_timeout_error(exception):
+        return (
+            "The upstream model route produced no response in time. Send the "
+            "message again or choose another model route."
+        )
+    if _routing_module._is_local_stream_timeout_error(exception):
+        return (
+            "The upstream model route stopped sending this response, so the "
+            "turn was cut short. Send the message again or choose another "
+            "model route."
+        )
+    if getattr(exception, "stream_incomplete", False):
+        return (
+            "The upstream model route ended the stream before it reported the "
+            "response as finished. Send the message again or choose another "
+            "model route."
+        )
+    return _routing_module._sanitized_upstream_route_failure_message(
+        model,
+        exception,
+        request_data,
+    )
 
 
 def _external_web_search_missing_answer_failed_event(
@@ -3997,6 +4070,187 @@ async def _yield_validated_structured_codex_compaction_stream(
     )
 
 
+async def _yield_native_stream_with_output_limit_continuation(
+    buffer: List[Any],
+    response: Any,
+    request_data: dict,
+    *,
+    stream_started_at: Optional[float] = None,
+    saw_visible_output: bool = False,
+) -> AsyncIterator[Any]:
+    """Deliver a Chat/Anthropic stream, continuing one its route cut off.
+
+    A route that reaches its own output ceiling closes the answer -- not the
+    turn -- with a terminal frame whose reason names the limit.  That frame is
+    withheld and the same route is asked for the rest, so a full-document
+    translation arrives as one answer instead of stopping mid-sentence.  The
+    withheld frame is re-emitted only when no continuation is possible, which
+    keeps a client that reads the reason (rather than the text) from being told
+    an unfinished answer was finished.
+    """
+
+    finished_choice_indices: set[int] = set()
+    saw_terminal = False
+    success_recorded = False
+    native_chunk_count = 0
+    # Whether any part of the *answer* reached the client.  Thinking does
+    # not count: a client renders it as a live activity block and needs no
+    # reconciliation, so a route that only ever streamed thinking can still
+    # be replaced by a peer.
+    visible_output_delivered = saw_visible_output
+    # The terminal frame this route emitted when it hit its output ceiling.
+    # Held back until the answer is finished so the client is never told an
+    # unfinished answer was complete.
+    withheld_ceiling_terminal: Optional[Any] = None
+    # Everything this answer has delivered, so a continuation resumes from the
+    # end of it instead of restarting the answer.
+    delivered_text_parts: List[str] = []
+
+    def remember_delivered_text(chunk: Any) -> Any:
+        text = _responses_output_module._response_text(chunk)
+        if text:
+            delivered_text_parts.append(text)
+        return chunk
+
+    def inspect_native_chunk(chunk: Any) -> bool:
+        nonlocal saw_terminal
+        nonlocal success_recorded
+        nonlocal native_chunk_count
+        nonlocal visible_output_delivered
+        chunk_exception = _stream_chunk_error_exception(chunk)
+        if chunk_exception is not None:
+            if saw_terminal:
+                return False
+            raise chunk_exception
+        native_chunk_count += 1
+        visible_output_delivered = (
+            visible_output_delivered or _stream_chunk_has_visible_output(chunk)
+        )
+        saw_terminal = saw_terminal or _native_stream_chunk_is_terminal(
+            chunk,
+            request_data,
+            finished_choice_indices,
+        )
+        if saw_terminal and not success_recorded:
+            _routing_module._record_deployment_success_for_cooldown(
+                request_data
+            )
+            success_recorded = True
+        return True
+
+    async def deliver_route() -> AsyncIterator[Any]:
+        nonlocal withheld_ceiling_terminal
+        nonlocal native_chunk_count
+        for chunk in buffer:
+            if not inspect_native_chunk(chunk):
+                return
+            yield remember_delivered_text(chunk)
+        async for chunk in _stream_with_idle_timeout(
+            response,
+            request_data,
+            stream_started_at=stream_started_at,
+            saw_visible_output=visible_output_delivered,
+            initial_chunk_count=len(buffer),
+        ):
+            chunk_exception = _stream_chunk_error_exception(chunk)
+            if chunk_exception is not None:
+                if saw_terminal:
+                    return
+                raise chunk_exception
+            if _stream_continuation_module._native_stream_output_limit_reason(chunk) is not None:
+                # This frame carries the answer's own completion state, so the
+                # delivery below is what decides whether it is ever sent.
+                withheld_ceiling_terminal = chunk
+                native_chunk_count += 1
+                return
+            if not inspect_native_chunk(chunk):
+                return
+            yield remember_delivered_text(chunk)
+
+    try:
+        async for chunk in deliver_route():
+            yield chunk
+    except Exception as exception:
+        if _routing_module._is_local_shutdown_exception(exception):
+            # The worker is being replaced.  Once the client has received
+            # answer text, a synthetic terminal failure would be rendered
+            # as ``router_restarting`` and stop the turn; let the response
+            # close so the client-side reconnect path can take over.
+            return
+        if saw_terminal:
+            return
+        if _routing_module._is_request_scoped_priority_deployment_failover_error(
+            exception,
+            request_data,
+        ):
+            _routing_module._mark_exception_for_deployment_failover(
+                exception,
+                request_data,
+            )
+        # Committing the buffered start to the client -- which the chunk
+        # cap does after 20 frames -- must not cost a thinking-only turn
+        # its route recovery.  An answer that was never delivered leaves
+        # nothing to reconcile, so a peer route may still serve the turn;
+        # a stream that already showed answer text keeps its pinned
+        # behaviour and reports the failure itself.
+        if visible_output_delivered:
+            raise
+        async for fallback_chunk in _yield_streaming_error_fallback_or_raise(
+            request_data,
+            exception,
+        ):
+            yield fallback_chunk
+        return
+
+    if withheld_ceiling_terminal is not None:
+        # The route stopped at its own ceiling.  Ask it for the rest and splice
+        # the continuation into this same answer; the withheld frame is sent
+        # only when there is nothing more to ask for.
+        continued = False
+        async for chunk in _stream_continuation_module._stream_native_continuation_rounds(
+            request_data,
+            "".join(delivered_text_parts),
+            stream_idle_timeout_seconds=_resolved_stream_timeout_seconds(
+                request_data,
+                "stream_idle_timeout_seconds",
+                _routing_module._stream_idle_timeout_seconds_for_request,
+            ),
+        ):
+            continued = True
+            yield remember_delivered_text(chunk)
+        # The continuation owns the answer's last frame: when it reached a
+        # natural stop it already emitted that frame, and when it ran out of
+        # rounds the withheld "length" frame is the honest report that the
+        # answer is still unfinished.  Re-emitting the withheld frame on top of
+        # a natural stop would tell the client an answer that finished had hit
+        # the ceiling.
+        if not continued:
+            yield withheld_ceiling_terminal
+        return
+
+    if not saw_terminal:
+        incomplete_exception = _native_stream_incomplete_exception(
+            request_data,
+            buffered_chunks=native_chunk_count,
+        )
+        # Same rule for the stream that simply ended: the route is only
+        # pinned once it has delivered part of the answer.  A clean EOF
+        # after thinking alone advances to the next route instead of
+        # ending the turn with a route the user never saw an answer from.
+        if visible_output_delivered:
+            if _routing_module._is_local_shutdown_exception(
+                incomplete_exception
+            ):
+                return
+            raise incomplete_exception
+        async for fallback_chunk in _yield_streaming_error_fallback_or_raise(
+            request_data,
+            incomplete_exception,
+        ):
+            yield fallback_chunk
+        return
+
+
 async def _yield_guarded_original_stream(
     buffer: List[Any],
     response: Any,
@@ -4008,109 +4262,14 @@ async def _yield_guarded_original_stream(
     synthesize_completed_on_clean_eof_after_visible_output: bool = False,
 ) -> AsyncIterator[Any]:
     if not _request_is_responses_stream(request_data):
-        finished_choice_indices: set[int] = set()
-        saw_terminal = False
-        success_recorded = False
-        native_chunk_count = 0
-        # Whether any part of the *answer* reached the client.  Thinking does
-        # not count: a client renders it as a live activity block and needs no
-        # reconciliation, so a route that only ever streamed thinking can still
-        # be replaced by a peer.
-        visible_output_delivered = saw_visible_output
-
-        def inspect_native_chunk(chunk: Any) -> bool:
-            nonlocal saw_terminal
-            nonlocal success_recorded
-            nonlocal native_chunk_count
-            nonlocal visible_output_delivered
-            chunk_exception = _stream_chunk_error_exception(chunk)
-            if chunk_exception is not None:
-                if saw_terminal:
-                    return False
-                raise chunk_exception
-            native_chunk_count += 1
-            visible_output_delivered = (
-                visible_output_delivered or _stream_chunk_has_visible_output(chunk)
-            )
-            saw_terminal = saw_terminal or _native_stream_chunk_is_terminal(
-                chunk,
-                request_data,
-                finished_choice_indices,
-            )
-            if saw_terminal and not success_recorded:
-                _routing_module._record_deployment_success_for_cooldown(
-                    request_data
-                )
-                success_recorded = True
-            return True
-
-        try:
-            for chunk in buffer:
-                if not inspect_native_chunk(chunk):
-                    return
-                yield chunk
-            async for chunk in _stream_with_idle_timeout(
-                response,
-                request_data,
-                stream_started_at=stream_started_at,
-                saw_visible_output=visible_output_delivered,
-                initial_chunk_count=len(buffer),
-            ):
-                if not inspect_native_chunk(chunk):
-                    return
-                yield chunk
-        except Exception as exception:
-            if _routing_module._is_local_shutdown_exception(exception):
-                # The worker is being replaced.  Once the client has received
-                # answer text, a synthetic terminal failure would be rendered
-                # as ``router_restarting`` and stop the turn; let the response
-                # close so the client-side reconnect path can take over.
-                return
-            if saw_terminal:
-                return
-            if _routing_module._is_request_scoped_priority_deployment_failover_error(
-                exception,
-                request_data,
-            ):
-                _routing_module._mark_exception_for_deployment_failover(
-                    exception,
-                    request_data,
-                )
-            # Committing the buffered start to the client -- which the chunk
-            # cap does after 20 frames -- must not cost a thinking-only turn
-            # its route recovery.  An answer that was never delivered leaves
-            # nothing to reconcile, so a peer route may still serve the turn;
-            # a stream that already showed answer text keeps its pinned
-            # behaviour and reports the failure itself.
-            if visible_output_delivered:
-                raise
-            async for fallback_chunk in _yield_streaming_error_fallback_or_raise(
-                request_data,
-                exception,
-            ):
-                yield fallback_chunk
-            return
-        if not saw_terminal:
-            incomplete_exception = _native_stream_incomplete_exception(
-                request_data,
-                buffered_chunks=native_chunk_count,
-            )
-            # Same rule for the stream that simply ended: the route is only
-            # pinned once it has delivered part of the answer.  A clean EOF
-            # after thinking alone advances to the next route instead of
-            # ending the turn with a route the user never saw an answer from.
-            if visible_output_delivered:
-                if _routing_module._is_local_shutdown_exception(
-                    incomplete_exception
-                ):
-                    return
-                raise incomplete_exception
-            async for fallback_chunk in _yield_streaming_error_fallback_or_raise(
-                request_data,
-                incomplete_exception,
-            ):
-                yield fallback_chunk
-            return
+        async for chunk in _yield_native_stream_with_output_limit_continuation(
+            buffer,
+            response,
+            request_data,
+            stream_started_at=stream_started_at,
+            saw_visible_output=saw_visible_output,
+        ):
+            yield chunk
         return
 
     if _responses_request_module._request_has_structured_codex_compaction(

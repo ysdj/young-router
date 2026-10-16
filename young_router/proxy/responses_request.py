@@ -38,8 +38,9 @@ from .base import (
     _HISTORY_IMAGE_ELISION_DEFAULT_MIN_BYTES,
     _HISTORY_IMAGE_ELISION_KEEP_ENV,
     _HISTORY_IMAGE_ELISION_MIN_BYTES_ENV,
+    _HISTORY_TOOL_OUTPUT_DEFAULT_KEPT_CHARS,
     _HISTORY_TOOL_OUTPUT_DEFAULT_MIN_CHARS,
-    _HISTORY_TOOL_OUTPUT_KEPT,
+    _HISTORY_TOOL_OUTPUT_KEPT_CHARS_ENV,
     _HISTORY_TOOL_OUTPUT_MIN_CHARS_ENV,
     _PREFIX_IMAGE_MODE_DEFAULT,
     _PREFIX_IMAGE_MODE_ENV,
@@ -3136,8 +3137,137 @@ def _history_tool_output_min_chars() -> int:
     return max(0, parsed)
 
 
+def _history_tool_output_kept_chars() -> int:
+    """Replayed tool-call record size kept whole at the end of the history."""
+
+    value = os.getenv(_HISTORY_TOOL_OUTPUT_KEPT_CHARS_ENV, "").strip()
+    if not value:
+        return _HISTORY_TOOL_OUTPUT_DEFAULT_KEPT_CHARS
+    try:
+        parsed = int(value)
+    except ValueError:
+        return _HISTORY_TOOL_OUTPUT_DEFAULT_KEPT_CHARS
+    return max(0, parsed)
+
+
+def _history_tool_call_record_kind(item_type: Any) -> Optional[str]:
+    """Return the lane a tool record belongs to, or ``None``.
+
+    An exec call and the exec output that consumed it are one record to the
+    upstream, so a replayed window that kept the call and dropped the output
+    with it would hand the gateway exactly the incomplete tool record it
+    rejects.  Both items of a lane are measured, kept and elided together.
+    """
+
+    if item_type in ("custom_tool_call", "custom_tool_call_output"):
+        return "custom"
+    if item_type in ("function_call", "function_call_output"):
+        return "function"
+    return None
+
+
+def _tool_record_weight(item: Any) -> int:
+    """Characters an item spends on the replayed tool-record budget."""
+
+    if not isinstance(item, dict):
+        return 0
+    item_type = item.get("type")
+    if item_type in ("custom_tool_call_output", "function_call_output"):
+        return len(json.dumps(item.get("output"), ensure_ascii=False))
+    if item_type == "function_call":
+        return len(json.dumps(item.get("arguments"), ensure_ascii=False))
+    if item_type == "custom_tool_call":
+        script = item.get("input")
+        return len(script) if isinstance(script, str) else 0
+    return 0
+
+
+def _elided_tool_call_note(size_chars: int) -> str:
+    return (
+        f"[{size_chars} characters elided: this tool output is outside the "
+        "replayed history window. Run the tool again if its contents are "
+        "needed.]"
+    )
+
+
+def _elided_tool_call_placeholder(note: str) -> str:
+    return json.dumps({"elided": note}, ensure_ascii=False)
+
+
+def _elided_peer_call(item: dict, note: str) -> Optional[dict]:
+    """Return the call of a record this pass emptied.
+
+    An older call whose output is *outside* the window is left alone, because it
+    already reads as prose the model produced: rewriting it would edit a
+    transcript the model never wrote.  The call the gateway refuses on is the
+    one whose record this pass just blanked, which is why the rewrite is driven
+    by the elided outputs rather than by every old call.  The fields the client
+    reads for identity -- id, call_id, namespace, name, status -- travel with
+    the placeholder.
+    """
+
+    if item.get("type") == "function_call":
+        arguments = item.get("arguments")
+        if isinstance(arguments, str):
+            return dict(item, arguments=_elided_tool_call_placeholder(note))
+        return None
+    script = item.get("input")
+    if isinstance(script, str):
+        return dict(item, input=note)
+    return None
+
+
+def _tool_call_lane_by_index(input_items: list) -> dict[int, str]:
+    """Map every tool-record index to the lane it belongs to.
+
+    A call and its output are one record to the upstream, and a request carries
+    the same record in one of two lane shapes.  Both items of a lane are
+    measured, judged and rewritten together, which is why the whole lane is what
+    this pass counts rather than each output on its own.
+    """
+
+    lane_by_index: dict[int, str] = {}
+    for index, item in enumerate(input_items):
+        if not isinstance(item, dict):
+            continue
+        lane = _history_tool_call_record_kind(item.get("type"))
+        if lane is not None:
+            lane_by_index[index] = lane
+    return lane_by_index
+
+
+def _frozen_tool_call_lane_ids(input_items: list) -> set[str]:
+    """Lanes whose every item sits before the request's signed boundary.
+
+    Signed content freezes the bytes before it: a lane that ends at or before
+    the first signed item is re-sent by the client exactly as it first went out,
+    so a record rewritten here would come back rewritten on the request after
+    this one and could never be repaired.  A lane with any item past the
+    boundary is mutable, because that is where this pass is allowed to write at
+    all.
+    """
+
+    lane_by_index = _tool_call_lane_by_index(input_items)
+    if not lane_by_index:
+        return set()
+    boundary: Optional[int] = None
+    for index, item in enumerate(input_items):
+        if isinstance(item, dict) and _value_has_encrypted_content(item):
+            boundary = index
+            break
+    if boundary is None:
+        return set()
+    frozen: set[str] = set()
+    for index, lane in lane_by_index.items():
+        if index >= boundary:
+            frozen.discard(lane)
+            continue
+        frozen.add(lane)
+    return frozen
+
+
 def _with_elided_oversized_tool_outputs(request_kwargs: dict) -> Optional[dict]:
-    """Drop oversized payloads from old tool outputs on every Responses turn.
+    """Bound the replayed tool-call window in the mutable replay suffix.
 
     A screenshot, a page snapshot or a file dump is consumed once and then
     replayed on every later turn.  Measured on one session, four image outputs
@@ -3146,6 +3276,17 @@ def _with_elided_oversized_tool_outputs(request_kwargs: dict) -> Optional[dict]:
     reported 80% of its own window.  The item keeps its type, its identity and
     its position, so the model still sees that the tool ran and can ask for the
     content again; only the payload is dropped.
+
+    What the window bounds is the replayed tool-call *tail*, in characters, per
+    lane: a window counted in outputs kept the last eight outputs whatever they
+    weighed, so a history of many medium outputs replayed whole on every turn
+    until the upstream refused it -- a 141-output Codex thread kept eight of
+    them, forty-odd records once both lanes of the request are counted.
+
+    This pass runs after the image passes, and it may only rewrite what they
+    left behind: an image output already replaced by previews and path
+    references is small, and one the client re-sends from its own frozen
+    transcript cannot be rewritten at all.
     """
 
     input_items = request_kwargs.get("input")
@@ -3154,37 +3295,100 @@ def _with_elided_oversized_tool_outputs(request_kwargs: dict) -> Optional[dict]:
     min_chars = _history_tool_output_min_chars()
     if min_chars <= 0:
         return None
-    positions = [
-        index
-        for index, item in enumerate(input_items)
-        if isinstance(item, dict)
-        and item.get("type") in {"custom_tool_call_output", "function_call_output"}
-    ]
-    elidable = set(
-        positions[: max(0, len(positions) - _HISTORY_TOOL_OUTPUT_KEPT)]
-    )
-    if not elidable:
+    kept_chars = _history_tool_output_kept_chars()
+    if kept_chars <= 0:
         return None
-    rewritten: list[Any] = []
-    elided_outputs = 0
-    elided_chars = 0
-    for index, item in enumerate(input_items):
-        if index in elidable and isinstance(item, dict):
-            encoded = json.dumps(item.get("output"), ensure_ascii=False)
-            if len(encoded) > min_chars:
-                note = (
-                    f"[{len(encoded)} characters elided: this tool output was a "
-                    "large screenshot, page snapshot, or file dump that is no "
-                    "longer current. Run the tool again if its contents are "
-                    "needed.]"
-                )
-                updated = dict(item)
-                updated["output"] = [{"type": "input_text", "text": note}]
-                rewritten.append(updated)
-                elided_outputs += 1
-                elided_chars += len(encoded) - len(note)
+    lane_by_index = _tool_call_lane_by_index(input_items)
+    if not lane_by_index:
+        return None
+    frozen_lanes = _frozen_tool_call_lane_ids(input_items)
+    lane_weights: dict[str, int] = {}
+    for index, lane in lane_by_index.items():
+        lane_weights[lane] = lane_weights.get(lane, 0) + _tool_record_weight(
+            input_items[index]
+        )
+    if not lane_weights:
+        return None
+    elided_by_index: dict[int, dict] = {}
+    for lane, weight in lane_weights.items():
+        if weight <= kept_chars:
+            continue
+        if lane in frozen_lanes:
+            continue
+        lane_indices = sorted(
+            index for index, value in lane_by_index.items() if value == lane
+        )
+        # The newest record is the one being answered, so it is kept whole even
+        # when it alone exceeds the window: the window is a floor under what the
+        # model works from, not a guarantee.  Everything older than it is
+        # emptied once the lane leaves the window, record by record.
+        newest_index = lane_indices[-1] if lane_indices else -1
+        for index in reversed(lane_indices):
+            item = input_items[index]
+            if not isinstance(item, dict):
                 continue
-        rewritten.append(item)
+            if index == newest_index:
+                continue
+            if not item.get("type", "").endswith("_output"):
+                continue
+            item_weight = _tool_record_weight(item)
+            if item_weight <= min_chars:
+                continue
+            weight -= item_weight
+            if weight <= kept_chars:
+                break
+            updated = dict(item)
+            updated["output"] = [
+                {"type": "input_text", "text": _elided_tool_call_note(item_weight)}
+            ]
+            elided_by_index[index] = updated
+    if not elided_by_index:
+        return None
+    # The call of every record this pass emptied is rewritten with it, so the
+    # replay never carries a call whose record arrived blank.  The pairing is
+    # by position, the way the client writes its own transcript: the call item
+    # that introduced the output sits immediately before it, or one reasoning
+    # item above it.  The identifiers are not used for the pairing because a
+    # replayed wire may carry only one of ``call_id`` / ``id`` on either side.
+    peer_updates: dict[int, dict] = {}
+    for index in sorted(elided_by_index):
+        if not input_items[index].get("type", "").endswith("_output"):
+            continue
+        for offset in (1, 2):
+            peer_index = index - offset
+            if peer_index < 0:
+                break
+            peer = input_items[peer_index]
+            if not isinstance(peer, dict):
+                continue
+            if _history_tool_call_record_kind(peer.get("type")) is None:
+                continue
+            if peer.get("type", "").endswith("_output"):
+                break
+            updated = _elided_peer_call(
+                peer,
+                _elided_tool_call_note(_tool_record_weight(input_items[index])),
+            )
+            if updated is not None:
+                peer_updates[peer_index] = updated
+            break
+    elided_by_index.update(peer_updates)
+    rewritten = [
+        elided_by_index.get(index, item) for index, item in enumerate(input_items)
+    ]
+    elided_outputs = sum(
+        1
+        for index, updated in elided_by_index.items()
+        if updated.get("type", "").endswith("_output")
+    )
+    elided_chars = sum(
+        max(
+            0,
+            _tool_record_weight(input_items[index])
+            - _tool_record_weight(updated),
+        )
+        for index, updated in elided_by_index.items()
+    )
     if not elided_outputs:
         return None
     result = dict(request_kwargs)

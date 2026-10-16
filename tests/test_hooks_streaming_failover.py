@@ -2619,3 +2619,527 @@ class HookStreamingFailoverTests(HookTestCase):
         self.assertNotIn("Retrieved evidence:", json.dumps(recovery_requests[0]))
         self.assertNotIn("external_web_search_synthesis", recovery_requests[0].get("litellm_metadata", {}))
         self.assertEqual(chunks[-1]["type"], "response.completed")
+
+
+class HookNativeStreamTerminalErrorTests(HookTestCase):
+    """The Chat/Anthropic terminal error must name the cause it stands for.
+
+    Every exhausted route used to reach a native event-stream client as one
+    hardcoded ``upstream_route_failure`` line, so an idle timeout, a relay
+    channel outage, and a worker replacement all arrived as the same
+    unexplained stop at whatever text had already streamed.
+    """
+
+    def _chat_request(self) -> dict:
+        return {
+            "model": "default-chat",
+            "messages": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+        }
+
+    def _timeout_exception(self, reason: str, **body: object) -> Exception:
+        exception = RuntimeError(f"probe {reason}")
+        exception.status_code = 504  # type: ignore[attr-defined]
+        exception.body = {"reason": reason, **body}  # type: ignore[attr-defined]
+        return exception
+
+    async def test_idle_timeout_is_named_instead_of_a_generic_route_failure(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        exception = self._timeout_exception(
+            "stream_idle_timeout",
+            idle_seconds=120.0,
+            saw_chunk=True,
+        )
+
+        chunk = hooks._synthesized_native_stream_error_chunk(
+            self._chat_request(),
+            exception,
+        )
+
+        self.assertEqual(chunk["error"]["code"], "upstream_stream_idle_timeout")
+        self.assertNotEqual(chunk["error"]["code"], "upstream_route_failure")
+        self.assertIn("stopped sending", chunk["error"]["message"])
+
+    async def test_start_timeout_keeps_its_own_code(self) -> None:
+        # The router's timeout predicate answers for both reasons, so the
+        # narrower start timeout has to be read before the idle one.
+        hooks, _proxy_server = load_hook_module()
+        exception = self._timeout_exception(
+            "stream_start_timeout",
+            start_seconds=120.0,
+            saw_chunk=False,
+            buffered_chunks=0,
+        )
+
+        chunk = hooks._synthesized_native_stream_error_chunk(
+            self._chat_request(),
+            exception,
+        )
+
+        self.assertEqual(chunk["error"]["code"], "upstream_stream_start_timeout")
+        self.assertIn("no response in time", chunk["error"]["message"])
+
+    async def test_truncated_native_stream_is_named_as_incomplete(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        exception = RuntimeError(
+            "Chat Completions stream ended before a terminal finish_reason"
+        )
+        exception.status_code = 503  # type: ignore[attr-defined]
+        exception.stream_incomplete = True  # type: ignore[attr-defined]
+        exception.body = {  # type: ignore[attr-defined]
+            "reason": "chat_completions_stream_incomplete",
+            "buffered_chunks": 3,
+        }
+
+        chunk = hooks._synthesized_native_stream_error_chunk(
+            self._chat_request(),
+            exception,
+        )
+
+        self.assertEqual(chunk["error"]["code"], "upstream_stream_incomplete")
+        self.assertIn("before it reported the response as finished", chunk["error"]["message"])
+
+    async def test_anthropic_terminal_error_keeps_its_wire_shape(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        request_data = {
+            "model": "default-claude",
+            "messages": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "proxy_server_request": {"url": "http://127.0.0.1:12390/v1/messages"},
+        }
+        exception = self._timeout_exception(
+            "stream_idle_timeout",
+            idle_seconds=120.0,
+            saw_chunk=True,
+        )
+
+        payload = hooks._synthesized_native_stream_error_chunk(
+            request_data,
+            exception,
+        )
+        decoded = payload.decode("utf-8")
+
+        self.assertTrue(decoded.startswith("event: error\ndata: "))
+        event = json.loads(decoded.split("data: ", 1)[1])
+        self.assertEqual(event["type"], "error")
+        self.assertEqual(event["error"]["type"], "api_error")
+        self.assertIn("stopped sending", event["error"]["message"])
+
+
+class HookOutputStreamContinuationTests(HookTestCase):
+    """A route that hits its own output ceiling must not end the answer.
+
+    ``finish_reason: "length"`` is the route saying "the answer is not
+    finished".  It is not a failure, so no recovery path ran and a
+    full-document translation stopped mid-sentence while the client reported a
+    successful turn.
+    """
+
+    def _chat_request(self) -> dict:
+        return {
+            "model": "default-chat",
+            "messages": [{"role": "user", "content": "翻译这篇文献。"}],
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/chat/completions"},
+        }
+
+    async def test_length_finish_reason_is_recognized(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        continuation_module = sys.modules["young_router.proxy.stream_continuation"]
+
+        ceiling = {
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}],
+        }
+        self.assertEqual(
+            continuation_module._native_stream_output_limit_reason(ceiling),
+            "length",
+        )
+
+        stopped = {
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        }
+        self.assertIsNone(
+            continuation_module._native_stream_output_limit_reason(stopped)
+        )
+
+    async def test_a_tool_turn_is_never_extended(self) -> None:
+        # A ceiling inside a tool turn means the call the model was writing is
+        # incomplete; replaying that as more text would hand the client a
+        # half-written call it cannot execute.
+        _, _proxy_server = load_hook_module()
+        continuation_module = sys.modules["young_router.proxy.stream_continuation"]
+        request_data = self._chat_request()
+        request_data["tools"] = [{"type": "function", "function": {"name": "probe"}}]
+
+        self.assertFalse(
+            continuation_module._request_is_continuable_native_stream(request_data)
+        )
+
+    async def test_a_client_supplied_ceiling_does_not_block_continuation(self) -> None:
+        """A ``max_tokens`` in the body is not proof the user chose one.
+
+        Cherry Studio sends the assistant's ``maxTokens`` (4096 by default) on
+        every request even when the per-assistant limit is switched off, so
+        refusing to continue any request that carries one disabled the repair
+        for exactly the client whose translations were being cut off at 4096.
+        """
+        _, _proxy_server = load_hook_module()
+        continuation_module = sys.modules["young_router.proxy.stream_continuation"]
+        self.set_env(continuation_module._STREAM_CONTINUATION_ENV, "1")
+        request_data = self._chat_request()
+        request_data["max_tokens"] = 4096
+
+        self.assertTrue(
+            continuation_module._request_is_continuable_native_stream(request_data)
+        )
+
+    async def test_the_continuation_drops_the_clients_ceiling(self) -> None:
+        # Keeping the client's ceiling would stop the continuation at the same
+        # place and never make progress.
+        _, _proxy_server = load_hook_module()
+        continuation_module = sys.modules["young_router.proxy.stream_continuation"]
+        request_data = self._chat_request()
+        request_data["max_tokens"] = 4096
+        request_data["max_completion_tokens"] = 4096
+
+        payload = continuation_module._continuation_request_payload(
+            request_data,
+            "已经译好的内容。",
+        )
+
+        self.assertIsNotNone(payload)
+        self.assertNotIn("max_tokens", payload)
+        self.assertNotIn("max_completion_tokens", payload)
+
+    async def test_continuation_is_off_by_default(self) -> None:
+        """The client's ceiling belongs to the client's own configuration.
+
+        Fixing it there is the right repair, so the router only takes over when
+        an operator turns this on.
+        """
+        _, _proxy_server = load_hook_module()
+        continuation_module = sys.modules["young_router.proxy.stream_continuation"]
+
+        self.assertFalse(
+            continuation_module._request_is_continuable_native_stream(
+                self._chat_request()
+            )
+        )
+
+    async def test_the_runtime_toggle_enables_continuation(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        continuation_module = sys.modules["young_router.proxy.stream_continuation"]
+        self.set_env(continuation_module._STREAM_CONTINUATION_ENV, "1")
+        self.assertTrue(
+            continuation_module._request_is_continuable_native_stream(
+                self._chat_request()
+            )
+        )
+        self.set_env(continuation_module._STREAM_CONTINUATION_ENV, "0")
+        self.assertFalse(
+            continuation_module._request_is_continuable_native_stream(
+                self._chat_request()
+            )
+        )
+
+    async def test_the_continuation_request_carries_the_delivered_tail(self) -> None:
+        _, _proxy_server = load_hook_module()
+        continuation_module = sys.modules["young_router.proxy.stream_continuation"]
+        request_data = self._chat_request()
+        request_data["temperature"] = 0.2
+        request_data["original_generic_function"] = lambda **kwargs: None
+        request_data["_target_order"] = 1
+
+        payload = continuation_module._continuation_request_payload(
+            request_data,
+            "第一段已经译好的内容",
+        )
+
+        self.assertIsNotNone(payload)
+        messages = payload["messages"]
+        self.assertEqual([m["role"] for m in messages], ["user", "assistant", "user"])
+        self.assertEqual(messages[1]["content"], "第一段已经译好的内容")
+        self.assertEqual(payload["temperature"], 0.2)
+        self.assertTrue(payload["stream"])
+        # The router's own dispatch state must never ride along on the call.
+        self.assertNotIn("original_generic_function", payload)
+        self.assertNotIn("_target_order", payload)
+
+    async def test_the_request_key_set_excludes_live_router_state(self) -> None:
+        # A live request holds the running event loop, which cannot be copied.
+        _, _proxy_server = load_hook_module()
+        continuation_module = sys.modules["young_router.proxy.stream_continuation"]
+
+        self.assertNotIn("original_generic_function", continuation_module._CONTINUATION_REQUEST_KEYS)
+        self.assertNotIn("litellm_metadata", continuation_module._CONTINUATION_REQUEST_KEYS)
+        self.assertNotIn("_target_order", continuation_module._CONTINUATION_REQUEST_KEYS)
+        self.assertNotIn("_excluded_deployment_ids", continuation_module._CONTINUATION_REQUEST_KEYS)
+
+    async def test_rounds_splice_the_continuation_into_one_answer(self) -> None:
+        """The end-to-end shape: a ceiling, then the rest, as one answer.
+
+        Driving the real helper against a stub route pins the whole contract --
+        the resumed prompt carries what was already written, the continuation's
+        frames are spliced into the answer, and the answer ends once on the
+        continuation's own ``stop`` rather than on the withheld ``length``.
+        """
+        hooks, proxy_server = load_hook_module()
+        continuation_module = sys.modules["young_router.proxy.stream_continuation"]
+        self.set_env(continuation_module._STREAM_CONTINUATION_ENV, "1")
+        # Each round adds the next piece and reports a ceiling until the last
+        # one, which closes the answer normally.
+        rounds = [
+            "第二段接着译的内容。",
+            "第三段收尾的内容。",
+            "",
+        ]
+        seen_prompts: list[list[dict]] = []
+
+        class StubRouter:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def acompletion(self, **kwargs):
+                index = min(self.calls, len(rounds) - 1)
+                self.calls += 1
+                seen_prompts.append(kwargs.get("messages"))
+
+                async def stream():
+                    text = rounds[index]
+                    if text:
+                        yield {
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"content": text},
+                                    "finish_reason": None,
+                                }
+                            ]
+                        }
+                    yield {
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": (
+                                    "length" if index < len(rounds) - 1 else "stop"
+                                ),
+                            }
+                        ]
+                    }
+
+                return stream()
+
+        original_router = getattr(proxy_server, "llm_router", None)
+        proxy_server.llm_router = StubRouter()
+        self.addCleanup(setattr, proxy_server, "llm_router", original_router)
+
+        request_data = self._chat_request()
+        chunks = [
+            chunk
+            async for chunk in continuation_module._stream_native_continuation_rounds(
+                request_data,
+                "第一段已经译好的内容。",
+                stream_idle_timeout_seconds=5.0,
+            )
+        ]
+
+        delivered = [
+            (chunk.get("choices") or [{}])[0].get("delta", {}).get("content")
+            for chunk in chunks
+        ]
+        # The helper yields only the continuation's own frames, in order: the
+        # text each round added, and nothing of the answer the client already
+        # read.
+        self.assertEqual(
+            [text for text in delivered if text],
+            ["第二段接着译的内容。", "第三段收尾的内容。"],
+        )
+        terminal = [
+            (chunk.get("choices") or [{}])[0].get("finish_reason")
+            for chunk in chunks
+            if (chunk.get("choices") or [{}])[0].get("finish_reason")
+        ]
+        self.assertEqual(terminal, ["stop"])
+        # The resumed prompt carries the answer so the model continues it.
+        self.assertEqual(
+            [m["role"] for m in seen_prompts[0]],
+            ["user", "assistant", "user"],
+        )
+        self.assertIn("第一段已经译好的内容。", seen_prompts[0][1]["content"])
+
+    async def test_the_round_limit_is_configurable(self) -> None:
+        # The bound is a setting, not a constant: a long document may need more
+        # rounds than a short one, and an operator may want fewer upstream
+        # calls. 0 keeps the route's truncated answer as it was.
+        _, _proxy_server = load_hook_module()
+        continuation_module = sys.modules["young_router.proxy.stream_continuation"]
+
+        self.assertEqual(continuation_module._max_continuation_rounds(), 8)
+        self.set_env(continuation_module._MAX_CONTINUATION_ROUNDS_ENV, "3")
+        self.assertEqual(continuation_module._max_continuation_rounds(), 3)
+        self.set_env(continuation_module._MAX_CONTINUATION_ROUNDS_ENV, "0")
+        self.assertEqual(continuation_module._max_continuation_rounds(), 0)
+        self.set_env(continuation_module._MAX_CONTINUATION_ROUNDS_ENV, "not-a-number")
+        self.assertEqual(continuation_module._max_continuation_rounds(), 8)
+
+    async def test_a_zero_round_limit_delivers_no_continuation(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        continuation_module = sys.modules["young_router.proxy.stream_continuation"]
+        self.set_env(continuation_module._MAX_CONTINUATION_ROUNDS_ENV, "0")
+
+        calls: list[int] = []
+
+        class StubRouter:
+            async def acompletion(self, **kwargs):
+                calls.append(1)
+
+                async def stream():
+                    yield {"choices": [{"index": 0, "delta": {"content": "x"}, "finish_reason": None}]}
+
+                return stream()
+
+        original_router = getattr(proxy_server, "llm_router", None)
+        proxy_server.llm_router = StubRouter()
+        self.addCleanup(setattr, proxy_server, "llm_router", original_router)
+
+        chunks = [
+            chunk
+            async for chunk in continuation_module._stream_native_continuation_rounds(
+                self._chat_request(),
+                "已经译好的内容",
+                stream_idle_timeout_seconds=5.0,
+            )
+        ]
+
+        self.assertEqual(chunks, [])
+        self.assertEqual(calls, [])
+
+    async def test_the_continuation_does_not_resend_the_source_document(self) -> None:
+        """Re-sending the document re-asks the original question.
+
+        A document-length user turn repeated verbatim beside the answer so far
+        made the route restart the translation instead of resuming it, and it
+        paid the whole prompt cost on every round.
+        """
+        _, _proxy_server = load_hook_module()
+        continuation_module = sys.modules["young_router.proxy.stream_continuation"]
+        document = "The study enrolled ten patients with platinum-sensitive disease. " * 400
+        request_data = {
+            "model": "default-chat",
+            "stream": True,
+            "messages": [
+                {"role": "system", "content": "Translate the whole document."},
+                {"role": "user", "content": document},
+            ],
+        }
+        delivered = "已译好的内容。" * 400
+
+        payload = continuation_module._continuation_request_payload(
+            request_data,
+            delivered,
+        )
+
+        self.assertIsNotNone(payload)
+        messages = payload["messages"]
+        self.assertEqual(
+            [m["role"] for m in messages],
+            ["system", "user", "assistant", "user"],
+        )
+        # The document is not carried whole: only a bounded tail quote of it.
+        self.assertLess(
+            len(messages[1]["content"]),
+            continuation_module._CONTINUATION_SOURCE_QUOTE_CHARS + 400,
+        )
+        self.assertNotIn(document, messages[1]["content"])
+        # The answer so far is the resume point, and it is the end of it.
+        self.assertEqual(
+            messages[2]["content"],
+            delivered[-continuation_module._CONTINUATION_TAIL_CHARS:],
+        )
+
+    async def test_the_continuation_names_the_document_as_context_only(self) -> None:
+        # The old preamble left the model reading a second "translate this"
+        # request, which is why it answered with a fresh refusal instead of the
+        # rest of the translation.
+        _, _proxy_server = load_hook_module()
+        continuation_module = sys.modules["young_router.proxy.stream_continuation"]
+        payload = continuation_module._continuation_request_payload(
+            {
+                "model": "default-chat",
+                "stream": True,
+                "messages": [{"role": "user", "content": "英文原文。" * 500}],
+            },
+            "已译内容。",
+        )
+
+        self.assertIsNotNone(payload)
+        opening = payload["messages"][0]["content"]
+        self.assertIn("not a new request", opening)
+
+    async def test_a_delivered_answer_reaches_the_continuation_in_full(self) -> None:
+        """The resume context must be the answer the client actually read.
+
+        An accumulator that only saw the last few frames handed the
+        continuation an almost empty answer, so the model had nothing to
+        resume from.
+        """
+        hooks, proxy_server = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        continuation_module = sys.modules["young_router.proxy.stream_continuation"]
+        self.set_env(continuation_module._STREAM_CONTINUATION_ENV, "1")
+        captured: dict = {}
+
+        class StubRouter:
+            async def acompletion(self, **kwargs):
+                captured["messages"] = kwargs.get("messages")
+
+                async def stream():
+                    yield {
+                        "choices": [
+                            {"index": 0, "delta": {"content": "[续写]"}, "finish_reason": None}
+                        ]
+                    }
+                    yield {
+                        "choices": [
+                            {"index": 0, "delta": {}, "finish_reason": "stop"}
+                        ]
+                    }
+
+                return stream()
+
+        original_router = getattr(proxy_server, "llm_router", None)
+        proxy_server.llm_router = StubRouter()
+        self.addCleanup(setattr, proxy_server, "llm_router", original_router)
+
+        frames = [
+            {"choices": [{"index": 0, "delta": {"content": f"第{i}句译文。"}, "finish_reason": None}]}
+            for i in range(300)
+        ]
+        frames.append({"choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]})
+
+        async def upstream():
+            for frame in frames:
+                yield frame
+
+        request_data = {
+            "model": "default-chat",
+            "stream": True,
+            "messages": [{"role": "user", "content": "翻译全文。"}],
+            "proxy_server_request": {"path": "/v1/chat/completions"},
+        }
+
+        async for _chunk in streaming._yield_native_stream_with_output_limit_continuation(
+            [],
+            upstream(),
+            request_data,
+            stream_started_at=0.0,
+        ):
+            pass
+
+        assistant_text = captured["messages"][-2]["content"]
+        expected = "".join(f"第{i}句译文。" for i in range(300))
+        self.assertEqual(
+            assistant_text,
+            expected[-continuation_module._CONTINUATION_TAIL_CHARS:],
+        )
