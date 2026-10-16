@@ -640,11 +640,23 @@ rsync -a \
   --exclude '*.pyc' \
   --exclude '*.pyo' \
   "$PROJECT_ROOT/young_router/" "$CORE/young_router/"
-copy_tree "$PI_WEB_ACCESS_PACKAGE_WORK" "$CORE/young_router/adapters/pi-web-access"
-copy_tree "$VERIDROP_WORK" "$CORE/young_router/adapters/veridrop"
-copy_tree "$WORKBUDDY_CONNECT_WORK" "$CORE/young_router/adapters/workbuddy-connect"
-copy_tree "$DSH_VISION_ROUTER_WORK" "$CORE/young_router/adapters/dsh-vision-router"
-copy_tree "$OPENCODE2DSH_WORK" "$CORE/young_router/adapters/opencode2dsh"
+# Filling the Core is seven copies that share nothing: five staged adapters, the
+# portable runtime, and its Node.  Together they are about 1.3 GB, and `cp -ac`
+# clones rather than copies, so run one after another they still spent a dozen
+# seconds -- and every second was a copy waiting for a volume that had nothing
+# else to do.  They run together here, on the same trees with the same per-copy
+# outcome, and the group is waited on and checked as a group before anything
+# reads what they wrote.
+COPY_PIDS=()
+start_copy() {
+  "$@" &
+  COPY_PIDS+=("$!")
+}
+start_copy copy_tree "$PI_WEB_ACCESS_PACKAGE_WORK" "$CORE/young_router/adapters/pi-web-access"
+start_copy copy_tree "$VERIDROP_WORK" "$CORE/young_router/adapters/veridrop"
+start_copy copy_tree "$WORKBUDDY_CONNECT_WORK" "$CORE/young_router/adapters/workbuddy-connect"
+start_copy copy_tree "$DSH_VISION_ROUTER_WORK" "$CORE/young_router/adapters/dsh-vision-router"
+start_copy copy_tree "$OPENCODE2DSH_WORK" "$CORE/young_router/adapters/opencode2dsh"
 
 if [[ -n "$RUNTIME_SOURCE" ]]; then
   if [[ ! -d "$RUNTIME_SOURCE/python" \
@@ -655,7 +667,7 @@ if [[ -n "$RUNTIME_SOURCE" ]]; then
     echo "YOUNG_ROUTER_CORE_RUNTIME_SOURCE must use the portable release-runtime layout, not a virtualenv." >&2
     exit 5
   fi
-  copy_tree "$RUNTIME_SOURCE" "$CORE/runtime"
+  start_copy copy_tree "$RUNTIME_SOURCE" "$CORE/runtime"
 else
   case "$ARCH" in
     arm64) UV_RUNTIME="cpython-3.12-macos-aarch64-none" ;;
@@ -721,11 +733,22 @@ else
   # The cache holds the interpreter and the wheels; the release lock is written
   # from the checkout below, so a cached entry never carries the claim for a
   # release it was not built from.
-  copy_tree "$RUNTIME_CACHE_ENTRY" "$CORE/runtime"
+  start_copy copy_tree "$RUNTIME_CACHE_ENTRY" "$CORE/runtime"
 fi
+start_copy copy_tree "$PI_WEB_ACCESS_NODE_WORK" "$CORE/runtime/bin"
+
+COPY_FAILED=0
+for copy_pid in "${COPY_PIDS[@]}"; do
+  wait "$copy_pid" || COPY_FAILED=1
+done
+if [[ "$COPY_FAILED" == "1" ]]; then
+  echo "Filling the Core from the staged integrations failed; no artifact was produced." >&2
+  exit 5
+fi
+# The release lock is written after the runtime lands, so a copied runtime can
+# never overwrite the claim for the release this build is packaging.
 cp "$PROJECT_ROOT/LITELLM_VERSION" "$CORE/runtime/LITELLM_VERSION"
 mkdir -p "$CORE/runtime/bin"
-copy_tree "$PI_WEB_ACCESS_NODE_WORK" "$CORE/runtime/bin"
 
 # The staged scan program is imported into the Core's own interpreter, so what
 # it imports and the bundled runtime does not already carry is added to that
@@ -1331,8 +1354,13 @@ if ! start_installed_app "$OLD_PIDS"; then
 fi
 
 RESTART_ARMED=0
-rm -rf "$PREVIOUS_APP"
+# The retired bundle is about a gigabyte and nothing reads it again, so removing
+# it does not hold the install open: the build is finished the moment the
+# replacement is running and answering, which is what the caller waits for.  The
+# path is captured first because the failure paths below own the variable.
+retired_app="$PREVIOUS_APP"
 PREVIOUS_APP=""
+( rm -rf "$retired_app" ) &
 INSTALL_COMPLETE=1
 
 printf '%s\n' "Young Router: running ($DESTINATION)"
