@@ -129,6 +129,68 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertLess(start_replacement, delete_previous)
         self.assertLess(delete_previous, mark_complete)
 
+    def test_repeat_builds_reuse_only_what_their_inputs_pin(self) -> None:
+        script = (ROOT / "scripts" / "build-and-install-macos.sh").read_text(
+            encoding="utf-8"
+        )
+
+        # The startup smoke's bytecode cache now survives a build, so its key is
+        # exactly what a stale entry could have come from: the assembled sources
+        # the smokes import and the release the bundled runtime was pinned to. A
+        # changed key is a directory holding nothing.
+        self.assertIn(
+            'PYCACHE_SMOKE_ROOT="${YOUNG_ROUTER_SMOKE_PYCACHE:-$STAGING_CACHE/pycache-smoke}"',
+            script,
+        )
+        self.assertIn('(root / "runtime" / "LITELLM_VERSION").read_bytes()', script)
+        self.assertIn('(root / "young_router").rglob("*.py")', script)
+        self.assertIn('cat "$PYCACHE_SMOKE_ROOT/key"', script)
+        self.assertIn('!= "$PYCACHE_SMOKE_KEY"', script)
+        self.assertLess(
+            script.index('PYCACHE_SMOKE_KEY="$("$CORE/runtime/python/bin/python3.12" - "$CORE"'),
+            script.index('mkdir -p "$PYCACHE_SMOKE_DIR"'),
+        )
+        # A cache that outlives the run cannot stand in for it: the entry the
+        # redirect proof looks for is removed first and has to come back.
+        self.assertIn(
+            "find \"$PYCACHE_SMOKE_DIR\" -path '*site-packages/litellm/__init__.cpython-312.pyc' -delete",
+            script,
+        )
+        self.assertLess(
+            script.index("find \"$PYCACHE_SMOKE_DIR\" -path '*site-packages/litellm/__init__.cpython-312.pyc' -delete"),
+            script.index('find "$PYCACHE_SMOKE_DIR" -name'),
+        )
+        # The relocation smokes read that cache, and the bundle still proves it
+        # picked up no bytecode of its own.
+        self.assertIn('YOUNG_ROUTER_PYCACHE_DIR="$PYCACHE_SMOKE_DIR"', script)
+        self.assertIn('"$PORTABLE_SMOKE/runtime/bin/litellm" --help', script)
+        self.assertNotIn('PYTHONDONTWRITEBYTECODE=1 "$PORTABLE_SMOKE', script)
+        self.assertIn('wrote bytecode into the signed Core bundle', script)
+
+        # swiftc is keyed on its four inputs, and the helper is still executed by
+        # every build whether or not the entry was there.
+        self.assertIn(
+            'VISION_CACHE_ENTRY="$VISION_CACHE_ROOT/$VISION_CACHE_KEY/vision_ocr"', script
+        )
+        self.assertIn(
+            'subprocess.run([swiftc, "--version"], capture_output=True).stdout', script
+        )
+        self.assertLess(
+            script.index('if [[ -x "$VISION_CACHE_ENTRY" ]]; then'),
+            script.index('"$VISION_HELPER" >/dev/null 2>&1'),
+        )
+
+        # Signing a Core's extensions is per file and therefore parallel, and a
+        # rename into the install stage is not verified a second time by itself.
+        self.assertIn(
+            'xargs -0 -n 4 -P "$STRIP_SIGN_JOBS" bash -c "$STRIP_SIGN_FILES" _', script
+        )
+        self.assertIn('if [[ "$STAGE_RENAMED" != "1" ]]; then', script)
+        self.assertLess(
+            script.index('STAGE_RENAMED=1'),
+            script.index('if [[ "$STAGE_RENAMED" != "1" ]]; then'),
+        )
+
     def test_macos_builds_and_installs_invalidate_finder_icon_cache(self) -> None:
         build = (ROOT / "scripts/build-and-install-macos.sh").read_text(
             encoding="utf-8"

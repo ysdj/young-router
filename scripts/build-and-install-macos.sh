@@ -765,17 +765,47 @@ cp -p "$VERIDROP_WORK/LICENSE" "$CORE/young_router/adapters/veridrop/LICENSE"
 VISION_HELPER_SOURCE="$APP_ROOT/src/native/macos/VisionOCR.swift"
 VISION_HELPER="$CORE/bin/vision_ocr"
 mkdir -p "$CORE/bin"
-"$SWIFTC_BIN" \
-  -sdk "$MACOS_SDK" \
-  -target "$ARCH-apple-macosx14.0" \
-  -file-prefix-map "$PROJECT_ROOT=." \
-  -debug-prefix-map "$PROJECT_ROOT=." \
-  "$VISION_HELPER_SOURCE" \
-  -o "$VISION_HELPER" \
-  -framework Vision \
-  -framework ImageIO \
-  -framework CoreGraphics \
-  -framework Foundation
+# swiftc spends about six seconds of every build on this one file, and its
+# inputs are exactly the source, the SDK, the target architecture, and the
+# compiler itself.  Those four name a cache entry; every flag, framework and
+# output path below belongs to this build and still runs whenever the entry is
+# missing.  The helper is launched below either way, so a cached binary is
+# executed and has to answer exactly as a freshly compiled one does.
+VISION_CACHE_ROOT="$STAGING_CACHE/vision-ocr"
+VISION_CACHE_KEY="$("$CORE/runtime/python/bin/python3.12" - \
+  "$VISION_HELPER_SOURCE" "$MACOS_SDK" "$SWIFTC_BIN" "$ARCH" <<'PYTHON_CACHE_KEY'
+import hashlib
+import pathlib
+import subprocess
+import sys
+
+source, sdk, swiftc, arch = sys.argv[1:5]
+digest = hashlib.sha256()
+digest.update(pathlib.Path(source).read_bytes())
+digest.update(f"\0{sdk}\0{arch}\0".encode())
+digest.update(subprocess.run([swiftc, "--version"], capture_output=True).stdout)
+print(digest.hexdigest()[:32])
+PYTHON_CACHE_KEY
+)"
+VISION_CACHE_ENTRY="$VISION_CACHE_ROOT/$VISION_CACHE_KEY/vision_ocr"
+if [[ -x "$VISION_CACHE_ENTRY" ]]; then
+  cp -ac "$VISION_CACHE_ENTRY" "$VISION_HELPER" 2>/dev/null \
+    || cp -a "$VISION_CACHE_ENTRY" "$VISION_HELPER"
+else
+  "$SWIFTC_BIN" \
+    -sdk "$MACOS_SDK" \
+    -target "$ARCH-apple-macosx14.0" \
+    -file-prefix-map "$PROJECT_ROOT=." \
+    -debug-prefix-map "$PROJECT_ROOT=." \
+    "$VISION_HELPER_SOURCE" \
+    -o "$VISION_HELPER" \
+    -framework Vision \
+    -framework ImageIO \
+    -framework CoreGraphics \
+    -framework Foundation
+  mkdir -p "$(dirname "$VISION_CACHE_ENTRY")"
+  cp -a "$VISION_HELPER" "$VISION_CACHE_ENTRY"
+fi
 [[ -x "$VISION_HELPER" ]] || {
   echo "The bundled Vision OCR helper is missing or not executable." >&2
   exit 5
@@ -928,21 +958,29 @@ esac
 
 # Native wheels and the bundled language runtimes carry local symbol tables
 # that are not needed at runtime. Strip them before the final app signature.
-while IFS= read -r -d '' binary; do
+# The loop is per file and files do not interact, while a Core carries around
+# ninety Mach-O extensions: run one at a time they spent well over a second of
+# every build inside codesign's own start-up alone.  The same commands still run
+# on the same files with the same per-file outcome, in parallel.
+#
+# strip rewrites the Mach-O pages and invalidates the wheel's embedded
+# signature, so each rewritten extension is signed itself: signing only the
+# outer app does not make macOS accept those pages when a worker imports the
+# module later.
+STRIP_SIGN_JOBS="${YOUNG_ROUTER_STRIP_SIGN_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
+STRIP_SIGN_FILES='
+for binary in "$@"; do
   case "$(file -b "$binary")" in
     Mach-O*)
       strip -x -S "$binary" >/dev/null 2>&1
-      # strip rewrites the Mach-O pages and invalidates the wheel's embedded
-      # signature.  Sign the rewritten extension itself; signing only the
-      # outer app does not make macOS accept these pages when a worker imports
-      # the module later.
       codesign --force --sign - "$binary" >/dev/null
       ;;
   esac
-done < <(
-  find "$CORE/runtime/site-packages" -type f \( -name '*.so' -o -name '*.dylib' \) -print0
-  printf '%s\0' "$CORE/runtime/bin/node" "$CORE/runtime/python/bin/python3.12" "$CORE/runtime/python/lib/libpython3.12.dylib"
-)
+done'
+find "$CORE/runtime/site-packages" -type f \( -name '*.so' -o -name '*.dylib' \) -print0 \
+  | xargs -0 -n 4 -P "$STRIP_SIGN_JOBS" bash -c "$STRIP_SIGN_FILES" _
+printf '%s\0' "$CORE/runtime/bin/node" "$CORE/runtime/python/bin/python3.12" "$CORE/runtime/python/lib/libpython3.12.dylib" \
+  | xargs -0 -n 1 -P "$STRIP_SIGN_JOBS" bash -c "$STRIP_SIGN_FILES" _
 
 # A full-tree compileall pass adds roughly 100 MB of caches, most of which
 # this app never imports. Remove stale caches before the real startup smoke
@@ -956,13 +994,44 @@ find "$CORE/young_router" "$CORE/runtime/site-packages" \
 # The package already carries LiteLLM's fallback cost map, so this must not
 # wait on a remote catalog refresh during a local build.
 export LITELLM_LOCAL_MODEL_COST_MAP=true
-# The smoke compiles the startup path into a cache this build owns and then
-# throws away, so the proof is a cache entry the run just wrote rather than one
-# a previous run left behind.  ``sitecustomize`` redirects every write to
-# ``PYTHONPYCACHEPREFIX``, so naming the directory here keeps the run's bytecode
-# out of both the build product and the user's own cache root.
-PYCACHE_SMOKE_DIR="$RUNTIME_WORK/pycache-smoke"
-rm -rf "$PYCACHE_SMOKE_DIR"
+# Compiling LiteLLM's two and a half thousand modules is most of this smoke,
+# and the relocation smokes below compile the same modules again from the moved
+# tree.  The cache is therefore kept between builds instead of thrown away --
+# keyed by the one thing that can make an entry stale: the sources these smokes
+# import, which is the assembled young_router tree plus the release the bundled
+# runtime pins.  A changed key is a directory that holds nothing, so a hit is
+# only ever a hit on bytecode compiled from exactly these sources.
+# ``sitecustomize`` redirects every write to ``YOUNG_ROUTER_PYCACHE_DIR``, which
+# keeps the bytecode out of both the build product and the user's cache root.
+PYCACHE_SMOKE_ROOT="${YOUNG_ROUTER_SMOKE_PYCACHE:-$STAGING_CACHE/pycache-smoke}"
+PYCACHE_SMOKE_KEY="$("$CORE/runtime/python/bin/python3.12" - "$CORE" <<'PYTHON_CACHE_KEY'
+import hashlib
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+digest = hashlib.sha256()
+digest.update((root / "runtime" / "LITELLM_VERSION").read_bytes())
+sources = [root / "sitecustomize.py", *sorted((root / "young_router").rglob("*.py"))]
+for path in sources:
+    digest.update(path.relative_to(root).as_posix().encode())
+    digest.update(b"\0")
+    digest.update(path.read_bytes())
+print(digest.hexdigest()[:32])
+PYTHON_CACHE_KEY
+)"
+PYCACHE_SMOKE_DIR="$PYCACHE_SMOKE_ROOT/$PYCACHE_SMOKE_KEY"
+mkdir -p "$PYCACHE_SMOKE_ROOT"
+if [[ "$(cat "$PYCACHE_SMOKE_ROOT/key" 2>/dev/null || true)" != "$PYCACHE_SMOKE_KEY" ]]; then
+  rm -rf "$PYCACHE_SMOKE_ROOT"
+  mkdir -p "$PYCACHE_SMOKE_DIR"
+  printf '%s\n' "$PYCACHE_SMOKE_KEY" > "$PYCACHE_SMOKE_ROOT/key"
+fi
+mkdir -p "$PYCACHE_SMOKE_DIR"
+# A cache that survives builds cannot prove by itself that this run wrote the
+# entry the check looks for, so the build removes exactly that entry first and
+# then expects it back.
+find "$PYCACHE_SMOKE_DIR" -path '*site-packages/litellm/__init__.cpython-312.pyc' -delete
 PYTHONDONTWRITEBYTECODE=0 \
 YOUNG_ROUTER_PYCACHE_DIR="$PYCACHE_SMOKE_DIR" \
 PYTHONPATH="$CORE:$CORE/runtime/site-packages" \
@@ -1023,11 +1092,18 @@ restore_core() {
 # without its Core.
 trap 'restore_core; cleanup' EXIT
 relocate_core
-PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PORTABLE_SMOKE" "$PORTABLE_SMOKE/runtime/bin/python" -c 'import litellm.proxy.proxy_server, young_router.core'
-PYTHONDONTWRITEBYTECODE=1 YOUNG_ROUTER_PROXY_PROCESS=1 PYTHONPATH="$PORTABLE_SMOKE" \
+# The cache is named here as well, so a repeat build verifies the moved tree by
+# importing from it instead of compiling it a second time.  The bytecode still
+# lands outside the bundle, and the checks below still prove the bundle itself
+# carries no ``__pycache__``.
+PYTHONDONTWRITEBYTECODE=0 YOUNG_ROUTER_PYCACHE_DIR="$PYCACHE_SMOKE_DIR" \
+  PYTHONPATH="$PORTABLE_SMOKE" "$PORTABLE_SMOKE/runtime/bin/python" -c 'import litellm.proxy.proxy_server, young_router.core'
+PYTHONDONTWRITEBYTECODE=0 YOUNG_ROUTER_PYCACHE_DIR="$PYCACHE_SMOKE_DIR" \
+  YOUNG_ROUTER_PROXY_PROCESS=1 PYTHONPATH="$PORTABLE_SMOKE" \
   "$PORTABLE_SMOKE/runtime/bin/python" -c \
   'from litellm.proxy.types_utils.utils import get_instance_fn; callback = get_instance_fn("young_router.callbacks.image_generation_routing_hook", config_file_path="runtime/config.yaml"); assert callback.__class__.__name__ == "YoungRouterHook"'
-PYTHONDONTWRITEBYTECODE=1 "$PORTABLE_SMOKE/runtime/bin/litellm" --help >/dev/null
+PYTHONDONTWRITEBYTECODE=0 YOUNG_ROUTER_PYCACHE_DIR="$PYCACHE_SMOKE_DIR" \
+  "$PORTABLE_SMOKE/runtime/bin/litellm" --help >/dev/null
 restore_core
 trap cleanup EXIT
 
@@ -1180,16 +1256,24 @@ stage_verified_bundle() {
   destination_device="$(stat -f %d "$(dirname "$INSTALL_STAGE")" 2>/dev/null || echo "")"
   if [[ -n "$source_device" && "$source_device" == "$destination_device" ]] \
     && mv "$STAGED_APP" "$INSTALL_STAGE" 2>/dev/null; then
+    # Nothing about the files changed, so the verification the build product
+    # already passed still holds for this path: only a byte copy has to prove
+    # the new location for itself.
+    STAGE_RENAMED=1
     return 0
   fi
+  STAGE_RENAMED=0
   copy_bundle "$STAGED_APP" "$INSTALL_STAGE"
 }
 
+STAGE_RENAMED=0
 INSTALL_STAGE="$(dirname "$DESTINATION")/.YoungRouter.install.$$.app"
 PREVIOUS_APP="$(dirname "$DESTINATION")/.YoungRouter.previous.$$.app"
 rm -rf "$INSTALL_STAGE" "$PREVIOUS_APP"
 stage_verified_bundle
-codesign --verify --deep --strict --verbose=2 "$INSTALL_STAGE"
+if [[ "$STAGE_RENAMED" != "1" ]]; then
+  codesign --verify --deep --strict --verbose=2 "$INSTALL_STAGE"
+fi
 
 # Keep the installed service available while the verified replacement takes
 # its place. Running processes retain the old executable after this rename;
