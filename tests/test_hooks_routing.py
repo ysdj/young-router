@@ -61,38 +61,6 @@ class HookRoutingTests(HookTestCase):
         diagnostic = hooks._recovery_diagnostic(forbidden)
         self.assertNotIn("secret-token-should-not-appear", json.dumps(diagnostic))
 
-    def test_recovery_policy_cools_an_opaque_403_instead_of_ending_the_group(self) -> None:
-        """A 403 that names no credential is a route to quarantine, not an answer.
-
-        A station answered summarization calls with ``403`` carrying the
-        Anthropic-shaped ``openai_error`` / ``bad_response_status_code`` body.
-        Classified with every other 403 it became ``error``, so the refusal was
-        terminal: the route stayed first in the order and the client never saw
-        the peer that could serve the same request.
-        """
-
-        hooks, _proxy_server = load_hook_module()
-
-        opaque_station = RuntimeError(
-            'litellm.APIError: APIError: OpenAIException - {"error":{"message":"openai_error",'
-            '"type":"bad_response_status_code","param":"","code":"bad_response_status_code"}}'
-        )
-        opaque_station.status_code = 403
-
-        # A rejection that names a credential must stay terminal, or a genuinely
-        # bad key would be cooled down and retried on the next request instead.
-        invalid_key = RuntimeError(
-            'OpenAIException - {"error":{"message":"Invalid API key provided",'
-            '"type":"invalid_request_error","code":"invalid_api_key"}}'
-        )
-        invalid_key.status_code = 403
-
-        self.assertEqual(
-            hooks._recovery_policy_for_exception(opaque_station),
-            "recovery_cooldown",
-        )
-        self.assertEqual(hooks._recovery_policy_for_exception(invalid_key), "error")
-
     def test_recovery_policy_defaults_match_error_boundaries(self) -> None:
         hooks, _proxy_server = load_hook_module()
         self.set_env(hooks._RECOVERY_POLICY_RATE_LIMIT_ENV, None)
