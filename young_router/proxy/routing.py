@@ -154,6 +154,7 @@ from .base import (
     _UPSTREAM_URL_SURFACE_OPENAI_CHAT,
     _UPSTREAM_URL_SURFACE_CHAT_BRIDGE_VALUES,
     _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES,
+    _UPSTREAM_URL_SURFACES,
     _VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY,
     _WEB_SEARCH_EXTERNAL_STARTED_METADATA_KEY,
     _XHIGH_REASONING_EFFORT,
@@ -7160,6 +7161,92 @@ def _is_deployment_compatible_bad_request_error(exception: Exception) -> bool:
     ):
         return False
     return True
+
+
+def _request_declares_responses_surface(request_kwargs: Optional[dict]) -> bool:
+    """Report whether the selected route states a Responses upstream surface.
+
+    ``openai/chat`` and its aliases are the surfaces the Chat bridge exists to
+    reach; a route that names ``openai/responses`` is not being denied that
+    surface, so its refusal must not be read as one.
+    """
+
+    request_kwargs = request_kwargs or {}
+    surface = _request_current_upstream_surface(request_kwargs)
+    if not surface:
+        model_info = _request_context_module._request_model_info(request_kwargs)
+        declared = model_info.get(_UPSTREAM_URL_SURFACE_KEY)
+        if isinstance(declared, str):
+            candidate = declared.strip().lower()
+            if candidate in _UPSTREAM_URL_SURFACES:
+                surface = candidate
+    return surface == _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES
+
+
+def _is_responses_surface_refusal_error(
+    exception: Exception,
+    request_kwargs: Optional[dict],
+    outer_request_kwargs: Optional[dict],
+) -> bool:
+    """Report whether a route refused the Responses surface itself.
+
+    A station with no Responses endpoint answers the request instead of refusing
+    the shape of it: ``openai_error`` over ``bad_response_status_code`` with no
+    complaint about the caller or the body.  It is the same body
+    ``_is_deployment_compatible_bad_request_error`` already reads, but a station
+    is free to choose any 4xx for it, so the status alone cannot decide.  This
+    is the case the Chat bridge exists for, and it is checked wherever a
+    Responses request may be sent, because the alternative -- reading the
+    refusal as the answer -- hands the client a failure for a route whose Chat
+    surface serves the same request.
+
+    A refusal that names a credential, a policy, or a quota is about this
+    request or this key and is never a surface mismatch, so it stays terminal.
+    A route that declares its Responses surface is not refused it either: the
+    station is configured to serve this shape, so the same body is a real
+    request failure and belongs to the deployment-compatibility bridges.
+    """
+
+    if not (
+        _responses_request_module._request_is_responses_api(request_kwargs)
+        or _responses_request_module._request_is_responses_api(outer_request_kwargs)
+    ):
+        return False
+    if _request_declares_responses_surface(request_kwargs) or _request_declares_responses_surface(
+        outer_request_kwargs
+    ):
+        return False
+    status_code = _exception_status_code(exception)
+    if status_code not in (400, 403, 404, 405, 406, 422, 501):
+        return False
+    if _is_terminal_prompt_or_policy_error(exception):
+        return False
+    text = _exception_text(exception)
+    if not text:
+        return False
+    if any(
+        marker in text
+        for marker in (
+            "authentication",
+            "api key",
+            "permission",
+            "policy",
+            "content_policy",
+            "content policy",
+            "insufficient_quota",
+            "quota",
+            "insufficient balance",
+            "rate limit",
+        )
+    ):
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "bad_response_status_code",
+            "openai_error",
+        )
+    )
 
 
 def _is_responses_schema_unsupported_error(exception: Exception) -> bool:

@@ -306,6 +306,12 @@ def _responses_chat_bridge_retry_reason(
         outer_request_kwargs,
     ):
         return "responses_endpoint_not_found"
+    if _routing_module._is_responses_surface_refusal_error(
+        exception,
+        request_kwargs,
+        outer_request_kwargs,
+    ):
+        return "responses_endpoint_not_found"
     if (
         (
             _responses_request_module._request_is_responses_api(request_kwargs)
