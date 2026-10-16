@@ -635,7 +635,16 @@ _HISTORY_IMAGE_ELISION_DEFAULT_KEEP = 0
 # rather than an image: bytes the gateway counts and the client discounts.
 _HISTORY_TOOL_OUTPUT_MIN_CHARS_ENV = "YOUNG_ROUTER_HISTORY_TOOL_OUTPUT_MIN_CHARS"
 _HISTORY_TOOL_OUTPUT_DEFAULT_MIN_CHARS = 20_000
-_HISTORY_TOOL_OUTPUT_KEPT = 8
+# The replay window is a token budget, not a count of outputs.  A count served
+# the client that produced the four-screenshot, eleven-snapshot history this
+# elision was written for, but it silently stops eliding for every lighter
+# agent that emits large outputs at a finer grain: a 141-output Codex thread
+# kept 8 *outputs* -- forty tool calls once both lanes of the request are
+# counted -- so the history still replayed hundreds of kilobytes on each turn
+# and the account's own gateway answered every one of them with its
+# incomplete-tool-record rejection.  What has to fit is the replayed tail.
+_HISTORY_TOOL_OUTPUT_KEPT_CHARS_ENV = "YOUNG_ROUTER_HISTORY_TOOL_OUTPUT_KEPT_CHARS"
+_HISTORY_TOOL_OUTPUT_DEFAULT_KEPT_CHARS = 80_000
 _PREFIX_IMAGE_ORIGINAL_PATH_ENV = "YOUNG_ROUTER_PREFIX_IMAGE_ORIGINAL_PATH"
 _PREFIX_IMAGE_ORIGINAL_PATH_DEFAULT = True
 # A replayed image may only be replaced by a path reference when the client can
@@ -1108,6 +1117,34 @@ _UPSTREAM_BALANCE_ERROR_MARKERS = (
     "剩余额度不足",
     "无可用额度",
     "额度已用完",
+)
+# A relay answers 403 with a body that names no policy of its own: the
+# Anthropic-shaped ``openai_error`` wrapper and the OpenAI-compatible
+# ``bad_response_status_code`` are what a station emits for a request it could
+# not serve, and neither is a statement about the caller's credential.  They are
+# read before the bare 403 classification, because a credential rejection always
+# names itself (``invalid_api_key``, ``authentication_error``, ``no permission``);
+# without this the same station stayed ``recovery_policy: error``, so every
+# retry walked back into it first and a summarization call that the next route
+# could serve was answered as terminal.
+_UPSTREAM_OPAQUE_FORBIDDEN_MARKERS = (
+    "bad_response_status_code",
+    "openai_error",
+    "upstream_error",
+    "bad gateway",
+)
+_UPSTREAM_CREDENTIAL_REJECTION_MARKERS = (
+    "invalid_api_key",
+    "invalid api key",
+    "incorrect api key",
+    "authentication_error",
+    "authenticationerror",
+    "unauthorized",
+    "no permission",
+    "permission_denied",
+    "insufficient permissions",
+    "account_deactivated",
+    "organization_disabled",
 )
 _UPSTREAM_TEMPORARY_ERROR_MARKERS = (
     "high demand",

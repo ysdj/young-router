@@ -145,6 +145,8 @@ from .base import (
     _TerminalFailedResponsesStreamResponse,
     _UPSTREAM_BALANCE_ERROR_MARKERS,
     _UPSTREAM_HTML_BAD_REQUEST_MARKERS,
+    _UPSTREAM_OPAQUE_FORBIDDEN_MARKERS,
+    _UPSTREAM_CREDENTIAL_REJECTION_MARKERS,
     _UPSTREAM_RELAY_CAPACITY_MARKERS,
     _UPSTREAM_TEMPORARY_ERROR_CLASS_NAMES,
     _UPSTREAM_TEMPORARY_ERROR_MARKERS,
@@ -771,6 +773,17 @@ def _recovery_policy_for_exception(exception: Exception) -> str:
             _RECOVERY_POLICY_COOLDOWN,
         )
     if _is_upstream_relay_capacity_error(exception):
+        return _recovery_policy_setting(
+            _RECOVERY_POLICY_SERVER_ENV,
+            _RECOVERY_POLICY_COOLDOWN,
+        )
+    # A 403 that names no credential of its own is a station refusing to serve,
+    # not a statement about this key: the next route in the same group is a
+    # candidate, and this one has to leave the front of the order for the
+    # cooldown window.  This runs before the bare-status branch below, which
+    # would otherwise answer ``error`` and hand the client a terminal failure
+    # for a route a peer could have served.
+    if status_code == 403 and _is_upstream_opaque_forbidden_error(exception):
         return _recovery_policy_setting(
             _RECOVERY_POLICY_SERVER_ENV,
             _RECOVERY_POLICY_COOLDOWN,
@@ -6626,6 +6639,27 @@ def _upstream_relay_capacity_message(exception: Exception) -> Optional[str]:
 
 def _is_upstream_relay_capacity_error(exception: Exception) -> bool:
     return _upstream_relay_capacity_message(exception) is not None
+
+
+def _is_upstream_opaque_forbidden_error(exception: Exception) -> bool:
+    """Report whether a 403 refused service without naming the caller's credential.
+
+    A station that answers ``403`` with the Anthropic-shaped ``openai_error`` or
+    the OpenAI-compatible ``bad_response_status_code`` is saying it could not
+    serve this request, not that this key is invalid.  The distinction decides
+    whether the route is quarantined or the whole group is declared terminal:
+    reading every 403 as a credential rejection left a route that refused a
+    summarization call at the front of the order, and the client received the
+    refusal as an answer no peer was allowed to improve on.
+
+    A rejection that does name a credential is never opaque, so a genuinely
+    bad key still fails fast instead of being cooled down and retried.
+    """
+
+    text = _exception_text(exception)
+    if any(marker in text for marker in _UPSTREAM_CREDENTIAL_REJECTION_MARKERS):
+        return False
+    return any(marker in text for marker in _UPSTREAM_OPAQUE_FORBIDDEN_MARKERS)
 
 
 def _sanitized_upstream_route_failure_message(
