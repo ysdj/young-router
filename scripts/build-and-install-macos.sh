@@ -170,7 +170,9 @@ stop_installed_app() {
   # polite signal first was tried here and answered the same question twice: the
   # listener the replacement needs is free in the same instant the processes
   # holding it die, and a turn that is cut is one the client reconnects through,
-  # so the grace only added a second to every install.
+  # so the grace only added a second to every install.  A proxy drain is not
+  # waited for here either: that budget belongs to a replacement the Core
+  # performs on purpose (``young_router/lifecycle.py``).
   APP_PROCESSES_STOP_POLLS=$(( STOP_TIMEOUT_SECONDS * 20 )) \
   survivors="$("$APP_PROCESSES" stop $bundle_pids)" || true
   if [[ -z "$survivors" ]]; then

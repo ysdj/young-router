@@ -70,6 +70,11 @@ descendants() {
 # listener the replacement needs is released in the same instant the processes
 # holding it die.  A caller with survivors to report gets them on stdout and a
 # non-zero status; SIGKILL cannot be escalated further, so there is no ladder.
+#
+# No caller waits for a proxy drain here.  The four-hour drain belongs to a
+# replacement the Core performs on purpose and the short bound to the host's own
+# quit path; ``young_router/lifecycle.py`` states which stop uses which, and a
+# grace budget in this path is the wait being reintroduced.
 stop() {
   local pid tries
   [[ $# -ge 1 ]] || usage

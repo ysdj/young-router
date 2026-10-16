@@ -68,7 +68,8 @@ if [[ -n "$("$APP_PROCESSES" hosts "$APP")" ]]; then
   # point.  Measured here: the host's quit path and the Core's shutdown need ten
   # to thirty seconds under load, while the loopback listener the replacement
   # needs is released in the same instant the processes holding it die, so
-  # waiting for that teardown was the whole of a restart's stop.
+  # waiting for that teardown was the whole of a restart's stop.  Neither path
+  # waits for a proxy drain: ``young_router/lifecycle.py`` says which stop does.
   survivors="$("$APP_PROCESSES" stop $STOPPING_PIDS)" || true
   if [[ -n "$survivors" ]]; then
     # SIGKILL cannot be escalated, so there is no ladder left to climb: these

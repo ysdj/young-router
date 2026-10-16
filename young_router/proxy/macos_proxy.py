@@ -136,6 +136,9 @@ def run(argv: list[str] | None = None) -> int:
         # default, even though the managed service gives the old worker the
         # configured drain window.  Keep the client connection alive for that
         # same window so an app restart does not synthesize router_restarting.
+        # The drain belongs to a replacement the Core performs on purpose: a
+        # restart or an install never waits here, it kills this process with the
+        # rest of the captured tree (``scripts/app-processes.sh stop``).
         timeout_graceful_shutdown=proxy_drain_grace_seconds(),
         # Codex sends each Responses turn request -- including the immutable
         # replay prefix with signed image bytes -- as one WebSocket text frame;

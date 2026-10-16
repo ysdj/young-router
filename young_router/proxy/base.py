@@ -121,7 +121,9 @@ _MIN_SHUTDOWN_PATCH_GRACE_SECONDS = 0.001
 # second drain with its own fixed default of thirty seconds, so a quit with one
 # turn still streaming spent that whole window there regardless of what the
 # app-exit grace here says.  The bound is LiteLLM's own environment variable,
-# re-read on every drain, so the short grace has to be pushed into it.
+# re-read on every drain, so the short grace has to be pushed into it.  This is
+# the app-exit path only: a restart or an install kills the tree instead of
+# draining it, so nothing there reads this bound.
 _LITELLM_DRAIN_TIMEOUT_ENV = "GRACEFUL_SHUTDOWN_TIMEOUT"
 
 # How long a marked app-exit worker stays alive so an open stream can write the

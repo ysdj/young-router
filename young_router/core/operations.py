@@ -100,11 +100,12 @@ def _bounded_text(value: object, *, limit: int = 240) -> str:
 
 
 def _proxy_drain_grace_seconds() -> float:
-    """How long a stopping proxy may finish the turns it already accepted.
+    """How long a replacement the Core performs on purpose may drain.
 
-    A deployment may lower this (a faster restart) or raise it (a very long
-    turn); an unreadable value falls back to the default rather than to a
-    stop-immediately kill.
+    This is the deliberate replacement's budget and not the app's restart path:
+    ``scripts/restart-app.sh`` and the installer kill the captured tree and start
+    the replacement without waiting for a drain (``young_router/lifecycle.py``
+    states which stop uses which bound).
     """
 
     return proxy_drain_grace_seconds()
