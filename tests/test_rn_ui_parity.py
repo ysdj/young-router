@@ -383,7 +383,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '"logs.tokenCountK": "令牌数(k)"',
             '"service.status": "状态: {status}"',
             '"common.empty": "(空)"',
-            '"providers.probeApplyTitle": "使用推荐协议?"',
+            '"providers.probeApplyTitle": "改用探测推荐的接口协议?"',
             '"relay.typeDetected": "已识别: {type}"',
         ):
             self.assertIn(marker, chinese)
@@ -1212,9 +1212,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertLess(model_detail.index('label={translate("providers.publicModel")}'), model_detail.index('providers.publicModelSettingsHint'))
         self.assertLess(model_detail.index('providers.publicModelSettingsHint'), model_detail.index('<PickerField label={translate("providers.provider")}'))
         self.assertIn('onOpenPublicModel', model_detail)
-        # The breadcrumb's public-model segment is the navigation; the upstream
-        # model is not a segment of its own (the pane's 上游模型 field states it).
-        self.assertIn('<NativeButton title={displayLabel(modelName, translate("providers.unnamedModel"))} link disabled={busy || !publicModelName} onPress={() => onOpenPublicModel?.()} style={styles.breadcrumbProvider} />', model_detail)
+        # The breadcrumb's second segment names the model this detail edits —
+        # the upstream model the routes table's own row leads with — and the
+        # 设置 button beside 公开上下文 is the pane's one way into the public
+        # model: the segment is a reading, so it is plain text with no link and
+        # no press, because a pressable segment read as a second entrance the
+        # user can neither reach a destination from nor tell apart from one.
+        self.assertIn('<Text numberOfLines={1} style={styles.inspectorHeading}>{displayLabel(upstreamName, translate("common.notAvailable"))}</Text>', model_detail)
+        self.assertNotIn('displayLabel(modelName, translate("providers.unnamedModel"))', model_detail)
         self.assertNotIn('tooltip={upstreamName} style={styles.inspectorHeading}', model_detail)
         # The navigation is a real button (设置) that opens the very group the
         # routes table lists: the pane is keyed by the display name the drafts
@@ -6771,12 +6776,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'value={selectedProviderKey?.id ?? ""} values={[{ value: "", label: translate("providers.undefinedKey") }, ...providerKeyOptions]} disabled={busy} onSelect={selectProviderKey}',
             self.ui,
         )
-        # The editable field carries the model's real value: the placeholder
-        # only labels the row and the breadcrumb, so a blank name cannot look
-        # like it was set while validation still reports it missing.
+        # The editable field carries the model's real value, so a blank name
+        # cannot look like it was set while validation still reports it
+        # missing; the localized placeholder labels the rows and the panes that
+        # name a model without editing it.
         self.assertIn("const modelFieldName = stringValue(model.model_name, stringValue(model.name));", self.ui)
         self.assertIn("value={modelFieldName}", self.ui)
-        self.assertIn('{displayLabel(modelName, translate("providers.unnamedModel"))}', self.ui)
+        self.assertIn('displayLabel(model.model_name ?? model.name, translate("providers.unnamedModel"))', self.ui)
         for locale in (self.zh, self.en):
             self.assertIn('"providers.unnamedModel"', locale)
         self.assertIn('"providers.unnamedModel": "未命名模型"', self.zh)
