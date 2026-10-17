@@ -553,6 +553,86 @@ class HookRouteRecoveryTests(HookTestCase):
         self.assertEqual(len(calls), 1)
         assert_upstream_route_failed_terminal(self, chunks)
 
+    async def test_route_recovery_stops_when_attempt_never_returns_a_first_event(self) -> None:
+        """A silent route ends the poll instead of spending the window waiting.
+
+        A first-event timeout that buffered nothing means the upstream was sent
+        the request and answered with zero bytes.  Polling replays identical
+        bytes against the same silent deployment, so every further attempt
+        spends another full start budget and reproduces the same silence.  The
+        poll stops and reports the failure terminal instead.
+        """
+
+        hooks, proxy_server = load_hook_module()
+        calls = []
+
+        class SilentStreamTimeout(Exception):
+            status_code = 504
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                calls.append(payload)
+                exc = SilentStreamTimeout("stream_start_timeout")
+                exc.body = {
+                    "reason": "stream_start_timeout",
+                    "buffered_chunks": 0,
+                    "saw_chunk": False,
+                }
+                exc.failed_deployment_id = "silent-route"
+                raise exc
+
+        proxy_server.llm_router = FakeRouter()
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "1")
+        self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "hi"}],
+            "stream": True,
+            "model_info": {"id": "silent-route", "order": 1},
+        }
+        first_exception = SilentStreamTimeout("stream_start_timeout")
+        first_exception.body = {
+            "reason": "stream_start_timeout",
+            "buffered_chunks": 0,
+            "saw_chunk": False,
+        }
+
+        chunks = [
+            chunk
+            async for chunk in hooks._stream_route_recovery_poll(
+                request_data,
+                first_exception,
+            )
+        ]
+
+        self.assertEqual(len(calls), 1)
+        assert_upstream_route_failed_terminal(self, chunks)
+
+    def test_first_event_timeout_keeps_polling_a_delivered_then_idle_stream(self) -> None:
+        """Only a zero-byte wait is terminal; a delivered stream is not.
+
+        The start-timeout rule bounds a route that answered nothing.  A
+        stream-idle timeout did deliver bytes, so the route served this
+        request and a later attempt may legitimately resume it.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        silent = RuntimeError("stream_start_timeout")
+        silent.body = {
+            "reason": "stream_start_timeout",
+            "buffered_chunks": 0,
+            "saw_chunk": False,
+        }
+        delivered = RuntimeError("stream_idle_timeout")
+        delivered.body = {
+            "reason": "stream_idle_timeout",
+            "buffered_chunks": 4,
+            "saw_chunk": True,
+        }
+
+        self.assertFalse(hooks._route_recovery_poll_keep_going(silent))
+        self.assertTrue(hooks._route_recovery_poll_keep_going(delivered))
+
     async def test_route_recovery_poll_propagates_context_size_error_without_retrying(self) -> None:
         hooks, proxy_server = load_hook_module()
         calls = []
@@ -1495,11 +1575,24 @@ class HookRouteRecoveryTests(HookTestCase):
         self.assertEqual(calls[0]["_target_order"], 2)
         self.assertIn({"type": "response.output_text.delta", "delta": "recovered web answer"}, chunks)
 
-    async def test_external_web_search_synthesis_stream_failure_falls_back_to_non_stream(self) -> None:
+    async def test_external_web_search_synthesis_never_drops_to_non_stream(self) -> None:
+        """A streaming synthesis recovery stays a stream on every attempt.
+
+        The client is holding an open Responses stream.  Re-issuing the
+        synthesis as a non-stream request changes the shape the client is
+        waiting on, discards the streaming contract for a turn whose answer
+        was never framed that way, and hands back one buffered body that has
+        to be re-chunked after the fact.  A silent route is answered with the
+        failure instead, never with a different protocol.
+        """
+
         hooks, proxy_server = load_hook_module()
         calls = []
 
         class GatewayTimeout(Exception):
+            status_code = 504
+
+        class SilentRoute(Exception):
             status_code = 504
 
         class FakeRouter:
@@ -1513,34 +1606,15 @@ class HookRouteRecoveryTests(HookTestCase):
 
             async def aresponses(self, **payload):
                 calls.append(copy.deepcopy(payload))
-                if payload.get("stream") is True:
-                    exc = TimeoutError("Young Router stream start timeout after 60s without the first stream event")
-                    exc.status_code = 504
-                    exc.body = {"reason": "stream_start_timeout"}
-                    exc.failed_deployment_id = "chatroute"
-                    exc.failed_deployment_order = 1
-                    raise exc
-                return {
-                    "id": "resp-non-stream-web-search-recovered",
-                    "object": "response",
-                    "status": "completed",
-                    "output_text": "Recovered final answer.",
-                    "output": [
-                        {
-                            "id": "msg-non-stream-web-search-recovered",
-                            "type": "message",
-                            "status": "completed",
-                            "role": "assistant",
-                            "content": [
-                                {
-                                    "type": "output_text",
-                                    "text": "Recovered final answer.",
-                                    "annotations": [],
-                                }
-                            ],
-                        }
-                    ],
+                exc = SilentRoute("Young Router stream start timeout after 60s without the first stream event")
+                exc.body = {
+                    "reason": "stream_start_timeout",
+                    "buffered_chunks": 0,
+                    "saw_chunk": False,
                 }
+                exc.failed_deployment_id = "chatroute"
+                exc.failed_deployment_order = 1
+                raise exc
 
         proxy_server.llm_router = FakeRouter()
         self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "1")
@@ -1565,7 +1639,7 @@ class HookRouteRecoveryTests(HookTestCase):
                     "Title: LiteLLM\nURL: https://github.com/BerriAI/litellm"
                 ),
             },
-            "metadata": {"request_id": "web-search-recovery-non-stream"},
+            "metadata": {"request_id": "web-search-recovery-stays-stream"},
             "model_info": {"id": "chatroute", "order": 1},
         }
         first_exception = GatewayTimeout("upstream synthesis timeout")
@@ -1578,23 +1652,10 @@ class HookRouteRecoveryTests(HookTestCase):
             )
         ]
 
-        self.assertEqual([call.get("stream") for call in calls], [True, False])
-        self.assertTrue(calls[1]["litellm_metadata"]["external_web_search_synthesis"])
-        self.assertTrue(calls[1]["litellm_metadata"][hooks._ROUTE_RECOVERY_POLL_METADATA_KEY])
-        self.assertEqual(calls[1].get("_target_order"), 1)
-        self.assertNotIn("tools", calls[1])
-        self.assertNotIn("_excluded_deployment_ids", calls[1])
-        self.assertNotIn("stream_options", calls[1])
-        self.assertNotIn("stream_timeout", calls[1])
-        self.assertNotIn("route_recovery_attempt_timeout_seconds", calls[1]["litellm_metadata"])
-        self.assertNotIn("route_recovery_max_seconds", calls[1]["litellm_metadata"])
-        deltas = [
-            chunk.get("delta")
-            for chunk in chunks
-            if isinstance(chunk, dict) and chunk.get("type") == "response.output_text.delta"
-        ]
-        self.assertEqual(deltas, ["Recovered final answer."])
-        self.assertEqual(chunks[-1]["type"], "response.completed")
+        self.assertTrue(calls, "the recovery attempt must reach the router")
+        for call in calls:
+            self.assertIs(call.get("stream"), True)
+        assert_upstream_route_failed_terminal(self, chunks)
 
     async def test_route_recovery_poll_preserves_no_healthy_reset_across_attempts(self) -> None:
         hooks, proxy_server = load_hook_module()

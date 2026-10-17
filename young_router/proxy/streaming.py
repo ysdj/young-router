@@ -6451,8 +6451,6 @@ from .streaming_recovery import (  # noqa: E402
     _configured_deployment_ids,
     _configured_deployment_orders,
     _external_web_search_exception_has_recovery_request,
-    _external_web_search_non_stream_synthesis_payload,
-    _external_web_search_non_stream_synthesis_recovery,
     _external_web_search_recovery_payload_for_blocked_original,
     _external_web_search_recovery_poll_error,
     _is_external_web_search_synthesis_recovery_payload,

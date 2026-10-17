@@ -374,13 +374,6 @@ async def _stream_route_recovery_poll_attempt(
     request_timeout_seconds = configured_timeout_seconds
     if deadline is not None and attempt > 1:
         remaining_poll_seconds = max(0.0, deadline - time.monotonic())
-        if remaining_poll_seconds <= 0:
-            raise _streaming_module._stream_start_timeout_exception(
-                request_data,
-                start_seconds=configured_timeout_seconds,
-                saw_chunk=False,
-                buffered_chunks=0,
-            )
         if request_timeout_seconds > 0:
             request_timeout_seconds = min(request_timeout_seconds, remaining_poll_seconds)
         else:
@@ -733,13 +726,6 @@ async def _stream_native_route_recovery_poll_attempt(
     request_timeout_seconds = configured_timeout_seconds
     if deadline is not None and attempt > 1:
         remaining_poll_seconds = max(0.0, deadline - time.monotonic())
-        if remaining_poll_seconds <= 0:
-            raise _streaming_module._stream_start_timeout_exception(
-                request_data,
-                start_seconds=configured_timeout_seconds,
-                saw_chunk=False,
-                buffered_chunks=0,
-            )
         if request_timeout_seconds > 0:
             request_timeout_seconds = min(
                 request_timeout_seconds,
@@ -905,7 +891,19 @@ def _route_recovery_poll_keep_going(exception: Exception) -> bool:
     if _routing_module._is_request_body_size_rejection_error(exception):
         return False
     if _streaming_module._external_web_search_exception_has_recovery_request(exception):
+        # This attempt carries its own recovery request, and that request is
+        # still a stream, so the next attempt is not a replay of these bytes.
         return True
+    # A first-event timeout with nothing buffered means the route was sent the
+    # request and answered with zero bytes.  That is a route that cannot serve
+    # this request at all, not a transient pause: every later attempt replays
+    # identical bytes against the same silent upstream and can only reproduce
+    # the same silence.  Keep polling here and one silent deployment spends the
+    # whole recovery window in start-budget waits while the client holds an open
+    # stream.  A stream-idle timeout is not this case — that one did deliver
+    # bytes, so a later attempt may legitimately resume.
+    if _routing_module._is_local_stream_start_timeout_error(exception):
+        return False
     return _routing_module._is_route_recovery_poll_error(exception)
 
 def _external_web_search_exception_has_recovery_request(
@@ -952,122 +950,6 @@ def _is_external_web_search_synthesis_recovery_payload(
         "litellm_metadata",
     ) or {}
     return metadata.get("external_web_search_synthesis") is True
-
-def _external_web_search_non_stream_synthesis_payload(
-    request_data: dict,
-) -> Optional[dict[str, Any]]:
-    if not _streaming_module._is_external_web_search_synthesis_recovery_payload(request_data):
-        return None
-    if not _streaming_module._request_is_responses_stream(request_data):
-        return None
-    method_name = _streaming_module._streaming_error_fallback_method_name(request_data)
-    if method_name != "aresponses":
-        return None
-    payload = _streaming_module._build_streaming_error_fallback_payload(
-        request_data,
-        method_name=method_name,
-        allow_repeated_attempt=True,
-    )
-    if payload is None:
-        return None
-    payload["stream"] = False
-    payload.pop("stream_options", None)
-    payload.pop("stream_timeout", None)
-    litellm_metadata = _request_context_module._request_metadata_dict(
-        payload,
-        "litellm_metadata",
-    ) or {}
-    updated_metadata = litellm_metadata.copy()
-    updated_metadata[_ROUTE_RECOVERY_POLL_METADATA_KEY] = True
-    payload["litellm_metadata"] = updated_metadata
-    target_order = _routing_module._coerce_order(
-        request_data.get(_streaming_module._ROUTE_RECOVERY_FORCED_TARGET_ORDER_KEY)
-    )
-    if target_order is None:
-        target_order = _responses_request_module._request_target_order(request_data)
-    if target_order is None:
-        for section_name in ("litellm_params", "model_info"):
-            section = request_data.get(section_name)
-            if not isinstance(section, dict):
-                continue
-            target_order = _routing_module._coerce_order(section.get("order"))
-            if target_order is not None:
-                break
-            target_order = _routing_module._order_from_route_key(section.get("route_key"))
-            if target_order is not None:
-                break
-    if target_order is not None:
-        payload["_target_order"] = target_order
-    payload.pop("_excluded_deployment_ids", None)
-    return payload
-
-async def _external_web_search_non_stream_synthesis_recovery(
-    request_data: dict,
-    exception: Exception,
-) -> Optional[AsyncIterator[Any]]:
-    if not _streaming_module._is_external_web_search_synthesis_recovery_payload(request_data):
-        return None
-    if not _routing_module._is_route_recovery_poll_error(exception):
-        return None
-
-    from litellm.proxy.proxy_server import llm_router
-
-    if llm_router is None:
-        raise RuntimeError("LiteLLM router is unavailable for external web_search synthesis recovery")
-    router_method = getattr(llm_router, "aresponses", None)
-    if router_method is None:
-        raise RuntimeError("LiteLLM router does not support aresponses external web_search synthesis recovery")
-    payload = _streaming_module._external_web_search_non_stream_synthesis_payload(
-        request_data,
-    )
-    if payload is None:
-        return None
-
-    _trace_module._request_route_trace(
-        "external_web_search_synthesis_non_stream_recovery_start", request_data,
-        target_order=payload.get("_target_order"),
-        excluded_deployment_ids=payload.get("_excluded_deployment_ids"),
-        request=_trace_module._trace_request_summary(request_data),
-        retry_request=_trace_module._trace_request_summary(payload, method_name="aresponses"),
-        exception=_routing_module._trace_exception(exception),
-    )
-    try:
-        response = await router_method(**payload)
-        _responses_web_search_bridge_module._external_web_search_raise_if_invalid_model_response(
-            response,
-            payload,
-            phase="synthesis",
-        )
-        _trace_module._request_route_trace(
-            "external_web_search_synthesis_non_stream_recovery_done", request_data,
-            target_order=payload.get("_target_order"),
-            excluded_deployment_ids=payload.get("_excluded_deployment_ids"),
-            response=_trace_module._trace_response_summary(response, payload),
-        )
-        return _streaming_module._non_streaming_response_as_stream(response, payload)
-    except Exception as recovery_exception:
-        _routing_module._mark_no_deployments_for_order_exhaustion(
-            recovery_exception,
-            payload,
-        )
-        if _routing_module._is_request_scoped_priority_deployment_failover_error(
-            recovery_exception,
-            payload,
-        ):
-            _routing_module._mark_exception_for_deployment_failover(
-                recovery_exception,
-                payload,
-            )
-        _trace_module._request_route_trace(
-            "external_web_search_synthesis_non_stream_recovery_error", request_data,
-            target_order=payload.get("_target_order"),
-            excluded_deployment_ids=payload.get("_excluded_deployment_ids"),
-            request=_trace_module._trace_request_summary(request_data),
-            retry_request=_trace_module._trace_request_summary(payload, method_name="aresponses"),
-            original_exception=_routing_module._trace_exception(exception),
-            exception=_routing_module._trace_exception(recovery_exception),
-        )
-        raise recovery_exception
 
 def _route_recovery_sse_keepalive(
     attempt: int,
@@ -1337,36 +1219,8 @@ async def _stream_route_recovery_poll(
         exception=_routing_module._trace_exception(exception),
     )
 
-    async def yield_non_stream_synthesis_recovery(
-        recovery_exception: Exception,
-        *,
-        reason: str,
-    ) -> AsyncIterator[Any]:
-        try:
-            recovered_stream = await _streaming_module._external_web_search_non_stream_synthesis_recovery(
-                request_data,
-                recovery_exception,
-            )
-            if recovered_stream is None:
-                return
-            async for recovered_chunk in recovered_stream:
-                yield recovered_chunk
-        except Exception as non_stream_exception:
-            nonlocal_last_exception[0] = non_stream_exception
-            _trace_module._request_route_trace(
-                "external_web_search_synthesis_non_stream_recovery_failed", request_data,
-                poll_attempt=attempt,
-                reason=reason,
-                original_exception=_routing_module._trace_exception(recovery_exception),
-                exception=_routing_module._trace_exception(non_stream_exception),
-            )
-            return
-
-    nonlocal_last_exception: list[Exception] = [last_exception]
-
     try:
         while True:
-            last_exception = nonlocal_last_exception[0]
             cooldown_wait = _streaming_module._route_recovery_poll_cooldown_wait(
                 request_data,
                 ignore_constraints=ignore_local_constraints,
@@ -1605,21 +1459,6 @@ async def _stream_route_recovery_poll(
                     elapsed_seconds=round(time.monotonic() - started_at_monotonic, 3),
                     exception=_routing_module._trace_exception(last_exception),
                 )
-                async for recovered_chunk in yield_non_stream_synthesis_recovery(
-                    last_exception,
-                    reason="empty_stream_attempt",
-                ):
-                    yield _streaming_module._responses_stream_chunk_for_delivery(recovered_chunk)
-                    yielded = True
-                if yielded:
-                    _trace_module._request_route_trace(
-                        "route_recovery_poll_success", request_data,
-                        poll_attempt=attempt,
-                        elapsed_seconds=round(time.monotonic() - started_at_monotonic, 3),
-                        recovery_mode="external_web_search_synthesis_non_stream",
-                    )
-                    return
-                last_exception = nonlocal_last_exception[0]
             except Exception as poll_exception:
                 if _routing_module._is_context_size_error(poll_exception):
                     _trace_module._request_route_trace(
@@ -1631,7 +1470,6 @@ async def _stream_route_recovery_poll(
                     raise
                 if not _streaming_module._route_recovery_poll_keep_going(poll_exception):
                     last_exception = poll_exception
-                    nonlocal_last_exception[0] = last_exception
                     _trace_module._request_route_trace(
                         "route_recovery_poll_terminal_error", request_data,
                         poll_attempt=attempt,
@@ -1640,29 +1478,12 @@ async def _stream_route_recovery_poll(
                     )
                     break
                 last_exception = poll_exception
-                nonlocal_last_exception[0] = last_exception
                 _trace_module._request_route_trace(
                     "route_recovery_poll_attempt_failed", request_data,
                     poll_attempt=attempt,
                     elapsed_seconds=round(time.monotonic() - started_at_monotonic, 3),
                     exception=_routing_module._trace_exception(last_exception),
                 )
-                yielded_non_stream = False
-                async for recovered_chunk in yield_non_stream_synthesis_recovery(
-                    last_exception,
-                    reason="stream_attempt_failed",
-                ):
-                    yielded_non_stream = True
-                    yield _streaming_module._responses_stream_chunk_for_delivery(recovered_chunk)
-                if yielded_non_stream:
-                    _trace_module._request_route_trace(
-                        "route_recovery_poll_success", request_data,
-                        poll_attempt=attempt,
-                        elapsed_seconds=round(time.monotonic() - started_at_monotonic, 3),
-                        recovery_mode="external_web_search_synthesis_non_stream",
-                    )
-                    return
-                last_exception = nonlocal_last_exception[0]
 
             now = time.monotonic()
             if max_poll_seconds <= 0 or (
