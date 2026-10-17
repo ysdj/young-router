@@ -420,13 +420,16 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             round_number=1,
         )
 
-        self.assertEqual(
-            continuation_kwargs["tools"],
-            hooks._pi_web_access_tool_definitions(),
-        )
+        tools = continuation_kwargs["tools"]
+        self.assertIn("tool_search", [tool.get("type") for tool in tools])
+        self.assertIn("codex_app", [tool.get("name") for tool in tools])
+        names = [tool.get("name") for tool in tools]
+        self.assertIn("read_thread", json.dumps(tools))
+        self.assertIn("web_search", names)
+        self.assertIn("fetch_content", names)
         self.assertNotIn("max_output_tokens", continuation_kwargs)
 
-    def test_external_web_search_continuation_slims_flattened_codex_tool_search(self) -> None:
+    def test_external_web_search_continuation_keeps_flattened_codex_client_tools(self) -> None:
         hooks, _ = load_hook_module()
         request_kwargs = {
             "model": "openai/vendor-chat",
@@ -445,10 +448,14 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             ],
         }
 
-        self.assertEqual(
-            hooks._external_web_search_continuation_tools(request_kwargs),
-            hooks._pi_web_access_tool_definitions(),
-        )
+        names = [
+            tool.get("name")
+            for tool in hooks._external_web_search_continuation_tools(request_kwargs)
+        ]
+        self.assertIn("tool_search", names)
+        self.assertIn("exec_command", names)
+        self.assertIn("web_search", names)
+        self.assertNotIn(names.count("web_search"), (0, 2))
 
     def test_external_web_search_continuation_keeps_native_pi_tools_without_legacy_bridge(self) -> None:
         hooks, _ = load_hook_module()

@@ -165,6 +165,36 @@ def _web_search_arguments_from_call(call: dict[str, Any]) -> Any:
     return _parse_tool_search_arguments(arguments)
 
 
+def _external_web_search_client_tool_call_items(response: Any) -> list[dict[str, Any]]:
+    """Return the client's own tool calls the model reached for instead of closing.
+
+    A continuation that asks for ``exec`` -- or any tool the bridge does not own
+    -- is the model going back to the work the search interrupted, so the call
+    has to travel back to Codex. The bridge answers for the search alone; a turn
+    that searched and then resumed reading the repository must not be cut short
+    at the moment it resumes. A ``web_search`` / ``fetch_content`` call is not
+    one of these: the bridge still owns that turn and runs it itself.
+    """
+
+    payload = _streaming_module._jsonable(response)
+    if not isinstance(payload, dict):
+        return []
+    output = payload.get("output")
+    if not isinstance(output, list):
+        return []
+    calls: list[dict[str, Any]] = []
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") not in _WEB_SEARCH_FUNCTION_CALL_ITEM_TYPES:
+            continue
+        name = _function_call_name(item)
+        if not name or name in _PI_WEB_ACCESS_TOOL_NAMES:
+            continue
+        calls.append(item)
+    return calls
+
+
 def _web_search_query_from_call(call: dict[str, Any]) -> Optional[str]:
     parsed = _web_search_arguments_from_call(call)
     if isinstance(parsed, dict):
@@ -3438,55 +3468,37 @@ def _external_web_search_chat_completion_tools(tools: Any) -> Optional[list[dict
 def _external_web_search_continuation_tools(
     request_kwargs: Optional[dict],
 ) -> list[dict[str, Any]]:
-    tools: list[dict[str, Any]] = []
-    seen_direct_tool = False
     request_tools = request_kwargs.get("tools") if isinstance(request_kwargs, dict) else None
-    # Codex's deferred tool surface contains a tool_search item plus a large
-    # namespace of ordinary desktop tools. Those tools are not candidates for
-    # this hidden web-search routing turn; sending all of them to the provider
-    # needlessly inflates every continuation request. Keep the bridge itself
-    # available so the model still controls query changes, result pages, and
-    # source opening.
-    if isinstance(request_tools, list) and any(
-        isinstance(tool, dict)
-        and (
-            tool.get("type") == "tool_search"
-            or (
-                tool.get("type") == "function"
-                and (
-                    tool.get("name") == "tool_search"
-                    or (
-                        isinstance(tool.get("function"), dict)
-                        and tool["function"].get("name") == "tool_search"
-                    )
-                )
-            )
-        )
-        for tool in request_tools
-    ):
-        return _responses_tools_module._pi_web_access_tool_definitions()
+    tools: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    seen_direct_tool = False
     if isinstance(request_tools, list):
-        direct_pi_tools: list[dict[str, Any]] = []
-        for tool in request_tools:
-            if not isinstance(tool, dict):
-                continue
-            function_name = _function_call_name(tool)
-            if function_name in _PI_WEB_ACCESS_TOOL_NAMES:
-                direct_pi_tools.append(copy.deepcopy(tool))
-        if direct_pi_tools:
-            return direct_pi_tools
         for tool in request_tools:
             if not isinstance(tool, dict):
                 continue
             tool_type = tool.get("type")
+            # The bridge answers for the search itself, so the provider-native
+            # search tool it replaces does not travel. Every other tool the
+            # client declared does: a turn that went looking for evidence comes
+            # back to the same tools it had, and the bridge hands back whatever
+            # it calls for one of them.
             if isinstance(tool_type, str) and tool_type in {"web_search", "web_search_preview"}:
                 continue
             copied = copy.deepcopy(tool)
             tools.append(copied)
-            if _function_call_name(copied) in _PI_WEB_ACCESS_TOOL_NAMES:
+            name = _function_call_name(copied)
+            if name:
+                seen_names.add(name)
+            if name in _PI_WEB_ACCESS_TOOL_NAMES:
                 seen_direct_tool = True
     if not seen_direct_tool:
-        tools.extend(_responses_tools_module._pi_web_access_tool_definitions())
+        for definition in _responses_tools_module._pi_web_access_tool_definitions():
+            name = _function_call_name(definition)
+            if name and name in seen_names:
+                continue
+            tools.append(copy.deepcopy(definition))
+            if name:
+                seen_names.add(name)
     return tools
 
 
@@ -4981,6 +4993,26 @@ async def _external_web_search_continue_or_synthesize(
             phase="continuation",
         )
         if _external_web_search_is_empty_continuation_response(continued):
+            client_calls = _external_web_search_client_tool_call_items(continued)
+            if client_calls:
+                # An ``empty_continuation`` is a turn with no text and no
+                # bridge-owned search call. When it carries one of the client's
+                # own tool calls it is not empty at all: the model went back to
+                # the work the search interrupted. Returning it here is what
+                # keeps the synthesis below from discarding that call.
+                _trace_module._route_trace(
+                    "external_web_search_bridge_client_tool_passthrough",
+                    request_id=_routing_module._trace_request_id(request_kwargs),
+                    session=_routing_module._trace_session_context(request_kwargs),
+                    model_group=_responses_execution_module._request_model_group(request_kwargs),
+                    deployment_id=_routing_module._deployment_id_from_request(request_kwargs),
+                    route_key=_routing_module._deployment_route_key_from_request(request_kwargs),
+                    round=round_number,
+                    tool_names=[
+                        _function_call_name(call) for call in client_calls
+                    ],
+                )
+                return continued
             _trace_module._route_trace(
                 "external_web_search_bridge_empty_continuation_synthesis",
         activity="upstream_model",
@@ -5120,6 +5152,28 @@ async def _resolve_web_search_function_calls(
             completed_actions,
         )
         if not round_actions:
+            client_calls = _external_web_search_client_tool_call_items(current_response)
+            if client_calls:
+                # The model went back to the client's own tool rather than
+                # closing the investigation, so this turn ends here and Codex
+                # runs the call. Skipping the finalize step is what keeps that
+                # call from being read as an empty synthesis and discarded.
+                _trace_module._route_trace(
+                    "external_web_search_bridge_client_tool_passthrough",
+                    request_id=_routing_module._trace_request_id(request_kwargs),
+                    session=_routing_module._trace_session_context(request_kwargs),
+                    model_group=_responses_execution_module._request_model_group(request_kwargs),
+                    deployment_id=_routing_module._deployment_id_from_request(request_kwargs),
+                    route_key=_routing_module._deployment_route_key_from_request(request_kwargs),
+                    round=round_number,
+                    tool_names=[
+                        _function_call_name(call) for call in client_calls
+                    ],
+                )
+                final_response = current_response
+                forced_synthesis = False
+                client_tool_passthrough = True
+                break
             final_response = current_response
             break
 
@@ -6141,6 +6195,27 @@ def _external_web_search_visible_message_items(items: Any) -> list[dict[str, Any
     return visible_items
 
 
+def _external_web_search_output_has_deliverable_items(items: Any) -> bool:
+    """Report whether the assembled output says something the client can act on.
+
+    A passthrough tool call is a finished turn: the bridge handed the model's
+    own request back to Codex, which runs it. Only a turn with neither a visible
+    message nor such a call is the missing-answer case that needs recovery.
+    """
+
+    if _external_web_search_visible_message_items(items):
+        return True
+    if not isinstance(items, list):
+        return False
+    return any(
+        isinstance(item, dict)
+        and item.get("type") in _WEB_SEARCH_FUNCTION_CALL_ITEM_TYPES
+        and _function_call_name(item) not in _PI_WEB_ACCESS_TOOL_NAMES
+        and _function_call_name(item)
+        for item in items
+    )
+
+
 def _message_item_stream_events(item: dict[str, Any], index: int) -> list[dict[str, Any]]:
     """Build the standard Responses events that stream one message item."""
 
@@ -6300,6 +6375,7 @@ async def _resolve_web_search_function_calls_stream_rounds(
     search_results = "\n\n".join(section for section in search_sections if section.strip())
     completed_labels = _external_web_search_action_labels(completed_actions)
     forced_synthesis = False
+    client_tool_passthrough = False
     route_recovery_attempted = False
 
     def collect_action_events(
@@ -6440,6 +6516,24 @@ async def _resolve_web_search_function_calls_stream_rounds(
             completed_actions,
         )
         if not round_actions:
+            client_calls = _external_web_search_client_tool_call_items(current_response)
+            if client_calls:
+                # The model resumed the client's own work instead of closing
+                # the investigation; hand the call back untouched rather than
+                # reading it as an answer the bridge has to synthesize.
+                _trace_module._route_trace(
+                    "external_web_search_bridge_client_tool_passthrough",
+                    request_id=_routing_module._trace_request_id(request_kwargs),
+                    session=_routing_module._trace_session_context(request_kwargs),
+                    model_group=_responses_execution_module._request_model_group(request_kwargs),
+                    deployment_id=_routing_module._deployment_id_from_request(request_kwargs),
+                    route_key=_routing_module._deployment_route_key_from_request(request_kwargs),
+                    round=round_number,
+                    tool_names=[_function_call_name(call) for call in client_calls],
+                )
+                final_response = current_response
+                client_tool_passthrough = True
+                break
             final_response = current_response
             break
 
@@ -6544,7 +6638,7 @@ async def _resolve_web_search_function_calls_stream_rounds(
             break
         final_response = current_response
 
-    if not forced_synthesis:
+    if not forced_synthesis and not client_tool_passthrough:
         search_results = "\n\n".join(section for section in search_sections if section.strip())
         completed_labels = _external_web_search_action_labels(completed_actions)
         try:
@@ -6640,7 +6734,7 @@ async def _resolve_web_search_function_calls_stream_rounds(
             }
         )
 
-    if not _external_web_search_visible_message_items(final_output):
+    if not _external_web_search_output_has_deliverable_items(final_output):
         exception = _external_web_search_missing_final_answer_exception(request_kwargs)
         if route_recovery_attempted:
             yield _streaming_module._synthesized_failed_response_event(
@@ -6686,7 +6780,7 @@ async def _resolve_web_search_function_calls_stream_rounds(
                     for event in _external_web_search_message_stream_events(item, index):
                         yield encode(event)
         synthesized_payload = recovered_payload
-        if not _external_web_search_visible_message_items(final_output):
+        if not _external_web_search_output_has_deliverable_items(final_output):
             yield _streaming_module._synthesized_failed_response_event(
                 request_kwargs or {},
                 exception,

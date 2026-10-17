@@ -333,6 +333,112 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
         self.assertEqual(dumped.count("response.web_search_call.completed"), 2)
         self.assertIn("Final answer after both searches.", dumped)
 
+    async def test_streaming_external_web_search_hands_back_client_tool_call(self) -> None:
+        """A search whose continuation asks for the client's own tool resumes.
+
+        The continuation is the model's own investigation turn. When it comes
+        back with an ``exec`` call instead of a closing answer, that call is the
+        turn going back to the repository work the search interrupted; the
+        bridge has to deliver it rather than force a text-only synthesis that
+        would discard it.
+        """
+
+        hooks, _ = load_hook_module()
+        original_run_action = hooks._external_web_search_run_action
+        continuation_calls = []
+
+        async def fake_run_action(action, page_cache, page_fetch_tasks):
+            return (
+                "Web search results for query: sample topic\n"
+                "Title: Source\n"
+                "URL: https://example.test/source\n"
+                "Snippet: Thin snippet only.",
+                ["https://example.test/source"],
+                action,
+            )
+
+        hooks._external_web_search_run_action = fake_run_action
+        self.addCleanup(
+            setattr,
+            hooks,
+            "_external_web_search_run_action",
+            original_run_action,
+        )
+
+        async def original_function(**kwargs):
+            continuation_calls.append(copy.deepcopy(kwargs))
+            return {
+                "id": "resp_resume",
+                "object": "response",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "function_call",
+                        "id": "call_resume_exec",
+                        "call_id": "call_resume_exec",
+                        "name": "exec",
+                        "arguments": json.dumps({"cmd": ["rg", "-n", "sample topic"]}),
+                        "status": "completed",
+                    }
+                ],
+            }
+
+        response = {
+            "id": "resp_initial",
+            "object": "response",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "function_call",
+                    "name": "web_search",
+                    "arguments": json.dumps({"query": "sample topic"}),
+                    "status": "completed",
+                }
+            ],
+        }
+
+        stream = hooks._resolve_web_search_function_calls_stream_rounds(
+            response,
+            {
+                "model": "openai/vendor-chat",
+                "input": "Investigate the topic.",
+                "tools": [
+                    {"type": "web_search"},
+                    {"type": "function", "name": "exec", "parameters": {"type": "object"}},
+                ],
+                "stream": True,
+            },
+            original_function=original_function,
+        )
+        chunks = []
+        async for chunk in stream:
+            chunks.append(jsonable_stream_chunk(chunk))
+
+        dumped = json.dumps(chunks)
+        completed = next(
+            chunk for chunk in chunks if chunk.get("type") == "response.completed"
+        )
+        output = completed["response"]["output"]
+        client_calls = [
+            item for item in output
+            if item.get("type") == "function_call" and item.get("name") == "exec"
+        ]
+        self.assertEqual(
+            [item.get("name") for item in client_calls],
+            ["exec"],
+        )
+        self.assertEqual(
+            client_calls[0].get("arguments"),
+            json.dumps({"cmd": ["rg", "-n", "sample topic"]}),
+        )
+        self.assertNotIn("hosted_tool_unsupported", dumped)
+        self.assertEqual(len(continuation_calls), 1)
+        continuation_tool_names = {
+            tool.get("name") for tool in continuation_calls[0]["tools"]
+        }
+        self.assertIn("exec", continuation_tool_names)
+        self.assertIn("web_search", continuation_tool_names)
+
     async def test_streaming_external_web_search_model_chooses_source_after_full_result_page(self) -> None:
         hooks, _ = load_hook_module()
         original_run_action = hooks._external_web_search_run_action
