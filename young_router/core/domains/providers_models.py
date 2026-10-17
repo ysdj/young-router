@@ -100,6 +100,24 @@ def _public_name_without_lane_suffix(model_id: str) -> str:
     return model_id
 
 
+def _largest(value: object) -> int | None:
+    """The largest positive number in a stated set, or ``None`` when it states none.
+
+    A catalog entry publishes the window sizes it accepts as a list, so the
+    number a route can actually reach is the largest of them rather than any
+    one position in the list.
+    """
+
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return None
+    numbers = [
+        number
+        for number in (_positive_int(item) for item in value)
+        if number is not None
+    ]
+    return max(numbers) if numbers else None
+
+
 # The relay issue code that says the station answered and does not list this
 # source: the account was read, the key is not among the keys it serves.  The
 # separate code matters because the two are opposites further out — a station
@@ -2435,6 +2453,12 @@ class ProvidersModelsDomain:
             raise DomainError(
                 "Sign in to the WorkBuddy desktop app before adding this account"
             )
+        # The import just read the account's own catalog, so the windows it
+        # states are known before the provider exists.  Without this the row
+        # stayed empty until some later pane read happened to refill it, and
+        # the account's 国际版 models reported nothing at all right after the
+        # one read that had the numbers in hand.
+        self._remember_published_windows(provider_id, document.get("models"))
         models: list[dict[str, Any]] = []
         for entry in document.get("models") or []:
             if not isinstance(entry, Mapping):
@@ -2800,13 +2824,27 @@ class ProvidersModelsDomain:
                 model_id = str(entry.get("id", "")).strip()
                 if not model_id:
                     continue
-                # ``defaultContextWindow`` is the budget the upstream actually
-                # requests; ``contextWindow`` is what it states outright.  The
-                # larger ``supportedContextWindows`` value is only a ceiling,
-                # so it is deliberately not consulted here.
-                window = _positive_int(
-                    entry.get("defaultContextWindow") or entry.get("contextWindow")
-                )
+                # The upstream states two numbers and the larger one is the
+                # window its requests actually get.  ``defaultContextWindow``
+                # is the budget it asks for by default, ``maxInputTokens``
+                # and ``supportedContextWindows`` are what it accepts, and a
+                # measured 1,048,301-token request is answered by the same
+                # endpoint that publishes the smaller default -- so reading
+                # only the default reported a third of the real window and
+                # made a route look full at a third of its capacity.  The
+                # accepted set is the larger number whenever the upstream
+                # states one at all.
+                stated = [
+                    number
+                    for number in (
+                        _positive_int(entry.get("maxInputTokens")),
+                        _largest(entry.get("supportedContextWindows")),
+                        _positive_int(entry.get("contextWindow")),
+                        _positive_int(entry.get("defaultContextWindow")),
+                    )
+                    if number is not None
+                ]
+                window = max(stated) if stated else None
                 if window is None:
                     continue
                 windows[model_id] = window

@@ -47,6 +47,23 @@ CATALOG = [
     },
 ]
 
+# The international catalog states a default budget well below the window its
+# requests are actually accepted at: a measured 1,048,301-token request is
+# answered by the same endpoint that publishes the 300,000 default.
+INTERNATIONAL_CATALOG = [
+    {
+        "id": "deepseek-v4.1-flash",
+        "name": "Deepseek-V4.1-Flash",
+        "contextWindow": 300_000,
+        "defaultContextWindow": 300_000,
+        "maxInputTokens": 1_000_000,
+        "supportedContextWindows": [300_000, 1_000_000],
+        "maxTokens": 128_000,
+        "supportsImages": True,
+        "billing": {"credits": "x0.00", "free": True},
+    },
+]
+
 
 class StubRuntime:
     """The worker surface Core depends on, without a Node process."""
@@ -54,6 +71,7 @@ class StubRuntime:
     def __init__(self, *, state: str = "signed-in", available: bool = True) -> None:
         self.state = state
         self.available = available
+        self.catalog = CATALOG
         self.calls: list[tuple[str, str]] = []
         self.stopped = 0
 
@@ -89,7 +107,7 @@ class StubRuntime:
             "available": True,
             "source": "live",
             "fetched_at_ms": 1,
-            "models": [dict(entry) for entry in CATALOG],
+            "models": [dict(entry) for entry in self.catalog],
             "status": self.provider_status(provider),
         }
 
@@ -164,6 +182,54 @@ class WorkBuddyProviderTests(unittest.TestCase):
             self.assertNotIn("127.0.0.1", document)
             self.assertNotIn("local-token", document)
             self.assertIn("model: openai/glm-5.3", document)
+
+    def test_a_route_reports_the_window_the_international_catalog_accepts(self) -> None:
+        """The 国际版 window is the accepted one, not the default it asks for.
+
+        The international catalog states a 300,000 default beside a 1,000,000
+        ``maxInputTokens`` and a ``supportedContextWindows`` that tops out at
+        the same 1,000,000, and a measured 1,048,301-token request is answered
+        by that endpoint.  Reporting the default made a route look full at a
+        third of what it accepts, so the largest number the entry states is the
+        one the row shows.
+        """
+
+        runtime = StubRuntime()
+        runtime.catalog = INTERNATIONAL_CATALOG
+        directory, domain, _config = self._domain(runtime)
+        with directory:
+            provider = domain.dispatch(
+                "service_provider.add", {"kind": "workbuddy_ai_login"}
+            )["providers"][0]
+            self.assertEqual(
+                1_000_000,
+                provider["models"][0]["upstream_context_window"],
+            )
+
+    def test_a_catalog_that_states_only_a_default_still_reports_it(self) -> None:
+        """An entry with no larger stated number keeps reporting what it does state."""
+
+        runtime = StubRuntime()
+        runtime.catalog = [
+            {
+                "id": "hy3",
+                "name": "Hy3",
+                "contextWindow": 192_000,
+                "defaultContextWindow": 192_000,
+                "maxTokens": 64_000,
+                "supportsImages": True,
+                "billing": {"credits": "x0.00 credits", "free": True},
+            }
+        ]
+        directory, domain, _config = self._domain(runtime)
+        with directory:
+            provider = domain.dispatch(
+                "service_provider.add", {"kind": "workbuddy_ai_login"}
+            )["providers"][0]
+            self.assertEqual(
+                192_000,
+                provider["models"][0]["upstream_context_window"],
+            )
 
     def test_a_wizard_created_entry_starts_without_models(self) -> None:
         """The wizard creates the service entry; the editor links the account."""
