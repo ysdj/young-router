@@ -41,6 +41,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "validation.modelNameRequired": "该模型缺少公开模型名。",
   "validation.modelUpstreamRequired": "该模型缺少上游模型。",
   "validation.modelProviderKeyMissing": "该模型选择的供应商密钥不可用。",
+  "validation.modelMultiplierMissing": "该路由所选中转分组没有可用的倍率。",
   "validation.invalidSyntax": "配置语法无效。",
   "validation.issueAt": "{path}：{message}",
   "validation.moreIssues": "（另有 {count} 项）",

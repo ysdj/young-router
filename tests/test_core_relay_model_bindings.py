@@ -1061,6 +1061,118 @@ model_list:
             self.assertEqual({"multiplier_missing"}, {item["code"] for item in result["issues"]})
             self.assertNotIn("replace-materialized-credential", json.dumps(result))
 
+    def test_a_resolved_multiplier_is_applied_even_without_an_authoritative_catalog(self) -> None:
+        """Following the multiplier has to land when no catalog was read.
+
+        A dependency-only Apply resolves the linked key from the credential the
+        document already persists, so it reads no catalog and marks the
+        resolution non-authoritative.  That resolution still carries the group's
+        own multiplier, and the route's order is not catalog evidence — it comes
+        from the number in hand.  Stopping at the catalog check left the route
+        without an effective order, so the dumper refused the whole save with
+        "Relay multiplier is unavailable" while the multiplier was sitting in
+        the very material being applied.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            domain = ProvidersModelsDomain(Path(directory) / "config.yaml")
+            source = relay_source(models=["upstream-chat"], multiplier=0.5)
+            domain.stage_relay_import([source])
+            provider = domain.snapshot()["providers"][0]
+            model_id = provider["models"][0]["id"]
+            domain.dispatch(
+                "model.patch",
+                {
+                    "provider_id": provider["id"],
+                    "model_id": model_id,
+                    "changes": {"order_mode": "relay_multiplier"},
+                },
+            )
+
+            # The key's own catalog never listed this upstream, and the
+            # resolution did not read one.
+            result = domain.materialize_relay_bindings(
+                {
+                    "resources": [
+                        {
+                            **source,
+                            "api_key": "replace-materialized-credential",
+                            "models": ["different-model"],
+                            "multiplier": 0.5,
+                            "catalog_authoritative": False,
+                        }
+                    ]
+                }
+            )
+
+            self.assertEqual([], result["issues"])
+            model = domain.snapshot()["providers"][0]["models"][0]
+            self.assertEqual("relay_multiplier", model["order_mode"])
+            self.assertEqual(0.5, model["effective_order"])
+            # And the draft is now writable: the save is what the pane's edit
+            # does, and it used to fail here.
+            self.assertTrue(domain.validate()["valid"])
+            domain.apply()
+            self.assertIn("order: 0.5", (Path(directory) / "config.yaml").read_text(encoding="utf-8"))
+
+    def test_a_multiplier_without_a_group_number_is_named_on_its_own_row(self) -> None:
+        """One unfinished route marks its own row, not every row.
+
+        The dumper reports an unusable route by its position inside its
+        provider and with no location at all, which the pane reads as "this
+        issue is everywhere" — so a single route asking for a multiplier it
+        could not materialize turned every provider and model row in the
+        window brown.  The location is known here, where the row's position
+        still is, so the issue carries it and the mark lands on the route that
+        is actually unfinished.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            domain = ProvidersModelsDomain(Path(directory) / "config.yaml")
+            source = relay_source(models=["upstream-chat"])
+            domain.stage_relay_import([source])
+            provider = domain.snapshot()["providers"][0]
+            followed_id = provider["models"][0]["id"]
+            domain.dispatch(
+                "model.add",
+                {
+                    "provider_id": provider["id"],
+                    "model": {
+                        "name": "plain-chat",
+                        "upstream_model": "upstream-plain",
+                        "api_key_name": provider["key_states"][0]["name"],
+                    },
+                },
+            )
+            domain.dispatch(
+                "model.patch",
+                {
+                    "provider_id": provider["id"],
+                    "model_id": followed_id,
+                    "changes": {"order_mode": "relay_multiplier"},
+                },
+            )
+
+            # A resolution that carried no multiplier at all leaves the route
+            # unfinished.  The reported location names the route, so the pane
+            # has a row to mark instead of marking the document.
+            result = domain.validate()
+            self.assertFalse(result["valid"])
+            issue = next(
+                item for item in result["issues"] if item["code"] == "model_multiplier_missing"
+            )
+            models = domain.snapshot()["providers"][0]["models"]
+            position = next(
+                index for index, model in enumerate(models) if model["id"] == followed_id
+            )
+            self.assertEqual(
+                f"providers_models.{provider['name']}.models[{position + 1}]",
+                issue["path"],
+            )
+            # Every reported issue names a row, so no single refusal can mark
+            # the whole window.
+            self.assertTrue(all(item.get("path") for item in result["issues"]))
+
     def test_a_provider_holds_one_base_url_and_its_routes_inherit_it(self) -> None:
         """A route never carries a second copy of its provider's address.
 

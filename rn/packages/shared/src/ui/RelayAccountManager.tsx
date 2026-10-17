@@ -6,6 +6,7 @@ import { usePendingAction } from "./pendingAction";
 import { setGroupManagerOpen } from "./providerWizardGate";
 import { useRelayDialogSurface } from "./relayDialogSurface";
 import { normalizeRelayOrigin } from "./relayOrigin";
+import { multiplierSpelling } from "./rateSpelling";
 import { UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
 
 export { normalizeRelayOrigin } from "./relayOrigin";
@@ -137,7 +138,7 @@ function resourceGroupName(resource: RelayResource, groups: RelayGroup[], transl
 /** The 倍率 value: the group's rate, or nothing when it has none. */
 function groupRateLabel(group: RelayGroup | undefined): string {
   const multiplier = group ? groupMultiplier(group.multiplier) : null;
-  return multiplier === null ? "" : `×${multiplier}`;
+  return multiplier === null ? "" : multiplierSpelling(multiplier);
 }
 
 /**

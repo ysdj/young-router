@@ -5402,28 +5402,29 @@ class ProvidersModelsDomain:
                         # evidence it states.
                         if resource.get("catalog_authoritative") is False:
                             model["binding_health"] = {"status": "linked"}
-                            materialized_models += 1
-                            affected_models.append(
+                        else:
+                            issues.append(
                                 {
+                                    "code": "catalog_model_missing",
                                     "provider_key_id": key["id"],
                                     "model_id": model_id,
-                                    "upstream_model": source_model_id,
+                                    "source": copy.deepcopy(source),
                                 }
                             )
-                            continue
-                        issues.append(
-                            {
-                                "code": "catalog_model_missing",
-                                "provider_key_id": key["id"],
-                                "model_id": model_id,
-                                "source": copy.deepcopy(source),
+                            model["binding_health"] = {
+                                "status": "catalog_model_missing",
+                                "detail": "The selected source model is absent from the relay catalog",
                             }
-                        )
-                        model["binding_health"] = {
-                            "status": "catalog_model_missing",
-                            "detail": "The selected source model is absent from the relay catalog",
-                        }
-                        continue
+                            continue
+                    # The order is resolved whether or not the catalog was
+                    # consulted.  The catalog decides what the route may
+                    # *call*; the order is the group's own number, which a
+                    # resolution that carried it knows even when it read no
+                    # catalog at all.  Deciding the order only after a catalog
+                    # hit let the non-authoritative branch above skip it, so a
+                    # route following the multiplier reached the dumper with no
+                    # effective order and the whole save was refused — with the
+                    # multiplier sitting unused in the material being applied.
                     order_mode = str(model.get("order_mode", "manual")).strip() or "manual"
                     if order_mode == "relay_multiplier":
                         if multiplier is None:
@@ -7027,6 +7028,26 @@ class ProvidersModelsDomain:
                             "path": location,
                             "code": "model_provider_key_missing",
                             "message": "The selected provider key is unavailable",
+                            "severity": "error",
+                        }
+                    )
+                elif (
+                    str(model.get("order_mode", "manual")).strip() == "relay_multiplier"
+                    and model.get("effective_order") in (None, "")
+                ):
+                    # A route following the multiplier is written with the
+                    # group's own number, so one that has not been materialized
+                    # cannot be dumped at all.  The dumper reports that by
+                    # position inside its provider and with no location at all,
+                    # which is what left the pane marking *every* row the moment
+                    # one route asked for a multiplier it did not have.  Name
+                    # the route here, where its position is still known, so the
+                    # mark lands on the row that is actually unfinished.
+                    issues.append(
+                        {
+                            "path": location,
+                            "code": "model_multiplier_missing",
+                            "message": "The linked relay group has no usable multiplier",
                             "severity": "error",
                         }
                     )

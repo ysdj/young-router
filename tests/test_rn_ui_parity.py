@@ -972,7 +972,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # multiplier or an account's own published catalog — so it asks about
         # the rate, not about which kind of provider the route uses.
         self.assert_ui_has('const followsServiceRate = usesRelayKey || providerService(provider) !== undefined;')
-        self.assert_ui_has('const followedRate = usesRelayKey ? relayMultiplier : serviceRateNumber(serviceRate);')
+        self.assert_ui_has('const followedRate = usesRelayKey ? relayMultiplier : rateNumber(serviceRate);')
         self.assert_ui_has('const canFollowMultiplier = followsServiceRate && followedRate !== undefined;')
         self.assert_ui_has('{canFollowMultiplier ? <NativeCheckbox')
         self.assert_ui_has('const order = Number.isFinite(parsed) ? parsed : 0;')
@@ -1045,7 +1045,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # one cannot disagree about the rate or the name they state.
         self.assert_ui_has('const modelCells = (item: UnknownRecord): string[] => {')
         self.assert_ui_has('const multiplier = relaySourceForKey(modelProviderKeyState(item, provider ?? {}), relaySources)?.multiplier;')
-        self.assert_ui_has('modelRateText(workspaceService, stringValue(item.upstream_model).trim(), multiplier, translate),')
+        self.assert_ui_has('modelRateText(workspaceService, stringValue(item.upstream_model).trim(), multiplier),')
         self.assert_ui_has('for (const item of ungrouped) rows.push({ key: editorIdentifier(item), cells: modelCells(item) });')
         self.assert_ui_has('for (const item of group.models) rows.push({ key: editorIdentifier(item), cells: modelCells(item) });')
         self.assert_ui_has('columns={variant === "inline"')
@@ -4038,9 +4038,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'label={translate("providers.providerName")}',
             'isLogin ? SERVICE_BASE_URLS[kind as ServiceID]',
             # Every label column in the pane is the shared one, so a rate row
-            # lines up with the fields beside it.
+            # lines up with the fields beside it.  An unstated rate paints
+            # blank, not 无: the upstream having published no rate and this
+            # pane not having read one are different facts.
             'providerAuthStatusLabel: { width: 88, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE }',
-            'serviceRate.trim() || translate("common.none")',
+            '{serviceRate.trim()}</Text>',
             # One association block is labelled by the provider's service, its
             # right-hand control follows the sign-in state, and an account-backed
             # provider keeps its key slot and fetch path.
@@ -4229,6 +4231,39 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.ui.index("serviceRates.set(service, { at: Date.now(), catalog: models, rates: serviceCatalogRates(models) });"),
         )
         self.assert_ui_has('if (catalog) { setServiceRate(peekServiceRate(service, upstreamModelID) ?? ""); return; }')
+
+    def test_a_rate_is_printed_without_its_trailing_zeros(self) -> None:
+        """`x0.00` reads as `x0`, and `x0.10` as `x0.1`, in both places a rate shows.
+        """
+
+        # The spelling lives in one module both panes import, so the model list
+        # column and the relay group sheet cannot diverge.
+        spelling = (ROOT / "rn/packages/shared/src/ui/rateSpelling.ts").read_text(encoding="utf-8")
+        self.assertIn('/** One stated rate with the `credits` unit word dropped. */', spelling)
+        self.assertIn('export function rateSpelling(', spelling)
+        self.assertIn('export function multiplierSpelling(', spelling)
+        self.assertIn('return prefix + String(number);', spelling)
+        self.assert_ui_has('import { multiplierSpelling, rateNumber, rateSpelling } from "./rateSpelling";')
+        self.assert_ui_has('rates[modelID] = rateSpelling(credits.replace(/\\s*credits?$/i, ""));')
+        self.assert_ui_has('if (relayMultiplier !== undefined) return multiplierSpelling(relayMultiplier);')
+        relay = (ROOT / "rn/packages/shared/src/ui/RelayAccountManager.tsx").read_text(encoding="utf-8")
+        self.assertIn('import { multiplierSpelling } from "./rateSpelling";', relay)
+        self.assertIn('return multiplier === null ? "" : multiplierSpelling(multiplier);', relay)
+        # The old inline spellings are gone: a second copy is how the two panes
+        # drifted apart in the first place.
+        for inline in (
+            'return `×${multiplier}`;',
+            'return multiplier === null ? "" : `×${multiplier}`;',
+        ):
+            self.assertNotIn(inline, self.ui)
+            self.assertNotIn(inline, relay)
+        # A rate nobody stated stays blank rather than reading 无: the upstream
+        # having published no number and this pane not having read one are
+        # different facts, and only the first is a statement about the upstream.
+        self.assert_ui_has('return rate === undefined ? "" : rateNumber(rate) !== undefined ? rate : "";')
+        self.assert_ui_has('{serviceRate.trim()}</Text>')
+        self.assertNotIn('serviceRate.trim() || translate("common.none")', self.ui)
+        self.assertNotIn('rate === undefined ? "" : serviceRateNumber(rate) !== undefined ? rate : translate("common.none")', self.ui)
 
     def test_unified_provider_workspace_lists_every_provider_kind(self) -> None:
         """服务商管理 is integrated: the provider table shows all kinds."""

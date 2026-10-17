@@ -35,6 +35,7 @@ import {
   type StationDraft,
 } from "./RelayAccountManager";
 import { suggestedProviderName, suggestedRelayStationName } from "./relayOrigin";
+import { multiplierSpelling, rateNumber, rateSpelling } from "./rateSpelling";
 import { isAssistantEditorOpen, isGroupManagerOpen, isProviderWizardOpen, setAssistantEditorOpen, setGroupManagerOpen, setProviderWizardOpen, subscribeProviderWizard } from "./providerWizardGate";
 import { RelayDialogHost, useRelayDialogSurface } from "./relayDialogSurface";
 import { SOURCE_LIST_FONT_SIZE, UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
@@ -322,9 +323,14 @@ async function serviceCatalog(
 /**
  * What one catalog states each model bills at.
  *
- * A catalog that states no billing leaves every entry empty rather than
- * writing a zero: this lane's models are free because the lane serves them
- * anonymously, and 无 is not a rate a route could follow.
+ * An entry is stored only when the catalog states a number for it.  Three
+ * states stay apart here and must not be collapsed into each other: a stated
+ * rate, a catalog that states none, and a read that has not happened yet.
+ * Writing `x0.00` for a free entry, or `无` for a catalog that states
+ * nothing, both render as a rate the route cannot follow — the first claims a
+ * zero the upstream never billed, the second claims knowledge where there is
+ * none.  An unknown rate is therefore absent from the map, and every reader
+ * paints it blank.
  */
 function serviceCatalogRates(models: UnknownRecord[]): Record<string, string> {
   const rates: Record<string, string> = {};
@@ -333,7 +339,13 @@ function serviceCatalogRates(models: UnknownRecord[]): Record<string, string> {
     if (!modelID) continue;
     const billing = asRecord(entry.billing);
     const credits = stringValue(billing.credits).trim();
-    rates[modelID] = credits ? credits.replace(/\s*credits?$/i, "") : billing.free === true ? "x0.00" : "";
+    if (credits) {
+      rates[modelID] = rateSpelling(credits.replace(/\s*credits?$/i, ""));
+      continue;
+    }
+    // A free entry with no stated number bills nothing, which is not a rate a
+    // route can follow: the upstream named a promotion, not a multiplier.
+    if (billing.free === true) continue;
   }
   return rates;
 }
@@ -429,20 +441,6 @@ function workbuddyObservationIsFresh(provider: UnknownRecord, windowSeconds: num
 }
 
 /**
- * One catalog rate as a number, or `undefined` when the row shows none.
- *
- * The displayed value keeps the catalog's own spelling (`x0.79`, or the free
- * entry the catalog marks as `x0.00`), while the order a route follows is a
- * number.  Reading it back here means the switch and the row it sits beside
- * can never disagree about which rate is being followed.
- */
-function serviceRateNumber(value: string): number | undefined {
-  const text = value.trim().replace(/^[x×]\s*/i, "");
-  if (!text) return undefined;
-  const parsed = Number(text);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
-}
-
 /**
  * One route's 倍率, as the list column states it next to the order it feeds.
  *
@@ -452,12 +450,14 @@ function serviceRateNumber(value: string): number | undefined {
  * detail pane reads, so the column and the pane can never disagree about the
  * rate a row is following.  A route whose rate is not known prints nothing —
  * an em dash would read as a zero, and this column is compared read down like
- * the order beside it.
+ * the order beside it.  `无` is dropped here for the same reason: it reads as a
+ * stated absence of a rate, when what the column actually holds is a rate it
+ * has not learned yet.
  */
-function modelRateText(service: ServiceID | undefined, upstreamModelID: string, relayMultiplier: number | undefined, translate: Translate): string {
-  if (relayMultiplier !== undefined) return `×${relayMultiplier}`;
+function modelRateText(service: ServiceID | undefined, upstreamModelID: string, relayMultiplier: number | undefined): string {
+  if (relayMultiplier !== undefined) return multiplierSpelling(relayMultiplier);
   const rate = peekServiceRate(service, upstreamModelID);
-  return rate === undefined ? "" : serviceRateNumber(rate) !== undefined ? rate : translate("common.none");
+  return rate === undefined ? "" : rateNumber(rate) !== undefined ? rate : "";
 }
 
 /** The shared busy word, or nothing when the read has settled. */
@@ -978,6 +978,7 @@ function validationIssueMessageKey(code: string): string | undefined {
     case ["model", "name", "required"].join("_"): return "validation.modelNameRequired";
     case ["model", "upstream", "required"].join("_"): return "validation.modelUpstreamRequired";
     case ["model", "provider", "key", "missing"].join("_"): return "validation.modelProviderKeyMissing";
+    case ["model", "multiplier", "missing"].join("_"): return "validation.modelMultiplierMissing";
     case ["invalid", "syntax"].join("_"): return "validation.invalidSyntax";
     default: return undefined;
   }
@@ -5406,7 +5407,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       return [
         `\t${modelUpstreamDisplay(providerId, item)}`,
         modelDisplayName(providerId, item),
-        modelRateText(workspaceService, stringValue(item.upstream_model).trim(), multiplier, translate),
+        modelRateText(workspaceService, stringValue(item.upstream_model).trim(), multiplier),
       ];
     };
     for (const item of ungrouped) rows.push({ key: editorIdentifier(item), cells: modelCells(item) });
@@ -6235,7 +6236,7 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
   // follows a number this app does not decide — so the switch asks whether a
   // rate is known, not which kind of provider the route happens to use.
   const followsServiceRate = usesRelayKey || providerService(provider) !== undefined;
-  const followedRate = usesRelayKey ? relayMultiplier : serviceRateNumber(serviceRate);
+  const followedRate = usesRelayKey ? relayMultiplier : rateNumber(serviceRate);
   const canFollowMultiplier = followsServiceRate && followedRate !== undefined;
   const manualOrder = numberValue(model.manual_order, modelEffectiveOrder(model));
   const followsMultiplier = canFollowMultiplier && modelOrderMode(model) === "relay_multiplier";
@@ -6367,7 +6368,11 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
       {bindingIssueText ? <Text style={styles.fieldHint}>{bindingIssueText}</Text> : null}
       {service ? <View style={styles.formRow}>
         <Text numberOfLines={1} style={styles.modelInspectorLabel}>{translate("providers.modelRate")}</Text>
-        <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{serviceRate.trim() || translate("common.none")}</Text>
+        {/* A rate the catalog states is printed as it states it.  A rate it
+            does not state stays blank: `无` would read as an upstream that
+            published no rate at all, which is a different fact from one whose
+            number this pane has not read yet. */}
+        <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{serviceRate.trim()}</Text>
       </View> : null}
       <TextField label={translate("providers.upstream")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} value={upstreamFieldValue} onDraftChange={(value) => drafts?.setModelUpstreamDraft(providerId, id, value)} onCommit={(upstream_model) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { upstream_model } })} />
       {/* The window the route's own upstream publishes, stated directly under
