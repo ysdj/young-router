@@ -8590,7 +8590,7 @@ function WebDavPasswordField({ configured, busy, translate, onSecretState }: { c
 
 type RouteTraceAttempt = {
   label: string;
-  state: "selected" | "failed" | "attempted";
+  state: "succeeded" | "selected" | "failed" | "attempted";
   detail: string;
   time: string;
 };
@@ -8693,6 +8693,7 @@ function formatLogTokens(value: string): string {
 function routeTraceEventLabel(value: string, translate: Translate): string {
   const labels: Record<string, Parameters<Translate>[0]> = {
     selected_deployment: "logs.routeEvent.selected",
+    deployment_success: "logs.routeEvent.deploymentSuccess",
     filter_deployments: "logs.routeEvent.filtered",
     generic_fallback_helper_start: "logs.routeEvent.fallback",
     generic_fallback_helper_error: "logs.routeEvent.fallbackFailed",
@@ -9294,7 +9295,13 @@ function renderLogRecord(record: unknown, tab: LogTab, index: number, translate:
     if (route) {
       routeAttempts.push({
         label: route,
-        state: failed ? "failed" : rawEvent === "selected_deployment" ? "selected" : "attempted",
+        state: failed
+          ? "failed"
+          : rawEvent === "deployment_success"
+            ? "succeeded"
+            : rawEvent === "selected_deployment"
+              ? "selected"
+              : "attempted",
         detail: details.filter(Boolean).join(" | "),
         time,
       });
@@ -9384,9 +9391,13 @@ function groupRouteTraceRequests(rows: RenderedLogRecord[]): RouteTraceRequest[]
         }
         // A route can be logged once when selected and again when it fails (or
         // when a recovery poll selects it again). Keep the path compact while
-        // allowing a later explicit selection/failure to become the visible
-        // state.
-        if (attempt.state !== "attempted") existing.state = attempt.state;
+        // allowing a later explicit selection/failure/success to become the
+        // visible state. A route that already served this request keeps that
+        // answer: a later bare selection of the same route says only that it
+        // was picked again, which is not a reason to withdraw the success.
+        if (attempt.state !== "attempted" && !(existing.state === "succeeded" && attempt.state === "selected")) {
+          existing.state = attempt.state;
+        }
         if (attempt.detail && (attempt.state !== "attempted" || !existing.detail)) existing.detail = attempt.detail;
         if (!existing.time && attempt.time) existing.time = attempt.time;
       }
@@ -9396,8 +9407,13 @@ function groupRouteTraceRequests(rows: RenderedLogRecord[]): RouteTraceRequest[]
     // empty "not available" route-trace requests.
     if (attempts.length === 0) return [];
     const failedCount = attempts.filter((attempt) => attempt.state === "failed").length;
-    const lastAttempt = attempts[attempts.length - 1];
-    const outcome: RouteTraceRequest["outcome"] = lastAttempt?.state === "failed"
+    // A request that served its answer is finished wherever an earlier hop
+    // failed, so the outcome reads from the last route that actually answered
+    // rather than from whichever route happened to be picked last.
+    const lastServed = attempts.map((attempt) => attempt.state).lastIndexOf("succeeded");
+    const outcome: RouteTraceRequest["outcome"] = lastServed >= 0
+      ? failedCount > 0 || attempts.length > 1 ? "fallback" : "direct"
+      : attempts[attempts.length - 1]?.state === "failed"
         ? "failed"
         : failedCount > 0 || attempts.length > 1 ? "fallback" : "direct";
     return {
@@ -9539,13 +9555,15 @@ function fitLogColumns(columns: LogColumn[], availableWidth: number): LogColumn[
 
 function routeTraceAttemptLabel(state: RouteTraceAttempt["state"], translate: Translate): string {
   if (state === "failed") return translate("logs.routeTrace.failedRoute");
+  if (state === "succeeded") return translate("logs.success");
   if (state === "selected") return translate("logs.routeTrace.selectedRoute");
   return translate("logs.routeTrace.attemptedRoute");
 }
 
 function routeTraceAttemptIcon(state: RouteTraceAttempt["state"]): string {
   if (state === "failed") return "×";
-  if (state === "selected") return "✓";
+  if (state === "succeeded") return "✓";
+  if (state === "selected") return "•";
   return "•";
 }
 
@@ -9705,23 +9723,23 @@ function RouteTraceWorkspace({ requests, selectedKey, native, translate, onSelec
             </View>
           </View>
           {selected.attempts.map((attempt, index) => {
-            const failed = attempt.state === "failed";
-            const chosen = attempt.state === "selected";
+            const tone = ROUTE_TRACE_ATTEMPT_TONES[attempt.state];
+            const active = attempt.state === "failed" || attempt.state === "succeeded";
             return <View key={`${attempt.label}:${index}`} style={styles.routeTraceTimelineRow}>
               <View style={styles.routeTraceTimelineRail}>
                 {index < selected.attempts.length - 1 ? <View style={styles.routeTraceTimelineLine} /> : null}
-                <View style={[styles.routeTraceTimelineNode, failed ? styles.routeTraceTimelineNodeFailed : chosen ? styles.routeTraceTimelineNodeSelected : styles.routeTraceTimelineNodeAttempted]}>
-                  <Text style={[styles.routeTraceTimelineNodeText, (failed || chosen) && styles.routeTraceTimelineNodeTextActive]}>{index + 1}</Text>
+                <View style={[styles.routeTraceTimelineNode, tone.node]}>
+                  <Text style={[styles.routeTraceTimelineNodeText, active && styles.routeTraceTimelineNodeTextActive]}>{index + 1}</Text>
                 </View>
               </View>
-              <View style={[styles.routeTraceStepCard, failed ? styles.routeTraceStepCardFailed : chosen ? styles.routeTraceStepCardSelected : null]}>
+              <View style={[styles.routeTraceStepCard, tone.card]}>
                 <View style={styles.routeTraceStepMetaRow}>
                   <Text style={styles.routeTraceStepNumber}>{translate("logs.routeTrace.stepProgress", { current: index + 1, total: selected.attempts.length })}</Text>
                   <View style={styles.routeTraceStepState}>
-                    <View style={[styles.routeTraceStepStateIcon, failed ? styles.routeTraceStepStateIconFailed : chosen ? styles.routeTraceStepStateIconSelected : styles.routeTraceStepStateIconAttempted]}>
-                      <Text style={[styles.routeTraceStepStateIconText, !failed && !chosen && styles.routeTraceStepStateIconTextAttempted]}>{routeTraceAttemptIcon(attempt.state)}</Text>
+                    <View style={[styles.routeTraceStepStateIcon, tone.icon]}>
+                      <Text style={[styles.routeTraceStepStateIconText, tone.iconText]}>{routeTraceAttemptIcon(attempt.state)}</Text>
                     </View>
-                    <Text style={[styles.routeTraceStepStateText, failed ? styles.routeTraceStepStateFailed : chosen ? styles.routeTraceStepStateSelected : styles.routeTraceStepStateAttempted]}>{routeTraceAttemptLabel(attempt.state, translate)}</Text>
+                    <Text style={[styles.routeTraceStepStateText, tone.text]}>{routeTraceAttemptLabel(attempt.state, translate)}</Text>
                   </View>
                 </View>
                 <Text numberOfLines={2} style={styles.routeTraceStepTitle}>{attempt.label}</Text>
@@ -10826,6 +10844,7 @@ const systemColors = {
   selectedControlText: semanticColor("alternateSelectedControlTextColor", "TextOnAccentFillColorPrimary", "#ffffff"),
   red: semanticColor("systemRedColor", undefined, "#b00020"),
   green: semanticColor("systemGreenColor", undefined, "#2f6b3d"),
+  yellow: semanticColor("systemYellowColor", undefined, "#7a5c00"),
   brown: semanticColor("systemBrownColor", undefined, "#6f5500"),
 } as const;
 
@@ -10928,7 +10947,8 @@ const styles = StyleSheet.create({
   routeTraceTimelineLine: { position: "absolute", top: 25, bottom: -17, left: 10, width: 2, backgroundColor: systemColors.separator },
   routeTraceTimelineNode: { width: 18, height: 18, borderRadius: 9, alignItems: "center", justifyContent: "center", zIndex: 1, backgroundColor: systemColors.control },
   routeTraceTimelineNodeStart: { backgroundColor: systemColors.secondaryLabel },
-  routeTraceTimelineNodeSelected: { backgroundColor: systemColors.green },
+  routeTraceTimelineNodeSelected: { backgroundColor: systemColors.yellow },
+  routeTraceTimelineNodeSucceeded: { backgroundColor: systemColors.green },
   routeTraceTimelineNodeFailed: { backgroundColor: systemColors.red },
   routeTraceTimelineNodeAttempted: { borderWidth: 1, borderColor: systemColors.secondaryLabel, backgroundColor: systemColors.control },
   routeTraceTimelineNodeText: { color: systemColors.label, fontSize: 10, fontWeight: "400", lineHeight: 12 },
@@ -10939,18 +10959,22 @@ const styles = StyleSheet.create({
   routeTraceStepLabel: { color: systemColors.label, fontSize: UI_TIP_FONT_SIZE },
   routeTraceStepValue: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
   routeTraceStepCard: { flex: 1, minWidth: 0, minHeight: 58, paddingHorizontal: 11, paddingVertical: 9, gap: 4, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.control },
-  routeTraceStepCardSelected: { borderColor: systemColors.green, borderWidth: 2 },
+  routeTraceStepCardSelected: { borderColor: systemColors.yellow, borderWidth: 2 },
+  routeTraceStepCardSucceeded: { borderColor: systemColors.green, borderWidth: 2 },
   routeTraceStepCardFailed: { borderColor: systemColors.red, borderWidth: 2 },
   routeTraceStepTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
   routeTraceStepState: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 5 },
   routeTraceStepStateIcon: { width: 14, height: 14, borderRadius: 7, alignItems: "center", justifyContent: "center" },
-  routeTraceStepStateIconSelected: { backgroundColor: systemColors.green },
+  routeTraceStepStateIconSelected: { backgroundColor: systemColors.yellow },
+  routeTraceStepStateIconSucceeded: { backgroundColor: systemColors.green },
   routeTraceStepStateIconFailed: { backgroundColor: systemColors.red },
   routeTraceStepStateIconAttempted: { borderWidth: 1, borderColor: systemColors.secondaryLabel, backgroundColor: systemColors.control },
   routeTraceStepStateIconText: { width: 14, height: 14, color: systemColors.selectedControlText, fontSize: 10, fontWeight: "700", lineHeight: 14, textAlign: "center" },
   routeTraceStepStateIconTextAttempted: { color: systemColors.secondaryLabel },
+  routeTraceStepStateIconTextSelected: { color: systemColors.selectedControlText },
   routeTraceStepStateText: { fontSize: UI_TIP_FONT_SIZE, fontWeight: "600" },
-  routeTraceStepStateSelected: { color: systemColors.green },
+  routeTraceStepStateSelected: { color: systemColors.yellow },
+  routeTraceStepStateSucceeded: { color: systemColors.green },
   routeTraceStepStateFailed: { color: systemColors.red },
   routeTraceStepStateAttempted: { color: systemColors.label },
   routeTraceStepDetail: { color: systemColors.label, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16 },
@@ -11013,3 +11037,41 @@ inspectorProbeFinding: { flexShrink: 1, minWidth: 0, cursor: "pointer" }, inspec
   secretActionButton: { width: 64, minWidth: 64, height: 26, flexShrink: 0 },
   formRow: { width: "100%", minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, formRowStacked: { alignItems: "flex-start" }, formRowSecretStacked: { alignItems: "flex-start" }, formRowLabel: { width: 112, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "left" }, formRowLabelStacked: { paddingTop: 4 }, formRowControl: { flex: 1, minWidth: 0, gap: 3 }, picker: { flex: 1, minWidth: 180, height: 26 }, pickerShrink: { minWidth: 0 },
 });
+
+/**
+ * A route step's ink follows what the step means rather than whether it was
+ * reached: only a route that actually served the request is green, a route the
+ * router picked but has not confirmed yet stays yellow, and a route that could
+ * not answer is red. A selection is a plan, so painting it with the success ink
+ * would claim an outcome the request has not reported.
+ */
+const ROUTE_TRACE_ATTEMPT_TONES: Record<
+  RouteTraceAttempt["state"],
+  { node?: ViewStyle; card?: ViewStyle; icon?: ViewStyle; iconText?: TextStyle; text?: TextStyle }
+> = {
+  succeeded: {
+    node: styles.routeTraceTimelineNodeSucceeded,
+    card: styles.routeTraceStepCardSucceeded,
+    icon: styles.routeTraceStepStateIconSucceeded,
+    text: styles.routeTraceStepStateSucceeded,
+  },
+  selected: {
+    node: styles.routeTraceTimelineNodeSelected,
+    card: styles.routeTraceStepCardSelected,
+    icon: styles.routeTraceStepStateIconSelected,
+    iconText: styles.routeTraceStepStateIconTextSelected,
+    text: styles.routeTraceStepStateSelected,
+  },
+  failed: {
+    node: styles.routeTraceTimelineNodeFailed,
+    card: styles.routeTraceStepCardFailed,
+    icon: styles.routeTraceStepStateIconFailed,
+    text: styles.routeTraceStepStateFailed,
+  },
+  attempted: {
+    node: styles.routeTraceTimelineNodeAttempted,
+    icon: styles.routeTraceStepStateIconAttempted,
+    iconText: styles.routeTraceStepStateIconTextAttempted,
+    text: styles.routeTraceStepStateAttempted,
+  },
+};

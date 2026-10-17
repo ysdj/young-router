@@ -438,6 +438,14 @@ def _trace_detail(raw: Mapping[str, Any]) -> str:
             ("stream", _trace_bool(interface.get("stream")), ""),
         )
 
+    if event == "deployment_success":
+        served_order = raw.get("order")
+        if served_order is None:
+            served_order = deployment.get("order")
+        return _trace_detail_parts(
+            ("order", served_order, ""),
+        )
+
     if event in {
         "same_deployment_protocol_fallback_available",
         "protocol_fallback_cache_hit",

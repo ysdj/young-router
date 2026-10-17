@@ -71,6 +71,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "logs.aborted.reasonServiceRestart": "服务重启导致中断",
   "logs.aborted.reasonStale": "长时间没有进展",
   "logs.routeEvent.selected": "已选路由",
+  "logs.routeEvent.deploymentSuccess": "该路由应答成功",
   "logs.routeEvent.filtered": "筛选路由",
   "logs.routeEvent.fallback": "准备回退",
   "logs.routeEvent.serviceTier": "服务等级",

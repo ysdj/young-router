@@ -190,6 +190,12 @@ _TEXT_ONLY_COMPLETION_MIN_DURATION_MS = 4000
 # Set by the deployment pre-call hook on the selected-deployment marker so the
 # wrapper that carries that attempt's stream can refresh its request-log row.
 _PENDING_REQUEST_LOG_ID_KEY = "_young_router_pending_request_log_id"
+# One request reaches the success funnel from more than one path (the post-call
+# hook, the protocol-fallback recorder, and stream completion each call it), so
+# the route trace records the route that served the request once per request.
+_TRACED_DEPLOYMENT_SUCCESSES: dict[str, float] = {}
+_TRACED_DEPLOYMENT_SUCCESSES_LOCK = threading.Lock()
+_TRACED_DEPLOYMENT_SUCCESSES_TTL_SECONDS = 600.0
 
 
 class _SelectedDeploymentMarkerStream:
@@ -300,6 +306,34 @@ def _remember_request_time(
         if not replace and request_id in store:
             return
         store[request_id] = (now, observed_at)
+
+
+def _claim_traced_deployment_success(request_id: str) -> bool:
+    """Claim the one success trace a request is allowed to write.
+
+    The same request can be recorded as served by one route from several
+    success paths, so the claim is keyed by request id and expires with the
+    other bounded request-correlation state.
+    """
+
+    key = request_id.strip()
+    if not key:
+        return True
+    now = time.monotonic()
+    with _TRACED_DEPLOYMENT_SUCCESSES_LOCK:
+        for seen, claimed_at in list(_TRACED_DEPLOYMENT_SUCCESSES.items()):
+            if claimed_at < now - _TRACED_DEPLOYMENT_SUCCESSES_TTL_SECONDS:
+                _TRACED_DEPLOYMENT_SUCCESSES.pop(seen, None)
+        if len(_TRACED_DEPLOYMENT_SUCCESSES) >= _FIRST_STREAM_OUTPUT_TIMES_MAX:
+            oldest = min(
+                _TRACED_DEPLOYMENT_SUCCESSES,
+                key=lambda seen: _TRACED_DEPLOYMENT_SUCCESSES[seen],
+            )
+            _TRACED_DEPLOYMENT_SUCCESSES.pop(oldest, None)
+        if key in _TRACED_DEPLOYMENT_SUCCESSES:
+            return False
+        _TRACED_DEPLOYMENT_SUCCESSES[key] = now
+        return True
 
 
 def _record_request_started_time(request_kwargs: Optional[dict]) -> None:
@@ -6285,12 +6319,51 @@ def _record_deployment_failure_for_cooldown(
         )
 
 
+def _trace_deployment_success(request_kwargs: Optional[dict]) -> None:
+    """State which route actually delivered the answer.
+
+    ``selected_deployment`` is emitted when the router picks a route, before
+    the request has run, so a selection on its own says nothing about whether
+    the upstream answered.  This is the one funnel every success path already
+    passes through, so it is where the route trace learns that a route is the
+    one which worked.
+    """
+
+    if not isinstance(request_kwargs, dict):
+        return
+    route_key = _deployment_route_key_from_request(request_kwargs)
+    deployment_id = _deployment_id_from_request(request_kwargs)
+    if not route_key and not deployment_id:
+        return
+    request_id = _trace_request_id(request_kwargs)
+    if request_id and not _claim_traced_deployment_success(request_id):
+        return
+    _trace_module._route_trace(
+        "deployment_success",
+        request_id=request_id,
+        session=_trace_session_context(request_kwargs),
+        model_group=_responses_execution_module._request_model_group(request_kwargs),
+        deployment_id=deployment_id,
+        route_key=route_key,
+        order=_deployment_order_from_request(request_kwargs),
+        deployment=_trace_deployment(
+            {
+                "model_info": _request_context_module._request_model_info(
+                    request_kwargs
+                ),
+                "litellm_params": _as_dict(request_kwargs.get("litellm_params")),
+            }
+        ),
+    )
+
+
 def _record_deployment_success_for_cooldown(request_kwargs: Optional[dict]) -> None:
     # Successful requests also refresh the session's deployment affinity so
     # the next request for the same session/model group reuses the upstream's
     # warm prompt cache. Every success path (non-streaming completion, stream
     # completion, guarded stream success) funnels through here.
     _record_session_deployment_affinity(request_kwargs)
+    _trace_deployment_success(request_kwargs)
     cooldown_keys = _deployment_cooldown_keys_from_request(request_kwargs)
     if not cooldown_keys:
         return

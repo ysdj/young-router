@@ -2335,13 +2335,19 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("routeTraceRequestTextSelected: { color: systemColors.selectedControlText }", self.ui)
         self.assertIn('secondaryLabel: semanticColor("secondaryLabelColor", "TextFillColorSecondary", "#6e6e73")', self.ui)
         self.assertIn("routeTraceTimelineNodeStart: { backgroundColor: systemColors.secondaryLabel }", self.ui)
-        self.assertIn("routeTraceTimelineNodeSelected: { backgroundColor: systemColors.green }", self.ui)
+        # A picked route is a plan the request has not confirmed yet, so it
+        # never wears the success ink; only a route that served the answer is
+        # green.
+        self.assertIn("routeTraceTimelineNodeSelected: { backgroundColor: systemColors.yellow }", self.ui)
+        self.assertIn("routeTraceTimelineNodeSucceeded: { backgroundColor: systemColors.green }", self.ui)
         self.assertIn("routeTraceTimelineNodeFailed: { backgroundColor: systemColors.red }", self.ui)
         self.assertIn('routeTraceTimelineNode: { width: 18, height: 18, borderRadius: 9', self.ui)
         self.assertIn("routeTraceTimelineNodeAttempted: { borderWidth: 1, borderColor: systemColors.secondaryLabel", self.ui)
         self.assertIn('routeTraceTimelineNodeText: { color: systemColors.label, fontSize: 10, fontWeight: "400"', self.ui)
-        self.assertIn("routeTraceStepCardSelected: { borderColor: systemColors.green, borderWidth: 2 }", self.ui)
-        self.assertIn("routeTraceStepStateSelected: { color: systemColors.green }", self.ui)
+        self.assertIn("routeTraceStepCardSelected: { borderColor: systemColors.yellow, borderWidth: 2 }", self.ui)
+        self.assertIn("routeTraceStepCardSucceeded: { borderColor: systemColors.green, borderWidth: 2 }", self.ui)
+        self.assertIn("routeTraceStepStateSelected: { color: systemColors.yellow }", self.ui)
+        self.assertIn("routeTraceStepStateSucceeded: { color: systemColors.green }", self.ui)
 
     def test_native_log_tables_support_compact_rows_on_both_hosts(self) -> None:
         mac_table_spec = (
@@ -4783,6 +4789,43 @@ class ReactNativeUiParityTests(unittest.TestCase):
         ):
             self.assert_ui_has(marker)
         self.assertNotIn("logs.routeTrace.otherDetail", self.ui)
+
+    def test_route_trace_greens_only_the_route_that_actually_served(self) -> None:
+        """A picked route is a plan; only a served route earns the success ink.
+
+        ``selected_deployment`` is emitted when the router picks a route,
+        before the request has run, so a selection that later failed and a
+        selection that succeeded were drawn identically. The trace view has to
+        learn the outcome from the success event, keep a later failure winning
+        over an earlier success, and not let a bare re-selection withdraw an
+        answer the request already gave.
+        """
+
+        for marker in (
+            'state: "succeeded" | "selected" | "failed" | "attempted";',
+            ': rawEvent === "deployment_success"',
+            '? "succeeded"',
+            "if (state === \"succeeded\") return translate(\"logs.success\");",
+            'if (state === "succeeded") return "✓";',
+            "const lastServed = attempts.map((attempt) => attempt.state).lastIndexOf(\"succeeded\");",
+            "!(existing.state === \"succeeded\" && attempt.state === \"selected\")",
+            "const ROUTE_TRACE_ATTEMPT_TONES: Record<",
+            'deployment_success: "logs.routeEvent.deploymentSuccess",',
+            'yellow: semanticColor("systemYellowColor", undefined, "#7a5c00"),',
+        ):
+            self.assert_ui_has(marker)
+        # The four tones each answer to their own state.
+        for marker in (
+            "node: styles.routeTraceTimelineNodeSucceeded,",
+            "node: styles.routeTraceTimelineNodeSelected,",
+            "node: styles.routeTraceTimelineNodeFailed,",
+            "node: styles.routeTraceTimelineNodeAttempted,",
+            "text: styles.routeTraceStepStateSucceeded,",
+            "text: styles.routeTraceStepStateSelected,",
+        ):
+            self.assert_ui_has(marker)
+        self.assertIn('"logs.routeEvent.deploymentSuccess": "该路由应答成功"', self.zh)
+        self.assertIn('"logs.routeEvent.deploymentSuccess": "Route served the request"', self.en)
 
     def test_station_accounts_panel_manages_accounts_with_staged_metadata(self) -> None:
         """账号管理: add, re-login, rename, remember, and remove station accounts."""

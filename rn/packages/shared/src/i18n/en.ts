@@ -71,6 +71,7 @@ export const en: Record<TranslationKey, string> = {
   "logs.aborted.reasonServiceRestart": "Interrupted by a service restart",
   "logs.aborted.reasonStale": "No progress for too long",
   "logs.routeEvent.selected": "Selected route",
+  "logs.routeEvent.deploymentSuccess": "Route served the request",
   "logs.routeEvent.filtered": "Filter routes",
   "logs.routeEvent.fallback": "Prepare fallback",
   "logs.routeEvent.serviceTier": "Service tier",

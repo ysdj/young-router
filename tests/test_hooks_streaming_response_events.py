@@ -245,6 +245,98 @@ class HookStreamingResponseEventTests(HookTestCase):
         self.assertNotIn("actual work done", dumped)
         self.assertEqual(chunks[-1]["type"], "response.completed")
 
+    async def test_a_completed_responses_stream_names_the_route_that_served_it(self) -> None:
+        """A Responses answer must reach the route trace as a success.
+
+        A Responses stream reports its outcome with a terminal ``completed``
+        event, which never reaches LiteLLM's stream-completion callback, so
+        the serving route was never named and a perfectly answered request
+        stayed indistinguishable from one that never came back.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        routing = sys.modules["young_router.proxy.routing"]
+        with routing._TRACED_DEPLOYMENT_SUCCESSES_LOCK:
+            routing._TRACED_DEPLOYMENT_SUCCESSES.clear()
+        self.addCleanup(routing._TRACED_DEPLOYMENT_SUCCESSES.clear)
+
+        text = "The answer is four."
+
+        async def upstream_stream():
+            yield {"type": "response.created", "response": {"id": "resp-1"}}
+            yield {
+                "type": "response.output_text.delta",
+                "delta": text,
+                "output_index": 0,
+            }
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-1",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "id": "msg-1",
+                            "type": "message",
+                            "status": "completed",
+                            "role": "assistant",
+                            "content": [
+                                {"type": "output_text", "text": text, "annotations": []}
+                            ],
+                        }
+                    ],
+                },
+            }
+
+        request_data = {
+            "model": "public-agent",
+            "request_id": "req-responses-success",
+            "stream": True,
+            "input": [{"role": "user", "content": "How many legs does a spider have?"}],
+            "custom_llm_provider": "provider_alpha",
+            "litellm_params": {
+                "model": "openai/default-chat",
+                "api_base": "https://relay.example/v1",
+            },
+            "model_info": {
+                "id": "deployment-responses",
+                "provider": "provider_alpha",
+                "api_key_name": "team",
+                "order": 0,
+            },
+        }
+
+        with self.assertLogs("young_router.route_trace", level="WARNING") as captured:
+            recorded: list = []
+            chunks = [
+                jsonable_stream_chunk(chunk)
+                async for chunk in hooks._yield_guarded_original_stream(
+                    [],
+                    upstream_stream(),
+                    request_data,
+                    on_responses_completed=lambda: recorded.append(
+                        routing._record_deployment_success_for_cooldown(request_data)
+                    ),
+                )
+            ]
+
+        self.assertEqual("response.completed", chunks[-1]["type"])
+        successes = [
+            json.loads(line.split("litellm_route_trace ", 1)[1])
+            for line in captured.output
+        ]
+        events = [record["event"] for record in successes]
+        self.assertIn("deployment_success", events)
+        served = next(r for r in successes if r["event"] == "deployment_success")
+        self.assertEqual("deployment-responses", served["deployment_id"])
+        self.assertEqual("req-responses-success", served["request_id"])
+        self.assertEqual(
+            "model=public-agent / provider=provider_alpha / upstream=openai/default-chat"
+            " / host=relay.example / key=team / order=0",
+            served["route_key"],
+        )
+
     async def test_responses_stream_serializes_upstream_completed_event_as_json(self) -> None:
         hooks, proxy_server = load_hook_module()
 

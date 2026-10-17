@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from typing import Callable
 
 from . import codex_fast_tier as _codex_fast_tier_module
 from . import codex_contract as _codex_contract_module
@@ -3108,6 +3109,29 @@ async def _streaming_error_fallback_response(
         _CURRENT_SELECTED_DEPLOYMENT_BOX.reset(selected_deployment_box_token)
 
 
+def _request_with_selected_deployment(
+    request_data: dict,
+    *,
+    selected_box: Any,
+) -> dict:
+    """Name the route a fallback round actually reached, or nothing.
+
+    A fallback round still carries the failed route on its request object, so
+    crediting that request would clear the failure it just recorded. The
+    selected-deployment marker holds the route the replay reached; without one
+    the replay named no route of its own, so this answers with no request at
+    all rather than with the failed one.
+    """
+
+    success_request = request_data.copy()
+    if _routing_module._apply_current_selected_deployment_to_request(
+        success_request,
+        selected_box=selected_box,
+    ):
+        return success_request
+    return {}
+
+
 async def _stream_streaming_error_fallback_round(
     request_data: dict,
     exception: Exception,
@@ -3182,6 +3206,18 @@ async def _stream_streaming_error_fallback_round(
                     update_top_level=False,
                 )
             yield chunk
+        # The replayed route delivered the whole answer without raising, which
+        # is what makes it the route that served this request. The native
+        # branch records its own success from its terminal frame.
+        if not _request_uses_native_event_stream(fallback_payload):
+            served_request = _request_with_selected_deployment(
+                fallback_payload,
+                selected_box=selected_deployment_box,
+            )
+            if served_request:
+                _routing_module._record_deployment_success_for_cooldown(
+                    served_request
+                )
     except Exception as fallback_exception:
         fallback_request = (
             fallback_payload if "fallback_payload" in locals() else request_data
@@ -4260,6 +4296,7 @@ async def _yield_guarded_original_stream(
     stream_started_at: Optional[float] = None,
     saw_visible_output: bool = False,
     synthesize_completed_on_clean_eof_after_visible_output: bool = False,
+    on_responses_completed: Optional[Callable[[], None]] = None,
 ) -> AsyncIterator[Any]:
     if not _request_is_responses_stream(request_data):
         async for chunk in _yield_native_stream_with_output_limit_continuation(
@@ -4291,6 +4328,19 @@ async def _yield_guarded_original_stream(
     completed_output_items: dict[int, dict[str, Any]] = {}
     internal_bridge_item_ids: set[str] = set()
     client_open_tool_output_indexes: set[int] = set()
+    # A Responses stream reports its outcome through a terminal ``completed``
+    # event rather than through LiteLLM's stream-completion callback, so this
+    # branch has to name the serving route itself. Without it a Responses
+    # request that answered perfectly never looks like a route that worked.
+    success_recorded = False
+
+    def record_responses_stream_success() -> None:
+        nonlocal success_recorded
+        if success_recorded or on_responses_completed is None:
+            return
+        success_recorded = True
+        on_responses_completed()
+
     completion_state = _ResponsesStreamCompletionState(request_data)
     saw_image_generation_activity = False
     saw_web_search_call_activity = False
@@ -5267,6 +5317,7 @@ async def _yield_guarded_original_stream(
             if _responses_completed_chunk_is_empty(chunk, request_data) and not visible_output_seen:
                 break
             saw_responses_completed = True
+            record_responses_stream_success()
             visible_output_seen = visible_output_seen or _responses_completed_chunk_has_usable_output(
                 chunk,
                 request_data,
@@ -5448,6 +5499,7 @@ async def _yield_guarded_original_stream(
                 if _responses_completed_chunk_is_empty(chunk, request_data) and not visible_output_seen:
                     break
                 saw_responses_completed = True
+                record_responses_stream_success()
                 for synthetic_chunk in _synthesized_missing_completed_tool_events(
                     chunk,
                     seen_output_item_ids,
@@ -6382,6 +6434,11 @@ async def _yield_start_buffered_stream_with_error_fallback(
         saw_responses_completed=saw_responses_completed,
         stream_started_at=stream_started_at,
         saw_visible_output=saw_visible_output,
+        on_responses_completed=(
+            lambda: _routing_module._record_deployment_success_for_cooldown(
+                request_data
+            )
+        ),
     ):
         yield chunk
 

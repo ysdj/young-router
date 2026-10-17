@@ -1088,6 +1088,67 @@ class HookTraceLoggingTests(HookTestCase):
                 end,
             )
 
+    def test_a_served_route_is_traced_once_per_request(self) -> None:
+        """One success trace per request, naming the route that served it.
+
+        A picked route is only a plan, so the route trace has to learn from the
+        success path which deployment actually answered. Several success paths
+        call the shared funnel for the same request, and each of them would
+        otherwise repeat the record.
+        """
+
+        hooks, _ = load_hook_module()
+        routing = sys.modules["young_router.proxy.routing"]
+        kwargs = {
+            "model": "public-agent",
+            "request_id": "req-success-1",
+            "custom_llm_provider": "provider_alpha",
+            "litellm_params": {
+                "model": "openai/default-chat",
+                "api_base": "https://relay.example/v1",
+            },
+            "model_info": {
+                "id": "deployment-9",
+                "provider": "provider_alpha",
+                "api_key_name": "team",
+                "order": 2,
+            },
+        }
+        with routing._TRACED_DEPLOYMENT_SUCCESSES_LOCK:
+            routing._TRACED_DEPLOYMENT_SUCCESSES.clear()
+        self.addCleanup(routing._TRACED_DEPLOYMENT_SUCCESSES.clear)
+
+        with self.assertLogs("young_router.route_trace", level="WARNING") as captured:
+            routing._record_deployment_success_for_cooldown(kwargs)
+            routing._record_deployment_success_for_cooldown(dict(kwargs))
+
+        records = [
+            json.loads(line.split("litellm_route_trace ", 1)[1])
+            for line in captured.output
+        ]
+        self.assertEqual(1, len(records))
+        record = records[0]
+        self.assertEqual("deployment_success", record["event"])
+        self.assertEqual("deployment-9", record["deployment_id"])
+        self.assertEqual("req-success-1", record["request_id"])
+        self.assertEqual("public-agent", record["model_group"])
+        self.assertEqual(2, record["order"])
+        self.assertEqual(
+            "model=public-agent / provider=provider_alpha / upstream=openai/default-chat"
+            " / host=relay.example / key=team / order=2",
+            record["route_key"],
+        )
+
+    def test_a_request_without_a_route_traces_no_success(self) -> None:
+        """A success with no route behind it names no route."""
+
+        hooks, _ = load_hook_module()
+        routing = sys.modules["young_router.proxy.routing"]
+        with self.assertNoLogs("young_router.route_trace", level="WARNING"):
+            routing._record_deployment_success_for_cooldown(
+                {"model": "public-agent", "request_id": "req-no-route"}
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

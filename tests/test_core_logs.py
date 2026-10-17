@@ -319,6 +319,59 @@ class LogsDomainTests(unittest.TestCase):
             self.assertNotIn("request", record)
             self.assertNotIn("private request body", json.dumps(record))
 
+    def test_route_trace_projects_a_served_route_like_its_selection(self) -> None:
+        """The success event must name the same route its selection named.
+
+        The trace view groups by request and merges a route's records into one
+        step, so a success that projected a different identity would land as a
+        separate route and never confirm the one that actually answered.
+        """
+
+        route_key = (
+            "model=public-chat / provider=provider-a / upstream=openai/upstream-chat"
+            " / host=provider.example / key=team / order=0"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            records = [
+                {
+                    "timestamp": "2026-08-01T04:10:11Z",
+                    "event": "selected_deployment",
+                    "request_id": "req-1",
+                    "model_group": "public-chat",
+                    "deployment_id": "deployment-a",
+                    "order": 0,
+                    "route_key": route_key,
+                },
+                {
+                    "timestamp": "2026-08-01T04:10:14Z",
+                    "event": "deployment_success",
+                    "request_id": "req-1",
+                    "model_group": "public-chat",
+                    "deployment_id": "deployment-a",
+                    "order": 0,
+                    "route_key": route_key,
+                },
+            ]
+            (root / "server.log").write_text(
+                "".join(
+                    f"[{record['timestamp']}] litellm_route_trace {json.dumps(record)}\n"
+                    for record in records
+                ),
+                encoding="utf-8",
+            )
+
+            projected = LogsDomain(root).view("route-trace")["log"]["records"]
+
+            self.assertEqual(2, len(projected))
+            by_event = {record["event"]: record for record in projected}
+            success = by_event["deployment_success"]
+            selection = by_event["selected_deployment"]
+            self.assertEqual("deployment_success", success["event"])
+            self.assertEqual("order=0", success["detail"])
+            self.assertEqual(selection["route"], success["route"])
+            self.assertEqual("deployment-a", success["route"]["deployment_id"])
+
     def test_route_trace_uses_configured_public_model_for_deployment_only_events(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

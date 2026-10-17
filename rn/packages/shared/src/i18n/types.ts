@@ -72,6 +72,7 @@ export type TranslationKey =
   | "logs.aborted.reasonServiceRestart"
   | "logs.aborted.reasonStale"
   | "logs.routeEvent.selected"
+  | "logs.routeEvent.deploymentSuccess"
   | "logs.routeEvent.filtered"
   | "logs.routeEvent.fallback"
   | "logs.routeEvent.serviceTier"
