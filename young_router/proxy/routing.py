@@ -209,6 +209,13 @@ class _SelectedDeploymentMarkerStream:
         self._response = response
         self._iterator = response.__aiter__()
         self._young_router_selected_deployment_marker = marker
+        # Every wrapper in this chain must keep the facts the response header
+        # hook reads from the object LiteLLM holds.  Losing this one hides the
+        # restored-reasoning marker from Codex, which then re-estimates the
+        # reasoning it already replayed.
+        for attribute in ("_young_router_restored_reasoning",):
+            if getattr(response, attribute, None) is True:
+                setattr(self, attribute, True)
 
     def __aiter__(self) -> AsyncIterator[Any]:
         return self
@@ -334,6 +341,97 @@ def _claim_traced_deployment_success(request_id: str) -> bool:
             return False
         _TRACED_DEPLOYMENT_SUCCESSES[key] = now
         return True
+
+
+# Requests whose client history replays encrypted reasoning.  The surface
+# adapter rewrites a Responses request into a Chat one before a deployment is
+# called, which drops the reasoning items along with ``input``, so the evidence
+# is recorded once on the client's own request and read back for every attempt.
+_RESTORED_REASONING_REQUESTS: dict[str, float] = {}
+_RESTORED_REASONING_REQUESTS_LOCK = threading.Lock()
+_RESTORED_REASONING_REQUESTS_TTL_SECONDS = 3600.0
+
+
+def _remember_restored_reasoning_replay(request_kwargs: Optional[dict], replayed: bool) -> None:
+    if not isinstance(request_kwargs, dict):
+        return
+    request_id = _trace_request_id(request_kwargs)
+    if not request_id:
+        return
+    now = time.monotonic()
+    with _RESTORED_REASONING_REQUESTS_LOCK:
+        for seen, remembered_at in list(_RESTORED_REASONING_REQUESTS.items()):
+            if remembered_at < now - _RESTORED_REASONING_REQUESTS_TTL_SECONDS:
+                _RESTORED_REASONING_REQUESTS.pop(seen, None)
+        if replayed:
+            if len(_RESTORED_REASONING_REQUESTS) >= _FIRST_STREAM_OUTPUT_TIMES_MAX:
+                oldest = min(
+                    _RESTORED_REASONING_REQUESTS,
+                    key=lambda seen: _RESTORED_REASONING_REQUESTS[seen],
+                )
+                _RESTORED_REASONING_REQUESTS.pop(oldest, None)
+            _RESTORED_REASONING_REQUESTS[request_id] = now
+            return
+        _RESTORED_REASONING_REQUESTS.pop(request_id, None)
+
+
+def _request_replays_restored_reasoning(request_kwargs: Optional[dict]) -> bool:
+    if not isinstance(request_kwargs, dict):
+        return False
+    request_id = _trace_request_id(request_kwargs)
+    if not request_id:
+        return False
+    with _RESTORED_REASONING_REQUESTS_LOCK:
+        remembered_at = _RESTORED_REASONING_REQUESTS.get(request_id)
+    return remembered_at is not None and remembered_at >= time.monotonic() - _RESTORED_REASONING_REQUESTS_TTL_SECONDS
+
+
+# The surface the deployment call of a request was adapted to.  ``make_call``
+# receives its kwargs by value, so a marker written while the deployment is
+# chosen never reaches it; the request id is the identity both sides share.
+_ADAPTED_SURFACE_REQUESTS: dict[str, tuple[float, str]] = {}
+_ADAPTED_SURFACE_REQUESTS_LOCK = threading.Lock()
+_ADAPTED_SURFACE_REQUESTS_TTL_SECONDS = 3600.0
+
+
+def _remember_request_adapted_surface(
+    request_kwargs: Optional[dict],
+    surface: Any,
+) -> None:
+    normalized = _normalized_request_surface(surface)
+    if not isinstance(request_kwargs, dict) or not normalized:
+        return
+    request_id = _trace_request_id(request_kwargs)
+    if not request_id:
+        return
+    now = time.monotonic()
+    with _ADAPTED_SURFACE_REQUESTS_LOCK:
+        for seen, (remembered_at, _surface) in list(_ADAPTED_SURFACE_REQUESTS.items()):
+            if remembered_at < now - _ADAPTED_SURFACE_REQUESTS_TTL_SECONDS:
+                _ADAPTED_SURFACE_REQUESTS.pop(seen, None)
+        if len(_ADAPTED_SURFACE_REQUESTS) >= _FIRST_STREAM_OUTPUT_TIMES_MAX and request_id not in _ADAPTED_SURFACE_REQUESTS:
+            oldest = min(
+                _ADAPTED_SURFACE_REQUESTS,
+                key=lambda seen: _ADAPTED_SURFACE_REQUESTS[seen][0],
+            )
+            _ADAPTED_SURFACE_REQUESTS.pop(oldest, None)
+        _ADAPTED_SURFACE_REQUESTS[request_id] = (now, normalized)
+
+
+def _request_adapted_surface(request_kwargs: Optional[dict]) -> str:
+    if not isinstance(request_kwargs, dict):
+        return ""
+    request_id = _trace_request_id(request_kwargs)
+    if not request_id:
+        return ""
+    with _ADAPTED_SURFACE_REQUESTS_LOCK:
+        entry = _ADAPTED_SURFACE_REQUESTS.get(request_id)
+    if entry is None:
+        return ""
+    remembered_at, surface = entry
+    if remembered_at < time.monotonic() - _ADAPTED_SURFACE_REQUESTS_TTL_SECONDS:
+        return ""
+    return surface
 
 
 def _record_request_started_time(request_kwargs: Optional[dict]) -> None:
@@ -796,6 +894,12 @@ def _recovery_policy_for_exception(exception: Exception) -> str:
         return _RECOVERY_POLICY_ERROR
 
     status_code = _exception_status_code(exception)
+    # A transport wrapper can hide a server's own answer behind its own class
+    # name.  When the wrapped error names an upstream HTTP status, that status
+    # is the evidence: the server answered, so the route's policy is decided by
+    # what it said rather than by the wrapper's connectivity shape.
+    if status_code is None:
+        status_code = _nested_upstream_status_code(exception)
     text = _exception_text(exception)
     if status_code == 402 or any(
         marker in text for marker in _UPSTREAM_BALANCE_ERROR_MARKERS
@@ -812,6 +916,15 @@ def _recovery_policy_for_exception(exception: Exception) -> str:
     if _is_no_deployments_available_error(exception):
         return _recovery_policy_setting(
             _RECOVERY_POLICY_SERVER_ENV,
+            _RECOVERY_POLICY_COOLDOWN,
+        )
+    # A server that refuses this route by policy or region answers the same way
+    # to every replay, so the route is unusable until someone changes the
+    # account, key, or region.  Waiting it out is not recovery; cooling it down
+    # is what stops a dead route from being tried on every request.
+    if status_code == 403:
+        return _recovery_policy_setting(
+            _RECOVERY_POLICY_REQUEST_ERROR_ENV,
             _RECOVERY_POLICY_COOLDOWN,
         )
     if (
@@ -4817,6 +4930,53 @@ def _exception_status_code(exception: Exception) -> Optional[int]:
     response = getattr(exception, "response", None)
     response_status_code = getattr(response, "status_code", None)
     return response_status_code if isinstance(response_status_code, int) else None
+
+
+_NESTED_UPSTREAM_STATUS_PATTERN = re.compile(
+    # ``403: {...}`` is the shape LiteLLM's OpenAI-compatible client emits when
+    # it turns a server refusal into a connection error.  The labelled forms
+    # cover the other spellings the same wrapper produces.
+    r"(?:"
+    r"\b(?:http(?:\s+status)?|status(?:\s+code)?|error(?:\s+code)?)\D{0,3}([45]\d\d)\b"
+    r"|(?:^|[-\s])([45]\d\d)\s*:"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _nested_upstream_status_code(exception: Exception) -> Optional[int]:
+    """The HTTP status an error wrapper carried, when the wrapper hid it.
+
+    A transport wrapper answers ``status_code`` for itself, so an upstream that
+    replied "403" inside an ``APIConnectionError`` reads as a network failure.
+    The distinction matters: a connection that never reached a server is a
+    transient outage worth waiting through, while a server that answered with a
+    refusal will answer the same way on the next attempt and belongs in the
+    route's cooldown accounting.  Only a status this error's own text spells
+    out counts, so a plain connection failure stays a connection failure.
+    """
+
+    if _exception_status_code(exception) is not None:
+        return None
+    pending = [exception]
+    seen: set[int] = set()
+    while pending:
+        candidate = pending.pop()
+        candidate_id = id(candidate)
+        if candidate_id in seen:
+            continue
+        seen.add(candidate_id)
+        match = _NESTED_UPSTREAM_STATUS_PATTERN.search(_exception_text(candidate))
+        if match is not None:
+            try:
+                return int(match.group(1) or match.group(2))
+            except ValueError:
+                return None
+        for attr in ("__cause__", "__context__", "original_exception"):
+            nested = getattr(candidate, attr, None)
+            if isinstance(nested, Exception) and id(nested) not in seen:
+                pending.append(nested)
+    return None
 
 
 def _duration_unit_seconds(value: float, unit: Optional[str]) -> float:

@@ -497,8 +497,16 @@ def normalize_config_document(document: Any) -> dict[str, str | None]:
     }
 
 
-def config_document_from_path(path: pathlib.Path = CONFIG_YAML) -> dict[str, str | None]:
-    config_text = path.read_text(encoding="utf-8")
+def config_document_from_path(
+    path: pathlib.Path = CONFIG_YAML,
+    *,
+    allow_missing: bool = False,
+) -> dict[str, str | None]:
+    config_text = (
+        ""
+        if allow_missing and not path.exists()
+        else path.read_text(encoding="utf-8")
+    )
     disabled_path = _disabled_models_path(path)
     disabled_text = (
         disabled_path.read_text(encoding="utf-8") if disabled_path.exists() else None

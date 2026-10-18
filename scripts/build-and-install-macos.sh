@@ -43,8 +43,35 @@ else
   YOUNG_ROUTER_MACOS_OUTPUT="$STAGE_ROOT/Young Router.app"
   export YOUNG_ROUTER_MACOS_OUTPUT
 fi
+STAGING_CACHE="${YOUNG_ROUTER_STAGING_CACHE:-$RN_ROOT/.staging-cache}"
+INSTALL_LOCK="$STAGING_CACHE/install.lock"
+mkdir -p "$(dirname "$INSTALL_LOCK")"
 DESTINATION="${YOUNG_ROUTER_INSTALL_APP:-/Applications/Young Router.app}"
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+if [[ "${YOUNG_ROUTER_ALLOW_CONCURRENT_INSTALL:-}" != "1" ]]; then
+  INSTALL_LOCK_OWNER="$(mktemp "${TMPDIR:-/tmp}/young-router-build-lock.XXXXXX")"
+  rm -f "$INSTALL_LOCK_OWNER"
+  PYTHONPATH="" PYTHONDONTWRITEBYTECODE=1 YOUNG_ROUTER_DISABLE_PYCACHE=1 \
+  python3 - "$INSTALL_LOCK" "$INSTALL_LOCK_OWNER" <<'PY' &
+import fcntl
+import os
+import sys
+
+lock = open(sys.argv[1], "a+")
+fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+with open(sys.argv[2], "x"):
+    pass
+os.set_inheritable(lock.fileno(), False)
+PY
+  INSTALL_LOCK_PID=$!
+  while [[ ! -e "$INSTALL_LOCK_OWNER" ]]; do
+    kill -0 "$INSTALL_LOCK_PID" 2>/dev/null || wait "$INSTALL_LOCK_PID"
+    sleep 0.01
+  done
+  rm -f "$INSTALL_LOCK_OWNER"
+  unset INSTALL_LOCK_OWNER
+fi
+
 RUNTIME_WORK="$(mktemp -d "${TMPDIR:-/tmp}/young-router-rn-runtime.XXXXXX")"
 # Third-party staging lives here instead of in the per-build temporary tree
 # above, because a build stages the same four releases over and over: each
@@ -55,16 +82,24 @@ RUNTIME_WORK="$(mktemp -d "${TMPDIR:-/tmp}/young-router-rn-runtime.XXXXXX")"
 # ``reused_staged_release`` in scripts/update_common.py).  A changed release,
 # a partial tree, or no cache at all stages from scratch, so deleting this
 # directory is always safe.
-STAGING_CACHE="${YOUNG_ROUTER_STAGING_CACHE:-$RN_ROOT/.staging-cache}"
 STAGE_ROOT="${STAGE_ROOT:-}"
 INSTALL_STAGE=""
 PREVIOUS_APP=""
 FAILED_APP=""
+STAGING_PIDS=()
+COPY_PIDS=()
+INSTALL_PREPARED=0
+RETIRED_HOST=""
+HOST_RETIRED=0
+FINISH_BUILD_RETIRED_CORE=""
+PORTABLE_MOVED=0
+PREVIOUS_APP_MOVED=0
 INSTALL_COMPLETE=0
 RESTART_ARMED=0
 OLD_PIDS=""
 NEW_PIDS=""
-START_TIMEOUT_SECONDS="${YOUNG_ROUTER_START_TIMEOUT_SECONDS:-70}"
+START_TIMEOUT_SECONDS="${YOUNG_ROUTER_START_TIMEOUT_SECONDS:-10}"
+PROXY_READY_TIMEOUT_SECONDS="${YOUNG_ROUTER_PROXY_READY_TIMEOUT_SECONDS:-360}"
 # How long the stop below may spend waiting for a killed process to be gone
 # before it reports what survived; a SIGKILL cannot be escalated further.
 STOP_TIMEOUT_SECONDS="${YOUNG_ROUTER_STOP_TIMEOUT_SECONDS:-20}"
@@ -78,26 +113,64 @@ LAST_STARTUP_STATE=""
 RUNTIME_FROM_CACHE=0
 
 cleanup() {
+  trap '' INT TERM
+  for staging_pid in "${STAGING_PIDS[@]+"${STAGING_PIDS[@]}"}"; do
+    staging_children="$(pgrep -P "$staging_pid" 2>/dev/null || true)"
+    [[ -z "$staging_children" ]] || kill $staging_children 2>/dev/null || true
+    kill "$staging_pid" 2>/dev/null || true
+  done
+  for copy_pid in "${COPY_PIDS[@]+"${COPY_PIDS[@]}"}"; do
+    copy_children="$(pgrep -P "$copy_pid" 2>/dev/null || true)"
+    [[ -z "$copy_children" ]] || kill $copy_children 2>/dev/null || true
+    kill "$copy_pid" 2>/dev/null || true
+  done
+  for test_pid in "${TEST_PIDS[@]+"${TEST_PIDS[@]}"}"; do
+    kill "$test_pid" 2>/dev/null || true
+  done
+  if [[ -n "${INSTALL_LOCK_PID:-}" ]]; then
+    lock_children="$(pgrep -P "$INSTALL_LOCK_PID" 2>/dev/null || true)"
+    [[ -z "$lock_children" ]] || kill $lock_children 2>/dev/null || true
+    kill "$INSTALL_LOCK_PID" 2>/dev/null || true
+  fi
+  [[ -z "${INSTALL_LOCK_OWNER:-}" ]] || rm -f "$INSTALL_LOCK_OWNER"
+  if [[ "$HOST_RETIRED" == "1" ]]; then
+    mv "$RETIRED_HOST" "$HOST_EXECUTABLE" 2>/dev/null || true
+  fi
+  [[ -z "$FINISH_BUILD_RETIRED_CORE" ]] || rm -rf "$FINISH_BUILD_RETIRED_CORE"
   [[ -z "$RUNTIME_WORK" ]] || rm -rf "$RUNTIME_WORK"
-  if [[ "$INSTALL_COMPLETE" != "1" && -n "$PREVIOUS_APP" && -e "$PREVIOUS_APP" && ! -e "$DESTINATION" ]]; then
+  if [[ "$INSTALL_COMPLETE" != "1" && "$PREVIOUS_APP_MOVED" == "1" && -n "$PREVIOUS_APP" && -e "$PREVIOUS_APP" ]]; then
+    if [[ -e "$DESTINATION" || -L "$DESTINATION" ]]; then
+      FAILED_APP="$(dirname "$DESTINATION")/.YoungRouter.failed.$$.app"
+      rm -rf "$FAILED_APP"
+      mv "$DESTINATION" "$FAILED_APP" || true
+    fi
     mv "$PREVIOUS_APP" "$DESTINATION" || true
   fi
   [[ -z "$INSTALL_STAGE" || ! -d "$INSTALL_STAGE" ]] || rm -rf "$INSTALL_STAGE"
   [[ -z "$FAILED_APP" || ! -d "$FAILED_APP" ]] || rm -rf "$FAILED_APP"
   [[ -z "$STAGE_ROOT" || ! -d "$STAGE_ROOT" ]] || rm -rf "$STAGE_ROOT"
-  if [[ "$RESTART_ARMED" == "1" && ( -e "$DESTINATION" || -L "$DESTINATION" ) ]]; then
-    [[ -n "$(installed_pids)" ]] || open -g "$DESTINATION" >/dev/null 2>&1 || true
+  if [[ "$BUILD_ONLY" == "0" && "$RESTART_ARMED" == "1" && ( -e "$DESTINATION" || -L "$DESTINATION" ) ]]; then
+    [[ -n "$(installed_pids)" ]] || open "$DESTINATION" >/dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
 cd "$RN_ROOT"
+set -euo pipefail
 
 copy_tree() {
   local source="$1"
   local destination="$2"
   mkdir -p "$destination"
-  # On APFS, -c uses clonefile and falls back to a regular copy across volumes.
-  cp -ac "$source/." "$destination/"
+  # A native tree copy replaces existing files without re-signing shared peers.
+  /usr/bin/ditto "$source" "$destination"
+}
+
+bundle_host_executable() {
+  local app="$1" name
+  name="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' \
+    "$app/Contents/Info.plist" 2>/dev/null || true)"
+  [[ -n "$name" ]] || name="$(basename "$app" .app)"
+  printf '%s\n' "$app/Contents/MacOS/$name"
 }
 
 copy_bundle() {
@@ -173,6 +246,7 @@ stop_installed_app() {
   # so the grace only added a second to every install.  A proxy drain is not
   # waited for here either: that budget belongs to a replacement the Core
   # performs on purpose (``young_router/lifecycle.py``).
+  [[ -n "$OLD_PIDS" ]] || OLD_PIDS="$bundle_pids"
   APP_PROCESSES_STOP_POLLS=$(( STOP_TIMEOUT_SECONDS * 20 )) \
   survivors="$("$APP_PROCESSES" stop $bundle_pids)" || true
   if [[ -z "$survivors" ]]; then
@@ -266,8 +340,8 @@ report_startup_state() {
 
 wait_for_started_app() {
   local rejected_pids="$1"
-  local deadline=$((SECONDS + START_TIMEOUT_SECONDS))
-  local app_pids app_pid candidate_pid ready_pid stable_pid="" stable_checks=0 next_launch_at=0 state
+  local launch_deadline=$((SECONDS + START_TIMEOUT_SECONDS)) global_deadline=$((SECONDS + PROXY_READY_TIMEOUT_SECONDS))
+  local app_pids app_pid candidate_pid ready_pid next_launch_at=0 state launcher
   while :; do
     app_pids="$(installed_pids)"
     candidate_pid=""
@@ -285,28 +359,21 @@ wait_for_started_app() {
     done <<<"$app_pids"
     [[ -n "$candidate_pid" ]] || report_startup_state "stopped (waiting to launch)"
     if [[ -n "$ready_pid" ]]; then
-      if [[ "$ready_pid" == "$stable_pid" ]]; then
-        stable_checks=$((stable_checks + 1))
-      else
-        stable_pid="$ready_pid"
-        stable_checks=1
-      fi
-      if (( stable_checks >= REQUIRED_HEALTH_CHECKS )); then
-        NEW_PIDS="$app_pids"
-        return 0
-      fi
-    else
-      stable_pid=""
-      stable_checks=0
+      NEW_PIDS="$app_pids"
+      return 0
     fi
-    (( SECONDS >= deadline )) && break
+    (( SECONDS >= global_deadline )) && break
+    if [[ -z "$candidate_pid" && $SECONDS -ge $launch_deadline ]]; then
+      break
+    fi
     # The app's single-instance guard can briefly still see the process we
     # just stopped through LaunchServices even after its PID exits. A normal
     # `open` may therefore activate the old registration and return without
     # starting the replacement. Retry only while no replacement process
     # exists; never request a forced new instance.
     if [[ -z "$candidate_pid" && $SECONDS -ge $next_launch_at ]]; then
-      open -g "$DESTINATION" >/dev/null 2>&1 || true
+      launcher=launch
+      open "$DESTINATION" >/dev/null 2>&1 || true
       next_launch_at=$((SECONDS + LAUNCH_RETRY_SECONDS))
     fi
     sleep 0.05
@@ -328,6 +395,12 @@ start_installed_app() {
   return 0
 }
 
+stop_replacement_for_rollback() {
+  local replacement_pids
+  replacement_pids="$(installed_pids)"
+  [[ -z "$replacement_pids" ]] || "$APP_PROCESSES" stop $replacement_pids >/dev/null || return 1
+}
+
 restore_previous_app() {
   local restore_failed=0
   if [[ -n "$PREVIOUS_APP" && ( -e "$PREVIOUS_APP" || -L "$PREVIOUS_APP" ) ]]; then
@@ -339,6 +412,9 @@ restore_previous_app() {
     if (( restore_failed == 0 )); then
       mv "$PREVIOUS_APP" "$DESTINATION" || restore_failed=1
     fi
+  fi
+  if (( restore_failed == 0 )); then
+    stop_replacement_for_rollback || restore_failed=1
   fi
   return "$restore_failed"
 }
@@ -391,7 +467,6 @@ fi
 PI_WEB_ACCESS_PACKAGE_WORK="$STAGING_CACHE/pi-web-access"
 PI_WEB_ACCESS_NODE_WORK="$RUNTIME_WORK/node"
 mkdir -p "$STAGING_CACHE"
-STAGING_PIDS=()
 WORKBUDDY_CONNECT_WORK="$STAGING_CACHE/workbuddy-connect"
 VERIDROP_WORK="$STAGING_CACHE/veridrop"
 OPENCODE2DSH_WORK="$STAGING_CACHE/opencode2dsh"
@@ -563,6 +638,7 @@ if [[ -f node_modules/typescript/bin/tsc ]]; then
 else
   pnpm run check:macos &
   STATIC_CHECKS_PID=$!
+  TEST_PIDS=("$STATIC_CHECKS_PID")
 fi
 wait_static_checks() {
   local failed=0 pid
@@ -594,10 +670,31 @@ case "$ARCH" in
   arm64|x86_64) XCODE_DESTINATION=( -destination "platform=macOS,arch=$ARCH" ) ;;
   *) echo "Unsupported macOS build architecture: $ARCH" >&2; exit 3 ;;
 esac
-APP="$(xcodebuild -workspace "$APP_ROOT/macos/YoungRouter.xcworkspace" -scheme YoungRouter-macOS -configuration Release "${XCODE_DESTINATION[@]}" -showBuildSettings 2>/dev/null | awk -F ' = ' '/TARGET_BUILD_DIR = / { target = $2 } /FULL_PRODUCT_NAME = / { product = $2 } END { if (target && product) print target "/" product }')"
+# Repeat installs share the compiler's object cache. It lives outside both the
+# bundle and the application so moving the verified product does not invalidate it.
+XCODE_BUILD_ARGS=()
+if [[ "$BUILD_ONLY" == "0" && "${YOUNG_ROUTER_FRESH_XCODE_BUILD:-0}" != "1" ]]; then
+  XCODE_BUILD_ARGS=( -derivedDataPath "$STAGING_CACHE/xcode-install" )
+fi
+APP="$(xcodebuild -workspace "$APP_ROOT/macos/YoungRouter.xcworkspace" -scheme YoungRouter-macOS -configuration Release "${XCODE_DESTINATION[@]}" "${XCODE_BUILD_ARGS[@]+"${XCODE_BUILD_ARGS[@]}"}" -showBuildSettings 2>/dev/null | awk -F ' = ' '/TARGET_BUILD_DIR = / { target = $2 } /FULL_PRODUCT_NAME = / { product = $2 } END { if (target && product) print target "/" product }')"
 if [[ -z "$APP" ]]; then
   echo "Could not resolve the React Native macOS build product path." >&2
   exit 4
+fi
+
+# Xcode cannot replace a host executable that a previous process still maps.
+# Retire the previous product before linking this build, then require the new
+# executable named by its Info.plist before anything is signed or moved.
+for retired_host in "$(dirname "$APP")"/.YoungRouter-retired-host.*; do
+  [[ -e "$retired_host" ]] || continue
+  rm -rf "$retired_host"
+done
+HOST_EXECUTABLE="$(bundle_host_executable "$APP")"
+if [[ -f "$HOST_EXECUTABLE" ]]; then
+  RETIRED_HOST="$(dirname "$APP")/.YoungRouter-retired-host.$$"
+  rm -rf "$RETIRED_HOST"
+  mv "$HOST_EXECUTABLE" "$RETIRED_HOST"
+  HOST_RETIRED=1
 fi
 
 RNMACOS_CLI="$RN_ROOT/vendor/react-native-macos-0.85/packages/react-native/cli.js"
@@ -615,6 +712,7 @@ RNMACOS_CLI="$RN_ROOT/vendor/react-native-macos-0.85/packages/react-native/cli.j
     -scheme YoungRouter-macOS \
     -configuration Release \
     "${XCODE_DESTINATION[@]}" \
+    "${XCODE_BUILD_ARGS[@]+"${XCODE_BUILD_ARGS[@]}"}" \
     ARCHS="$ARCH" \
     ONLY_ACTIVE_ARCH=YES \
     build
@@ -624,6 +722,14 @@ if [[ -z "$APP" || ! -d "$APP" ]]; then
   echo "React Native macOS build did not produce YoungRouter.app." >&2
   exit 4
 fi
+HOST_EXECUTABLE="$(bundle_host_executable "$APP")"
+if [[ ! -x "$HOST_EXECUTABLE" ]]; then
+  echo "The built bundle has no host executable at $HOST_EXECUTABLE; no artifact was produced." >&2
+  exit 4
+fi
+[[ -z "$RETIRED_HOST" ]] || ( rm -rf "$RETIRED_HOST" ) &
+RETIRED_HOST=""
+HOST_RETIRED=0
 
 # The staging jobs have been running alongside the native build; this is where
 # their output is first read, so this is where a failed one is reported. It is
@@ -652,12 +758,13 @@ done
 if [[ -e "$CORE" ]]; then
   retired_core="$(dirname "$APP")/.YoungRouter-retired-core.$$"
   if mv "$CORE" "$retired_core" 2>/dev/null; then
-    ( rm -rf "$retired_core" ) &
+    FINISH_BUILD_RETIRED_CORE="$retired_core"
   else
     rm -rf "$CORE"
   fi
 fi
 mkdir -p "$CORE"
+INSTALL_PREPARED=1
 cp "$PROJECT_ROOT/sitecustomize.py" "$CORE/sitecustomize.py"
 rsync -a \
   --exclude '__pycache__/' \
@@ -886,7 +993,7 @@ fi
 }
 [[ -f "$CORE/young_router/adapters/workbuddy_stream.mjs" ]] || {
   echo "The macOS build output does not contain young_router/adapters/workbuddy_stream.mjs." >&2
-  exit 1
+  exit 5
 }
 [[ -f "$CORE/young_router/adapters/workbuddy-connect/lib/index.js" ]] || {
   echo "The bundled dsh-workbuddy-connect package is missing." >&2
@@ -1145,8 +1252,21 @@ restore_core() {
 }
 # Restore however this ends, so a failed import cannot leave the built app
 # without its Core.
-trap 'restore_core; cleanup' EXIT
+finish_build() {
+  restore_core
+  if [[ "$PORTABLE_MOVED" == "1" ]]; then
+    rm -rf "$PORTABLE_SMOKE"
+  fi
+  if [[ -n "$FINISH_BUILD_RETIRED_CORE" ]]; then
+    rm -rf "$FINISH_BUILD_RETIRED_CORE"
+    FINISH_BUILD_RETIRED_CORE=""
+  fi
+  cleanup
+}
+trap finish_build EXIT
+[[ -z "$FINISH_BUILD_RETIRED_CORE" ]] || ( rm -rf "$FINISH_BUILD_RETIRED_CORE" ) &
 relocate_core
+PORTABLE_MOVED=1
 # The cache is named here as well, so a repeat build verifies the moved tree by
 # importing from it instead of compiling it a second time.  The bytecode still
 # lands outside the bundle, and the checks below still prove the bundle itself
@@ -1160,6 +1280,7 @@ PYTHONDONTWRITEBYTECODE=0 YOUNG_ROUTER_PYCACHE_DIR="$PYCACHE_SMOKE_DIR" \
 PYTHONDONTWRITEBYTECODE=0 YOUNG_ROUTER_PYCACHE_DIR="$PYCACHE_SMOKE_DIR" \
   "$PORTABLE_SMOKE/runtime/bin/litellm" --help >/dev/null
 restore_core
+PORTABLE_MOVED=0
 trap cleanup EXIT
 
 # The smoke imports above deliberately exercise bytecode generation, but
@@ -1349,6 +1470,7 @@ printf '%s\n' "Young Router: replacing bundle and stopping previous process"
 RESTART_ARMED=1
 if [[ -e "$DESTINATION" || -L "$DESTINATION" ]]; then
   mv "$DESTINATION" "$PREVIOUS_APP"
+  PREVIOUS_APP_MOVED=1
 fi
 if ! mv "$INSTALL_STAGE" "$DESTINATION"; then
   [[ ! -e "$PREVIOUS_APP" && ! -L "$PREVIOUS_APP" ]] || mv "$PREVIOUS_APP" "$DESTINATION"
@@ -1371,18 +1493,6 @@ if ! stop_installed_app "$OLD_PIDS"; then
   }
   exit 1
 fi
-# A Core may have forked its proxy just after the pre-swap snapshot. Capture
-# any remaining process still executing the retired bundle before launching
-# the replacement, so no old listener can survive into the new lifecycle.
-REMAINING_OLD_PIDS="$(bundle_processes)"
-if [[ -n "$REMAINING_OLD_PIDS" ]] && ! stop_installed_app "$REMAINING_OLD_PIDS"; then
-  echo "The old Young Router proxy did not stop; restoring the previous bundle." >&2
-  restore_previous_app || {
-    echo "The previous Young Router bundle could not be restored." >&2
-    exit 1
-  }
-  exit 1
-fi
 printf '%s\n' "Young Router: starting replacement and checking Core/proxy health"
 if ! start_installed_app "$OLD_PIDS"; then
   echo "The new Young Router app failed readiness checks; restoring the previous bundle." >&2
@@ -1391,6 +1501,9 @@ if ! start_installed_app "$OLD_PIDS"; then
     exit 1
   }
   exit 1
+fi
+if ! open "$DESTINATION" >/dev/null 2>&1; then
+  echo "Young Router is running, but its main window could not be requested." >&2
 fi
 
 RESTART_ARMED=0

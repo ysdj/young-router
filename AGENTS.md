@@ -3,6 +3,7 @@
 ## What Belongs Here
 
 - This guide holds decisions a reader cannot recover from the tree: the trap, the boundary, the non-obvious consequence. Never restate what the source already states — a symbol's behaviour, a name that exists, a change that was made, or a line that was removed — because that copy drifts the moment the code moves. A rule whose whole content is "do not reintroduce what was deleted" is also pollution: the tests that fail without it are the record. Prefer a comment at the site; a rule earns a line here only when it spans files a reader would not otherwise connect.
+- When an investigation finds a non-obvious protocol or lifecycle pitfall, record the observed failure mode and the invariant that prevents it in a concise comment at the owning branch before finishing the change. This rule is itself intentional and applies to later fixes.
 
 ## Scope
 

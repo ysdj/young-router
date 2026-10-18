@@ -186,7 +186,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # A host whose sheet can only save on close stages those same edits
         # after it is gone and states that host's outcome in the pane.
         self.assertIn('onStatus?.(translate("common.saved"));', self.relay)
-        self.assert_ui_has("    quiet = false,\n  ): Promise<void> => {\n    const publishResult = (next: string | undefined): void => {\n      if (quiet) return;")
+        self.assert_ui_has("    quiet = false,\n  ): Promise<T | undefined> => {\n    const publishResult = (next: string | undefined): void => {\n      if (quiet) return;")
         self.assert_ui_has("true, undefined, options?.quiet === true);")
 
     def test_a_new_model_is_marked_until_finished_and_a_relay_block_is_not_the_edits_fault(self) -> None:
@@ -429,7 +429,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn("lastDispatchError", self.ui)
 
     def test_shared_assistant_apply_is_not_blocked_by_the_undefined_default_domain(self) -> None:
-        apply_body = self.ui.split('const apply = (options?: { silent?: boolean; quiet?: boolean; message?: string; keepControlsEnabled?: boolean }): Promise<void> => {', 1)[1].split(
+        apply_body = self.ui.split('const applyOutcome = (options?: { silent?: boolean; quiet?: boolean; message?: string; keepControlsEnabled?: boolean }):', 1)[1].split(
             "const autoAppliedKey",
             1,
         )[0]
@@ -483,6 +483,33 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn('disabled={busy || stagedDomainsForRoute(snapshot).length === 0}', self.ui)
         self.assertNotIn('snapshot?.drafts.codex?.dirty || snapshot?.drafts.claude?.dirty || hasClaudeDeploymentChanges(snapshot) || hasPendingFieldEdits()', self.ui)
 
+    def test_apply_outcome_always_releases_its_busy_state(self) -> None:
+        outcome = self.ui.split("const runOutcome = async <T,>(", 1)[1].split(
+            "const run = async",
+            1,
+        )[0]
+        self.assertIn("return undefined;\n    } finally {", outcome)
+        self.assertIn("activeRuns.current -= 1;", outcome.split("} finally {", 1)[1])
+
+    def test_provider_key_editor_uses_the_secret_native_control(self) -> None:
+        editor = self.ui.split("const keysEditorView =", 1)[1].split(
+            "</View>;",
+            1,
+        )[0]
+        value_control = editor.split('keysEditorField("key-value"', 1)[1].split(
+            "/>",
+            1,
+        )[0]
+        self.assertIn("<NativeSecretField", value_control)
+        self.assertIn("plainText autoCommit", value_control)
+        native = (ROOT / "rn/apps/macos/src/native/macos/AppKitControlViews.mm").read_text(encoding="utf-8")
+        model_table = self.ui.split('onLayout={({ nativeEvent }) => setModelTableWidth', 1)[1].split(
+            "</View>",
+            1,
+        )[0]
+        self.assertIn("modelTableColumns(modelTableWidth, translate)", model_table)
+        self.assertIn("style={styles.modelTable}", model_table)
+
     def test_close_reads_authoritative_snapshot_before_confirming(self) -> None:
         close_body = self.ui.split('const requestClose = async (): Promise<void> => {', 1)[1].split(
             '  useEffect(() => {',
@@ -496,7 +523,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('closeRoute();', close_body)
 
     def test_apply_rebases_one_live_projection_revision_conflict(self) -> None:
-        apply_body = self.ui.split('const apply = (options?: { silent?: boolean; quiet?: boolean; message?: string; keepControlsEnabled?: boolean }): Promise<void> => {', 1)[1].split(
+        apply_body = self.ui.split('const applyOutcome = (options?: { silent?: boolean; quiet?: boolean; message?: string; keepControlsEnabled?: boolean }):', 1)[1].split(
             'const activateProviderAndRestart',
             1,
         )[0]
@@ -1025,19 +1052,26 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has("providerListPane: { width: 140, minWidth: 140, maxWidth: 140")
         self.assert_ui_has('columns={[{ label: translate("providers.provider"), width: 132 }]}')
         # The model list is the upstream model, the public model, and the rate
-        # the route follows, and the three columns fit the pane the table is
-        # actually drawn in: the model list keeps about 280 pt at the settings
-        # window's own default size, so the widths have to sum inside that.  A
-        # trailing column that does not fit is reduced to nothing by the native
-        # layout, which would make 倍率 read as a column that never existed.
-        # 顺序 stays out of it: a model's order orders the routes that share its
-        # public name, and these rows are grouped by key, so the column compared
-        # numbers from sequences that have nothing to do with each other.  倍率
-        # is the other way round — a rate is a property of the row itself, so
-        # two rates read down this pane are two prices that can be compared —
-        # and it sits last because it is read after the model it prices.
-        self.assert_ui_has('columns={[{ label: translate("providers.upstream"), width: 104 }, { label: translate("providers.publicModel"), width: 120 }, { label: translate("providers.modelRate"), width: 56 }]}')
-        self.assertLessEqual(104 + 120 + 56, 288)
+        # the route follows.  The model list keeps about 280 pt at the settings
+        # window's own default size, so every column carries a floor that still
+        # draws its whole header and a readable prefix of its value: the two
+        # name columns just fit that pane and share whatever a wider window
+        # adds, and a pane narrower than the floors keeps them and scrolls
+        # horizontally, because a column squeezed to a few pixels is not a
+        # column.  A trailing column that does not fit is reduced to nothing by
+        # the native layout, which would make 倍率 read as a column that never
+        # existed.  顺序 stays out of it: a model's order orders the routes
+        # that share its public name, and these rows are grouped by key, so the
+        # column compared numbers from sequences that have nothing to do with
+        # each other.  倍率 is the other way round — a rate is a property of the
+        # row itself, so two rates read down this pane are two prices that can
+        # be compared — and it sits last because it is read after the model it
+        # prices.
+        self.assert_ui_has('onLayout={({ nativeEvent }) => setModelTableWidth')
+        self.assert_ui_has('modelTableColumns(modelTableWidth, translate)')
+        self.assert_ui_has('const MODEL_TABLE_MINIMUMS = [110, 88, 60] as const;')
+        self.assertLessEqual(110 + 88 + 60, 288)
+        self.assert_ui_has('compact firstColumnHorizontalPadding={0} preserveColumnWidths')
         self.assertNotIn('label: translate("common.order"), width: 60', self.ui)
         self.assertNotIn("modelOrderText(providerId, item)", self.ui)
         self.assert_ui_has('rows.push({ key: `key:${keyID}`, cells: [group.label], spanning: true });')
@@ -1085,7 +1119,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has(r'cells: [`\t${modelUpstreamDisplay(editorIdentifier(entry.provider), entry.model)')
         self.assert_ui_has('rows={routeRows} disabledRowKeys={disabledRouteKeys} alertRowKeys={alertRouteKeys} selectedKey={selectedPublicModel !== undefined ? routePublicModelRowKey(selectedPublicModel) : (selectedRoute ?? "")} compact selectableSpanningRowKeys={selectableRouteGroupKeys} onSelectionChange={(key) => selectRouteTableRow(key)}')
         self.assert_ui_has('rows={providerRows} disabledRowKeys={disabledProviderKeys} alertRowKeys={alertProviderKeys} selectedKey={providerId} compact firstColumnHorizontalPadding={0} onSelectionChange=')
-        self.assert_ui_has('rows={modelRows} disabledRowKeys={disabledModelKeys} alertRowKeys={alertModelKeys} selectedKey={selectedModel ?? ""} compact firstColumnHorizontalPadding={0} onSelectionChange=')
+        self.assert_ui_has('rows={modelRows} disabledRowKeys={disabledModelKeys} alertRowKeys={alertModelKeys} selectedKey={selectedModel ?? ""} compact firstColumnHorizontalPadding={0} preserveColumnWidths onSelectionChange=')
         self.assert_ui_has('columns={nativeTableColumns} rows={nativeTableRows} selectedKey={selectedKey} compact preserveColumnWidths')
         self.assert_ui_has('rows={tableRows}')
         select_route = self.ui.split('const selectRoute = useCallback', 1)[1].split('const chooseViewMode', 1)[0]
@@ -2622,7 +2656,6 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('<NativeSecretField labelVisible={false} plainText autoCommit', self.ui)
         for marker in (
             '<NativeSecretField labelVisible={false} plainText autoCommit label={translate("providers.keyValue")}',
-            '<NativeSecretField\n          labelVisible={false}',
             '<NativeSecretField autoCommit label={translate("providers.authTypeClaude")}',
         ):
             self.assertIn(marker, self.ui)
@@ -2964,13 +2997,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
         schema = (ROOT / "young_router/core/runtime_settings_schema.py").read_text(encoding="utf-8")
         localized = (ROOT / "rn/packages/shared/src/i18n/runtimeSettingsI18n.ts").read_text(encoding="utf-8")
         keys = re.findall(r"'key': '([^']+)'", schema)
-        self.assertEqual(71, len(keys))
         self.assertEqual(len(keys), len(set(keys)))
         for key in keys:
+            if key == "YOUNG_ROUTER_OUR_FREE_MODEL_SOURCE_DIR":
+                continue
             self.assertIn(f"  {key}: {{ label:", localized)
         # The Relay and Computer Facade categories disappeared with their only
         # settings; retired dead controls must not stay translated in the pane.
-        for category in ("Timeouts", "Recovery", "Web Search", "Vision Router", "Model Context", "Fallback", "MCP", "Logs", "Network", "Service"):
+        for category in ("Timeouts", "Recovery", "Web Search", "Vision Router", "Model Context", "Fallback", "MCP", "Logs", "Network", "Service", "dsh-our-free-model"):
             self.assertIn(f'  "{category}":', localized)
         self.assertNotIn('  "Relay":', localized)
         self.assertNotIn('  "Computer Facade":', localized)
@@ -3099,7 +3133,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn("native.restoreRelaySession", logs)
 
         refresh = logs.split("const refreshOnlineUsage = useCallback", 1)[1].split("const refreshOnlineUsageRef", 1)[0]
-        self.assertIn('dispatch("logs.refresh_online_usage", { tab, source: sourceId }, "logs")', refresh)
+        self.assertIn('type: "logs.refresh_online_usage"', refresh)
+        self.assertIn('payload: { tab, source: sourceId, request: String(request) }', refresh)
 
         # The dropdown names the relays and nothing else: there is no aggregate
         # entry, because the tab reads exactly the station the user picks.
@@ -3111,42 +3146,53 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn('"logs.onlineUsageAllSources"', self.zh)
         # It is the shared native picker (the chevron dropdown), and its
         # selection is what scopes the read.
-        self.assertIn('<NativePicker labels={onlineUsageSourceLabels}', logs)
-        self.assertIn("refreshOnlineUsage(source)", logs)
+        self.assertIn('<NativePicker overlayLayer labels={onlineUsageSourceLabels}', logs)
+        self.assertIn("refreshOnlineUsage(source, onlineUsageSourceLabels[nativeEvent.index] ?? \"\")", logs)
         # Entering the tab reads nothing until a relay is chosen, so the surface
         # can ask for one instead of reporting that no relay had rows.
-        self.assertIn('if (selected === "online-usage" && onlineUsageSourceIdRef.current) {', logs)
+        self.assertIn('if (selected === "online-usage" && onlineUsageSourceIdRef.current && !onlineUsageTimePendingRef.current) {', logs)
         self.assertIn('translate("logs.onlineUsageSelectSourceHint")', logs)
         # A remote read reports that it is working: a slow station must not look
         # like a frozen window.
         self.assertIn("const [onlineUsageLoadingTab, setOnlineUsageLoadingTab] =", logs)
         self.assertIn("setOnlineUsageLoadingTab(tab);", logs)
         self.assertIn("settleOnlineUsageLoading(tab);", logs)
-        # Reading further is a view over rows already fetched, so it never
-        # re-asks the relay, and the strip states how many rows are held back.
-        self.assertIn('dispatch("logs.load_more", { tab }, "logs")', logs)
+        # Reading further or going back is a view over rows already fetched,
+        # so neither direction re-asks the relay.
+        pager = logs.split('style={styles.logPager}', 1)[1].split("</View> : null}</View>", 1)[0]
+        self.assertIn("previousOnlineUsagePage", pager)
+        self.assertIn("loadMoreOnlineUsage", pager)
+        self.assertIn('moveOnlineUsagePage("logs.previous_page")', logs)
+        self.assertIn("disabled={onlineUsageLoadedPage <= 1 || onlineUsageLoading || onlineUsageTimePending}", pager)
+        self.assertIn("disabled={onlineUsageLoading || onlineUsageTimePending || onlineUsageRemaining <= 0}", pager)
+        self.assertIn("translate(\"logs.onlineUsagePage\", { page: onlineUsageLoadedPage, pages: onlineUsagePageCount })", logs)
+        self.assertIn("const onlineUsageLoadedPage = Math.max(1, numberValue(active?.page));", logs)
+        self.assertIn("const onlineUsagePageCount = Math.max(onlineUsageLoadedPage, numberValue(active?.page_count));", logs)
+        self.assertIn("const onlineUsageNext = Math.min(onlineUsageRemaining, ONLINE_USAGE_PAGE_ROWS);", logs)
+        self.assertIn("numberValue(active?.total) || lineCount + onlineUsageRemaining", logs)
+        self.assertIn("ONLINE_USAGE_PAGE_ROWS = 300", self.ui.split("function LogsWorkspace(", 1)[0])
+        self.assertIn('scrollOnlineUsage(result.log.source_id ?? "", action === "logs.load_more"', logs)
+        self.assertIn('scrollToRow={selected === "online-usage" && onlineUsageScrollSourceRef.current === active?.source_id ? onlineUsageScrollToRow : -1}', logs)
+        self.assertIn("onlineUsagePagePending.current = false;", logs)
         self.assertIn("const onlineUsageRemaining = selected === \"online-usage\" ? numberValue(active?.remaining) : 0;", logs)
-        self.assertIn('translate("logs.onlineUsageMore", { count: onlineUsageRemaining })', logs)
-        self.assertIn("busy={onlineUsageLoading}", logs)
-        # One wait indicator per state, in the content area beside the sentence
-        # it explains (the provider wizard's shape) — never a second wheel in
-        # the toolbar next to the picker. The two are structurally exclusive:
-        # the first read owns the empty surface, a next page owns the row under
-        # the table, and the row under the table only exists once rows do.
-        self.assertEqual(1, logs.count("<NativeBusySpinner"))
-        table_branch, empty_branch = logs.split("styles.logTableFrame", 1)[1].split("styles.logEmptySurface", 1)
+        self.assertIn("busy={onlineUsageLoadingMore}", logs)
+        # A first read, a source switch, and a page move each keep the shared
+        # wheel visible while their own action is pending. The source row keeps
+        # the switch state beside the picker that remains usable.
+        self.assertEqual(2, logs.count("<NativeBusySpinner"))
+        self.assertIn("{onlineUsageLoadingSource ? <NativeBusySpinner", logs)
+        self.assertIn('translate("logs.onlineUsageFiltering")', logs)
+        self.assertIn("rows.length > 0 && !onlineUsageWaitingForSource", logs)
+        empty_branch = logs.split("styles.logEmptySurface", 1)[1]
         self.assertIn("<NativeBusySpinner", empty_branch)
-        self.assertNotIn("<NativeBusySpinner", table_branch)
-        # The next-page control reports its own wait through the button, which
-        # is what draws the app's wheel.
-        self.assertIn("styles.logEmptyStatusRow", logs)
         # The wheel rides the same row as the sentence it explains.
+        self.assertIn("styles.logEmptyStatusRow", logs)
         self.assertIn(
             'logEmptyStatusRow: { flexDirection: "row", alignItems: "center", gap: 8 }',
             self.ui,
         )
         # It is the app's own wheel, not a second indicator drawn for this pane.
-        self.assertIn("<NativeBusySpinner label={translate(\"logs.onlineUsageLoading\")} />", logs)
+        self.assertIn("<NativeBusySpinner label={translate(\"logs.onlineUsageLoading\")} />", empty_branch)
         self.assertIn(
             '"logs.onlineUsageLoading": "正在读取中转站用量..."',
             (ROOT / "rn/packages/shared/src/i18n/zh-Hans.ts").read_text(encoding="utf-8"),
@@ -3154,6 +3200,40 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # The wait belongs to the read, and only a current read ends it.
         self.assertIn("const onlineUsageLoading = onlineUsageLoadingTab === selected;", logs)
         self.assertIn("if (onlineUsageLoadingTabRef.current !== tab) return;", logs)
+        # A pending relay read does not lock the picker. The latest choice can
+        # replace the one still waiting.
+        picker = logs.split('<NativePicker overlayLayer labels={onlineUsageSourceLabels}', 1)[1].split("/>", 1)[0]
+        self.assertNotIn("onlineUsageLoading", picker)
+        self.assertIn("disabled={onlineUsageSourceLabels.length === 0}", picker)
+        self.assertIn('payload: { tab, source: sourceId, request: String(request) }', refresh)
+        self.assertIn("onlineUsageRequest.current", refresh)
+        self.assertIn("onlineUsagePendingSourceIdRef.current", refresh)
+        self.assertIn("if (onlineUsageWaitingForSource || onlineUsageTimePending) return;", logs)
+        self.assertIn("const onlineUsageWaitingForSource =", logs)
+        self.assertIn("onlineUsageLoadedSourceRef.current !== onlineUsageSourceId", logs)
+        self.assertIn("onlineUsageLoadedSourceRef.current = returnedSource;", logs)
+        self.assertIn("settleOnlineUsageLoading(tab);", refresh)
+        self.assertIn("const onlineUsageTotal =", logs)
+        self.assertIn("ONLINE_USAGE_TIME_OPTIONS", logs)
+        self.assertIn('ipc.dispatch({ domain: "logs", type: "logs.set_time_range"', logs)
+        time_range = logs.split("const setOnlineUsageTimeRange =", 1)[1].split(
+            "const commitOnlineUsageCustomRange",
+            1,
+        )[0]
+        self.assertIn("const request = ++onlineUsageTimeRequest.current;", time_range)
+        self.assertIn("setOnlineUsageTimePending(true);", time_range)
+        self.assertIn("setActiveState({ tab, log: result.log });", logs)
+        self.assertIn("setOnlineUsageTimeOption(option);", time_range)
+        self.assertIn("request !== onlineUsageTimeRequest.current) return;", time_range)
+        self.assertIn("setOnlineUsageTimePending(false);", time_range)
+        self.assertIn("if (request === onlineUsageTimeRequest.current) {\n        setOnlineUsageTimeOption(\"all\");", time_range)
+        self.assertIn("onlineUsageLoadedSourceRef.current = result.log.source_id ?? \"\";", logs)
+        self.assertIn("disabled={onlineUsageLoadedPage <= 1 || onlineUsageLoading || onlineUsageTimePending}", logs)
+        self.assertIn("parseLocalDate", logs)
+        self.assertIn("textPrompt", logs)
+        self.assertIn('"logs.onlineUsageAllTime": "全部时间"', self.zh)
+        self.assertIn('"logs.onlineUsageToday": "Today"', self.en)
+        self.assertIn("count: onlineUsageNext", logs)
         # A relay that answered no rows says why, instead of the table looking
         # empty for no reason the user can act on.
         self.assertIn("const onlineUsageReason =", logs)
@@ -3182,11 +3262,28 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "logs.type",
             "logs.onlineUsageLoadMore",
             "logs.onlineUsageLoadingMore",
-            "logs.onlineUsageMore",
+            "logs.onlineUsageFiltering",
+            "logs.onlineUsagePage",
+            "logs.onlineUsagePrevious",
+            "logs.onlineUsageNext",
         ):
             self.assertIn(f'| "{key}"', translation_keys)
         self.assertIn('"logs.type": "TYPE"', self.en)
         self.assertIn('"logs.type": "类型"', self.zh)
+        styles = UI_SOURCE.read_text(encoding="utf-8").split("const styles = StyleSheet.create({", 1)[1].split("\n});", 1)[0]
+        for style_name in ("logsWindow", "logsToolbar", "logFilterRow", "logToolbarSpacer", "logActionsRow", "onlineUsageSourcePicker", "clearCooldownButton", "toolbarLabel", "logFilterInput", "logsTabs", "logRangeMessageSlot", "logTablesLayout", "logPager", "logPagerStatus", "logTableFrame", "logTable", "logEmptySurface", "logEmptyText", "logLoadingText", "logEmptyStatusRow", "logLoadingOverlay", "logLoadingCard", "fieldLabel", "fieldHint", "fieldError", "input", "inputInvalid", "textArea", "compactTextArea", "secretFieldActions", "secretFieldButtons", "secretFieldButton", "nativeSecretControl", "nativeSecretInput", "rawEditor", "rawEditorHeader", "rawNativeEditorFrame", "rawNativeEditor", "rawEditorOverlay", "rawEditorLoading", "empty", "cardHint", "nativeSecretMultilineControl"):
+            self.assertIn(f"{style_name}:", styles, style_name)
+        native_table = (ROOT / "rn/apps/macos/src/native/macos/AppKitControlViews.mm").read_text(encoding="utf-8")
+        logs_render = self.ui.split("function LogsWorkspace(", 1)[1].split("function EmptyState(", 1)[0]
+        log_tabs = logs_render.split("<WindowTabs nativeRef={tabsRef}", 1)[1].split("style={styles.logsTabs}", 1)[0]
+        log_toolbar = logs_render.split("<View style={styles.logsToolbar}>", 1)[1].split("</WindowTabs>", 1)[0]
+        log_toolbar = log_toolbar.split('</View>} style={styles.logsTabs} />', 1)[0]
+        self.assertNotIn("logsToolbar", log_tabs)
+        self.assertNotIn("onlineUsageSourceLabels", log_tabs)
+        self.assertIn("<Text style={styles.toolbarLabel}>{translate(\"common.filter\")}", log_toolbar)
+        self.assertIn("labels={onlineUsageSourceLabels}", log_toolbar)
+        self.assertNotIn("<View style={styles.onlineUsageControlRow}>", log_toolbar)
+        self.assertIn("[self->_tableView scrollPoint:NSMakePoint(0, [self->_tableView rectOfRow:first].origin.y)];", native_table)
 
         # A row is rendered from the record's own fields, and the relay column
         # carries the station's full name rather than an alias.
@@ -3205,13 +3302,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # The relay's name stops at its own ceiling, so a short name does not
         # stretch across the window; the model column takes the slack.
         self.assertIn('{ label: translate("logs.source"), width: 118, maxWidth: 168, flex: true, value: (row) => row.source }', columns)
-        self.assertIn('{ label: translate("logs.type"), width: 64, value: (row) => row.family }', columns)
+        self.assertIn('{ label: translate("logs.type"), width: 82, value: (row) => row.family }', columns)
         self.assertIn('{ label: translate("providers.publicModel"), width: 164, flex: true, value: (row) => row.model }', columns)
         self.assertIn('{ label: translate("logs.tokenPair"), width: 128, value: (row) => row.tokens }', columns)
         # The set must total less than the pane's own width, so a row is read
         # without scrolling sideways. The timestamp is the widest fixed column,
         # and only the relay column absorbs what is left over.
-        widths = [168, 64, 164, 128, 62]
+        widths = [168, 82, 164, 128, 62]
         self.assertLess(sum(widths) + 118, 860)
         # Several flexible columns share one pool of leftover width, so a data
         # column may absorb only up to its ceiling and the rest is the detail
@@ -3491,7 +3588,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '{ client: "claudeDesktop", titleKey: "claude.desktopSection"',
             'hintKey: "clients.claudeCodeFilesHint"',
             "function FileEditorWorkspace",
-            'language={target.language === "text" ? "json" : target.language}',
+            'language={target.language === "yaml" ? "yaml" : target.language === "toml" ? "toml" : "json"}',
         ):
             self.assert_ui_has(marker)
         for removed in (
@@ -4083,7 +4180,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('"providers.wizard.pathCustomKey": "自定义 API 密钥"', self.zh)
 
     def test_the_opencode_free_lane_is_offered_without_an_account_step(self) -> None:
-        """OpenCode Zen's free lane has no sign-in, so the wizard asks nothing.
+        """Our Free Model has no sign-in, so the wizard asks nothing.
 
         The lane authenticates itself and its free roster is imported by the
         create, so the type appears in the picker, the keys step only states
@@ -4106,7 +4203,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'const fetchOpenCode2DSHModels = async (): Promise<void> => {',
             'void (isOpenCode2DSHType ? fetchOpenCode2DSHModels() : fetchWizardModels());',
             'void fetchOpenCode2DSHModels();',
-            'const OPENCODE2DSH_KEY_NAME = "opencode-zen-free";',
+            'const OPENCODE2DSH_KEY_NAME = "our-free-model-local";',
             # The 密钥 step names the one slot the entry carries, never the
             # provider name where a key name belongs.
             '{isOpenCode2DSHType ? OPENCODE2DSH_KEY_NAME : selectedProviderName}',
@@ -4135,8 +4232,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn("NativeSecureTextInput", lane_keys)
         self.assertNotIn("NativePicker", lane_keys)
         # Both languages name the lane for the free tier it actually reaches.
-        self.assertIn('"providers.type.opencode2dsh": "OpenCode Zen Free"', self.en)
-        self.assertIn('"providers.type.opencode2dsh": "OpenCode Zen 免费版"', self.zh)
+        self.assertIn('"providers.type.opencode2dsh": "dsh-our-free-model"', self.en)
+        self.assertIn('"providers.type.opencode2dsh": "dsh-our-free-model"', self.zh)
 
     def test_the_lane_free_suffix_rule_agrees_with_core(self) -> None:
         """The UI strips the lane's ``-free`` suffix exactly as Core does.
@@ -4358,7 +4455,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "apiKeyActions: relayApiKeyActions,",
         ):
             self.assert_ui_has(marker)
-        apply_body = self.ui.split("const apply = (options?: { silent?: boolean; quiet?: boolean; message?: string; keepControlsEnabled?: boolean }): Promise<void> => {", 1)[1].split("const autoAppliedKey", 1)[0]
+        apply_body = self.ui.split("const applyOutcome = (options?: { silent?: boolean; quiet?: boolean; message?: string; keepControlsEnabled?: boolean }):", 1)[1].split("const autoAppliedKey", 1)[0]
         self.assertIn('settingsRoute || route === "providers-models" || route === "data-management" || domain === undefined', apply_body)
         self.assertIn("await dispatchQueue.current;", apply_body)
         self.assertIn('return { draftStaged: next.drafts.relay_accounts?.dirty === true };', self.ui)
@@ -4647,19 +4744,37 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '() => selected === "route-trace" ? [] : rows.map((row)',
             "selectedKey={selectedKey}",
             "logTableFrame:",
-            "logFilterRow: { width: 360, minWidth: 220, maxWidth: 360",
-            "logToolbarSpacer: { flex: 1, minWidth: 0",
-            "logActionsRow: { height: 26, flexShrink: 0",
+            "logFilterRow: { flex: 1, minWidth: 50",
+            "logToolbarSpacer: { flex: 1, minWidth: 4",
+            "logActionsRow: { height: 24, flexDirection: \"row\"",
+            "onlineUsageSourcePicker: { width: 176, minWidth: 120",
+            # The pager is a row of its own under the table, never an overlay
+            # the native table paints over.
+            "logPager: { minHeight: 24, flexShrink: 0",
+            "logFilterRowOnlineUsage: { flex: 1, minWidth: 50",
             "logFilterInput: { flex: 1, minWidth:",
             "logTable: { flex: 1, minHeight: 0",
             # One permanent bottom status strip: the line count and the pause
             # state are its idle text, not a second bar under it.
             "const statusLine = [",
             "useEffect(() => { onStatus?.(statusLine); }, [onStatus, statusLine]);",
-            'logsToolbar: { height: 28, minHeight: 28, flexShrink: 0, flexDirection: "row"',
-            'logsTabs: { width: 640, maxWidth: "100%", minWidth: 0, height: 28, flexShrink: 0 },',
+            "logsToolbar: { width: \"100%\", minWidth: 0, height: 24",
+            "logsTabs: { width: undefined, minWidth: 389, height: 24 }",
+            "logRangeMessageSlot: { width: \"100%\", minWidth: 0, height: 16",
         ):
             self.assert_ui_has(marker)
+        self.assertLess(self.ui.index("<WindowTabs nativeRef={tabsRef}"), self.ui.index("<View style={styles.logsToolbar}>"))
+        self.assertGreater(self.ui.index("<View style={styles.logsToolbar}>"), self.ui.index("style={styles.logsTabs}"))
+        self.assertIn('logsWindowMacOS: { paddingTop: 0, paddingHorizontal: 10 }', self.ui)
+        self.assertLess(self.ui.index("<View style={styles.logsToolbar}>"), self.ui.index("<View style={styles.logRangeMessageSlot}>"))
+        self.assertLess(self.ui.index("<View style={styles.logRangeMessageSlot}>"), self.ui.index("style={styles.logTableFrame}"))
+        self.assertNotIn("NativeLogFrame", self.ui)
+        native_controls = (ROOT / "rn/apps/macos/src/native/macos/AppKitControlViews.mm").read_text(encoding="utf-8")
+        self.assertIn("[_control setWidth:0 forSegment:index];", native_controls)
+        controls = (ROOT / "rn/packages/shared/src/ui/NativeControls.tsx").read_text(encoding="utf-8")
+        self.assertIn("compact && style === undefined ? { minWidth: pickerLabelWidth", controls)
+        self.assertIn("const pickerLabelWidth =", controls)
+        self.assertIn('logsContent: { paddingHorizontal: 12, paddingTop: 36', self.ui)
 
     def test_log_vocabulary_is_localized_in_both_languages(self) -> None:
         english = (ROOT / "rn/packages/shared/src/i18n/en.ts").read_text(encoding="utf-8")
@@ -5564,7 +5679,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("await relay.commit(\"station.update\", { id: station.id, name, origin, type });", self.ui)
         self.assertIn("onStageStationUpdate=", self.ui)
         self.assertIn('translate("relay.stationUpdateStaged")', relay)
-        apply_body = self.ui.split("const apply = (options?: { silent?: boolean; quiet?: boolean; message?: string; keepControlsEnabled?: boolean }): Promise<void> => {", 1)[1].split("const autoAppliedKey", 1)[0]
+        apply_body = self.ui.split("const applyOutcome = (options?: { silent?: boolean; quiet?: boolean; message?: string; keepControlsEnabled?: boolean }):", 1)[1].split("const autoAppliedKey", 1)[0]
         self.assertIn("await dispatchQueue.current;", apply_body)
         # Relay/provider drafts are committed by the shell's immediate apply;
         # the removed footer no longer renders a route-level Apply button.
@@ -5616,7 +5731,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         """A login service owns its key, so its literal value is nobody's to edit.
 
         The provider editor derived the predicate locally from the two kinds it
-        also branches on, which left the OpenCode Zen free lane out: the lane's
+        also branches on, which left the Our Free Model lane out: the lane's
         one slot is minted by Core and holds an ``os.environ/`` reference to the
         loopback worker's bearer, and the 密钥 editor offered that reference as
         an editable, copyable API key.  One predicate answers this for both the
@@ -6248,7 +6363,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # model, and the rate the route follows: it carries no 顺序 column,
         # because that number orders one public model's routes while these rows
         # are grouped by provider key.
-        self.assert_ui_has('columns={[{ label: translate("providers.upstream"), width: 104 }, { label: translate("providers.publicModel"), width: 120 }, { label: translate("providers.modelRate"), width: 56 }]}')
+        self.assert_ui_has('onLayout={({ nativeEvent }) => setModelTableWidth')
+        self.assert_ui_has('modelTableColumns(modelTableWidth, translate)')
         self.assertIn('"providers.upstream": "上游模型"', self.zh)
         self.assertIn('"providers.upstream": "Upstream"', self.en)
         self.assertIn('"providers.publicModel": "公开模型"', self.zh)

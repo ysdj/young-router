@@ -125,6 +125,7 @@ class RuntimeSettingsDomain:
 
     def __init__(self, settings_path: Path | str | None = None):
         self.settings_path = Path(settings_path).expanduser() if settings_path else _default_runtime_settings_path()
+        self.our_free_model = None
         self.specs: dict[str, Any] = {}
         self._metadata: dict[str, dict[str, Any]] = {}
         self._raw_values: dict[str, str] = {}
@@ -135,6 +136,26 @@ class RuntimeSettingsDomain:
         self._baseline_bytes: bytes | None = None
         self.revision = 0
         self.reload()
+
+    def attach_our_free_model(self, runtime: object | None) -> None:
+        """Apply a committed worker setting through its owning runtime."""
+
+        self.our_free_model = runtime
+
+    def _apply_values(self, values: Mapping[str, str]) -> None:
+        if self.our_free_model is None:
+            return
+        settings = {
+            "defaultMaxTokens": values["YOUNG_ROUTER_OUR_FREE_MODEL_MAX_TOKENS"],
+            "exposeRegionModels": values["YOUNG_ROUTER_OUR_FREE_MODEL_EXPOSE_REGION_MODELS"],
+            "probeIntervalMinutes": values["YOUNG_ROUTER_OUR_FREE_MODEL_REFRESH_INTERVAL_MINUTES"],
+            "standaloneProbe": values["YOUNG_ROUTER_OUR_FREE_MODEL_PROBE_ON_REFRESH"],
+            "sourceDir": values["YOUNG_ROUTER_OUR_FREE_MODEL_SOURCE_DIR"],
+        }
+        if settings == self.our_free_model.settings:
+            return
+        self.our_free_model.stop()
+        self.our_free_model.settings = settings
 
     @staticmethod
     def _defaults(specs: Mapping[str, Any]) -> dict[str, str]:
@@ -488,6 +509,7 @@ class RuntimeSettingsDomain:
         except PersistenceError as exc:
             raise DomainError(safe_exception_message(exc)) from None
         self.reload()
+        self._apply_values(self._raw_values)
         return {"applied": True, **self.snapshot()}
 
     def external_disk_state(self) -> dict[str, bool]:

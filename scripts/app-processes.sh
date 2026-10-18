@@ -16,6 +16,8 @@
 #   app-processes.sh stop  <pid>...      signal them together and wait for them
 #                                        to be gone; survivors are printed and
 #                                        the exit status is 1
+#   app-processes.sh orphans <app-path>  the bundle's worker processes left
+#                                        without a Core after a failed install
 #   app-processes.sh alive <pid>...      those of them that are still running,
 #                                        one pid per line
 set -uo pipefail
@@ -60,6 +62,24 @@ descendants() {
   done
 }
 
+orphaned_workers() {
+  local app_path="$1" pid parent command
+  local worker="$app_path/Contents/Resources/Core/young_router/adapters/opencode2dsh_worker.mjs"
+  # A failed install can retire an entire app bundle while its Core is still
+  # starting its managed worker. The worker is then reparented before the next
+  # install can capture it through the host tree. A live Core from any bundle
+  # owns its own worker; every other process running this bundle's exact worker
+  # script is a survivor of that bundle's retired process tree.
+  for pid in $(pgrep -f "opencode2dsh_worker\.mjs" 2>/dev/null || true); do
+    parent="$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ')"
+    command="$(ps -p "$parent" -o command= 2>/dev/null || true)"
+    if [[ -n "$parent" && "$command" != *"young_router.core"* ]] \
+      && [[ "$(ps -p "$pid" -o command= 2>/dev/null || true)" == *"$worker"* ]]; then
+      printf '%s\n' "$pid"
+    fi
+  done
+}
+
 # Replacing a bundle's processes is one policy for every entry point, so it
 # lives here beside the rules that decide which processes those are: the
 # captured pids are signalled together, in one shot, and the caller waits only
@@ -89,6 +109,38 @@ stop() {
   done
   alive "$@"
   return 1
+}
+
+stop_installed_app_when_ready() {
+  local destination="$1" app_pids app_pid deadline proxy_ready
+  deadline=$((SECONDS + 40))
+  while :; do
+    app_pids="$("$0" hosts "$destination")"
+    [[ -n "$app_pids" ]] && break
+    (( SECONDS < deadline )) || return 0
+    sleep 0.05
+  done
+  # The host's Core launches the proxy asynchronously. Its normal quit path
+  # replaces Core, which would leave a host running after this stop returned.
+  deadline=$((SECONDS + 40))
+  while :; do
+    proxy_ready=0
+    while read -r app_pid; do
+      [[ -n "$app_pid" ]] || continue
+      if ps -p "$app_pid" -o command= 2>/dev/null | grep -q -- ' -m young_router.core --endpoint-file '; then
+        app_pids="$("$0" tree "$destination")"
+        if ps -p $app_pids -o command= 2>/dev/null | grep -q -- ' -m young_router.proxy.macos_proxy '; then
+          proxy_ready=1
+        fi
+        break
+      fi
+    done <<<"$app_pids"
+    (( proxy_ready == 0 )) || break
+    (( SECONDS < deadline )) || break
+    sleep 0.05
+  done
+  app_pids="$("$0" hosts "$destination")"
+  [[ -z "$app_pids" ]] || stop $app_pids
 }
 
 tree() {
@@ -128,6 +180,16 @@ case "$1" in
   stop)
     shift
     stop "$@"
+    ;;
+  stop-when-ready)
+    shift
+    [[ -n "${1:-}" ]] || usage
+    stop_installed_app_when_ready "$1"
+    ;;
+  orphans)
+    shift
+    [[ -n "${1:-}" ]] || usage
+    orphaned_workers "$1"
     ;;
   alive)
     shift

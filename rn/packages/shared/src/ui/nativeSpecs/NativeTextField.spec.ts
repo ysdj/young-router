@@ -19,6 +19,8 @@ export interface NativeTextFieldProps extends ViewProps {
   secureTextEntry?: WithDefault<boolean, false>;
   /** Native search field chrome (NSSearchField with a magnifier and clear button). */
   search?: WithDefault<boolean, false>;
+  // @macos-only
+  borderless?: WithDefault<boolean, false>;
   disabled?: WithDefault<boolean, false>;
   onChangeText?: DirectEventHandler<TextEvent>;
   onBlur?: DirectEventHandler<Readonly<{}>>;

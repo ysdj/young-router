@@ -52,7 +52,7 @@ from .domains.logs import active_cooldown_states, active_recovery_states
 
 
 MAX_OPERATION_OUTPUT_BYTES = 128 * 1024
-MAX_USAGE_ROWS = 100
+MAX_USAGE_ROWS = 10_000
 SERVICE_STATES = frozenset({"starting", "running", "unhealthy", "stopped", "unknown"})
 OWNER_RECORD_VERSION = 2
 # Local proxy port used when no valid preference is configured.
@@ -243,7 +243,7 @@ class CoreServiceController:
         # Set by ``attach_workbuddy`` when Core owns a WorkBuddy worker; a
         # bare controller (tests, CLI probes) simply has none.
         self._workbuddy: object | None = None
-        # Set by ``attach_opencode2dsh`` when Core owns an OpenCode Zen
+        # Set by ``attach_opencode2dsh`` when Core owns the dsh-our-free-model
         # worker; a bare controller (tests, CLI probes) simply has none.
         self._opencode2dsh: object | None = None
 
@@ -253,7 +253,7 @@ class CoreServiceController:
         self._workbuddy = runtime
 
     def attach_opencode2dsh(self, runtime: object | None) -> None:
-        """Share the Core-owned OpenCode Zen worker with this controller."""
+        """Share the Core-owned dsh-our-free-model worker with this controller."""
 
         self._opencode2dsh = runtime
 
@@ -301,29 +301,23 @@ class CoreServiceController:
             return {}
 
     def _opencode2dsh_environment(self, *, autostart: bool) -> dict[str, str]:
-        """The loopback base URL and bearer the proxy child resolves.
-
-        ``autostart`` is only for the proxy launch: a status poll or a preview
-        must never spawn a Node worker on its own, and a config that routes
-        nothing through OpenCode Zen never starts one either.
-        """
+        """The free-model worker's loopback base URL and bearer."""
 
         runtime = self._opencode2dsh
         if runtime is None:
             return {}
         try:
             if autostart:
-                if self._runtime_config_references_workbuddy():
+                # The worker starts only when the saved config names the base
+                # reference it publishes.
+                reference = "os.environ/YOUNG_ROUTER_OPENCODE2DSH_BASE"
+                if reference in self.paths.runtime_config.read_text(encoding="utf-8"):
                     return runtime.environment(autostart=True)
-                # Removing every managed route releases the worker instead of
-                # leaving a process behind an unused port.
                 runtime.stop()
                 return {}
             return runtime.environment_values()
         except Exception:
-            # A missing Node runtime or an unstaged package leaves the
-            # OpenCode Zen routes unusable; every other provider must still
-            # start.
+            # Other routes remain startable when the upstream package is absent.
             return {}
 
     def _managed_worker_environment(self, *, autostart: bool) -> dict[str, str]:
@@ -705,6 +699,9 @@ class CoreServiceController:
         if forced_port is not None:
             env["LITELLM_PORT"] = forced_port
         env["LITELLM_RUNTIME_ROOT"] = str(self.paths.root)
+        # CPython reads these before ``sitecustomize`` can run. The wrapper keeps
+        # its own imports out of the signed bundle; imports made after this
+        # module is loaded are redirected with the explicit writable cache.
         env["LITELLM_CONFIG_FILE"] = str(self.paths.config)
         env["LITELLM_RUNTIME_CONFIG"] = str(self.paths.runtime_config)
         env["YOUNG_ROUTER_RUNTIME_SETTINGS_FILE"] = str(self.paths.settings)
@@ -1427,15 +1424,14 @@ class OnlineUsageReader:
         except Exception:
             return []
 
-    def refresh(self, source_id: str | None = None) -> list[str]:
+    def refresh(self, source_id: str | None = None) -> tuple[list[dict[str, str]], str]:
         from . import remote_usage_logs
 
         try:
-            text = remote_usage_logs.render(self.config_path, 5.0, source_id)
+            records, reason = remote_usage_logs.collect(self.config_path, 5.0, source_id)
         except Exception:
-            return ["Online usage logs are unavailable."]
-        lines = [REDACT_TEXT(line)[:512] for line in str(text).splitlines() if line.strip()]
-        return lines[-MAX_USAGE_ROWS:] or ["No recent online usage rows."]
+            return [], remote_usage_logs.USAGE_REASON_UNAVAILABLE
+        return records[-MAX_USAGE_ROWS:], reason
 
 
 __all__ = [

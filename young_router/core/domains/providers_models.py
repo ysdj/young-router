@@ -80,7 +80,7 @@ from ._shared import (
 # catalog's own enumeration into a routing decision nobody made.
 IMPORTED_MODEL_ORDER = 0
 
-# The suffix the anonymous Zen lane puts on its free ids (``cat-jam-free``).
+# The suffix the upstream free lane puts on its ids (``cat-jam-free``).
 # It states the lane, not the model, and the public name a client sees must not
 # carry it: the same model reached through a paid route would then have two
 # public names for one thing.  Only the public name is stripped — the upstream
@@ -426,7 +426,7 @@ class ProvidersModelsDomain:
         return self.workbuddy
 
     def _opencode2dsh(self):
-        """The OpenCode Zen worker owner; created on demand for a bare domain."""
+        """The dsh-our-free-model worker owner; created on demand for a bare domain."""
 
         if self.opencode2dsh is None:
             from ...adapters.opencode2dsh import OpenCode2DSHRuntime
@@ -675,9 +675,8 @@ class ProvidersModelsDomain:
             # this account never probes a Responses endpoint that cannot exist.
             return "openai/chat", "fixed"
         if auth_kind in opencode2dsh_module.OPENCODE2DSH_AUTH_KINDS:
-            # The OpenCode Zen worker mounts Chat Completions alone, so a route
-            # on this lane never probes a Responses endpoint that cannot exist.
-            return "openai/chat", "fixed"
+            # The upstream gateway serves both Chat Completions and Responses.
+            return "openai/responses", "fixed"
         if auth_kind == "api_key":
             return "", "fallback"
         return "", "fixed"
@@ -2483,22 +2482,21 @@ class ProvidersModelsDomain:
     def _opencode2dsh_catalog_models(self, auth_kind: str) -> list[dict[str, Any]]:
         """Import the staged adapter's live free-model roster as this lane's models.
 
-        The upstream owns which ids the anonymous Zen lane serves and the
-        models.dev metadata behind their limits, so the roster is read from the
-        adapter rather than guessed here.  An empty roster is a real failure for
-        the user's own add action - the lane reaches Zen but served nothing -
-        and saying so is what lets the pane report it instead of creating an
-        account that routes nowhere.
+        The upstream owns which free models it serves and their capabilities,
+        so the roster is read from the adapter rather than guessed here.
         """
 
         provider_id = opencode2dsh_module.AUTH_KIND_TO_PROVIDER[auth_kind]
         try:
             document = self._opencode2dsh().models(provider_id, refresh=True)
+        except opencode2dsh_module.OpenCode2DSHCatalogUnavailable:
+            self._opencode2dsh().ensure_configured()
+            return []
         except Exception:
-            raise DomainError("The OpenCode Zen free model list is unavailable") from None
+            raise DomainError("The dsh-our-free-model catalog is unavailable") from None
         if document.get("available") is not True:
             raise DomainError(
-                "The OpenCode Zen anonymous free lane could not be reached from this machine"
+                "The dsh-our-free-model integration could not be reached from this machine"
             )
         # The import just read the lane's catalog, so the windows it states are
         # known before the provider exists: a route added from this roster
@@ -2512,8 +2510,6 @@ class ProvidersModelsDomain:
             if not model_id:
                 continue
             model: dict[str, Any] = {
-                # The public name drops the lane's own ``-free`` suffix; the
-                # route still addresses the upstream's real id.
                 "name": _public_name_without_lane_suffix(model_id),
                 "upstream_model": model_id,
                 "enabled": True,
@@ -2521,7 +2517,7 @@ class ProvidersModelsDomain:
             }
             models.append(model)
         if not models:
-            raise DomainError("The OpenCode Zen free lane reported no models")
+            raise DomainError("The dsh-our-free-model catalog reported no models")
         return models
 
     def _workbuddy_operation(self, action: str, data: Mapping[str, Any]) -> None:
@@ -2644,11 +2640,11 @@ class ProvidersModelsDomain:
         try:
             provider_id = opencode2dsh_module.validated_provider(provider_id)
         except ValueError:
-            raise DomainError("The requested OpenCode Zen provider is unavailable") from None
+            raise DomainError("The requested dsh-our-free-model provider is unavailable") from None
         try:
             document = self._opencode2dsh().models(provider_id, refresh=refresh)
         except Exception:
-            raise DomainError("The OpenCode Zen integration is unavailable") from None
+            raise DomainError("The dsh-our-free-model integration is unavailable") from None
         self._remember_published_windows(provider_id, document.get("models"))
         self._last_operation = {
             "operation": "opencode2dsh_models",
@@ -2670,7 +2666,7 @@ class ProvidersModelsDomain:
                 data.get("provider", opencode2dsh_module.OPENCODE2DSH_PROVIDER)
             )
         except ValueError:
-            raise DomainError("The requested OpenCode Zen provider is unavailable") from None
+            raise DomainError("The requested dsh-our-free-model provider is unavailable") from None
         runtime = self._opencode2dsh()
         try:
             if action == "opencode2dsh_status":
@@ -2690,7 +2686,7 @@ class ProvidersModelsDomain:
             # would fetch the whole Zen directory again on every model switch.
             document = runtime.models(provider_id, refresh=bool(data.get("refresh", False)))
         except Exception:
-            raise DomainError("The OpenCode Zen integration is unavailable") from None
+            raise DomainError("The dsh-our-free-model integration is unavailable") from None
         # The lane's catalog is where its own window per free model is read, so
         # the same answer that lists the roster also becomes what a projection
         # reports for a route on it.
@@ -3839,7 +3835,7 @@ class ProvidersModelsDomain:
         workbuddy_module.WORKBUDDY_AI_AUTH_KIND: {
             "name": workbuddy_module.WORKBUDDY_DISPLAY_NAMES[workbuddy_module.WORKBUDDY_AI_PROVIDER],
         },
-        # OpenCode Zen carries no default model: the staged adapter's own
+        # dsh-our-free-model carries no default model: the staged adapter's own
         # catalog is the roster, so a newly added lane imports exactly what the
         # lane can call today.
         opencode2dsh_module.OPENCODE2DSH_AUTH_KIND: {
@@ -3928,7 +3924,7 @@ class ProvidersModelsDomain:
             # whole point of adding the account.
             raw_models = self._workbuddy_catalog_models(kind)
         if raw_models is None and kind in opencode2dsh_module.OPENCODE2DSH_AUTH_KINDS:
-            # The OpenCode Zen lane owns no free-text roster either: the staged
+            # The dsh-our-free-model lane owns no free-text roster either: the staged
             # adapter's live catalog is the source of truth, and importing it is
             # the whole point of adding the lane.
             raw_models = self._opencode2dsh_catalog_models(kind)

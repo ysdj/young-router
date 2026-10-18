@@ -429,86 +429,71 @@ class PiWebAccessNodeStagingTests(unittest.TestCase):
 
 
 class OpenCode2DSHStagingTests(unittest.TestCase):
-    """The OpenCode Zen plugin stages under the same provenance contract.
+    """The existing OpenCode provider stages dsh-our-free-model intact."""
 
-    Its published artifact is the scoped plugin package, not the repository
-    root, so the reuse test has to hold against this script's own package name,
-    entry point, and dependency list rather than a copy of WorkBuddy's.
-    """
-
-    PACKAGE = "@opencode2dsh/dsh-plugin"
-    VERSION = "0.3.12"
-    INTEGRITY = "sha512-plugin"
-
-    def setUp(self) -> None:
-        self.directory = Path(tempfile.mkdtemp(prefix="young-router-oc2dsh-reuse-"))
-        self.addCleanup(lambda: __import__("shutil").rmtree(self.directory, ignore_errors=True))
-
-    def stage_plugin(self, *, version: str = VERSION, integrity: str = INTEGRITY) -> None:
-        (self.directory / "lib").mkdir(parents=True, exist_ok=True)
-        (self.directory / "lib/index.js").write_text("export const apply = () => {}\n", encoding="utf-8")
-        (self.directory / "package.json").write_text(
-            json.dumps({"name": self.PACKAGE, "version": version}), encoding="utf-8"
+    @mock.patch.object(opencode2dsh, "_install_peers", autospec=True)
+    @mock.patch.object(opencode2dsh, "find_npm", return_value="npm")
+    def test_the_upstream_source_is_copied_without_a_protocol_rewrite(
+        self, _find_npm: mock.Mock, install_peers: mock.Mock
+    ) -> None:
+        temporary = Path(tempfile.mkdtemp(prefix="young-router-ofm-source-"))
+        self.addCleanup(shutil.rmtree, temporary, ignore_errors=True)
+        source = temporary / "dsh-our-free-model"
+        source.mkdir()
+        for relative in opencode2dsh.REQUIRED_FILES:
+            path = source / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("upstream\\n", encoding="utf-8")
+        (source / "package.json").write_text(
+            json.dumps(
+                {
+                    "name": "dsh-our-free-model",
+                    "version": "2.4.0",
+                    "peerDependencies": {
+                        name: "*" for name in opencode2dsh.REQUIRED_PEERS
+                    },
+                }
+            ),
+            encoding="utf-8",
         )
-        for dependency in opencode2dsh.REQUIRED_DEPENDENCY_DIRECTORIES:
-            (self.directory / "node_modules" / dependency).mkdir(parents=True, exist_ok=True)
-        update_common.record_staged_release(
-            self.directory, package_name=self.PACKAGE, version=version, integrity=integrity
+        output = temporary / "output" / "opencode2dsh"
+
+        def install_peers_once(_command, *, npm_root, **_kwargs) -> None:
+            for name in opencode2dsh.REQUIRED_PEERS:
+                path = npm_root / "node_modules" / name
+                path.mkdir(parents=True)
+                (path / "package.json").write_text("{}", encoding="utf-8")
+
+        install_peers.side_effect = install_peers_once
+        version = opencode2dsh.update(output, source_url=f"file://{source}")
+        original_record = (output / update_common.STAGED_RELEASE_MARKER).read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(version, "2.4.0")
+        self.assertEqual((output / "src/core/runtime.js").read_text(), "upstream\\n")
+        self.assertTrue((output / "node_modules" / "@deepseek-ai" / "dsh-llm").is_dir())
+        original_runtime = (output / "src/core/runtime.js").read_bytes()
+        original_peer = (
+            output / "node_modules" / "@deepseek-ai" / "dsh-llm" / "package.json"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(install_peers.call_count, 1, "an unchanged source must keep its staged peers")
+        self.assertEqual((output / "src/core/runtime.js").read_bytes(), original_runtime)
+        self.assertEqual(
+            (output / "node_modules" / "@deepseek-ai" / "dsh-llm" / "package.json").read_text(
+                encoding="utf-8"
+            ),
+            original_peer,
         )
 
-    def reusable(self, **overrides) -> bool:
-        arguments = dict(
-            package_name=self.PACKAGE,
-            version=self.VERSION,
-            integrity=self.INTEGRITY,
-            required_files=opencode2dsh.REQUIRED_PACKAGE_FILES,
-            required_peer_dirs=opencode2dsh.REQUIRED_DEPENDENCY_DIRECTORIES,
-        )
-        arguments.update(overrides)
-        return update_common.reused_staged_release(self.directory, **arguments)
-
-    def test_the_plugin_resolves_as_a_scoped_package(self) -> None:
-        self.assertEqual(opencode2dsh.PACKAGE_NAME, "@opencode2dsh/dsh-plugin")
-        self.assertEqual(opencode2dsh.REQUIRED_PACKAGE_FILES, ("package.json", "lib/index.js"))
-
-    def test_a_tree_holding_the_resolved_release_is_reused(self) -> None:
-        self.stage_plugin()
-        self.assertTrue(self.reusable())
-
-    def test_a_different_release_is_not_reused(self) -> None:
-        self.stage_plugin(version="0.3.11")
-        self.assertFalse(self.reusable())
-
-    def test_a_missing_dependency_is_not_reused(self) -> None:
-        self.stage_plugin()
-        shutil.rmtree(self.directory / "node_modules" / opencode2dsh.REQUIRED_DEPENDENCY_DIRECTORIES[0])
-        self.assertFalse(self.reusable())
-
-    def test_the_dependency_specs_carry_the_declared_ranges(self) -> None:
-        specs = opencode2dsh._dependency_specs(
-            {"dependencies": {"undici": "^8.10.1", "yaml": "^2.9.0"}}
-        )
-        self.assertIn("undici@^8.10.1", specs)
-        self.assertIn("yaml@^2.9.0", specs)
-        # Every required dependency is named even when the manifest omits it,
-        # so the flatten step always finds the peers the worker imports.
-        for name in opencode2dsh.REQUIRED_DEPENDENCY_DIRECTORIES:
-            self.assertTrue(any(spec == name or spec.startswith(f"{name}@") for spec in specs), name)
-
-    def test_a_matching_tree_skips_the_installer(self) -> None:
-        self.stage_plugin()
-        calls: list[Path] = []
-
-        def fake_metadata(registry_url: str):
-            return self.VERSION, "https://registry.invalid/pkg.tgz", {"dist": {"integrity": self.INTEGRITY}}
-
-        with mock.patch.object(opencode2dsh, "_package_metadata", fake_metadata), \
-             mock.patch.object(opencode2dsh, "_find_executable", lambda name: "npm"), \
-             mock.patch.object(opencode2dsh, "_run_npm_install", lambda *a, **k: calls.append(self.directory)):
-            version = opencode2dsh.update(self.directory, registry_url="https://registry.invalid")
-
-        self.assertEqual(version, self.VERSION)
-        self.assertEqual(calls, [], "an unchanged tree must not be reinstalled")
+    def test_an_upstream_missing_its_protocol_fails_the_stage(self) -> None:
+        source = Path(tempfile.mkdtemp(prefix="young-router-ofm-incomplete-"))
+        self.addCleanup(shutil.rmtree, source, ignore_errors=True)
+        (source / "package.json").write_text("{}", encoding="utf-8")
+        with self.assertRaises(update_common.UpdateError):
+            opencode2dsh.update(
+                source.parent / "output",
+                source_url=f"file://{source}",
+            )
 
 
 if __name__ == "__main__":

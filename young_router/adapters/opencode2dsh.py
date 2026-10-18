@@ -1,75 +1,49 @@
-"""Python adapter for the bundled ``@opencode2dsh/dsh-plugin`` worker.
+"""Bridge the existing OpenCode provider to the bundled free-model plugin.
 
-OpenCode Zen's anonymous free lane is not reimplemented here.  The upstream
-project (https://github.com/FishBottle7/opencode2dsh, npm
-``@opencode2dsh/dsh-plugin``) owns the free-model catalog and its fallback
-chain, the CLI-identical request disguise, and the ``pi-ai`` wire layer that
-streams from Zen; ``scripts/update_opencode2dsh.py`` stages the published
-package on every artifact build.  This module owns only what the gateway needs
-around it:
+The upstream project (https://github.com/Ebony-Vinyl/dsh-our-free-model) owns
+the OpenCode-compatible request protocol, free-model routing, model metadata,
+and loopback server. Its public core exports are imported in place by
+``opencode2dsh_worker.mjs`` and ``scripts/update_opencode2dsh.py`` stages the
+verified upstream tree for every artifact build.
 
-* one long-lived Node worker per Core process, started on a loopback port with
-  an inbound bearer this process generates, supervised for as long as this Core
-  runs, and
-* the two environment references the managed LiteLLM child resolves
-  (``YOUNG_ROUTER_OPENCODE2DSH_BASE`` and the matching key) so no port or token
-  ever reaches ``config.yaml``.
-
-The lane needs no credential of the user's, so unlike a desktop-app account
-there is no sign-in to report: a worker that cannot reach Zen reports the
-upstream's own refusal in its catalog read, and the provider stays usable
-whenever the lane answers.
+This adapter owns only the Core-side process lifecycle and the two environment
+references the managed LiteLLM child resolves. The provider id remains
+``opencode2dsh`` so saved routes keep their identity.
 """
 
 from __future__ import annotations
 
-import copy
 import json
 import os
 from pathlib import Path
+import secrets
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 from typing import Any, Mapping
 
-from ..node_runtime import node_command as node_runtime_command
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from ..browser_identity import browser_request_headers
+from ..core.persistence import PersistenceError, read_json
+from ..node_runtime import node_command as node_runtime_command
+
 
 OPENCODE2DSH_PROVIDER = "opencode2dsh"
-
-#: The auth kind the configuration stores for this provider.  It names a lane
-#: that authenticates itself, so the kind exists to identify the integration
-#: rather than to carry a user credential.
+# The persisted auth-kind spelling keeps existing provider rows connected.
 OPENCODE2DSH_AUTH_KIND = "opencode2dsh_login"
 OPENCODE2DSH_AUTH_KINDS = (OPENCODE2DSH_AUTH_KIND,)
 AUTH_KIND_TO_PROVIDER = {OPENCODE2DSH_AUTH_KIND: OPENCODE2DSH_PROVIDER}
-PROVIDER_TO_AUTH_KIND = {value: key for key, value in AUTH_KIND_TO_PROVIDER.items()}
-# The lane's own catalog states each free model's context window, so a route on
-# it has an upstream-published window the same way a WorkBuddy account does.
-# Declaring the lane here is what lets Core remember those numbers instead of
-# naming this integration in its own rules.
+PROVIDER_TO_AUTH_KIND = {OPENCODE2DSH_PROVIDER: OPENCODE2DSH_AUTH_KIND}
 CATALOG_AUTH_KINDS = frozenset(OPENCODE2DSH_AUTH_KINDS)
 CATALOG_AUTH_KIND_TO_PROVIDER = dict(AUTH_KIND_TO_PROVIDER)
 
-# The lane this integration reaches is Zen's anonymous free tier, not Zen's
-# paid models: the same endpoint answers 401 AuthError for a paid id under the
-# anonymous credential.  The name states that, so a user never reads it as an
-# account for the paid catalog.
-OPENCODE2DSH_DISPLAY_NAME = "OpenCode Zen Free"
-
-# Variable names the managed proxy resolves.  They are process-local names,
-# never credentials: the token itself lives only in this Core process and in
-# the worker's command line.
+OPENCODE2DSH_DISPLAY_NAME = "dsh-our-free-model"
 API_BASE_ENV = {OPENCODE2DSH_PROVIDER: "YOUNG_ROUTER_OPENCODE2DSH_BASE"}
 API_KEY_ENV = {OPENCODE2DSH_PROVIDER: "YOUNG_ROUTER_OPENCODE2DSH_KEY"}
-# Provider key slot name shown in the provider editor.  The slot exists only
-# because LiteLLM requires a non-empty key for an OpenAI-compatible route; its
-# value is the loopback bearer above.
-API_KEY_NAME = "opencode-zen-free"
+API_KEY_NAME = "our-free-model-local"
 
 _OPENCODE2DSH_DIR_ENV = "YOUNG_ROUTER_OPENCODE2DSH_DIR"
 _OPENCODE2DSH_NODE_ENV = "YOUNG_ROUTER_OPENCODE2DSH_NODE"
@@ -77,29 +51,56 @@ _OPENCODE2DSH_WORKER_ENV = "YOUNG_ROUTER_OPENCODE2DSH_WORKER"
 _OPENCODE2DSH_START_TIMEOUT_SECONDS = 45.0
 _OPENCODE2DSH_STATUS_TIMEOUT_SECONDS = 30.0
 _OPENCODE2DSH_MODELS_TIMEOUT_SECONDS = 90.0
-# Two reads answer through this client, and both are asked for more often than
-# their upstream changes: the catalog churns about daily, and the provenance
-# line beside it moves only when a fetch succeeds or fails.  Caching them keeps
-# one opened model pane from paying a worker round trip (which reaches Zen and
-# models.dev) per model switch, while an explicit refresh still reaches
-# upstream.
-_OPENCODE2DSH_STATUS_TTL_SECONDS = 20.0
-_OPENCODE2DSH_MODELS_TTL_SECONDS = 120.0
-# A worker that served for at least this long died a casualty, not a defect:
-# it is replaced on the spot.  One that dies younger is restarted on the next
-# delay step instead, and one that keeps dying young is left to the demand path
-# (a pane read, the next proxy launch) after the steps run out.
-_OPENCODE2DSH_SETTLED_SECONDS = 60.0
-_OPENCODE2DSH_RESTART_DELAYS_SECONDS = (0.0, 0.5, 2.0, 5.0, 15.0)
+_SOURCE_STATE = "sourceDir"
 
 
 class OpenCode2DSHUnavailable(RuntimeError):
-    """The staged integration is missing or its worker cannot serve."""
+    """The staged free-model integration cannot serve."""
+
+
+class OpenCode2DSHCatalogUnavailable(OpenCode2DSHUnavailable):
+    """The worker answers, but the remote catalog cannot be read."""
+
+
+def _lock_file(handle: Any, *, wait: bool) -> bool:
+    """Lock one byte owned by the worker handoff handshake."""
+
+    try:
+        _lock_handle(handle, wait=wait)
+    except OSError:
+        return False
+    return True
+
+
+def _unlock_file(handle: Any) -> None:
+    _unlock_handle(handle)
+
+
+def _lock_handle(handle: Any, *, wait: bool) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK if wait else msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+
+
+def _unlock_handle(handle: Any) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 def staged_root() -> Path:
-    """Directory holding the staged upstream package and its dependencies."""
-
     configured = os.environ.get(_OPENCODE2DSH_DIR_ENV, "").strip()
     if configured:
         return Path(configured).expanduser()
@@ -121,524 +122,478 @@ def node_command() -> str:
     )
 
 
-# The loopback base URL and the bearer this Core owns.  They are published to
-# the process environment for the proxy child, and kept here as well so a
-# Core-side read (a probe, a catalog fetch) resolves exactly what the child
-# was launched with.
-_PUBLISHED_ENVIRONMENT: dict[str, str] = {}
+def upstream_environment() -> dict[str, str]:
+    """Point the upstream's explicitly configurable ESBuild install at its own."""
+
+    configured = os.environ.get("ESBUILD_BINARY_PATH", "").strip()
+    binary = (
+        Path(configured).expanduser()
+        if configured
+        else load_root() / "node_modules" / ".bin" / "esbuild"
+    )
+    if not binary.is_file():
+        return {}
+    return {"ESBUILD_BINARY_PATH": str(binary)}
+
+
+_PUBLISHED_LOCK = threading.Lock()
+_PUBLISHED: dict[str, str] = {}
 
 
 def published_environment() -> dict[str, str]:
-    """The environment fragment this deployment owns."""
-
-    return dict(_PUBLISHED_ENVIRONMENT)
+    with _PUBLISHED_LOCK:
+        return dict(_PUBLISHED)
 
 
 def _publish(values: Mapping[str, str]) -> None:
-    if not values:
-        return
-    _PUBLISHED_ENVIRONMENT.update(values)
-    os.environ.update(values)
+    with _PUBLISHED_LOCK:
+        _PUBLISHED.clear()
+        _PUBLISHED.update(values)
 
 
 def available() -> bool:
-    """Whether the staged package and its entry point are present."""
+    try:
+        if not worker_path().is_file():
+            return False
+        return (load_root() / "package.json").is_file()
+    except OSError:
+        return False
 
-    root = staged_root()
-    return (root / "package.json").is_file() and (root / "lib" / "index.js").is_file()
+
+def load_root() -> Path:
+    configured = os.environ.get(
+        "YOUNG_ROUTER_OUR_FREE_MODEL_SOURCE_DIR", ""
+    ).strip()
+    if configured:
+        return Path(configured).expanduser()
+    configured = os.environ.get(_OPENCODE2DSH_DIR_ENV, "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    adjacent = worker_path().parent / "opencode2dsh"
+    return adjacent if (adjacent / "package.json").is_file() else staged_root()
 
 
 def api_base_reference(provider: str) -> str:
-    """The provider base URL reference stored in ``config.yaml``."""
-
     return f"os.environ/{API_BASE_ENV[validated_provider(provider)]}"
 
 
 def api_key_reference(provider: str) -> str:
-    """The provider key reference stored in ``config.yaml``."""
-
     return f"os.environ/{API_KEY_ENV[validated_provider(provider)]}"
 
 
 def validated_provider(value: object) -> str:
-    provider = str(value or "").strip().lower()
+    provider = str(value or "").strip()
     if provider != OPENCODE2DSH_PROVIDER:
-        raise ValueError("Unknown OpenCode Zen provider")
+        raise ValueError("Unknown OpenCode provider")
     return provider
 
 
 def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.bind(("127.0.0.1", 0))
-        return int(probe.getsockname()[1])
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return int(listener.getsockname()[1])
+
+
+def _safe_problem(error: object) -> str:
+    """One line from a worker failure, without request bodies or headers."""
+
+    text = str(error or "").strip().splitlines()
+    return text[0][:800] if text else "dsh-our-free-model worker failed"
 
 
 class OpenCode2DSHRuntime:
-    """Own the OpenCode Zen worker process and answer its control requests."""
+    """Own one worker serving the upstream's free-model runtime."""
 
-    def __init__(self, runtime_root: Path | str | None = None) -> None:
-        base = Path(runtime_root).expanduser() if runtime_root else Path.home() / ".young-router"
-        self.root = base / ".litellm-runtime" / "opencode2dsh"
+    def __init__(
+        self,
+        runtime_root: Path | str | None = None,
+        *,
+        settings: Mapping[str, str] | None = None,
+    ) -> None:
+        base = Path(runtime_root) if runtime_root is not None else Path.home() / ".young-router"
+        self.root = base / ".litellm-runtime" / OPENCODE2DSH_PROVIDER
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.settings = dict(settings or {})
         self._lock = threading.RLock()
         self._process: subprocess.Popen[bytes] | None = None
-        # Set while this runtime wants no worker at all: a released runtime
-        # must not have one resurrected by the supervision of the worker it
-        # just stopped.
-        self._released = threading.Event()
-        self._restart_step = 0
-        self._started_at = 0.0
+        self._ready_pipe: Any | None = None
+        self._worker_lock: Any | None = None
         self._port = 0
+        self._gateway_port = 0
         self._token = ""
-        self._environment: dict[str, str] = {}
-        self._status_cache: tuple[float, dict[str, Any]] | None = None
-        self._models_cache: tuple[float, dict[str, Any]] | None = None
-        self._log_path = self.root / "worker.log"
-        self._state_path = self.root / "worker.json"
-        stored = self._read_state()
-        if stored:
-            self._port = stored
-        self._token = self._keyring_token()
-        if self._port and available():
-            self._environment = self._proxy_environment()
-            self._publish_environ_locked()
-
-    # -- state ------------------------------------------------------------
-
-    def _read_state(self) -> int:
-        """The loopback port a previous Core remembered, or 0."""
-
-        try:
-            document = json.loads(self._state_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return 0
-        if not isinstance(document, dict):
-            return 0
-        port = document.get("port")
-        return int(port) if type(port) is int and 0 < port <= 65535 else 0
-
-    def _keyring_path(self) -> Path:
-        return self.root / "worker.key"
-
-    def _keyring_token(self) -> str:
-        """The loopback bearer, remembered so a replacement Core resumes it.
-
-        The running proxy resolved this bearer from its own environment when it
-        launched and cannot learn another one, so a replacement Core has to
-        answer with the same value the worker it inherits was started with.
-        """
-
-        try:
-            token = self._keyring_path().read_text(encoding="utf-8").strip()
-        except OSError:
-            token = ""
-        if token:
-            return token
-        import secrets
-
-        token = secrets.token_urlsafe(32)
-        return token
-
-    def _persist_state(self) -> None:
-        """Remember the loopback address and bearer for a replacement Core."""
-
-        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self._keyring_path().write_text(self._token, encoding="utf-8")
-        try:
-            os.chmod(self._keyring_path(), 0o600)
-        except OSError:
-            pass
-        self._state_path.write_text(
-            json.dumps({"port": self._port, "token": self._token}), encoding="utf-8"
-        )
-
-    # -- worker lifecycle -------------------------------------------------
+        self._stopping = False
 
     def environment(self, *, autostart: bool = False) -> dict[str, str]:
-        """Return the proxy environment fragment for the running worker.
-
-        ``autostart`` starts the worker when it is not running: the managed
-        proxy needs those variables before it launches, while a snapshot read
-        must never spawn a process on its own.
-        """
-
         if autostart:
             self.ensure_started()
+        return self.environment_values()
+
+    def configure_environ(self) -> dict[str, str]:
+        return self.environment(autostart=False)
+
+    def autostart_if_configured(self) -> None:
+        """Start the worker only when a saved route already adopts this lane."""
+
+        if not self._gateway_port and not published_environment():
+            self.ensure_started()
+
+    def ensure_configured(self) -> bool:
+        """Confirm the loopback worker is running without reading the outer network."""
+
         with self._lock:
-            self._publish_environ_locked()
-            return dict(self._environment)
+            if self._process is None or self._process.poll() is not None:
+                raise OpenCode2DSHUnavailable("The dsh-our-free-model worker is not running")
+            self._request("/health", timeout=2.0, authenticated=False)
+            return True
 
     def ensure_started(self) -> bool:
-        """Start the worker when needed; return whether it is serving."""
-
-        if not available():
-            return False
         with self._lock:
-            if self._healthy():
+            if self._process is not None and self._process.poll() is None and self._healthy():
                 return True
-            # A worker asked for by name - a pane read, a probe, the next
-            # proxy launch - gets the full restart budget again: the steps
-            # below bound what supervision does on its own, never what the
-            # user's own read asks for.
-            self._restart_step = 0
-            started = self._start()
-            if started:
-                # Core-side probes and model-list reads resolve the same
-                # ``os.environ/`` references the proxy child does, so the
-                # fragment has to be visible to this process as well.
-                self.configure_environ()
-            return started
+            self._stopping = False
+            self._stop()
+            source_dir = str(self.settings.get(_SOURCE_STATE, "")).strip()
+            if source_dir:
+                os.environ["YOUNG_ROUTER_OUR_FREE_MODEL_SOURCE_DIR"] = source_dir
+            staged = load_root()
+            manifest = staged / "package.json"
+            if not manifest.is_file() or not worker_path().is_file():
+                raise OpenCode2DSHUnavailable(
+                    f"The bundled free-model integration is missing: {staged}"
+                )
+            port = _free_port()
+            token = secrets.token_urlsafe(32)
+            os.environ["YOUNG_ROUTER_OUR_FREE_MODEL_SOURCE_DIR"] = str(staged)
+            process = self._spawn(worker_path(), port, token, manifest)
+            self._process = process
+            self._port = 0
+            self._token = token
+            try:
+                self._wait_ready(process, port)
+            except Exception:
+                self._stop_process(process)
+                raise
+            self._publish_environ_locked()
+            return True
 
     def _healthy(self) -> bool:
-        if self._process is None or self._process.poll() is not None:
+        if not self._port:
             return False
-        return self._port > 0
-
-    def _start(self) -> bool:
-        remembered = self._port
-        self._stop_locked()
-        # A worker is wanted again: the release the teardown just signalled
-        # must not end this generation's supervision.
-        self._released.clear()
-        if not available():
+        try:
+            self._request("/health", timeout=2.0, authenticated=False)
+        except Exception:
             return False
-        node = node_command()
-        worker = worker_path()
-        if not worker.is_file():
-            raise OpenCode2DSHUnavailable(f"OpenCode Zen worker is missing: {worker}")
-        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        # The remembered port is a hint, not a promise: another process may
-        # hold it, in which case the worker is restarted on a fresh one and the
-        # new address is persisted for the next Core.
-        ready = self._spawn(node, worker, remembered)
-        if ready is None:
-            ready = self._spawn(node, worker, 0)
-        if ready is None:
-            # A start that produced no worker leaves the address a running
-            # proxy resolved exactly where it was.  Forgetting it would send
-            # the next attempt to a port nobody was told about - a live worker
-            # behind a proxy still calling a dead one, which is worse than the
-            # failure it replaced.
-            self._port = remembered
-            self._environment = self._proxy_environment() if remembered else {}
-            self._publish_environ_locked()
-            return False
-        self._port = int(ready.get("port") or 0)
-        self._environment = self._proxy_environment()
-        # A freshly started worker has its own catalog read ahead of it: what
-        # the previous worker answered describes a process that is gone.
-        self._status_cache = None
-        self._models_cache = None
-        self._started_at = time.monotonic()
-        self._persist_state()
-        self._publish_environ_locked()
-        self._watch_locked(self._process)
-        return self._port > 0
+        return True
 
-    def _watch_locked(self, process: subprocess.Popen[bytes] | None) -> None:
-        """Supervise one worker for as long as this runtime owns it."""
-
-        if process is None:
-            return
-        threading.Thread(
-            target=self._supervise,
-            args=(process,),
-            name="young-router-opencode2dsh-supervisor",
-            daemon=True,
-        ).start()
-
-    def _supervise(self, process: subprocess.Popen[bytes] | None) -> None:
-        """Replace a worker that exited without this runtime asking it to.
-
-        A worker that dies takes every OpenCode Zen route with it: the running
-        proxy resolved its loopback base URL from its own environment when it
-        launched and cannot learn another one.  One thread per worker blocks on
-        the process itself, so an idle runtime costs nothing and a death is
-        repaired on the remembered port the proxy is already calling.  The
-        delay steps bound a worker that keeps dying young - a broken
-        integration, not a casualty.
-        """
-
-        while True:
-            if process is not None:
-                process.wait()
-                with self._lock:
-                    if self._process is not process:
-                        return
-                    self._process = None
-                    self._stop_process(process)
-                    settled = time.monotonic() - self._started_at >= _OPENCODE2DSH_SETTLED_SECONDS
-            else:
-                settled = False
-            with self._lock:
-                if self._released.is_set():
-                    return
-                if settled:
-                    self._restart_step = 0
-                else:
-                    self._restart_step = min(
-                        self._restart_step + 1, len(_OPENCODE2DSH_RESTART_DELAYS_SECONDS)
-                    )
-                step = self._restart_step
-            if step >= len(_OPENCODE2DSH_RESTART_DELAYS_SECONDS):
-                return
-            delay = _OPENCODE2DSH_RESTART_DELAYS_SECONDS[step]
-            if delay and self._released.wait(delay):
-                return
-            with self._lock:
-                if self._released.is_set() or self._process is not None:
-                    return
-                try:
-                    started = self._start() and self._process is not None
-                except Exception:
-                    started = False
-                process = self._process if started else None
-
-    def _spawn(self, node: str, worker: Path, port: int) -> dict[str, Any] | None:
-        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        log = self._log_path.open("ab")
-        command = [
-            node,
+    def _spawn(
+        self,
+        worker: Path,
+        port: int,
+        token: str,
+        manifest: Path,
+    ) -> subprocess.Popen[bytes]:
+        args = [
+            node_command(),
             str(worker),
             "--port",
             str(port),
-            "--token",
-            self._token,
             "--root",
             str(self.root),
-            "--entry",
-            str(staged_root() / "lib" / "index.js"),
         ]
-        try:
-            process = subprocess.Popen(
-                command,
-                cwd=str(self.root),
-                env={**os.environ, "YOUNG_ROUTER_OPENCODE2DSH_ROOT": str(self.root)},
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=log,
-                # The worker stays in Core's process group: a Core that is
-                # replaced or killed takes its worker with it instead of
-                # leaving an orphan on the loopback port.
-                start_new_session=False,
-                close_fds=True,
+        for key, value in sorted(self.settings.items()):
+            args.extend(("--setting", f"{key}={value}"))
+        log_path = self.root / f"worker.{port}.log"
+        log_path.unlink(missing_ok=True)
+        handoff = tempfile.TemporaryFile(mode="w+", dir=self.root, prefix="handoff.", suffix=".lock")
+        _lock_file(handoff, wait=True)
+        handoff.seek(0)
+        handoff.truncate()
+        handoff.write(token)
+        handoff.flush()
+        os.fsync(handoff.fileno())
+        (self.root / "online.json").unlink(missing_ok=True)
+        worker_lock = tempfile.TemporaryFile(
+            mode="w+", dir=self.root, prefix="worker.", suffix=".lock"
+        )
+        _lock_handle(worker_lock, wait=False)
+        args.extend(
+            (
+                "--handoff",
+                str(handoff.fileno()),
+                "--lease",
+                str(worker_lock.fileno()),
+                "--entry",
+                str(manifest),
             )
-        except OSError as exc:
-            log.close()
-            raise OpenCode2DSHUnavailable(f"OpenCode Zen worker could not start: {exc}") from exc
-        ready = self._read_ready(process)
-        log.close()
-        if ready is None:
-            self._stop_process(process)
-            return None
-        self._process = process
-        return ready
+        )
+        with log_path.open("wb") as log:
+            try:
+                process = subprocess.Popen(
+                    args,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    env={
+                        **os.environ,
+                        **upstream_environment(),
+                        "YOUNG_ROUTER_OUR_FREE_MODEL_TOKEN": token,
+                        "YOUNG_ROUTER_OUR_FREE_MODEL_ROOT": str(self.root),
+                        "RUNNER_TEMP": str(self.root),
+                    },
+                    pass_fds=(handoff.fileno(), worker_lock.fileno()) if os.name != "nt" else (),
+                    start_new_session=os.name != "nt",
+                )
+            except OSError as exc:
+                _unlock_handle(worker_lock)
+                worker_lock.close()
+                _unlock_handle(handoff)
+                handoff.close()
+                raise OpenCode2DSHUnavailable(
+                    f"dsh-our-free-model worker could not start: {_safe_problem(exc)}"
+                ) from exc
+        self._ready_pipe = handoff
+        self._worker_lock = worker_lock
+        return process
 
-    def _read_ready(self, process: subprocess.Popen[bytes]) -> dict[str, Any] | None:
-        """Read the worker's one-line readiness record without blocking Core."""
-
-        if process.stdout is None:
-            return None
+    def _wait_ready(self, process: subprocess.Popen[bytes], port: int) -> None:
+        handoff = self._ready_pipe
+        if handoff is None:
+            raise OpenCode2DSHUnavailable("The dsh-our-free-model worker hand-off is unavailable")
         deadline = time.monotonic() + _OPENCODE2DSH_START_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
-            line = process.stdout.readline()
-            if line:
-                try:
-                    payload = json.loads(line.decode("utf-8", "replace"))
-                except json.JSONDecodeError:
-                    return None
-                return payload if payload.get("ready") is True else None
+            # The worker creates its lease while the handoff remains held.
+            worker_lock = self._worker_lock
+            if worker_lock is None:
+                raise OpenCode2DSHUnavailable("The dsh-our-free-model worker hand-off was lost")
+            _unlock_handle(handoff)
+            handoff.flush()
             if process.poll() is not None:
-                return None
-        return None
+                raise OpenCode2DSHUnavailable(self._worker_failure(process, port))
+            try:
+                _lock_handle(worker_lock, wait=False)
+            except OSError:
+                time.sleep(0.05)
+                continue
+            if not (self.root / "online.json").is_file():
+                _unlock_handle(worker_lock)
+                time.sleep(0.05)
+                continue
+            self._ready_handle = None
+            self._ready_pipe = None
+            self._worker_lock = None
+            break
+        else:
+            raise OpenCode2DSHUnavailable("The dsh-our-free-model worker did not start in time")
+        ready_path = self.root / "online.json"
+        if ready_path.stat().st_mode & 0o077:
+            raise OpenCode2DSHUnavailable("The dsh-our-free-model readiness file is not private")
+        ready = read_json(ready_path, default={})
+        try:
+            control_port = ready["controlPort"]
+            gateway_port = ready["gatewayPort"]
+            if type(control_port) is not int or type(gateway_port) is not int:
+                raise TypeError
+        except (KeyError, TypeError):
+            raise OpenCode2DSHUnavailable("The dsh-our-free-model readiness file is invalid") from None
+        self._port = control_port
+        self._gateway_port = gateway_port
+        handoff.close()
+
+    def _worker_failure(self, process: subprocess.Popen[bytes], port: int) -> str:
+        try:
+            text = (self.root / f"worker.{port}.log").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        last = next((line.strip() for line in reversed(text.splitlines()) if line.strip()), "")
+        return f"Exit {process.returncode}: {last}" if last else f"Exit {process.returncode}"
 
     def _proxy_environment(self) -> dict[str, str]:
-        base = f"http://127.0.0.1:{self._port}"
+        if not self._token:
+            return {}
+        try:
+            online = read_json(self.root / "online.json", default={})
+            gateway_port = int(online["gatewayPort"])
+        except (PersistenceError, KeyError, TypeError, ValueError):
+            gateway_port = self._gateway_port
+        if not gateway_port:
+            return {}
+        base = f"http://127.0.0.1:{gateway_port}"
         return {
             API_BASE_ENV[OPENCODE2DSH_PROVIDER]: f"{base}/v1",
             API_KEY_ENV[OPENCODE2DSH_PROVIDER]: self._token,
         }
 
-    def configure_environ(self) -> dict[str, str]:
-        """Publish the fragment process-locally for Core-side resolution."""
+    def environment_values(self) -> dict[str, str]:
+        with self._lock:
+            source_dir = str(self.settings.get(_SOURCE_STATE, "")).strip()
+            if source_dir:
+                os.environ["YOUNG_ROUTER_OUR_FREE_MODEL_SOURCE_DIR"] = source_dir
+            return self._proxy_environment() if self._gateway_port else {}
 
-        environment = self.environment()
-        _publish(environment)
-        return environment
+    def _publish_environ_locked(self) -> None:
+        values = self._proxy_environment()
+        _publish(values)
+        os.environ.update(values)
 
     def stop(self) -> None:
         with self._lock:
-            self._stop_locked()
-            self._restart_step = 0
+            self._stop()
+        _publish({})
+        for name in (*API_BASE_ENV.values(), *API_KEY_ENV.values()):
+            os.environ.pop(name, None)
 
-    def _stop_locked(self) -> None:
-        self._released.set()
-        process, self._process = self._process, None
+    def _stop(self) -> None:
+        process = self._process
+        self._stopping = True
+        self._process = None
         self._port = 0
-        self._environment = {}
-        self._status_cache = None
-        self._models_cache = None
-        for name in (API_BASE_ENV, API_KEY_ENV):
-            for variable in name.values():
-                os.environ.pop(variable, None)
-        if process is None:
-            return
+        self._gateway_port = 0
+        self._token = ""
+        if self._worker_lock is not None:
+            _unlock_handle(self._worker_lock)
+            self._worker_lock.close()
+            self._worker_lock = None
+        if self._ready_pipe is not None:
+            _unlock_handle(self._ready_pipe)
+            self._ready_pipe.close()
+            self._ready_pipe = None
         self._stop_process(process)
 
-    @staticmethod
-    def _stop_process(process: subprocess.Popen[bytes]) -> None:
-        try:
-            if process.poll() is None:
-                try:
-                    process.terminate()
-                except OSError:
-                    return
-                deadline = time.monotonic() + 5.0
-                while time.monotonic() < deadline and process.poll() is None:
-                    time.sleep(0.05)
-                if process.poll() is None:
-                    try:
-                        process.kill()
-                    except OSError:
-                        pass
-        finally:
-            if process.stdout is not None:
-                try:
-                    process.stdout.close()
-                except OSError:
-                    pass
-
-    # -- control surface --------------------------------------------------
-
-    def _request(self, path: str, *, timeout: float) -> dict[str, Any]:
-        if not self.ensure_started():
-            raise OpenCode2DSHUnavailable("The OpenCode Zen integration is unavailable")
-        url = f"http://127.0.0.1:{self._port}{path}"
-        # Loopback traffic owned by this process: it must not be reformatted by
-        # an ambient proxy, and it carries the shared browser identity rather
-        # than a self-naming client fingerprint.
-        request = Request(
-            url,
-            headers={**browser_request_headers(), "Authorization": f"Bearer {self._token}"},
-        )
-        try:
-            with urlopen(request, timeout=timeout) as response:  # noqa: S310 - fixed loopback URL
-                payload = response.read()
-        except (HTTPError, URLError, OSError, TimeoutError) as exc:
-            raise OpenCode2DSHUnavailable("The OpenCode Zen worker did not answer") from exc
-        try:
-            document = json.loads(payload.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise OpenCode2DSHUnavailable("The OpenCode Zen worker returned an invalid document") from exc
-        if not isinstance(document, dict):
-            raise OpenCode2DSHUnavailable("The OpenCode Zen worker returned an invalid document")
-        return document
+    def _stop_process(self, process: subprocess.Popen[bytes] | None) -> None:
+        self._stopping = True
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
 
     def status(self, *, refresh: bool = False) -> dict[str, Any]:
-        """Report the catalog provenance and roster size."""
-
-        now = time.monotonic()
-        if not refresh and self._status_cache is not None:
-            stamped, cached = self._status_cache
-            if now - stamped < _OPENCODE2DSH_STATUS_TTL_SECONDS:
-                return cached
-        if not available():
-            return {"available": False, "detail": "integration_unstaged", "providers": {}}
-        if not self.ensure_started():
-            return {"available": False, "detail": "worker_unavailable", "providers": {}}
-        document = self._request("/control/status", timeout=_OPENCODE2DSH_STATUS_TIMEOUT_SECONDS)
-        providers = {
-            OPENCODE2DSH_PROVIDER: {
-                "provider": OPENCODE2DSH_PROVIDER,
-                "state": "ready" if document.get("available") is True else "unavailable",
-                "detail": str(document.get("detail") or ""),
-                "modelCount": document.get("modelCount"),
+        document = self._request(
+            "/control/status",
+            timeout=_OPENCODE2DSH_STATUS_TIMEOUT_SECONDS,
+        )
+        return {
+            "providers": {
+                OPENCODE2DSH_PROVIDER: {
+                    "provider": OPENCODE2DSH_PROVIDER,
+                    "state": "ready" if document.get("ok") is True else "failed",
+                    **{
+                        key: document[key]
+                        for key in ("version", "laneState")
+                        if document.get(key) is not None
+                    },
+                }
             }
         }
-        result = {
-            "available": document.get("available") is True,
-            "detail": str(document.get("detail") or ""),
-            "providers": providers,
-        }
-        self._status_cache = (now, result)
-        if refresh:
-            # A refreshing status read re-reads the catalog upstream, so an
-            # answer remembered from before this call describes a roster the
-            # worker has already replaced.
-            self._models_cache = None
-        return result
-
-    def models(self, provider: str = OPENCODE2DSH_PROVIDER, *, refresh: bool = False) -> dict[str, Any]:
-        """Return the catalog, with the worker's own provenance.
-
-        The catalog answers the model pane and the account import, so it is
-        read far more often than it changes.  A fresh remembered answer is
-        returned as-is; an explicit ``refresh`` (the pane's 刷新 button, the
-        account import) always reaches upstream, and so does any read whose
-        remembered answer was a failure.
-        """
-
-        name = validated_provider(provider)
-        now = time.monotonic()
-        if not refresh and self._models_cache is not None:
-            stamped, cached = self._models_cache
-            if now - stamped < _OPENCODE2DSH_MODELS_TTL_SECONDS:
-                return copy.deepcopy(cached)
-        if not available():
-            return {"available": False, "detail": "integration_unstaged", "models": []}
-        document = self._request("/control/models", timeout=_OPENCODE2DSH_MODELS_TIMEOUT_SECONDS)
-        # A catalog read answers the provenance question too, so the status
-        # document it carries replaces the one the status cache holds.
-        self._status_cache = None
-        entries = [
-            item for item in (document.get("models") or []) if isinstance(item, dict)
-        ] if isinstance(document.get("models"), list) else []
-        result = {
-            "available": document.get("available") is True and bool(entries),
-            "detail": str(document.get("detail") or ""),
-            "source": str(document.get("source") or ""),
-            "models": entries,
-            "status": {
-                "provider": name,
-                "state": "ready" if document.get("available") is True else "unavailable",
-                "detail": str(document.get("detail") or ""),
-            },
-        }
-        # A read that ran before the worker reached Zen comes back available
-        # but empty; remembering that would blank the pane for the whole
-        # interval, so only a catalog that named a model is kept.
-        if result["models"]:
-            self._models_cache = (now, copy.deepcopy(result))
-        else:
-            self._models_cache = None
-        return result
 
     def provider_status(self, provider: str = OPENCODE2DSH_PROVIDER) -> dict[str, Any]:
-        document = self.status()
-        providers = document.get("providers")
-        if isinstance(providers, dict):
-            entry = providers.get(validated_provider(provider))
-            if isinstance(entry, dict):
-                return entry
-        return {}
+        validated_provider(provider)
+        return dict(self.status().get("providers", {}).get(provider, {}))
 
-    def environment_values(self) -> dict[str, str]:
-        """Current environment fragment without starting the worker."""
-
+    def models(
+        self,
+        provider: str = OPENCODE2DSH_PROVIDER,
+        *,
+        refresh: bool = False,
+    ) -> dict[str, Any]:
+        validated_provider(provider)
         with self._lock:
-            self._publish_environ_locked()
-            return dict(self._environment)
+            if self._process is None or self._process.poll() is not None:
+                self.ensure_started()
+        try:
+            document = self._request(
+                "/control/refresh" if refresh else "/control/models",
+                method="POST" if refresh else "GET",
+                body={"probe": False} if refresh else None,
+                timeout=_OPENCODE2DSH_MODELS_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            raise OpenCode2DSHCatalogUnavailable("The free-model catalog is unavailable") from exc
+        if refresh and not document.get("models"):
+            document = self._request(
+                "/control/models",
+                timeout=_OPENCODE2DSH_MODELS_TIMEOUT_SECONDS,
+            )
+        return {
+            "operation": "opencode2dsh_models",
+            "provider": provider,
+            "available": document.get("ok") is True,
+            "source": "dsh-our-free-model",
+            "models": list(document.get("models") or []),
+        }
 
-    def _publish_environ_locked(self) -> None:
-        """Expose the fragment to this process too, when it exists."""
-
-        _publish(self._environment)
+    def _request(
+        self,
+        path: str,
+        *,
+        port: int | None = None,
+        timeout: float,
+        authenticated: bool = True,
+        method: str = "GET",
+        body: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        with self._lock:
+            target_port = port or self._port
+            token = self._token
+        if not target_port:
+            raise OpenCode2DSHUnavailable("The dsh-our-free-model worker is not running")
+        headers = {"Accept": "application/json"}
+        if authenticated:
+            headers["Authorization"] = f"Bearer {token}"
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        request = Request(
+            f"http://127.0.0.1:{target_port}{path}",
+            data=data,
+            method=method,
+            headers=headers,
+        )
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                parsed = json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            raise OpenCode2DSHUnavailable(
+                f"The dsh-our-free-model worker answered HTTP {exc.code}"
+            ) from exc
+        except (URLError, OSError, UnicodeDecodeError, ValueError) as exc:
+            raise OpenCode2DSHUnavailable(_safe_problem(exc)) from exc
+        if not isinstance(parsed, dict):
+            raise OpenCode2DSHUnavailable("The dsh-our-free-model worker returned an invalid document")
+        return parsed
 
 
 def unsupported_status() -> dict[str, Any]:
-    """Status document used when the integration is not staged."""
+    return {
+        "providers": {
+            OPENCODE2DSH_PROVIDER: {
+                "provider": OPENCODE2DSH_PROVIDER,
+                "state": "missing",
+            }
+        }
+    }
 
-    return {"available": False, "detail": "integration_unstaged", "providers": {}}
 
-
-def script_available() -> bool:
-    return available() and worker_path().is_file()
+__all__ = [
+    "API_BASE_ENV",
+    "API_KEY_ENV",
+    "API_KEY_NAME",
+    "AUTH_KIND_TO_PROVIDER",
+    "CATALOG_AUTH_KINDS",
+    "CATALOG_AUTH_KIND_TO_PROVIDER",
+    "OPENCODE2DSH_AUTH_KIND",
+    "OPENCODE2DSH_AUTH_KINDS",
+    "OPENCODE2DSH_DISPLAY_NAME",
+    "OPENCODE2DSH_PROVIDER",
+    "OpenCode2DSHRuntime",
+    "OpenCode2DSHCatalogUnavailable",
+    "OpenCode2DSHUnavailable",
+    "api_base_reference",
+    "api_key_reference",
+    "available",
+    "node_command",
+    "published_environment",
+    "staged_root",
+    "unsupported_status",
+    "validated_provider",
+    "worker_path",
+]

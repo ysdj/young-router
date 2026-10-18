@@ -72,6 +72,7 @@ export type EditorDocument =
   | "dsh_desktop_settings"
   | "opencode_config"
   | "opencode_auth"
+  | "codex_agents"
   | "codex_model_catalog";
 
 /**
@@ -97,11 +98,13 @@ export interface ClientFile {
     | "dsh_settings"
     | "dsh_desktop_settings"
     | "opencode_config"
-    | "opencode_auth";
+    | "opencode_auth"
+    | "codex_agents"
+    | "codex_model_catalog";
   name: string;
   path: string;
   display_path: string;
-  language: "json" | "toml" | "yaml" | "text";
+  language: "json" | "jsonc" | "toml" | "yaml" | "text";
   exists: boolean;
   /**
    * View state of the editor sheet that owns this file: true while the sheet
@@ -393,6 +396,14 @@ export interface LogView extends LogSummary {
   reason?: string;
   /** Rows the relay reported beyond the page this view carries. */
   remaining?: number;
+  /** Matching rows the relay reported across every page. */
+  total?: number;
+  /** The page Core currently exposes, starting at 1. */
+  page?: number;
+  /** The number of pages available from rows already fetched. */
+  page_count?: number;
+  /** Whether this answer carried every row the current page requested. */
+  complete?: boolean;
 }
 
 export interface CoreSnapshot {
@@ -804,6 +815,7 @@ export interface NativeLeafAdapter {
    * left unanswered).
    */
   showConfirmation(options: { title: string; message: string; confirmLabel: string; cancelLabel?: string; destructive?: boolean }): Promise<boolean>;
+  textPrompt?(options: { title: string; value: string; confirmLabel: string; cancelLabel?: string }): Promise<string | null>;
   showReadOnlyText(options: { title: string; text: string; closeLabel: string; language: "json" | "toml" | "text"; html: string }): Promise<void>;
   /**
    * Show an official provider login through the platform-owned auth surface.

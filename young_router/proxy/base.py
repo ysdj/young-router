@@ -552,6 +552,11 @@ _UPSTREAM_URL_SURFACES = {
     _UPSTREAM_URL_SURFACE_ANTHROPIC,
 }
 _CURRENT_UPSTREAM_URL_SURFACE_KEY = "_young_router_upstream_url_surface"
+# Set on a deployment-call request when a Codex history carrying encrypted
+# reasoning is about to be replayed to a Chat-shaped surface.  The adapter
+# rewrites ``input`` into ``messages``, so the evidence is recorded before that
+# rewrite and read back when the answer is handed to the client.
+_RESTORED_REASONING_REPLAY_KEY = "_young_router_restored_reasoning_replay"
 _ATTEMPTED_UPSTREAM_URL_SURFACES_KEY = "_young_router_attempted_upstream_url_surfaces"
 _UPSTREAM_URL_SURFACE_DEPLOYMENT_ID_KEY = (
     "_young_router_upstream_url_surface_deployment_id"

@@ -30,6 +30,85 @@ _DEFAULT_MAX_RESULTS = 5
 _MAX_RESULTS = 20
 
 
+def _pi_web_access_tool_definitions() -> list[dict[str, Any]]:
+    """Return the public function tools sent to upstream models by the proxy."""
+    return [
+        {
+            "type": "function",
+            "name": "web_search",
+            "description": (
+                "Search the web using the configured pi-web-access providers. "
+                "Use query for one search or queries for several varied searches. "
+                "Returns source URLs and snippets; use fetch_content to read a "
+                "known result page."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Single search query."},
+                    "queries": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Multiple varied searches.",
+                    },
+                    "numResults": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20,
+                        "description": "Results per query (default 5, max 20).",
+                    },
+                    "includeContent": {"type": "boolean", "description": "Request full page content when supported."},
+                    "recencyFilter": {
+                        "type": "string",
+                        "enum": ["day", "week", "month", "year"],
+                        "description": "Optional recency filter.",
+                    },
+                    "domainFilter": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional domain allow/deny list.",
+                    },
+                    "provider": {
+                        "description": "Optional configured provider or provider list.",
+                        "oneOf": [
+                            {"type": "string"},
+                            {"type": "array", "items": {"type": "string"}},
+                        ],
+                    },
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "type": "function",
+            "name": "fetch_content",
+            "description": (
+                "Fetch a known URL and extract readable content as markdown. "
+                "Use this after web_search when the snippets are insufficient."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "Single URL to fetch."},
+                    "urls": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Multiple URLs to fetch.",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["readable"],
+                        "description": "Extract readable page content as markdown.",
+                    },
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+        },
+    ]
+
+
 def _external_web_search_int_env(
     name: str,
     default: int,
@@ -160,7 +239,12 @@ def _clean_urls(value: Any) -> list[str]:
     return urls
 
 
-def _pi_web_access_search_sync(query: str, *, page: int = 1) -> tuple[str, Any]:
+def _pi_web_access_search_sync(
+    query: str,
+    *,
+    page: int = 1,
+    options: dict[str, Any] | None = None,
+) -> tuple[str, Any]:
     if not isinstance(page, int) or page < 1:
         raise ValueError("search page must be a positive integer")
     max_results = _external_web_search_int_env(
@@ -176,7 +260,7 @@ def _pi_web_access_search_sync(query: str, *, page: int = 1) -> tuple[str, Any]:
         60.0,
     )
     response = _worker_request(
-        {"action": "search", "query": query, "page": page},
+        {"action": "search", "query": query, "page": page, **(options or {})},
         timeout_seconds=timeout,
         max_results=max_results,
     )
@@ -217,4 +301,5 @@ __all__ = [
     "_external_web_search_int_env",
     "_pi_web_access_page_excerpt",
     "_pi_web_access_search_sync",
+    "_pi_web_access_tool_definitions",
 ]

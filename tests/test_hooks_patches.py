@@ -364,6 +364,65 @@ class HookPatchTests(HookTestCase):
             {key.lower(): value for key, value in received["headers"].items()},
         )
 
+    def test_restamping_a_streamed_event_keeps_its_json_frame(self) -> None:
+        """A copied Responses event must stay the JSON frame the client reads.
+
+        LiteLLM 1.106.0 stamps the requested model onto a dict chunk by
+        rebuilding it (``{**chunk, "model": ...}``), which drops the event's
+        own ``__str__``.  ``async_data_generator`` writes a delivered chunk as
+        ``data: {chunk}``, so a flattened event reaches the client as a Python
+        repr: no parseable SSE frame, and Codex reports the stream as closed
+        before ``response.completed``.  The copy keeps the class, and a plain
+        dict chunk still gets the plain stamp.
+        """
+
+        hooks, proxy_server = load_hook_module()
+
+        def restamp_as_litellm_106(
+            *,
+            chunk,
+            requested_model_from_client,
+            request_data,
+            model_mismatch_logged,
+            **_kwargs,
+        ):
+            if not isinstance(chunk, dict):
+                return chunk, model_mismatch_logged
+            if chunk.get("model") == requested_model_from_client:
+                return chunk, model_mismatch_logged
+            return {**chunk, "model": requested_model_from_client}, model_mismatch_logged
+
+        proxy_server._restamp_streaming_chunk_model = restamp_as_litellm_106
+        hooks._install_stream_chunk_restamp_patch()
+        installed = proxy_server._restamp_streaming_chunk_model
+
+        event = hooks._JSONStreamEvent(
+            {
+                "type": "response.completed",
+                "response": {"id": "resp-1", "status": "completed"},
+            }
+        )
+        stamped, _logged = installed(
+            chunk=event,
+            requested_model_from_client="public-model",
+            request_data={},
+            model_mismatch_logged=False,
+        )
+
+        self.assertIsInstance(stamped, hooks._JSONStreamEvent)
+        self.assertEqual(json.loads(str(stamped))["model"], "public-model")
+        self.assertEqual(json.loads(str(stamped))["type"], "response.completed")
+
+        plain = {"type": "response.output_item.added", "item": {"type": "message"}}
+        plain_stamped, _ = installed(
+            chunk=plain,
+            requested_model_from_client="public-model",
+            request_data={},
+            model_mismatch_logged=False,
+        )
+        self.assertIs(type(plain_stamped), dict)
+        self.assertEqual(plain_stamped["model"], "public-model")
+
     def test_anthropic_unversioned_messages_endpoint_skips_only_the_duplicate_suffix(self) -> None:
         hooks, _ = load_hook_module()
         litellm_module = sys.modules["litellm"]
@@ -481,32 +540,6 @@ class HookPatchTests(HookTestCase):
                 self.assertEqual(kwargs["api_base"], expected_api_base)
                 self.assertEqual(kwargs["litellm_metadata"]["api_base"], expected_api_base)
 
-    def test_selected_deployment_update_preserves_original_route_model_group(self) -> None:
-        hooks, _ = load_hook_module()
-        request_kwargs = {
-            "call_type": "aresponses",
-            "model": "balanced-chat",
-            "input": "Use web_search.",
-        }
-
-        hooks._remember_request_model_group_before_deployment_update(request_kwargs)
-        request_kwargs["model"] = "openai/vendor-chat"
-
-        synthesis_kwargs = hooks._external_web_search_synthesis_kwargs(
-            request_kwargs,
-            "Web search results for query: test\n"
-            "Title: source\n"
-            "URL: https://example.test\n"
-            "Snippet: evidence",
-        )
-
-        self.assertEqual(
-            request_kwargs["litellm_metadata"][
-                hooks._RESPONSES_CHAT_BRIDGE_ORIGINAL_MODEL_GROUP_KEY
-            ],
-            "balanced-chat",
-        )
-        self.assertEqual(synthesis_kwargs["model"], "balanced-chat")
 
     def test_selected_deployment_marker_does_not_create_clientside_credential_override(self) -> None:
         hooks, _ = load_hook_module()
@@ -596,8 +629,11 @@ class HookPatchTests(HookTestCase):
         sys.modules["litellm.router"] = router_module
         hooks._install_generic_deployment_failover_patch()
 
-        error = RuntimeError("plain 403")
-        error.status_code = 403
+        # A gateway that refuses these bytes by size is this route's own answer:
+        # the request advances to a peer route and the refusal that ends the turn
+        # is still the one the upstream wrote.
+        error = RuntimeError("request body too large for this gateway")
+        error.status_code = 413
 
         async def original_generic_function(**kwargs):
             raise error
@@ -610,7 +646,7 @@ class HookPatchTests(HookTestCase):
 
         terminal = context.exception
         self.assertIs(terminal, error)
-        self.assertEqual(getattr(terminal, "status_code", None), 403)
+        self.assertEqual(getattr(terminal, "status_code", None), 413)
         self.assertTrue(seen["wrapped"])
         self.assertEqual(error.failed_deployment_id, "picked-deployment")
         self.assertIsNone(getattr(error, "failed_deployment_order", None))

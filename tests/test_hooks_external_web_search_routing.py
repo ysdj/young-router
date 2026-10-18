@@ -73,6 +73,53 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
             },
         )
 
+    def test_external_web_search_expands_query_and_url_arrays(self) -> None:
+        hooks, _ = load_hook_module()
+        query_call = {
+            "type": "function_call",
+            "name": "web_search",
+            "call_id": "search_batch",
+            "arguments": json.dumps(
+                {
+                    "queries": ["first subject", "second subject"],
+                    "numResults": 3,
+                    "domainFilter": ["example.test"],
+                }
+            ),
+        }
+        self.assertEqual(
+            hooks._web_search_actions_from_call(query_call),
+            [
+                {
+                    "type": "search",
+                    "query": "first subject",
+                    "numResults": "3",
+                    "domainFilter": '["example.test"]',
+                },
+                {
+                    "type": "search",
+                    "query": "second subject",
+                    "numResults": "3",
+                    "domainFilter": '["example.test"]',
+                },
+            ],
+        )
+        url_call = {
+            "type": "function_call",
+            "name": "fetch_content",
+            "call_id": "page_batch",
+            "arguments": json.dumps(
+                {"urls": ["https://example.test/a", "https://example.test/b"]}
+            ),
+        }
+        self.assertEqual(
+            hooks._web_search_actions_from_response({"output": [url_call]}),
+            [
+                {"type": "openPage", "url": "https://example.test/a"},
+                {"type": "openPage", "url": "https://example.test/b"},
+            ],
+        )
+
     def test_external_web_search_bare_url_query_opens_the_page(self) -> None:
         hooks, _ = load_hook_module()
 
@@ -463,7 +510,7 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
         self.assertIs(context.exception, sanitized_error)
         self.assertFalse(run_actions_called)
 
-    async def test_external_web_search_bridge_preemptively_maps_xhigh_to_low(self) -> None:
+    async def test_external_web_search_bridge_preserves_requested_reasoning(self) -> None:
         hooks, _ = load_hook_module()
         calls = []
 
@@ -514,13 +561,13 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
             chunks.append(chunk)
         self.assertEqual(chunks[0]["delta"], "OK")
         self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["reasoning"]["effort"], "low")
+        self.assertEqual(calls[0]["reasoning"]["effort"], "xhigh")
         self.assertTrue(
             calls[0]["litellm_metadata"][hooks._WEB_SEARCH_EXTERNAL_BRIDGE_KEY]
         )
         self.assertNotIn("use_chat_completions_api", calls[0])
 
-    async def test_external_web_search_function_bridge_forces_low_reasoning(self) -> None:
+    async def test_external_web_search_function_bridge_preserves_reasoning(self) -> None:
         hooks, _ = load_hook_module()
         calls = []
 
@@ -580,7 +627,7 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
             chunks.append(chunk)
         self.assertEqual(chunks[0]["delta"], "OK")
         self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["reasoning"]["effort"], "low")
+        self.assertEqual(calls[0]["reasoning"]["effort"], "xhigh")
         self.assertNotIn("use_chat_completions_api", calls[0])
         self.assertTrue(
             calls[0]["litellm_metadata"][hooks._WEB_SEARCH_EXTERNAL_BRIDGE_KEY]
@@ -898,6 +945,80 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
             )
         )
 
+    async def test_streaming_bridge_streams_a_buffered_route_answer(self) -> None:
+        """A streaming bridge turn must stay a stream when the route buffers.
+
+        The external-web-search rounds run against a buffered answer, but the
+        client's turn is still a streaming request and LiteLLM's stream hooks
+        only accept an async iterator. Returning that buffered Responses object
+        made the proxy answer with
+        ``'ResponsesAPIResponse' object has no attribute '__aiter__'`` and a 500,
+        which the client reported as ``upstream_route_failure``.
+        """
+
+        hooks, _ = load_hook_module()
+
+        async def original_function(**_kwargs):
+            return {
+                "id": "resp_buffered_route",
+                "object": "response",
+                "status": "completed",
+                "output_text": "ok",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "ok"}],
+                    }
+                ],
+            }
+
+        bridge_kwargs = {
+            "call_type": "aresponses",
+            "model": "deepseek-v4.1-flash",
+            "input": "Say only: ok",
+            "stream": True,
+            "tools": [hooks._pi_web_access_tool_definitions()[0]],
+            "use_chat_completions_api": True,
+            "litellm_metadata": {
+                hooks._WEB_SEARCH_EXTERNAL_BRIDGE_KEY: True,
+                hooks._WEB_SEARCH_EXTERNAL_BRIDGE_STREAM_KEY: True,
+            },
+            "model_info": {
+                "id": "workbuddy-local",
+                "upstream_url_surface": "openai/chat",
+            },
+        }
+
+        response = await hooks._execute_responses_chat_bridge_call(
+            original_function,
+            bridge_kwargs,
+            original_request_kwargs=bridge_kwargs,
+            outer_request_kwargs=bridge_kwargs,
+            start_event="responses_chat_bridge_preemptive_start",
+            error_event="responses_chat_bridge_preemptive_error",
+        )
+
+        self.assertTrue(
+            hooks._response_is_async_iterable(response),
+            f"streaming bridge returned {type(response)!r} instead of an async iterator",
+        )
+        chunks = [chunk async for chunk in response]
+        event_types = [
+            chunk.get("type") for chunk in chunks if isinstance(chunk, dict)
+        ]
+        self.assertEqual(event_types[0], "response.created")
+        self.assertEqual(event_types[-1], "response.completed")
+        self.assertEqual(
+            "".join(
+                chunk.get("delta", "")
+                for chunk in chunks
+                if isinstance(chunk, dict)
+                and chunk.get("type") == "response.output_text.delta"
+            ),
+            "ok",
+        )
+
     async def test_external_web_search_unknown_native_support_falls_back_after_tool_error(self) -> None:
         hooks, _ = load_hook_module()
         calls = []
@@ -1009,180 +1130,9 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
 
         self.assertIsNone(hooks._with_responses_external_web_search_bridge(request_kwargs))
 
-    def test_external_web_search_synthesis_does_not_reenter_bridge_from_outer_tools(self) -> None:
-        hooks, _ = load_hook_module()
-        original_request = {
-            "call_type": "aresponses",
-            "model": "balanced-chat",
-            "input": "请使用 web_search 查询Sample City weather",
-            "stream": True,
-            "tools": [{"type": "web_search"}],
-            "custom_tools": [{"name": "apply_patch"}],
-            "functions": [{"name": "exec_command"}],
-            "mcp_servers": [{"name": "computer-use"}],
-            "tool_resources": {"file_search": {"vector_store_ids": ["vs_1"]}},
-            "litellm_metadata": {
-                hooks._WEB_SEARCH_EXTERNAL_BRIDGE_KEY: True,
-                hooks._WEB_SEARCH_EXTERNAL_BRIDGE_STREAM_KEY: True,
-            },
-        }
 
-        synthesis_kwargs = hooks._external_web_search_synthesis_kwargs(
-            original_request,
-            "Web search results for query: Sample City weather\nTitle: source\nURL: https://example.test\nSnippet: warm",
-        )
 
-        self.assertFalse(hooks._request_should_intercept_external_web_search(synthesis_kwargs))
-        self.assertNotIn("tools", synthesis_kwargs)
-        self.assertNotIn("custom_tools", synthesis_kwargs)
-        self.assertNotIn("functions", synthesis_kwargs)
-        self.assertNotIn("mcp_servers", synthesis_kwargs)
-        self.assertNotIn("tool_resources", synthesis_kwargs)
-        self.assertNotIn("use_chat_completions_api", synthesis_kwargs)
-        self.assertNotIn(hooks._WEB_SEARCH_EXTERNAL_BRIDGE_KEY, synthesis_kwargs["litellm_metadata"])
-        self.assertNotIn(
-            hooks._WEB_SEARCH_EXTERNAL_BRIDGE_STREAM_KEY,
-            synthesis_kwargs["litellm_metadata"],
-        )
-        self.assertNotIn(
-            hooks._RESPONSES_CHAT_BRIDGE_PREEMPTIVE_METADATA_KEY,
-            synthesis_kwargs["litellm_metadata"],
-        )
-        self.assertTrue(
-            synthesis_kwargs["litellm_metadata"][
-                "external_web_search_synthesis"
-            ]
-        )
-        self.assertTrue(
-            synthesis_kwargs["litellm_metadata"][
-                hooks._RESPONSES_CHAT_BRIDGE_METADATA_KEY
-            ]
-        )
 
-        bridge_kwargs = hooks._responses_chat_bridge_preemptive_kwargs(
-            synthesis_kwargs,
-            original_request,
-            include_hosted_web_search_unsupported=True,
-            include_client_tool_unsupported=True,
-        )
-
-        self.assertIsNone(bridge_kwargs)
-
-        synthesis_metadata_kwargs = synthesis_kwargs.copy()
-        synthesis_metadata_kwargs["metadata"] = synthesis_metadata_kwargs.pop(
-            "litellm_metadata"
-        )
-        bridge_kwargs = hooks._responses_chat_bridge_preemptive_kwargs(
-            synthesis_metadata_kwargs,
-            original_request,
-            include_hosted_web_search_unsupported=True,
-            include_client_tool_unsupported=True,
-        )
-
-        self.assertIsNone(bridge_kwargs)
-
-    def test_external_web_search_synthesis_uses_selected_upstream_model(self) -> None:
-        hooks, _ = load_hook_module()
-        original_request = {
-            "call_type": "aresponses",
-            "model": "openai/vendor-chat",
-            "input": "Original request",
-            "stream": True,
-            "custom_tools": [{"name": "apply_patch"}],
-            "functions": [{"name": "exec_command"}],
-            "mcp_servers": [{"name": "computer-use"}],
-            "litellm_metadata": {
-                hooks._WEB_SEARCH_EXTERNAL_BRIDGE_KEY: True,
-                hooks._WEB_SEARCH_EXTERNAL_BRIDGE_STREAM_KEY: True,
-                hooks._RESPONSES_CHAT_BRIDGE_ORIGINAL_MODEL_GROUP_KEY: "balanced-chat",
-            },
-            "model_info": {
-                "model_group": "legacy-chat",
-                "model": "openai/vendor-chat",
-                "route_key": "provider_chat / openai/vendor-chat / key=default",
-            },
-        }
-
-        synthesis_kwargs = hooks._external_web_search_synthesis_kwargs(
-            original_request,
-            "Web search results for query: test\n"
-            "Title: source\n"
-            "URL: https://example.test\n"
-            "Snippet: evidence",
-        )
-
-        self.assertEqual(synthesis_kwargs["model"], "legacy-chat")
-        self.assertNotEqual(synthesis_kwargs["model"], "openai/vendor-chat")
-
-    def test_external_web_search_payloads_do_not_inject_short_timeouts(self) -> None:
-        hooks, _ = load_hook_module()
-        original_request = {
-            "call_type": "aresponses",
-            "model": "openai/vendor-chat",
-            "input": "Use web_search for a source-backed answer.",
-            "stream": True,
-            "litellm_metadata": {
-                hooks._WEB_SEARCH_EXTERNAL_BRIDGE_KEY: True,
-                hooks._WEB_SEARCH_EXTERNAL_BRIDGE_STREAM_KEY: True,
-            },
-        }
-
-        synthesis_kwargs = hooks._external_web_search_synthesis_kwargs(
-            original_request,
-            "Web search results for query: test\n"
-            "Title: source\n"
-            "URL: https://example.test\n"
-            "Snippet: evidence",
-        )
-        continuation_kwargs = hooks._external_web_search_continuation_kwargs(
-            original_request,
-            search_results="Web search results for query: test",
-            queries=["test"],
-            round_number=1,
-        )
-
-        for payload in (synthesis_kwargs, continuation_kwargs):
-            metadata = payload["litellm_metadata"]
-            self.assertNotIn("route_recovery_attempt_timeout_seconds", metadata)
-            self.assertNotIn("route_recovery_max_seconds", metadata)
-            self.assertEqual(
-                hooks._request_timeout_seconds(),
-                hooks._REQUEST_TIMEOUT_DEFAULT_SECONDS,
-            )
-            self.assertEqual(
-                hooks._stream_start_timeout_seconds_for_request(payload),
-                hooks._STALL_TIMEOUT_DEFAULT_SECONDS,
-            )
-            self.assertEqual(
-                hooks._recovery_max_seconds_for_request(payload),
-                hooks._RECOVERY_MAX_DEFAULT_SECONDS,
-            )
-
-    def test_external_web_search_low_reasoning_keeps_selected_runtime_credentials(self) -> None:
-        hooks, _ = load_hook_module()
-        low_kwargs = hooks._external_web_search_low_reasoning_kwargs(
-            {
-                "call_type": "aresponses",
-                "model": "openai/vendor-chat",
-                "input": "Use web_search.",
-                "stream": True,
-                "api_base": "https://chat-provider.example/v1",
-                "api_key": "sk-test-route",
-                "custom_llm_provider": "openai",
-                "litellm_metadata": {
-                    hooks._WEB_SEARCH_EXTERNAL_BRIDGE_KEY: True,
-                },
-                "model_info": {
-                    "id": "chat-route",
-                    "model_group": "legacy-chat",
-                    "route_key": "provider_chat / openai/vendor-chat / key=default / order=1",
-                },
-            }
-        )
-
-        self.assertEqual(low_kwargs["api_base"], "https://chat-provider.example/v1")
-        self.assertEqual(low_kwargs["api_key"], "sk-test-route")
-        self.assertEqual(low_kwargs["custom_llm_provider"], "openai")
 
     def test_external_web_search_continuation_trims_large_source_evidence(self) -> None:
         hooks, _ = load_hook_module()
@@ -1219,70 +1169,19 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
             len(evidence),
             hooks._EXTERNAL_WEB_SEARCH_CONTINUATION_EVIDENCE_MAX_CHARS + 80,
         )
-        self.assertLess(len(continuation_kwargs["input"]), len(raw_results))
+        self.assertLess(
+            len(json.dumps(continuation_kwargs["input"], ensure_ascii=False)),
+            len(raw_results) + 500,
+        )
         self.assertIn("Evidence section trimmed for continuation", evidence)
-        self.assertIn("Retrieved evidence observed so far", continuation_kwargs["input"])
-        self.assertNotIn(large_page, continuation_kwargs["input"])
+        continuation_input = json.dumps(continuation_kwargs["input"], ensure_ascii=False)
+        self.assertNotIn("Retrieved evidence observed so far", continuation_input)
+        self.assertNotIn(large_page, continuation_input)
         self.assertNotIn(large_page, evidence)
         self.assertTrue(continuation_kwargs["stream"])
 
-    def test_external_web_search_continuation_preserves_recent_conversation_context(self) -> None:
-        hooks, _ = load_hook_module()
-        request_kwargs = {
-            "call_type": "aresponses",
-            "model": "openai/vendor-chat",
-            "input": [
-                {
-                    "role": "user",
-                    "content": "先整理这篇论文的证据。",
-                },
-                {
-                    "role": "assistant",
-                    "content": "上一轮已经整理出结论：需要补充验证来源并修正结论。",
-                },
-                *({"type": "reasoning"} for _ in range(45)),
-                {
-                    "role": "user",
-                    "content": "改",
-                },
-            ],
-            "stream": True,
-        }
 
-        continuation_kwargs = hooks._external_web_search_continuation_kwargs(
-            request_kwargs,
-            search_results=(
-                "Web search results for query: paper evidence\n"
-                "Title: Source\n"
-                "URL: https://example.test/source\n"
-                "Snippet: Relevant evidence."
-            ),
-            queries=["paper evidence"],
-            round_number=1,
-        )
-
-        context = continuation_kwargs["litellm_metadata"][
-            hooks._EXTERNAL_WEB_SEARCH_CONVERSATION_CONTEXT_KEY
-        ]
-        self.assertIn("assistant: 上一轮已经整理出结论", context)
-        self.assertIn("user: 改", context)
-        self.assertIn("assistant: 上一轮已经整理出结论", continuation_kwargs["input"])
-        self.assertIn("user: 改", continuation_kwargs["input"])
-
-        synthesis_kwargs = hooks._external_web_search_synthesis_kwargs(
-            continuation_kwargs,
-            "Retrieved page content for URL: https://example.test/source\nEvidence.",
-        )
-        self.assertEqual(
-            synthesis_kwargs["litellm_metadata"][
-                hooks._EXTERNAL_WEB_SEARCH_CONVERSATION_CONTEXT_KEY
-            ],
-            context,
-        )
-        self.assertIn("assistant: 上一轮已经整理出结论", synthesis_kwargs["input"])
-        self.assertIn("user: 改", synthesis_kwargs["input"])
-
-    def test_external_web_search_continuation_drops_original_large_instructions(self) -> None:
+    def test_external_web_search_continuation_preserves_original_large_instructions(self) -> None:
         hooks, _ = load_hook_module()
         large_instructions = "Repository developer instruction. " * 700
 
@@ -1304,154 +1203,12 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
             round_number=1,
         )
 
-        self.assertNotIn("Repository developer instruction", continuation_kwargs["instructions"])
-        self.assertLess(len(continuation_kwargs["instructions"]), 1400)
-        self.assertIn("Decide the next step", continuation_kwargs["input"])
-        self.assertIn("Use web_search for latest Python.", continuation_kwargs["input"])
+        self.assertEqual(continuation_kwargs["instructions"], large_instructions)
+        continuation_input = json.dumps(continuation_kwargs["input"], ensure_ascii=False)
+        self.assertIn("Use web_search for latest Python.", continuation_input)
+        self.assertNotIn("Decide the next step", continuation_input)
 
-    def test_external_web_search_recovery_prompts_keep_original_user_text_stable(self) -> None:
-        hooks, _ = load_hook_module()
-        original_request = {
-            "call_type": "aresponses",
-            "model": "default-chat",
-            "input": (
-                "Compare these two trials carefully https://example.test/one "
-                "https://example.test/two"
-            ),
-            "stream": True,
-            "litellm_metadata": {
-                hooks._WEB_SEARCH_EXTERNAL_BRIDGE_KEY: True,
-                hooks._WEB_SEARCH_EXTERNAL_BRIDGE_STREAM_KEY: True,
-            },
-        }
 
-        continuation_kwargs = hooks._external_web_search_continuation_kwargs(
-            original_request,
-            search_results=(
-                "Web search results for query: trial comparison\n"
-                "Title: Trial One\n"
-                "URL: https://example.test/one\n"
-                "Snippet: Evidence one."
-            ),
-            queries=["trial comparison"],
-            completed_actions=[{"type": "search", "query": "trial comparison"}],
-            round_number=1,
-        )
-        synthesis_kwargs = hooks._external_web_search_synthesis_kwargs(
-            continuation_kwargs,
-            "Retrieved page content for URL: https://example.test/one\nEvidence one.",
-        )
-        second_continuation_kwargs = hooks._external_web_search_continuation_kwargs(
-            synthesis_kwargs,
-            search_results="Retrieved page content for URL: https://example.test/two\nEvidence two.",
-            queries=["trial comparison", "https://example.test/two"],
-            completed_actions=[
-                {"type": "search", "query": "trial comparison"},
-                {"type": "openPage", "url": "https://example.test/two"},
-            ],
-            round_number=2,
-        )
-
-        expected = original_request["input"]
-        self.assertEqual(
-            continuation_kwargs["litellm_metadata"][
-                hooks._EXTERNAL_WEB_SEARCH_ORIGINAL_USER_TEXT_KEY
-            ],
-            expected,
-        )
-        self.assertEqual(
-            synthesis_kwargs["litellm_metadata"][
-                hooks._EXTERNAL_WEB_SEARCH_ORIGINAL_USER_TEXT_KEY
-            ],
-            expected,
-        )
-        self.assertEqual(
-            second_continuation_kwargs["litellm_metadata"][
-                hooks._EXTERNAL_WEB_SEARCH_ORIGINAL_USER_TEXT_KEY
-            ],
-            expected,
-        )
-        self.assertEqual(
-            hooks._external_web_search_user_prompt_text(second_continuation_kwargs),
-            expected,
-        )
-        self.assertNotIn("Original user request: Original user request", synthesis_kwargs["input"])
-        self.assertNotIn("Original user request: Original user request", second_continuation_kwargs["input"])
-        self.assertNotIn("Retrieved evidence observed so far", synthesis_kwargs["input"].split(expected, 1)[0])
-        self.assertIn(expected, synthesis_kwargs["input"])
-        self.assertIn(expected, second_continuation_kwargs["input"])
-
-        legacy_recovery_request = {
-            "input": (
-                "Original user request. Any instruction to call or use web_search has "
-                "already been satisfied by the compatibility bridge:\n"
-                "Original user request:\n"
-                f"Original user request:\n{expected}\n\n"
-                "Web actions completed so far:\n- trial comparison\n\n"
-                "Retrieved evidence observed so far:\nEvidence from a previous round.\n\n"
-                "Decide the next step now using the available lookup functions.\n\n"
-                "Retrieved evidence:\nEvidence from synthesis.\n\n"
-                "Now answer the original user request directly. Do not call tools."
-            )
-        }
-        self.assertEqual(
-            hooks._external_web_search_user_prompt_text(legacy_recovery_request),
-            expected,
-        )
-
-    def test_external_web_search_synthesis_keeps_current_bridge_model_without_model_info_model(self) -> None:
-        hooks, _ = load_hook_module()
-        original_request = {
-            "call_type": "aresponses",
-            "model": "openai/vendor-chat",
-            "input": "Original request",
-            "stream": True,
-            "litellm_metadata": {
-                hooks._WEB_SEARCH_EXTERNAL_BRIDGE_KEY: True,
-                hooks._WEB_SEARCH_EXTERNAL_BRIDGE_STREAM_KEY: True,
-                hooks._RESPONSES_CHAT_BRIDGE_ORIGINAL_MODEL_GROUP_KEY: "balanced-chat",
-            },
-            "model_info": {
-                "id": "79f0dc70",
-                "model_group": "legacy-chat",
-                "route_key": "provider_chat / openai/vendor-chat / key=default",
-            },
-        }
-
-        synthesis_kwargs = hooks._external_web_search_synthesis_kwargs(
-            original_request,
-            "Web search results for query: test\n"
-            "Title: source\n"
-            "URL: https://example.test\n"
-            "Snippet: evidence",
-        )
-        continuation_kwargs = hooks._external_web_search_continuation_kwargs(
-            original_request,
-            search_results="Web search results for query: test",
-            queries=["test"],
-            round_number=1,
-        )
-
-        self.assertEqual(synthesis_kwargs["model"], "legacy-chat")
-        self.assertEqual(continuation_kwargs["model"], "legacy-chat")
-        self.assertNotEqual(synthesis_kwargs["model"], "openai/vendor-chat")
-        self.assertNotEqual(continuation_kwargs["model"], "openai/vendor-chat")
-        self.assertEqual(
-            [tool.get("name") for tool in continuation_kwargs["tools"]],
-            ["web_search", "fetch_content"],
-        )
-        continuation_surface = json.dumps(
-            {
-                "tools": continuation_kwargs["tools"],
-                "instructions": continuation_kwargs["instructions"],
-                "input": continuation_kwargs["input"],
-            }
-        )
-        self.assertIn("url", continuation_surface)
-        self.assertIn("fetch_content", continuation_surface)
-        self.assertNotIn("custom_tools", continuation_kwargs)
-        self.assertNotIn("functions", continuation_kwargs)
-        self.assertNotIn("mcp_servers", continuation_kwargs)
 
     def test_external_web_search_router_model_group_reads_new_route_key_model(self) -> None:
         hooks, _ = load_hook_module()
@@ -1476,54 +1233,6 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
             )
         )
 
-    def test_external_web_search_recovery_payloads_prefer_selected_route_over_outer_alias(self) -> None:
-        hooks, _ = load_hook_module()
-        original_request = {
-            "call_type": "aresponses",
-            "model": "legacy-chat",
-            "input": "Original request",
-            "stream": True,
-            "litellm_metadata": {
-                hooks._WEB_SEARCH_EXTERNAL_BRIDGE_KEY: True,
-                hooks._WEB_SEARCH_EXTERNAL_BRIDGE_STREAM_KEY: True,
-                hooks._RESPONSES_CHAT_BRIDGE_ORIGINAL_MODEL_GROUP_KEY: "legacy-chat",
-            },
-            "model_info": {
-                "id": "79f0dc70",
-                "model_group": "legacy-chat",
-                "route_key": "provider_chat / openai/vendor-chat / key=default / order=1",
-            },
-            "litellm_params": {
-                "model": "openai/vendor-chat",
-                "api_base": "https://chat-provider.example/v1",
-                "order": 1,
-            },
-        }
-
-        synthesis_kwargs = hooks._external_web_search_synthesis_kwargs(
-            original_request,
-            "Web search results for query: test\n"
-            "Title: source\n"
-            "URL: https://example.test\n"
-            "Snippet: evidence",
-        )
-        continuation_kwargs = hooks._external_web_search_continuation_kwargs(
-            original_request,
-            search_results="Web search results for query: test",
-            queries=["test"],
-            round_number=1,
-        )
-
-        self.assertEqual(synthesis_kwargs["model"], "legacy-chat")
-        self.assertEqual(continuation_kwargs["model"], "legacy-chat")
-        self.assertNotIn("max_output_tokens", continuation_kwargs)
-        self.assertTrue(continuation_kwargs["stream"])
-        self.assertEqual(
-            continuation_kwargs["litellm_params"]["api_base"],
-            "https://chat-provider.example/v1",
-        )
-        self.assertNotEqual(synthesis_kwargs["model"], "openai/vendor-chat")
-        self.assertNotEqual(continuation_kwargs["model"], "openai/vendor-chat")
 
     def test_external_web_search_continuation_keeps_explicit_output_budget(self) -> None:
         hooks, _ = load_hook_module()

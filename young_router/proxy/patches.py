@@ -37,7 +37,10 @@ from .base import (
     _RESPONSES_COMPLETION_STREAM_PATCH_ATTR,
     _RESPONSES_TOOL_SEARCH_BRIDGE_PATCH_ATTR,
     _ROUTING_CONSTRAINT_PATCH_ATTR,
+    _RESTORED_REASONING_REPLAY_KEY,
     _SELECTED_DEPLOYMENT_MARKER_PATCH_ATTR,
+    _UPSTREAM_URL_SURFACE_ANTHROPIC,
+    _UPSTREAM_URL_SURFACE_OPENAI_CHAT,
     _VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY,
     _install_websocket_frame_limit_patch,
     _install_uvicorn_shutdown_marker_patch,
@@ -57,6 +60,71 @@ _RESPONSES_COMPLETION_STREAM_OUTPUT_ITEM_PATCH_ATTR = (
 _RESPONSES_WEBSOCKET_HTTP_BRIDGE_PATCH_ATTR = (
     "_young_router_responses_websocket_http_bridge_patch"
 )
+_STREAM_CHUNK_RESTAMP_PATCH_ATTR = "_young_router_stream_chunk_restamp_patch"
+
+
+def _install_stream_chunk_restamp_patch() -> None:
+    """Stamp the client-facing model without flattening a chunk's wire form.
+
+    ``async_data_generator`` writes a delivered chunk as ``f"data: {chunk}"``,
+    so a plain dict reaches the client as a Python repr and no SSE JSON frame
+    at all.  Young Router's Responses events are a dict subclass whose
+    ``__str__`` is that JSON frame.  LiteLLM 1.106.0 stamps the requested
+    model onto a dict chunk by rebuilding it as ``{**chunk, "model": ...}``,
+    which drops the subclass: every event then arrived unparseable and Codex
+    reported ``stream closed before response.completed``.  1.105.1 mutated the
+    same object and kept the class.  Keep the class on the copy this version
+    makes, so the frame stays parseable for every client of the Responses API.
+    """
+
+    try:
+        from litellm.proxy import proxy_server as _litellm_proxy_server
+    except Exception:
+        return
+
+    original_restamp = getattr(
+        _litellm_proxy_server,
+        "_restamp_streaming_chunk_model",
+        None,
+    )
+    if not callable(original_restamp) or getattr(
+        original_restamp,
+        _STREAM_CHUNK_RESTAMP_PATCH_ATTR,
+        False,
+    ):
+        return
+
+    def patched_restamp_streaming_chunk_model(
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        chunk = kwargs.get("chunk", args[0] if args else None)
+        stamped, model_mismatch_logged = original_restamp(*args, **kwargs)
+        if (
+            stamped is not chunk
+            and isinstance(chunk, dict)
+            and type(chunk) is not dict
+            and type(stamped) is dict
+        ):
+            try:
+                stamped = type(chunk)(stamped)
+            except Exception:
+                pass
+        return stamped, model_mismatch_logged
+
+    setattr(
+        patched_restamp_streaming_chunk_model,
+        _STREAM_CHUNK_RESTAMP_PATCH_ATTR,
+        True,
+    )
+    setattr(
+        patched_restamp_streaming_chunk_model,
+        "_original_restamp_streaming_chunk_model",
+        original_restamp,
+    )
+    _litellm_proxy_server._restamp_streaming_chunk_model = (
+        patched_restamp_streaming_chunk_model
+    )
 
 
 def _install_responses_websocket_http_bridge_patch() -> None:
@@ -746,6 +814,16 @@ def _install_selected_deployment_marker_patch() -> None:
         ) -> None:
             _responses_execution_module._remember_request_model_group_before_deployment_update(kwargs)
             surface = _routing_module._request_surface_for_deployment(kwargs, deployment)
+            # Read the client's replay before the surface adapter rewrites it:
+            # ``input`` becomes ``messages`` for a Chat-shaped route, and the
+            # answer that comes back then covers the whole restored context.
+            restored_reasoning_replay = surface in {
+                _UPSTREAM_URL_SURFACE_OPENAI_CHAT,
+                _UPSTREAM_URL_SURFACE_ANTHROPIC,
+            } and _responses_execution_module._chat_bridge_reasoning_included(kwargs)
+            # ``make_call`` receives its kwargs by value, so the surface this
+            # attempt was adapted to travels under the request id instead.
+            _routing_module._remember_request_adapted_surface(kwargs, surface)
             if not surface:
                 _routing_module._remember_selected_deployment(deployment)
                 force_browser_headers = _responses_request_module._request_forces_browser_compatible_headers(kwargs)
@@ -808,6 +886,8 @@ def _install_selected_deployment_marker_patch() -> None:
                 surface,
                 deployment.get("litellm_params", {}).get("model"),
             )
+            if restored_reasoning_replay:
+                kwargs[_RESTORED_REASONING_REPLAY_KEY] = True
             if force_browser_headers:
                 kwargs[_BROWSER_COMPATIBLE_HEADERS_RETRY_METADATA_KEY] = True
 
@@ -899,6 +979,16 @@ def _install_selected_deployment_marker_patch() -> None:
                 )
             else:
                 _routing_module._record_protocol_fallback_success(kwargs)
+            # The answer a Chat-shaped deployment produces covers the client's
+            # whole context, whatever route inside this call converted it: the
+            # local bridge, or LiteLLM's own protocol fallback onto the
+            # deployment's Chat surface.  The fact travels on the response
+            # object because Codex reads it from the streaming HTTP header,
+            # which LiteLLM assembles from this very object.
+            response = _responses_execution_module._with_restored_reasoning_marker(
+                response,
+                kwargs,
+            )
             return response
         except Exception as exc:
             marker = _CURRENT_SELECTED_DEPLOYMENT.get()
@@ -1954,6 +2044,7 @@ def install_all() -> None:
     _install_generic_deployment_failover_patch()
     _install_same_deployment_retry_policy_patch()
     _install_responses_websocket_http_bridge_patch()
+    _install_stream_chunk_restamp_patch()
     _install_websocket_frame_limit_patch()
     # A stream this process truncates while it is being replaced is not
     # upstream evidence, so the teardown is marked wherever uvicorn is run.

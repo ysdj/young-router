@@ -4,6 +4,109 @@ from hook_test_utils import *
 
 
 class HookResponsesChatBridgeTests(HookTestCase):
+    async def test_adapted_chat_stream_reports_restored_reasoning(self) -> None:
+        hooks, _ = load_hook_module()
+
+        async def adapted_stream():
+            yield {"type": "response.completed", "response": {"status": "completed"}}
+
+        codex_kwargs = {
+            "model": "default-chat",
+            "input": [
+                {"role": "user", "content": "continue"},
+                {
+                    "type": "reasoning",
+                    "summary": [],
+                    "encrypted_content": "opaque-reasoning",
+                },
+            ],
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+            },
+            # The answer this predicate describes comes from a Chat-shaped
+            # upstream re-reading the client's whole context.
+            "use_chat_completions_api": True,
+        }
+        marked = hooks._with_restored_reasoning_marker(
+            adapted_stream(),
+            codex_kwargs,
+        )
+        self.assertTrue(hooks._restored_reasoning_included(marked))
+        self.assertEqual(
+            {"x-reasoning-included": "true"},
+            await hooks.YoungRouterHook().async_post_call_response_headers_hook(
+                data={},
+                user_api_key_dict=None,
+                response=marked,
+                request_headers={},
+            ),
+        )
+
+        # The same request without any encrypted reasoning replays nothing, so
+        # it must not claim the upstream counted restored reasoning.
+        without_reasoning = dict(codex_kwargs)
+        without_reasoning["input"] = [{"role": "user", "content": "continue"}]
+        plain = hooks._with_restored_reasoning_marker(
+            adapted_stream(),
+            without_reasoning,
+        )
+        self.assertFalse(hooks._restored_reasoning_included(plain))
+
+        # A route that serves the history as Responses items replays the same
+        # context, so its usage covers the reasoning items too and the header
+        # follows the replay rather than the wire shape that carried it.
+        native = dict(codex_kwargs)
+        native.pop("use_chat_completions_api")
+        native["model_info"] = {"upstream_url_surface": "openai/responses"}
+        self.assertTrue(
+            hooks._restored_reasoning_included(
+                hooks._with_restored_reasoning_marker(adapted_stream(), native)
+            )
+        )
+
+        # A buffered Responses payload is not a stream, so it carries nothing
+        # either: the fact only reaches the client through an HTTP header.
+        buffered = {"object": "response", "status": "completed", "output": []}
+        self.assertIs(
+            buffered,
+            hooks._with_restored_reasoning_marker(buffered, codex_kwargs),
+        )
+        self.assertNotIn("headers", buffered)
+
+    async def test_replayed_reasoning_fact_survives_the_surface_rewrite(self) -> None:
+        """A Chat-shaped route rewrites ``input`` before the answer exists.
+
+        The evidence that a Codex history carrying encrypted reasoning was
+        replayed therefore has to be recorded while ``input`` is still the
+        Responses request, and read back from the deployment call's own request.
+        """
+
+        hooks, _ = load_hook_module()
+        codex_request = {
+            "model": "default-chat",
+            "input": [
+                {"role": "user", "content": "continue"},
+                {"type": "reasoning", "summary": [], "encrypted_content": "opaque"},
+            ],
+            "client_metadata": {"x-codex-turn-metadata": '{"request_kind":"turn"}'},
+        }
+        self.assertTrue(hooks._chat_bridge_reasoning_included(codex_request))
+
+        # What the surface adapter leaves behind: the replayed fact, and no
+        # ``input`` list to re-read it from.
+        rewritten = {
+            "model": "default-chat",
+            "messages": [{"role": "user", "content": "continue"}],
+            hooks._RESTORED_REASONING_REPLAY_KEY: True,
+        }
+        self.assertTrue(hooks._restored_reasoning_replayed(rewritten))
+
+        async def adapted_stream():
+            yield {"type": "response.completed", "response": {"status": "completed"}}
+
+        marked = hooks._with_restored_reasoning_marker(adapted_stream(), rewritten)
+        self.assertTrue(hooks._restored_reasoning_included(marked))
+
     def test_chat_bridge_removes_empty_nested_enum_from_tool_schema(self) -> None:
         hooks, _ = load_hook_module()
         tools, _, stats = hooks._responses_chat_bridge_sanitize_tools(

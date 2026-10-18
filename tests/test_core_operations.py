@@ -11,6 +11,7 @@ import sys
 import tempfile
 import textwrap
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -41,6 +42,92 @@ model_list: []
 
 
 class CoreOperationsTests(unittest.TestCase):
+    def test_default_domains_read_the_private_runtime_config(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            # A bare Core reads the runtime's own staged document, not a file at
+            # the runtime root: that is the copy the proxy child is started
+            # from, and a default domain that loaded anything else would show
+            # rows the proxy is not serving.
+            config = root / ".litellm-runtime" / "config.yaml"
+            config.parent.mkdir(parents=True, exist_ok=True)
+            config.write_text("providers: {}\nmodel_list: []\n", encoding="utf-8")
+            with mock.patch.dict(
+                os.environ,
+                {"YOUNG_ROUTER_HOME": str(root), "LITELLM_CONFIG_FILE": ""},
+                clear=False,
+            ), mock.patch(
+                "young_router.core.operations.CoreServiceController"
+            ) as controller_type:
+                controller_type.return_value.status.return_value = {"state": "stopped"}
+                core = CoreStore.with_default_domains(runtime_root=root)
+
+        self.assertTrue(core._domains["providers_models"]._exists)
+        self.assertEqual([], core._domains["providers_models"].snapshot()["providers"])
+
+    def test_a_provider_key_read_never_waits_for_the_store_lock(self) -> None:
+        """A key on screen may not queue behind relay work.
+
+        A relay login or a station refresh holds the store lock across its own
+        network round trip.  The pane draws the provider's key when it opens, so
+        that read uses the free lock when it can have it and the live document
+        otherwise, instead of leaving the field on its loading hint.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / ".litellm-runtime" / "config.yaml"
+            config.parent.mkdir(parents=True, exist_ok=True)
+            config.write_text(PROVIDER_CONFIG, encoding="utf-8")
+            with mock.patch.dict(
+                os.environ,
+                {"YOUNG_ROUTER_HOME": str(root), "LITELLM_CONFIG_FILE": ""},
+                clear=False,
+            ), mock.patch(
+                "young_router.core.operations.CoreServiceController"
+            ):
+                core = CoreStore.with_default_domains(runtime_root=root)
+                target = "primary\u001fdefault"
+                self.assertEqual(
+                    "replace-me-secret",
+                    core.trusted_secret_value(
+                        "providers_models", "api_key", target, revision=core.revision
+                    ),
+                )
+
+                holding = threading.Event()
+                release = threading.Event()
+                # The revision the capability was issued for is read before the
+                # lock is taken: it is itself a locked property.
+                revision = core.revision
+
+                def hold_store_lock() -> None:
+                    with core._lock:
+                        holding.set()
+                        release.wait(5.0)
+
+                thread = threading.Thread(target=hold_store_lock, daemon=True)
+                thread.start()
+                try:
+                    self.assertTrue(holding.wait(5.0))
+                    started = time.monotonic()
+                    # Both halves of drawing the key: the lease that authorizes
+                    # the read, then the read itself.
+                    descriptor = core.trusted_secret_read_descriptor(
+                        "providers_models", "api_key", target
+                    )
+                    value = core.trusted_secret_value(
+                        "providers_models", "api_key", target, revision=revision
+                    )
+                    elapsed = time.monotonic() - started
+                    self.assertEqual("primary", descriptor["target"].split("\u001f")[0])
+                finally:
+                    release.set()
+                    thread.join(5.0)
+
+        self.assertEqual("replace-me-secret", value)
+        self.assertLess(elapsed, 1.0)
+
     @staticmethod
     def _configured_webdav_domain(root: Path, config: Path) -> WebDAVSettingsDomain:
         domain = WebDAVSettingsDomain(
@@ -477,24 +564,33 @@ class CoreOperationsTests(unittest.TestCase):
             self.assertEqual([], events)
 
     def test_default_core_exposes_stopped_service_before_starting_the_proxy(self) -> None:
-        with mock.patch("young_router.core.operations.CoreServiceController") as controller_type:
+        with tempfile.TemporaryDirectory() as directory, mock.patch(
+            "young_router.core.operations.CoreServiceController"
+        ) as controller_type:
+            config = Path(directory) / "config.yaml"
+            config.write_text("providers: {}\nmodel_list: []\n", encoding="utf-8")
             controller = controller_type.return_value
             controller.status.return_value = {"state": "stopped"}
             controller.dispatch.return_value = {"state": "stopped"}
 
-            core = CoreStore.with_default_domains(runtime_root="/tmp/young-router-core-start")
+            core = CoreStore.with_default_domains(runtime_root=directory, config_path=config)
 
         controller.start.assert_not_called()
         self.assertEqual("stopped", core.snapshot()["service"]["state"])
 
     def test_new_app_core_resets_transient_routing_state(self) -> None:
-        with mock.patch("young_router.core.operations.CoreServiceController") as controller_type:
+        with tempfile.TemporaryDirectory() as directory, mock.patch(
+            "young_router.core.operations.CoreServiceController"
+        ) as controller_type:
+            config = Path(directory) / "config.yaml"
+            config.write_text("providers: {}\nmodel_list: []\n", encoding="utf-8")
             controller = controller_type.return_value
             controller.status.return_value = {"state": "stopped"}
             controller.dispatch.return_value = {"state": "stopped"}
 
             CoreStore.with_default_domains(
-                runtime_root="/tmp/young-router-core-new-app",
+                runtime_root=directory,
+                config_path=config,
                 reset_transient_routing_state=True,
             )
 
@@ -509,7 +605,9 @@ class CoreOperationsTests(unittest.TestCase):
         """
 
         with tempfile.TemporaryDirectory() as directory:
-            core = CoreStore.with_default_domains(runtime_root=directory)
+            config = Path(directory) / "config.yaml"
+            config.write_text("providers: {}\nmodel_list: []\n", encoding="utf-8")
+            core = CoreStore.with_default_domains(runtime_root=directory, config_path=config)
             controller = CoreServiceController(directory)
 
             # A service dispatch answers with the revision; the promise is read
@@ -526,12 +624,16 @@ class CoreOperationsTests(unittest.TestCase):
             self.assertFalse(controller.paths.launch_background.exists())
 
     def test_default_core_exposes_a_non_running_service_for_diagnostics(self) -> None:
-        with mock.patch("young_router.core.operations.CoreServiceController") as controller_type:
+        with tempfile.TemporaryDirectory() as directory, mock.patch(
+            "young_router.core.operations.CoreServiceController"
+        ) as controller_type:
+            config = Path(directory) / "config.yaml"
+            config.write_text("providers: {}\nmodel_list: []\n", encoding="utf-8")
             controller = controller_type.return_value
             controller.status.return_value = {"state": "unknown"}
             controller.dispatch.return_value = {"state": "unknown"}
 
-            core = CoreStore.with_default_domains(runtime_root="/tmp/young-router-core-unavailable")
+            core = CoreStore.with_default_domains(runtime_root=directory, config_path=config)
 
         controller.start.assert_not_called()
         self.assertEqual("unknown", core.snapshot()["service"]["state"])

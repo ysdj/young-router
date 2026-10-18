@@ -18,69 +18,31 @@ _PYCACHE_DIR_ENV = "YOUNG_ROUTER_PYCACHE_DIR"
 
 
 def _install_bytecode_cache() -> None:
-    """Let every interpreter read its compiled LiteLLM bytecode instead of reparsing it.
-
-    The shipped bundle carries no ``.pyc`` files: the build strips them so
-    ``__pycache__`` entries cannot sit outside AppKit's signed resource
-    contract.  LiteLLM is about 2,600 modules of source, so every launch parses
-    and compiles them again -- the single largest part of the proxy's cold
-    start, paid once by the Core and once more by the worker that preloads
-    LiteLLM before it forks sixteen children.
-
-    The app's own state root is writable and already exists on every launch
-    path, so the compiled bytecode is written there instead of beside the
-    signed sources.  ``sys.pycache_prefix`` redirects every write for the whole
-    process, including the forked workers, so one launch warms the cache for
-    the next and a restart's own cost is not paid again by its children.
-
-    ``PYTHONDONTWRITEBYTECODE`` is cleared deliberately: the launcher scripts
-    set it to keep ``__pycache__`` out of the bundle, which is exactly what this
-    replaces, and leaving it set would make every launch recompile forever.
-    """
-
     if os.environ.get("YOUNG_ROUTER_DISABLE_PYCACHE") == "1":
-        # A child inherits ``PYTHONPYCACHEPREFIX`` in its environment, so a
-        # probe that turns the cache off has to clear the prefix as well or it
-        # would keep writing into the parent's cache.
         sys.pycache_prefix = None
         os.environ.pop("PYTHONPYCACHEPREFIX", None)
         return
     configured = os.environ.get(_PYCACHE_DIR_ENV, "").strip()
     if not configured:
+        configured = os.environ.get("PYTHONPYCACHEPREFIX", "").strip()
+    if not configured:
         root = os.environ.get("LITELLM_RUNTIME_ROOT", "").strip() or os.environ.get(
             "YOUNG_ROUTER_HOME", ""
         ).strip()
         if not root:
-            # The production Core is launched with the host's inherited
-            # environment, which carries no runtime root: the host encodes the
-            # root in the private ``--metadata`` path instead.  The same
-            # ``<home>/.young-router`` location the host and Core both resolve
-            # is therefore derived here, so every interpreter on every launch
-            # path -- the Core, the proxy master, and its forked workers -- finds
-            # the one cache.
             home = os.environ.get("HOME", "").strip()
-            if not home:
-                return
-            root = os.path.join(home, ".young-router")
-        if not root:
+            if home:
+                root = os.path.join(home, ".young-router")
+        if root:
+            configured = os.path.join(root, "pycache")
+    if configured:
+        try:
+            os.makedirs(configured, exist_ok=True)
+        except OSError:
             return
-        configured = os.path.join(root, "pycache")
-    try:
-        os.makedirs(configured, exist_ok=True)
-    except OSError:
-        return
-    if not os.access(configured, os.W_OK):
-        return
-    # Written for the interpreter this runs in and inherited by every process it
-    # forks, so the proxy's workers share the warm cache their parent built.
-    sys.pycache_prefix = configured
-    os.environ["PYTHONPYCACHEPREFIX"] = configured
-    os.environ.pop("PYTHONDONTWRITEBYTECODE", None)
-    # CPython reads ``PYTHONDONTWRITEBYTECODE`` into ``sys.dont_write_bytecode``
-    # before ``sitecustomize`` is imported, so clearing the variable is not
-    # enough: the flag itself is what every import consults, and leaving it set
-    # would make the cache above a directory nothing ever writes to.
-    sys.dont_write_bytecode = False
+        if os.access(configured, os.W_OK):
+            sys.pycache_prefix = configured
+            os.environ["PYTHONPYCACHEPREFIX"] = configured
 
 
 _install_bytecode_cache()

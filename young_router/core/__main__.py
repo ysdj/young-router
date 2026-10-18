@@ -88,6 +88,7 @@ def _watch_windows_parent(parent_pid: int, stop: threading.Event, *, poll_interv
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the Young Router Python Core IPC service")
     parser.add_argument("--metadata", type=Path, help="private Core metadata path")
+    parser.add_argument("--config", type=Path, help="explicit provider configuration path")
     parser.add_argument("--endpoint-file", type=Path, help="private endpoint descriptor path")
     parser.add_argument("--parent-pid", type=_positive_pid, help="native host process identifier")
     parser.add_argument("--claude-settings", type=Path, help="explicit Claude settings path")
@@ -124,6 +125,7 @@ def run(argv: list[str] | None = None) -> int:
         parent_watchdog.start()
     core = CoreStore.with_default_domains(
         metadata_path=args.metadata,
+        config_path=args.config,
         claude_settings_path=args.claude_settings,
         language_path=args.language_file,
         runtime_root=args.runtime_root,

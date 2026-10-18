@@ -236,6 +236,13 @@ private enum NativeRelayOriginPolicy {
         routeWindowFactory = factory
     }
 
+    /// AppKit creates this singleton while the storyboard's application menu is
+    /// decoded. Publishing the status item here gives the app its background
+    /// surface before a primary window exists.
+    public func installStatusItem() {
+        _ = statusItem
+    }
+
     public func setReactHostStarter(_ starter: @escaping () -> Void) {
         reactHostStarter = starter
     }
@@ -485,10 +492,14 @@ private enum NativeRelayOriginPolicy {
     /// alive for menu/service state, but route content lives in independent
     /// React windows created by ``routeWindowFactory``.
     public func hideHostWindowAtLaunch(_ window: NSWindow?) {
+        hideHostWindowAtLaunch(window, keepStatusItem: false)
+    }
+
+    public func hideHostWindowAtLaunch(_ window: NSWindow?, keepStatusItem: Bool) {
         if let window {
             hostWindow = window
         }
-        hideHostWindow()
+        withoutAnimations { window?.orderOut(nil) }
     }
 
     public func windowShouldClose(_ sender: NSWindow) -> Bool {
@@ -934,6 +945,58 @@ private enum NativeRelayOriginPolicy {
         }
         presentBuiltDecisionPanel(built, in: parent, locksParent: locksParent, prepare: prepare, completion: completion)
         return built.panel
+    }
+
+    /// One text value in the same decision surface, used by the online-usage
+    /// time range. The parent stays locked, Enter applies, and Escape cancels.
+    func presentTextPrompt(
+        title: String,
+        value: String,
+        confirmLabel: String,
+        cancelLabel: String,
+        completion: @escaping (String?) -> Void
+    ) {
+        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        input.cell?.wraps = false
+        input.cell?.isScrollable = true
+        input.cell?.usesSingleLineMode = true
+        input.stringValue = String(value.prefix(64))
+        input.maximumNumberOfLines = 1
+        input.font = NSFont.systemFont(ofSize: nativeUIFontSize)
+        input.setAccessibilityLabel(title)
+        let answers: [NativeDecisionAnswer] = [
+            NativeDecisionAnswer(id: "cancel", title: cancelLabel, isCancel: true),
+            NativeDecisionAnswer(id: "apply", title: confirmLabel, isDefault: true),
+        ]
+        var builtPanel: NSPanel?
+        builtPanel = presentDecisionPanel(
+            title,
+            message: "",
+            answers: answers,
+            accessory: input,
+            accessoryHeight: 24,
+            prepare: {
+                builtPanel?.makeFirstResponder(input)
+                input.currentEditor()?.selectAll(nil)
+            }
+        ) { [weak input] answer in
+            guard let input else {
+                completion(nil)
+                return
+            }
+            self.endActiveEditingOnLineField(input)
+            completion(answer == "apply" ? input.stringValue : nil)
+        }
+    }
+
+    /// AppKit keeps a field's editor in charge of its text until editing ends.
+    /// Commit it before a provider's menu-level Apply reads the value.
+    private func endActiveEditingOnLineField(_ field: NSTextField) {
+        guard let window = field.window, let editor = field.currentEditor() else { return }
+        let text = editor.string
+        if window.makeFirstResponder(nil) {
+            field.stringValue = text
+        }
     }
 
     /// Builds one decision panel: the question as its window title, the detail in
@@ -2716,9 +2779,7 @@ final class NativeDecisionPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
 
-    override func cancelOperation(_ sender: Any?) {
-        onEscape?()
-    }
+    override func cancelOperation(_ sender: Any?) { onEscape?() }
 }
 
 /// The anchored explanation a question mark opens beside its control.

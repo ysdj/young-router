@@ -46,6 +46,7 @@ type NativeSegmentedProps = {
   selectedValue: string;
   disabled?: boolean;
   compact?: boolean;
+  overlayLayer?: boolean;
   onChange?: (event: NativeSyntheticEvent<{ value: string; index: number }>) => void;
   style?: StyleProp<ViewStyle>;
 };
@@ -55,6 +56,7 @@ type NativePickerProps = {
   selectedValue: string;
   disabled?: boolean;
   compact?: boolean;
+  overlayLayer?: boolean;
   onChange?: (event: NativeSyntheticEvent<{ value: string; index: number }>) => void;
   style?: StyleProp<ViewStyle>;
 };
@@ -63,8 +65,8 @@ export const AppKitButton = React.forwardRef<any, NativeButtonProps>(function Ap
   return <NativeAppKitButton {...props} ref={ref as never} style={[props.link ? styles.linkButton : styles.button, props.style]} />;
 });
 
-export function AppKitSegmentedControl({ labels, selectedValue, disabled, compact, onChange, style, ref }: NativeSegmentedProps & { ref?: React.Ref<any> }): React.JSX.Element {
-  return <NativeAppKitSegmentedControl ref={ref as never} labels={labels} selectedValue={selectedValue} disabled={disabled} compact={compact} onChange={onChange} style={[styles.segmented, style]} />;
+export function AppKitSegmentedControl({ labels, selectedValue, disabled, compact, overlayLayer = false, onChange, style, ref }: NativeSegmentedProps & { overlayLayer?: boolean; ref?: React.Ref<any> }): React.JSX.Element {
+  return <NativeAppKitSegmentedControl ref={ref as never} labels={labels} selectedValue={selectedValue} disabled={disabled} compact={compact} overlayLayer={overlayLayer} onChange={onChange} style={[styles.segmented, style]} />;
 }
 
 export function AppKitPicker({ labels, selectedValue, disabled, compact, onChange, style }: NativePickerProps): React.JSX.Element {
@@ -75,8 +77,8 @@ export function AppKitCheckbox({ label, value, disabled, compact, labelVisible, 
   return <NativeAppKitCheckbox label={label} labelVisible={labelVisible} value={value} disabled={disabled} compact={compact} onValueChange={(event) => onValueChange?.(event.nativeEvent.value)} style={[styles.checkbox, style]} />;
 }
 
-export function AppKitTextField({ style, onChangeText, onSubmitEditing, onBlur, search = false, ...props }: TextInputProps & { search?: boolean }): React.JSX.Element {
-  return <NativeAppKitTextField value={props.value} placeholder={props.placeholder} multiline={props.multiline} secureTextEntry={props.secureTextEntry} search={search} disabled={props.editable === false} onChangeText={(event) => onChangeText?.(event.nativeEvent.text)} onBlur={() => onBlur?.({} as never)} onSubmitEditing={(event) => onSubmitEditing?.({ ...event, nativeEvent: { text: event.nativeEvent.text } } as never)} accessibilityLabel={props.accessibilityLabel} style={[styles.textField, style]} />;
+export function AppKitTextField({ style, onChangeText, onSubmitEditing, onBlur, search = false, borderless = false, ...props }: TextInputProps & { search?: boolean; borderless?: boolean }): React.JSX.Element {
+  return <NativeAppKitTextField value={props.value} placeholder={props.placeholder} multiline={props.multiline} secureTextEntry={props.secureTextEntry} search={search} borderless={borderless} disabled={props.editable === false} onChangeText={(event) => onChangeText?.(event.nativeEvent.text)} onBlur={() => onBlur?.({} as never)} onSubmitEditing={(event) => onSubmitEditing?.({ ...event, nativeEvent: { text: event.nativeEvent.text } } as never)} accessibilityLabel={props.accessibilityLabel} style={[styles.textField, style]} />;
 }
 
 export function AppKitToggle({ value, disabled, onValueChange, style, accessibilityLabel }: { value: boolean; disabled?: boolean; onValueChange?: (value: boolean) => void; style?: StyleProp<ViewStyle>; accessibilityLabel?: string }): React.JSX.Element {
@@ -87,8 +89,8 @@ export function AppKitSelectableRow({ title, detail, selected, disabled, onPress
   return <NativeAppKitSelectableRow title={title} detail={detail} selected={selected} disabled={disabled} onPress={() => onPress?.()} style={[styles.selectableRow, style]} />;
 }
 
-export function AppKitTable({ columnLabels, columnWidths, rowKeys, cells, selectedKey, alternatingRows, compact, followBottom, borderless, sourceList, rowSymbols, rowSymbolColors, rowImageNames, cellHorizontalPadding, firstColumnHorizontalPadding, preserveColumnWidths, scrollTrailingColumnOverflow, disabledRowKeys, secondaryCellKeys, alertRowKeys, spanningRowKeys, selectableSpanningRowKeys, onSelectionChange, onRowDoublePress, style }: { columnLabels: string[]; columnWidths: number[]; rowKeys: string[]; cells: string[]; selectedKey: string; alternatingRows?: boolean; compact?: boolean; followBottom?: boolean; borderless?: boolean; sourceList?: boolean; rowSymbols?: string[]; rowSymbolColors?: string[]; rowImageNames?: string[]; cellHorizontalPadding?: number; firstColumnHorizontalPadding?: number; preserveColumnWidths?: boolean; scrollTrailingColumnOverflow?: boolean; disabledRowKeys?: string[]; secondaryCellKeys?: string[]; /** Rows whose text renders in the warning (brown) color. */ alertRowKeys?: string[]; spanningRowKeys?: string[]; /** Spanning rows that are entries of their own and select like ordinary rows. */ selectableSpanningRowKeys?: string[]; onSelectionChange?: (event: NativeSyntheticEvent<{ key: string; index: number }>) => void; onRowDoublePress?: (event: NativeSyntheticEvent<{ key: string; index: number }>) => void; style?: StyleProp<ViewStyle> }): React.JSX.Element {
-  return <NativeAppKitTable columnLabels={columnLabels} columnWidths={columnWidths} rowKeys={rowKeys} cells={cells} selectedKey={selectedKey} alternatingRows={alternatingRows} compact={compact} followBottom={followBottom} borderless={borderless} sourceList={sourceList} rowSymbols={rowSymbols} rowSymbolColors={rowSymbolColors} rowImageNames={rowImageNames} cellHorizontalPadding={cellHorizontalPadding} firstColumnHorizontalPadding={firstColumnHorizontalPadding} preserveColumnWidths={preserveColumnWidths} scrollTrailingColumnOverflow={scrollTrailingColumnOverflow} disabledRowKeys={disabledRowKeys} secondaryCellKeys={secondaryCellKeys} alertRowKeys={alertRowKeys} spanningRowKeys={spanningRowKeys} selectableSpanningRowKeys={selectableSpanningRowKeys} onSelectionChange={onSelectionChange} onRowDoublePress={onRowDoublePress} style={[styles.table, style]} />;
+export function AppKitTable({ columnLabels, columnWidths, rowKeys, cells, selectedKey, alternatingRows, compact, followBottom, scrollToRow, borderless, sourceList, rowSymbols, rowSymbolColors, rowImageNames, cellHorizontalPadding, firstColumnHorizontalPadding, preserveColumnWidths, scrollTrailingColumnOverflow, disabledRowKeys, secondaryCellKeys, alertRowKeys, spanningRowKeys, selectableSpanningRowKeys, onSelectionChange, onRowDoublePress, style }: { columnLabels: string[]; columnWidths: number[]; rowKeys: string[]; cells: string[]; selectedKey: string; alternatingRows?: boolean; compact?: boolean; followBottom?: boolean; scrollToRow?: number; borderless?: boolean; sourceList?: boolean; rowSymbols?: string[]; rowSymbolColors?: string[]; rowImageNames?: string[]; cellHorizontalPadding?: number; firstColumnHorizontalPadding?: number; preserveColumnWidths?: boolean; scrollTrailingColumnOverflow?: boolean; disabledRowKeys?: string[]; secondaryCellKeys?: string[]; /** Rows whose text renders in the warning (brown) color. */ alertRowKeys?: string[]; spanningRowKeys?: string[]; /** Spanning rows that are entries of their own and select like ordinary rows. */ selectableSpanningRowKeys?: string[]; onSelectionChange?: (event: NativeSyntheticEvent<{ key: string; index: number }>) => void; onRowDoublePress?: (event: NativeSyntheticEvent<{ key: string; index: number }>) => void; style?: StyleProp<ViewStyle> }): React.JSX.Element {
+  return <NativeAppKitTable columnLabels={columnLabels} columnWidths={columnWidths} rowKeys={rowKeys} cells={cells} selectedKey={selectedKey} alternatingRows={alternatingRows} compact={compact} followBottom={followBottom} scrollToRow={scrollToRow} borderless={borderless} sourceList={sourceList} rowSymbols={rowSymbols} rowSymbolColors={rowSymbolColors} rowImageNames={rowImageNames} cellHorizontalPadding={cellHorizontalPadding} firstColumnHorizontalPadding={firstColumnHorizontalPadding} preserveColumnWidths={preserveColumnWidths} scrollTrailingColumnOverflow={scrollTrailingColumnOverflow} disabledRowKeys={disabledRowKeys} secondaryCellKeys={secondaryCellKeys} alertRowKeys={alertRowKeys} spanningRowKeys={spanningRowKeys} selectableSpanningRowKeys={selectableSpanningRowKeys} onSelectionChange={onSelectionChange} onRowDoublePress={onRowDoublePress} style={[styles.table, style]} />;
 }
 
 export function AppKitTextEditor({ value, documentKey, readOnly, wrap, onChangeText, style }: { value: string; documentKey?: string; readOnly?: boolean; wrap?: boolean; onChangeText?: (text: string) => void; style?: StyleProp<ViewStyle> }): React.JSX.Element {

@@ -16,7 +16,7 @@ Young Router is a native macOS and Windows app that runs a local AI gateway (bui
 - **Authenticity deep test.** The model detail pane's probe names what it will run: when the model is one the bundled [Veridrop](https://github.com/canarybyte/veridrop) tables carry, it also runs Veridrop's `quick` suite against the route and reports whether the endpoint answers as the model it claims — identity, thinking signature, model consistency, protocol conformance, and message ids. A failed check is only reported — the model keeps its enable checkbox and its routing stays yours to change.
 - **Image generation bridge.** Image-generation requests are routed to the deployments that support them, with a forced retry when a capable route returns nothing.
 - **WorkBuddy accounts (China and international).** Add the product in the provider wizard, then link the WorkBuddy desktop app's own sign-in in the provider's **Service links** section: Young Router imports that app's model roster, keeps the token refreshed, and serves it through the bundled [dsh-workbuddy-connect](https://github.com/corrinehu/dsh-workbuddy-connect) worker, which stays the single owner of the upstream protocol. Both products can coexist and each keeps its own account, catalog, and credit.
-- **OpenCode Zen free models.** The wizard's **OpenCode Zen Free** type adds the free models OpenCode Zen serves on its anonymous lane, through the bundled [opencode2dsh](https://github.com/FishBottle7/opencode2dsh) plugin, which stays the single owner of the lane's protocol. There is no account and no key to enter, and the imported roster is exactly the free ids the lane advertises — Zen's paid models are a separate catalog that the anonymous lane cannot reach.
+- **dsh-our-free-model through the existing OpenCode provider.** The wizard's **dsh-our-free-model** type reuses the bundled [dsh-our-free-model](https://github.com/Ebony-Vinyl/dsh-our-free-model) integration. A small process bridge imports that project's OpenCode protocol and local gateway in place; there is no account or key to enter. Its model, region visibility, refresh, and probe settings live in **Runtime**.
 - **Codex & Claude in one click.** Codex Settings writes the local endpoint and key without touching your other settings, and adds model catalog, fast tier, compaction, reasoning-effort compatibility, and usage normalization. Claude Settings offers **Use local API**, plus models, permissions, and sandbox.
 - **Private by default.** Prompts, message bodies, authorization headers, and API keys never enter the request log.
 - **Validated, safe configuration.** Every edit is validated as it is saved, a rejected change leaves the previous configuration untouched, and credentials stay in private storage.
@@ -31,7 +31,7 @@ Also included: route-trace HTML reports, online usage, and optional WebDAV confi
 3. Open **Service Provider Management…** to sign in to OpenAI / Claude, or add a New API / Sub2API station by URL. Keys and models load automatically.
    Prefer plain API keys? Add them in **Providers & Models…**, or import your current Codex / Claude setup.
    WorkBuddy users: in the wizard pick WorkBuddy or WorkBuddy AI — the wizard fills the service's own address — then link the desktop app's account in the provider's **Service links** block and press **Manage models** to pick the models to import.
-   OpenCode Zen users: in the wizard pick **OpenCode Zen Free** — nothing is typed there — and press Finish; the free roster is imported with the entry. This reaches the anonymous free lane only; from a network the lane rate-limits, every call answers `FreeTierError` until an exit the lane accepts is used.
+   OpenCode provider users: in the wizard pick **dsh-our-free-model** — nothing is typed there — and press Finish; the bundled dsh-our-free-model integration imports the free roster with the entry. If its upstream refuses the current network location, the provider's catalog read reports that failure.
 4. Connect your tools:
    - **Codex** → **Codex Settings…** → choose a LiteLLM deployment
    - **Claude** → **Claude Settings…** → **Use local API**
@@ -107,7 +107,7 @@ MIT License. See [LICENSE](./LICENSE).
 - **真伪探测。** 模型详情页的按钮会说明它将要执行什么：模型名在内置 [Veridrop](https://github.com/canarybyte/veridrop) 的模型表内时，对该线路跑一遍 Veridrop 的 `quick` 套件，核验它是否真的由所声称的模型作答（身份一致性、思维签名、模型一致性、协议规范性、消息标识规范）。核验未通过只作为结果展示——不会取消模型的启用勾选，路由怎么改仍由你决定。
 - **图像生成桥接。** 图像生成请求会被路由到真正支持该能力的线路；能力线路返回空响应时会强制重试，避免请求白跑。
 - **WorkBuddy 账号（国内版与国际版）。** 在添加向导中选出产品，再在供应商详情页的**服务商关联**里关联 WorkBuddy 桌面 App 自己的登录：漾路由据此导入该 App 的模型列表并自动续期，通过内置的 [dsh-workbuddy-connect](https://github.com/corrinehu/dsh-workbuddy-connect) worker 调用——上游协议始终由这个第三方包负责。两版可以并存，各自使用自己的账号、模型列表与积分。
-- **OpenCode Zen 免费模型。** 向导里的 **OpenCode Zen 免费版** 类型会接入 OpenCode Zen 匿名通道上的免费模型，由内置的 [opencode2dsh](https://github.com/FishBottle7/opencode2dsh) 插件负责——该通道的协议始终由这个第三方包维护。这里无需账号、无需填写密钥，导入的模型正是该通道公开的那批免费 id；Zen 的付费模型属于另一个目录，匿名通道无法调用。
+- **通过现有 OpenCode provider 接入 dsh-our-free-model。** 向导里的 **dsh-our-free-model** 类型使用内置的 [dsh-our-free-model](https://github.com/Ebony-Vinyl/dsh-our-free-model) 集成。Young Router 的进程桥直接引用该项目的 OpenCode 协议与本地网关；无需账号或填写密钥。输出上限、地区受限模型、刷新间隔和可用性探测等设置位于 **Runtime**。
 - **Codex 与 Claude 一键接入。** Codex 设置会写入本地端点与密钥且不碰你的其他配置，并提供模型目录、Fast 层级、压缩方式、推理强度兼容和用量归一化；Claude 设置提供**使用本机 API**，以及模型、权限和沙箱选项。
 - **默认保护隐私。** 提示词正文、消息内容、授权头和 API 密钥不会进入请求日志。
 - **配置安全可控。** 每次修改都会先校验再保存；校验不通过的修改不会覆盖现有配置，原始凭据保存在私有存储中。
@@ -122,7 +122,7 @@ MIT License. See [LICENSE](./LICENSE).
 3. 打开**服务商管理…** 登录 OpenAI / Claude，或填入 URL 添加 New API / Sub2API 中转站，密钥和模型会自动加载。
    如果习惯直接用 API 密钥，可以在**供应商与模型…** 中添加，或导入现有的 Codex / Claude 配置。
    WorkBuddy 用户：在向导的供应商类型中选择 WorkBuddy 或 WorkBuddy AI（基础 URL 自动填入服务官方地址），然后在供应商详情页的**服务商关联**里关联桌面 App 账号，再用**模型管理**挑选要导入的模型。
-   OpenCode Zen 用户：在向导中选择 **OpenCode Zen 免费版**（无需填写任何内容），点击完成即可，免费模型列表会随条目一并导入。这里只接入匿名免费通道；若所在网络被该通道限流，调用会返回 `FreeTierError`，需改用该通道接受的出口后才可正常使用。
+   OpenCode provider 用户：在向导中选择 **dsh-our-free-model**（无需填写任何内容），点击完成即可，内置的 dsh-our-free-model 集成会随条目导入免费模型列表。若上游拒绝当前网络出口，provider 的模型列表读取会显示失败。
 4. 接入工具：
    - **Codex** → **Codex 设置…** → 选择一个 LiteLLM 部署
    - **Claude** → **Claude 设置…** → **使用本机 API**

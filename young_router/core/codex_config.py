@@ -1751,6 +1751,7 @@ def apply_structured_patch(
         result = _apply_permissions_patch(result, patch_data["permissions"])
     if "mcp_servers" in patch_data:
         result = _apply_mcp_patch(result, patch_data["mcp_servers"])
+
     if "plugins" in patch_data:
         result = _apply_enabled_entries_patch(result, "plugins", patch_data["plugins"])
     if "apps" in patch_data:
@@ -1785,6 +1786,7 @@ def apply_structured_patch(
         for server_id in list(_get_mapping(parse_toml_text(result).get("mcp_servers"))):
             if server_id not in desired_servers:
                 result = remove_table(result, ("mcp_servers", str(server_id)))
+
     if "plugins" in patch_data:
         desired_plugins = {
             item["id"].strip()

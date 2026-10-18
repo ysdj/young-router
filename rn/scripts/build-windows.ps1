@@ -60,11 +60,10 @@ try {
   $WorkBuddyConnectUpdater = Join-Path $ProjectRoot "scripts\update_workbuddy_connect.py"
   & uv run --no-project --python 3.12 $WorkBuddyConnectUpdater --output $WorkBuddyConnectWork
   if ($LASTEXITCODE -ne 0) { throw "Could not update the bundled dsh-workbuddy-connect package." }
-  # The OpenCode Zen free lane is driven through the published plugin package,
-  # so every artifact build re-resolves its latest release.
+  # The existing OpenCode provider stages dsh-our-free-model's upstream sources.
   $OpenCode2DshUpdater = Join-Path $ProjectRoot "scripts\update_opencode2dsh.py"
   & uv run --no-project --python 3.12 $OpenCode2DshUpdater --output $OpenCode2DshWork
-  if ($LASTEXITCODE -ne 0) { throw "Could not update the bundled @opencode2dsh/dsh-plugin package." }
+  if ($LASTEXITCODE -ne 0) { throw "Could not update the bundled dsh-our-free-model package." }
   # The vision fallback routes through the staged upstream package rather than a
   # copy of its chain, so every artifact build re-resolves its latest release.
   $DshVisionRouterUpdater = Join-Path $ProjectRoot "scripts\update_dsh_vision_router.py"
@@ -179,8 +178,9 @@ print('young-router-veridrop-import-ok')
   if (-not (Test-Path (Join-Path $Core "young_router\adapters\opencode2dsh_worker.mjs"))) {
     throw "The Windows build output does not contain young_router/adapters/opencode2dsh_worker.mjs."
   }
-  if (-not (Test-Path (Join-Path $Core "young_router\adapters\opencode2dsh\lib\index.js"))) {
-    throw "The bundled @opencode2dsh/dsh-plugin package is missing."
+  if (-not (Test-Path (Join-Path $Core "young_router\adapters\opencode2dsh\src\core\runtime.js")) -or
+      -not (Test-Path (Join-Path $Core "young_router\adapters\opencode2dsh\src\forward.js"))) {
+    throw "The bundled dsh-our-free-model sources are missing."
   }
   if (-not (Test-Path (Join-Path $Core "young_router\adapters\dsh-vision-router\lib\core-primitives.js"))) {
     throw "The bundled dsh-vision-router package is missing."

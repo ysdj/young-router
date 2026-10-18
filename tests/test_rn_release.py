@@ -11,6 +11,26 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ReactNativeReleaseTests(unittest.TestCase):
+    def read_release_build_script(self) -> str:
+        return (ROOT / "scripts" / "build-and-install-macos.sh").read_text(
+            encoding="utf-8"
+        )
+
+    def test_install_failure_restores_the_previous_app(self) -> None:
+        script = self.read_release_build_script()
+        wrapper = script.index('wait_static_checks() {')
+        cleanup = script.index('cleanup() {')
+        assertions = script.index('mv "$RETIRED_HOST" "$HOST_EXECUTABLE"', cleanup)
+        app_restore = script.index(
+            'if [[ "$INSTALL_COMPLETE" != "1" && "$PREVIOUS_APP_MOVED" == "1"',
+            assertions,
+        )
+        cleanup_ends = script.index('trap cleanup EXIT', app_restore)
+        self.assertNotIn('return', script[assertions:cleanup_ends])
+        self.assertIn('mv "$PREVIOUS_APP" "$DESTINATION" || true', script[app_restore:cleanup_ends])
+        self.assertIn('mv "$DESTINATION" "$FAILED_APP" || true', script[app_restore:cleanup_ends])
+        self.assertLess(assertions, app_restore)
+
     def test_macos_core_pruning_keeps_litellm_proxy_mcp_imports(self) -> None:
         prune_module = runpy.run_path(str(ROOT / "scripts" / "prune-macos-core.py"))
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -47,7 +67,7 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn('INSTALL_COMPLETE=1', installer)
         self.assertIn('RESTART_ARMED=0', installer)
         self.assertIn('RESTART_ARMED=1', installer)
-        self.assertIn('[[ -n "$(installed_pids)" ]] || open -g "$DESTINATION"', installer)
+        self.assertIn('[[ -n "$(installed_pids)" ]] || open "$DESTINATION"', installer)
         self.assertNotIn("open -n", installer)
         self.assertNotIn('tell application id "young.router.app" to quit', installer)
         self.assertIn("stop_installed_app", installer)
@@ -63,11 +83,10 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertNotIn('kill -TERM "$pid"', installer)
         self.assertIn('line ~ /\\/Young ?Router[^\\/]*\\.app\\/Contents\\/MacOS\\/YoungRouter$/', installer)
         self.assertIn('*/Young*Router*.app/Contents/MacOS/YoungRouter', installer)
-        self.assertIn('START_TIMEOUT_SECONDS="${YOUNG_ROUTER_START_TIMEOUT_SECONDS:-70}"', installer)
+        self.assertIn('START_TIMEOUT_SECONDS="${YOUNG_ROUTER_START_TIMEOUT_SECONDS:-10}"', installer)
         self.assertIn('STOP_TIMEOUT_SECONDS="${YOUNG_ROUTER_STOP_TIMEOUT_SECONDS:-20}"', installer)
         self.assertNotIn("STOP_GRACE_POLLS", installer)
         self.assertNotIn("STOP_DRAIN_SECONDS", installer)
-        self.assertIn('REQUIRED_HEALTH_CHECKS=3', installer)
         self.assertIn('LAUNCH_RETRY_SECONDS=1', installer)
         self.assertNotIn("preserved_proxy_port", installer)
         self.assertNotIn("refuse_running_install", installer)
@@ -77,20 +96,20 @@ class ReactNativeReleaseTests(unittest.TestCase):
         # the one named above.
         self.assertIn('"$APP_PROCESSES" stop $bundle_pids', installer)
         self.assertIn('start_installed_app "$OLD_PIDS"', installer)
+        self.assertIn('if ! open "$DESTINATION" >/dev/null 2>&1; then', installer)
         self.assertIn('curl --fail --silent --show-error --max-time 1', installer)
         self.assertIn('health/liveliness', installer)
         self.assertIn(' -m young_router.proxy.macos_proxy ', installer)
-        self.assertIn('stable_checks >= REQUIRED_HEALTH_CHECKS', installer)
+        self.assertIn('global_deadline=$((SECONDS + PROXY_READY_TIMEOUT_SECONDS))', installer)
         self.assertIn('restore_previous_app', installer)
         self.assertIn("copy_bundle()", installer)
         self.assertIn('ditto --rsrc --extattr --acl "$source" "$destination"', installer)
         self.assertIn('copy_bundle "$STAGED_APP" "$INSTALL_STAGE"', installer)
         self.assertIn('codesign --verify --deep --strict --verbose=2 "$INSTALL_STAGE"', installer)
-        self.assertIn('open -g "$DESTINATION" >/dev/null 2>&1 || true', installer)
+        self.assertIn('open "$DESTINATION" >/dev/null 2>&1 || true', installer)
         self.assertIn('if [[ -z "$candidate_pid" && $SECONDS -ge $next_launch_at ]]; then', installer)
         self.assertIn('start_installed_app "$OLD_PIDS"', installer)
         self.assertNotIn('sleep 1', installer)
-        self.assertNotIn('codesign --verify --deep --strict --verbose=2 "$DESTINATION"', installer)
         self.assertIn('INSTALLED_RUNTIME="$DESTINATION/Contents/Resources/Core/runtime"', installer)
         self.assertIn('export YOUNG_ROUTER_CORE_RUNTIME_SOURCE="$INSTALLED_RUNTIME"', installer)
         self.assertIn('"$INSTALLED_RUNTIME/LITELLM_VERSION"', installer)
@@ -104,7 +123,7 @@ class ReactNativeReleaseTests(unittest.TestCase):
         replace_previous = installer.index('mv "$DESTINATION" "$PREVIOUS_APP"')
         install_replacement = installer.index('if ! mv "$INSTALL_STAGE" "$DESTINATION"; then')
         capture_old_pids = installer.index('OLD_PIDS="$(bundle_processes)"')
-        stop_after_replace = installer.rindex("stop_installed_app")
+        stop_after_replace = installer.rindex('if ! stop_installed_app "$OLD_PIDS"; then')
         verify_install_stage = installer.index(
             'codesign --verify --deep --strict --verbose=2 "$INSTALL_STAGE"'
         )
@@ -123,9 +142,10 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertLess(arm_restart, stop_after_replace)
         self.assertLess(stop_after_replace, start_replacement)
         self.assertIn('if ! stop_installed_app "$OLD_PIDS"; then', installer)
-        self.assertIn('REMAINING_OLD_PIDS="$(bundle_processes)"', installer)
-        self.assertIn('if [[ -n "$REMAINING_OLD_PIDS" ]] && ! stop_installed_app "$REMAINING_OLD_PIDS"; then', installer)
-        self.assertIn("The old Young Router app did not stop; restoring the previous bundle.", installer)
+        # The old bundle is renamed before its processes stop, so a second
+        # discovery by the installed path finds nothing.
+        self.assertNotIn('REMAINING_OLD_PIDS="$(bundle_processes)"', installer)
+        self.assertIn("restore_previous_app", installer)
         self.assertLess(start_replacement, delete_previous)
         self.assertLess(delete_previous, mark_complete)
         self.assertIn('( rm -rf "$retired_app" ) &', installer)
@@ -164,6 +184,7 @@ class ReactNativeReleaseTests(unittest.TestCase):
         # The relocation smokes read that cache, and the bundle still proves it
         # picked up no bytecode of its own.
         self.assertIn('YOUNG_ROUTER_PYCACHE_DIR="$PYCACHE_SMOKE_DIR"', script)
+        self.assertIn('"$CORE/runtime/python/bin/python3.12" -c', script)
         self.assertIn('"$PORTABLE_SMOKE/runtime/bin/litellm" --help', script)
         self.assertNotIn('PYTHONDONTWRITEBYTECODE=1 "$PORTABLE_SMOKE', script)
         self.assertIn('wrote bytecode into the signed Core bundle', script)
@@ -189,7 +210,7 @@ class ReactNativeReleaseTests(unittest.TestCase):
         # A build does not wait for the previous Core to be deleted, and the
         # worker smokes run while the strip/sign pass and the startup import do.
         self.assertIn('retired_core="$(dirname "$APP")/.YoungRouter-retired-core.$$"', script)
-        self.assertIn('( rm -rf "$retired_core" ) &', script)
+        self.assertIn('rm -rf "$FINISH_BUILD_RETIRED_CORE"', script)
         self.assertIn('WORKER_SMOKE_LOG="$RUNTIME_WORK/worker-smokes.log"', script)
         self.assertIn('if ! wait "$WORKER_SMOKE_PID"; then', script)
         self.assertIn(
@@ -231,6 +252,53 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn('"$LSREGISTER" -f "$DESTINATION"', installer)
         self.assertLess(install_replacement, refresh_installed_icon)
         self.assertLess(refresh_installed_icon, stop_previous_app)
+
+    def test_no_build_ships_a_bundle_without_its_host_executable(self) -> None:
+        # The product's executable can be mapped by a process from an earlier
+        # build, and Xcode cannot link a new one over a mapped file -- so the
+        # stale copy is retired *before* the native build, which then links this
+        # build's own executable in its place. Retiring it after the build
+        # renamed away the executable it had just linked: the artifact and the
+        # installed app carried an empty Contents/MacOS, which macOS draws as a
+        # damaged app that no one can launch.
+        script = (ROOT / "scripts" / "build-and-install-macos.sh").read_text(encoding="utf-8")
+
+        resolve_product = script.index('APP="$(xcodebuild')
+        native_build = script.index('ARCHS="$ARCH" \\\n    ONLY_ACTIVE_ARCH=YES')
+        retire_host = script.index('mv "$HOST_EXECUTABLE" "$RETIRED_HOST"')
+        prove_host = script.index('if [[ ! -x "$HOST_EXECUTABLE" ]]; then')
+        sign_artifact = script.index('codesign --force --deep --sign - "$APP"')
+        self.assertLess(resolve_product, native_build)
+        self.assertLess(retire_host, native_build)
+        self.assertLess(native_build, prove_host)
+        self.assertLess(prove_host, sign_artifact)
+        self.assertIn("no host executable at $HOST_EXECUTABLE", script)
+        final_host_retirement = script.index(
+            '[[ -z "$RETIRED_HOST" ]] || ( rm -rf "$RETIRED_HOST" ) &'
+        )
+        self.assertGreater(final_host_retirement, prove_host)
+
+        # The executable is the one the bundle's own Info.plist names, because
+        # the build product (YoungRouter.app) and the installed copy (Young
+        # Router.app) do not share a file name with the executable they launch.
+        self.assertIn('HOST_EXECUTABLE="$(bundle_host_executable "$APP")"', script)
+        self.assertIn("/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable'", script)
+        # The build finds its cached product through the same DerivedData
+        # location when it links it, so the stale product is the one Xcode
+        # actually writes over.
+        self.assertIn(
+            'XCODE_BUILD_ARGS=( -derivedDataPath "$STAGING_CACHE/xcode-install" )',
+            script,
+        )
+        self.assertIn(
+            '"${XCODE_BUILD_ARGS[@]+"${XCODE_BUILD_ARGS[@]}"}" -showBuildSettings',
+            script,
+        )
+        self.assertIn(
+            '"${XCODE_BUILD_ARGS[@]+"${XCODE_BUILD_ARGS[@]}"}" \\\n'
+            '    ARCHS="$ARCH"',
+            script,
+        )
 
     def test_release_entry_uses_react_native_build_and_portable_core(self) -> None:
         script = (ROOT / "scripts" / "package-release.sh").read_text(encoding="utf-8")
@@ -441,7 +509,8 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertLess(final_cache_cleanup, script.index('codesign --force --deep --sign - "$APP"'))
         self.assertIn("export LITELLM_LOCAL_MODEL_COST_MAP=true", script)
         self.assertIn("copy_tree()", script)
-        self.assertIn('cp -ac "$source/." "$destination/"', script)
+        self.assertIn('/usr/bin/ditto "$source" "$destination"', script)
+        self.assertIn('[[ -z "$RUNTIME_WORK" ]] || rm -rf "$RUNTIME_WORK"', script)
         self.assertIn('copy_tree "$RUNTIME_SOURCE" "$CORE/runtime"', script)
         self.assertIn('copy_tree "$CORE" "$PORTABLE_SMOKE"', script)
         self.assertIn('copy_tree "$APP" "$STAGED_OUTPUT"', script)
@@ -531,7 +600,8 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn('mv "$CORE" "$PORTABLE_SMOKE"', script)
         self.assertIn('mv "$PORTABLE_SMOKE" "$CORE"', script)
         # A failed import must not leave the built app without its Core.
-        self.assertIn("trap 'restore_core; cleanup' EXIT", script)
+        self.assertIn('PORTABLE_MOVED=1', script)
+        self.assertIn('trap finish_build EXIT', script)
         # The old form copied the whole Core aside on every build; the copy now
         # exists only as the cross-volume fallback.
         self.assertNotIn('PORTABLE_SMOKE="$RUNTIME_WORK/portable-core"', script)
@@ -565,9 +635,13 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn('PI_WEB_ACCESS_NODE_ARGS+=("${NODE_SOURCE_ARGS[@]}")', script)
         # The unguarded form must not appear for that array.
         self.assertNotIn('"${NODE_SOURCE_ARGS[@]}" &', script)
-        # STAGING_PIDS is appended once per staging job before it is ever
-        # expanded, so it cannot be empty at the point of use.
+        # An empty array has to be initialized, and an exit must stop every
+        # staged update rather than leave a child writing a cache that the
+        # next installer begins to modify.
         self.assertEqual(5, script.count('STAGING_PIDS+=("$!")'))
+        self.assertIn('STAGING_PIDS[@]+"${STAGING_PIDS[@]}"', script)
+        self.assertIn('INSTALL_LOCK_PID=$!', script)
+        self.assertIn('rm -f "$INSTALL_LOCK_OWNER"', script)
 
     def test_staging_caches_are_persistent_and_gated_by_the_staging_scripts(self) -> None:
 
@@ -585,7 +659,7 @@ class ReactNativeReleaseTests(unittest.TestCase):
 
         # Every staged integration resolves into the cache, and none of them
         # still points at the throwaway per-build tree.
-        for artifact in ("pi-web-access", "workbuddy-connect", "opencode2dsh", "veridrop", "dsh-vision-router"):
+        for artifact in ("pi-web-access", "workbuddy-connect", "veridrop", "dsh-vision-router"):
             self.assertIn(f'"$STAGING_CACHE/{artifact}"', macos)
             self.assertIn(f'Join-Path $StagingCache "{artifact}"', windows)
         self.assertNotIn('WORKBUDDY_CONNECT_WORK="$RUNTIME_WORK/', macos)

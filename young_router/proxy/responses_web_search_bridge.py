@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 
 from ..adapters import pi_web_access as _pi_web_access_module
 from . import responses_output as _responses_output_module
@@ -98,6 +99,10 @@ def _function_call_name(call: Any) -> Optional[str]:
 
 
 def _is_web_search_function_call_item(item: Any) -> bool:
+    # Hosted web search and the local bridge use different wire item types.
+    # Recognize only the ordinary pi-web-access function names here; treating
+    # every search-looking text or hosted item as a function call causes the
+    # bridge to manufacture a continuation for a response that already ended.
     if not isinstance(item, dict):
         return False
     item_type = item.get("type")
@@ -328,20 +333,7 @@ def _web_search_action_from_call(call: dict[str, Any]) -> Optional[dict[str, str
         url = _external_web_search_clean_url(
             parsed.get("url") or parsed.get("href") or parsed.get("page_url")
         )
-        if url is None and isinstance(parsed.get("urls"), list):
-            for candidate in parsed["urls"]:
-                url = _external_web_search_clean_url(candidate)
-                if url:
-                    break
         return {"type": "openPage", "url": url} if url else None
-
-    if tool_name == "web_search":
-        queries = parsed.get("queries")
-        if isinstance(queries, list):
-            for candidate in queries:
-                if isinstance(candidate, str) and candidate.strip():
-                    parsed = {**parsed, "query": candidate.strip()}
-                    break
 
     action_type = _external_web_search_action_name(
         parsed.get("action") or parsed.get("type") or parsed.get("operation")
@@ -396,6 +388,51 @@ def _web_search_action_from_call(call: dict[str, Any]) -> Optional[dict[str, str
     return None
 
 
+def _web_search_actions_from_call(call: dict[str, Any]) -> list[dict[str, str]]:
+    """Expand one function call into bounded local search actions.
+
+    queries and urls are one model call with multiple requested actions. Keep
+    the original call id in protocol history; only the local execution plan is
+    expanded here.
+    """
+    parsed = _web_search_arguments_from_call(call)
+    name = _function_call_name(call)
+    if not isinstance(parsed, dict):
+        action = _web_search_action_from_call(call)
+        return [action] if action else []
+    if name == "web_search" and isinstance(parsed.get("queries"), list):
+        actions: list[dict[str, str]] = []
+        options = {
+            key: json.dumps(parsed[key], ensure_ascii=False, separators=(",", ":"))
+            for key in ("numResults", "includeContent", "recencyFilter", "domainFilter", "provider")
+            if parsed.get(key) is not None
+        }
+        for candidate in parsed["queries"]:
+            if isinstance(candidate, str) and candidate.strip():
+                actions.append({"type": "search", "query": candidate.strip(), **options})
+        return actions
+    if name == "web_search":
+        action = _web_search_action_from_call(call)
+        if action and action.get("type") == "search":
+            options = {
+                key: json.dumps(parsed[key], ensure_ascii=False, separators=(",", ":"))
+                for key in ("numResults", "includeContent", "recencyFilter", "domainFilter", "provider")
+                if parsed.get(key) is not None
+            }
+            action.update(options)
+        return [action] if action else []
+    if name == "fetch_content" and isinstance(parsed.get("urls"), list):
+        actions: list[dict[str, str]] = []
+        for candidate in [parsed.get("url"), *parsed["urls"]]:
+            url = _external_web_search_clean_url(candidate)
+            action = {"type": "openPage", "url": url} if url else None
+            if action and action not in actions:
+                actions.append(action)
+        return actions
+    action = _web_search_action_from_call(call)
+    return [action] if action else []
+
+
 def _external_web_search_valid_action(action: Optional[dict[str, str]]) -> Optional[dict[str, str]]:
     if not isinstance(action, dict):
         return None
@@ -443,7 +480,15 @@ def _external_web_search_action_key(action: dict[str, str]) -> str:
             f"{action.get('pattern', '').strip().lower()}"
         )
     page = _external_web_search_page_number(action.get("page")) or 1
-    return f"search:{action.get('query', '').strip().lower()}:page:{page}"
+    options = {
+        key: action[key]
+        for key in ("numResults", "includeContent", "recencyFilter", "domainFilter", "provider")
+        if key in action
+    }
+    return (
+        f"search:{action.get('query', '').strip().lower()}:page:{page}:"
+        f"{json.dumps(options, sort_keys=True, ensure_ascii=False)}"
+    )
 
 
 def _external_web_search_action_label(action: dict[str, str]) -> str:
@@ -774,10 +819,20 @@ def _mark_provider_native_web_search_event(
 _PROVIDER_HIDDEN_WEB_SEARCH_REASONING_ID_PREFIX = "tco_"
 _PROVIDER_HIDDEN_WEB_SEARCH_DISPLAY_QUERY = "Web search"
 
-_RAW_TOOL_CALL_START = "<tool_call"
+_RAW_TOOL_CALL_START = "<tool_call>"
 _RAW_TOOL_CALL_END = "</tool_call>"
-_RAW_TOOL_CALL_BLOCK_RE = re.compile(r"(?is)<tool_call\b[^>]*>.*?</tool_call>")
-_RAW_TOOL_CALL_TAIL_RE = re.compile(r"(?is)<tool_call\b[^>]*>.*$")
+_RAW_TOOL_CALL_BLOCK_RE = re.compile(r"(?ims)^[ \t]*<tool_call>.*?</tool_call>")
+_RAW_TOOL_CALL_TAIL_RE = re.compile(r"(?ims)^[ \t]*<tool_call>.*$")
+_DSML_TOOL_CALL_START = "<\uff5c\uff5cDSML\uff5c\uff5c calls>"
+_DSML_TOOL_CALL_END = "</\uff5c\uff5cDSML\uff5c\uff5c calls>"
+_DSML_TOOL_CALL_BLOCK_RE = re.compile(
+    r"(?ims)^[ \t]*<\uff5c\uff5cDSML\uff5c\uff5c\s+calls>.*?</\uff5c\uff5cDSML\uff5c\uff5c\s+calls>"
+)
+_DSML_TOOL_CALL_TAIL_RE = re.compile(
+    r"(?ims)^[ \t]*<\uff5c\uff5cDSML\uff5c\uff5c\s+calls>.*$"
+)
+_RAW_TOOL_CALL_START_MARKERS = (_RAW_TOOL_CALL_START, _DSML_TOOL_CALL_START)
+_RAW_TOOL_CALL_END_MARKERS = (_RAW_TOOL_CALL_END, _DSML_TOOL_CALL_END)
 
 
 def _raw_tool_call_pending_prefix_len(text: str, marker: str) -> int:
@@ -791,65 +846,181 @@ def _raw_tool_call_pending_prefix_len(text: str, marker: str) -> int:
 
 
 def _strip_raw_tool_call_blocks(text: str) -> str:
-    if not isinstance(text, str) or _RAW_TOOL_CALL_START not in text.lower():
+    if not isinstance(text, str):
         return text
-    cleaned = _RAW_TOOL_CALL_BLOCK_RE.sub("", text)
-    cleaned = _RAW_TOOL_CALL_TAIL_RE.sub("", cleaned)
+    # Code examples are content, not wire tool calls.
+    parts = re.split(r"(```[\s\S]*?```|`[^`\n]*`)", text)
+    for index in range(0, len(parts), 2):
+        segment = parts[index]
+        cleaned = _RAW_TOOL_CALL_BLOCK_RE.sub("", segment)
+        cleaned = _RAW_TOOL_CALL_TAIL_RE.sub("", cleaned)
+        cleaned = _DSML_TOOL_CALL_BLOCK_RE.sub("", cleaned)
+        cleaned = _DSML_TOOL_CALL_TAIL_RE.sub("", cleaned)
+        if cleaned != segment and cleaned.strip() in {".", "。"}:
+            cleaned = ""
+        parts[index] = cleaned
+    cleaned = "".join(parts)
+    if cleaned == text:
+        return text
     cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    return cleaned
+    return re.sub(r"\n{3,}", "\n\n", cleaned)
+
+
+def _raw_dsml_tool_call_items(text: str) -> list[dict[str, Any]]:
+    # DSML delimiters may be split across streamed deltas, so callers feed a
+    # whole accumulated block here. Fenced examples remain prose and are
+    # excluded by the segment split; an orphan period before a real block is
+    # removed by the streaming filter rather than emitted as visible output.
+    if not isinstance(text, str):
+        return []
+    invoke_pattern = re.compile(
+        r'(?is)<\uff5c\uff5cDSML\uff5c\uff5c\s+invoke\s+name="([^"]+)"\s*>(.*?)'
+        r'</\uff5c\uff5cDSML\uff5c\uff5c\s+invoke\s*>'
+    )
+    parameter_pattern = re.compile(
+        r'(?is)<\uff5c\uff5cDSML\uff5c\uff5c\s+parameter\s+name="([^"]+)"'
+        r'(\s+[^>]*)?>(.*?)</\uff5c\uff5cDSML\uff5c\uff5c\s+parameter\s*>'
+    )
+    items: list[dict[str, Any]] = []
+    segments = re.split(r"(```[\s\S]*?```|`[^`\n]*`)", text)
+    for segment in segments[::2]:
+        for block in re.finditer(r"(?is)<\uff5c\uff5cDSML\uff5c\uff5c\s+calls>.*?</\uff5c\uff5cDSML\uff5c\uff5c\s+calls>", segment):
+            for invoke in invoke_pattern.finditer(block.group(0)):
+                name = html.unescape(invoke.group(1)).strip()
+                if not name:
+                    continue
+                arguments: dict[str, Any] = {}
+                for parameter in parameter_pattern.finditer(invoke.group(2)):
+                    key = html.unescape(parameter.group(1)).strip()
+                    value = html.unescape(parameter.group(3))
+                    attributes = parameter.group(2) or ""
+                    if re.search(r'\bstring="false"', attributes, re.IGNORECASE):
+                        value = json.loads(value)
+                    arguments[key] = value
+                call_id = f"dsml_call_{time.time_ns()}"
+                items.append({
+                    "id": call_id,
+                    "call_id": call_id,
+                    "type": "function_call",
+                    "name": name,
+                    "arguments": json.dumps(arguments, ensure_ascii=False),
+                    "status": "completed",
+                })
+    return items
 
 
 class _RawToolCallTextFilter:
     def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self._reset_segment()
+        self.raw_tool_call_items: list[dict[str, Any]] = []
+
+    def _reset_segment(self) -> None:
         self.buffer = ""
-        self.dropping = False
+        self.end_marker: Optional[str] = None
+        self.line_prefix = ""
+        self.code_delimiter = ""
+        self.hidden_block_parts: list[str] = []
+
+    def finish_message(self, text: Optional[str] = None) -> None:
+        # Some Responses-compatible providers emit the tool block in text
+        # deltas but omit that text from response.completed. Keep the parsed
+        # call until that terminal event so the tool protocol survives.
+        if not self.raw_tool_call_items and isinstance(text, str):
+            self.raw_tool_call_items.extend(_raw_dsml_tool_call_items(text))
+        self._reset_segment()
+
+    def take_raw_tool_call_items(self) -> list[dict[str, Any]]:
+        items = self.raw_tool_call_items
+        self.raw_tool_call_items = []
+        self._reset_segment()
+        return items
+
+    def _visible(self, text: str) -> str:
+        for match in re.finditer(r"`+", text):
+            delimiter = match.group(0)
+            if not self.code_delimiter:
+                self.code_delimiter = delimiter
+            elif delimiter == self.code_delimiter:
+                self.code_delimiter = ""
+        self.line_prefix = (self.line_prefix + text).rsplit("\n", 1)[-1]
+        return text
+
+    def _can_start(self, prefix: str) -> bool:
+        delimiter = self.code_delimiter
+        for match in re.finditer(r"`+", prefix):
+            value = match.group(0)
+            if not delimiter:
+                delimiter = value
+            elif delimiter == value:
+                delimiter = ""
+        return not delimiter and not (
+            self.line_prefix + prefix
+        ).rsplit("\n", 1)[-1].strip()
 
     def consume(self, text: str) -> str:
         if not isinstance(text, str) or not text:
             return ""
         self.buffer += text
         output: list[str] = []
-
+        markers = (_RAW_TOOL_CALL_START, _DSML_TOOL_CALL_START)
         while self.buffer:
             lowered = self.buffer.lower()
-            if self.dropping:
-                end_index = lowered.find(_RAW_TOOL_CALL_END)
+            if self.end_marker:
+                end_index = lowered.find(self.end_marker.lower())
                 if end_index < 0:
-                    keep = _raw_tool_call_pending_prefix_len(
-                        self.buffer,
-                        _RAW_TOOL_CALL_END,
-                    )
+                    keep = _raw_tool_call_pending_prefix_len(self.buffer, self.end_marker)
+                    captured = self.buffer[:-keep] if keep else self.buffer
+                    if captured:
+                        self.hidden_block_parts.append(captured)
                     self.buffer = self.buffer[-keep:] if keep else ""
                     break
-                self.buffer = self.buffer[end_index + len(_RAW_TOOL_CALL_END) :]
-                self.dropping = False
+                block_text = (
+                    "".join(self.hidden_block_parts)
+                    + self.buffer[:end_index + len(self.end_marker)]
+                )
+                self.raw_tool_call_items.extend(
+                    _raw_dsml_tool_call_items(block_text)
+                )
+                self.hidden_block_parts = []
+                self.buffer = self.buffer[end_index + len(self.end_marker):]
+                self.end_marker = None
                 continue
-
-            start_index = lowered.find(_RAW_TOOL_CALL_START)
-            if start_index >= 0:
-                if start_index:
-                    output.append(self.buffer[:start_index])
-                self.buffer = self.buffer[start_index:]
-                self.dropping = True
+            candidates = [
+                (index, marker)
+                for marker in markers
+                if (index := lowered.find(marker.lower())) >= 0
+                and self._can_start(self.buffer[:index])
+            ]
+            if candidates:
+                index, marker = min(candidates, key=lambda value: value[0])
+                prefix = self.buffer[:index]
+                if prefix.strip() not in {".", "。"}:
+                    output.append(self._visible(prefix))
+                self.buffer = self.buffer[index:]
+                self.hidden_block_parts = []
+                self.end_marker = (
+                    _DSML_TOOL_CALL_END if marker == _DSML_TOOL_CALL_START
+                    else _RAW_TOOL_CALL_END
+                )
                 continue
-
-            keep = _raw_tool_call_pending_prefix_len(self.buffer, _RAW_TOOL_CALL_START)
-            if keep:
-                if len(self.buffer) > keep:
-                    output.append(self.buffer[:-keep])
-                self.buffer = self.buffer[-keep:]
+            keep = max(
+                (_raw_tool_call_pending_prefix_len(self.buffer, marker)
+                 for marker in markers), default=0,
+            )
+            if keep and self._can_start(self.buffer[:-keep]):
+                prefix = self.buffer[:-keep]
+                if prefix.strip() not in {".", "。"}:
+                    output.append(self._visible(prefix))
+                    self.buffer = self.buffer[-keep:]
                 break
-
-            output.append(self.buffer)
+            if not self.line_prefix.strip() and self.buffer.strip() in {".", "。"}:
+                break
+            output.append(self._visible(self.buffer))
             self.buffer = ""
-            break
-
         return "".join(output)
-
-    def reset(self) -> None:
-        self.buffer = ""
-        self.dropping = False
 
 
 def _provider_hosted_web_search_type(value: Any) -> Optional[str]:
@@ -1681,8 +1852,11 @@ def _sanitize_response_raw_tool_call_text(response: Any) -> Any:
         return response
     changed = False
 
+    raw_tool_calls: list[dict[str, Any]] = []
     output_text = payload.get("output_text")
     if isinstance(output_text, str):
+        if not isinstance(payload.get("output"), list) or not payload["output"]:
+            raw_tool_calls = _raw_dsml_tool_call_items(output_text)
         cleaned_output_text = _strip_raw_tool_call_blocks(output_text)
         if cleaned_output_text != output_text:
             payload = copy.deepcopy(payload)
@@ -1696,12 +1870,31 @@ def _sanitize_response_raw_tool_call_text(response: Any) -> Any:
     if isinstance(output, list):
         clean_output: list[Any] = []
         for item in output:
+            if isinstance(item, dict) and item.get("type") == "message":
+                message_text = _responses_output_module._response_text(item)
+                dsml_calls = _raw_dsml_tool_call_items(message_text)
+                if dsml_calls:
+                    clean_item, item_changed = _sanitize_message_raw_tool_calls(item)
+                    if item_changed and _responses_output_module._response_text(clean_item).strip():
+                        clean_output.append(clean_item)
+                    raw_tool_calls.extend(dsml_calls)
+                    changed = True
+                    continue
             clean_item, item_changed = _sanitize_message_raw_tool_calls(item)
             clean_output.append(clean_item)
             changed = changed or item_changed
         if changed:
             payload = copy.deepcopy(payload)
             payload["output"] = clean_output
+    if raw_tool_calls:
+        payload = copy.deepcopy(payload)
+        output = payload.setdefault("output", [])
+        if not isinstance(output, list):
+            output = []
+            payload["output"] = output
+        output.extend(raw_tool_calls)
+        payload.pop("output_text", None)
+        changed = True
 
     return payload if changed else response
 
@@ -1910,9 +2103,9 @@ def _sanitize_raw_tool_call_text_stream_chunk(
         return _streaming_module._json_stream_event(clean_chunk) if isinstance(chunk, _JSONStreamEvent) else clean_chunk
 
     if chunk_type == "response.output_text.done":
-        if text_filter is not None:
-            text_filter.reset()
         text = dumped.get("text")
+        if text_filter is not None:
+            text_filter.finish_message(text if isinstance(text, str) else None)
         if not isinstance(text, str):
             return chunk
         cleaned_text = _strip_raw_tool_call_blocks(text)
@@ -1943,6 +2136,33 @@ def _sanitize_raw_tool_call_text_stream_chunk(
     if chunk_type == "response.completed":
         response = dumped.get("response")
         clean_response = _sanitize_response_stream_payload(response)
+        raw_tool_calls = (
+            text_filter.take_raw_tool_call_items()
+            if text_filter is not None
+            else []
+        )
+        if raw_tool_calls:
+            payload = _streaming_module._jsonable(clean_response)
+            if isinstance(payload, dict):
+                output = payload.get("output")
+                output = list(output) if isinstance(output, list) else []
+                existing_counts: dict[tuple[str, str], int] = {}
+                for item in output:
+                    if not isinstance(item, dict) or item.get("type") != "function_call":
+                        continue
+                    key = (str(item.get("name") or ""), str(item.get("arguments") or ""))
+                    existing_counts[key] = existing_counts.get(key, 0) + 1
+                for item in raw_tool_calls:
+                    key = (str(item.get("name") or ""), str(item.get("arguments") or ""))
+                    count = existing_counts.get(key, 0)
+                    if count:
+                        existing_counts[key] = count - 1
+                    else:
+                        output.append(item)
+                payload["output"] = output
+                if not _responses_output_module._response_text(payload).strip():
+                    payload.pop("output_text", None)
+                clean_response = payload
         if clean_response is response:
             return chunk
         clean_chunk = copy.deepcopy(dumped)
@@ -2195,28 +2415,15 @@ def _web_search_actions_from_response(response: Any) -> list[dict[str, str]]:
     actions: list[dict[str, str]] = []
     seen: set[str] = set()
     for call in calls:
-        if _function_call_name(call) == "web_search":
-            parsed = _web_search_arguments_from_call(call)
-            raw_queries = parsed.get("queries") if isinstance(parsed, dict) else None
-            if isinstance(raw_queries, list):
-                for raw_query in raw_queries:
-                    if not isinstance(raw_query, str) or not raw_query.strip():
-                        continue
-                    action = {"type": "search", "query": raw_query.strip()}
-                    key = _external_web_search_action_key(action)
-                    if key not in seen:
-                        seen.add(key)
-                        actions.append(action)
+        for raw_action in _web_search_actions_from_call(call):
+            action = _external_web_search_valid_action(raw_action)
+            if not action:
                 continue
-        action = _web_search_action_from_call(call)
-        action = _external_web_search_valid_action(action)
-        if not action:
-            continue
-        key = _external_web_search_action_key(action)
-        if key in seen:
-            continue
-        seen.add(key)
-        actions.append(action)
+            key = _external_web_search_action_key(action)
+            if key in seen:
+                continue
+            seen.add(key)
+            actions.append(action)
     return actions
 
 
@@ -2232,103 +2439,6 @@ def _web_search_actions_for_request(
 ) -> list[dict[str, str]]:
     _ = request_kwargs
     return _web_search_actions_from_response(response)
-
-
-def _external_web_search_force_low_reasoning(
-    value: Any,
-    *,
-    in_reasoning: bool = False,
-) -> tuple[Any, bool]:
-    if not isinstance(value, dict):
-        return value, False
-
-    changed = False
-    updated: dict[Any, Any] = {}
-    for key, item in value.items():
-        if key == "reasoning_effort" and isinstance(item, str) and item.strip():
-            updated[key] = "low"
-            changed = changed or item.strip().lower() != "low"
-            continue
-        if key == "reasoning" and isinstance(item, dict):
-            mapped_item, item_changed = (
-                _external_web_search_force_low_reasoning(
-                    item,
-                    in_reasoning=True,
-                )
-            )
-            updated[key] = mapped_item
-            changed = changed or item_changed
-            continue
-        if in_reasoning and key == "effort" and isinstance(item, str) and item.strip():
-            updated[key] = "low"
-            changed = changed or item.strip().lower() != "low"
-            continue
-        if key in {"extra_body", "litellm_params"} and isinstance(item, dict):
-            mapped_item, item_changed = (
-                _external_web_search_force_low_reasoning(item)
-            )
-            updated[key] = mapped_item
-            changed = changed or item_changed
-            continue
-        updated[key] = item
-
-    return (updated if changed else value), changed
-
-
-def _external_web_search_low_reasoning_kwargs(
-    request_kwargs: Optional[dict],
-    *,
-    force_top_level: bool = False,
-) -> dict[str, Any]:
-    low_kwargs = _external_web_search_safe_request_base(request_kwargs)
-    mapped_kwargs, _ = _external_web_search_force_low_reasoning(
-        low_kwargs
-    )
-    if isinstance(mapped_kwargs, dict):
-        low_kwargs = mapped_kwargs.copy()
-    if force_top_level or "reasoning" in low_kwargs:
-        low_kwargs["reasoning"] = {"effort": "low"}
-    if "reasoning_effort" in low_kwargs:
-        low_kwargs["reasoning_effort"] = "low"
-    return low_kwargs
-
-
-def _external_web_search_progress_preamble_reason(text: str) -> Optional[str]:
-    compact = " ".join(str(text or "").split()).strip()
-    if not compact or len(compact) > 1200:
-        return None
-    lowered = compact.lower()
-    if _RAW_TOOL_CALL_START in lowered:
-        return None
-    if "mcp__" in lowered and "web_search" in lowered:
-        return None
-    if re.search(r"\bweb[_ -]?search\s*\(", lowered):
-        return None
-
-    cjk_action = (
-        r"(?:搜索|检索|查找|查证|核查|核实|核验|验证|确认|求证|获取|收集|阅读|打开|"
-        r"读取|调用|执行|深挖|调查|研究|继续查|再查)"
-    )
-    cjk_starter = r"(?:我(?:将|来|会|要|需要)|让我|现在我(?:来|将|会|要|需要)?|接下来我|下面我|先|继续|再)"
-    if re.search(cjk_starter + r"[^。！？\n]{0,120}" + cjk_action, compact):
-        return "web_search_progress_preamble"
-
-    english_action = (
-        r"(?:search|look\s+up|verify|check|confirm|fetch|collect|read|open|"
-        r"investigate|research|continue|run\s+parallel\s+searches)"
-    )
-    english_starter = (
-        r"(?:i\s*(?:will|'ll|’ll|am\s+going\s+to|need\s+to|can)|"
-        r"let\s+me|now\s+i\s*(?:will|'ll|’ll|am\s+going\s+to)?|"
-        r"next\s+i\s*(?:will|'ll|’ll|am\s+going\s+to)?|i'll\s+continue)"
-    )
-    if re.search(
-        english_starter + r"[^.!?\n]{0,180}\b" + english_action + r"\b",
-        lowered,
-    ):
-        return "web_search_progress_preamble"
-
-    return None
 
 
 def _external_web_search_completed_assistant_message_items(response: Any) -> list[dict[str, Any]]:
@@ -2412,6 +2522,7 @@ async def _external_web_search_run_query(
     query: str,
     *,
     page: int = 1,
+    options: Optional[dict[str, Any]] = None,
 ) -> tuple[str, list[str]]:
     try:
         attempts = _external_web_search_rate_limit_retry_attempts() + 1
@@ -2422,7 +2533,7 @@ async def _external_web_search_run_query(
                 text, structured = await asyncio.to_thread(
                     _pi_web_access_module._pi_web_access_search_sync,
                     query,
-                    page=page,
+                    **({"page": page, "options": options} if options else {"page": page}),
                 )
                 break
             except Exception as exc:
@@ -2609,7 +2720,17 @@ async def _external_web_search_run_action(
         return section, urls, action
     query = action.get("query", "")
     page = _external_web_search_page_number(action.get("page")) or 1
-    section, urls = await _external_web_search_run_query(query, page=page)
+    options: dict[str, Any] = {}
+    for key in ("numResults", "includeContent", "recencyFilter", "domainFilter", "provider"):
+        raw_value = action.get(key)
+        if isinstance(raw_value, str):
+            try:
+                options[key] = json.loads(raw_value)
+            except (TypeError, ValueError):
+                continue
+    section, urls = await _external_web_search_run_query(
+        query, page=page, options=options
+    )
     return section, urls, action
 
 
@@ -2627,6 +2748,9 @@ async def _external_web_search_run_actions(
         )
     )
     sections = [section for section, _urls, _action in action_results]
+    _external_web_search_remember_action_outputs(
+        request_kwargs, [(action, section) for section, _urls, action in action_results]
+    )
     source_urls_by_action = [urls for _section, urls, _action in action_results]
     completed_actions = [action for _section, _urls, action in action_results]
     source_urls: list[str] = []
@@ -2722,9 +2846,6 @@ def _external_web_search_synthesis_invalid_reason(response: Any) -> Optional[str
     text = _responses_output_module._response_text(response)
     if not text.strip():
         return "empty_synthesis"
-    progress_reason = _external_web_search_progress_preamble_reason(text)
-    if progress_reason is not None:
-        return progress_reason
     compact = " ".join(text.split())
     lowered = compact.lower()
     if re.search(r"<\s*/?\s*tool_call\b", lowered):
@@ -2746,9 +2867,6 @@ def _external_web_search_initial_no_action_invalid_reason(response: Any) -> Opti
     text = _responses_output_module._response_text(response)
     if not text.strip():
         return None
-    progress_reason = _external_web_search_progress_preamble_reason(text)
-    if progress_reason is not None:
-        return progress_reason
     compact = " ".join(text.split())
     lowered = compact.lower()
     if re.search(r"<\s*/?\s*tool_call\b", lowered):
@@ -2896,6 +3014,8 @@ _EXTERNAL_WEB_SEARCH_CONVERSATION_CONTEXT_MAX_CHARS = 8000
 _EXTERNAL_WEB_SEARCH_PENDING_RECOVERY_REQUEST_KEY = (
     "external_web_search_pending_recovery_request"
 )
+_EXTERNAL_WEB_SEARCH_PROTOCOL_HISTORY_KEY = "external_web_search_protocol_history"
+_EXTERNAL_WEB_SEARCH_ACTION_OUTPUTS_KEY = "external_web_search_action_outputs"
 _EXTERNAL_WEB_SEARCH_REQUEST_BASE_KEYS = (
     "call_type",
     "model",
@@ -2956,38 +3076,44 @@ _EXTERNAL_WEB_SEARCH_INTERNAL_REQUEST_KEYS = {
 }
 
 
-def _external_web_search_safe_json_value(value: Any, *, depth: int = 0) -> Any:
-    if value is None or depth > 8:
-        return None
-    if isinstance(value, (str, int, float, bool)):
+def _external_web_search_safe_json_value(
+    value: Any, *, runtime_metadata: bool = True, ancestors: Optional[set[int]] = None,
+) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
         return value
+    ancestors = set() if ancestors is None else ancestors
+    if id(value) in ancestors:
+        return None
+    nested_ancestors = ancestors | {id(value)}
     if isinstance(value, (list, tuple, set)):
-        cleaned_list = [
-            item
-            for item in (
-                _external_web_search_safe_json_value(item, depth=depth + 1)
-                for item in value
+        cleaned_list: list[Any] = []
+        for item in value:
+            cleaned = _external_web_search_safe_json_value(
+                item, runtime_metadata=runtime_metadata, ancestors=nested_ancestors,
             )
-            if item is not None
-        ]
+            if cleaned is not None or item is None:
+                cleaned_list.append(cleaned)
         return cleaned_list
     if isinstance(value, dict):
-        cleaned: dict[str, Any] = {}
+        cleaned_dict: dict[str, Any] = {}
         for key, item in value.items():
             key_text = str(key)
-            if key_text in _EXTERNAL_WEB_SEARCH_INTERNAL_REQUEST_KEYS:
+            if runtime_metadata and key_text in _EXTERNAL_WEB_SEARCH_INTERNAL_REQUEST_KEYS:
                 continue
-            cleaned_item = _external_web_search_safe_json_value(
+            cleaned = _external_web_search_safe_json_value(
                 item,
-                depth=depth + 1,
+                runtime_metadata=runtime_metadata and key_text not in {"input", "tools", "messages"},
+                ancestors=nested_ancestors,
             )
-            if cleaned_item is not None:
-                cleaned[key_text] = cleaned_item
-        return cleaned
+            if cleaned is not None or item is None:
+                cleaned_dict[key_text] = cleaned
+        return cleaned_dict
     json_value = _streaming_module._jsonable(value)
-    if json_value is None or json_value is value:
-        return json_value
-    return _external_web_search_safe_json_value(json_value, depth=depth + 1)
+    if json_value is value:
+        return None
+    return _external_web_search_safe_json_value(
+        json_value, runtime_metadata=runtime_metadata, ancestors=nested_ancestors,
+    )
 
 
 def _external_web_search_safe_payload_copy(
@@ -3008,7 +3134,9 @@ def _external_web_search_safe_request_base(
     for key in _EXTERNAL_WEB_SEARCH_REQUEST_BASE_KEYS:
         if key not in request_kwargs:
             continue
-        value = _external_web_search_safe_json_value(request_kwargs.get(key))
+        value = _external_web_search_safe_json_value(
+            request_kwargs.get(key), runtime_metadata=key not in {"input", "tools", "messages"},
+        )
         if value is not None:
             payload[key] = value
     return payload
@@ -3190,6 +3318,118 @@ def _external_web_search_continuation_evidence(search_results: str) -> str:
     )
 
 
+def _external_web_search_response_output_items(response: Any) -> list[dict[str, Any]]:
+    payload = _streaming_module._jsonable(response)
+    if not isinstance(payload, dict) or not isinstance(payload.get("output"), list):
+        return []
+    return [
+        copy.deepcopy(item)
+        for item in payload["output"]
+        if isinstance(item, dict)
+    ]
+
+
+def _external_web_search_tool_call_id(call: Any) -> Optional[str]:
+    if not isinstance(call, dict):
+        return None
+    value = call.get("call_id") or call.get("id")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _external_web_search_protocol_history(
+    request_kwargs: Optional[dict],
+    response: Any,
+    tool_output: str,
+) -> list[dict[str, Any]]:
+    metadata = _request_context_module._request_metadata_dict(
+        request_kwargs,
+        "litellm_metadata",
+    ) or {}
+    history = metadata.get(_EXTERNAL_WEB_SEARCH_PROTOCOL_HISTORY_KEY)
+    if isinstance(history, list):
+        items = [copy.deepcopy(item) for item in history if isinstance(item, dict)]
+    else:
+        original_input = request_kwargs.get("input") if isinstance(request_kwargs, dict) else None
+        if isinstance(original_input, list):
+            items = copy.deepcopy(original_input)
+        elif isinstance(original_input, str) and original_input.strip():
+            items = [{"role": "user", "content": original_input}]
+        else:
+            items = []
+
+    response_items = _external_web_search_response_output_items(response)
+    response_call_index = 0
+    calls: list[dict[str, Any]] = []
+    for item in response_items:
+        if not _is_web_search_function_call_item(item):
+            continue
+        call_id = _external_web_search_tool_call_id(item)
+        if call_id is None:
+            call_id = f"ws_bridge_call_{len(items)}_{response_call_index}"
+            item["call_id"] = call_id
+        response_call_index += 1
+        calls.append(item)
+    if response_items:
+        items.extend(response_items)
+
+    output = str(tool_output or "").strip()
+    action_outputs = metadata.get(_EXTERNAL_WEB_SEARCH_ACTION_OUTPUTS_KEY) or {}
+    for call in calls:
+        actions = _web_search_actions_from_response({"output": [call]})
+        sections = [action_outputs.get(_external_web_search_action_key(action)) for action in actions]
+        call_output = output
+        if sections and all(isinstance(section, str) for section in sections):
+            call_output = "\n\n".join(sections)
+        elif action_outputs:
+            call_output = json.dumps({
+                "error": "web_search_action_budget_exhausted",
+                "unexecuted_actions": [
+                    action for action, section in zip(actions, sections) if section is None
+                ],
+            }, ensure_ascii=False)
+        items.append(
+            {
+                "type": "function_call_output",
+                "call_id": _external_web_search_tool_call_id(call),
+                "output": call_output,
+            }
+        )
+    return items
+
+
+def _external_web_search_remember_action_outputs(
+    request_kwargs: Optional[dict],
+    results: list[tuple[dict[str, str], str]],
+) -> None:
+    if not isinstance(request_kwargs, dict):
+        return
+    metadata = (_request_context_module._request_metadata_dict(
+        request_kwargs, "litellm_metadata",
+    ) or {}).copy()
+    outputs = dict(metadata.get(_EXTERNAL_WEB_SEARCH_ACTION_OUTPUTS_KEY) or {})
+    for action, section in results:
+        outputs[_external_web_search_action_key(action)] = section
+    metadata[_EXTERNAL_WEB_SEARCH_ACTION_OUTPUTS_KEY] = outputs
+    request_kwargs["litellm_metadata"] = metadata
+
+
+def _external_web_search_set_protocol_history(
+    request_kwargs: Optional[dict],
+    history: list[dict[str, Any]],
+) -> None:
+    if not isinstance(request_kwargs, dict):
+        return
+    metadata = _request_context_module._request_metadata_dict(
+        request_kwargs,
+        "litellm_metadata",
+    ) or {}
+    updated = _external_web_search_safe_payload_copy(metadata)
+    updated[_EXTERNAL_WEB_SEARCH_PROTOCOL_HISTORY_KEY] = copy.deepcopy(history)
+    request_kwargs["litellm_metadata"] = updated
+
+
 def _external_web_search_fallback_answer(
     search_results: str,
     *,
@@ -3268,18 +3508,6 @@ def _external_web_search_inherit_active_chat_surface(
         target_kwargs[_CURRENT_UPSTREAM_URL_SURFACE_KEY] = surface
 
 
-def _external_web_search_chat_synthesis_messages(
-    call_kwargs: dict[str, Any],
-) -> list[dict[str, str]]:
-    messages: list[dict[str, str]] = []
-    instructions = call_kwargs.get("instructions")
-    if isinstance(instructions, str) and instructions.strip():
-        messages.append({"role": "system", "content": instructions.strip()})
-    prompt = call_kwargs.get("input")
-    if not isinstance(prompt, str) or not prompt.strip():
-        prompt = _external_web_search_user_prompt_text(call_kwargs)
-    messages.append({"role": "user", "content": str(prompt or "").strip()})
-    return messages
 
 
 def _external_web_search_chat_message_content(value: Any) -> str:
@@ -3472,25 +3700,27 @@ def _external_web_search_continuation_tools(
     tools: list[dict[str, Any]] = []
     seen_names: set[str] = set()
     seen_direct_tool = False
-    if isinstance(request_tools, list):
-        for tool in request_tools:
-            if not isinstance(tool, dict):
-                continue
-            tool_type = tool.get("type")
-            # The bridge answers for the search itself, so the provider-native
-            # search tool it replaces does not travel. Every other tool the
-            # client declared does: a turn that went looking for evidence comes
-            # back to the same tools it had, and the bridge hands back whatever
-            # it calls for one of them.
-            if isinstance(tool_type, str) and tool_type in {"web_search", "web_search_preview"}:
-                continue
-            copied = copy.deepcopy(tool)
-            tools.append(copied)
-            name = _function_call_name(copied)
-            if name:
-                seen_names.add(name)
-            if name in _PI_WEB_ACCESS_TOOL_NAMES:
-                seen_direct_tool = True
+    declared_tools = _responses_request_module._codex_declared_tools(request_kwargs)
+    for tool in declared_tools:
+        if not isinstance(tool, dict):
+            continue
+        tool_type = tool.get("type")
+        # The bridge answers for the search itself, so the provider-native
+        # search tool it replaces does not travel. Every other tool the
+        # client declared does: a turn that went looking for evidence comes
+        # back to the same tools it had, and the bridge hands back whatever
+        # it calls for one of them.
+        if isinstance(tool_type, str) and tool_type in {"web_search", "web_search_preview"}:
+            continue
+        copied = copy.deepcopy(tool)
+        if copied in tools:
+            continue
+        tools.append(copied)
+        name = _function_call_name(copied)
+        if name:
+            seen_names.add(name)
+        if name in _PI_WEB_ACCESS_TOOL_NAMES:
+            seen_direct_tool = True
     if not seen_direct_tool:
         for definition in _responses_tools_module._pi_web_access_tool_definitions():
             name = _function_call_name(definition)
@@ -3643,43 +3873,7 @@ def _external_web_search_chat_tool_payload(
     )
     if chat_tools:
         payload["tools"] = chat_tools
-    active_request_kwargs = request_kwargs or call_kwargs
-    initial_lookup_required = phase == "initial" and _external_web_search_requires_initial_lookup(
-        active_request_kwargs
-    )
-    optional_third_party_lookup = (
-        initial_lookup_required
-        and _external_web_search_chat_route_is_non_gpt(active_request_kwargs)
-    )
-    if optional_third_party_lookup:
-        weak_search_note = (
-            "A local evidence lookup function is available but is optional; "
-            "its ranking and snippets can be noisy. "
-            "Use your own knowledge and reasoning first; call it only when "
-            "current or external evidence is genuinely needed. If you call "
-            "it, use one focused query and stop when the evidence is enough."
-        )
-        time_note = _responses_tools_module._current_time_context_instruction(
-            active_request_kwargs
-        )
-        if time_note:
-            weak_search_note = f"{weak_search_note} {time_note}"
-        payload["messages"] = [
-            {
-                "role": "system",
-                "content": weak_search_note,
-            },
-            {
-                "role": "user",
-                "content": _external_web_search_user_prompt_text(active_request_kwargs),
-            },
-        ]
-        payload["tool_choice"] = "auto"
-    elif initial_lookup_required:
-        # The local functions are ordinary optional tools. Do not force a
-        # particular function call merely because the request looks current.
-        payload["tool_choice"] = "auto"
-    elif "tool_choice" in call_kwargs:
+    if "tool_choice" in call_kwargs:
         payload["tool_choice"] = _external_web_search_chat_completion_tool_choice(
             call_kwargs.get("tool_choice")
         )
@@ -3693,11 +3887,6 @@ def _external_web_search_chat_tool_payload(
         max_completion_tokens = _request_context_module._positive_int_value(
             call_kwargs.get("max_output_tokens")
         )
-    if max_completion_tokens is None and initial_lookup_required:
-        if optional_third_party_lookup:
-            max_completion_tokens = 512
-        else:
-            max_completion_tokens = _EXTERNAL_WEB_SEARCH_INITIAL_OUTPUT_TOKENS
     if max_completion_tokens is not None:
         payload["max_completion_tokens"] = max_completion_tokens
 
@@ -3740,61 +3929,6 @@ def _external_web_search_chat_tool_payload(
     return payload
 
 
-def _external_web_search_chat_synthesis_payload(
-    call_kwargs: dict[str, Any],
-    request_kwargs: Optional[dict],
-) -> dict[str, Any]:
-    payload: dict[str, Any] = {}
-    model_group = _responses_execution_module._request_model_group(call_kwargs) or (
-        call_kwargs.get("model") if isinstance(call_kwargs.get("model"), str) else None
-    )
-    if isinstance(model_group, str) and model_group.strip():
-        payload["model"] = model_group
-
-    payload["messages"] = _external_web_search_chat_synthesis_messages(call_kwargs)
-    payload["stream"] = False
-
-    max_completion_tokens = _request_context_module._positive_int_value(
-        call_kwargs.get("max_completion_tokens")
-    )
-    if max_completion_tokens is None:
-        max_completion_tokens = _request_context_module._positive_int_value(
-            call_kwargs.get("max_output_tokens")
-        )
-    if max_completion_tokens is not None:
-        payload["max_completion_tokens"] = max_completion_tokens
-
-    for key in (
-        "temperature",
-        "top_p",
-        "reasoning",
-        "user",
-        "service_tier",
-        "seed",
-        "stop",
-        "response_format",
-        "metadata",
-        "litellm_metadata",
-        "_target_order",
-        "_excluded_deployment_ids",
-    ):
-        value = call_kwargs.get(key)
-        if value is not None:
-            payload[key] = copy.deepcopy(value)
-
-    _external_web_search_chat_payload_with_bridge_stream_budgets(
-        payload,
-        call_kwargs,
-    )
-
-    if "litellm_metadata" not in payload:
-        metadata = _request_context_module._request_metadata_dict(
-            request_kwargs,
-            "litellm_metadata",
-        )
-        if metadata is not None:
-            payload["litellm_metadata"] = copy.deepcopy(metadata)
-    return payload
 
 
 def _external_web_search_chat_message_text(message: Any) -> str:
@@ -3886,15 +4020,6 @@ def _external_web_search_chat_completion_message(chat_response: Any) -> Any:
     choices = payload.get("choices")
     choice = choices[0] if isinstance(choices, list) and choices else None
     return choice.get("message") if isinstance(choice, dict) else None
-
-
-def _external_web_search_chat_progress_preamble_reason(chat_response: Any) -> Optional[str]:
-    message = _external_web_search_chat_completion_message(chat_response)
-    if _external_web_search_chat_completion_function_call_items(message):
-        return None
-    return _external_web_search_progress_preamble_reason(
-        _external_web_search_chat_message_text(message)
-    )
 
 
 def _external_web_search_chat_completion_to_response(
@@ -4029,61 +4154,6 @@ def _external_web_search_chat_sub_call_timeout_seconds(
     return ceiling
 
 
-async def _external_web_search_chat_synthesis_response(
-    call_kwargs: dict[str, Any],
-    request_kwargs: Optional[dict],
-) -> Optional[Any]:
-    _external_web_search_inherit_active_chat_surface(call_kwargs, request_kwargs)
-    if not _external_web_search_chat_only_route(call_kwargs):
-        return None
-    try:
-        from litellm.proxy.proxy_server import llm_router
-    except Exception:
-        llm_router = None
-    acompletion = getattr(llm_router, "acompletion", None)
-    if not callable(acompletion):
-        return None
-
-    payload = _tools_module._with_external_web_search_post_call_suppressed(
-        _external_web_search_chat_synthesis_payload(call_kwargs, request_kwargs)
-    )
-    if not payload.get("model"):
-        return None
-    _trace_module._route_trace(
-        "external_web_search_bridge_synthesis_chat_start",
-        request_id=_routing_module._trace_request_id(request_kwargs or call_kwargs),
-        session=_routing_module._trace_session_context(request_kwargs or call_kwargs),
-        model_group=_responses_execution_module._request_model_group(call_kwargs)
-        or _responses_execution_module._request_model_group(request_kwargs),
-        deployment_id=_routing_module._deployment_id_from_request(call_kwargs),
-        route_key=_routing_module._deployment_route_key_from_request(call_kwargs),
-        request=_trace_module._trace_request_summary(call_kwargs),
-        retry_request=_trace_module._trace_request_summary(
-            payload,
-            method_name="acompletion",
-        ),
-    )
-    chat_response = await _external_web_search_await_chat_sub_call(
-        acompletion,
-        payload,
-        call_kwargs,
-        phase="synthesis",
-    )
-    response = _external_web_search_chat_completion_to_response(
-        chat_response,
-        call_kwargs,
-    )
-    _trace_module._route_trace(
-        "external_web_search_bridge_synthesis_chat_done",
-        request_id=_routing_module._trace_request_id(request_kwargs or call_kwargs),
-        session=_routing_module._trace_session_context(request_kwargs or call_kwargs),
-        model_group=_responses_execution_module._request_model_group(call_kwargs)
-        or _responses_execution_module._request_model_group(request_kwargs),
-        deployment_id=_routing_module._deployment_id_from_request(call_kwargs),
-        route_key=_routing_module._deployment_route_key_from_request(call_kwargs),
-        response=_trace_module._trace_response_summary(response, call_kwargs),
-    )
-    return response
 
 
 def _external_web_search_upstream_host(
@@ -4189,48 +4259,6 @@ async def _external_web_search_chat_tool_response(
                 phase=phase,
             )
 
-        progress_reason = _external_web_search_chat_progress_preamble_reason(
-            chat_response
-        )
-        if progress_reason is not None:
-            retry_payload = copy.deepcopy(payload)
-            messages = retry_payload.get("messages")
-            if not isinstance(messages, list):
-                messages = []
-                retry_payload["messages"] = messages
-            progress_text = _external_web_search_chat_message_text(
-                _external_web_search_chat_completion_message(chat_response)
-            )
-            if progress_text:
-                messages.append({"role": "assistant", "content": progress_text})
-            messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        "Continue the current task now. Do not return another status "
-                        "update or plan. If the declared work requires a skill or another "
-                        "tool, make the corresponding tool call in this turn; only give a "
-                        "final answer after the task is actually complete."
-                    ),
-                }
-            )
-            _trace_module._route_trace(
-                "external_web_search_bridge_chat_tool_progress_retry",
-                request_id=_routing_module._trace_request_id(request_kwargs or call_kwargs),
-                session=_routing_module._trace_session_context(request_kwargs or call_kwargs),
-                model_group=_responses_execution_module._request_model_group(call_kwargs)
-                or _responses_execution_module._request_model_group(request_kwargs),
-                deployment_id=_routing_module._deployment_id_from_request(call_kwargs),
-                route_key=_routing_module._deployment_route_key_from_request(call_kwargs),
-                phase=phase,
-                invalid_reason=progress_reason,
-            )
-            chat_response = await _external_web_search_await_chat_sub_call(
-                acompletion,
-                retry_payload,
-                call_kwargs,
-                phase=phase,
-            )
     finally:
         _routing_module._apply_current_selected_deployment_to_request(
             call_kwargs,
@@ -4246,13 +4274,6 @@ async def _external_web_search_chat_tool_response(
         raise _external_web_search_invalid_synthesis_exception(
             request_kwargs or call_kwargs,
             reason="malformed_web_search_function_call",
-            phase=phase,
-        )
-    progress_reason = _external_web_search_chat_progress_preamble_reason(chat_response)
-    if progress_reason is not None:
-        raise _external_web_search_invalid_synthesis_exception(
-            request_kwargs or call_kwargs,
-            reason=progress_reason,
             phase=phase,
         )
     response = _external_web_search_chat_completion_to_response(
@@ -4287,16 +4308,23 @@ def _external_web_search_completed_actions_metadata(
         if not isinstance(item, dict):
             continue
         if any(key in item for key in ("arguments", "function", "input")):
-            action = _web_search_action_from_call(item)
+            raw_actions = _web_search_actions_from_call(item)
+        elif item.get("type") in {"search", "openPage", "findInPage"}:
+            # Completed-action metadata already has normalized actions. Parsing
+            # it as tool arguments drops search options, so the next round treats
+            # the same search as new work and executes it again.
+            raw_actions = [copy.deepcopy(item)]
         else:
-            action = _web_search_action_from_call({"arguments": item})
-        if action is None:
-            continue
-        key = _external_web_search_action_key(action)
-        if key in seen:
-            continue
-        seen.add(key)
-        actions.append(action)
+            raw_actions = [_web_search_action_from_call({"arguments": item})]
+        for action in raw_actions:
+            action = _external_web_search_valid_action(action)
+            if action is None:
+                continue
+            key = _external_web_search_action_key(action)
+            if key in seen:
+                continue
+            seen.add(key)
+            actions.append(action)
     return actions
 
 
@@ -4481,78 +4509,6 @@ def _external_web_search_conversation_context_prefix(
         f"{context}\n\n"
     )
 
-async def _external_web_search_synthesize_or_fallback(
-    *,
-    request_kwargs: Optional[dict],
-    search_results: str,
-    queries: list[str],
-    source_urls: list[str],
-    original_function: Optional[Any],
-) -> Any:
-    if original_function is None:
-        exception = _external_web_search_invalid_synthesis_exception(
-            request_kwargs,
-            reason="missing_original_function",
-        )
-        raise exception
-
-    synthesis_kwargs = _external_web_search_synthesis_kwargs(
-        request_kwargs,
-        search_results,
-    )
-    _trace_module._route_trace(
-        "external_web_search_bridge_synthesis_start",
-        activity="upstream_model",
-        request_id=_routing_module._trace_request_id(request_kwargs),
-        session=_routing_module._trace_session_context(request_kwargs),
-        model_group=_responses_execution_module._request_model_group(request_kwargs),
-        deployment_id=_routing_module._deployment_id_from_request(request_kwargs),
-        route_key=_routing_module._deployment_route_key_from_request(request_kwargs),
-        queries=queries,
-    )
-    try:
-        synthesized = await _external_web_search_call_original(
-            original_function,
-            synthesis_kwargs,
-            request_kwargs=request_kwargs,
-            phase="synthesis",
-        )
-        reason = _external_web_search_synthesis_invalid_reason(synthesized)
-        _trace_module._route_trace(
-            "external_web_search_bridge_synthesis_done",
-        activity="upstream_model",
-            request_id=_routing_module._trace_request_id(request_kwargs),
-            session=_routing_module._trace_session_context(request_kwargs),
-            model_group=_responses_execution_module._request_model_group(request_kwargs),
-            deployment_id=_routing_module._deployment_id_from_request(request_kwargs),
-            route_key=_routing_module._deployment_route_key_from_request(request_kwargs),
-            queries=queries,
-            source_url_count=len(source_urls),
-            invalid_reason=reason,
-            response_preview=_trace_module._sanitize_trace_text(_responses_output_module._response_text(synthesized)),
-        )
-        if reason is None:
-            return synthesized
-        exception = _external_web_search_invalid_synthesis_exception(
-            request_kwargs,
-            reason=reason,
-        )
-        raise exception
-    except Exception as exc:
-        _trace_module._route_trace(
-            "external_web_search_bridge_synthesis_error",
-        activity="upstream_model",
-            request_id=_routing_module._trace_request_id(request_kwargs),
-            session=_routing_module._trace_session_context(request_kwargs),
-            model_group=_responses_execution_module._request_model_group(request_kwargs),
-            deployment_id=_routing_module._deployment_id_from_request(request_kwargs),
-            route_key=_routing_module._deployment_route_key_from_request(request_kwargs),
-            queries=queries,
-            exception=_routing_module._trace_exception(exc),
-        )
-        _routing_module._mark_exception_for_deployment_failover(exc, request_kwargs)
-        _external_web_search_set_recovery_request(exc, synthesis_kwargs)
-        raise
 
 
 def _external_web_search_continuation_kwargs(
@@ -4563,6 +4519,8 @@ def _external_web_search_continuation_kwargs(
     completed_actions: Optional[list[dict[str, str]]] = None,
     round_number: int,
     final_round: bool = False,
+    response: Any = None,
+    round_evidence: Optional[str] = None,
 ) -> dict[str, Any]:
     continuation_kwargs = _external_web_search_safe_request_base(request_kwargs)
     continuation_kwargs["tools"] = _external_web_search_continuation_tools(request_kwargs)
@@ -4573,7 +4531,6 @@ def _external_web_search_continuation_kwargs(
         "function_call",
         "functions",
         "mcp_servers",
-        "tool_choice",
         "tool_resources",
         "use_chat_completions_api",
         "web_search_options",
@@ -4600,80 +4557,22 @@ def _external_web_search_continuation_kwargs(
         completed_actions or []
     )
     continuation_metadata["external_web_search_search_results"] = continuation_evidence
+    continuation_metadata.pop(_EXTERNAL_WEB_SEARCH_PROTOCOL_HISTORY_KEY, None)
+    continuation_metadata.pop(_EXTERNAL_WEB_SEARCH_ACTION_OUTPUTS_KEY, None)
     continuation_kwargs["litellm_metadata"] = continuation_metadata
 
-    continuation_has_pi_tools = any(
-        isinstance(tool, dict)
-        and _function_call_name(tool) in _PI_WEB_ACCESS_TOOL_NAMES
-        for tool in continuation_kwargs.get("tools", [])
-    )
-    if continuation_has_pi_tools:
-        note = (
-            "Web-search evidence is attached below. Decide the next step now and "
-            "answer the user's request directly. If the evidence is insufficient, "
-            "you may use the "
-            "available native pi-web-access functions according to their schemas; "
-            "otherwise provide the final answer now. Do not emit tool-call markup "
-            "as text."
-        )
+    existing_instructions = request_kwargs.get("instructions") if isinstance(request_kwargs, dict) else None
+    if isinstance(existing_instructions, str) and existing_instructions.strip():
+        continuation_kwargs["instructions"] = existing_instructions
     else:
-        note = (
-            "Retrieved evidence is attached below. Decide the next step from the "
-            "available tools and evidence: choose whether to search again (and which "
-            "result page), open a listed source URL, find text within an opened page, or "
-            "provide the final answer. If the search-result snippets directly answer the "
-            "user's request with the needed facts, provide the final answer immediately; "
-            "do not open a page merely to repeat them. Open a source, change the query, "
-            "or request another result page only when evidence is missing, ambiguous, "
-            "conflicting, or the user explicitly asks for deeper verification. Page-text "
-            "matches and opened-page content are stronger evidence than search-result "
-            "snippets; when sources conflict, do not infer a fact is absent merely because "
-            "a wrapper or snippet omits it. For a narrow factual request, prefer one "
-            "clearly specific source before opening additional sources. "
-            "Do not emit tool-call markup as text."
-        )
-    time_note = _responses_tools_module._current_time_context_instruction(request_kwargs)
-    if time_note:
-        note = f"{note} {time_note}"
-    continuation_kwargs["instructions"] = note
-
-    time_context_lines = ""
-    if time_note:
-        time_context_lines = f"Authoritative time context:\n{time_note}\n\n"
-    query_lines = "\n".join(f"- {query}" for query in queries) or "- (none)"
-    next_step_text = (
-        "If the evidence directly answers the request, provide the final answer. "
-        "Otherwise you may use a native pi-web-access function according to its "
-        "schema."
-        if continuation_has_pi_tools
-        else
-        "If the evidence directly answers the request, provide the final answer. "
-        "Otherwise choose whether to use an available lookup function with a focused "
-        "query, a source URL to read, or a URL plus pattern to find text."
+        continuation_kwargs.pop("instructions", None)
+    history = _external_web_search_protocol_history(
+        request_kwargs,
+        response,
+        round_evidence or search_results,
     )
-    final_round_note = (
-        "This is the final investigation step: do not request further search "
-        "or page actions. Provide the final answer to the user now."
-        if final_round
-        else ""
-    )
-    if final_round_note:
-        continuation_kwargs["instructions"] = (
-            f"{continuation_kwargs['instructions']} {final_round_note}"
-        )
-    continuation_kwargs["input"] = (
-        _external_web_search_conversation_context_prefix(request_kwargs)
-        + "Original user request:\n"
-        f"{original_request or '(no user text extracted)'}\n\n"
-        f"{time_context_lines}"
-        "Web actions completed so far:\n"
-        f"{query_lines}\n\n"
-        f"{_tools_module._EXTERNAL_WEB_SEARCH_CONTINUATION_INPUT_MARKER}\n"
-        f"{continuation_evidence}\n\n"
-        "Decide the next step now. "
-        f"{next_step_text}"
-        + (f" {final_round_note}" if final_round_note else "")
-    )
+    _external_web_search_set_protocol_history(request_kwargs, history)
+    continuation_kwargs["input"] = history
     continuation_kwargs.pop("messages", None)
     continuation_kwargs["stream"] = True
     # A reasoning upstream digesting the accumulated evidence can stay silent
@@ -4782,6 +4681,8 @@ def _external_web_search_prepare_continuation_recovery_request(
     completed_actions: Optional[list[dict[str, str]]] = None,
     round_number: int,
     final_round: bool = False,
+    response: Any = None,
+    round_evidence: Optional[str] = None,
 ) -> dict[str, Any]:
     continuation_kwargs = _external_web_search_continuation_kwargs(
         request_kwargs,
@@ -4790,6 +4691,8 @@ def _external_web_search_prepare_continuation_recovery_request(
         completed_actions=completed_actions,
         round_number=round_number,
         final_round=final_round,
+        response=response,
+        round_evidence=round_evidence,
     )
     _external_web_search_set_pending_recovery_request(
         request_kwargs,
@@ -4822,17 +4725,11 @@ async def _external_web_search_call_original(
     while True:
         try:
             response = None
-            if phase == "synthesis":
-                response = await _external_web_search_chat_synthesis_response(
-                    call_kwargs,
-                    request_kwargs or call_kwargs,
-                )
-            else:
-                response = await _external_web_search_chat_tool_response(
-                    call_kwargs,
-                    request_kwargs or call_kwargs,
-                    phase=phase,
-                )
+            response = await _external_web_search_chat_tool_response(
+                call_kwargs,
+                request_kwargs or call_kwargs,
+                phase=phase,
+            )
             if response is None:
                 response = original_function(
                     **_tools_module._with_external_web_search_post_call_suppressed(call_kwargs)
@@ -4947,147 +4844,59 @@ async def _external_web_search_continue_or_synthesize(
     round_number: int,
     original_function: Optional[Any],
     final_round: bool = False,
+    response: Any = None,
+    round_evidence: Optional[str] = None,
+    prepared_request: Optional[dict] = None,
 ) -> Any:
     if original_function is None:
-        return await _external_web_search_synthesize_or_fallback(
+        raise _external_web_search_invalid_synthesis_exception(
+            request_kwargs, reason="missing_original_function", phase="continuation"
+        )
+    if _external_web_search_client_tool_call_items(response):
+        raise _external_web_search_invalid_synthesis_exception(
+            request_kwargs, reason="mixed_client_and_server_tool_calls", phase="continuation"
+        )
+    continuation_kwargs = prepared_request
+    if continuation_kwargs is None:
+        continuation_kwargs = _external_web_search_prepare_continuation_recovery_request(
             request_kwargs=request_kwargs,
             search_results=search_results,
             queries=queries,
-            source_urls=source_urls,
-            original_function=original_function,
+            completed_actions=completed_actions,
+            round_number=round_number,
+            response=response,
+            round_evidence=round_evidence,
         )
-
-    continuation_kwargs = _external_web_search_prepare_continuation_recovery_request(
-        request_kwargs=request_kwargs,
-        search_results=search_results,
-        queries=queries,
-        completed_actions=completed_actions,
-        round_number=round_number,
-        final_round=final_round,
-    )
     _trace_module._route_trace(
         "external_web_search_bridge_continuation_start",
         activity="upstream_model",
         request_id=_routing_module._trace_request_id(request_kwargs),
-        session=_routing_module._trace_session_context(request_kwargs),
-        model_group=_responses_execution_module._request_model_group(request_kwargs),
-        deployment_id=_routing_module._deployment_id_from_request(request_kwargs),
-        route_key=_routing_module._deployment_route_key_from_request(request_kwargs),
         round=round_number,
-        queries=queries,
-        evidence_chars=len(search_results or ""),
-        continuation_evidence_chars=len(
-            continuation_kwargs.get("litellm_metadata", {}).get(
-                "external_web_search_search_results",
-                "",
-            )
-        ),
-        continuation_input_chars=len(str(continuation_kwargs.get("input") or "")),
-        continuation_max_output_tokens=continuation_kwargs.get("max_output_tokens"),
+        request=_trace_module._trace_request_summary(continuation_kwargs),
     )
     try:
         continued = await _external_web_search_call_original(
-            original_function,
-            continuation_kwargs,
-            request_kwargs=request_kwargs,
-            phase="continuation",
+            original_function, continuation_kwargs,
+            request_kwargs=request_kwargs, phase="continuation",
         )
-        if _external_web_search_is_empty_continuation_response(continued):
-            client_calls = _external_web_search_client_tool_call_items(continued)
-            if client_calls:
-                # An ``empty_continuation`` is a turn with no text and no
-                # bridge-owned search call. When it carries one of the client's
-                # own tool calls it is not empty at all: the model went back to
-                # the work the search interrupted. Returning it here is what
-                # keeps the synthesis below from discarding that call.
-                _trace_module._route_trace(
-                    "external_web_search_bridge_client_tool_passthrough",
-                    request_id=_routing_module._trace_request_id(request_kwargs),
-                    session=_routing_module._trace_session_context(request_kwargs),
-                    model_group=_responses_execution_module._request_model_group(request_kwargs),
-                    deployment_id=_routing_module._deployment_id_from_request(request_kwargs),
-                    route_key=_routing_module._deployment_route_key_from_request(request_kwargs),
-                    round=round_number,
-                    tool_names=[
-                        _function_call_name(call) for call in client_calls
-                    ],
-                )
-                return continued
-            _trace_module._route_trace(
-                "external_web_search_bridge_empty_continuation_synthesis",
-        activity="upstream_model",
-                request_id=_routing_module._trace_request_id(request_kwargs),
-                session=_routing_module._trace_session_context(request_kwargs),
-                model_group=_responses_execution_module._request_model_group(request_kwargs),
-                deployment_id=_routing_module._deployment_id_from_request(request_kwargs),
-                route_key=_routing_module._deployment_route_key_from_request(request_kwargs),
-                round=round_number,
-                queries=queries,
-            )
-            return await _external_web_search_synthesize_or_fallback(
-                request_kwargs=request_kwargs,
-                search_results=search_results,
-                queries=queries,
-                source_urls=source_urls,
-                original_function=original_function,
-            )
         _trace_module._route_trace(
             "external_web_search_bridge_continuation_done",
         activity="upstream_model",
             request_id=_routing_module._trace_request_id(request_kwargs),
-            session=_routing_module._trace_session_context(request_kwargs),
-            model_group=_responses_execution_module._request_model_group(request_kwargs),
-            deployment_id=_routing_module._deployment_id_from_request(request_kwargs),
-            route_key=_routing_module._deployment_route_key_from_request(request_kwargs),
             round=round_number,
-            queries=queries,
-            response_preview=_trace_module._sanitize_trace_text(_responses_output_module._response_text(continued)),
-            next_queries=_web_search_queries_for_request(continued, request_kwargs),
-            next_actions=_web_search_actions_for_request(continued, request_kwargs),
+            response=_trace_module._trace_response_summary(continued, continuation_kwargs),
         )
         return continued
     except Exception as exc:
-        should_raise_with_recovery = False
-        if (
-            _routing_module._is_route_recovery_poll_error(exc)
-            and _external_web_search_invalid_response_phase(exc) != "continuation"
-        ):
-            should_raise_with_recovery = True
-        if _external_web_search_is_timeout_exception(exc):
-            should_raise_with_recovery = True
-        if should_raise_with_recovery:
-            _routing_module._mark_exception_for_deployment_failover(exc, request_kwargs)
-            _external_web_search_set_recovery_request(exc, continuation_kwargs)
-        recovery_request = _external_web_search_recovery_request_from_exception(exc)
+        _external_web_search_set_recovery_request(exc, continuation_kwargs)
         _trace_module._route_trace(
             "external_web_search_bridge_continuation_error",
         activity="upstream_model",
             request_id=_routing_module._trace_request_id(request_kwargs),
-            session=_routing_module._trace_session_context(request_kwargs),
-            model_group=_responses_execution_module._request_model_group(request_kwargs),
-            deployment_id=_routing_module._deployment_id_from_request(request_kwargs),
-            route_key=_routing_module._deployment_route_key_from_request(request_kwargs),
             round=round_number,
-            queries=queries,
             exception=_routing_module._trace_exception(exc),
-            recovery_payload_phase=_external_web_search_recovery_payload_phase(
-                recovery_request
-            ),
-            recovery_payload_stream=(
-                recovery_request.get("stream")
-                if isinstance(recovery_request, dict)
-                else None
-            ),
         )
-        if should_raise_with_recovery:
-            raise
-        return await _external_web_search_synthesize_or_fallback(
-            request_kwargs=request_kwargs,
-            search_results=search_results,
-            queries=queries,
-            source_urls=source_urls,
-            original_function=original_function,
-        )
+        raise
 
 
 async def _external_web_search_finalize_response(
@@ -5099,27 +4908,16 @@ async def _external_web_search_finalize_response(
     source_urls: list[str],
     original_function: Optional[Any],
 ) -> Any:
-    reason = _external_web_search_synthesis_invalid_reason(response)
-    if reason is None:
-        return response
-    _trace_module._route_trace(
-        "external_web_search_bridge_final_invalid",
-        request_id=_routing_module._trace_request_id(request_kwargs),
-        session=_routing_module._trace_session_context(request_kwargs),
-        model_group=_responses_execution_module._request_model_group(request_kwargs),
-        deployment_id=_routing_module._deployment_id_from_request(request_kwargs),
-        route_key=_routing_module._deployment_route_key_from_request(request_kwargs),
-        queries=queries,
-        invalid_reason=reason,
-        response_preview=_trace_module._sanitize_trace_text(_responses_output_module._response_text(response)),
+    if _web_search_function_calls(response):
+        raise _external_web_search_invalid_synthesis_exception(
+            request_kwargs,
+            reason="web_search_action_budget_exhausted",
+            phase="continuation",
+        )
+    _external_web_search_raise_if_invalid_model_response(
+        response, request_kwargs, phase="continuation",
     )
-    return await _external_web_search_synthesize_or_fallback(
-        request_kwargs=request_kwargs,
-        search_results=search_results,
-        queries=queries,
-        source_urls=source_urls,
-        original_function=original_function,
-    )
+    return response
 
 
 async def _resolve_web_search_function_calls(
@@ -5171,8 +4969,6 @@ async def _resolve_web_search_function_calls(
                     ],
                 )
                 final_response = current_response
-                forced_synthesis = False
-                client_tool_passthrough = True
                 break
             final_response = current_response
             break
@@ -5206,9 +5002,8 @@ async def _resolve_web_search_function_calls(
         search_results = "\n\n".join(section for section in search_sections if section.strip())
         completed_labels = _external_web_search_action_labels(completed_actions)
 
-        # The round budget guards against an endless action loop; it must not
-        # replace the model's own final answer. Ask the model itself to close
-        # the investigation on the last round and keep its answer verbatim.
+        # Results go back with the original call and task context. The model
+        # chooses whether to use another tool or return a message.
         current_response = await _external_web_search_continue_or_synthesize(
             request_kwargs=request_kwargs,
             search_results=search_results,
@@ -5218,6 +5013,8 @@ async def _resolve_web_search_function_calls(
             round_number=round_number,
             original_function=original_function,
             final_round=round_number >= max_rounds,
+            response=current_response,
+            round_evidence=message,
         )
         final_response = current_response
 
@@ -5238,102 +5035,6 @@ async def _resolve_web_search_function_calls(
     )
 
 
-def _external_web_search_synthesis_kwargs(
-    request_kwargs: Optional[dict],
-    search_results: str,
-) -> dict[str, Any]:
-    synthesis_evidence = _external_web_search_synthesis_evidence(search_results)
-    synthesis_kwargs = _external_web_search_low_reasoning_kwargs(
-        request_kwargs,
-        force_top_level=True,
-    )
-    for key in (
-        "allowed_tools",
-        "custom_tools",
-        "function_call",
-        "functions",
-        "mcp_servers",
-        "parallel_tool_calls",
-        "tool_choice",
-        "tool_resources",
-        "tools",
-        "use_chat_completions_api",
-        "web_search_options",
-    ):
-        synthesis_kwargs.pop(key, None)
-
-    metadata = _request_context_module._request_metadata_dict(synthesis_kwargs, "litellm_metadata") or {}
-    synthesis_metadata = metadata.copy()
-    original_request = _external_web_search_user_prompt_text(request_kwargs)
-    conversation_context = _external_web_search_conversation_context(request_kwargs)
-    if original_request:
-        synthesis_metadata[_EXTERNAL_WEB_SEARCH_ORIGINAL_USER_TEXT_KEY] = original_request
-    if conversation_context:
-        synthesis_metadata[_EXTERNAL_WEB_SEARCH_CONVERSATION_CONTEXT_KEY] = (
-            conversation_context
-        )
-    synthesis_metadata.pop(_WEB_SEARCH_EXTERNAL_BRIDGE_KEY, None)
-    synthesis_metadata.pop(_WEB_SEARCH_EXTERNAL_BRIDGE_STREAM_KEY, None)
-    synthesis_metadata.pop(_RESPONSES_CHAT_BRIDGE_PREEMPTIVE_METADATA_KEY, None)
-    synthesis_metadata["external_web_search_synthesis"] = True
-    synthesis_metadata["external_web_search_search_results"] = synthesis_evidence
-    synthesis_metadata[_RESPONSES_CHAT_BRIDGE_METADATA_KEY] = True
-    synthesis_kwargs["litellm_metadata"] = synthesis_metadata
-
-    note = (
-        "External web_search compatibility bridge synthesis mode. The search "
-        "step is already complete. Do not call tools, do not emit tool-call "
-        "markup, do not mention mcp tool names, and do not say that you will "
-        "search. Write only the final answer to the user. Use only the provided "
-        "retrieved evidence, cite source URLs from that evidence, and say when "
-        "the evidence is insufficient. Page-text matches and opened-page content "
-        "are stronger evidence than search-result snippets; if sources conflict, "
-        "do not make an absence claim from an omitted field or wrapper alone. The "
-        "local pi-web-access bridge may differ from hosted OpenAI web_search "
-        "ranking and snippets."
-    )
-    time_note = _responses_tools_module._current_time_context_instruction(request_kwargs)
-    if time_note:
-        note = f"{note} {time_note}"
-    existing = synthesis_kwargs.get("instructions")
-    if isinstance(existing, str) and existing.strip():
-        synthesis_kwargs["instructions"] = f"{existing.rstrip()}\n\n{note}"
-    else:
-        synthesis_kwargs["instructions"] = note
-    time_context_lines = ""
-    if time_note:
-        time_context_lines = f"Authoritative time context:\n{time_note}\n\n"
-    synthesis_input = (
-        _external_web_search_conversation_context_prefix(request_kwargs)
-        + "Original user request. Any instruction to call or use web_search has "
-        "already been satisfied by the compatibility bridge:\n"
-        f"{original_request or '(no user text extracted)'}\n\n"
-        f"{time_context_lines}"
-        "Retrieved evidence:\n"
-        f"{synthesis_evidence}\n\n"
-        "Now answer the original user request directly. Do not call tools."
-    )
-    synthesis_kwargs["input"] = synthesis_input
-    synthesis_kwargs.pop("messages", None)
-    requested_output_tokens = _request_context_module._positive_int_value(
-        synthesis_kwargs.get("max_output_tokens")
-    )
-    synthesis_kwargs["max_output_tokens"] = max(
-        requested_output_tokens or 0,
-        _EXTERNAL_WEB_SEARCH_SYNTHESIS_OUTPUT_TOKENS,
-    )
-    synthesis_kwargs["stream"] = False
-    # A hidden bridge turn, budgeted like the continuation it replaces.
-    synthesis_kwargs["stream_idle_timeout_seconds"] = (
-        _EXTERNAL_WEB_SEARCH_SYNTHESIS_STREAM_TIMEOUT_SECONDS
-    )
-    synthesis_kwargs["stream_start_timeout_seconds"] = (
-        _EXTERNAL_WEB_SEARCH_SYNTHESIS_STREAM_TIMEOUT_SECONDS
-    )
-    return _responses_execution_module._normalize_external_web_search_router_kwargs(
-        synthesis_kwargs,
-        request_kwargs,
-    )
 
 
 def _external_web_search_invalid_synthesis_exception(
@@ -5460,10 +5161,7 @@ def _external_web_search_recovery_kwargs(
         recovery_kwargs["stream"] = True
         return _external_web_search_bounded_recovery_kwargs(recovery_kwargs)
 
-    recovery_kwargs = _external_web_search_synthesis_kwargs(
-        request_kwargs,
-        search_results,
-    )
+    recovery_kwargs = _external_web_search_safe_request_base(request_kwargs)
     model_group = _external_web_search_recovery_model_group(recovery_kwargs)
     if isinstance(model_group, str) and model_group.strip():
         recovery_kwargs["model"] = model_group
@@ -5506,6 +5204,8 @@ def _external_web_search_model_response_invalid_reason(
     if phase == "continuation":
         if _external_web_search_has_malformed_function_call(response):
             return "malformed_web_search_function_call"
+        if _external_web_search_client_tool_call_items(response):
+            return None
         if (
             not _web_search_function_calls(response)
             and _external_web_search_has_completed_assistant_message(response)
@@ -5513,9 +5213,6 @@ def _external_web_search_model_response_invalid_reason(
             return None
         text = _responses_output_module._response_text(response)
         if text.strip():
-            progress_reason = _external_web_search_progress_preamble_reason(text)
-            if progress_reason is not None:
-                return progress_reason
             return None
         if _web_search_function_calls(response):
             return None
@@ -5542,11 +5239,10 @@ def _external_web_search_raise_if_invalid_model_response(
     reason = _external_web_search_model_response_invalid_reason(response, phase=phase)
     if reason is None:
         return
-    if phase == "continuation" and reason == "empty_continuation":
-        return
     exception = _external_web_search_invalid_synthesis_exception(
         request_kwargs,
         reason=reason,
+        phase=phase,
     )
     try:
         exception.external_web_search_invalid_phase = phase  # type: ignore[attr-defined]
@@ -5831,180 +5527,6 @@ async def _external_web_search_bridge_stream(
         })
     yield encode({"type": "response.completed", "response": response})
 
-async def _resolve_web_search_function_calls_stream(
-    response: Any,
-    request_kwargs: Optional[dict],
-    original_function: Optional[Any] = None,
-) -> AsyncIterator[dict[str, Any]]:
-    actions = _web_search_actions_for_request(response, request_kwargs)
-    payload = _streaming_module._jsonable(response)
-    if not isinstance(payload, dict):
-        payload = _hosted_tool_unsupported_response(request_kwargs, _responses_output_module._response_text(response))
-    if not actions:
-        async for chunk in _external_web_search_bridge_stream(payload):
-            yield chunk
-        return
-
-    def encode(event: dict[str, Any]) -> dict[str, Any]:
-        return _JSONStreamEvent(event)
-
-    created_response = copy.deepcopy(payload)
-    created_response["status"] = "in_progress"
-    created_response["output"] = []
-    yield encode({"type": "response.created", "response": created_response})
-
-    sequence_number = 0
-    search_sections: list[str] = []
-    source_urls: list[str] = []
-    completed_search_items: list[dict[str, Any]] = []
-    page_cache: dict[str, str] = {}
-    page_fetch_tasks: dict[str, asyncio.Task[str]] = {}
-    completed_actions: list[dict[str, str]] = []
-    started_search_items = [
-        (action, search_item)
-        for action in actions
-        for search_item in [_external_web_search_call_item_for_action(action)]
-        if search_item is not None
-    ]
-    for output_index, (_action, search_item) in enumerate(started_search_items):
-        added_item = copy.deepcopy(search_item)
-        added_item["status"] = "in_progress"
-        yield encode(
-            {
-                "type": "response.output_item.added",
-                "output_index": output_index,
-                "item": added_item,
-            }
-        )
-        for event_type in (
-            "response.web_search_call.in_progress",
-            "response.web_search_call.searching",
-        ):
-            sequence_number += 1
-            yield encode(
-                {
-                    "type": event_type,
-                    "item_id": search_item.get("id"),
-                    "output_index": output_index,
-                    "sequence_number": sequence_number,
-                    "action": copy.deepcopy(added_item.get("action", {})),
-                }
-            )
-
-        action = started_search_items[output_index][0]
-        section, urls, completed_action = await _external_web_search_run_action(
-            action,
-            page_cache,
-            page_fetch_tasks,
-        )
-        search_sections.append(section)
-        completed_actions.append(completed_action)
-        for url in urls:
-            if url not in source_urls:
-                source_urls.append(url)
-        completed_search_item = _external_web_search_call_item_for_action(
-            completed_action,
-            urls,
-        )
-        if completed_search_item is None:
-            continue
-        completed_search_item["id"] = search_item.get("id")
-        completed_search_items.append(completed_search_item)
-        sequence_number += 1
-        yield encode(
-            {
-                "type": "response.web_search_call.completed",
-                "item_id": completed_search_item.get("id"),
-                "output_index": output_index,
-                "sequence_number": sequence_number,
-                "action": copy.deepcopy(completed_search_item.get("action", {})),
-            }
-        )
-        yield encode(
-            {
-                "type": "response.output_item.done",
-                "output_index": output_index,
-                "item": completed_search_item,
-            }
-        )
-
-    search_results = "\n\n".join(section for section in search_sections if section.strip())
-    completed_labels = _external_web_search_action_labels(completed_actions)
-    synthesis_task = asyncio.create_task(
-        _external_web_search_synthesize_or_fallback(
-            request_kwargs=request_kwargs,
-            search_results=search_results,
-            queries=completed_labels,
-            source_urls=source_urls,
-            original_function=original_function,
-        )
-    )
-    try:
-        async for keepalive in _external_web_search_keepalives_until_done(
-            synthesis_task,
-            request_kwargs=request_kwargs,
-            phase="web_search_synthesis",
-        ):
-            yield keepalive
-        synthesized = await synthesis_task
-    finally:
-        if not synthesis_task.done():
-            synthesis_task.cancel()
-
-    synthesized_payload = _streaming_module._jsonable(synthesized)
-    if not isinstance(synthesized_payload, dict):
-        synthesized_payload = _hosted_tool_unsupported_response(
-            request_kwargs,
-            _responses_output_module._response_text(synthesized),
-        )
-    output_items = synthesized_payload.get("output")
-    if not isinstance(output_items, list):
-        output_items = []
-    if not output_items:
-        text = _responses_output_module._response_text(synthesized_payload)
-        if text.strip():
-            output_items = _hosted_tool_unsupported_response(
-                request_kwargs,
-                text,
-            )["output"]
-
-    final_output = list(completed_search_items)
-    for item in output_items:
-        if not isinstance(item, dict):
-            continue
-        if item.get("type") == "web_search_call":
-            continue
-        if _is_web_search_function_call_item(item):
-            continue
-        final_output.append(item)
-        index = len(final_output) - 1
-        if item.get("type") == "message":
-            for event in _message_item_stream_events(item, index):
-                yield encode(event)
-            continue
-
-        added_tool_item = copy.deepcopy(item)
-        if added_tool_item.get("status") == "completed":
-            added_tool_item["status"] = "in_progress"
-        yield encode(
-            {
-                "type": "response.output_item.added",
-                "output_index": index,
-                "item": added_tool_item,
-            }
-        )
-        yield encode(
-            {
-                "type": "response.output_item.done",
-                "output_index": index,
-                "item": item,
-            }
-        )
-
-    final_response = copy.deepcopy(synthesized_payload)
-    final_response["status"] = "completed"
-    final_response["output"] = final_output
-    yield encode({"type": "response.completed", "response": final_response})
 
 
 async def _external_web_search_keepalives_until_done(
@@ -6507,6 +6029,11 @@ async def _resolve_web_search_function_calls_stream_rounds(
             collection["source_urls_by_action"] = urls_by_action
             collection["completed_actions"] = completed
             collection["completed_items"] = visible_items
+            _external_web_search_remember_action_outputs(
+                request_kwargs, [
+                    (result[2], result[0]) for result in round_results if result is not None
+                ],
+            )
 
         return stream_events(), collection
 
@@ -6569,19 +6096,19 @@ async def _resolve_web_search_function_calls_stream_rounds(
         search_results = "\n\n".join(section for section in search_sections if section.strip())
         completed_labels = _external_web_search_action_labels(completed_actions)
         try:
-            # The round budget guards against an endless action loop; it must
-            # not replace the model's own final answer. On the last round the
-            # continuation directs the model itself to close the investigation
-            # and its answer is kept verbatim.
+            # Prepare once before starting the task so recovery uses the same
+            # transcript and never appends a call/result pair twice.
             final_round = round_number >= max_rounds
 
-            _external_web_search_prepare_continuation_recovery_request(
+            prepared_request = _external_web_search_prepare_continuation_recovery_request(
                 request_kwargs=request_kwargs,
                 search_results=search_results,
                 queries=completed_labels,
                 completed_actions=completed_actions,
                 round_number=round_number,
                 final_round=final_round,
+                response=current_response,
+                round_evidence=round_message,
             )
 
             continuation_task = asyncio.create_task(
@@ -6594,6 +6121,9 @@ async def _resolve_web_search_function_calls_stream_rounds(
                     round_number=round_number,
                     original_function=original_function,
                     final_round=final_round,
+                    response=current_response,
+                    round_evidence=round_message,
+                    prepared_request=prepared_request,
                 )
             )
             try:
@@ -6632,8 +6162,66 @@ async def _resolve_web_search_function_calls_stream_rounds(
                 final_response,
                 request_kwargs,
             ):
-                current_response = final_response
-                continue
+                recovery_actions = _web_search_actions_for_request(
+                    final_response,
+                    request_kwargs,
+                )
+                if _external_web_search_budgeted_actions(
+                    recovery_actions,
+                    completed_actions,
+                ):
+                    current_response = final_response
+                    continue
+                try:
+                    replay_request = (
+                        _external_web_search_prepare_continuation_recovery_request(
+                            request_kwargs=request_kwargs,
+                            search_results=search_results,
+                            queries=completed_labels,
+                            completed_actions=completed_actions,
+                            round_number=round_number,
+                            response=final_response,
+                            round_evidence=search_results,
+                        )
+                    )
+                    replay_task = asyncio.create_task(
+                        _external_web_search_call_original(
+                            original_function,
+                            replay_request,
+                            request_kwargs=request_kwargs,
+                            phase="continuation",
+                        )
+                    )
+                    try:
+                        async for keepalive in _external_web_search_keepalives_until_done(
+                            replay_task,
+                            request_kwargs=request_kwargs,
+                            phase="web_search_continuation_replay",
+                        ):
+                            yield keepalive
+                        replayed_response = await replay_task
+                    finally:
+                        if not replay_task.done():
+                            replay_task.cancel()
+                    if _has_web_search_actions_for_request(
+                        replayed_response,
+                        request_kwargs,
+                    ):
+                        current_response = replayed_response
+                        continue
+                    final_response = replayed_response
+                    client_calls = _external_web_search_client_tool_call_items(
+                        replayed_response
+                    )
+                    if client_calls:
+                        client_tool_passthrough = True
+                    break
+                except Exception as replay_exc:
+                    yield _streaming_module._synthesized_failed_response_event(
+                        request_kwargs or {},
+                        replay_exc,
+                    )
+                    return
             forced_synthesis = True
             break
         final_response = current_response
@@ -6788,8 +6376,13 @@ async def _resolve_web_search_function_calls_stream_rounds(
             return
 
     final_response_payload = copy.deepcopy(synthesized_payload)
-    final_response_payload["status"] = "completed"
+    final_response_payload.setdefault("status", "completed")
     final_response_payload["output"] = final_output
-    yield encode({"type": "response.completed", "response": final_response_payload})
+    terminal_type = {
+        "incomplete": "response.incomplete",
+        "failed": "response.failed",
+        "cancelled": "response.failed",
+    }.get(final_response_payload["status"], "response.completed")
+    yield encode({"type": terminal_type, "response": final_response_payload})
 
 

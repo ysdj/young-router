@@ -8,5 +8,6 @@
 @property(nonatomic, assign) BOOL liteLLMTerminationReady;
 
 - (void)startReactHostWhenNeeded;
+- (void)installNativeStatusItem;
 
 @end

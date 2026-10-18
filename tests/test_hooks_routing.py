@@ -110,7 +110,11 @@ class HookRoutingTests(HookTestCase):
         self.assertEqual(hooks._recovery_diagnostic(station_balance)["kind"], "billing")
         rejected = RuntimeError("OpenAIException - permission denied")
         rejected.status_code = 403
-        self.assertEqual(hooks._recovery_policy_for_exception(rejected), "error")
+        # A refusal that a replay cannot change is the request-error policy, and
+        # that policy cools the route down: leaving a route the key may not use
+        # first in every request is what made one dead route look like an
+        # outage.  The diagnostic still says which refusal it was.
+        self.assertEqual(hooks._recovery_policy_for_exception(rejected), "recovery_cooldown")
         self.assertEqual(hooks._recovery_diagnostic(rejected)["kind"], "authentication")
         self.assertFalse(hooks._should_count_deployment_failure_for_cooldown(network))
         self.assertFalse(hooks._should_count_deployment_failure_for_cooldown(rate_limit))

@@ -644,7 +644,7 @@ class CoreIPCServer:
             or not self._valid_session(session_token)
         ):
             raise CoreError("invalid_secret", "The requested secret field is unavailable")
-        descriptor = self.core.trusted_secret_descriptor(domain, field, target)
+        descriptor = self.core.trusted_secret_read_descriptor(domain, field, target)
         token = secrets.token_urlsafe(32)
         capability = _SecretReadCapability(
             token=token,

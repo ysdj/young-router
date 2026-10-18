@@ -727,8 +727,19 @@ import Foundation
             childEnvironment["PYTHONPATH"] = current.map { "\(rootPath):\($0)" } ?? rootPath
             childEnvironment["LITELLM_BIN"] = coreRoot.appendingPathComponent("runtime/bin/litellm").path
         }
-        // Core imports from a signed application bundle.  Bytecode caches
-        // must never be written beside those signed resources at runtime.
+        // PYTHONPYCACHEPREFIX mirrors paths below the current working directory,
+        // so an absolute cache can still write into the bundle before the
+        // wrapper redirects Core's imports. Python's no-bytecode mode keeps
+        // this early import sealed; after the wrapper loads, Core writes its own
+        // runtime cache to the private directory below.
+        if let metadataPath = coreMetadataPath(environment: childEnvironment) {
+            childEnvironment["YOUNG_ROUTER_PYCACHE_DIR"] =
+                "\((metadataPath as NSString).deletingLastPathComponent)/core-state/pycache"
+            childEnvironment.removeValue(forKey: "PYTHONPYCACHEPREFIX")
+        } else {
+            childEnvironment.removeValue(forKey: "YOUNG_ROUTER_PYCACHE_DIR")
+            childEnvironment.removeValue(forKey: "PYTHONPYCACHEPREFIX")
+        }
         childEnvironment["PYTHONDONTWRITEBYTECODE"] = "1"
         process.environment = childEnvironment
         process.standardOutput = FileHandle.nullDevice

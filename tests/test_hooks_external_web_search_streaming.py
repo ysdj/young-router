@@ -486,10 +486,11 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
             continuation_calls.append(copy.deepcopy(kwargs))
             metadata = kwargs.get("litellm_metadata", {})
             if metadata.get("external_web_search_continuation"):
-                self.assertIn("https://example.test/unrelated", kwargs.get("input", ""))
+                input_text = json.dumps(kwargs.get("input"), ensure_ascii=False)
+                self.assertIn("https://example.test/unrelated", input_text)
                 self.assertIn(
                     "https://example.test/sample-subject-factor-a",
-                    kwargs.get("input", ""),
+                    input_text,
                 )
                 continuation_count = sum(
                     1
@@ -1477,9 +1478,10 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
                 "external_web_search_synthesis",
                 request_data["litellm_metadata"],
             )
-            self.assertIn("Retrieved evidence observed so far:", request_data["input"])
-            self.assertIn("Weather Source", request_data["input"])
-            self.assertIn("https://example.test/weather", request_data["input"])
+            request_input = json.dumps(request_data["input"], ensure_ascii=False)
+            self.assertNotIn("Retrieved evidence observed so far:", request_input)
+            self.assertIn("Weather Source", request_input)
+            self.assertIn("https://example.test/weather", request_input)
             yield {
                 "type": "response.output_text.delta",
                 "delta": "Recovered final answer. https://example.test/weather",
@@ -1754,7 +1756,10 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
             [tool.get("name") for tool in recovery_request["tools"]],
             ["web_search", "fetch_content"],
         )
-        self.assertIn("Decide the next step now", recovery_request["input"])
+        self.assertNotIn(
+            "Decide the next step now",
+            json.dumps(recovery_request["input"], ensure_ascii=False),
+        )
         dumped = json.dumps(chunks)
         self.assertIn("Recovered final answer. https://example.test/one", dumped)
         self.assertNotIn('\"type\": \"function_call\"', dumped)
@@ -1967,7 +1972,11 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
             original_calls += 1
             if original_calls == 1:
                 raise TemporaryUpstreamError("upstream 504")
-            self.assertNotIn("tools", kwargs)
+            self.assertIn("tools", kwargs)
+            self.assertIn(
+                "Web search results for query: sample subject factor A factor B inhibition",
+                json.dumps(kwargs.get("input"), ensure_ascii=False),
+            )
             return {
                 "id": "resp_synth_after_duplicate",
                 "object": "response",
@@ -2119,7 +2128,10 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
             if original_calls == 1:
                 raise TemporaryUpstreamError("upstream 504")
             self.assertIn("tools", kwargs)
-            self.assertIn("sample subject factor A factor B follow-up", kwargs["input"])
+            self.assertIn(
+                "sample subject factor A factor B follow-up",
+                json.dumps(kwargs["input"], ensure_ascii=False),
+            )
             return {
                 "id": "resp_final_after_followup",
                 "object": "response",
@@ -2377,7 +2389,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
         ]
 
         dumped = json.dumps(chunks)
-        self.assertEqual(original_calls, 2)
+        self.assertEqual(original_calls, 1)
         self.assertEqual(len(recovery_requests), 1)
         self.assertEqual(
             [tool.get("name") for tool in recovery_requests[0].get("tools", [])],
@@ -2386,9 +2398,13 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
         self.assertTrue(
             recovery_requests[0]["litellm_metadata"]["external_web_search_continuation"]
         )
-        self.assertIn("Retrieved evidence observed so far:", recovery_requests[0]["input"])
-        self.assertIn("Weather Source", recovery_requests[0]["input"])
-        self.assertIn("https://example.test/weather", recovery_requests[0]["input"])
+        self.assertIn(
+            "Web search results for query: Sample City weather",
+            json.dumps(recovery_requests[0]["input"], ensure_ascii=False),
+        )
+        recovery_input = json.dumps(recovery_requests[0]["input"], ensure_ascii=False)
+        self.assertIn("Weather Source", recovery_input)
+        self.assertIn("https://example.test/weather", recovery_input)
         self.assertIn("response.web_search_call.completed", dumped)
         self.assertIn("Recovered after empty synthesis. https://example.test/weather", dumped)
         self.assertIn('"type": "response.completed"', dumped)
@@ -2565,9 +2581,10 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
         self.assertTrue(
             recovery_requests[0]["litellm_metadata"]["external_web_search_continuation"]
         )
-        self.assertIn("Retrieved evidence observed so far:", recovery_requests[0]["input"])
-        self.assertIn("Weather Source", recovery_requests[0]["input"])
-        self.assertIn("https://example.test/weather", recovery_requests[0]["input"])
+        recovery_input = json.dumps(recovery_requests[0]["input"], ensure_ascii=False)
+        self.assertNotIn("Retrieved evidence observed so far:", recovery_input)
+        self.assertIn("Weather Source", recovery_input)
+        self.assertIn("https://example.test/weather", recovery_input)
         self.assertIn('"type": "response.completed"', dumped)
         self.assertIn("Recovered by route recovery.", dumped)
         self.assertNotIn('"type": "response.failed"', dumped)

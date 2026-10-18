@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -568,17 +569,75 @@ class SiteCustomizeTests(unittest.TestCase):
                 extra_env={
                     "HOME": str(home),
                     "PYTHONDONTWRITEBYTECODE": "1",
+                    "PYTHONPYCACHEPREFIX": "",
                 },
             )
 
         self.assertEqual(result.returncode, 0, result.stderr)
         prefix, dont_write = result.stdout.strip().splitlines()
         self.assertEqual(prefix, str(home / ".young-router" / "pycache"))
-        # The launcher exports PYTHONDONTWRITEBYTECODE so ``__pycache__`` never
-        # reaches the signed bundle.  CPython reads that variable into the flag
-        # before sitecustomize runs, so clearing the variable is not enough: the
-        # flag itself has to be turned off or the cache is never written.
-        self.assertEqual(dont_write, "False")
+        # The cache is an explicit location outside the bundle. Keeping CPython's
+        # no-bytecode startup flag protects every other import as well.
+        self.assertEqual(dont_write, "True")
+        self.assertEqual(result.stderr, "")
+
+    def test_bytecode_is_redirected_after_the_proxy_environment_is_materialized(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            wrapper = Path(temp_dir) / "bin" / "python"
+            wrapper.parent.mkdir(parents=True)
+            wrapper.write_text(
+                '#!/bin/sh\nexec "$LITELLM_TEST_PYTHON" "$@"\n',
+                encoding="utf-8",
+            )
+            wrapper.chmod(0o755)
+            package = Path(temp_dir) / "young_router"
+            package.mkdir()
+            (package / "__init__.py").write_text("", encoding="utf-8")
+            environment = {
+                **os.environ,
+                "HOME": str(Path(temp_dir) / "home"),
+                "PYTHONPATH": os.pathsep.join((str(package), str(ROOT))),
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "YOUNG_ROUTER_DISABLE_PYCACHE": "",
+                "LITELLM_RUNTIME_ROOT": "",
+                "YOUNG_ROUTER_HOME": "",
+                "LITELLM_TEST_PYTHON": self.python(),
+            }
+            environment.pop("PYTHONPYCACHEPREFIX", None)
+            environment["YOUNG_ROUTER_PYCACHE_DIR"] = str(Path(temp_dir) / "startup-cache")
+            result = subprocess.run(
+                [
+                    str(wrapper),
+                    "-c",
+                    (
+                        "import os, sitecustomize, sys; "
+                        "print(sys.pycache_prefix); "
+                        "print(os.environ['PYTHONPYCACHEPREFIX'])"
+                    ),
+                ],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            in_bundle = list(package.rglob("__pycache__/*.pyc"))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        expected = str(Path(temp_dir) / "startup-cache")
+        self.assertEqual(result.stdout.strip().splitlines(), [expected, expected])
+        self.assertEqual(in_bundle, [])
+        environment["YOUNG_ROUTER_PYCACHE_DIR"] = str(Path(temp_dir) / "state" / "pycache")
+        environment["LITELLM_RUNTIME_ROOT"] = str(Path(temp_dir) / "state")
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        result = subprocess.run(
+            [self.python(), "-c", "import sys; print(sys.pycache_prefix)"],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), str(Path(temp_dir) / "state" / "pycache"))
 
     def test_an_explicit_cache_dir_wins_over_the_state_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -592,6 +651,7 @@ class SiteCustomizeTests(unittest.TestCase):
                 extra_env={
                     "HOME": str(temp),
                     "YOUNG_ROUTER_PYCACHE_DIR": str(chosen),
+                    "YOUNG_ROUTER_DISABLE_PYCACHE": "",
                 },
             )
 

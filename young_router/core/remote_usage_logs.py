@@ -32,12 +32,11 @@ from young_router.browser_identity import browser_request_headers
 
 MAX_TARGETS = 4
 MAX_WORKERS = 4
-PAGE_SIZE = 80
 # How many rows one key of one station may contribute. The log view holds up
 # to MAX_LINES and states its own limit in the status strip, so a reader cap
 # below that would silently drop rows the view was willing to show. It stays
 # bounded because the response is third-party and must not grow without limit.
-MAX_ROWS_PER_TARGET = 2_000
+MAX_ROWS_PER_TARGET = 10_000
 DEFAULT_TIMEOUT_SECONDS = 4.0
 # A relay answers a log page as one JSON document, and a station's own page
 # size is often 1000 rows: a real, valid answer is routinely several hundred
@@ -530,7 +529,7 @@ def _row_record(
     """Build one usage record carrying its relay's full name and its fields."""
 
     timestamp = _safe_timestamp(
-        raw.get("created_at") or raw.get("createdAt") or raw.get("timestamp")
+        raw.get("created_at", raw.get("createdAt", raw.get("timestamp")))
     ) or fallback_timestamp
     details = _row_details(raw)
     if not details.get("model") and not details.get("total_tokens"):
@@ -583,7 +582,7 @@ def fetch_target(
         if not answered and first_result != "refused":
             continue
         records: list[dict[str, Any]] = []
-        if first_rows:
+        if first_rows is not None:
             records.extend(_records_from(first_rows, target, kind, fallback_timestamp))
         rest = credentials[1:]
         if rest:
@@ -594,7 +593,7 @@ def fetch_target(
                 futures = [executor.submit(_fetch_key, key, probe, timeout, kind) for key in rest]
                 for future in futures:
                     result, _payload, rows = future.result()
-                    if result == "ok" and rows:
+                    if result == "ok" and rows is not None:
                         records.extend(_records_from(rows, target, kind, fallback_timestamp))
         if answered or records:
             return kind, _deduplicated_records(records)

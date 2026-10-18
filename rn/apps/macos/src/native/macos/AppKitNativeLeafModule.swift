@@ -140,6 +140,18 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
         }
     }
 
+    @objc(textPrompt:value:confirmLabel:cancelLabel:resolver:rejecter:)
+    func textPrompt(_ title: String, value: String, confirmLabel: String, cancelLabel: String, resolver resolve: @escaping RCTPromiseResolveBlock, rejecter reject: RCTPromiseRejectBlock) {
+        guard title.count <= 160, value.utf8.count <= 64,
+              confirmLabel.utf8.count <= 160, cancelLabel.utf8.count <= 160 else {
+            reject("E_NATIVE_TEXT_PROMPT", "The text prompt input is invalid.", nil)
+            return
+        }
+        DispatchQueue.main.async {
+            self.leaf.presentTextPrompt(title: title, value: value, confirmLabel: confirmLabel, cancelLabel: cancelLabel, completion: resolve)
+        }
+    }
+
     @objc(showGroupManager:resolver:rejecter:)
     func showGroupManager(
         _ options: [String: Any],

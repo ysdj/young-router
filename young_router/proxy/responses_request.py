@@ -1259,6 +1259,15 @@ def _request_has_codex_client_evidence(request_kwargs: Optional[dict]) -> bool:
     if not isinstance(request_kwargs, dict):
         return False
 
+    # Codex Desktop declares its local tool registry in a leading
+    # ``additional_tools`` item.  LiteLLM may omit the identifying headers and
+    # client metadata in its reduced context, but the ``functions`` namespace
+    # is the native Codex marker.  Generic Responses clients also use
+    # ``additional_tools`` for arbitrary tools, so the item alone is not
+    # sufficient evidence.
+    if _request_has_codex_additional_tools_namespace(request_kwargs):
+        return True
+
     for headers in _incoming_request_headers(request_kwargs):
         for header_name in (
             "X-Codex-Turn-Metadata",
@@ -1289,6 +1298,30 @@ def _request_has_codex_client_evidence(request_kwargs: Optional[dict]) -> bool:
             value = metadata.get(key)
             if isinstance(value, str) and value.strip():
                 return True
+    return False
+
+
+def _request_has_codex_additional_tools_namespace(
+    request_kwargs: Optional[dict],
+) -> bool:
+    if not isinstance(request_kwargs, dict):
+        return False
+    input_value = request_kwargs.get("input")
+    if not isinstance(input_value, list):
+        return False
+    for item in input_value:
+        if not isinstance(item, dict) or item.get("type") != "additional_tools":
+            break
+        item_tools = item.get("tools")
+        if not isinstance(item_tools, list):
+            continue
+        if any(
+            isinstance(tool, dict)
+            and tool.get("type") == "namespace"
+            and tool.get("name") == "functions"
+            for tool in item_tools
+        ):
+            return True
     return False
 
 
@@ -1518,7 +1551,13 @@ def _codex_bridge_search_declarations(
     request_kwargs: dict,
     direct_tools: List[dict],
 ) -> dict:
-    """Replace Responses/provider search declarations with local functions."""
+    """Replace Responses/provider search declarations with local functions.
+
+    The decision is made from the wire protocol and route metadata, never from
+    model prose such as a promise to search or continue.  Chat fallbacks need
+    the local functions at top level; leaving them only in ``additional_tools``
+    makes a third-party model see no usable search tool.
+    """
 
     modified_kwargs = request_kwargs.copy()
     from . import responses_tools as _responses_tools_module
@@ -1536,7 +1575,9 @@ def _codex_bridge_search_declarations(
 
     # The Codex client can carry an older ordinary-function declaration with
     # one of the bridge names. Replace it with the canonical schema rather
-    # than leaving a same-named function with incompatible parameters.
+    # than leaving a same-named function with incompatible parameters. Keeping
+    # the original non-search declarations is also required for a continuation:
+    # after a search the model may still need to call any tool from the turn.
     local_tool_names = {
         _codex_tool_definition_name(tool)
         for tool in direct_tools

@@ -24,12 +24,16 @@ from .base import (
     _PROTOCOL_FALLBACK_CLIENT_SURFACE_KEY,
     _PROTOCOL_FALLBACK_FROM_SURFACE_KEY,
     _PROTOCOL_FALLBACK_RELAX_TOOL_CHOICE_KEY,
+    _RESTORED_REASONING_REPLAY_KEY,
     _RouteOrder,
+    _UPSTREAM_URL_SURFACE_OPENAI_CHAT,
+    _UPSTREAM_URL_SURFACE_ANTHROPIC,
     _RESPONSES_CHAT_BRIDGE_ORIGINAL_MODEL_GROUP_KEY,
     _RESPONSES_FUNCTION_TOOL_BRIDGE_FALLBACK_REASON_KEY,
     _WEB_SEARCH_EXTERNAL_BRIDGE_KEY,
     _WEB_SEARCH_EXTERNAL_BRIDGE_STREAM_KEY,
     _VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY,
+    asyncio,
     inspect,
     time,
     _normalize_response_completed_event_usage,
@@ -331,9 +335,147 @@ async def _responses_chat_bridge_text_stream_from_chat_stream(
     yield _normalize_response_completed_event_usage(completed)
 
 
+def _chat_bridge_reasoning_included(bridge_kwargs: dict) -> bool:
+    bridge_input = bridge_kwargs.get("input")
+    return _responses_request_module._request_has_codex_client_evidence(
+        bridge_kwargs
+    ) and isinstance(bridge_input, list) and any(
+        isinstance(item, dict)
+        and item.get("type") == "reasoning"
+        and isinstance(item.get("encrypted_content"), str)
+        and bool(item["encrypted_content"].strip())
+        for item in bridge_input
+    )
+
+
+REASONING_INCLUDED_HEADER = "x-reasoning-included"
+_RESTORED_REASONING_ATTR = "_young_router_restored_reasoning"
+
+
+class _RestoredReasoningStream:
+    """A Responses stream whose usage already covered replayed reasoning.
+
+    Codex decides whether to re-estimate earlier encrypted reasoning from the
+    ``x-reasoning-included`` *HTTP response header*: its SSE client reads the
+    header once, before the first event, and nothing inside the event body can
+    replace it.  The adapted stream is created here, far below LiteLLM's
+    request processing, so the fact travels on the object LiteLLM hands to its
+    response-header hook (see
+    ``YoungRouterHook.async_post_call_response_headers_hook``).
+
+    The adapted Chat request replays the client's context as ordinary
+    messages, so the upstream reports every restored token in
+    ``usage.input_tokens``.  Codex must therefore not add its own estimate of
+    the encrypted reasoning items on top, which is what made a 185k-token
+    context look like 400k and triggered a needless pre-turn compaction.
+    """
+
+    def __init__(self, response: Any) -> None:
+        self._response = response
+        self._iterator = response.__aiter__()
+        setattr(self, _RESTORED_REASONING_ATTR, True)
+        # This wrapper sits outside the selected-deployment marker stream, and
+        # the hooks that handle a failed initial stream read that marker off
+        # the response object.  Without it the route that failed is never
+        # excluded and the retry picks the same route again.
+        marker = getattr(response, "_young_router_selected_deployment_marker", None)
+        if marker is not None:
+            self._young_router_selected_deployment_marker = marker
+
+    def __aiter__(self) -> Any:
+        return self
+
+    async def __anext__(self) -> Any:
+        return await self._iterator.__anext__()
+
+    async def aclose(self) -> None:
+        close = getattr(self._iterator, "aclose", None)
+        if not callable(close):
+            return
+        result = close()
+        if hasattr(result, "__await__"):
+            await result
+
+
+def _restored_reasoning_included(response: Any) -> bool:
+    """Whether this response object says it covered replayed reasoning."""
+
+    return getattr(response, _RESTORED_REASONING_ATTR, False) is True
+
+
+def _restored_reasoning_replayed(request_kwargs: dict) -> bool:
+    """Whether this answer replays a Codex history that carries reasoning.
+
+    Every route this router serves receives that history — as encrypted
+    reasoning items on a Responses surface, or as the restored messages a
+    bridge writes for a Chat one — and reports the usage it actually billed.
+    Codex's own estimate of those items is therefore a second count of the same
+    context, which is what turned a 185k-token conversation into a 400k one and
+    started a pre-turn compaction nobody needed.
+    """
+
+    if request_kwargs.get(_RESTORED_REASONING_REPLAY_KEY) is True:
+        return True
+    # The client's own request is the only place the reasoning items can still
+    # be seen once a bridge or a surface adapter has rewritten its input.
+    return _routing_module._request_replays_restored_reasoning(
+        request_kwargs
+    ) or _chat_bridge_reasoning_included(request_kwargs)
+
+
+def _with_restored_reasoning_marker(response: Any, request_kwargs: dict) -> Any:
+    """Tag an answer that replayed the client's encrypted reasoning."""
+
+    already = _restored_reasoning_included(response)
+    replayed = _restored_reasoning_replayed(request_kwargs)
+    stream = callable(getattr(response, "__aiter__", None))
+    marked = already or (replayed and stream)
+    _trace_module._route_trace(
+        "responses_restored_reasoning_marker",
+        request_id=_routing_module._trace_request_id(request_kwargs),
+        session=_routing_module._trace_session_context(request_kwargs),
+        model_group=_request_model_group(request_kwargs),
+        replayed=replayed,
+        codex_evidence=_responses_request_module._request_has_codex_client_evidence(
+            request_kwargs
+        ),
+        surface=_responses_request_module._codex_request_responses_surface(
+            request_kwargs
+        ),
+        flagged=request_kwargs.get(_RESTORED_REASONING_REPLAY_KEY) is True,
+        request_evidence=_routing_module._request_replays_restored_reasoning(
+            request_kwargs
+        ),
+        adapted_surface=_routing_module._request_adapted_surface(request_kwargs),
+        stream=stream,
+        already=already,
+        marked=marked,
+        response_type=type(response).__name__,
+    )
+    if already or not marked:
+        return response
+    return _RestoredReasoningStream(response)
+
+
+def responses_chat_bridge_stream(
+    bridge_kwargs: dict,
+    upstream_response: Any,
+) -> Any:
+    return _with_restored_reasoning_marker(
+        _responses_chat_bridge_text_stream_from_chat_stream(
+            upstream_response,
+            bridge_kwargs,
+        ),
+        bridge_kwargs,
+    )
+
+
 async def _responses_chat_bridge_direct_stream_response(
     bridge_kwargs: dict,
 ) -> Optional[Any]:
+    # The adapter still emits a Responses stream. Codex compacts from that same
+    # history, so its header must describe the replay the adapter really sends
+    # to the upstream, rather than the legacy Chat-shaped request it replaces.
     payload = _chat_bridge_stream_payload(bridge_kwargs)
     if payload is None:
         return None
@@ -351,25 +493,35 @@ async def _responses_chat_bridge_direct_stream_response(
             method_name="acompletion",
         ),
     )
-    chat_response = await acompletion(**payload)
+    start_timeout_seconds = _routing_module._stream_start_timeout_seconds_for_request(
+        bridge_kwargs
+    )
+    if start_timeout_seconds > 0:
+        try:
+            chat_response = await asyncio.wait_for(
+                acompletion(**payload),
+                timeout=start_timeout_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            raise _streaming_module._stream_start_timeout_exception(
+                bridge_kwargs,
+                start_seconds=start_timeout_seconds,
+                saw_chunk=False,
+                buffered_chunks=0,
+            ) from exc
+    else:
+        chat_response = await acompletion(**payload)
     if _responses_output_module._response_is_async_iterable(chat_response):
-        return _responses_chat_bridge_text_stream_from_chat_stream(
-            chat_response,
-            bridge_kwargs,
-        )
+        return responses_chat_bridge_stream(bridge_kwargs, chat_response)
 
     text = _chat_completion_message_text(chat_response)
     if not text:
         return None
 
-    async def single_response_stream() -> Any:
-        async for chunk in _responses_chat_bridge_text_stream_from_chat_stream(
-            _single_chat_completion_chunk_stream(chat_response),
-            bridge_kwargs,
-        ):
-            yield chunk
-
-    return single_response_stream()
+    return responses_chat_bridge_stream(
+        bridge_kwargs,
+        _single_chat_completion_chunk_stream(chat_response),
+    )
 
 
 async def _single_chat_completion_chunk_stream(response: Any) -> Any:
@@ -441,7 +593,7 @@ async def _execute_responses_chat_bridge_call(
         "litellm_metadata",
     ) or {}
     if bridge_metadata.get(_WEB_SEARCH_EXTERNAL_BRIDGE_KEY) is True:
-        bridge_kwargs = _responses_web_search_bridge_module._external_web_search_low_reasoning_kwargs(
+        bridge_kwargs = _responses_web_search_bridge_module._external_web_search_safe_request_base(
             bridge_kwargs
         )
         bridge_metadata = _request_context_module._request_metadata_dict(
@@ -553,17 +705,33 @@ async def _execute_responses_chat_bridge_call(
                 # and still return a Chat iterator. Adapt that iterator into a
                 # terminating Responses stream instead of handing the raw Chat
                 # chunks to the caller.
-                return _responses_chat_bridge_text_stream_from_chat_stream(
-                    response,
-                    active_bridge_kwargs,
+                return responses_chat_bridge_stream(
+                    active_bridge_kwargs, response
                 )
+            # The search rounds above are buffered, but this request is still a
+            # streaming request: the client and LiteLLM's own stream hooks only
+            # accept an async iterator here. Returning the buffered Responses
+            # object made LiteLLM fail with "'ResponsesAPIResponse' object has
+            # no attribute '__aiter__'" and answer the turn with a 500, so the
+            # finalized payload is emitted as ordinary Responses SSE.
+            resolved_response = response
             if should_intercept_external_web_search:
-                return await _responses_web_search_bridge_module._resolve_web_search_function_calls(
-                    response,
-                    active_bridge_kwargs,
-                    original_function,
+                resolved_response = (
+                    await _responses_web_search_bridge_module._resolve_web_search_function_calls(
+                        response,
+                        active_bridge_kwargs,
+                        original_function,
+                    )
                 )
-            return response
+            response_payload = _streaming_module._jsonable(resolved_response)
+            if not isinstance(response_payload, dict):
+                response_payload = _responses_web_search_bridge_module._hosted_tool_unsupported_response(
+                    active_bridge_kwargs,
+                    _responses_output_module._response_text(resolved_response),
+                )
+            return _responses_web_search_bridge_module._external_web_search_bridge_stream(
+                response_payload
+            )
         if (
             should_intercept_external_web_search
             and active_bridge_metadata.get(_WEB_SEARCH_EXTERNAL_BRIDGE_STREAM_KEY) is True
@@ -615,7 +783,12 @@ async def _execute_responses_chat_bridge_call(
         _routing_module._record_protocol_fallback_success(
             active_bridge_kwargs.copy()
         )
-        return response
+        # Every adapted answer leaves this function through here, so the
+        # restored-reasoning fact is attached once instead of at each return.
+        return _with_restored_reasoning_marker(
+            response,
+            active_bridge_kwargs,
+        )
 
     try:
         return await execute_once_and_remember_fallback(bridge_kwargs)
@@ -1089,7 +1262,7 @@ async def _execute_responses_external_web_search_bridge_call(
     original_request_kwargs: Optional[dict] = None,
     outer_request_kwargs: Optional[dict] = None,
 ) -> Any:
-    bridge_kwargs = _responses_web_search_bridge_module._external_web_search_low_reasoning_kwargs(
+    bridge_kwargs = _responses_web_search_bridge_module._external_web_search_safe_request_base(
         bridge_kwargs
     )
     bridge_metadata = _request_context_module._request_metadata_dict(
@@ -1210,7 +1383,7 @@ async def _execute_responses_function_tool_bridge_call(
         "litellm_metadata",
     ) or {}
     if bridge_metadata.get(_WEB_SEARCH_EXTERNAL_BRIDGE_KEY) is True:
-        bridge_kwargs = _responses_web_search_bridge_module._external_web_search_low_reasoning_kwargs(
+        bridge_kwargs = _responses_web_search_bridge_module._external_web_search_safe_request_base(
             bridge_kwargs
         )
     bridge_metadata = _request_context_module._request_metadata_dict(

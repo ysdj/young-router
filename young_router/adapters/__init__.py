@@ -1,5 +1,5 @@
 """Adapters and worker scripts for the third-party integrations this app
-bundles (pi-web-access, Veridrop, WorkBuddy, OpenCode Zen, dsh-vision-router).
+bundles (pi-web-access, Veridrop, WorkBuddy, dsh-our-free-model, dsh-vision-router).
 
 A staged worker that serves a model endpoint publishes the base URL it is
 reachable at as an ``os.environ/`` *reference*, never as a literal URL: the

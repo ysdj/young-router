@@ -35,6 +35,7 @@ export interface NativeLeafBridge {
   showActionMenu(title: string, items: string[], anchor: NativeMenuAnchor): Promise<number | undefined>;
   showGroupedActionMenu?(title: string, groups: Array<{ title: string; items: string[] }>, anchor: NativeMenuAnchor): Promise<{ group: number; item: number } | undefined>;
   showConfirmation(title: string, message: string, confirmLabel: string, cancelLabel: string, destructive: boolean): Promise<boolean>;
+  textPrompt?(title: string, value: string, confirmLabel: string, cancelLabel: string): Promise<string | null>;
   showReadOnlyText(title: string, text: string, closeLabel: string, language: "json" | "toml" | "text", html: string): Promise<void>;
   showProviderAuth?(options: {
     provider: "openai" | "claude";
@@ -175,6 +176,9 @@ export function createNativeLeafBridgeAdapter(bridge: NativeLeafBridge): NativeL
       ? ({ title, groups, anchor }) => bridge.showGroupedActionMenu!(title, groups, anchor)
       : undefined,
     showConfirmation: ({ title, message, confirmLabel, cancelLabel, destructive }) => bridge.showConfirmation(title, message, confirmLabel, cancelLabel ?? "", destructive === true),
+    textPrompt: bridge.textPrompt
+      ? ({ title, value, confirmLabel, cancelLabel }) => bridge.textPrompt!(title, value, confirmLabel, cancelLabel ?? "")
+      : undefined,
     showReadOnlyText: ({ title, text, closeLabel, language, html }) => bridge.showReadOnlyText(title, text, closeLabel, language, html),
     showProviderAuth: bridge.showProviderAuth
       ? (options) => bridge.showProviderAuth!(options)

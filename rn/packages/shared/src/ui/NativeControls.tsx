@@ -86,6 +86,7 @@ type SegmentedProps = {
   selectedValue: string;
   disabled?: boolean;
   compact?: boolean;
+  overlayLayer?: boolean;
   onChange?: (event: NativeSyntheticEvent<{ value: string; index: number }>) => void;
   style?: StyleProp<ViewStyle>;
 };
@@ -179,9 +180,13 @@ type PickerProps = {
   selectedValue: string;
   disabled?: boolean;
   compact?: boolean;
+  /** A macOS overlay that must remain above native content controls. */
+  overlayLayer?: boolean;
   onChange?: (event: NativeSyntheticEvent<{ value: string; index: number }>) => void;
   style?: StyleProp<ViewStyle>;
 };
+
+const pickerLabelWidth = (labels: string[], selectedValue: string): number => Math.ceil(Math.min(180, Math.max(80, ...([selectedValue, ...labels].map((label) => label.length * 13 * 0.72 + 32)))));
 
 type TableColumn = {
   label: string;
@@ -205,6 +210,8 @@ type TableProps = {
    */
   compact?: boolean;
   followBottom?: boolean;
+  /** One explicit table scroll request; -1 keeps the current viewport. */
+  scrollToRow?: number;
   framed?: boolean;
   /** Sidebar source-list chrome: no header, single full-width column. */
   sourceList?: boolean;
@@ -351,12 +358,19 @@ export function NativeSegmentedControl(props: SegmentedProps & { ref?: React.Ref
   return <NativeSegmentedControlWithRef {...props} ref={props.ref} />;
 }
 
-export function NativeTextField({ style, onChangeText, onSubmitEditing, search = false, ...props }: TextInputProps & { search?: boolean }): React.JSX.Element {
+type TextFieldProps = TextInputProps & {
+  search?: boolean;
+  /** Draw this field without its native bezel when another border owns it. */
+  borderless?: boolean;
+};
+
+
+export function NativeTextField({ style, onChangeText, onSubmitEditing, search = false, borderless = false, ...props }: TextFieldProps): React.JSX.Element {
   if (Platform.OS === "windows") {
     return <WinUITextInput value={props.value} placeholder={props.placeholder} multiline={props.multiline} secureTextEntry={props.secureTextEntry} search={search} disabled={props.editable === false} keyboardType={props.keyboardType} accessibilityLabel={props.accessibilityLabel} onChangeText={(event) => onChangeText?.(event.nativeEvent.text)} onBlur={() => props.onBlur?.({} as never)} onSubmitEditing={(event) => onSubmitEditing?.({ ...event, nativeEvent: { text: event.nativeEvent.text } } as never)} style={style} />;
   }
   if (Platform.OS === "macos") {
-    return <AppKitTextField {...props} search={search} style={style} onChangeText={onChangeText} onSubmitEditing={onSubmitEditing} />;
+    return <AppKitTextField {...props} search={search} borderless={borderless} style={style} onChangeText={onChangeText} onSubmitEditing={onSubmitEditing} />;
   }
   return <TextInput {...props} style={style} onChangeText={onChangeText} onSubmitEditing={onSubmitEditing} />;
 }
@@ -392,18 +406,18 @@ export function NativeCheckbox({ label, value, disabled, compact = true, labelVi
   return <Pressable style={[styles.checkboxFallback, sizedStyle]} disabled={disabled} onPress={() => onValueChange?.(!value)} accessibilityRole="checkbox" accessibilityLabel={label} accessibilityState={{ checked: value, disabled }}><StaticBooleanIndicator value={value} />{labelVisible ? <Text style={styles.controlText}>{label}</Text> : null}</Pressable>;
 }
 
-export function NativePicker({ labels, selectedValue, disabled, compact = true, onChange, style }: PickerProps): React.JSX.Element {
+export function NativePicker({ labels, selectedValue, disabled, compact = true, overlayLayer = false, onChange, style }: PickerProps): React.JSX.Element {
   if (Platform.OS === "windows") {
     return <WinUIPicker labels={labels} selectedValue={selectedValue} disabled={disabled} compact={compact} onChange={(event) => onChange?.({ ...event, nativeEvent: event.nativeEvent })} style={style} />;
   }
   if (Platform.OS === "macos") {
-    return <AppKitPicker labels={labels} selectedValue={selectedValue} disabled={disabled} compact={compact} onChange={onChange} style={style} />;
+    return <AppKitPicker labels={labels} selectedValue={selectedValue} disabled={disabled} compact={compact} overlayLayer={overlayLayer} onChange={onChange} style={[compact && style === undefined ? { minWidth: pickerLabelWidth(labels, selectedValue) } : null, style]} />;
   }
   return <NativeSegmentedControl labels={labels} selectedValue={selectedValue} disabled={disabled} compact={compact} onChange={onChange} style={style} />;
 }
 
 
-export function NativeTable({ columns, rows, selectedKey = "", striped = true, compact = true, followBottom = false, framed = true, sourceList = false, rowSymbols = [], rowSymbolColors = [], rowImageNames = [], cellHorizontalPadding = 8, firstColumnHorizontalPadding = 8, preserveColumnWidths = false, scrollTrailingColumnOverflow = false, disabledRowKeys = [], secondaryCellKeys = [], selectableSpanningRowKeys = [], onSelectionChange, onRowDoublePress, style, alertRowKeys = [] }: TableProps): React.JSX.Element {
+export function NativeTable({ columns, rows, selectedKey = "", striped = true, compact = true, followBottom = false, scrollToRow = -1, framed = true, sourceList = false, rowSymbols = [], rowSymbolColors = [], rowImageNames = [], cellHorizontalPadding = 8, firstColumnHorizontalPadding = 8, preserveColumnWidths = false, scrollTrailingColumnOverflow = false, disabledRowKeys = [], secondaryCellKeys = [], selectableSpanningRowKeys = [], onSelectionChange, onRowDoublePress, style, alertRowKeys = [] }: TableProps): React.JSX.Element {
   // Striped rows belong to the list surface, not to its contents: the native
   // table paints its alternating bands across the whole viewport, so an empty
   // list shows the same stripes and reads as a list that happens to have no
@@ -429,6 +443,7 @@ export function NativeTable({ columns, rows, selectedKey = "", striped = true, c
     alternatingRows: stripedRows,
     compact,
     followBottom,
+    scrollToRow,
     borderless: !framed,
     sourceList,
     rowSymbols,
@@ -441,7 +456,8 @@ export function NativeTable({ columns, rows, selectedKey = "", striped = true, c
     selectableSpanningRowKeys: Array.from(selectableSpanningKeys),
   };
   if (Platform.OS === "windows") {
-    return <WinUITable {...nativeProps} onSelectionChange={(event) => onSelectionChange?.(event.nativeEvent.key, event.nativeEvent.index)} onRowDoublePress={(event) => onRowDoublePress?.(event.nativeEvent.key, event.nativeEvent.index)} style={[styles.table, style]} />;
+    const { scrollToRow: _macOSScroll, ...windowsProps } = nativeProps;
+    return <WinUITable {...windowsProps} onSelectionChange={(event) => onSelectionChange?.(event.nativeEvent.key, event.nativeEvent.index)} onRowDoublePress={(event) => onRowDoublePress?.(event.nativeEvent.key, event.nativeEvent.index)} style={[styles.table, style]} />;
   }
   if (Platform.OS === "macos") {
     return <AppKitTable {...nativeProps} cellHorizontalPadding={cellHorizontalPadding} firstColumnHorizontalPadding={firstColumnHorizontalPadding} preserveColumnWidths={preserveColumnWidths} scrollTrailingColumnOverflow={scrollTrailingColumnOverflow} onSelectionChange={(event) => onSelectionChange?.(event.nativeEvent.key, event.nativeEvent.index)} onRowDoublePress={(event) => onRowDoublePress?.(event.nativeEvent.key, event.nativeEvent.index)} style={[styles.table, style]} />;

@@ -479,12 +479,59 @@ def catalog_is_current(
                 # file already on disk counts as current and the next refresh
                 # retries the read.
                 return True
-        return read_json(path, default=None) == catalog_payload(
+        existing = read_json(path, default=None)
+        existing_models = existing.get("models") if isinstance(existing, Mapping) else None
+        if not isinstance(existing_models, Sequence) or isinstance(
+            existing_models, (str, bytes, bytearray)
+        ):
+            return False
+        expected = catalog_payload(
             names,
             registry=registry,
             native_models=resolved_native,
             base_slug=base_slug,
         )
+        if any(not isinstance(item, Mapping) for item in existing_models):
+            return False
+        existing_fallback = not any(
+            profile_has_instructions(item) for item in existing_models
+        )
+        if existing_fallback and base_slug and any(
+            isinstance(item, Mapping)
+            and str(item.get("slug") or "").strip().casefold()
+            == base_slug.strip().casefold()
+            and profile_has_instructions(item)
+            for item in resolved_native
+        ):
+            expected = catalog_payload(
+                names,
+                registry=registry,
+                native_models=resolved_native,
+                base_slug=base_slug,
+            )
+        if existing != expected and [
+            item.get("slug") for item in existing_models
+        ] != [item.get("slug") for item in expected["models"]]:
+            return False
+        existing_native = any(
+            profile_has_instructions(item) for item in existing_models
+        )
+        expected_native = any(
+            profile_has_instructions(item) for item in expected["models"]
+        )
+        if existing != expected:
+            return expected_native and not existing_native
+        if expected_native and not existing_native:
+            # A transient unreadable client catalog may already have been
+            # written over this file. Repair that downgrade as soon as the
+            # installed client again supplies its instructions.
+            return False
+        if existing_native and not expected_native:
+            # During a client update, its catalog may be temporarily unreadable.
+            # Keep the instructions already in use rather than downgrading a
+            # restored thread to the fallback context Codex re-estimates.
+            return True
+        return True
     except PersistenceError:
         return False
 

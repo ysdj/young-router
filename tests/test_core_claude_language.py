@@ -83,7 +83,10 @@ class ClaudeSettingsDomainTests(unittest.TestCase):
     def test_core_registers_both_domains_and_keeps_apply_confirmation_at_the_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
+            config = root / "config.yaml"
+            config.write_text("providers: {}\nmodel_list: []\n", encoding="utf-8")
             core = CoreStore.with_default_domains(
+                config_path=config,
                 claude_settings_path=root / "claude" / "settings.json",
                 language_path=root / "language.json",
             )

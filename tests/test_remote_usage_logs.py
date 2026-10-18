@@ -487,7 +487,12 @@ class RemoteUsageLogsTests(unittest.TestCase):
         # several-hundred-kilobyte document. A cap below that rejected the
         # busiest keys as if their endpoint were unsupported.
         items = [
-            {"model_name": f"model-{index}", "total_tokens": index, "token_name": "k"}
+            {
+                "model_name": f"model-{index}",
+                "total_tokens": index,
+                "token_name": "k",
+                "created_at": index,
+            }
             for index in range(1000)
         ]
 

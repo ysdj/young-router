@@ -16,5 +16,7 @@ export interface NativeSegmentedProps extends ViewProps {
   selectedValue?: string;
   disabled?: WithDefault<boolean, false>;
   compact?: WithDefault<boolean, false>;
+  // @macos-only
+  overlayLayer?: WithDefault<boolean, false>;
   onChange?: DirectEventHandler<ChangeEvent>;
 }

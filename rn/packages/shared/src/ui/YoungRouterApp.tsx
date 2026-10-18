@@ -157,7 +157,7 @@ function providerKind(provider: UnknownRecord | undefined): ProviderKind {
 type ServiceID = "openai" | "claude" | "workbuddy" | "workbuddyAI" | "opencode2dsh";
 
 /**
- * The key slot every OpenCode Zen Free entry carries.
+ * The key slot every dsh-our-free-model entry carries.
  *
  * The lane needs no credential of the user's, but LiteLLM still requires a
  * non-empty key for an OpenAI-compatible route, so Core mints one loopback
@@ -165,7 +165,7 @@ type ServiceID = "openai" | "claude" | "workbuddy" | "workbuddyAI" | "opencode2d
  * will have instead of printing the provider name where a key name belongs;
  * it must stay identical to `API_KEY_NAME` in `young_router/adapters/opencode2dsh.py`.
  */
-const OPENCODE2DSH_KEY_NAME = "opencode-zen-free";
+const OPENCODE2DSH_KEY_NAME = "our-free-model-local";
 
 /**
  * The auth kinds that own the key slot their provider mints.
@@ -196,7 +196,7 @@ function managedServiceForSlot(managed: boolean, authKind: ProviderAuthKind): Se
 }
 
 /**
- * The public name of one OpenCode Zen lane id.
+ * The public name of one upstream free-lane model id.
  *
  * The lane marks its free ids with a ``-free`` suffix (``cat-jam-free``).  That
  * states the lane rather than the model, so the public name a client sees drops
@@ -560,6 +560,43 @@ const LOG_VIEW_POLL_MS = 5_000;
 const REQUEST_LOG_POLL_MS = 1_000;
 const RECOVERY_LOG_POLL_MS = 1_000;
 const ONLINE_USAGE_POLL_MS = 15_000;
+const ONLINE_USAGE_PAGE_ROWS = 300;
+const ONLINE_USAGE_TIME_OPTIONS = ["all", "today", "7d", "30d", "custom"] as const;
+type OnlineUsageTimeOption = typeof ONLINE_USAGE_TIME_OPTIONS[number];
+type OnlineUsageRange = { since?: number; until?: number };
+
+function localDateParts(now = new Date()): [string, string] {
+  const pad = (value: number): string => String(value).padStart(2, "0");
+  return [
+    `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`,
+    `${pad(now.getHours())}:${pad(now.getMinutes())}`,
+  ];
+}
+
+function parseLocalDate(value: string, end = false): number | undefined {
+  const match = /^(\d{4})-(\d{2})-(\d{2})(?:\s+(\d{2}):(\d{2}))?$/.exec(value.trim());
+  if (!match) return undefined;
+  const parsed = new Date(
+    Number(match[1]), Number(match[2]) - 1, Number(match[3]),
+    match[4] === undefined ? (end ? 23 : 0) : Number(match[4]),
+    match[5] === undefined ? (end ? 59 : 0) : Number(match[5]),
+    match[4] === undefined && end ? 59 : 0,
+  );
+  return parsed.getFullYear() === Number(match[1])
+    && parsed.getMonth() === Number(match[2]) - 1
+    && parsed.getDate() === Number(match[3])
+    && (match[4] === undefined || (parsed.getHours() === Number(match[4]) && parsed.getMinutes() === Number(match[5])))
+    ? parsed.getTime()
+    : undefined;
+}
+
+function onlineUsageTimeLabel(option: OnlineUsageTimeOption, translate: Translate): string {
+  return option === "all" ? translate("logs.onlineUsageAllTime")
+    : option === "today" ? translate("logs.onlineUsageToday")
+    : option === "7d" ? translate("logs.onlineUsageRecent7d")
+    : option === "30d" ? translate("logs.onlineUsageRecent30d")
+    : translate("logs.onlineUsageRangePrompt");
+}
 // How long one relay read answers later implicit callers for the same account.
 // It exists to stop the account pane's mount read and 分组管理's aligned draft
 // from paying for the same station round trip twice; an explicit read (a
@@ -1120,6 +1157,10 @@ const NON_STAGING_ACTIONS: ReadonlySet<string> = new Set([
   "provider_probe",
   "probe",
   "reset_transient_routing_state",
+  "logs_set_time_range",
+  "logs_set_filter",
+  "logs_load_more",
+  "logs_previous_page",
 ]);
 
 function isNonStagingAction(type: string): boolean {
@@ -1282,6 +1323,7 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
   const snapshotLanguage = snapshot?.language;
   const translate = useMemo<Translate>(() => !snapshotLanguage || snapshotLanguage === "system" ? hostTranslate : createTranslator(snapshotLanguage), [hostTranslate, snapshotLanguage]);
   const handledNativeActions = useRef(new Set<string>());
+  const executedRouteRequest = useRef<string | undefined>(undefined);
   // The desktop host starts its service once while opening, except after an
   // explicit Stop issued before that startup attempt completes.
   const serviceShouldBeRunning = useRef(true);
@@ -1493,6 +1535,9 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
 
   useEffect(() => {
     if (!routeRequest) return;
+    const routeKey = `${routeRequestSequence ?? 0}:${routeRequest}`;
+    if (executedRouteRequest.current === routeKey) return;
+    executedRouteRequest.current = routeKey;
     if (isWindowManagerHost) {
       if (routeRequest !== "home") {
         const windowRoute = canonicalWindowRoute(routeRequest);
@@ -1514,6 +1559,10 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
       native.window.focus(windowRoute);
     }
   }, [isPrimaryHost, isWindowManagerHost, native, routeRequest, routeRequestSequence]);
+  useEffect(() => {
+    if (!snapshot || (routeRequest && routeRequest !== "home") || !isSettingsShellRoute(route)) return;
+    setRoute(canonicalWindowRoute(route));
+  }, [route, routeRequest, snapshot]);
 
   useEffect(() => {
     if (!isPrimaryHost) return;
@@ -1892,7 +1941,7 @@ function IconButton({ label, symbol, title, disabled, onPress }: { label: string
 function WindowTabs({ values, selected, disabled, onSelect, style, nativeRef }: { values: Array<{ id: string; title: string }>; selected: string; disabled?: boolean; onSelect: (id: string) => void; style?: StyleProp<ViewStyle>; nativeRef?: React.Ref<HostInstance> }): React.JSX.Element {
   const labels = values.map((item) => item.title);
   const selectedValue = values.find((item) => item.id === selected)?.title ?? labels[0] ?? "";
-  return <NativeSegmentedControl ref={nativeRef} labels={labels} selectedValue={selectedValue} disabled={disabled} onChange={({ nativeEvent }) => { const next = values[nativeEvent.index]; if (next) onSelect(next.id); }} style={[styles.windowTabs, style]} />;
+  return <NativeSegmentedControl ref={nativeRef} labels={labels} selectedValue={selectedValue} disabled={disabled} overlayLayer={Boolean(nativeRef)} onChange={({ nativeEvent }) => { const next = values[nativeEvent.index]; if (next) onSelect(next.id); }} style={[styles.windowTabs, style]} />;
 }
 
 function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native, translate, logTabRequest, fileIdRequest, nativeAction, onSnapshot, onNavigate, onClose, onRegisterFlush }: { route: AppRoute; shell?: boolean; windowRoute?: AppRoute; snapshot?: CoreSnapshot; ipc: IpcClient; native: NativeLeafAdapter; translate: Translate; logTabRequest?: LogTab; fileIdRequest?: string; nativeAction?: { id: string; sequence: number }; onSnapshot: (next: CoreSnapshot) => void; onNavigate: (route: AppRoute) => void; onClose: () => void; onRegisterFlush?: (flush?: () => Promise<boolean>) => void }): React.JSX.Element {
@@ -2051,7 +2100,7 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
     if (staged) revision.current = staged.revision;
     return staged ?? { cancelled: true };
   }, null);
-  const run = async (
+  const runOutcome = async <T,>(
     operation: () => Promise<unknown>,
     message: ResultMessage = "common.saved",
     keepControlsEnabled = false,
@@ -2061,7 +2110,7 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
     // bar, so this window publishes nothing at all — not the wait, not the
     // result, and not the failure.
     quiet = false,
-  ): Promise<void> => {
+  ): Promise<T | undefined> => {
     const publishResult = (next: string | undefined): void => {
       if (quiet) return;
       if (dataManagementTab) {
@@ -2096,9 +2145,11 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
         publishResult(message === null ? undefined : translate(message));
       }
       if (refreshAfter) await refresh();
+      return value as T;
     } catch (reason: unknown) {
       const validationStatus = await validationStatusAfterFailure(reason);
       publishResult(validationStatus ?? errorMessage(reason, translate));
+      return undefined;
     } finally {
       activeRuns.current -= 1;
       if (!keepControlsEnabled) {
@@ -2106,6 +2157,9 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
         if (busyRuns.current === 0) setBusy(false);
       }
     }
+  };
+  const run = async (...arguments_: Parameters<typeof runOutcome>): Promise<void> => {
+    await runOutcome(...arguments_);
   };
   const runDataManagement = (tab: DataManagementTab, operation: () => Promise<unknown>, message: ResultMessage, keepControlsEnabled = false): Promise<void> => run(operation, message, keepControlsEnabled, true, tab);
   const runWebDavOperation = async (operation: () => Promise<unknown>, message: ResultMessage): Promise<void> => {
@@ -2430,9 +2484,9 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
     }
     return "keep";
   }, [ipc, native, onSnapshot, translate]);
-  const apply = (options?: { silent?: boolean; quiet?: boolean; message?: string; keepControlsEnabled?: boolean }): Promise<void> => {
-    if ((!settingsRoute && !domain) || domain === "logs") return Promise.resolve();
-    return run(async () => {
+  const applyOutcome = (options?: { silent?: boolean; quiet?: boolean; message?: string; keepControlsEnabled?: boolean }): Promise<IpcResults["apply"] | { cancelled: true } | undefined> => {
+    if ((!settingsRoute && !domain) || domain === "logs") return Promise.resolve(undefined);
+    return runOutcome<IpcResults["apply"] | { cancelled: true }>(async () => {
       await flushPendingFields();
       // Inline relay edits stage through the shared dispatch queue when their
       // fields lose focus. Wait for that queue before taking the apply
@@ -2503,6 +2557,9 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
       if (diskConflicts.length > 0) setKeptDiskGeneration({});
       return result;
     }, options?.silent ? null : (options?.message ?? "common.saved"), options?.keepControlsEnabled === true, true, undefined, options?.quiet === true);
+  };
+  const apply = async (options?: { silent?: boolean; quiet?: boolean; message?: string; keepControlsEnabled?: boolean }): Promise<void> => {
+    await applyOutcome(options);
   };
   // A child surface applies the draft it wrote itself (分组管理's 保存并关闭):
   // the pane it was opened from must stay silent about work it did not start,
@@ -3124,7 +3181,7 @@ function nextServiceProviderName(providers: UnknownRecord[], kind: ServiceProvid
     : kind === "claude_login" ? "Claude"
       : kind === "workbuddy_login" ? "WorkBuddy"
         : kind === "workbuddy_ai_login" ? "WorkBuddy AI"
-          : "OpenCode Zen Free";
+          : "dsh-our-free-model";
   const names = new Set(providers.map((provider) => stringValue(provider.display_name, stringValue(provider.name)).trim().toLocaleLowerCase()).filter(Boolean));
   if (!names.has(base.toLocaleLowerCase())) return base;
   let suffix = 2;
@@ -3220,7 +3277,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
 
   const isOfficialLoginType = providerType === "openai" || providerType === "claude";
   const isWorkBuddyType = providerType === "workbuddy" || providerType === "workbuddyAI";
-  // OpenCode Zen has no sign-in and no user secret at all: its provider is
+  // dsh-our-free-model has no sign-in and no user secret at all: its provider is
   // created straight from the provider step, so it shares neither the key
   // step's fields nor the official services' web login.
   const isOpenCode2DSHType = providerType === "opencode2dsh";
@@ -4221,7 +4278,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       }
       return;
     }
-    // OpenCode Zen imported its roster with the create too, so 完成 only has
+    // dsh-our-free-model imported its roster with the create too, so 完成 only has
     // to mint the entry; nothing is selected or typed on this step.
     if (isOpenCode2DSHType) {
       setProcessing(true);
@@ -4580,6 +4637,7 @@ function presentProviderAuthChallenge(native: NativeLeafAdapter, translate: Tran
 }
 
 function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate, dispatch, dispatchWithOutcome, onStatus, onSecretState, applyProbedSurface, onOpenWizard, relay, addOfficialAccount, onActivateAndRestart }: { snapshot?: CoreSnapshot; ipc: IpcClient; onSnapshot: (next: CoreSnapshot) => void; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; dispatchWithOutcome: (type: string, payload?: UnknownRecord, domain?: ConfigDomain, keepControlsEnabled?: boolean) => Promise<CoreSnapshot | undefined>; onStatus: (status?: string) => void; onSecretState: (state: SecretState) => void; applyProbedSurface: ApplyProbedSurface; onOpenWizard: () => void; relay: RelayWorkspaceBridge; addOfficialAccount: (kind: ServiceProviderKind) => Promise<string>; onActivateAndRestart: () => Promise<boolean> }): React.JSX.Element {
+  const [modelTableWidth, setModelTableWidth] = useState(0);
   const state = domainState(snapshot, "providers_models");
   const relaySources = useMemo(() => relaySourcesFromSnapshot(snapshot), [snapshot]);
   const relayStations = useMemo(() => relayStationsFromSnapshot(snapshot), [snapshot]);
@@ -5596,7 +5654,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
           </TablePane>
           <View style={styles.providerMiddlePane}>
             <TablePane style={[styles.modelListPane]} title={translate("providers.models")} actions={<>{provider && providerKindSelected !== "openai" && providerKindSelected !== "claude" ? <IconButton label="+" title={translate("providers.newModel")} disabled={busy} onPress={addModel} /> : null}{model ? <IconButton label="⧉" title={translate("common.copy")} disabled={busy} onPress={duplicateModel} /> : null}{model ? <IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteModel} /> : null}</>}>
-              <NativeTable columns={[{ label: translate("providers.upstream"), width: 104 }, { label: translate("providers.publicModel"), width: 120 }, { label: translate("providers.modelRate"), width: 56 }]} rows={modelRows} disabledRowKeys={disabledModelKeys} alertRowKeys={alertModelKeys} selectedKey={selectedModel ?? ""} compact firstColumnHorizontalPadding={0} onSelectionChange={(key) => { setSelectedModel(key); setProviderSourceModel(undefined); }} style={styles.nativeModelTable} />
+              <View style={styles.nativeModelTable} onLayout={({ nativeEvent }) => setModelTableWidth(nativeEvent.layout.width)}><NativeTable columns={modelTableColumns(modelTableWidth, translate)} rows={modelRows} disabledRowKeys={disabledModelKeys} alertRowKeys={alertModelKeys} selectedKey={selectedModel ?? ""} compact firstColumnHorizontalPadding={0} preserveColumnWidths onSelectionChange={(key) => { setSelectedModel(key); setProviderSourceModel(undefined); }} style={styles.modelTable} /></View>
               {provider && providerKindSelected !== "openai" && providerKindSelected !== "claude" ? <View style={styles.tableBottomRow}><NativePicker labels={fetchKeyOptions.length > 0 ? fetchKeyOptions.map((option) => option.label) : [translate("common.default")]} selectedValue={fetchKeyOptions.find((option) => option.value === selectedFetchKey)?.label ?? translate("common.default")} disabled={busy || fetchKeyChoices.length === 0} onChange={({ nativeEvent }) => { const option = fetchKeyOptions[nativeEvent.index]; if (option) setFetchKeyID(option.value); }} style={styles.fetchKeyPicker} /><ActionButton title={translate("providers.fetch")} busy={fetchModelsBusy} disabled={(busy && !fetchModelsBusy) || !selectedFetchKey} onPress={() => { void fetchModels(); }} /></View> : null}
             </TablePane>
           </View>
@@ -6630,6 +6688,37 @@ function upstreamModelLabel(model: UnknownRecord): string {
   return separator >= 0 ? value.slice(separator + 1) : value;
 }
 
+// The model list is three columns in the middle pane of the window, and that
+// pane is the narrowest of the three: at the default window it holds roughly
+// 280 pt.  Every column therefore has a floor that still draws its whole
+// header and a readable prefix of its value — the names are ellipsized by the
+// cell, never by the header — and the two name columns share whatever the
+// window adds.  A pane narrower than the sum of the floors keeps them and
+// scrolls horizontally (`preserveColumnWidths`), because a column squeezed to
+// a few pixels is not a column.
+const MODEL_TABLE_MINIMUMS = [110, 88, 60] as const;
+
+function modelTableColumns(width: number, translate: Translate): Array<{ label: string; width: number }> {
+  const labels = [translate("providers.upstream"), translate("providers.publicModel"), translate("providers.modelRate")];
+  const minimums = MODEL_TABLE_MINIMUMS;
+  const minimumTotal = minimums[0] + minimums[1] + minimums[2];
+  // The table's own 1 pt frame is not column space: spending the last two
+  // points on the columns leaves the native table scrolling by that much.
+  const available = width - 2;
+  if (!(available > minimumTotal)) return labels.map((label, index) => ({ label, width: minimums[index] }));
+  // The upstream name is the one that carries a vendor prefix and a version
+  // suffix, so it takes the larger half of the slack; the rate column is a
+  // word and a short number and never grows.
+  const slack = available - minimumTotal;
+  const upstreamWidth = minimums[0] + Math.ceil(slack * 0.55);
+  const publicWidth = minimums[1] + (slack - Math.ceil(slack * 0.55));
+  return [
+    { label: labels[0], width: upstreamWidth },
+    { label: labels[1], width: publicWidth },
+    { label: labels[2], width: minimums[2] },
+  ];
+}
+
 // The public-model row key the routes table uses for one public model.  The
 // name itself is the selection identity, so the key prefix only marks the
 // row kind.
@@ -6899,7 +6988,7 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
   const isWorkBuddyAccount = kind === "workbuddy" || kind === "workbuddyAI";
   // The one predicate, not a second spelling of it: a login service owns its
   // key, so no key editor may be drawn for it.  Re-deriving this locally from
-  // the two kinds this pane also branches on left the OpenCode Zen free lane
+  // the two kinds this pane also branches on left the dsh-our-free-model lane
   // out, and its minted loopback slot — whose value is a Core-owned
   // ``os.environ/`` reference, not a secret of the user's — was offered in the
   // 密钥 editor as an editable, copyable API key.
@@ -7350,7 +7439,7 @@ function editorTargetFromPayload(payload: string | undefined): ClientFile | unde
     const payloadPresented = parsed.present === true;
     if (fields.some((field) => typeof parsed[field] !== "string" || !parsed[field])) return undefined;
     const language = parsed.language as ClientFile["language"];
-    if (!["json", "toml", "yaml", "text"].includes(language)) return undefined;
+    if (!["json", "jsonc", "toml", "yaml", "text"].includes(language)) return undefined;
     return {
       id: parsed.id as string,
       client: parsed.client as ClientFile["client"],
@@ -7516,7 +7605,7 @@ function FileEditorWorkspace({ file, fileId, nativeAction, ipc, native, translat
     </View>
     {target === undefined
       ? <View style={assistantFileSurfaceStyles.editorLoading}><Text style={assistantFileSurfaceStyles.filesStatus}>{translate("common.loading")}</Text></View>
-      : <RawEditor showLabel={false} showDiff codexPane syncRevision={syncRevision} style={assistantFileSurfaceStyles.editorRouteRaw} label={target.name} domain={target.domain} document={target.document} language={target.language === "text" ? "json" : target.language} ipc={ipc} translate={translate} onConflict={onEditorConflict} reloadToken={reloadToken} baselineToken={baselineToken} />}
+      : <RawEditor showLabel={false} showDiff codexPane syncRevision={syncRevision} style={assistantFileSurfaceStyles.editorRouteRaw} label={target.name} domain={target.domain} document={target.document} language={target.language === "yaml" ? "yaml" : target.language === "toml" ? "toml" : "json"} ipc={ipc} translate={translate} onConflict={onEditorConflict} reloadToken={reloadToken} baselineToken={baselineToken} />}
     <View style={assistantFileSurfaceStyles.editorFooter}>
       {/* The child states its own result beside its buttons; the buttons keep
           their trailing edge, so a message never moves them. */}
@@ -8658,10 +8747,14 @@ function shortLogTimestamp(value: unknown): string {
   const raw = stringValue(value);
   if (!raw) return "";
   const numeric = Number(raw);
-  const parsed = Number.isFinite(numeric) && /^[-+]?\d+(?:\.\d+)?$/.test(raw.trim())
+  const parsed = Number.isFinite(numeric) && /^\d+(?:\.\d+)?$/.test(raw.trim())
     ? new Date(Math.abs(numeric) < 100_000_000_000 ? numeric * 1000 : numeric)
     : new Date(raw);
   if (Number.isNaN(parsed.getTime())) return raw;
+  if (parsed.getUTCFullYear() === 1970 && parsed.getUTCMonth() === 0 &&
+      parsed.getUTCDate() === 1 && parsed.getUTCHours() < 3) {
+    return "";
+  }
   const pad = (part: number): string => String(part).padStart(2, "0");
   return `${parsed.getFullYear()}-${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())} ${pad(parsed.getHours())}:${pad(parsed.getMinutes())}:${pad(parsed.getSeconds())}`;
 }
@@ -9077,13 +9170,29 @@ function parseTextLogRecord(record: string, tab: LogTab, _index: number, transla
   let time = "";
   while (detail.startsWith("[")) {
     const match = detail.match(/^\[([^\]]+)\]\s*(.*)$/);
-    if (!match || Number.isNaN(new Date(match[1]).getTime())) break;
-    if (!time) time = shortLogTimestamp(match[1]);
+    if (!match || logTimestampNumber(match[1]) === undefined) break;
+    if (!time) {
+      time = shortLogTimestamp(match[1]);
+      if (!time && /^\d{1,10}(?:\.\d+)?$/.test(match[1])) {
+        const epochDate = new Date(Number(match[1]) * 1000);
+        if (epochDate.getUTCFullYear() >= 2020) {
+          const pad = (part: number): string => String(part).padStart(2, "0");
+          time = `${epochDate.getFullYear()}-${pad(epochDate.getMonth() + 1)}-${pad(epochDate.getDate())} ${pad(epochDate.getHours())}:${pad(epochDate.getMinutes())}:${pad(epochDate.getSeconds())}`;
+        }
+      }
+    }
     detail = match[2].trim();
   }
   if (!time) {
+    const epochPrefix = detail.match(/^(\d{1,10}(?:\.\d+)?)\s+(.*)$/);
+    if (epochPrefix && logTimestampNumber(epochPrefix[1]) !== undefined) {
+      time = shortLogTimestamp(epochPrefix[1]);
+      detail = epochPrefix[2].trim();
+    }
+  }
+  if (!time) {
     const leadingTimestamp = detail.match(/^(Updated\s+)?(\d{4}-\d{2}-\d{2}[T ]\S+)\s*(.*)$/);
-    if (leadingTimestamp && !Number.isNaN(new Date(leadingTimestamp[2] ?? "").getTime())) {
+    if (leadingTimestamp && logTimestampNumber(leadingTimestamp[2] ?? "") !== undefined) {
       time = shortLogTimestamp(leadingTimestamp[2]);
       detail = `${leadingTimestamp[1] ?? ""}${leadingTimestamp[3] ?? ""}`.trim();
     }
@@ -9149,7 +9258,9 @@ function parseTextLogRecord(record: string, tab: LogTab, _index: number, transla
 function logTokenPair(record: UnknownRecord): string {
   const prompt = compactLogValue(record.prompt_tokens);
   const completion = compactLogValue(record.completion_tokens);
-  if (prompt && completion) return `${formatLogTokens(prompt)} / ${formatLogTokens(completion)}`;
+  if (prompt || completion) {
+    return `${formatLogTokens(prompt) || "0"} / ${formatLogTokens(completion) || "0"}`;
+  }
   return formatLogTokens(compactLogValue(record.total_tokens));
 }
 
@@ -9494,14 +9605,13 @@ function logColumns(tab: LogTab, translate: Translate, hasStatus = true): LogCol
     // the table stays inside its frame instead of scrolling sideways.
     //
     // The widths are sized to the content these columns actually carry (a
-    // relay name, `Sub2API`, `gemini-3.1-pro-preview`, `34113.8 / 88.5`), not
-    // to a guess: the set has to total less than the pane's own width, and
-    // only the one flexible column may absorb what is left over.
+    // relay name, `Sub2API`, `gemini-3.1-pro-preview`, `34113.8 / 88.5`). The
+    // type column keeps its complete label rather than truncating it.
     // The relay's name is short (`sisct2`), so it takes slack only up to a
     // name's own width and the model column — whose values are the longest on
     // the row — absorbs the rest.
     { label: translate("logs.source"), width: 118, maxWidth: 168, flex: true, value: (row) => row.source },
-    { label: translate("logs.type"), width: 64, value: (row) => row.family },
+    { label: translate("logs.type"), width: 82, value: (row) => row.family },
     { label: translate("providers.publicModel"), width: 164, flex: true, value: (row) => row.model },
     // A credential-scoped usage summary states no per-request outcome, so the
     // column is drawn only when a row actually carries one instead of
@@ -9797,6 +9907,9 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
   const appliedTabRequestKey = useRef(requestedTabKey);
   const clearTabRef = useRef<typeof LOG_TABS[number] | undefined>(undefined);
   const viewRevisionRef = useRef<number | undefined>(undefined);
+  const [onlineUsagePendingSourceId, setOnlineUsagePendingSourceId] = useState("");
+  const onlineUsagePagePending = useRef(false);
+  const [onlineUsagePagePendingTab, setOnlineUsagePagePendingTab] = useState<typeof LOG_TABS[number] | undefined>();
   // The filter field owns its text until Core confirms it.  A poll that still
   // carries the previous filter lands between a keystroke and the 250 ms
   // dispatch, and syncing the field from it deleted the character the user had
@@ -9812,6 +9925,15 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
   // read through a ref rather than captured in that effect's closure.
   const onlineUsageSourceIdRef = useRef("");
   onlineUsageSourceIdRef.current = selected === "online-usage" ? active?.source_id ?? "" : "";
+  const onlineUsageSourcesRef = useRef<NonNullable<LogView["sources"]>>([]);
+  onlineUsageSourcesRef.current = activeState?.tab === "online-usage" ? activeState.log.sources ?? [] : [];
+  const [onlineUsageKnownSources, setOnlineUsageKnownSources] = useState<NonNullable<LogView["sources"]>>([]);
+  useEffect(() => {
+    const sources = activeState?.tab === "online-usage" ? activeState.log.sources : undefined;
+    if (onlineUsageKnownSources.length === 0 && sources?.length) {
+      setOnlineUsageKnownSources(sources);
+    }
+  }, [activeState, onlineUsageKnownSources.length]);
   useEffect(() => {
     if (appliedTabRequestKey.current === requestedTabKey) return;
     appliedTabRequestKey.current = requestedTabKey;
@@ -9845,6 +9967,9 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
         viewRevisionRef.current = result.revision;
         if (result.changed && result.log) {
           setActiveState({ tab: selected, log: result.log });
+          if (selected === "online-usage" && result.log.complete === false) {
+            viewRevisionRef.current = undefined;
+          }
           setPauseIntent((current) => current?.tab === selected && current.paused === result.log?.paused ? undefined : current);
           setClearIntent((current) => current?.tab === selected && result.log?.line_count === 0 ? undefined : current);
         }
@@ -9863,7 +9988,7 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
     // Re-entering the tab resumes whatever relay was already chosen, so a
     // window that comes back to a station keeps showing it. A tab with no
     // selection reads nothing: the pane asks for one instead.
-    if (selected === "online-usage" && onlineUsageSourceIdRef.current) {
+    if (selected === "online-usage" && onlineUsageSourceIdRef.current && !onlineUsageTimePendingRef.current) {
       void refreshOnlineUsageRef.current(onlineUsageSourceIdRef.current);
     }
     return () => { mounted = false; clearInterval(interval); };
@@ -9976,11 +10101,19 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
   // Rows the relay reported beyond the page on screen. Reading further is a
   // view over rows already fetched, so it never re-asks the relay.
   const onlineUsageRemaining = selected === "online-usage" ? numberValue(active?.remaining) : 0;
+  const onlineUsageTotal = selected === "online-usage"
+    ? numberValue(active?.total) || lineCount + onlineUsageRemaining
+    : 0;
+  const onlineUsageNext = Math.min(onlineUsageRemaining, ONLINE_USAGE_PAGE_ROWS);
+  const onlineUsageLoadedPage = Math.max(1, numberValue(active?.page));
+  const onlineUsagePageCount = Math.max(onlineUsageLoadedPage, numberValue(active?.page_count));
   const statusLine = [
-    translate(active && lineCount >= active.limit ? "logs.latestLinesAtLimit" : "common.lines", { count: lineCount }),
-    // The strip is the one report surface, so the fact that more rows exist
-    // and how many is stated here rather than in a second bar of its own.
-    onlineUsageRemaining > 0 ? translate("logs.onlineUsageMore", { count: onlineUsageRemaining }) : "",
+    selected === "online-usage" && lineCount > 0
+      ? translate("common.lines", { count: lineCount })
+      : translate(active && lineCount >= active.limit ? "logs.latestLinesAtLimit" : "common.lines", { count: lineCount }),
+    selected === "online-usage" && lineCount > 0
+      ? translate("logs.onlineUsagePage", { page: onlineUsageLoadedPage, pages: onlineUsagePageCount })
+      : "",
     paused ? translate("logs.paused") : "",
   ].filter(Boolean).join(" | ");
   useEffect(() => { onStatus?.(statusLine); }, [onStatus, statusLine]);
@@ -9988,7 +10121,9 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
   // dropdown picks which configured relay to read, and the rows land in the
   // table this window already draws. Opening the station's dashboard in a
   // child browser is deliberately not a path here — the tab is a log view.
-  const onlineUsageSources = selected === "online-usage" ? active?.sources ?? [] : [];
+  const onlineUsageSources = onlineUsageSourcesRef.current?.length
+    ? onlineUsageSourcesRef.current
+    : onlineUsageKnownSources;
   // Why the chosen relay answered no rows. It is the pane's own message, so a
   // station that exposes no usage feed says that instead of looking empty for
   // no reason the user can act on.
@@ -10023,73 +10158,274 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
   // finishes reports that nothing is loading any more.
   const [onlineUsageLoadingTab, setOnlineUsageLoadingTab] =
     useState<typeof LOG_TABS[number] | undefined>();
+  const [onlineUsageTimeOption, setOnlineUsageTimeOption] = useState<OnlineUsageTimeOption>("all");
+  const [onlineUsageRangeText, setOnlineUsageRangeText] = useState("");
+  const [onlineUsageRangeError, setOnlineUsageRangeError] = useState("");
+  const [onlineUsageTimePending, setOnlineUsageTimePending] = useState(false);
+  const onlineUsageTimeLabels = useMemo(
+    () => ONLINE_USAGE_TIME_OPTIONS.map((option) => onlineUsageTimeLabel(option, translate)),
+    [translate],
+  );
+  const onlineUsageTimeValues = useMemo(
+    () => onlineUsageTimeLabels.map((_label, index) => ONLINE_USAGE_TIME_OPTIONS[index] ?? "all"),
+    [onlineUsageTimeLabels],
+  );
+  const onlineUsageTimeValue = onlineUsageTimeLabels[ONLINE_USAGE_TIME_OPTIONS.indexOf(onlineUsageTimeOption)] ?? "";
   const onlineUsageLoadingTabRef = useRef<typeof LOG_TABS[number] | undefined>(undefined);
   const onlineUsageLoading = onlineUsageLoadingTab === selected;
+  const onlineUsageTimePendingRef = useRef(false);
+  const [onlineUsagePendingLabel, setOnlineUsagePendingLabel] = useState("");
+  // The view may still carry the previous relay's preference and rows until a
+  // switch is confirmed. Its absence means "nothing loaded", never "the old
+  // relay is the choice": the rows and the spinner then change together.
+  const onlineUsageLoadedSourceRef = useRef("");
+  const onlineUsageWaitingForSource = selected === "online-usage"
+    && (onlineUsagePendingSourceId
+      ? onlineUsagePendingSourceId !== onlineUsageSourceId
+      : onlineUsageLoadedSourceRef.current !== onlineUsageSourceId);
+  const onlineUsagePendingSourceIdRef = useRef("");
+  const [onlineUsageScrollToRow, setOnlineUsageScrollToRow] = useState(-1);
+  const onlineUsageScrollSourceRef = useRef("");
+  const onlineUsageHostSourceRef = useRef("");
+  const onlineUsageRequest = useRef(0);
+  const onlineUsageLoadingRequest = useRef(0);
+  const onlineUsageTimeRequest = useRef(0);
   // An answered read and a failed one both end the wait, and only the read that
   // is still current may clear it: a stale answer must not hide the wait of a
   // newer station the user has since chosen.
-  const settleOnlineUsageLoading = (tab: typeof LOG_TABS[number]): void => {
+  const settleOnlineUsageLoading = (tab: typeof LOG_TABS[number], log?: LogView): void => {
     if (onlineUsageLoadingTabRef.current !== tab) return;
+    if (log) setActiveState({ tab, log });
     onlineUsageLoadingTabRef.current = undefined;
     setOnlineUsageLoadingTab(undefined);
+    setOnlineUsagePendingLabel("");
+    setOnlineUsagePendingSourceId("");
+    onlineUsagePendingSourceIdRef.current = "";
   };
-  const refreshOnlineUsage = useCallback((sourceId: string): void => {
+  const scrollOnlineUsage = (source: string, row: number): void => {
+    onlineUsageScrollSourceRef.current = source;
+    setOnlineUsageScrollToRow(row);
+  };
+  const refreshOnlineUsage = useCallback((sourceId: string, sourceLabel = ""): void => {
     const tab = "online-usage" as const;
+    const request = ++onlineUsageRequest.current;
+    onlineUsageLoadingRequest.current = request;
     // Only the tab that started the read owns the wait, so switching away
     // while a station answers does not leave another tab looking busy.
     onlineUsageLoadingTabRef.current = tab;
     setOnlineUsageLoadingTab(tab);
-    void dispatch("logs.refresh_online_usage", { tab, source: sourceId }, "logs").then(async () => {
-      try {
-        const result = await ipc.logs(tab);
-        if (selectedTabRef.current !== tab) return;
-        viewRevisionRef.current = result.revision;
-        if (result.log) setActiveState({ tab, log: result.log });
-      } catch {
-        // The tab's own poll reconciles the confirmed Core view.
-      } finally {
-        settleOnlineUsageLoading(tab);
+    setOnlineUsagePendingSourceId(sourceId);
+    onlineUsagePendingSourceIdRef.current = sourceId;
+    filterDirty.current = false;
+    setFilterDraft("");
+    setOnlineUsagePendingLabel(sourceLabel);
+    void ipc.dispatch({
+      domain: "logs",
+      type: "logs.refresh_online_usage",
+      payload: { tab, source: sourceId, request: String(request) },
+    }).then(async (staged) => {
+      if (onlineUsageLoadingRequest.current !== request) return;
+      if (onlineUsagePendingSourceIdRef.current !== sourceId) return;
+      viewRevisionRef.current = staged.revision;
+      const result = await ipc.logs(tab);
+      if (result.log) {
+        const returnedSource = result.log.source_id || sourceId;
+        if (onlineUsageHostSourceRef.current !== returnedSource) {
+          onlineUsageHostSourceRef.current = returnedSource;
+          setOnlineUsageScrollToRow(-1);
+        }
+        onlineUsageLoadedSourceRef.current = returnedSource;
+        setActiveState({ tab, log: result.log });
       }
-    }).catch(() => settleOnlineUsageLoading(tab));
-  }, [dispatch, ipc]);
+      if (onlineUsageLoadingRequest.current !== request) return;
+      if (onlineUsagePendingSourceIdRef.current !== sourceId) return;
+      if (selectedTabRef.current !== tab) return;
+      viewRevisionRef.current = result.revision;
+      settleOnlineUsageLoading(tab);
+    }).catch(() => {
+      settleOnlineUsageLoading(tab);
+    }).finally(() => {
+      if (onlineUsageLoadingRequest.current !== onlineUsageRequest.current) return;
+      if (onlineUsagePendingSourceIdRef.current !== sourceId) return;
+      settleOnlineUsageLoading(tab);
+    });
+  }, [ipc]);
   // The tab-entry effect runs before this callback exists in source order, so
   // it reaches the current one through a ref instead of capturing a stale
   // closure or re-subscribing the poll whenever the callback identity changes.
   const refreshOnlineUsageRef = useRef(refreshOnlineUsage);
   refreshOnlineUsageRef.current = refreshOnlineUsage;
-  const loadMoreOnlineUsage = (): void => {
+  const moveOnlineUsagePage = (action: "logs.load_more" | "logs.previous_page"): void => {
     const tab = "online-usage" as const;
-    if (onlineUsageLoading) return;
+    if (onlineUsagePagePending.current) return;
     onlineUsageLoadingTabRef.current = tab;
+    onlineUsagePagePending.current = true;
+    setOnlineUsagePagePendingTab(tab);
     setOnlineUsageLoadingTab(tab);
-    // A page in flight must not queue another: the table stays live and the
-    // wheel says the next page is being prepared.
-    void dispatch("logs.load_more", { tab }, "logs").then(async () => {
+    // A page in flight must not queue another. Both directions move over rows
+    // Core already fetched, so neither dispatches a relay refresh.
+    void dispatch(action, { tab }, "logs").then(async () => {
       try {
         const result = await ipc.logs(tab);
         if (selectedTabRef.current !== tab) return;
         viewRevisionRef.current = result.revision;
-        if (result.log) setActiveState({ tab, log: result.log });
+        if (result.log) {
+          setActiveState({ tab, log: result.log });
+          scrollOnlineUsage(result.log.source_id ?? "", action === "logs.load_more"
+            ? Math.max(0, result.log.line_count - 1)
+            : Math.max(0, result.log.line_count - ONLINE_USAGE_PAGE_ROWS));
+        }
       } catch {
         // The tab's own poll reconciles the confirmed Core view.
-      } finally {
-        settleOnlineUsageLoading(tab);
       }
-    }).catch(() => settleOnlineUsageLoading(tab));
+    }).finally(() => {
+      onlineUsagePagePending.current = false;
+      setOnlineUsagePagePendingTab(undefined);
+      if (onlineUsageLoadingTabRef.current === tab && !onlineUsagePendingSourceIdRef.current) {
+        onlineUsageLoadingTabRef.current = undefined;
+      }
+      setOnlineUsageLoadingTab((current) => current === tab && !onlineUsagePendingSourceIdRef.current ? undefined : current);
+    });
   };
-  return <View style={styles.logsWindow}>
-    <View style={styles.logsToolbar}>
-      <View style={styles.logFilterRow}><Text style={styles.toolbarLabel}>{translate("common.filter")}</Text><NativeTextField style={styles.logFilterInput} value={filterDraft} placeholder={translate("logs.filterCurrent")} onChangeText={(filter) => { filterDirty.current = true; setFilterDraft(filter); if (filterTimer.current) clearTimeout(filterTimer.current); filterTimer.current = setTimeout(() => { void dispatch("logs.set_filter", { tab: selected, filter }, "logs"); }, 250); }} accessibilityLabel={translate("common.filter")} /></View>
-      <View style={styles.logToolbarSpacer} />
-      <View style={styles.logActionsRow}>{selected === "online-usage" ? <NativePicker labels={onlineUsageSourceLabels} selectedValue={onlineUsageSourceIndex >= 0 ? onlineUsageSourceLabels[onlineUsageSourceIndex] ?? "" : ""} disabled={onlineUsageLoading || onlineUsageSourceLabels.length === 0} onChange={({ nativeEvent }) => { const source = onlineUsageSourceValues[nativeEvent.index]; if (source !== undefined) refreshOnlineUsage(source); }} style={styles.onlineUsageSourcePicker} /> : null}{selected === "recovery" ? <NativeButton title={translate("logs.clearRecoveryCooldown")} accessibilityLabel={translate("logs.clearRecoveryCooldown")} compact busy={cooldownClearPending} disabled={busy && !cooldownClearPending} onPress={clearCooldowns} style={styles.clearCooldownButton} /> : null}<IconButton label="" symbol={paused ? "play" : "pause"} title={paused ? translate("common.resume") : translate("common.pause")} disabled={busy} onPress={togglePaused} /><IconButton label="" symbol="trash" title={translate("common.clearView")} disabled={busy} onPress={clearLogs} /></View>
-    </View>
+  const loadMoreOnlineUsage = (): void => moveOnlineUsagePage("logs.load_more");
+  const previousOnlineUsagePage = (): void => moveOnlineUsagePage("logs.previous_page");
+  const setOnlineUsageTime = useCallback(async (range: OnlineUsageRange): Promise<void> => {
+    const tab = "online-usage" as const;
+    const staged = await ipc.dispatch({ domain: "logs", type: "logs.set_time_range", payload: { tab, ...range } });
+    const result = await ipc.logs(tab);
+    if (selectedTabRef.current !== tab) return;
+    viewRevisionRef.current = staged.revision;
+    if (!result.log) return;
+    setActiveState({ tab, log: result.log });
+    onlineUsageLoadedSourceRef.current = result.log.source_id ?? "";
+  }, [ipc]);
+  const setOnlineUsageTimeRange = (option: OnlineUsageTimeOption, range: OnlineUsageRange): void => {
+    const request = ++onlineUsageTimeRequest.current;
+    onlineUsagePagePending.current = false;
+    setOnlineUsagePagePendingTab(undefined);
+    setOnlineUsageTimePending(true);
+    onlineUsageTimePendingRef.current = true;
+    setOnlineUsageRangeError("");
+    void setOnlineUsageTime(range).then(() => {
+      if (request !== onlineUsageTimeRequest.current) return;
+      setOnlineUsageTimeOption(option);
+      setOnlineUsageRangeError(onlineUsageSourceId || option === "all"
+        ? ""
+        : translate("logs.onlineUsageSelectSourceHint"));
+    }).catch(() => {
+      if (request === onlineUsageTimeRequest.current) {
+        setOnlineUsageTimeOption("all");
+        setOnlineUsageRangeError(translate("error.generic"));
+      }
+    }).finally(() => {
+      if (request === onlineUsageTimeRequest.current) {
+        onlineUsageTimePendingRef.current = false;
+        setOnlineUsageTimePending(false);
+      }
+    });
+  };
+  const commitOnlineUsageCustomRange = (): void => {
+    const text = onlineUsageRangeText.trim();
+    if (!text) {
+      setOnlineUsageTimeRange("all", {});
+      return;
+    }
+    const matched = /^(\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2})?)\s+-\s+(\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2})?)$/.exec(text);
+    const [start, end] = text.split(/\s+-\s+/, 2);
+    const since = matched ? parseLocalDate(start) : undefined;
+    const until = matched ? parseLocalDate(end, true) : undefined;
+    if (since === undefined || until === undefined || since > until) {
+      setOnlineUsageRangeError(translate("logs.onlineUsageRangeInvalid"));
+      return;
+    }
+    setOnlineUsageRangeError("");
+    setOnlineUsageTimeRange("custom", { since, until });
+  };
+  const chooseOnlineUsageTime = (option: OnlineUsageTimeOption): void => {
+    if (option === "custom") {
+      setOnlineUsageRangeError("");
+      setOnlineUsageTimeOption("custom");
+      editOnlineUsageRange();
+      return;
+    }
+    const now = Date.now();
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+    const days = option === "7d" ? 7 : option === "30d" ? 30 : 0;
+    setOnlineUsageRangeError("");
+    setOnlineUsageTimeRange(option, {
+      ...(option === "today" ? { since: todayStart.getTime() } :
+        days ? { since: now - days * 86_400_000 } : {}),
+      until: option === "all" ? undefined : now,
+    });
+  };
+  const onlineUsageLoadingMore = onlineUsageLoading && !onlineUsagePendingSourceId;
+  const onlineUsageLoadingSource = onlineUsageLoadingTabRef.current === selected
+    ? onlineUsagePendingLabel
+    : "";
+  const onlineUsagePagerStatus = onlineUsageTimePending
+    ? translate("logs.onlineUsageFiltering")
+    : onlineUsageLoadingSource
+    ? translate("logs.onlineUsageLoading") + (onlineUsageLoadingSource ? ` ${onlineUsageLoadingSource}` : "")
+    : translate("logs.onlineUsagePage", { page: onlineUsageLoadedPage, pages: onlineUsagePageCount });
+  const onlineUsagePageBusy = selected === "online-usage" && onlineUsagePagePendingTab === selected;
+  const onlineUsagePageStatus = onlineUsagePageBusy
+    ? translate("logs.onlineUsageLoadingMore")
+    : onlineUsagePagerStatus;
+  const editOnlineUsageRange = (): void => {
+    const prompt = native.textPrompt;
+    if (!prompt) {
+      setOnlineUsageRangeError(translate("error.generic"));
+      return;
+    }
+    void prompt({
+      title: translate("logs.onlineUsageRangePrompt"), value: onlineUsageRangeText,
+      confirmLabel: translate("logs.onlineUsageApplyRange"), cancelLabel: translate("status.cancel"),
+    }).then((value) => {
+      if (value === null) return;
+      setOnlineUsageRangeText(value);
+      const text = value.trim();
+      if (!text) {
+        setOnlineUsageTimeRange("all", {});
+        return;
+      }
+      const [start, end, extra] = text.split(/\s+-\s+/, 3);
+      const since = start ? parseLocalDate(start) : undefined;
+      const until = end && !extra ? parseLocalDate(end, true) : undefined;
+      if (since === undefined || until === undefined || since > until) {
+        setOnlineUsageRangeError(translate("logs.onlineUsageRangeInvalid"));
+        return;
+      }
+      setOnlineUsageTimeOption("custom");
+      setOnlineUsageRangeError("");
+      setOnlineUsageTimeRange("custom", { since, until });
+    }).catch(() => setOnlineUsageRangeError(translate("error.generic")));
+  };
+  useEffect(() => {
+    if (onlineUsageRangeError === translate("logs.onlineUsageRangeInvalid")) return;
+    if (onlineUsageRangeError) setOnlineUsageRangeError("");
+  }, [onlineUsageSourceId]);
+  return <View style={[styles.logsWindow, Platform.OS === "macos" ? styles.logsWindowMacOS : null]}>
     <WindowTabs nativeRef={tabsRef} values={tabOptions} selected={selected} disabled={busy} onSelect={(tab) => {
       if (clearTabRef.current) return;
       setSelected(tab as LogTab);
     }} style={styles.logsTabs} />
-    {rows.length > 0 ? selected === "route-trace"
+    <View style={styles.logsToolbar}>
+      <View style={styles.logFilterRow}><Text style={styles.toolbarLabel}>{translate("common.filter")}</Text><NativeTextField style={styles.logFilterInput} value={filterDraft} placeholder={translate("logs.filterCurrent")} onChangeText={(filter) => { filterDirty.current = true; setFilterDraft(filter); if (filterTimer.current) clearTimeout(filterTimer.current); filterTimer.current = setTimeout(() => { void dispatch("logs.set_filter", { tab: selected, filter }, "logs"); }, 250); }} accessibilityLabel={translate("common.filter")} /></View>
+      {selected === "online-usage" ? <><NativePicker overlayLayer labels={onlineUsageTimeLabels} selectedValue={onlineUsageTimeValue} compact onChange={({ nativeEvent }) => {
+        const option = onlineUsageTimeValues[nativeEvent.index];
+        if (option) chooseOnlineUsageTime(option);
+      }} style={styles.onlineUsageTimePicker} /></> : null}
+      <View style={styles.logActionsRow}>{selected === "online-usage" ? <NativePicker overlayLayer labels={onlineUsageSourceLabels} selectedValue={onlineUsagePendingLabel || (onlineUsageSourceIndex >= 0 ? onlineUsageSourceLabels[onlineUsageSourceIndex] ?? "" : "")} disabled={onlineUsageSourceLabels.length === 0} onChange={({ nativeEvent }) => { const source = onlineUsageSourceValues[nativeEvent.index]; if (source !== undefined) refreshOnlineUsage(source, onlineUsageSourceLabels[nativeEvent.index] ?? ""); }} style={styles.onlineUsageSourcePicker} /> : null}{selected === "recovery" ? <NativeButton title={translate("logs.clearRecoveryCooldown")} accessibilityLabel={translate("logs.clearRecoveryCooldown")} compact busy={cooldownClearPending} disabled={busy && !cooldownClearPending} onPress={clearCooldowns} style={styles.clearCooldownButton} /> : null}{onlineUsageLoadingSource ? <NativeBusySpinner label={translate("logs.onlineUsageLoading")} /> : null}<IconButton label="" symbol={paused ? "play" : "pause"} title={paused ? translate("common.resume") : translate("common.pause")} disabled={busy} onPress={togglePaused} /><IconButton label="" symbol="trash" title={translate("common.clearView")} disabled={busy} onPress={clearLogs} /></View>
+    </View>
+    {selected === "online-usage" ? <View style={styles.logRangeMessageSlot}>
+      <Text numberOfLines={1} style={styles.logRangeError} accessibilityLiveRegion="polite">{onlineUsageRangeError}</Text>
+      {onlineUsageTimeOption === "custom" && onlineUsageRangeError === translate("logs.onlineUsageRangeInvalid") ? <Text numberOfLines={1} style={styles.logRangeErrorHint}>{translate("logs.onlineUsageRangeHint")}</Text> : null}
+    </View> : null}
+    {rows.length > 0 && !onlineUsageWaitingForSource ? selected === "route-trace"
       ? <RouteTraceWorkspace requests={routeTraceRequests} selectedKey={selectedKey} native={native} translate={translate} onSelect={(key) => setSelectedKeys((current) => ({ ...current, [selected]: key }))} />
-      : <View style={styles.logTableFrame} onLayout={({ nativeEvent }) => setTableWidth(nativeEvent.layout.width)}><NativeTable columns={nativeTableColumns} rows={nativeTableRows} selectedKey={selectedKey} compact preserveColumnWidths scrollTrailingColumnOverflow onSelectionChange={(key) => setSelectedKeys((current) => ({ ...current, [selected]: key }))} onRowDoublePress={(_key, index) => {
+      : <View style={styles.logTablesLayout}><View style={styles.logTableFrame} onLayout={({ nativeEvent }) => setTableWidth(nativeEvent.layout.width)}><NativeTable columns={nativeTableColumns} rows={nativeTableRows} selectedKey={selectedKey} compact preserveColumnWidths scrollTrailingColumnOverflow onSelectionChange={(key) => setSelectedKeys((current) => ({ ...current, [selected]: key }))} onRowDoublePress={(_key, index) => {
+        if (onlineUsageWaitingForSource || onlineUsageTimePending) return;
         const row = rows[index];
         if (!row) return;
         // A usage row's detail is the fields it carries, one per line, because
@@ -10104,29 +10440,27 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
           language: usageRow ? "text" : "json",
           html: readOnlyCodeEditorHtml(editorMenuLabels(translate)),
         });
-      }} style={styles.logTable} />{onlineUsageRemaining > 0 ? <View style={styles.logMoreRow}>
-        {/* The button's own busy state draws the app's wheel, so the row does
-            not add a second one beside it. */}
-        <NativeButton
-          title={onlineUsageLoading ? translate("logs.onlineUsageLoadingMore") : translate("logs.onlineUsageLoadMore", { count: Math.min(onlineUsageRemaining, 100) })}
-          accessibilityLabel={translate("logs.onlineUsageLoadMore", { count: Math.min(onlineUsageRemaining, 100) })}
-          compact
-          busy={onlineUsageLoading}
-          disabled={onlineUsageLoading}
-          onPress={loadMoreOnlineUsage}
-        />
-        <Text style={styles.logEmptyText}>{translate("logs.onlineUsageMore", { count: onlineUsageRemaining })}</Text>
+      }} scrollToRow={selected === "online-usage" && onlineUsageScrollSourceRef.current === active?.source_id ? onlineUsageScrollToRow : -1} style={styles.logTable} /></View>{selected === "online-usage" ? <View style={styles.logPager}>
+        <NativeButton title={translate("logs.onlineUsagePrevious", { count: ONLINE_USAGE_PAGE_ROWS })} accessibilityLabel={translate("logs.onlineUsagePrevious", { count: ONLINE_USAGE_PAGE_ROWS })} compact disabled={onlineUsageLoadedPage <= 1 || onlineUsageLoading || onlineUsageTimePending} onPress={previousOnlineUsagePage} titleWidth="tight" />
+        <Text accessibilityLiveRegion="polite" style={styles.logPagerStatus}>{onlineUsagePagerStatus}</Text>
+        <NativeButton title={onlineUsageLoadingMore ? translate("logs.onlineUsageLoadingMore") : translate("logs.onlineUsageNext", { count: onlineUsageNext })} accessibilityLabel={translate("logs.onlineUsageNext", { count: onlineUsageNext })} compact busy={onlineUsageLoadingMore} disabled={onlineUsageLoading || onlineUsageTimePending || onlineUsageRemaining <= 0} onPress={loadMoreOnlineUsage} titleWidth="tight" />
       </View> : null}</View>
       : <View style={styles.logEmptySurface}>
-        {onlineUsagePrompt && !onlineUsageLoading
+        {onlineUsagePrompt && !onlineUsageLoading && !onlineUsagePendingLabel && !onlineUsageTimePending
           ? <Text style={styles.logEmptyText}>{translate("logs.onlineUsageSelectSourceHint")}</Text>
           : <View style={styles.logEmptyStatusRow}>
             {onlineUsageLoading ? <NativeBusySpinner label={translate("logs.onlineUsageLoading")} /> : null}
-            <Text style={styles.logEmptyText}>{onlineUsageLoading
+            <Text style={styles.logLoadingText}>{onlineUsageTimePending
+              ? translate("logs.onlineUsageFiltering")
+              : onlineUsageLoading
               ? translate("logs.onlineUsageLoading")
-              : onlineUsageReason
-                ? onlineUsageReason
-                : clearing || active ? translate("logs.empty") : translate("logs.loading")}</Text>
+                + (onlineUsageLoadingSource ? ` ${onlineUsageLoadingSource}` : "")
+              : onlineUsageWaitingForSource
+                ? translate("logs.onlineUsageLoading")
+                  + (onlineUsagePendingLabel ? ` ${onlineUsagePendingLabel}` : "")
+                : onlineUsageReason
+                  ? onlineUsageReason
+                  : clearing || active ? translate("logs.empty") : translate("logs.loading")}</Text>
           </View>}
       </View>}
   </View>;
@@ -10999,10 +11333,10 @@ const styles = StyleSheet.create({
   routeTraceNoSelectionText: { color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "center" },
   root: { flex: 1, minWidth: 420 },
   menuBarHost: { flex: 1 }, error: { margin: 20, color: systemColors.red, fontSize: UI_FONT_SIZE },
-  windowSurface: { flex: 1, position: "relative", backgroundColor: systemColors.window }, windowContent: { flexGrow: 1, paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, gap: 8 }, windowContentFixed: { flex: 1, minHeight: 0 }, fileEditorRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providersContent: { paddingBottom: 6, gap: 6 }, providerWizardRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providerWizardSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, logsContent: { paddingHorizontal: 12, paddingTop: 8, paddingBottom: 0 }, runtimeContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, dataManagementContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, assistantSettingsContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, windowTitleBlock: { paddingHorizontal: 20, paddingTop: 12, paddingBottom: 3, gap: 3 }, windowTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
+  windowSurface: { flex: 1, position: "relative", backgroundColor: systemColors.window }, windowContent: { flexGrow: 1, paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, gap: 8 }, windowContentFixed: { flex: 1, minHeight: 0 }, fileEditorRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providersContent: { paddingBottom: 6, gap: 6 }, providerWizardRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providerWizardSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, logsContent: { paddingHorizontal: 12, paddingTop: 36, paddingBottom: 0 }, runtimeContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, dataManagementContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, assistantSettingsContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, windowTitleBlock: { paddingHorizontal: 20, paddingTop: 12, paddingBottom: 3, gap: 3 }, windowTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
   // Settings window: a native source-list sidebar next to the active pane.
   settingsShell: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row" }, settingsSidebar: { width: 200, flexShrink: 0, minHeight: 0 }, settingsSidebarHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 16, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarAppIcon: { width: SETTINGS_HEADER_CONTENT_HEIGHT, height: SETTINGS_HEADER_CONTENT_HEIGHT, borderRadius: 4 }, settingsSidebarTitle: { color: systemColors.label, fontSize: SOURCE_LIST_FONT_SIZE, fontWeight: "600" }, settingsSidebarSpacer: { flex: 1, minHeight: 8 }, settingsSidebarList: { flex: 1, minHeight: 0 }, settingsRail: { width: SETTINGS_RAIL_WIDTH, flexShrink: 0, minHeight: 0, paddingTop: 6, overflow: "hidden" }, settingsRailList: { flex: 1, minHeight: 0 }, settingsRailDivider: { position: "absolute", top: 0, bottom: 0, right: 0, width: 1, backgroundColor: systemColors.separator }, settingsRailDetail: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsRailDetailHeader: { minHeight: 50, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 14, paddingVertical: 8, backgroundColor: systemColors.window }, settingsRailDetailTitleBlock: { flex: 1, minWidth: 0, gap: 2 }, settingsRailDetailActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, settingsRailDetailTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, settingsRailDetailHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16 }, settingsDetail: { minWidth: 0, flex: 1, paddingTop: SETTINGS_TITLEBAR_INSET }, settingsDetailBody: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsDetailBodyBare: { backgroundColor: "transparent" }, settingsDetailPane: { flex: 1, minWidth: 0 }, settingsPaneHeader: { flexShrink: 0, paddingHorizontal: 20, paddingTop: 10, paddingBottom: 8 }, settingsPaneTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600", lineHeight: SETTINGS_HEADER_CONTENT_HEIGHT },  routeStatusBar: { minHeight: 24, flexShrink: 0, justifyContent: "center", paddingHorizontal: 16, paddingVertical: 4, borderTopWidth: 1, borderTopColor: systemColors.separator }, routeStatusText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE },
-  generalScroll: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, generalContent: { paddingTop: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, paddingBottom: 16, gap: 18 }, generalSection: { gap: 4 }, generalSectionTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, generalRow: { ...SETTINGS_FIELD_ROW_INDENTED }, generalRowLabel: { ...SETTINGS_FIELD_LABEL }, generalRowValue: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, generalToggle: { ...SETTINGS_FIELD_SWITCH_SLOT }, generalHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }, generalHelpText: { ...SETTINGS_FIELD_HELP_TEXT }, generalServiceAction: { minWidth: 96 }, providerToolbar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardToolbarButton: { minWidth: 104 }, toolbarSpacer: { flex: 1 }, windowTabs: { width: 224, height: 24 },
+  generalScroll: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, generalContent: { paddingTop: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, paddingBottom: 16, gap: 18 }, generalSection: { gap: 4 }, generalSectionTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, generalRow: { ...SETTINGS_FIELD_ROW_INDENTED }, generalRowLabel: { ...SETTINGS_FIELD_LABEL }, generalRowValue: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, generalToggle: { ...SETTINGS_FIELD_SWITCH_SLOT }, generalHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }, generalHelpText: { ...SETTINGS_FIELD_HELP_TEXT }, generalServiceAction: { minWidth: 96 }, providerToolbar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardToolbarButton: { minWidth: 104 }, toolbarSpacer: { flex: 1 }, windowTabsRow: { flex: 1, minWidth: 0, height: 28, flexDirection: "row", alignItems: "center", gap: 8 }, windowTabsToolbarRow: { flex: 1, minWidth: 0, width: "100%", height: 24, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 6, overflow: "hidden" }, windowTabs: { width: 224, height: 24 }, windowTabsWithActions: { flexShrink: 1 }, windowTabsActions: { flex: 1, minWidth: 0, maxWidth: 400, marginLeft: "auto", flexShrink: 0 },
   providerWizardSetupContent: { flex: 1, minHeight: 0, justifyContent: "flex-start", alignItems: "center", paddingHorizontal: 24, paddingTop: 18, paddingBottom: 12 }, providerWizardSetupSurface: { width: "100%", maxWidth: 520, minWidth: 0, gap: 12 }, providerWizardSetupSurfaceModel: { flex: 1, minHeight: 0 }, providerWizardSignInPanel: { width: "100%", minHeight: 160, justifyContent: "center", gap: 8, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 7, backgroundColor: systemColors.control, paddingHorizontal: 16, paddingVertical: 18 }, providerWizardAuthRow: { minHeight: 30, flexDirection: "row", alignItems: "center", gap: 8 }, providerWizardAuthStatus: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
   providerMiddlePane: { flex: 1, minWidth: 0, gap: 6 },
   keysPane: { flex: 1, minWidth: 0, minHeight: 0 }, keysInline: { minWidth: 0, gap: 6, paddingTop: 6, borderTopWidth: 1, borderTopColor: systemColors.separator }, keysInlineBody: { minWidth: 0, height: KEYS_INLINE_LIST_HEIGHT, flexDirection: "row", alignItems: "flex-start", gap: 6 }, keysTableInline: { flex: 1, minWidth: 0, height: KEYS_INLINE_LIST_HEIGHT, minHeight: KEYS_INLINE_LIST_HEIGHT }, keysEditorInline: { width: KEYS_INLINE_EDITOR_WIDTH, minWidth: 0, flexGrow: 0, flexShrink: 0, gap: 5 }, keysEditorField: { minWidth: 0, gap: 2 }, keysEditorFieldHeader: { height: 22, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 4 }, keysEditorFieldLabel: { flexShrink: 1, color: systemColors.label, fontSize: UI_FONT_SIZE },
@@ -11037,7 +11371,7 @@ const styles = StyleSheet.create({
   // row is the same 24 pt row and starts at the pane's top with no extra inset,
   // so 供应商: <name> reads on one line with that button instead of sitting a few
   // points below it, and the sections under it keep the left column's row pitch.
-  providersLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }, providerWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, providerLeftColumn: { flex: 1, minWidth: 0, minHeight: 0, gap: 6 }, providerModelColumns: { flex: 1, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }, routeWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, fetchKeyPicker: { width: 170, height: 24, marginRight: 6, flexShrink: 0 }, providerListPane: { width: 140, minWidth: 140, maxWidth: 140, flexGrow: 0, flexShrink: 0 }, modelListPane: { flex: 1, minWidth: 0 }, tablePane: { flex: 1, minWidth: 0, gap: 6 }, tablePaneWide: { flex: 1, minWidth: 0 }, tableTitleRow: { height: 24, flexDirection: "row", alignItems: "center" }, tableTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, tableActions: { marginLeft: "auto", flexDirection: "row", gap: 6 }, iconButton: { minWidth: 22, width: 22, minHeight: 22, height: 22, alignItems: "center", justifyContent: "center" }, tableBottomRow: { minHeight: 26, flexDirection: "row", alignItems: "center" }, nativeProviderTable: { flex: 1, minHeight: 0 }, nativeModelTable: { flex: 1, minHeight: 0 }, nativeRouteTable: { flex: 1, minHeight: 0 }, providerInspector: { width: 290, minWidth: 290, maxWidth: 290, flexGrow: 0, flexShrink: 0 }, providerEditorContent: { flex: 1, minHeight: 0 }, providerEditorScrollContent: { paddingLeft: 0, paddingRight: 16, paddingBottom: 12, gap: 6 }, persistentScrollIndicator: { position: "absolute", width: 0, height: 0 }, providerEditorHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerEditorHeading: { flex: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerReturnToModel: { flexShrink: 1 }, providerEditorSection: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 3, gap: 4 }, providerEnabledRow: { minHeight: 22, flexDirection: "row", alignItems: "center" }, providerSourceFields: { minWidth: 0, gap: 4 }, inspectorContent: { paddingLeft: 0, paddingRight: 6, paddingBottom: 12, gap: 6 }, inspectorBody: { gap: 4 }, modelBreadcrumb: { minHeight: 24, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 4 }, breadcrumbProvider: { flexShrink: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, breadcrumbSeparator: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorHeading: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorDivider: { height: 1, backgroundColor: systemColors.separator }, inspectorEnabledRow: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, // A link is also a cursor: the row shows the pointing hand over the whole
+  providersLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }, providerWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, providerLeftColumn: { flex: 1, minWidth: 0, minHeight: 0, gap: 6 }, providerModelColumns: { flex: 1, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }, routeWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, fetchKeyPicker: { width: 170, height: 24, marginRight: 6, flexShrink: 0 }, providerListPane: { width: 140, minWidth: 140, maxWidth: 140, flexGrow: 0, flexShrink: 0 }, modelListPane: { flex: 1, minWidth: 0 }, tablePane: { flex: 1, minWidth: 0, gap: 6 }, tablePaneWide: { flex: 1, minWidth: 0 }, tableTitleRow: { height: 24, flexDirection: "row", alignItems: "center" }, tableTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, tableActions: { marginLeft: "auto", flexDirection: "row", gap: 6 }, iconButton: { minWidth: 22, width: 22, minHeight: 22, height: 22, alignItems: "center", justifyContent: "center" }, tableBottomRow: { minHeight: 26, flexDirection: "row", alignItems: "center" }, nativeProviderTable: { flex: 1, minHeight: 0 }, nativeModelTable: { flex: 1, minHeight: 0 }, modelTable: { flex: 1, minHeight: 0 }, nativeRouteTable: { flex: 1, minHeight: 0 }, providerInspector: { width: 290, minWidth: 290, maxWidth: 290, flexGrow: 0, flexShrink: 0 }, providerEditorContent: { flex: 1, minHeight: 0 }, providerEditorScrollContent: { paddingLeft: 0, paddingRight: 16, paddingBottom: 12, gap: 6 }, persistentScrollIndicator: { position: "absolute", width: 0, height: 0 }, providerEditorHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerEditorHeading: { flex: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerReturnToModel: { flexShrink: 1 }, providerEditorSection: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 3, gap: 4 }, providerEnabledRow: { minHeight: 22, flexDirection: "row", alignItems: "center" }, providerSourceFields: { minWidth: 0, gap: 4 }, inspectorContent: { paddingLeft: 0, paddingRight: 6, paddingBottom: 12, gap: 6 }, inspectorBody: { gap: 4 }, modelBreadcrumb: { minHeight: 24, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 4 }, breadcrumbProvider: { flexShrink: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, breadcrumbSeparator: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorHeading: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorDivider: { height: 1, backgroundColor: systemColors.separator }, inspectorEnabledRow: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, // A link is also a cursor: the row shows the pointing hand over the whole
 // finding, label included, exactly like every native link in the app.
 inspectorProbeFinding: { flexShrink: 1, minWidth: 0, cursor: "pointer" }, inspectorProbeFindingText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textDecorationLine: "underline" }, inspectorEnableControl: { flexShrink: 0 }, orderEditorRow: { width: "100%", minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, orderEditorField: { flex: 1, width: undefined }, orderFollowControl: { flexShrink: 0 }, modelWindowValue: { flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 6 }, modelWindowText: { flexShrink: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE }, modelWindowLink: { flexShrink: 0 }, protocolSettings: { gap: 4 }, helpTipAnchor: { position: "relative", zIndex: 2 }, helpTipDismiss: { position: "absolute", left: -2400, right: -2400, top: -2400, bottom: -2400 }, helpTipButton: { width: 16, height: 16, minWidth: 16, minHeight: 16 }, helpTipPopup: { position: "absolute", right: 0, bottom: 22, width: 208, paddingHorizontal: 8, paddingVertical: 6, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.control, shadowColor: "#000000", shadowOpacity: 0.18, shadowRadius: 8, shadowOffset: { width: 0, height: 2 } }, helpTipText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
   externalSettingsWorkspace: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }, externalSettingsFieldList: { ...SETTINGS_FIELD_LIST }, externalSettingsField: { ...SETTINGS_FIELD }, externalSettingsInputRow: { ...SETTINGS_FIELD_ROW_INDENTED }, externalSettingsFieldLabel: { ...SETTINGS_FIELD_LABEL }, externalSettingsValueSlot: { ...SETTINGS_FIELD_ROUTE_SLOT }, externalSettingsBooleanControl: { ...SETTINGS_FIELD_SWITCH_SLOT }, externalSettingsHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }, externalSettingsHelpText: { ...SETTINGS_FIELD_HELP_TEXT }, externalSettingsPane: { flex: 1, minHeight: 0 }, externalSettingsPaneContent: { paddingVertical: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, gap: 14 }, codexRawEditorBase: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, minHeight: 0, gap: 5 }, codexRawEditorHeader: { minHeight: 18 }, codexRawEditorLabel: { fontFamily: Platform.select({ macos: "Menlo", windows: "Cascadia Mono", default: "monospace" }), fontWeight: "600" }, codexRawNativeEditor: { minHeight: 0 }, codexRawEditorLoading: { minHeight: 0 },
@@ -11046,7 +11380,58 @@ inspectorProbeFinding: { flexShrink: 1, minWidth: 0, cursor: "pointer" }, inspec
   // The WebDAV tab is fields of the same grid the other panes draw, so its
   // list is the shared list rather than a form of its own.
   webdavFieldList: { ...SETTINGS_FIELD_LIST }, webdavPasswordInput: { width: SETTINGS_FIELD_VALUE_WIDTH, minHeight: 26 }, webdavFieldUnit: { width: 68, flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
-  logsWindow: { flex: 1, minHeight: 0, gap: 4 }, logsToolbar: { height: 28, minHeight: 28, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, logFilterRow: { width: 360, minWidth: 220, maxWidth: 360, height: 26, flexDirection: "row", alignItems: "center", gap: 8 }, logToolbarSpacer: { flex: 1, minWidth: 0 }, logActionsRow: { height: 26, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, onlineUsageSourcePicker: { width: 240, height: 24, flexShrink: 0 }, clearCooldownButton: { minWidth: 96, height: 22 }, toolbarLabel: { color: systemColors.label, fontSize: UI_FONT_SIZE, flexShrink: 0 }, logFilterInput: { flex: 1, minWidth: 0, height: 26 }, logsTabs: { width: 640, maxWidth: "100%", minWidth: 0, height: 28, flexShrink: 0 }, logTableFrame: { flex: 1, minHeight: 0, minWidth: 0 }, logTable: { flex: 1, minHeight: 0 }, logEmptySurface: { flex: 1, minHeight: 0, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, logEmptyText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textAlign: "center", paddingHorizontal: 20 }, logEmptyStatusRow: { flexDirection: "row", alignItems: "center", gap: 8 }, logMoreRow: { minHeight: 28, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, paddingTop: 4 }, fieldLabel: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "500" }, fieldHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, fieldError: { color: systemColors.red, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, input: { width: "100%", minHeight: 26, color: systemColors.label, fontSize: UI_FONT_SIZE }, inputInvalid: { borderWidth: 1, borderColor: systemColors.red, borderRadius: 4 }, textArea: { minHeight: 108, textAlignVertical: "top", fontFamily: "Menlo" }, compactTextArea: { minHeight: 56, maxHeight: 56 }, secretFieldActions: { flexDirection: "row", alignItems: "center", gap: 6 }, secretFieldButtons: { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 4 }, secretFieldButton: { flex: 1, minWidth: 0, height: 26 }, nativeSecretControl: { flex: 1, minWidth: 0, minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, nativeSecretInput: { flex: 1, minWidth: 86, minHeight: 26 }, rawEditor: { flex: 1, minHeight: 180, gap: 4 }, rawEditorHeader: { minHeight: 28, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }, rawNativeEditorFrame: { flex: 1, minHeight: 160, position: "relative" }, rawNativeEditor: { flex: 1, minHeight: 160 }, rawEditorOverlay: { position: "absolute", left: 0, right: 0, top: 0, bottom: 0, justifyContent: "center", alignItems: "center", gap: 8, paddingHorizontal: 12, backgroundColor: systemColors.textBackground }, rawEditorLoading: { flex: 1, minHeight: 160, justifyContent: "center", paddingHorizontal: 8, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, empty: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, paddingVertical: 12 }, cardHint: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, marginTop: 2 },
+  logsWindow: { flex: 1, minHeight: 0, gap: 4 },
+  logsWindowMacOS: { paddingTop: 0, paddingHorizontal: 10 },
+  logsToolbar: { width: "100%", minWidth: 0, height: 24, flexDirection: "row", alignItems: "center", gap: 6, flexShrink: 0 },
+  logFilterRow: { flex: 1, minWidth: 50, height: 24, flexDirection: "row", alignItems: "center", gap: 6 },
+  logFilterRowOnlineUsage: { flex: 1, minWidth: 50 },
+  logToolbarSpacer: { flex: 1, minWidth: 4 },
+  logActionsRow: { height: 24, flexDirection: "row", alignItems: "center", flexShrink: 0, gap: 6 },
+  // A labelled picker states its own name, so it needs the width of the widest
+  // label the window can put in it instead of shrinking to its intrinsic size:
+  // ``全部…`` and ``选择…`` were what a 80 pt floor produced.
+  onlineUsageSourcePicker: { width: 176, minWidth: 120, height: 24, flexShrink: 1 },
+  onlineUsageTimePicker: { width: 120, minWidth: 104, height: 24, flexShrink: 1 },
+  logRangeMessageSlot: { width: "100%", minWidth: 0, height: 16, flexDirection: "row", alignItems: "center", gap: 8, flexShrink: 0, overflow: "hidden" },
+  logRangeError: { color: systemColors.brown, fontSize: UI_TIP_FONT_SIZE, lineHeight: 14, flexShrink: 1 },
+  logRangeErrorHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 14, flexShrink: 1 },
+  clearCooldownButton: { minWidth: 96, height: 22 },
+  toolbarLabel: { color: systemColors.label, fontSize: UI_FONT_SIZE, flexShrink: 0 },
+  logFilterInput: { flex: 1, minWidth: 0, height: 24 },
+  logsTabs: { width: undefined, minWidth: 389, height: 24 },
+  logTabControl: { flex: 1, width: undefined, minWidth: 0, height: 28 },
+  logTablesLayout: { flex: 1, minHeight: 0, minWidth: 0 },
+  logTableFrame: { flex: 1, minHeight: 0, minWidth: 0 },
+  logTableScroll: { flex: 1, minHeight: 0, minWidth: 0 },
+  logTable: { flex: 1, minHeight: 0 },
+  logPager: { minHeight: 24, flexShrink: 0, flexDirection: "row", alignItems: "center", justifyContent: "flex-end", gap: 8, paddingHorizontal: 2 },
+  logPagerStatus: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textAlign: "center" },
+  logEmptySurface: { flex: 1, minHeight: 0, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground },
+  logEmptyText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textAlign: "center", paddingHorizontal: 20 },
+  logLoadingText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textAlign: "center" },
+  logEmptyStatusRow: { flexDirection: "row", alignItems: "center", gap: 8 },
+  logLoadingOverlay: { flex: 1, minHeight: 0, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground, alignItems: "center", justifyContent: "center" },
+  logLoadingCard: { minHeight: 32, paddingHorizontal: 14, justifyContent: "center", borderWidth: 1, borderColor: systemColors.separator, borderRadius: 4 },
+  fieldLabel: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "500" },
+  fieldHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
+  fieldError: { color: systemColors.red, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
+  input: { width: "100%", minHeight: 26, color: systemColors.label, fontSize: UI_FONT_SIZE },
+  inputInvalid: { borderWidth: 1, borderColor: systemColors.red, borderRadius: 4 },
+  textArea: { minHeight: 108, textAlignVertical: "top", fontFamily: "Menlo" },
+  compactTextArea: { minHeight: 56, maxHeight: 56 },
+  secretFieldActions: { flexDirection: "row", alignItems: "center", gap: 6 },
+  secretFieldButtons: { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 4 },
+  secretFieldButton: { flex: 1, minWidth: 0, height: 26 },
+  nativeSecretControl: { flex: 1, minWidth: 0, minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 },
+  nativeSecretInput: { flex: 1, minWidth: 86, minHeight: 26 },
+  rawEditor: { flex: 1, minHeight: 180, gap: 4 },
+  rawEditorHeader: { minHeight: 28, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 },
+  rawNativeEditorFrame: { flex: 1, minHeight: 160, position: "relative" },
+  rawNativeEditor: { flex: 1, minHeight: 160 },
+  rawEditorOverlay: { position: "absolute", left: 0, right: 0, top: 0, bottom: 0, justifyContent: "center", alignItems: "center", gap: 8, paddingHorizontal: 12, backgroundColor: systemColors.textBackground },
+  rawEditorLoading: { flex: 1, minHeight: 160, justifyContent: "center", paddingHorizontal: 8, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground },
+  empty: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, paddingVertical: 12 },
+  cardHint: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, marginTop: 2 },
   nativeSecretMultilineControl: { alignItems: "flex-start", minHeight: 108 },
   nativeSecretTextArea: { minHeight: 108, height: 108, alignSelf: "stretch" },
   secretActionButton: { width: 64, minWidth: 64, height: 26, flexShrink: 0 },

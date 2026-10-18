@@ -425,6 +425,146 @@ class HookStreamingToolEventTests(HookTestCase):
             "让我再搜索。\n\n结论可见。",
         )
 
+    def test_raw_dsml_tool_call_does_not_leave_orphan_period(self) -> None:
+        hooks, _ = load_hook_module()
+        marker = "\uff5c\uff5cDSML\uff5c\uff5c"
+        content = [
+            ".\n\n",
+            "<" + marker + " calls>\n",
+            "<" + marker + " invoke name=\"exec_command\">\n",
+            "<" + marker + " parameter name=\"cmd\">sleep 295</" + marker + " parameter>\n",
+            "</" + marker + " invoke>\n</" + marker + " calls>",
+        ]
+        text_filter = hooks._RawToolCallTextFilter()
+        visible = []
+        for delta in content:
+            chunk = hooks._sanitize_raw_tool_call_text_stream_chunk(
+                {"type": "response.output_text.delta", "delta": delta},
+                text_filter,
+            )
+            if chunk is not None:
+                visible.append(chunk.get("delta", ""))
+
+        self.assertEqual("".join(visible), "")
+        self.assertEqual(
+            [item["name"] for item in text_filter.take_raw_tool_call_items()],
+            ["exec_command"],
+        )
+        self.assertEqual(
+            hooks._strip_raw_tool_call_blocks(".\n\n" + "".join(content[1:])),
+            "",
+        )
+
+    async def test_guarded_stream_promotes_raw_dsml_call_to_function_call(self) -> None:
+        hooks, _ = load_hook_module()
+        marker = "\uff5c\uff5cDSML\uff5c\uff5c"
+        raw = (
+            ".\n\n<" + marker + " calls>\n<" + marker
+            + " invoke name=\"exec_command\">\n<" + marker
+            + " parameter name=\"cmd\">sleep 295</" + marker
+            + " parameter>\n</" + marker + " invoke>\n</" + marker + " calls>"
+        )
+
+        async def upstream_stream():
+            yield {"type": "response.created", "response": {"id": "resp_dsml", "status": "in_progress", "output": []}}
+            yield {"type": "response.output_text.delta", "delta": raw}
+            yield {"type": "response.output_text.done", "text": raw}
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_dsml",
+                    "status": "completed",
+                    "output_text": raw,
+                    "output": [
+                        {
+                            "id": "msg_dsml",
+                            "type": "message",
+                            "status": "completed",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": raw}],
+                        }
+                    ],
+                },
+            }
+
+        request_data = {
+            "model": "default-chat",
+            "input": "run a command",
+            "stream": True,
+            "tools": [{"type": "function", "name": "exec_command", "parameters": {"type": "object"}}],
+        }
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks._yield_guarded_original_stream(
+                [], upstream_stream(), request_data
+            )
+        ]
+        completed = chunks[-1]["response"]
+        self.assertIsNone(completed.get("output_text"))
+        self.assertEqual(
+            sum(item.get("type") == "function_call" for item in completed["output"]),
+            1,
+        )
+        self.assertEqual(completed["output"][0]["type"], "function_call")
+        self.assertEqual(completed["output"][0]["name"], "exec_command")
+        self.assertEqual(
+            json.loads(completed["output"][0]["arguments"]),
+            {"cmd": "sleep 295"},
+        )
+        self.assertNotIn(".\n\n", json.dumps(chunks, ensure_ascii=False))
+        self.assertNotIn(marker, json.dumps(chunks, ensure_ascii=False))
+
+    async def test_guarded_stream_recovers_dsml_call_omitted_from_completed_payload(self) -> None:
+        hooks, _ = load_hook_module()
+        marker = "\uff5c\uff5cDSML\uff5c\uff5c"
+        deltas = [
+            ".\n\n",
+            "<" + marker + " calls>\n<" + marker + " invoke name=\"exec_command\">\n",
+            "<" + marker + " parameter name=\"cmd\">sleep 295</" + marker + " parameter>\n",
+            "</" + marker + " invoke>\n</" + marker + " calls>",
+        ]
+
+        async def upstream_stream():
+            yield {"type": "response.created", "response": {"id": "resp_dsml_missing", "status": "in_progress", "output": []}}
+            for delta in deltas:
+                yield {"type": "response.output_text.delta", "delta": delta}
+            yield {
+                "type": "response.output_text.done",
+                "text": "".join(deltas),
+            }
+            # This relay omits its text delta and tool markup from the terminal
+            # payload, but the tool call was already present on the wire.
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_dsml_missing",
+                    "status": "completed",
+                    "output": [],
+                },
+            }
+
+        request_data = {
+            "model": "default-chat",
+            "input": "run a command",
+            "stream": True,
+            "tools": [{"type": "function", "name": "exec_command", "parameters": {"type": "object"}}],
+        }
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks._yield_guarded_original_stream(
+                [], upstream_stream(), request_data
+            )
+        ]
+        completed = chunks[-1]["response"]
+        self.assertEqual(completed["output"][0]["type"], "function_call")
+        self.assertEqual(completed["output"][0]["name"], "exec_command")
+        self.assertEqual(
+            json.loads(completed["output"][0]["arguments"]),
+            {"cmd": "sleep 295"},
+        )
+        self.assertNotIn(marker, json.dumps(chunks, ensure_ascii=False))
+        self.assertNotIn(".\n\n", json.dumps(chunks, ensure_ascii=False))
+
     async def test_guarded_responses_stream_bridge_uses_bounded_completion_state(self) -> None:
         hooks, _ = load_hook_module()
         streaming_module = hooks._owners["_yield_guarded_original_stream"]

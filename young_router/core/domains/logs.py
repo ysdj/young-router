@@ -36,10 +36,9 @@ MAX_READ_BYTES = 16 * 1024 * 1024
 # the response envelope while still returning the newest useful log rows.
 MAX_VIEW_BYTES = 3 * 1024 * 1024
 DEFAULT_LINES = 10_000
-# One page of online usage. A relay can report thousands of rows, so the view
-# carries this many and the pane asks for the next page as it scrolls: the
-# payload stays small while the relay's whole history stays reachable.
-ONLINE_USAGE_PAGE_ROWS = 100
+# A page of online usage. The next pages reveal rows already read without
+# issuing another remote query.
+ONLINE_USAGE_PAGE_ROWS = 300
 MAX_LINES = 100_000
 MAX_FILTER_CHARS = 256
 RECOVERY_HEARTBEAT_TTL_SECONDS = 45.0
@@ -1277,6 +1276,23 @@ def _is_service_noise(line: str) -> bool:
     return False
 
 
+def _epoch_seconds(value: object) -> float | None:
+    """One comparable instant from a seconds or milliseconds epoch.
+
+    The online-usage reader resolves a station's own timestamps to Unix
+    seconds; a range that arrives in milliseconds (JavaScript's
+    ``Date.getTime()``) has to be brought to the same scale before it is
+    compared, or every row falls outside it.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if not math.isfinite(number):
+        return None
+    return number / 1000 if abs(number) >= 100_000_000_000 else number
+
+
 def _timestamp_number(value: object) -> float | None:
     """Return a comparable timestamp without making log parsing strict."""
     if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -1287,7 +1303,9 @@ def _timestamp_number(value: object) -> float | None:
     if not isinstance(value, str) or not value.strip():
         return None
     text = value.strip()
-    if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", text):
+    # A station can return a date without a time. It still contains hyphens,
+    # but it names a calendar instant rather than a Unix-second count.
+    if re.fullmatch(r"\d+(?:\.\d+)?", text):
         number = float(text)
         if not math.isfinite(number):
             return None
@@ -1299,7 +1317,9 @@ def _timestamp_number(value: object) -> float | None:
     except (TypeError, ValueError, OverflowError):
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        # Relay calendars are local to this app's user. Interpreting a bare
+        # midnight as UTC would move the start of the day by eight hours here.
+        parsed = parsed.astimezone()
     try:
         return parsed.timestamp()
     except (OverflowError, OSError, ValueError):
@@ -1611,6 +1631,9 @@ class LogsDomain:
         self._runtime_log_max_bytes: int | None = None
         self._runtime_log_backup_segments: int | None = None
         self._online_usage_records: list[dict[str, Any]] = []
+        # Inclusive relay timestamps in the user's selected range.
+        self._online_usage_since: float | None = None
+        self._online_usage_until: float | None = None
         self._online_usage_refreshed = False
         self._online_usage_revision = 0
         # The dropdown's selection, and the list it selects from. Both are
@@ -1622,9 +1645,14 @@ class LogsDomain:
         # How many of the relay's rows the view currently carries. It grows by
         # one page each time the pane reaches the end of what it has.
         self._online_usage_window = ONLINE_USAGE_PAGE_ROWS
+        self._online_usage_loaded = ONLINE_USAGE_PAGE_ROWS
+        self._online_usage_total = 0
         self._online_usage_sources: list[dict[str, str]] = []
         self._online_usage_sources_revision = -1
         self._online_usage_source_id = ""
+        # Only the latest requested source may replace the view. A slower
+        # answer for an earlier source ends that request, never this one.
+        self._online_usage_request = ""
         runtime = self.root / ".litellm-runtime"
         self._recovery_path = Path(
             os.environ.get("YOUNG_ROUTER_ROUTE_RECOVERY_STATE_FILE", runtime / "route-recovery-state.json")
@@ -1641,6 +1669,9 @@ class LogsDomain:
         self._filters: dict[str, str] = {}
         self._limits: dict[str, int] = {}
         self._source_signatures: dict[str, tuple[object, ...]] = {}
+        # The first view reads its own source, while the later empty-state polls
+        # can stay on the unchanged-view fast path.
+        self._view_built: set[str] = {"online-usage"}
         self._view_revisions: dict[str, int] = {tab: 0 for tab in LOG_TABS}
         self._tabs: dict[str, dict[str, Any]] = {
             tab: self._empty_tab(tab) for tab in LOG_TABS
@@ -1807,7 +1838,7 @@ class LogsDomain:
         return [record for record, _size in entries if record is not None]
 
     def _empty_tab(self, tab: str) -> dict[str, Any]:
-        return {
+        value: dict[str, Any] = {
             "tab": tab,
             "available": False,
             "paused": tab in self._paused,
@@ -1816,6 +1847,13 @@ class LogsDomain:
             "filter": self._filters.get(tab, ""),
             "limit": self._line_limit(tab),
         }
+        if tab == "online-usage":
+            value["sources"] = self._online_usage_all_sources()
+        # A fresh domain starts with an empty view, and the source choices
+        # belong to that first answer too; otherwise the pane would only show
+        # a relay after someone left and re-entered the tab.
+        self._view_built.add(tab)
+        return value
 
     def _online_usage_reader_instance(self) -> object:
         reader = self._online_usage_reader
@@ -1840,12 +1878,21 @@ class LogsDomain:
         try:
             sources = self._online_usage_reader_instance().sources()
         except Exception:
+            self._online_usage_sources_revision = -1
             sources = []
         self._online_usage_sources = [
             {"id": str(item.get("id", "")), "label": str(item.get("label", ""))}
             for item in sources
             if isinstance(item, Mapping) and str(item.get("id", ""))
         ]
+        return self._online_usage_sources
+
+    def _online_usage_all_sources(self) -> list[dict[str, str]]:
+        """Read configured local choices after an empty source cache."""
+
+        if not self._online_usage_sources:
+            self._online_usage_sources_revision = -1
+            return self._online_usage_source_list()
         return self._online_usage_sources
 
     def _refresh_runtime_settings(self) -> None:
@@ -2136,6 +2183,13 @@ class LogsDomain:
             current = self._source_cursor("online-usage")
             if current[0] == "online" and current[1] == cursor[1] and current[2] >= cursor[2]:
                 records = records[int(cursor[2]) :]
+        if self._online_usage_since is not None or self._online_usage_until is not None:
+            records = [
+                record for record in records
+                if (moment := _record_timestamp(record)) is not None
+                and (self._online_usage_since is None or moment >= self._online_usage_since)
+                and (self._online_usage_until is None or moment <= self._online_usage_until)
+            ]
         needle = self._filters.get("online-usage", "").casefold()
         if needle:
             records = [record for record in records if needle in str(record).casefold()]
@@ -2148,6 +2202,7 @@ class LogsDomain:
             # rows themselves are all kept here: the page is a view over them,
             # never the thing that decides how much usage exists.
             records = self._online_usage_matching()
+            self._online_usage_total = len(records)
             start = max(0, len(records) - self._online_usage_window)
             return self._online_usage_refreshed, records[start:]
         path = self._path(tab)
@@ -2364,6 +2419,7 @@ class LogsDomain:
                 source = (-1, -1)
         return (
             *source,
+            self._file_cursor(self.config_path) if tab == "online-usage" else None,
             self._filters.get(tab, ""),
             self._line_limit(tab),
             tab in self._cleared,
@@ -2385,15 +2441,13 @@ class LogsDomain:
             self._store_tab(tab, self._fit_view_records(previous))
             return
         signature = self._source_signature(tab)
-        if not force and self._source_signatures.get(tab) == signature:
+        if not force and tab in self._view_built and self._source_signatures.get(tab) == signature:
             return
         available, records = self._records(tab)
         value: dict[str, Any] = {
             "tab": tab,
             "available": available,
             "paused": tab in self._paused,
-            "line_count": len(records),
-            "records": records,
             "filter": self._filters.get(tab, ""),
             "limit": self._line_limit(tab),
         }
@@ -2401,14 +2455,31 @@ class LogsDomain:
             # The tab's own dropdown is part of its view: the pane renders the
             # choices and the chosen one from the same snapshot its rows came
             # from, so a refresh can never label rows with another relay.
-            value["sources"] = self._online_usage_source_list()
+            value["sources"] = self._online_usage_all_sources()
             value["source_id"] = self._online_usage_source_id
             value["reason"] = self._online_usage_reason
+            total = self._online_usage_total
+            # The pager needs the whole picture from Core: the page's rows can
+            # be trimmed by the IPC byte cap, so a UI calculation from line
+            # count would not agree with the next-page action.
+            window_pages = (self._online_usage_window + ONLINE_USAGE_PAGE_ROWS - 1) // ONLINE_USAGE_PAGE_ROWS
+            page_count = max(1, (total + ONLINE_USAGE_PAGE_ROWS - 1) // ONLINE_USAGE_PAGE_ROWS)
+            page = max(1, min(window_pages, page_count))
+            value["total"] = total
+            value["page"] = page
+            value["page_count"] = page_count
             # The pane needs to know a next page exists before it offers to
-            # fetch one, so the count of rows held back travels with the page.
-            value["remaining"] = max(0, len(self._online_usage_matching()) - len(records))
-        self._store_tab(tab, self._fit_view_records(value))
+            # fetch one, so the count of rows after this page travels with it.
+            value["remaining"] = max(0, total - self._online_usage_window)
+        # Fit the records to the IPC result only after the pager describes the
+        # rows held by Core: byte-cap trimming must not make an existing next
+        # page look absent.
+        value["line_count"] = len(records)
+        value["records"] = records
+        fitted = self._fit_view_records(value)
+        self._store_tab(tab, fitted)
         self._source_signatures[tab] = signature
+        self._view_built.add(tab)
 
     def _store_tab(self, tab: str, value: dict[str, Any]) -> None:
         if self._tabs.get(tab) == value:
@@ -2439,6 +2510,8 @@ class LogsDomain:
             used += extra
         metadata["records"] = list(reversed(selected))
         metadata["line_count"] = len(metadata["records"])
+        if value.get("tab") == "online-usage":
+            metadata["_response_trimmed"] = True
         return metadata
 
     def snapshot(self) -> dict[str, Any]:
@@ -2467,7 +2540,11 @@ class LogsDomain:
         return {
             "changed": changed,
             "revision": revision,
-            "log": dict(self._tabs[tab]) if changed else None,
+            "log": {
+                key: value
+                for key, value in self._tabs[tab].items()
+                if not key.startswith("_")
+            } if changed else None,
         }
 
     def dispatch(self, action: str, payload: object | None = None) -> dict[str, Any]:
@@ -2476,6 +2553,31 @@ class LogsDomain:
         if tab not in LOG_TABS:
             raise LogsDomainError("Log tab is invalid")
         operation = action.removeprefix("logs.").replace("-", "_")
+        if operation == "set_time_range":
+            if tab != "online-usage":
+                raise LogsDomainError("Log tab is invalid")
+            since = data.get("since")
+            until = data.get("until")
+            if any(
+                value is not None
+                and (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value))
+                for value in (since, until)
+            ) or (since is not None and until is not None and since > until):
+                raise LogsDomainError("Log time range is invalid")
+            # The range is compared with the parsed row timestamps, which are
+            # Unix seconds.  A caller that hands over a millisecond epoch (the
+            # only thing JavaScript's Date.getTime() answers) would otherwise
+            # filter every row out: the range started some fifty thousand years
+            # ahead of the data.
+            self._online_usage_since = _epoch_seconds(since)
+            self._online_usage_until = _epoch_seconds(until)
+            self._online_usage_window = ONLINE_USAGE_PAGE_ROWS
+            self._online_usage_loaded = ONLINE_USAGE_PAGE_ROWS
+            self._discard_clear(tab)
+            self._source_signatures.pop(tab, None)
+            self.revision += 1
+            self._refresh(tab, force=True)
+            return self.snapshot()
         if tab == "requests":
             # A view action can change what the tab shows (filter, limit,
             # pause, clear) — never serve it from a window parsed under the
@@ -2521,11 +2623,27 @@ class LogsDomain:
             if tab != "online-usage":
                 raise LogsDomainError("Log tab is invalid")
             # Reading further is a view over rows already fetched: the relay is
-            # not asked again just because the user scrolled.
+            # not asked again just because the user changed pages.
             self._online_usage_window = min(
-                MAX_LINES, self._online_usage_window + ONLINE_USAGE_PAGE_ROWS
+                MAX_LINES,
+                max(self._online_usage_window, self._online_usage_loaded) + ONLINE_USAGE_PAGE_ROWS,
             )
+            self._online_usage_loaded = self._online_usage_window
             self._discard_clear(str(tab))
+            self._source_signatures.pop(tab, None)
+        elif operation == "previous_page":
+            if tab != "online-usage":
+                raise LogsDomainError("Log tab is invalid")
+            loaded = self._tabs.get(tab)
+            if loaded and isinstance(loaded.get("line_count"), int):
+                self._online_usage_loaded = loaded["line_count"]
+            self._online_usage_window = max(
+                ONLINE_USAGE_PAGE_ROWS,
+                self._online_usage_loaded - ONLINE_USAGE_PAGE_ROWS,
+            )
+            self._online_usage_loaded = self._online_usage_window
+            self._discard_clear(str(tab))
+            self._source_signatures.pop(tab, None)
         elif operation in {"refresh", "reload", "refresh_online_usage"}:
             self._discard_clear(str(tab))
             if tab == "online-usage":
@@ -2533,10 +2651,14 @@ class LogsDomain:
                 # scope keeps the current selection, so the pane's idle poll
                 # never re-reads a relay the user did not choose.
                 requested = data.get("source", data.get("source_id"))
+                request = data.get("request")
                 source_id = self._online_usage_source_id
                 if isinstance(requested, str) and requested.strip():
                     source_id = requested.strip()[:64]
                 self._online_usage_source_id = source_id
+                if isinstance(request, str) and request:
+                    self._online_usage_request = request
+                self._online_usage_reason = ""
                 try:
                     reader = self._online_usage_reader_instance()
                     refresh = getattr(reader, "refresh", None)
@@ -2554,6 +2676,14 @@ class LogsDomain:
                         # plus the reason it has none; the reason is the pane's
                         # own message and never a row shaped like a usage one.
                         values, reason = answered if isinstance(answered, tuple) else (answered, "")
+                    if (
+                        isinstance(request, str)
+                        and request != self._online_usage_request
+                    ):
+                        # This answer belongs to a source the user has since
+                        # replaced, so it neither becomes a row nor ends the
+                        # wait for the newer source.
+                        return self.snapshot()
                     # A plain string is still accepted as a row, so a reader
                     # that only states one sentence produces something.
                     self._online_usage_records = [
@@ -2566,9 +2696,19 @@ class LogsDomain:
                     ][-self._line_limit(str(tab)) :]
                     self._online_usage_reason = str(reason)[:512]
                 except Exception:
+                    if (
+                        isinstance(request, str)
+                        and request != self._online_usage_request
+                    ):
+                        return self.snapshot()
                     self._online_usage_records = []
                     self._online_usage_reason = "Online usage logs are unavailable."
                 self._online_usage_window = ONLINE_USAGE_PAGE_ROWS
+                self._online_usage_loaded = ONLINE_USAGE_PAGE_ROWS
+                # The chosen range is a view over whichever relay answered, not
+                # a property of the relay that was chosen when it was set:
+                # dropping it here left the pane's own time menu naming a range
+                # that no longer filtered anything.
                 self._online_usage_refreshed = True
                 self._online_usage_revision += 1
         else:

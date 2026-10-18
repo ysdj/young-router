@@ -69,6 +69,11 @@ class ClientFilesDomainTests(unittest.TestCase):
             )
             self.assertEqual("dsh", files["dsh_desktop_settings"]["client"])
             self.assertEqual("opencode.json", files["opencode_config"]["name"])
+            self.assertEqual(
+                str(Path(directory) / "opencode-data" / "auth.json"),
+                files["opencode_auth"]["path"],
+            )
+            self.assertEqual("json", files["opencode_auth"]["language"])
             # The model catalog the Codex pane's switch installs is listed with
             # the file name Core itself writes, under the same Codex home.
             self.assertEqual("model-catalog.json", files["codex_model_catalog"]["name"])

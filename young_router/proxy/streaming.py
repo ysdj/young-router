@@ -4345,6 +4345,11 @@ async def _yield_guarded_original_stream(
     saw_image_generation_activity = False
     saw_web_search_call_activity = False
     saw_visible_assistant_output_after_web_search = False
+    # The bridge consumes the upstream web_search function_call before it is
+    # delivered to the client.  Keep that protocol fact after takeover so a
+    # failed hidden continuation can still enter the recovery path even when
+    # the consumed call is no longer present in completed_output_items.
+    bridge_search_intercepted = False
     seen_web_search_activity_keys: set[str] = set()
     namespace_by_name = _responses_output_module._responses_namespace_tool_map(
         request_data.get("input"),
@@ -4761,7 +4766,10 @@ async def _yield_guarded_original_stream(
             saw_web_search_call_activity
             and not saw_visible_assistant_output_after_web_search
             and not completed_output_has_visible_assistant_text()
-            and completed_output_is_web_search_call_only()
+            and (
+                completed_output_is_web_search_call_only()
+                or (bridge_search_intercepted and not synthesized_text().strip())
+            )
         )
 
     def external_web_search_recovery_allowed(exception: Optional[Exception]) -> bool:
@@ -5140,6 +5148,66 @@ async def _yield_guarded_original_stream(
             yield _synthesized_failed_response_event(request_data, recovery_exception)
             return
 
+        recovered_output = recovered_payload.get("output")
+        recovered_non_search_items = [
+            item
+            for item in recovered_output
+            if isinstance(item, dict)
+            and item.get("type") != "web_search_call"
+            and not _responses_web_search_bridge_module._is_web_search_function_call_item(item)
+        ] if isinstance(recovered_output, list) else []
+        recovered_has_only_search_calls = not recovered_non_search_items
+        if recovered_has_only_search_calls:
+            original_function = _responses_execution_module._responses_bridge_original_function(
+                request_data
+            )
+            if original_function is not None:
+                try:
+                    continuation_request = (
+                        _responses_web_search_bridge_module._external_web_search_prepare_continuation_recovery_request(
+                            request_kwargs=request_data,
+                            search_results=search_results,
+                            queries=completed_labels,
+                            completed_actions=completed_actions_for_recovery,
+                            round_number=1,
+                            response=recovered_payload,
+                            round_evidence=search_results,
+                        )
+                    )
+                    continued = await _responses_web_search_bridge_module._external_web_search_call_original(
+                        original_function,
+                        continuation_request,
+                        request_kwargs=request_data,
+                        phase="continuation",
+                    )
+                    continued_payload = _jsonable(continued)
+                    if isinstance(continued_payload, dict):
+                        continued_output = continued_payload.get("output")
+                        continued_non_search_items = [
+                            item
+                            for item in continued_output
+                            if isinstance(item, dict)
+                            and item.get("type") != "web_search_call"
+                            and not _responses_web_search_bridge_module._is_web_search_function_call_item(item)
+                        ] if isinstance(continued_output, list) else []
+                        if not continued_non_search_items:
+                            raise RuntimeError(
+                                "route recovery continuation returned another web_search-only response"
+                            )
+                        recovered_payload = continued_payload
+                    else:
+                        raise RuntimeError("route recovery continuation returned no response")
+                except Exception as continuation_exc:
+                    recovery_exception = search_tool_missing_answer_exception(
+                        "route recovery continuation after duplicate web_search call failed",
+                        continuation_exc,
+                    )
+                    yield _synthesized_failed_response_event(
+                        request_data,
+                        recovery_exception,
+                    )
+                    return
+
         final_output = current_completed_output()
         for item in recovered_payload.get("output", []):
             if not isinstance(item, dict):
@@ -5300,6 +5368,7 @@ async def _yield_guarded_original_stream(
         visible_output_seen = visible_output_seen or _stream_chunk_has_visible_output(chunk)
         bridge_payload = bridge_payload_for_chunk(chunk)
         if bridge_payload is not None:
+            bridge_search_intercepted = True
             for closed_chunk in unclosed_client_visible_tool_completion_events():
                 remember(closed_chunk)
                 yield closed_chunk
@@ -5482,6 +5551,7 @@ async def _yield_guarded_original_stream(
             visible_output_seen = visible_output_seen or _stream_chunk_has_visible_output(chunk)
             bridge_payload = bridge_payload_for_chunk(chunk)
             if bridge_payload is not None:
+                bridge_search_intercepted = True
                 for closed_chunk in unclosed_client_visible_tool_completion_events():
                     remember(closed_chunk)
                     yield closed_chunk
@@ -5639,6 +5709,7 @@ async def _yield_guarded_original_stream(
     if not saw_responses_completed:
         bridge_payload = bridge_payload_from_state(require_finished_arguments=True)
         if bridge_payload is not None:
+            bridge_search_intercepted = True
             for closed_chunk in unclosed_client_visible_tool_completion_events():
                 remember(closed_chunk)
                 yield closed_chunk

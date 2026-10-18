@@ -57,6 +57,13 @@ class YoungRouterHook(CustomLogger):
             return None
         if not _responses_request_module._request_is_responses_api(data):
             return None
+        # Recorded here, before any bridge or surface adapter rewrites the
+        # input: a Chat-shaped route replays this history as messages and the
+        # answer it returns covers the whole restored context.
+        _routing_module._remember_restored_reasoning_replay(
+            data,
+            _responses_execution_module._chat_bridge_reasoning_included(data),
+        )
         elided = _responses_request_module._with_elided_oversized_tool_outputs(data)
         if elided is None:
             return None
@@ -406,6 +413,41 @@ class YoungRouterHook(CustomLogger):
         raise _image_generation_module._image_generation_tool_runtime_fallback_exception(
             capability_unsupported=True,
         )
+
+    async def async_post_call_response_headers_hook(
+        self,
+        data: dict,
+        user_api_key_dict: Any,
+        response: Any,
+        request_headers: Any = None,
+    ) -> dict:
+        """Put a fact about the adapted stream on the real HTTP response.
+
+        Codex reads ``x-reasoning-included`` from the streaming HTTP headers
+        before the first SSE event and uses it to decide whether its own token
+        estimate must add the earlier encrypted reasoning again.  No key inside
+        the event body reaches that decision, so a marker written into
+        ``response.created`` is invisible to it and a 185k-token context still
+        looked like 400k.
+
+        Only an adapted stream carries the fact: it replayed the client's
+        context as ordinary messages, so the upstream counted every restored
+        token.  A native Responses answer keeps whatever header its own
+        upstream sent, and this hook adds nothing.
+        """
+
+        restored = _responses_execution_module._restored_reasoning_included(response)
+        _trace_module._route_trace(
+            "responses_reasoning_included_header",
+            request_id=_routing_module._trace_request_id(data),
+            session=_routing_module._trace_session_context(data),
+            model_group=_responses_execution_module._request_model_group(data),
+            applied=restored,
+            response_type=type(response).__name__,
+        )
+        if not restored:
+            return {}
+        return {_responses_execution_module.REASONING_INCLUDED_HEADER: "true"}
 
     async def async_post_call_streaming_iterator_hook(
         self,

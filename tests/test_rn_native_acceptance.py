@@ -361,14 +361,14 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         launch = source.split("- (void)applicationDidFinishLaunching:", 1)[1].split(
             "- (void)startReactHostWhenNeeded", 1
         )[0]
+        surfaces = source.split("- (void)applicationWillFinishLaunching:", 1)[1].split(
+            "- (void)applicationDidFinishLaunching:", 1
+        )[0]
 
-        self.assertIn("self.automaticallyLoadReactNativeWindow = NO;", launch)
-        self.assertIn("[nativeLeaf setReactHostStarter:^{", launch)
+        self.assertIn("self.automaticallyLoadReactNativeWindow = NO;", surfaces)
+        self.assertIn("[AppKitNativeLeaf.shared setReactHostStarter:^{", launch)
+        self.assertIn("[super applicationDidFinishLaunching:notification];", launch)
         self.assertIn("[self startReactHostWhenNeeded];", launch)
-        self.assertLess(
-            launch.index("[nativeLeaf setReactHostStarter:^{"),
-            launch.rindex("[self startReactHostWhenNeeded];"),
-        )
 
     def test_core_replacement_waits_for_the_previous_process_to_exit(self) -> None:
         mac = (MAC_NATIVE / "CoreIPCBridge.swift").read_text(encoding="utf-8")
@@ -404,7 +404,15 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
     def test_macos_core_never_mutates_the_signed_bundle_with_bytecode(self) -> None:
         mac = (MAC_NATIVE / "CoreIPCBridge.swift").read_text(encoding="utf-8")
 
-        self.assertIn('childEnvironment["PYTHONDONTWRITEBYTECODE"] = "1"', mac)
+        start = mac.split("    private func startCoreLocked() throws -> Endpoint {", 1)[1].split(
+            "    private func previewProfileEnvironment", 1
+        )[0]
+        self.assertIn('childEnvironment["YOUNG_ROUTER_PYCACHE_DIR"]', start)
+        self.assertIn('childEnvironment.removeValue(forKey: "PYTHONPYCACHEPREFIX")', start)
+        self.assertIn(
+            'childEnvironment["PYTHONDONTWRITEBYTECODE"] = "1"',
+            start,
+        )
 
     def test_macos_event_poll_retries_without_replacing_core(self) -> None:
         mac = (MAC_NATIVE / "CoreIPCBridge.swift").read_text(encoding="utf-8")
@@ -1209,6 +1217,8 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
 
         self.assertIn("applicationShouldHandleReopen", app_delegate)
+        reopen = app_delegate.split("- (BOOL)applicationShouldHandleReopen:", 1)[1].split("- (void)application:", 1)[0]
+        self.assertLess(reopen.index("[self startReactHostWhenNeeded];"), reopen.index('openRouteFromDeepLink:@"providers-models"'))
         self.assertIn("hasVisibleWindows", app_delegate)
         self.assertIn('openRouteFromDeepLink:@"providers-models" logTab:nil', app_delegate)
         self.assertNotIn("native-open-relay-accounts", leaf)
@@ -1291,12 +1301,12 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         platform_entry = (SHARED / "platformEntry.ts").read_text(encoding="utf-8")
         ui = (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
 
-        native_shell = app_delegate.index("AppKitNativeLeaf *nativeLeaf = AppKitNativeLeaf.shared;")
+        native_shell = app_delegate.index("[self installNativeStatusItem];")
         core_warm = app_delegate.index("[CoreIPCBridge.shared warm];")
         react_start = app_delegate.index("[super applicationDidFinishLaunching:notification];")
         self.assertLess(native_shell, react_start)
         self.assertIn("self.automaticallyLoadReactNativeWindow = NO;", app_delegate)
-        self.assertIn("[nativeLeaf setReactHostStarter:^{", app_delegate)
+        self.assertIn("[AppKitNativeLeaf.shared setReactHostStarter:^{", app_delegate)
         self.assertIn("- (void)startReactHostWhenNeeded", app_delegate)
         self.assertIn("[self loadReactNativeWindow:nil];", app_delegate)
         self.assertLess(native_shell, core_warm)
@@ -2155,9 +2165,10 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # the read.
         usage_logs = logs_ui.split("const refreshOnlineUsage", 1)[1].split("return <View style={styles.logsWindow}", 1)[0]
         self.assertNotIn("native.openRelayLogs", usage_logs)
-        self.assertIn('dispatch("logs.refresh_online_usage", { tab, source: sourceId }, "logs")', usage_logs)
+        self.assertIn('type: "logs.refresh_online_usage"', usage_logs)
+        self.assertIn("source: sourceId", usage_logs)
         self.assertNotIn("openRelayUsageLogs", logs_ui)
-        self.assertIn("const onlineUsageSources = selected === \"online-usage\" ? active?.sources ?? [] : [];", logs_ui)
+        self.assertIn("const onlineUsageSources = onlineUsageSourcesRef.current?.length", logs_ui)
         self.assertIn("const onlineUsageSourceValues = useMemo(", logs_ui)
         # The dropdown names the relays; there is no aggregate entry, because
         # the tab reads exactly the station the user picks.
@@ -2423,6 +2434,11 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("_field.action = @selector(submitSecret:);", mac)
         self.assertIn("controlTextDidEndEditing", mac)
         self.assertIn("loadPlainTextSecretForGeneration", mac)
+        # A host read that fails while Core is still starting (the pane opens a
+        # second after a launch) must ask again instead of leaving the saved key
+        # behind its loading hint for as long as the field is on screen.
+        self.assertIn("[self readPlainTextSecretForGeneration:generation attempt:0];", mac)
+        self.assertIn("kPlainTextSecretReadAttempts", mac)
         self.assertIn("readPlainTextSecret", mac_core)
         self.assertIn("host/secret/read", mac_core)
         self.assertIn("ReadPlainTextSecret", windows_core)

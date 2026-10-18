@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 
+from ..adapters import pi_web_access as _pi_web_access_module
 from . import responses_web_search_bridge as _responses_web_search_bridge_module
 from . import request_context as _request_context_module
 from . import routing as _routing_module
@@ -369,112 +370,8 @@ def _responses_bridge_provider_native_web_search_tool(tool: Any) -> Optional[dic
 
 
 def _pi_web_access_tool_definitions() -> list[dict[str, Any]]:
-    """Return the model-facing function tools registered by pi-web-access.
-
-    The proxy executes these calls through the bundled pi-web-access worker.
-    Keep the public names and parameter shape aligned with the extension so a
-    model can choose them normally; do not replace them with a private proxy
-    function or an instruction that forces a call.
-    """
-    return [
-        {
-            "type": "function",
-            "name": "web_search",
-            "description": (
-                "Search the web using the configured pi-web-access providers. "
-                "Use query for one search or queries for several varied searches. "
-                "Returns source URLs and snippets; use fetch_content to read a "
-                "known result page."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Single search query.",
-                    },
-                    "queries": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Multiple varied search queries.",
-                    },
-                    "numResults": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 20,
-                        "description": "Results per query (default 5, max 20).",
-                    },
-                    "includeContent": {
-                        "type": "boolean",
-                        "description": "Request full page content when supported.",
-                    },
-                    "recencyFilter": {
-                        "type": "string",
-                        "enum": ["day", "week", "month", "year"],
-                        "description": "Optional recency filter.",
-                    },
-                    "domainFilter": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Optional domain allow/deny list.",
-                    },
-                    "provider": {
-                        "description": "Optional configured provider or provider list.",
-                        "oneOf": [
-                            {"type": "string"},
-                            {"type": "array", "items": {"type": "string"}},
-                        ],
-                    },
-                    "workflow": {
-                        "type": "string",
-                        "enum": ["none", "summary-review", "auto-summary"],
-                        "description": "Search workflow; use none for a direct result set.",
-                    },
-                },
-                "required": [],
-                "additionalProperties": False,
-            },
-        },
-        {
-            "type": "function",
-            "name": "fetch_content",
-            "description": (
-                "Fetch a known URL and extract readable content as markdown. "
-                "Use this after web_search when the snippets are insufficient."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string", "description": "Single URL to fetch."},
-                    "urls": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Multiple URLs to fetch.",
-                    },
-                    "mode": {
-                        "type": "string",
-                        "enum": ["readable", "raw", "answer"],
-                        "description": "Fetch mode; readable is the default.",
-                    },
-                    "prompt": {
-                        "type": "string",
-                        "description": "Question for mode answer.",
-                    },
-                    "forceClone": {
-                        "type": "boolean",
-                        "description": "Force cloning a large GitHub repository.",
-                    },
-                    "answerModel": {"type": "string"},
-                    "timestamp": {"type": "string"},
-                    "frames": {"type": "integer", "minimum": 1, "maximum": 12},
-                    "model": {"type": "string"},
-                    "auth": {"oneOf": [{"type": "string"}, {"type": "boolean"}]},
-                },
-                "required": [],
-                "additionalProperties": False,
-            },
-        },
-    ]
+    """Return the shared client and proxy declaration for pi-web-access."""
+    return _pi_web_access_module._pi_web_access_tool_definitions()
 
 
 def _responses_external_web_search_bridge_tools(
@@ -490,6 +387,9 @@ def _responses_external_web_search_bridge_tools(
         if not isinstance(tool, dict):
             continue
         if tool.get("type") in ({"web_search", "web_search_preview"} | _PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES):
+            # Replace only hosted/provider-native declarations.  A plain
+            # function named ``web_search`` is already the pi-web-access
+            # contract and must keep its arguments and call identity.
             bridged_web_search_tools += 1
             if not has_direct_search_tool:
                 bridged_tools.extend(_pi_web_access_tool_definitions())

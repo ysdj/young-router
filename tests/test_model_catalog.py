@@ -29,6 +29,87 @@ def _number_text_for_schema(value: float) -> str:
 
 
 class ModelCatalogTests(unittest.TestCase):
+    def test_fallback_catalog_repairs_the_native_base_profile(self) -> None:
+        native_models = [
+            {
+                "slug": "first-native",
+                "priority": 1,
+                "visibility": "list",
+                "model_messages": {"instructions_template": "First agent"},
+            },
+            {
+                "slug": "second-native",
+                "priority": 2,
+                "visibility": "list",
+                "model_messages": {"instructions_template": "Second agent"},
+            },
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "model-catalog.json"
+            with mock.patch(
+                "young_router.core.model_catalog.load_native_catalog",
+                return_value=[],
+            ):
+                write_catalog(path, ["public-model"])
+            with mock.patch(
+                "young_router.core.model_catalog.load_native_catalog",
+                return_value=native_models,
+            ):
+                self.assertFalse(
+                    catalog_is_current(path, ["public-model"], base_slug="second-native")
+                )
+                write_catalog(
+                    path, ["public-model"], base_slug="second-native"
+                )
+                self.assertTrue(
+                    catalog_is_current(path, ["public-model"], base_slug="second-native")
+                )
+
+            model = json.loads(path.read_text(encoding="utf-8"))["models"][0]
+            self.assertEqual(
+                "Second agent",
+                model["model_messages"]["instructions_template"],
+            )
+
+    def test_fallback_catalog_is_replaced_when_native_instructions_are_readable(self) -> None:
+        native_profile = {
+            "slug": "gpt-6-astra",
+            "model_messages": {"instructions_template": "Native agent instructions"},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "model-catalog.json"
+            with mock.patch(
+                "young_router.core.model_catalog.load_native_catalog",
+                return_value=[],
+            ):
+                write_catalog(path, ["public-model"])
+            with mock.patch(
+                "young_router.core.model_catalog.load_native_catalog",
+                return_value=[native_profile],
+            ):
+                self.assertFalse(catalog_is_current(path, ["public-model"]))
+                write_catalog(path, ["public-model"])
+                self.assertTrue(catalog_is_current(path, ["public-model"]))
+
+            model = json.loads(path.read_text(encoding="utf-8"))["models"][0]
+            self.assertEqual(
+                "Native agent instructions",
+                model["model_messages"]["instructions_template"],
+            )
+            fallback_model = {
+                "slug": model["slug"],
+                "base_instructions": "Fallback instructions",
+            }
+            (path).write_text(
+                json.dumps({"models": [fallback_model]}),
+                encoding="utf-8",
+            )
+            with mock.patch(
+                "young_router.core.model_catalog.load_native_catalog",
+                return_value=[],
+            ):
+                self.assertFalse(catalog_is_current(path, ["public-model"]))
+
     def test_model_context_refresh_default_is_six_hours(self) -> None:
         self.assertEqual(6, DEFAULT_MODEL_CONTEXT_REFRESH_HOURS)
         setting = next(

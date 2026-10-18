@@ -1,9 +1,7 @@
-"""OpenCode Zen free-lane provider integration.
+"""The existing OpenCode provider backed by dsh-our-free-model.
 
-The upstream protocol is a third-party package staged at build time, so these
-tests drive the seam instead of the network: a stub runtime stands in for the
-worker and asserts what Core asks it for and what the provider domain does with
-the answer.
+The upstream protocol is staged unchanged at build time, so these tests drive
+the seam instead of the network: a stub runtime stands in for the worker.
 """
 
 from __future__ import annotations
@@ -12,6 +10,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from young_router.adapters import opencode2dsh
 from young_router.core.domains import DomainError
@@ -91,6 +90,9 @@ class StubRuntime:
     def environment_values(self) -> dict[str, str]:
         return self.environment()
 
+    def autostart_if_configured(self) -> None:
+        self.calls.append(("autostart", "launch"))
+
     def stop(self) -> None:
         self.stopped += 1
 
@@ -122,8 +124,7 @@ class OpenCode2DSHProviderTests(unittest.TestCase):
             provider = domain.snapshot()["providers"][0]
             self.assertEqual(provider["name"], opencode2dsh.OPENCODE2DSH_DISPLAY_NAME)
             self.assertEqual(provider["auth_status"], "signed_in")
-            self.assertEqual(opencode2dsh.API_KEY_NAME, "opencode-zen-free")
-            self.assertEqual(provider["key_states"][0]["name"], "opencode-zen-free")
+            self.assertEqual(provider["key_states"][0]["name"], opencode2dsh.API_KEY_NAME)
             self.assertEqual(
                 provider["api_base"], opencode2dsh.api_base_reference(opencode2dsh.OPENCODE2DSH_PROVIDER)
             )
@@ -138,7 +139,7 @@ class OpenCode2DSHProviderTests(unittest.TestCase):
             )
             first = provider["models"][0]
             self.assertEqual(first["litellm_model"], "openai/big-pickle")
-            self.assertEqual(first["upstream_url_surface"], "openai/chat")
+            self.assertEqual(first["upstream_url_surface"], "openai/responses")
             self.assertEqual(first["upstream_protocol_mode"], "fixed")
             self.assertEqual(first["api_key_name"], opencode2dsh.API_KEY_NAME)
             self.assertTrue(provider["key_states"][0]["configured"])
@@ -159,7 +160,7 @@ class OpenCode2DSHProviderTests(unittest.TestCase):
 
         directory, domain, _config = self._domain(StubRuntime(available=False))
         with directory:
-            with self.assertRaisesRegex(DomainError, "anonymous free lane could not be reached"):
+            with self.assertRaisesRegex(DomainError, "could not be reached"):
                 domain.dispatch("service_provider.add", {"kind": "opencode2dsh_login"})
 
     def test_the_status_and_catalog_reads_answer_through_the_operation_summary(self) -> None:
@@ -224,7 +225,13 @@ class OpenCode2DSHProviderTests(unittest.TestCase):
                 "    api_keys:\n"
                 "      - name: personal\n"
                 "        value: sk-real-user-key\n"
-                "model_list: []\n",
+                "model_list:\n"
+                "  - model_name: unused\n"
+                "    litellm_params:\n"
+                "      model: openai/unused\n"
+                "      api_base: os.environ/YOUNG_ROUTER_OPENCODE2DSH_BASE\n"
+                "    model_info:\n"
+                "      upstream_url_surface: openai/responses\n",
                 encoding="utf-8",
             )
             domain = ProvidersModelsDomain(
@@ -528,6 +535,100 @@ class OpenCode2DSHProviderTests(unittest.TestCase):
 
 
 class OpenCode2DSHStoreTests(unittest.TestCase):
+    def test_core_launch_starts_only_a_saved_free_model_route(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "config.yaml"
+            config_path.write_text(
+                "providers:\n"
+                "  mine: &mine\n"
+                "    api_base: os.environ/YOUNG_ROUTER_OPENCODE2DSH_BASE\n"
+                "    api_keys:\n"
+                "      - name: our-free-model-local\n"
+                "        value: os.environ/YOUNG_ROUTER_OPENCODE2DSH_KEY\n"
+                "    x-young-router-provider-auth: {kind: opencode2dsh_login, credential_ref: configured}\n"
+                "model_list:\n"
+                "  - model_name: ours-model\n"
+                "    litellm_params: {model: openai/model, api_base: *mine, api_key: os.environ/YOUNG_ROUTER_OPENCODE2DSH_KEY}\n"
+                "    model_info: {provider: mine}\n",
+                encoding="utf-8",
+            )
+            runtime = StubRuntime()
+            with mock.patch.object(opencode2dsh, "OpenCode2DSHRuntime", lambda root, settings=None: runtime), mock.patch.object(CoreStore, "_set_service_from_result", lambda *args, **kwargs: None):
+                store = CoreStore.with_default_domains(config_path=config_path, runtime_root=root, metadata_path=root / "state.json")
+                self.assertIs(store._opencode2dsh_runtime, runtime)
+            self.assertIn(("autostart", "launch"), runtime.calls)
+            store.shutdown()
+
+            config_path.write_text("providers: {}\nmodel_list: []\n", encoding="utf-8")
+            runtime = StubRuntime()
+            with mock.patch.object(opencode2dsh, "OpenCode2DSHRuntime", lambda root, settings=None: runtime):
+                store = CoreStore.with_default_domains(
+                    config_path=config_path,
+                    runtime_root=root,
+                    metadata_path=root / "state.json",
+                )
+            store.shutdown()
+            self.assertNotIn(("autostart", "launch"), runtime.calls)
+
+    def test_core_resolves_the_default_provider_document_before_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "provider-cache" / "config.yaml"
+            config_path.parent.mkdir()
+            config_path.write_text(
+                "providers:\n"
+                "  ours: &ours\n"
+                "    api_base: os.environ/YOUNG_ROUTER_OPENCODE2DSH_BASE\n"
+                "    api_keys:\n"
+                "      - name: our-free-model-local\n"
+                "        value: os.environ/YOUNG_ROUTER_OPENCODE2DSH_KEY\n"
+                "    x-young-router-provider-auth: {kind: opencode2dsh_login, credential_ref: configured}\n"
+                "model_list:\n"
+                "  - model_name: ours-model\n"
+                "    litellm_params: {model: openai/model, api_base: *ours, api_key: os.environ/YOUNG_ROUTER_OPENCODE2DSH_KEY}\n"
+                "    model_info: {provider: ours}\n",
+                encoding="utf-8",
+            )
+            runtime = StubRuntime()
+            environment = {
+                "YOUNG_ROUTER_HOME": str(root),
+                "LITELLM_CONFIG_FILE": str(config_path),
+            }
+            with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(
+                opencode2dsh, "OpenCode2DSHRuntime", lambda root, settings=None: runtime
+            ), mock.patch.object(CoreStore, "_set_service_from_result", lambda *args, **kwargs: None):
+                store = CoreStore.with_default_domains(
+                    runtime_root=root,
+                    metadata_path=root / "state.json",
+                )
+            store.shutdown()
+            self.assertIn(("autostart", "launch"), runtime.calls)
+
+    def test_core_opens_an_unavailable_default_provider_document(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "provider-cache" / "config.yaml"
+            config_path.parent.mkdir()
+            runtime = StubRuntime()
+            environment = {
+                "YOUNG_ROUTER_HOME": str(root),
+                "LITELLM_CONFIG_FILE": str(config_path),
+            }
+            with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(
+                opencode2dsh, "OpenCode2DSHRuntime", lambda root, settings=None: runtime
+            ), mock.patch.object(CoreStore, "_set_service_from_result", lambda *args, **kwargs: None):
+                store = CoreStore.with_default_domains(
+                    runtime_root=root,
+                    metadata_path=root / "state.json",
+                )
+            store.shutdown()
+            self.assertNotIn(("autostart", "launch"), runtime.calls)
+            self.assertEqual(
+                [],
+                store._domains["providers_models"].snapshot()["providers"],
+            )
+
     def test_core_owns_the_worker_and_stops_it_on_shutdown(self) -> None:
         """A Core-owned worker never outlives the process that holds its bearer."""
 
@@ -584,6 +685,12 @@ class OpenCode2DSHStoreTests(unittest.TestCase):
 class OpenCode2DSHAdapterTests(unittest.TestCase):
     def test_the_staged_root_and_references_are_named_after_the_integration(self) -> None:
         self.assertEqual(opencode2dsh.staged_root().name, "opencode2dsh")
+        self.assertEqual(opencode2dsh.load_root().name, "opencode2dsh")
+        esbuild = opencode2dsh.load_root() / "node_modules" / ".bin" / "esbuild"
+        self.assertEqual(
+            opencode2dsh.upstream_environment(),
+            {"ESBUILD_BINARY_PATH": str(esbuild)} if esbuild.is_file() else {},
+        )
         self.assertEqual(opencode2dsh.worker_path().name, "opencode2dsh_worker.mjs")
         self.assertEqual(
             opencode2dsh.api_base_reference("opencode2dsh"),
@@ -596,25 +703,74 @@ class OpenCode2DSHAdapterTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             opencode2dsh.validated_provider("workbuddy")
 
-    def test_available_requires_the_staged_entry_point(self) -> None:
+    def test_available_requires_the_staged_manifest_and_worker(self) -> None:
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         saved = os.environ.get("YOUNG_ROUTER_OPENCODE2DSH_DIR")
+        saved_source = os.environ.get("YOUNG_ROUTER_OUR_FREE_MODEL_SOURCE_DIR")
         os.environ["YOUNG_ROUTER_OPENCODE2DSH_DIR"] = directory.name
+        os.environ["YOUNG_ROUTER_OUR_FREE_MODEL_SOURCE_DIR"] = directory.name
 
         def restore() -> None:
             if saved is None:
                 os.environ.pop("YOUNG_ROUTER_OPENCODE2DSH_DIR", None)
             else:
                 os.environ["YOUNG_ROUTER_OPENCODE2DSH_DIR"] = saved
+            if saved_source is None:
+                os.environ.pop("YOUNG_ROUTER_OUR_FREE_MODEL_SOURCE_DIR", None)
+            else:
+                os.environ["YOUNG_ROUTER_OUR_FREE_MODEL_SOURCE_DIR"] = saved_source
 
         self.addCleanup(restore)
+        staged = Path(directory.name)
         self.assertFalse(opencode2dsh.available())
-        (Path(directory.name) / "lib").mkdir()
-        (Path(directory.name) / "package.json").write_text("{}", encoding="utf-8")
+        (staged / "package.json").write_text("{}", encoding="utf-8")
+        saved_worker = os.environ.get("YOUNG_ROUTER_OPENCODE2DSH_WORKER")
+        worker = staged / "opencode2dsh_worker.mjs"
+        os.environ["YOUNG_ROUTER_OPENCODE2DSH_WORKER"] = str(worker)
         self.assertFalse(opencode2dsh.available())
-        (Path(directory.name) / "lib" / "index.js").write_text("", encoding="utf-8")
-        self.assertTrue(opencode2dsh.available())
+        worker.write_text("", encoding="utf-8")
+        try:
+            self.assertTrue(opencode2dsh.available())
+            (staged / "package.json").unlink()
+            self.assertFalse(opencode2dsh.available())
+        finally:
+            if saved_worker is None:
+                os.environ.pop("YOUNG_ROUTER_OPENCODE2DSH_WORKER", None)
+            else:
+                os.environ["YOUNG_ROUTER_OPENCODE2DSH_WORKER"] = saved_worker
+
+    def test_runtime_settings_reach_the_bridge_only_when_committed(self) -> None:
+        from young_router.core.domains.runtime import RuntimeSettingsDomain
+
+        class Bridge:
+            settings = {
+                "defaultMaxTokens": "32768",
+                "exposeRegionModels": "1",
+                "probeIntervalMinutes": "15",
+                "standaloneProbe": "0",
+                "sourceDir": "",
+            }
+
+            def __init__(self) -> None:
+                self.stops = 0
+
+            def stop(self) -> None:
+                self.stops += 1
+
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RuntimeSettingsDomain(Path(directory) / "runtime-settings.env")
+            bridge = Bridge()
+            domain.attach_our_free_model(bridge)
+            domain.dispatch(
+                "set_setting",
+                {"key": "YOUNG_ROUTER_OUR_FREE_MODEL_MAX_TOKENS", "value": "4096"},
+            )
+            self.assertEqual(bridge.stops, 0)
+            domain.apply()
+            self.assertEqual(bridge.settings["defaultMaxTokens"], "4096")
+            self.assertEqual(bridge.settings["sourceDir"], "")
+            self.assertEqual(bridge.stops, 1)
 
 
 if __name__ == "__main__":

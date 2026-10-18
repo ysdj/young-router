@@ -4,6 +4,118 @@ from hook_test_utils import *
 
 
 class HookStreamingTimeoutTests(HookTestCase):
+    async def test_codex_chat_bridge_reports_restored_reasoning(self) -> None:
+        """Codex must know whether the adapted upstream replay has reasoning."""
+
+        hooks, proxy_server = load_hook_module()
+
+        class FakeRouter:
+            async def acompletion(self, **_kwargs):
+                async def chunks():
+                    yield {
+                        "choices": [{"delta": {"content": "answer"}}],
+                        "usage": {"total_tokens": 120},
+                    }
+
+                return chunks()
+
+        proxy_server.llm_router = FakeRouter()
+
+        async def codex_stream(has_reasoning: bool) -> list[dict]:
+            input_items = [{"role": "user", "content": "continue"}]
+            if has_reasoning:
+                input_items.append(
+                    {
+                        "type": "reasoning",
+                        "summary": [],
+                        "encrypted_content": "opaque-reasoning",
+                    }
+                )
+            stream = await hooks._responses_chat_bridge_direct_stream_response(
+                {
+                    "model": "default-chat",
+                    "input": input_items,
+                    "stream": True,
+                    "client_metadata": {
+                        "x-codex-turn-metadata": '{"request_kind":"turn"}',
+                    },
+                    "model_info": {
+                        "upstream_url_surface": "openai/chat",
+                    },
+                }
+            )
+            return [jsonable_stream_chunk(chunk) async for chunk in stream]
+
+        async def repaired_response(**_kwargs):
+            return {
+                "id": "resp_repaired",
+                "object": "response",
+                "status": "completed",
+                "output_text": "done",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "done"}],
+                    }
+                ],
+            }
+
+        repair = await hooks._execute_responses_chat_bridge_call(
+            repaired_response,
+            {
+                "model": "default-chat",
+                "input": [
+                    {"role": "user", "content": "continue"},
+                    {
+                        "type": "reasoning",
+                        "summary": [],
+                        "encrypted_content": "opaque-reasoning",
+                    },
+                ],
+                "stream": True,
+                "client_metadata": {
+                    "x-codex-turn-metadata": '{"request_kind":"turn"}',
+                },
+                "model_info": {
+                    "upstream_url_surface": "openai/chat",
+                },
+                "reasoning_effort": "high",
+            },
+            start_event="test_start",
+            error_event="test_error",
+        )
+        self.assertTrue(hooks._restored_reasoning_included(repair))
+        headers = await hooks.YoungRouterHook().async_post_call_response_headers_hook(
+            data={},
+            user_api_key_dict=None,
+            response=repair,
+            request_headers={},
+        )
+        self.assertEqual({"x-reasoning-included": "true"}, headers)
+        restored = await repair.__anext__()
+        self.assertNotIn("headers", restored["response"])
+
+    async def test_native_responses_answer_carries_no_restored_reasoning_header(
+        self,
+    ) -> None:
+        """Only an adapted replay may claim the upstream counted the reasoning."""
+
+        hooks, _ = load_hook_module()
+
+        async def native_stream():
+            yield {"type": "response.completed", "response": {"status": "completed"}}
+
+        hook = hooks.YoungRouterHook()
+        self.assertEqual(
+            {},
+            await hook.async_post_call_response_headers_hook(
+                data={},
+                user_api_key_dict=None,
+                response=native_stream(),
+                request_headers={},
+            ),
+        )
     async def test_first_event_compaction_and_stream_idle_timeouts_are_independent(self) -> None:
         hooks, _ = load_hook_module()
         self.set_env(hooks._REQUEST_TIMEOUT_SECONDS_ENV, "10")

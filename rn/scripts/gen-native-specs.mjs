@@ -174,8 +174,8 @@ function render(text, source, platform, componentName, specFile) {
   const body = rendered.join("\n").replace(/\s+$/, "");
   return (
     header +
-    body +
-    `\n\nexport default codegenNativeComponent<${propsInterface(source)}>(${JSON.stringify(componentName)});\n`
+    (body.match(/export default codegenNativeComponent</) ? body : body +
+    `\n\nexport default codegenNativeComponent<${propsInterface(source)}>(${JSON.stringify(componentName)});`) + "\n"
   );
 }
 

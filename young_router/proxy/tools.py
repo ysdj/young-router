@@ -65,7 +65,14 @@ def _tools_include_web_search(tools: Any) -> bool:
 
 
 def _tools_include_pi_web_access_tool(tools: Any) -> bool:
-    """Return whether direct bundled pi-web-access tools are declared."""
+    """Return whether direct bundled pi-web-access tools are declared.
+
+    These are ordinary function declarations, so ``has_web_search_tool`` is
+    intentionally false for them.  The two flags must not be merged: the
+    hosted-tool flag describes a provider-native ``web_search`` item, while
+    this flag tells streaming/post-call code that the local worker must execute
+    a ``web_search`` or ``fetch_content`` function call.
+    """
     if not isinstance(tools, list):
         return False
     for tool in tools:
@@ -87,6 +94,9 @@ def _tools_include_pi_web_access_tool(tools: Any) -> bool:
 
 
 def _request_has_web_search_tool(request_kwargs: Optional[dict]) -> bool:
+    # Do not use this hosted-tool predicate to detect the pi-web-access bridge;
+    # a real third-party Codex request can contain search-named functions while
+    # still having no provider-native web-search item.
     request_kwargs = request_kwargs or {}
     return _tools_include_web_search(request_kwargs.get("tools"))
 

@@ -6,6 +6,37 @@ from hook_test_utils import *
 
 
 class HookRouteRecoveryTests(HookTestCase):
+    def test_a_server_refusal_hidden_in_a_connection_error_cools_the_route(self) -> None:
+        """A refused route is cooled down; a real outage keeps recovering.
+
+        LiteLLM turns some server answers into ``APIConnectionError``, whose
+        class name reads as an outage.  The server still answered, and it will
+        answer the same way to every replay, so the route is unusable until
+        someone changes the account or region.  Cooling it down is what stops
+        the next request from reaching it; a connection that never got an
+        answer keeps the recovery policy.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        refusal = "openaiException - 403: {\"type\":\"freetiererror\",\"message\":\"free tier\"}"
+        wrapped = type("APIConnectionError", (Exception,), {})(refusal)
+        outage = type("APIConnectionError", (Exception,), {})("connection refused")
+        direct = RuntimeError("forbidden")
+        direct.status_code = 403
+
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(wrapped),
+            hooks._RECOVERY_POLICY_COOLDOWN,
+        )
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(direct),
+            hooks._RECOVERY_POLICY_COOLDOWN,
+        )
+        self.assertNotEqual(
+            hooks._recovery_policy_for_exception(outage),
+            hooks._RECOVERY_POLICY_COOLDOWN,
+        )
+
     def test_stream_route_recovery_eligibility_is_protocol_neutral(self) -> None:
         hooks, _proxy_server = load_hook_module()
         self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "1")

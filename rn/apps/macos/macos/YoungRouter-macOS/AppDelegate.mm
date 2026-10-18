@@ -16,32 +16,33 @@
 
 @implementation AppDelegate
 
-- (void)applicationDidFinishLaunching:(NSNotification *)notification
+- (void)installNativeStatusItem
 {
-  // Young Router intentionally presents every UI state immediately. Keep the
-  // AppKit defaults aligned with that contract before any window or view is
-  // created, including future route surfaces.
+  [AppKitNativeLeaf.shared installStatusItem];
+}
+
+- (void)applicationWillFinishLaunching:(NSNotification *)notification
+{
   NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
   [defaults setBool:NO forKey:@"NSAutomaticWindowAnimationsEnabled"];
   [defaults setBool:NO forKey:@"NSScrollAnimationEnabled"];
   self.moduleName = @"YoungRouter";
   self.initialProps = @{ @"isPrimaryHost": @YES, @"isWindowManagerHost": @YES };
-  // Publish the native status item immediately. React and Core continue
-  // loading asynchronously behind an already interactive menu-bar shell.
-  AppKitNativeLeaf *nativeLeaf = AppKitNativeLeaf.shared;
-  [CoreIPCBridge.shared warm];
+  self.automaticallyLoadReactNativeWindow = NO;
 #if __has_include(<ReactAppDependencyProvider/RCTAppDependencyProvider.h>)
   self.dependencyProvider = [RCTAppDependencyProvider new];
 #endif
-  // Publish the native fallback immediately, then start the hidden primary
-  // React host so localization and the first Core snapshot can populate the
-  // menu without waiting for a user action.
-  self.automaticallyLoadReactNativeWindow = NO;
-  [super applicationDidFinishLaunching:notification];
-  [nativeLeaf hideHostWindowAtLaunch:nil];
-  [nativeLeaf setReactHostStarter:^{
+  [self installNativeStatusItem];
+}
+
+- (void)applicationDidFinishLaunching:(NSNotification *)notification
+{
+  [CoreIPCBridge.shared warm];
+  [AppKitNativeLeaf.shared setReactHostStarter:^{
     [self startReactHostWhenNeeded];
   }];
+  [super applicationDidFinishLaunching:notification];
+  [AppKitNativeLeaf.shared hideHostWindowAtLaunch:self.window];
   [self startReactHostWhenNeeded];
 }
 
@@ -149,6 +150,7 @@
   if (hasVisibleWindows) {
     return YES;
   }
+  [self startReactHostWhenNeeded];
   [AppKitNativeLeaf.shared openRouteFromDeepLink:@"providers-models" logTab:nil];
   return NO;
 }
@@ -178,7 +180,13 @@
         logTab = item.value;
       }
     }
-    [AppKitNativeLeaf.shared openRouteFromDeepLink:route logTab:logTab];
+    // A URL can launch the app before applicationDidFinishLaunching. The
+    // route factory lives in the React host, so publish the initial route
+    // after starting it rather than dropping an early provider or log link.
+    dispatch_async(dispatch_get_main_queue(), ^{
+      [self startReactHostWhenNeeded];
+      [AppKitNativeLeaf.shared openRouteFromDeepLink:route logTab:logTab];
+    });
   }
 }
 

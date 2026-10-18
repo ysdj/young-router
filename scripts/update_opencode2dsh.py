@@ -1,36 +1,22 @@
 #!/usr/bin/env python3
-"""Stage the latest ``opencode2dsh`` plugin for an artifact build.
+"""Stage dsh-our-free-model without altering its OpenCode integration.
 
-The upstream project (https://github.com/FishBottle7/opencode2dsh) owns the
-OpenCode Zen anonymous lane: the free-model catalog and its fallback chain, the
-CLI-identical request disguise, the session/request id derivation, and the
-``pi-ai`` wire layer that streams from Zen.  Its npm distribution is the
-integration surface, so every artifact build resolves the ``latest`` dist-tag,
-installs the package together with the dependencies it declares, and flattens
-the result into the Core bundle.  No repository lock is written: a stale
-adaptation is never packaged.
-
-The published artifact is the plugin package itself
-(``@opencode2dsh/dsh-plugin``); the repository root is a private workspace whose
-own ``dependencies`` pin it, and it publishes no ``lib/`` of its own.  This
-script therefore resolves the plugin package directly rather than the
-workspace root.
-
-``*_URL`` environment variables and the matching command-line options exist for
-offline/unit-test fixtures.
+The existing Young Router provider reuses the upstream project's runtime and
+OpenCode protocol. Its source is copied intact into the Core adapter tree; only
+Young Router's process bridge lives outside that tree.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import subprocess
+import tempfile
 from pathlib import Path
 import sys
-import tarfile
-import tempfile
-from typing import Any
-
+import shutil
 _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
@@ -38,136 +24,181 @@ if str(_SCRIPT_DIR) not in sys.path:
 from update_common import (
     PACKAGE_VERSION_PATTERN,
     UpdateError,
+    STAGED_RELEASE_MARKER,
+    copy_tree,
     find_npm,
-    flatten_npm_package,
-    package_metadata,
     record_staged_release,
-    release_integrity,
-    request_bytes,
     reused_staged_release,
-    run_npm_install,
+    npm_dependency_manifest,
 )
 
 
-PACKAGE_NAME = "@opencode2dsh/dsh-plugin"
-PACKAGE_REGISTRY_URL = os.environ.get(
-    "OPENCODE2DSH_NPM_REGISTRY_URL",
-    f"https://registry.npmjs.org/{PACKAGE_NAME}",
+PACKAGE_NAME = "dsh-our-free-model"
+SOURCE_URL = os.environ.get(
+    "OUR_FREE_MODEL_SOURCE_URL",
+    "https://github.com/Ebony-Vinyl/dsh-our-free-model.git",
 )
 DEFAULT_TIMEOUT_SECONDS = 180
-# Build-tool metadata lookup identity: this script runs on a maintainer's
-# machine, not in the shipped app.
-USER_AGENT = "Young-Router/opencode2dsh-build"
-# Entry point the worker imports, plus the module-level names it reads off that
-# entry.  A staged package missing one of these cannot drive the library at
-# runtime, so the build fails here instead of shipping a Core that reports the
-# OpenCode Zen lane as unavailable.
-REQUIRED_PACKAGE_FILES = ("package.json", "lib/index.js")
-# The plugin's own runtime dependencies (``dependencies`` in its manifest), all
-# published.  They are installed explicitly so the flatten step always lands
-# them beside the package, whatever the package manager decides to hoist.
-REQUIRED_DEPENDENCY_DIRECTORIES = (
+REQUIRED_FILES = (
+    "package.json",
+    "index.js",
+    "src/adapter.js",
+    "src/core/runtime.js",
+    "src/forward.js",
+    "src/providers/registry.json",
+    "vendor/channel-pack/pack.js",
+    "LICENSE",
+)
+REQUIRED_PEERS = (
+    "@deepseek-ai/cordis",
+    "@deepseek-ai/dsh-credentials",
+    "@deepseek-ai/dsh-llm",
     "@deepseek-ai/schemastery",
-    "@earendil-works/pi-ai",
-    "undici",
-    "yaml",
 )
 
 
-def _request_bytes(url: str, *, timeout: int = DEFAULT_TIMEOUT_SECONDS) -> bytes:
-    return request_bytes(url, timeout=timeout, user_agent=USER_AGENT)
-
-
-def _package_metadata(registry_url: str) -> tuple[str, str, dict[str, Any]]:
-    """Resolve the ``latest`` dist-tag and its tarball from the npm registry."""
-
-    return package_metadata(
-        registry_url,
-        package_name=PACKAGE_NAME,
-        timeout=DEFAULT_TIMEOUT_SECONDS,
-        user_agent=USER_AGENT,
-    )
-
-
-def _find_executable(name: str) -> str:
-    return find_npm(name, purpose="stage the opencode2dsh integration")
-
-
-def _dependency_specs(version_payload: dict[str, Any]) -> list[str]:
-    """Install the plugin's declared dependencies and the adapter's peers."""
-
-    dependencies = version_payload.get("dependencies")
-    if not isinstance(dependencies, dict):
-        raise UpdateError(f"{PACKAGE_NAME} publishes no dependency list to stage")
-    names = [
-        f"{name}@{spec}" if isinstance(spec, str) and spec.strip() else str(name)
-        for name, spec in dependencies.items()
-    ]
-    for name in REQUIRED_DEPENDENCY_DIRECTORIES:
-        if name not in dependencies:
-            names.append(name)
-    return names
-
-
-def _run_npm_install(
-    npm: str, npm_root: Path, package_tarball: Path, dependency_specs: list[str]
-) -> None:
-    run_npm_install(
-        npm,
+def _install_peers(command: list[str], *, npm_root: Path) -> None:
+    npm_dependency_manifest(
         npm_root,
-        package_tarball,
-        dependency_specs,
-        package_name=PACKAGE_NAME,
-        timeout=DEFAULT_TIMEOUT_SECONDS,
+        [
+            f"{name}@{spec}"
+            for name, spec in json.loads(
+                (npm_root.parent / "payload" / "package.json").read_text(encoding="utf-8")
+            )["peerDependencies"].items()
+        ],
     )
-
-
-def _flatten_package(npm_root: Path, destination: Path) -> str:
-    return flatten_npm_package(
-        npm_root,
-        destination,
-        package_name=PACKAGE_NAME,
-        required_files=REQUIRED_PACKAGE_FILES,
-        required_peer_dirs=REQUIRED_DEPENDENCY_DIRECTORIES,
+    install = subprocess.run(
+        [
+            *command,
+            "install",
+            "--prefix",
+            str(npm_root),
+            "--no-package-lock",
+            "--ignore-scripts",
+            "--omit=dev",
+            "--fund=false",
+            "--audit=false",
+        ],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=DEFAULT_TIMEOUT_SECONDS * 2,
+        check=False,
     )
+    if install.returncode != 0:
+        details = (install.stderr or install.stdout).strip()[-2000:]
+        raise UpdateError(
+            f"npm could not install {PACKAGE_NAME} peers"
+            + (f": {details}" if details else "")
+        )
 
 
-def update(output: Path, *, registry_url: str, version: str | None = None) -> str:
+def _content_digest(root: Path, *, omit_nodes: bool = False) -> str:
+    """Identify the upstream source payload before peers are installed."""
+
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root)
+        if relative.as_posix() == STAGED_RELEASE_MARKER:
+            continue
+        if omit_nodes and "node_modules" in relative.parts:
+            continue
+        if path.is_file() and not path.is_symlink():
+            digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(path.read_bytes())
+    return f"sha256-{digest.hexdigest()}"
+
+
+def update(output: Path, *, source_url: str, ref: str = "main") -> str:
     output = output.expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
-    latest, tarball_url, version_payload = _package_metadata(registry_url)
-    if version is not None:
-        if not PACKAGE_VERSION_PATTERN.fullmatch(version):
-            raise UpdateError(f"Invalid requested {PACKAGE_NAME} version: {version}")
-        latest = version
-    integrity = release_integrity(version_payload)
-    # The release was resolved above on this build; this only skips installing
-    # the identical one again.  See ``reused_staged_release``.
-    if reused_staged_release(
-        output,
-        package_name=PACKAGE_NAME,
-        version=latest,
-        integrity=integrity,
-        required_files=REQUIRED_PACKAGE_FILES,
-        required_peer_dirs=REQUIRED_DEPENDENCY_DIRECTORIES,
-    ):
-        return latest
-    npm = _find_executable("OPENCODE2DSH_NPM_BIN")
-    with tempfile.TemporaryDirectory(prefix="young-router-opencode2dsh-") as directory:
+    with tempfile.TemporaryDirectory(prefix="young-router-our-free-model-") as directory:
         work = Path(directory)
-        package_tarball = work / "opencode2dsh-plugin.tgz"
-        package_tarball.write_bytes(_request_bytes(tarball_url))
-        npm_root = work / "npm"
-        _run_npm_install(npm, npm_root, package_tarball, _dependency_specs(version_payload))
-        package_version = _flatten_package(npm_root, output)
-        if package_version != latest:
-            raise UpdateError(
-                f"npm installed {PACKAGE_NAME} {package_version}, expected {latest}"
+        checkout = work / "source"
+        if source_url.startswith("file://"):
+            shutil.copytree(Path(source_url[7:]), checkout, symlinks=True)
+        else:
+            result = subprocess.run(
+                [
+                    "git",
+                    "clone",
+                    "--depth",
+                    "1",
+                    "--branch",
+                    ref,
+                    source_url,
+                    str(checkout),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=DEFAULT_TIMEOUT_SECONDS,
+                check=False,
             )
-        record_staged_release(
-            output, package_name=PACKAGE_NAME, version=latest, integrity=integrity
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout).strip().splitlines()
+                raise UpdateError(detail[-1] if detail else f"Could not clone {PACKAGE_NAME}")
+        package_file = checkout / "package.json"
+        for relative in REQUIRED_FILES:
+            if not (checkout / relative).is_file():
+                raise UpdateError(f"{PACKAGE_NAME} source is missing {relative}")
+        package = json.loads(package_file.read_text(encoding="utf-8"))
+        peers = package.get("peerDependencies")
+        if not isinstance(peers, dict):
+            raise UpdateError(f"{PACKAGE_NAME} source declares no peers")
+        for name in REQUIRED_PEERS:
+            if name not in peers:
+                raise UpdateError(f"{PACKAGE_NAME} source no longer declares the peer {name}")
+        version = package.get("version")
+        if not isinstance(version, str) or not PACKAGE_VERSION_PATTERN.fullmatch(version):
+            raise UpdateError(f"{PACKAGE_NAME} source has an invalid version")
+
+        payload = work / "payload"
+        copy_tree(checkout, payload, package_name=PACKAGE_NAME)
+        shutil.rmtree(payload / ".git", ignore_errors=True)
+        # Install the declared peer closure beside the unchanged upstream files.
+        npm_root = work / "npm"
+        _install_peers(
+            [find_npm("OUR_FREE_MODEL_NPM_BIN", purpose="stage the free-model integration")],
+            npm_root=npm_root,
         )
-    return package_version
+        dependency_root = npm_root / "node_modules"
+        for child in dependency_root.iterdir():
+            if child.name.startswith("."):
+                continue
+            target = payload / "node_modules" / child.name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(child, target, symlinks=True)
+        for name in REQUIRED_PEERS:
+            if not (payload / "node_modules" / name).is_dir():
+                raise UpdateError(f"Staged {PACKAGE_NAME} is missing the peer package {name}")
+        upstream_digest = _content_digest(payload, omit_nodes=True)
+        reused = reused_staged_release(
+            output,
+            package_name=PACKAGE_NAME,
+            version=version,
+            integrity=upstream_digest,
+            required_files=REQUIRED_FILES,
+            required_peer_dirs=REQUIRED_PEERS,
+        )
+        if reused:
+            return version
+        staging = output.parent / f".{output.name}.staged"
+        if staging.exists():
+            shutil.rmtree(staging)
+        payload.rename(staging)
+        if output.exists():
+            shutil.rmtree(output)
+        staging.rename(output)
+        record_staged_release(
+            output,
+            package_name=PACKAGE_NAME,
+            version=version,
+            integrity=upstream_digest,
+        )
+        return version
 
 
 def parse_arguments(arguments: list[str]) -> argparse.Namespace:
@@ -175,23 +206,23 @@ def parse_arguments(arguments: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--output", required=True, help="Core/young_router/adapters/opencode2dsh destination"
     )
-    parser.add_argument("--registry-url", default=PACKAGE_REGISTRY_URL)
-    parser.add_argument("--version", help="Stage this exact version instead of the latest dist-tag")
+    parser.add_argument("--source-url", default=SOURCE_URL)
+    parser.add_argument("--ref", default="main")
     return parser.parse_args(arguments)
 
 
 def main(arguments: list[str]) -> int:
     options = parse_arguments(arguments)
     try:
-        package_version = update(
+        tag = update(
             Path(options.output),
-            registry_url=options.registry_url,
-            version=options.version,
+            source_url=options.source_url,
+            ref=options.ref,
         )
-    except (OSError, UpdateError, ValueError, json.JSONDecodeError, tarfile.TarError) as exc:
+    except (OSError, UpdateError, ValueError, json.JSONDecodeError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    print(f"Installed {PACKAGE_NAME} {package_version} into {Path(options.output).expanduser()}")
+    print(f"Installed {PACKAGE_NAME} {tag} into {Path(options.output).expanduser()}")
     return 0
 
 

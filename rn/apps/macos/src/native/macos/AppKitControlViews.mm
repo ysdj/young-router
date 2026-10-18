@@ -742,9 +742,15 @@ static void LayoutAppKitControlInBounds(NSView *control, NSRect bounds, BOOL fil
     preferredHeight = NSHeight(bounds);
   }
   const CGFloat height = MIN(NSHeight(bounds), preferredHeight);
+  // A component clipped by an app-owned native frame may receive its top-left
+  // origin rather than a centered frame; keeping the bezel high means tall
+  // frames with a scrollable child must not move the control out of sight.
+  const CGFloat y = bounds.origin.y > 0
+      ? NSMaxY(bounds) - height
+      : NSMidY(bounds) - height / 2.0;
   control.frame = NSMakeRect(
       NSMinX(bounds),
-      NSMidY(bounds) - height / 2.0,
+      y,
       NSWidth(bounds),
       MAX(0, height));
 }
@@ -1988,6 +1994,9 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitCheckboxCls(void)
   if (oldViewProps.disabled != newViewProps.disabled) {
     _picker.enabled = !newViewProps.disabled;
   }
+  if (oldViewProps.overlayLayer != newViewProps.overlayLayer) {
+    self.layer.zPosition = newViewProps.overlayLayer ? 1000 : 0;
+  }
   if (compactChanged) {
     _picker.controlSize = newViewProps.compact ? NSControlSizeSmall : NSControlSizeRegular;
     _picker.font = [NSFont systemFontOfSize:LiteLLMUIFontSize];
@@ -2062,6 +2071,22 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPickerCls(void)
   const BOOL labelsChanged = oldViewProps.labels != newViewProps.labels;
   const BOOL selectedChanged = oldViewProps.selectedValue != newViewProps.selectedValue;
   const BOOL compactChanged = oldViewProps.compact != newViewProps.compact;
+  if (oldViewProps.overlayLayer != newViewProps.overlayLayer) {
+    self.layer.zPosition = newViewProps.overlayLayer ? 1000 : 0;
+  }
+  if (labelsChanged && newViewProps.labels.size() == oldViewProps.labels.size()) {
+    // Only a label edit keeps its segments. A new control gets its natural
+    // widths from AppKit, which preserves every title and leaves the extra
+    // width in the native row instead of spreading it across the window.
+    BOOL edited = NO;
+    for (size_t index = 0; index < newViewProps.labels.size(); index++) {
+      if (oldViewProps.labels[index] != newViewProps.labels[index]) {
+        [_control setWidth:0 forSegment:index];
+        edited = YES;
+      }
+    }
+    if (edited) [_host setNeedsLayout:YES];
+  }
 
   if (labelsChanged) {
     _control.segmentCount = newViewProps.labels.size();
@@ -2449,6 +2474,12 @@ BOOL TextFieldScrollViewCanConsume(NSScrollView *scrollView, NSEvent *event)
       _multilineField.selectable = !newViewProps.disabled;
     }
   } else {
+    if (activeControlChanged || oldViewProps.borderless != newViewProps.borderless) {
+      const BOOL borderless = newViewProps.borderless;
+      _field.bezeled = !borderless;
+      _field.drawsBackground = !borderless;
+      _field.liteLLMFocusBorderView.borderVisible = !borderless && _field.liteLLMShowsFocusBorder;
+    }
     if ((shouldSynchronizeText || recoverEmptyControl) && ![activeField.stringValue isEqualToString:value]) {
       activeField.stringValue = value;
     }
@@ -2961,7 +2992,12 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   if (dataChanged) {
     [_tableView reloadData];
     _hasLoadedData = YES;
-    if (newViewProps.scrollTrailingColumnOverflow) {
+    if (newViewProps.preserveColumnWidths) {
+      _measuredColumnWidths.clear();
+      _settingColumnWidths = YES;
+      for (NSTableColumn *column in _tableView.tableColumns) column.minWidth = 1;
+      _settingColumnWidths = NO;
+    } else if (newViewProps.scrollTrailingColumnOverflow) {
       [self updateColumnMinimumWidths];
     } else {
       _measuredColumnWidths.clear();
@@ -2972,6 +3008,20 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   }
 
   [self updateScrollerVisibility];
+  if (newViewProps.scrollToRow >= 0) {
+    const NSInteger target = MIN(
+        static_cast<NSInteger>(newViewProps.scrollToRow),
+        _tableView.numberOfRows - 1);
+    if (target >= 0) {
+      dispatch_async(dispatch_get_main_queue(), ^{
+        if (self->_tableView.numberOfRows > 0) {
+          const NSInteger first = MIN(target, self->_tableView.numberOfRows - 1);
+          [self->_tableView scrollRowToVisible:first];
+          [self->_tableView scrollPoint:NSMakePoint(0, [self->_tableView rectOfRow:first].origin.y)];
+        }
+      });
+    }
+  }
   if (newViewProps.followBottom && dataChanged && wasFollowingBottom) {
     dispatch_async(dispatch_get_main_queue(), ^{
       if (self->_tableView.numberOfRows > 0) {
@@ -4410,8 +4460,10 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
 - (void)setActiveText:(NSString *)value;
 - (void)setActiveEnabled:(BOOL)enabled editable:(BOOL)editable selectable:(BOOL)selectable;
 - (BOOL)isPlainTextAutoCommitField;
+- (void)endActiveEditingOnLineField:(NSTextField *)field;
 - (void)stageCurrentSecretForRequest:(NSInteger)commitRequest;
 - (void)loadPlainTextSecretForGeneration:(NSUInteger)generation;
+- (void)readPlainTextSecretForGeneration:(NSUInteger)generation attempt:(NSInteger)attempt;
 @end
 
 @implementation LiteLLMAppKitSecureTextInputComponentView {
@@ -4434,9 +4486,24 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
   BOOL _stageInFlight;
   BOOL _autoCommit;
   BOOL _plainText;
+  BOOL _readablePlainText;
   BOOL _secretDirty;
   BOOL _synchronizingField;
   NSString *_lastSyncedPlainText;
+}
+
+- (void)endActiveEditingOnLineField:(NSTextField *)field
+{
+  // NSTextField keeps the edited value in its field editor until the responder
+  // changes; commit that value before Core reads the plain-text secret.
+  if (field == nil) return;
+  NSWindow *window = field.window;
+  NSText *editor = field.currentEditor;
+  if (window == nil || editor == nil) return;
+  NSString *text = editor.string;
+  if ([window makeFirstResponder:nil]) {
+    field.stringValue = text;
+  }
 }
 
 + (ComponentDescriptorProvider)componentDescriptorProvider
@@ -4495,6 +4562,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
     _lastStatus = @"";
     _lastError = @"";
     _lastSyncedPlainText = @"";
+    _readablePlainText = NO;
   }
   return self;
 }
@@ -4509,6 +4577,11 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
   NSString *label = StringFromStdString(newViewProps.label);
   const BOOL isMultiline = newViewProps.multiline;
   NSView *activeControl = isMultiline ? _scrollView : (newViewProps.plainText ? _plainField : _field);
+  const BOOL activeControlChanged = _host.control != activeControl;
+  const BOOL visibleChanged = _readablePlainText != (newViewProps.plainText && (newViewProps.autoCommit || newViewProps.disabled));
+  _readablePlainText = newViewProps.plainText && (newViewProps.autoCommit || newViewProps.disabled);
+  const BOOL resetReadable = newViewProps.resetRequest != oldViewProps.resetRequest &&
+      newViewProps.resetRequest != _lastResetRequest;
   if (_host.control != activeControl) {
     _field.liteLLMShowsFocusBorder = NO;
     _plainField.liteLLMShowsFocusBorder = NO;
@@ -4567,9 +4640,9 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
       newViewProps.commitRequest != _lastCommitRequest) {
     [self stageCurrentSecretForRequest:newViewProps.commitRequest];
   }
-  const BOOL readablePlainText = newViewProps.plainText && newViewProps.autoCommit && (
-      ([domain isEqualToString:@"providers_models"] && [field isEqualToString:@"api_key"] && target.length > 0) ||
-      ([domain isEqualToString:@"relay_accounts"] && [field isEqualToString:@"api_key"] && target.length > 0) ||
+  const BOOL readablePlainText = !isMultiline && newViewProps.plainText && newViewProps.autoCommit && (
+      ([domain isEqualToString:@"providers_models"] || [domain isEqualToString:@"relay_accounts"]) ?
+          [field isEqualToString:@"api_key"] && target.length > 0 :
       ([domain isEqualToString:@"codex"] && [field isEqualToString:@"api_key"] && target.length == 0) ||
       ([domain isEqualToString:@"claude"] &&
        ([field isEqualToString:@"deployment_token"] || [field isEqualToString:@"desktop_gateway_api_key"]) &&
@@ -4577,7 +4650,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
       ([domain isEqualToString:@"runtime"] && [field isEqualToString:@"setting"] &&
        ([target isEqualToString:@"YOUNG_ROUTER_PI_WEB_ACCESS_CONFIG_JSON"] ||
         [target isEqualToString:@"YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON"])));
-  if (identityChanged && readablePlainText) {
+  if ((identityChanged || activeControlChanged || visibleChanged || resetReadable) && readablePlainText) {
     [self loadPlainTextSecretForGeneration:_generation];
   }
   [_host setNeedsLayout:YES];
@@ -4620,6 +4693,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
   NSString *domain = [_domain copy];
   NSString *field = [_secretField copy];
   NSString *target = [_target copy];
+  [self.window makeFirstResponder:nil];
   NSString *secret = value;
   const BOOL preservePlainText = [self isPlainTextAutoCommitField];
   if (!preservePlainText) {
@@ -4665,6 +4739,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
   NSString *domain = [_domain copy];
   NSString *field = [_secretField copy];
   NSString *target = [_target copy];
+  [self endEditingForPlainTextRead];
   // A value this process already read is shown at once: the field never
   // returns to its loading hint for a key the app already knows.
   NSString *memoized = LiteLLMPlainTextSecretMemo()[LiteLLMPlainTextMemoKey(domain, field, target)];
@@ -4677,6 +4752,23 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
     [self emitRevision:_lastRevision present:_lastPresent status:@"ready" error:@"" commitRequest:_lastCommitRequest];
     return;
   }
+  [self readPlainTextSecretForGeneration:generation attempt:0];
+}
+
+// A read that could not answer leaves the field on its loading hint with
+// nothing to ask again: the pane opens within a second of a launch, when Core
+// may still be starting, and a host read that fails then would keep the saved
+// key hidden for as long as the field is on screen.  Ask again a bounded number
+// of times instead, keeping the new value and the final failure as the only
+// things it reports.
+static const NSInteger kPlainTextSecretReadAttempts = 12;
+static const NSTimeInterval kPlainTextSecretReadRetrySeconds = 0.5;
+
+- (void)readPlainTextSecretForGeneration:(NSUInteger)generation attempt:(NSInteger)attempt
+{
+  NSString *domain = [_domain copy];
+  NSString *field = [_secretField copy];
+  NSString *target = [_target copy];
   __weak LiteLLMAppKitSecureTextInputComponentView *weakSelf = self;
   [CoreIPCBridge.shared readPlainTextSecretForDomain:domain
                                                field:field
@@ -4684,8 +4776,20 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
                                           completion:^(NSString *_Nullable value, NSString *_Nullable error) {
     LiteLLMAppKitSecureTextInputComponentView *strongSelf = weakSelf;
     if (strongSelf == nil || generation != strongSelf->_generation ||
-        ![strongSelf isPlainTextAutoCommitField] || strongSelf->_secretDirty) return;
+        !strongSelf->_readablePlainText ||
+        strongSelf->_secretDirty ||
+        ![strongSelf->_domain isEqualToString:domain] ||
+        ![strongSelf->_secretField isEqualToString:field] ||
+        ![strongSelf->_target isEqualToString:target]) return;
     if (error.length > 0 || value == nil) {
+      if (attempt + 1 < kPlainTextSecretReadAttempts) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kPlainTextSecretReadRetrySeconds * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+          LiteLLMAppKitSecureTextInputComponentView *retrySelf = weakSelf;
+          if (retrySelf == nil || generation != retrySelf->_generation) return;
+          [retrySelf readPlainTextSecretForGeneration:generation attempt:attempt + 1];
+        });
+        return;
+      }
       [strongSelf emitRevision:strongSelf->_lastRevision present:strongSelf->_lastPresent status:@"error" error:@"read_failed" commitRequest:strongSelf->_lastCommitRequest];
       return;
     }
@@ -4695,8 +4799,13 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
     strongSelf->_lastSyncedPlainText = [value copy];
     strongSelf->_synchronizingField = NO;
     strongSelf->_secretDirty = NO;
-    [strongSelf emitRevision:strongSelf->_lastRevision present:strongSelf->_lastPresent status:@"ready" error:@"" commitRequest:strongSelf->_lastCommitRequest];
+    [strongSelf emitRevision:strongSelf->_lastRevision present:value.length > 0 status:@"ready" error:@"" commitRequest:strongSelf->_lastCommitRequest];
   }];
+}
+
+- (void)endEditingForPlainTextRead
+{
+  [self endActiveEditingOnLineField:_plainField];
 }
 
 - (void)submitSecret:(__unused id)sender

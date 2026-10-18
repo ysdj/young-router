@@ -55,7 +55,7 @@ then
 fi
 
 if (($# == 0)); then
-  exec env PYTHONPATH=.:tests "${TEST_COMMAND[@]}" -m unittest discover -s tests -p 'test*.py' -v
+  exec env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=.:tests "${TEST_COMMAND[@]}" -m unittest discover -s tests -p 'test*.py' -v
 fi
 
 targets=()
@@ -77,4 +77,4 @@ for target in "$@"; do
   targets+=("$target")
 done
 
-exec env PYTHONPATH=.:tests "${TEST_COMMAND[@]}" -m unittest "${targets[@]}" -v
+exec env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=.:tests "${TEST_COMMAND[@]}" -m unittest "${targets[@]}" -v

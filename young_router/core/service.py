@@ -55,6 +55,10 @@ _SECRET_FIELDS: dict[tuple[str, str], bool] = {
     ("relay_accounts", "password"): True,
 }
 
+# How long a plaintext read waits for the store lock before reading the live
+# document instead.  The field is on screen already; a relay round trip that
+# holds the lock must not hold the key back with it.
+_SECRET_READ_LOCK_TIMEOUT_SECONDS = 0.05
 _PLAINTEXT_SECRET_FIELDS = {
     ("providers_models", "api_key"),
     ("providers_models", "provider_auth_token"),
@@ -820,7 +824,7 @@ class CoreStore:
         # The WorkBuddy worker is Core-owned: it must not outlive the process
         # that keeps its credential copy and its loopback bearer.
         self._workbuddy_runtime = workbuddy_runtime
-        # The OpenCode Zen worker is Core-owned for the same reason: it must
+        # The dsh-our-free-model worker is Core-owned for the same reason: it must
         # not outlive the process that holds its loopback bearer.
         self._opencode2dsh_runtime = opencode2dsh_runtime
         self._domains: dict[str, DomainAdapter] = {}
@@ -900,7 +904,7 @@ class CoreStore:
         host can still open the remaining settings windows.
         """
 
-        from .domains._shared import _default_runtime_root, _default_runtime_settings_path
+        from .domains._shared import _default_provider_config_path, _default_runtime_root, _default_runtime_settings_path
         from .domains.claude import ClaudeSettingsDomain
         from .domains.clients import ClientSettingsDomain
         from .domains.codex import CodexSettingsDomain
@@ -933,17 +937,78 @@ class CoreStore:
         # so the proxy child receives the very base URLs it is serving.
         workbuddy_runtime = WorkBuddyRuntime(resolved_runtime_root)
         controller.attach_workbuddy(workbuddy_runtime)
-        # One worker per Core process serves every OpenCode Zen route; the
+        # One worker per Core process serves every dsh-our-free-model route; the
         # service controller and the provider domain share that instance so the
         # proxy child receives the very base URL it is serving.
-        opencode2dsh_runtime = OpenCode2DSHRuntime(resolved_runtime_root)
+        runtime_settings = RuntimeSettingsDomain(resolved_runtime_settings_path)
+        opencode2dsh_runtime = OpenCode2DSHRuntime(
+            resolved_runtime_root,
+            settings={
+                "defaultMaxTokens": runtime_settings.snapshot()["values"][
+                    "YOUNG_ROUTER_OUR_FREE_MODEL_MAX_TOKENS"
+                ],
+                "exposeRegionModels": runtime_settings.snapshot()["values"][
+                    "YOUNG_ROUTER_OUR_FREE_MODEL_EXPOSE_REGION_MODELS"
+                ],
+                "probeIntervalMinutes": runtime_settings.snapshot()["values"][
+                    "YOUNG_ROUTER_OUR_FREE_MODEL_REFRESH_INTERVAL_MINUTES"
+                ],
+                "standaloneProbe": runtime_settings.snapshot()["values"][
+                    "YOUNG_ROUTER_OUR_FREE_MODEL_PROBE_ON_REFRESH"
+                ],
+                "sourceDir": runtime_settings.snapshot()["values"][
+                    "YOUNG_ROUTER_OUR_FREE_MODEL_SOURCE_DIR"
+                ],
+            },
+        )
+        runtime_settings.attach_our_free_model(opencode2dsh_runtime)
         controller.attach_opencode2dsh(opencode2dsh_runtime)
+        # A saved route's loopback base is resolved by the managed proxy and by
+        # Core's own catalog/probe reads. Start its worker once, at Core launch;
+        # a fresh provider adopts the same worker when it is created later.
+        from ..adapters import opencode2dsh as opencode2dsh_module
+        from ..config import load as config_load
+        import yaml
+
+        resolved_config_path = (
+            Path(config_path).expanduser()
+            if config_path is not None
+            else _default_provider_config_path()
+        )
+        try:
+            document = config_load.config_document_from_path(
+                resolved_config_path,
+                allow_missing=True,
+            )
+            draft = config_load.load_config_document(document)
+            # ``_model_to_editor`` records a route's provider. A route that
+            # states only its provider's base inherits it, so the route's
+            # provider owns the launch decision.
+            adopted_provider_names = {
+                str(provider.get("name") or "")
+                for provider in draft["providers"]
+                if isinstance(provider, Mapping)
+                and provider.get("auth_kind") in opencode2dsh_module.OPENCODE2DSH_AUTH_KINDS
+            }
+            adopted_route = any(
+                model.get("provider") in adopted_provider_names
+                for provider in draft["providers"]
+                if isinstance(provider, Mapping)
+                for model in provider.get("models", [])
+                if isinstance(model, Mapping)
+            )
+            if adopted_route:
+                opencode2dsh_runtime.autostart_if_configured()
+        except (OSError, ValueError, yaml.YAMLError):
+            # The Providers pane owns the error for a malformed optional
+            # document; it must not prevent the other settings from opening.
+            pass
         adapters: list[DomainAdapter] = []
         settings_factories: tuple[tuple[str, Callable[[], DomainAdapter]], ...] = (
             (
                 "providers_models",
                 lambda: ProvidersModelsDomain(
-                    config_path,
+                    resolved_config_path,
                     auth_manager=provider_auth,
                     workbuddy=workbuddy_runtime,
                     opencode2dsh=opencode2dsh_runtime,
@@ -958,7 +1023,7 @@ class CoreStore:
                     runtime_root=resolved_runtime_root,
                 ),
             ),
-            ("runtime", lambda: RuntimeSettingsDomain(resolved_runtime_settings_path)),
+            ("runtime", lambda: runtime_settings),
             (
                 "webdav",
                 lambda: WebDAVSettingsDomain(
@@ -987,8 +1052,8 @@ class CoreStore:
             adapters.append(RecoverableDomain("clients", clients_factory))
         adapters.append(
             LogsDomain(
-                runtime_root,
-                config_path=config_path,
+                resolved_runtime_root,
+                config_path=resolved_config_path,
                 runtime_settings_path=runtime_settings_path,
             )
         )
@@ -1676,6 +1741,54 @@ class CoreStore:
                 "present": present,
             }
 
+    def _trusted_secret_document_read(self, domain: str, field: object, target: object | None) -> tuple[dict[str, Any], str]:
+        """Validate one plaintext-native field and read its live value.
+
+        Deliberately lock-free: the caller decides how long it may wait for the
+        store, because the value is drawn on screen already.  Every lookup here
+        is a read of the document this process already holds.
+        """
+
+        name = _canonical_domain(domain)
+        field_name = field.strip() if isinstance(field, str) else ""
+        descriptor_key = (name, field_name)
+        if descriptor_key not in _PLAINTEXT_SECRET_FIELDS:
+            raise CoreError("invalid_secret", "The requested secret field is unavailable")
+        if descriptor_key == ("runtime", "setting") and target not in _MULTILINE_SECRET_TARGETS:
+            raise CoreError("invalid_secret", "The requested secret field is unavailable")
+        target_required = _SECRET_FIELDS[descriptor_key]
+        if target_required and (
+            not isinstance(target, str)
+            or not target
+            or len(target.encode("utf-8")) > 256
+        ):
+            raise CoreError("invalid_secret", "The requested secret field is unavailable")
+        if not target_required and target not in (None, ""):
+            raise CoreError("invalid_secret", "The requested secret field is unavailable")
+        target_value = target if target_required else None
+        adapter = self._domains.get(name)
+        reader = getattr(adapter, "trusted_secret_value", None) if adapter is not None else None
+        if not callable(reader):
+            raise CoreError("invalid_secret", "The requested secret field is unavailable")
+        try:
+            value = reader(field_name, target_value)
+        except Exception:
+            raise CoreError("invalid_secret", "The requested secret field is unavailable") from None
+        if (
+            not isinstance(value, str)
+            or len(value.encode("utf-8")) > _secret_value_limit(name, field_name, target_value)
+            or "\x00" in value
+            or (not _allows_multiline_secret(name, field_name, target_value) and any(character in value for character in "\r\n"))
+        ):
+            raise CoreError("invalid_secret", "The requested secret field is unavailable")
+        return {
+            "domain": name,
+            "field": field_name,
+            "target": target_value,
+            "revision": self._revision,
+            "present": bool(value.strip()),
+        }, value
+
     def trusted_secret_descriptor(self, domain: str, field: str, target: object | None = None) -> dict[str, Any]:
         """Validate one explicitly plaintext-native credential field.
 
@@ -1684,45 +1797,27 @@ class CoreStore:
         """
 
         with self._lock:
-            name = _canonical_domain(domain)
-            field_name = field.strip() if isinstance(field, str) else ""
-            descriptor_key = (name, field_name)
-            if descriptor_key not in _PLAINTEXT_SECRET_FIELDS:
-                raise CoreError("invalid_secret", "The requested secret field is unavailable")
-            if descriptor_key == ("runtime", "setting") and target not in _MULTILINE_SECRET_TARGETS:
-                raise CoreError("invalid_secret", "The requested secret field is unavailable")
-            target_required = _SECRET_FIELDS[descriptor_key]
-            if target_required and (
-                not isinstance(target, str)
-                or not target
-                or len(target.encode("utf-8")) > 256
-            ):
-                raise CoreError("invalid_secret", "The requested secret field is unavailable")
-            if not target_required and target not in (None, ""):
-                raise CoreError("invalid_secret", "The requested secret field is unavailable")
-            target_value = target if target_required else None
-            adapter = self._domains.get(name)
-            reader = getattr(adapter, "trusted_secret_value", None) if adapter is not None else None
-            if not callable(reader):
-                raise CoreError("invalid_secret", "The requested secret field is unavailable")
-            try:
-                value = reader(field_name, target_value)
-            except Exception:
-                raise CoreError("invalid_secret", "The requested secret field is unavailable") from None
-            if (
-                not isinstance(value, str)
-                or len(value.encode("utf-8")) > _secret_value_limit(name, field_name, target_value)
-                or "\x00" in value
-                or (not _allows_multiline_secret(name, field_name, target_value) and any(character in value for character in "\r\n"))
-            ):
-                raise CoreError("invalid_secret", "The requested secret field is unavailable")
-            return {
-                "domain": name,
-                "field": field_name,
-                "target": target_value,
-                "revision": self._revision,
-                "present": bool(value.strip()),
-            }
+            return self._trusted_secret_document_read(domain, field, target)[0]
+
+    def trusted_secret_read_descriptor(
+        self,
+        domain: str,
+        field: str,
+        target: object | None = None,
+    ) -> dict[str, Any]:
+        """The descriptor of a plaintext read lease, without waiting.
+
+        Issuing the lease is the first half of drawing a key that is already on
+        screen, so it takes the store lock only when the lock is free: a relay
+        round trip holding it must not delay the field behind that round trip.
+        """
+
+        locked = self._lock.acquire(timeout=_SECRET_READ_LOCK_TIMEOUT_SECONDS)
+        try:
+            return self._trusted_secret_document_read(domain, field, target)[0]
+        finally:
+            if locked:
+                self._lock.release()
 
     def trusted_secret_value(
         self,
@@ -1732,27 +1827,27 @@ class CoreStore:
         *,
         revision: int,
     ) -> str:
-        """Read one plaintext field via an already-authorized native lease."""
+        """Read one plaintext field via an already-authorized native lease.
 
-        with self._lock:
-            self._check_revision(revision)
-            descriptor = self.trusted_secret_descriptor(domain, field, target)
-            adapter = self._domains.get(str(descriptor["domain"]))
-            reader = getattr(adapter, "trusted_secret_value", None) if adapter is not None else None
-            if not callable(reader):
-                raise CoreError("invalid_secret", "The requested secret field is unavailable")
-            try:
-                value = reader(str(descriptor["field"]), descriptor["target"])
-            except Exception:
-                raise CoreError("invalid_secret", "The requested secret field is unavailable") from None
-            if (
-                not isinstance(value, str)
-                or len(value.encode("utf-8")) > _secret_value_limit(str(descriptor["domain"]), str(descriptor["field"]), descriptor["target"])
-                or "\x00" in value
-                or (not _allows_multiline_secret(str(descriptor["domain"]), str(descriptor["field"]), descriptor["target"]) and any(character in value for character in "\r\n"))
-            ):
-                raise CoreError("invalid_secret", "The requested secret field is unavailable")
+        A provider pane draws the key the moment it opens, so this read may not
+        queue behind the store's own work: a relay login or a station refresh
+        holds the store lock across its network round trip, and a key waiting
+        for that lock stayed on its loading hint for as long as the round trip
+        took.  The capability this call consumes was issued for a revision the
+        store already authorized, so a busy store is not a reason to wait — the
+        read uses the free lock when it can have it and the live document
+        otherwise, and the caller re-reads after any later change.
+        """
+
+        locked = self._lock.acquire(timeout=_SECRET_READ_LOCK_TIMEOUT_SECONDS)
+        try:
+            if locked:
+                self._check_revision(revision)
+            _descriptor, value = self._trusted_secret_document_read(domain, field, target)
             return value
+        finally:
+            if locked:
+                self._lock.release()
 
     def stage_secret(
         self,

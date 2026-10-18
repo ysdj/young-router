@@ -210,6 +210,69 @@ class HookResponsesRequestPrepTests(HookTestCase):
         self.assertIn("fetch_content", bridged_tools)
         self.assertEqual(original["tools"], [])
 
+    async def test_pre_call_bridges_codex_search_for_third_party_chat(self) -> None:
+        hooks, _ = load_hook_module()
+        original = self._codex_collaboration_request()
+        original.pop("client_metadata")
+        original["input"][0]["tools"].append(
+            {
+                "type": "namespace",
+                "name": "functions",
+                "tools": [{"type": "function", "name": "exec_command"}],
+            }
+        )
+        original["tools"] = [
+            {
+                "type": "function",
+                "name": "web_search",
+                "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+            },
+            {
+                "type": "function",
+                "name": "fetch_content",
+                "parameters": {"type": "object", "properties": {"url": {"type": "string"}}},
+            },
+        ]
+        original["model_info"] = {
+            "provider": "third-party",
+            "upstream_url_surface": "openai/chat",
+        }
+
+        modified = await hooks.YoungRouterHook().async_pre_call_deployment_hook(
+            original,
+            call_type="aresponses",
+        )
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(
+            [tool["name"] for tool in modified["tools"]],
+            ["web_search", "fetch_content"],
+        )
+        web_search = next(tool for tool in modified["tools"] if tool["name"] == "web_search")
+        self.assertIn("queries", web_search["parameters"]["properties"])
+        self.assertTrue(hooks._tools_module._request_has_pi_web_access_tool(modified))
+
+    def test_generic_additional_tools_do_not_identify_codex(self) -> None:
+        hooks, _ = load_hook_module()
+        request = {
+            "call_type": "aresponses",
+            "input": [
+                {
+                    "type": "additional_tools",
+                    "tools": [
+                        {
+                            "type": "namespace",
+                            "name": "utilities",
+                            "tools": [{"type": "function", "name": "lookup"}],
+                        }
+                    ],
+                }
+            ],
+        }
+
+        self.assertFalse(hooks._responses_request_module._request_has_codex_client_evidence(request))
+
     def test_codex_non_gpt_route_bridges_explicit_search_capability(self) -> None:
         hooks, _ = load_hook_module()
         contract = hooks._codex_contract_module

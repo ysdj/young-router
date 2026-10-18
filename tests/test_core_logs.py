@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
+import os
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -58,6 +60,25 @@ class _ScopedUsageReader:
         ]
 
 
+class _PagedUsageReader:
+    """A relay whose five rows span two pages without a second remote read."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def refresh(self, source_id: str | None = None) -> list[dict[str, str]]:
+        self.calls += 1
+        return [
+            {
+                "timestamp": f"2026-01-01T00:00:0{index}Z",
+                "source": "newapi",
+                "source_label": "paged-relay",
+                "model": f"model-{index}",
+            }
+            for index in range(5)
+        ]
+
+
 class _StructuredUsageReader:
     """A usage reader answering with the record shape Core projects."""
 
@@ -100,6 +121,24 @@ class _SilentUsageReader:
         from young_router.core.remote_usage_logs import USAGE_REASON_UNSUPPORTED
 
         return [], USAGE_REASON_UNSUPPORTED
+
+
+class _OverlappingUsageReader:
+    """An older source waits until a newer source has answered."""
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def refresh(self, source_id: str | None = None) -> list[dict[str, str]]:
+        if source_id == "slow":
+            self.started.set()
+            self.release.wait(2)
+        return [{
+            "timestamp": "2026-07-18T10:00:00Z",
+            "source_label": source_id or "",
+            "model": f"{source_id} model",
+        }]
 
 
 class LogsDomainTests(unittest.TestCase):
@@ -2050,6 +2089,63 @@ model_list:
             self.assertFalse(second["changed"])
             self.assertIsNone(second["log"])
 
+    def test_ipc_accepts_the_online_usage_view_and_keeps_its_pages(self) -> None:
+        class _UsageIPCReader:
+            def refresh(self, source_id: str | None = None) -> list[dict[str, str]]:
+                return [
+                    {
+                        "timestamp": "2026-01-01T00:00:00Z",
+                        "source_label": source_id or "",
+                        "model": f"model-{index}",
+                    }
+                    for index in range(450)
+                ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            server = CoreIPCServer(CoreStore(domains=[LogsDomain(root, online_usage_reader=_UsageIPCReader())]))
+            endpoint = server.start()
+            self.addCleanup(server.stop)
+            client = CoreIPCClient(endpoint, server.bootstrap_token)
+            self.addCleanup(client.close)
+
+            server.core.dispatch(
+                {"domain": "logs", "type": "logs.refresh_online_usage", "payload": {"tab": "online-usage", "source": "relay"}}
+            )
+            first = client.call("logs", {"tab": "online-usage"})["log"]
+            self.assertEqual((300, 1, 2), (first["line_count"], first["page"], first["page_count"]))
+
+            server.core.dispatch(
+                {"domain": "logs", "type": "logs.load_more", "payload": {"tab": "online-usage"}}
+            )
+            second = client.call("logs", {"tab": "online-usage"})["log"]
+            self.assertEqual((450, 2, 2, 0), (second["line_count"], second["page"], second["page_count"], second["remaining"]))
+            self.assertEqual([], [key for key in first if key.startswith("_")])
+
+    def test_default_core_can_start_when_the_optional_worker_is_not_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime_root = root / ".young-router"
+            provider_root = runtime_root / ".litellm-runtime"
+            provider_root.mkdir(parents=True)
+            (provider_root / "config.yaml").write_text(
+                "model_list:\n  - model_name: healthy\n    litellm_params:\n      model: openai/healthy\n",
+                encoding="utf-8",
+            )
+            with mock.patch.dict(os.environ, {"HOME": str(root), "YOUNG_ROUTER_OPENCODE2DSH_DIR": ""}):
+                core = CoreStore.with_default_domains(
+                    metadata_path=runtime_root / "metadata.json",
+                    reset_transient_routing_state=False,
+                )
+                self.addCleanup(core.shutdown)
+                server = CoreIPCServer(core)
+                endpoint = server.start()
+                self.addCleanup(server.stop)
+                client = CoreIPCClient(endpoint, server.bootstrap_token)
+                self.addCleanup(client.close)
+                view = client.call("logs", {"tab": "online-usage"})
+            self.assertEqual("online-usage", view["log"]["tab"])
+
     def test_online_usage_reads_nothing_until_a_relay_is_named(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             reader = _ScopedUsageReader()
@@ -2071,6 +2167,21 @@ model_list:
             self.assertTrue(tab["available"])
             self.assertEqual("two", tab["source_id"])
             self.assertEqual(1, tab["line_count"])
+
+    def test_online_usage_toolbar_lists_relays_before_a_refresh(self) -> None:
+        class _NeverRead:
+            def refresh(self, source_id: str | None = None) -> list[dict[str, str]]:
+                self.fail("A source listing must not contact a relay.")
+
+            def sources(self) -> list[dict[str, str]]:
+                return [{"id": "one", "label": "one"}]
+
+        with tempfile.TemporaryDirectory() as directory:
+            domain = LogsDomain(directory, online_usage_reader=_NeverRead())
+            self.assertEqual(
+                [{"id": "one", "label": "one"}],
+                domain.view("online-usage")["log"]["sources"],
+            )
 
     def test_clearing_online_usage_does_not_hide_the_next_refresh(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2155,6 +2266,256 @@ model_list:
 
             self.assertEqual(["two"], sorted(set(reader.scopes)))
             self.assertEqual("two", domain.view("online-usage")["log"]["source_id"])
+
+    def test_default_core_resolves_usage_sources_from_the_provider_config(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime_root = Path(directory) / "home" / ".young-router"
+            provider_root = runtime_root / ".litellm-runtime"
+            provider_root.mkdir(parents=True)
+            (provider_root / "config.yaml").write_text(
+                """\
+providers:
+  relay:
+    api_base: http://127.0.0.1:45678/v1
+    api_keys:
+      - name: default
+        value: usage-key
+model_list:
+  - model_name: shared-model
+    litellm_params:
+      model: openai/shared-model
+      api_base: http://127.0.0.1:45678/v1
+    model_info:
+      provider: relay
+      api_key_name: default
+""",
+                encoding="utf-8",
+            )
+            with mock.patch.dict(os.environ, {"HOME": str(runtime_root.parent)}):
+                core = CoreStore.with_default_domains(
+                    metadata_path=runtime_root / "metadata.json",
+                    reset_transient_routing_state=False,
+                )
+                sources = core.log_view("online-usage")["log"]["sources"]
+
+            self.assertEqual(["relay"], [source["label"] for source in sources])
+
+    def test_online_usage_pages_move_over_fetched_rows_in_both_directions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            reader = _PagedUsageReader()
+            with mock.patch("young_router.core.domains.logs.ONLINE_USAGE_PAGE_ROWS", 3):
+                domain = LogsDomain(directory, online_usage_reader=reader)
+                domain.dispatch("logs.refresh_online_usage", {"tab": "online-usage", "source": "one"})
+                tab = domain.view("online-usage")["log"]
+                self.assertEqual(5, tab["total"])
+                self.assertEqual((1, 2, 3), (tab["page"], tab["page_count"], tab["line_count"]))
+                self.assertEqual(["model-2", "model-3", "model-4"], [row["model"] for row in tab["records"]])
+
+                domain.dispatch("logs.load_more", {"tab": "online-usage"})
+                tab = domain.view("online-usage")["log"]
+                self.assertEqual((2, 2, 5), (tab["page"], tab["page_count"], tab["line_count"]))
+                self.assertEqual("model-0", tab["records"][0]["model"])
+                self.assertEqual(0, tab["remaining"])
+
+                domain.dispatch("logs.previous_page", {"tab": "online-usage"})
+                tab = domain.view("online-usage")["log"]
+                self.assertEqual((1, 2, 3), (tab["page"], tab["page_count"], tab["line_count"]))
+                self.assertEqual("model-2", tab["records"][0]["model"])
+                self.assertEqual(2, tab["remaining"])
+
+            self.assertEqual(1, reader.calls)
+
+    def test_online_usage_first_page_carries_three_hundred_rows(self) -> None:
+        class _LargeUsageReader:
+            def refresh(self, source_id: str | None = None) -> list[dict[str, str]]:
+                return [
+                    {"timestamp": "2026-01-01T00:00:00Z", "source_label": source_id or "", "model": str(index)}
+                    for index in range(450)
+                ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            domain = LogsDomain(directory, online_usage_reader=_LargeUsageReader())
+            domain.dispatch("logs.refresh_online_usage", {"tab": "online-usage", "source": "one"})
+            tab = domain.view("online-usage")["log"]
+
+            self.assertGreaterEqual(tab["line_count"], 300)
+            self.assertEqual(tab["line_count"] + tab["remaining"], tab["total"])
+            self.assertEqual((450, 1, 2), (tab["total"], tab["page"], tab["page_count"]))
+
+            domain.dispatch("logs.load_more", {"tab": "online-usage"})
+            next_page = domain.view("online-usage")["log"]
+            self.assertEqual(450, next_page["line_count"])
+            self.assertEqual((2, 2, 0), (next_page["page"], next_page["page_count"], next_page["remaining"]))
+
+    def test_a_byte_trimmed_online_usage_page_does_not_hide_following_pages(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            reader = _PagedUsageReader()
+            with mock.patch("young_router.core.domains.logs.ONLINE_USAGE_PAGE_ROWS", 3), \
+                mock.patch("young_router.core.domains.logs.MAX_VIEW_BYTES", 100):
+                domain = LogsDomain(directory, online_usage_reader=reader)
+                domain.dispatch("logs.refresh_online_usage", {"tab": "online-usage", "source": "one"})
+                tab = domain.view("online-usage")["log"]
+                self.assertLess(tab["line_count"], 3)
+                self.assertEqual(2, tab["remaining"])
+                self.assertLess(tab["line_count"], 3)
+
+                domain.dispatch("logs.load_more", {"tab": "online-usage"})
+                tab = domain.view("online-usage")["log"]
+                self.assertEqual((2, 0), (tab["page"], tab["remaining"]))
+
+    def test_online_usage_time_range_filters_rows_and_resets_pages(self) -> None:
+        class _TimedUsageReader:
+            def refresh(self, source_id: str | None = None) -> list[dict[str, str]]:
+                return [
+                    {"timestamp": f"2026-01-0{day}T12:00:00Z", "model": str(day)}
+                    for day in range(1, 5)
+                ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            domain = LogsDomain(directory, online_usage_reader=_TimedUsageReader())
+            domain.dispatch("logs.refresh_online_usage", {"tab": "online-usage", "source": "one"})
+            domain.dispatch("logs.set_time_range", {
+                "tab": "online-usage",
+                "since": 1767319200,
+                "until": 1767491999,
+            })
+            tab = domain.view("online-usage")["log"]
+            self.assertEqual(["2", "3"], [row["model"] for row in tab["records"]])
+            self.assertEqual((2, 1), (tab["total"], tab["page"]))
+            domain.dispatch("logs.set_time_range", {"tab": "online-usage"})
+            restored = domain.view("online-usage")["log"]
+            self.assertEqual(4, restored["total"])
+            self.assertEqual(1, restored["page"])
+
+    def test_online_usage_time_range_accepts_a_millisecond_epoch(self) -> None:
+        """The pane sends Date.getTime(); the rows are Unix seconds.
+
+        A range compared at the wrong scale is not a filter that shows nothing
+        by accident: it excludes every row, so the tab looked empty for a range
+        the data clearly falls in.
+        """
+
+        class _TimedUsageReader:
+            def refresh(self, source_id: str | None = None) -> list[dict[str, str]]:
+                return [
+                    {"timestamp": f"2026-01-0{day}T12:00:00Z", "model": str(day)}
+                    for day in range(1, 5)
+                ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            domain = LogsDomain(directory, online_usage_reader=_TimedUsageReader())
+            domain.dispatch("logs.refresh_online_usage", {"tab": "online-usage", "source": "one"})
+            domain.dispatch("logs.set_time_range", {
+                "tab": "online-usage",
+                "since": 1767319200 * 1000,
+                "until": 1767491999 * 1000,
+            })
+            tab = domain.view("online-usage")["log"]
+            self.assertEqual(["2", "3"], [row["model"] for row in tab["records"]])
+            self.assertEqual(2, tab["total"])
+
+    def test_online_usage_time_range_survives_a_relay_switch(self) -> None:
+        """The range is a view over whichever relay answered.
+
+        A switch used to clear it, so the pane's own time menu kept naming a
+        range that no longer filtered the rows underneath it.
+        """
+
+        class _TwoSourceUsageReader:
+            def refresh(self, source_id: str | None = None) -> list[dict[str, str]]:
+                day = 1 if source_id == "one" else 3
+                return [
+                    {"timestamp": f"2026-01-0{day}T12:00:00Z", "model": f"{source_id}-{day}"},
+                    {"timestamp": "2026-01-04T12:00:00Z", "model": f"{source_id}-4"},
+                ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            domain = LogsDomain(directory, online_usage_reader=_TwoSourceUsageReader())
+            domain.dispatch("logs.refresh_online_usage", {"tab": "online-usage", "source": "one"})
+            domain.dispatch("logs.set_time_range", {
+                "tab": "online-usage",
+                "since": 1767319200,
+                "until": 1767491999,
+            })
+            domain.dispatch("logs.refresh_online_usage", {"tab": "online-usage", "source": "two"})
+            tab = domain.view("online-usage")["log"]
+            self.assertEqual(["two-3"], [row["model"] for row in tab["records"]])
+            self.assertEqual(1, tab["total"])
+
+    def test_online_usage_date_only_timestamp_is_a_calendar_day(self) -> None:
+        class _DateUsageReader:
+            def refresh(self, source_id: str | None = None) -> list[dict[str, str]]:
+                return [
+                    {"timestamp": "2026-10-17", "model": "yesterday"},
+                    {"timestamp": "2026-10-18", "model": "today"},
+                ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            domain = LogsDomain(directory, online_usage_reader=_DateUsageReader())
+            domain.dispatch("logs.refresh_online_usage", {"tab": "online-usage", "source": "one"})
+            domain.dispatch("logs.set_time_range", {
+                "tab": "online-usage",
+                "since": datetime(2026, 10, 18).timestamp(),
+                "until": datetime(2026, 10, 18, 23, 59, 59).timestamp(),
+            })
+            tab = domain.view("online-usage")["log"]
+            self.assertEqual(["today"], [row["model"] for row in tab["records"]])
+
+    def test_online_usage_keeps_the_files_structured_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            domain = LogsDomain(directory)
+
+            with mock.patch(
+                "young_router.core.remote_usage_logs.collect",
+                return_value=(
+                    [{
+                        "timestamp": "2026-07-18T10:00:00Z",
+                        "source": "sub2api",
+                        "source_id": "one",
+                        "source_label": "relay",
+                        "source_family": "Sub2API",
+                        "model": "gpt-5",
+                        "prompt_tokens": "100",
+                        "completion_tokens": "20",
+                        "total_tokens": "120",
+                    }],
+                    "",
+                ),
+            ) as collect:
+                domain.dispatch(
+                    "logs.refresh_online_usage",
+                    {"tab": "online-usage", "source": "one"},
+                )
+
+            collect.assert_called_once_with(domain.config_path, 5.0, "one")
+            record = domain.view("online-usage")["log"]["records"][0]
+            self.assertEqual("2026-07-18T10:00:00Z", record["timestamp"])
+            self.assertEqual("relay", record["source_label"])
+            self.assertEqual("Sub2API", record["source_family"])
+            self.assertEqual("gpt-5", record["model"])
+            self.assertEqual("120", record["total_tokens"])
+
+    def test_online_usage_latest_choice_wins_when_reads_overlap(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            reader = _OverlappingUsageReader()
+            domain = LogsDomain(directory, online_usage_reader=reader)
+            slow = threading.Thread(target=lambda: domain.dispatch(
+                "logs.refresh_online_usage",
+                {"tab": "online-usage", "source": "slow", "request": "request-one"},
+            ))
+            slow.start()
+            self.assertTrue(reader.started.wait(1))
+
+            domain.dispatch(
+                "logs.refresh_online_usage",
+                {"tab": "online-usage", "source": "fast", "request": "request-two"},
+            )
+            reader.release.set()
+            slow.join(2)
+
+            tab = domain.view("online-usage")["log"]
+            self.assertEqual("fast", tab["source_id"])
+            self.assertEqual("fast model", tab["records"][0]["model"])
 
 
 if __name__ == "__main__":
