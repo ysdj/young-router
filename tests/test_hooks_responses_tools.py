@@ -396,6 +396,79 @@ class HookResponsesToolBridgeTests(HookTestCase):
             },
         )
 
+    def test_chat_bridge_drops_blank_assistant_turns(self) -> None:
+        """A tool-only turn's placeholder must not reach a chat surface.
+
+        Codex replays a turn that only calls tools as an assistant message whose
+        text is a single space, because the Responses surface needs a carrier
+        for its phase.  A reasoning model answers such an assistant turn with a
+        lone ``.`` of its own, the client renders that as a stray dot, and the
+        dot is then replayed in every later request.  The turn states nothing by
+        construction, so the bridge drops it instead of passing it on.
+        """
+
+        hooks, _ = load_hook_module()
+        canonical = [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": " "}]},
+            {
+                "type": "function_call",
+                "id": "fc_exec",
+                "call_id": "call_exec",
+                "name": "exec_command",
+                "arguments": '{"cmd":"pwd"}',
+            },
+            {
+                "type": "function_call_output",
+                "id": "fco_exec",
+                "call_id": "call_exec",
+                "output": "/tmp",
+            },
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": ""}]},
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "looked at it"}],
+            },
+        ]
+
+        bridged, stats = hooks._responses_chat_bridge_input(canonical)
+
+        self.assertEqual(len(bridged), 4)
+        self.assertEqual(
+            [item.get("type") for item in bridged],
+            ["message", "function_call", "function_call_output", "message"],
+        )
+        self.assertEqual(stats["dropped_blank_assistant_messages"], 2)
+        self.assertEqual(
+            bridged[-1]["content"][0]["text"],
+            "looked at it",
+        )
+
+    def test_chat_bridge_preserves_legacy_exec_patch_arguments(self) -> None:
+        hooks, _ = load_hook_module()
+        patch = "*** Begin Patch\n*** Update File: a.js\n*** End Patch"
+        source = "text(await tools.apply_patch(patch));"
+        canonical = [
+            {
+                "type": "custom_tool_call",
+                "id": "ctc_exec_patch",
+                "call_id": "call_exec_patch",
+                "name": "exec",
+                "input": source,
+                "arguments": {"patch": patch},
+                "status": "completed",
+            }
+        ]
+
+        bridged, _ = hooks._responses_chat_bridge_input(canonical)
+
+        self.assertEqual(
+            json.loads(bridged[0]["arguments"]),
+            {"patch": patch, "input": source},
+        )
+        self.assertEqual(canonical[0]["arguments"], {"patch": patch})
+
     def test_chat_bridge_flattens_replayed_namespace_calls_to_the_declared_names(self) -> None:
         hooks, _ = load_hook_module()
         tools = [

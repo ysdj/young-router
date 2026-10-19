@@ -13,6 +13,7 @@ import {
   type ViewStyle,
 } from "react-native";
 import {
+  AppKitBusySpinner,
   AppKitButton,
   AppKitCheckbox,
   AppKitPersistentScrollIndicator,
@@ -334,13 +335,21 @@ export function NativeButton(props: ButtonProps & { ref?: React.Ref<any> }): Rea
 /**
  * The app's own busy wheel as a standalone control.
  *
- * A wait that owns a whole pane is reported with the platform's spinner where
- * the user is looking, never with a sentence alone and never with a
- * progress-indicator view: React's `ActivityIndicator` is the same wheel the
- * native buttons already draw, so a busy surface and a busy button spin alike.
+ * Every wait the app reports draws the same wheel: the busy button, the
+ * provider wizard's model step, and the 分组管理 sheet's 密钥 row all render
+ * `AppKitBusySpinner`'s frames (`AppKitNativeLeaf.swift`).  A standalone wait
+ * therefore mounts the native view that draws those frames rather than
+ * `ActivityIndicator`, which renders AppKit's system progress indicator —
+ * different spoke count, weight, and fade — inside a 12 pt box it paints past,
+ * which is also what clipped the leading spokes against the row's left edge.
  * `label` is the accessibility name, because a wheel has no words.
  */
 export function NativeBusySpinner({ label, style }: { label: string; style?: StyleProp<ViewStyle> }): React.JSX.Element {
+  if (Platform.OS === "macos") {
+    return <AppKitBusySpinner accessibilityLabel={label} running style={[styles.busySpinner, style]} />;
+  }
+  // Windows draws the same wait with the platform's own ring; the host's
+  // `ProgressRing` is its one busy affordance (AGENTS.md).
   return <ActivityIndicator accessibilityLabel={label} size="small" style={[styles.busySpinner, style]} />;
 }
 

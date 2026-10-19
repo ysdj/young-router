@@ -2407,20 +2407,34 @@ class CoreStore:
                 model_count = max(0, int(model_count))
             except (TypeError, ValueError):
                 model_count = 0
-            providers.append(
-                {
-                    "id": str(provider_id),
-                    "display_name": str(display_name),
-                    "enabled": item.get("enabled") is not False,
-                    "model_count": model_count,
-                    "api_key": {
-                        "present": bool(item.get("api_key_configured"))
-                        or _secret_presence(item.get("api_key", item.get("api_keys")))
-                    },
-                    "endpoint": str(item.get("endpoint", item.get("api_base", "")) or ""),
-                    "models": models,
-                }
-            )
+            provider_summary = {
+                "id": str(provider_id),
+                "display_name": str(display_name),
+                "enabled": item.get("enabled") is not False,
+                "model_count": model_count,
+                "api_key": {
+                    "present": bool(item.get("api_key_configured"))
+                    or _secret_presence(item.get("api_key", item.get("api_keys")))
+                },
+                "endpoint": str(item.get("endpoint", item.get("api_base", "")) or ""),
+                "models": models,
+            }
+            # The account metadata travels with the summary.  It is what tells a
+            # login-backed provider apart from an API-key one, and the pane
+            # routes each row to its own action on it: a row whose ``auth_kind``
+            # is missing reads as an API-key provider, so the ordinary
+            # ``provider.delete`` is dispatched for a lane Core refuses there
+            # ("Login providers are managed in Service Provider Management") and
+            # the entry can never be removed from this list.  A summary is a
+            # projection of the detail record, never a narrower record: every
+            # field a client acts on has to survive it.
+            if item.get("auth_kind") is not None:
+                provider_summary["auth_kind"] = item.get("auth_kind")
+            if item.get("auth_status") is not None:
+                provider_summary["auth_status"] = item.get("auth_status")
+            if item.get("auth_active") is not None:
+                provider_summary["auth_active"] = item.get("auth_active")
+            providers.append(provider_summary)
         revision = value.get("revision", 0)
         return {"providers": providers, "revision": revision if type(revision) is int else 0}
 

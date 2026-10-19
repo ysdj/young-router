@@ -1294,6 +1294,16 @@ void FloatPersistentScrollerOverContent(NSScrollView *scrollView)
     const CGFloat strip = MAX(11, NSWidth(frame));
     frame.origin.x = NSMaxX(bounds) - strip;
     frame.size.width = strip;
+    // The knob's travel is the viewport's, not the one AppKit measured when it
+    // last tiled: a resize (the provider wizard grows a row, a pane swaps its
+    // content) left the capsule at the old viewport height, so its knob sat
+    // where the previous layout had put it and the track ended short of the
+    // bottom edge.  Re-derive the track from the bounds this pass measured and
+    // let AppKit recompute the knob inside it.
+    const CGFloat trackHeight = NSHeight(bounds);
+    if (fabs(NSHeight(frame) - trackHeight) > 0.5) {
+      frame.size.height = trackHeight;
+    }
     scrollView.verticalScroller.frame = frame;
   }
   if (scrollView.hasHorizontalScroller && scrollView.horizontalScroller != nil) {
@@ -1301,11 +1311,25 @@ void FloatPersistentScrollerOverContent(NSScrollView *scrollView)
     const CGFloat strip = MAX(11, NSHeight(frame));
     frame.origin.y = scrollView.isFlipped ? NSMaxY(bounds) - strip : NSMinY(bounds);
     frame.size.height = strip;
+    const CGFloat trackWidth = NSWidth(bounds);
+    if (fabs(NSWidth(frame) - trackWidth) > 0.5) {
+      frame.size.width = trackWidth;
+    }
     scrollView.horizontalScroller.frame = frame;
   }
   const NSRect clipFrame = NSMakeRect(NSMinX(bounds), NSMinY(bounds), NSWidth(bounds), NSHeight(bounds));
   if (!NSEqualRects(clipView.frame, clipFrame)) {
     clipView.frame = clipFrame;
+  }
+  // The track grew or shrank with the viewport, so the knob's share of it is
+  // stale until AppKit re-reads the document: ask it to redraw.  Calling back
+  // into `scrollView` here would re-enter this function through `tile`, so the
+  // refresh is only a redraw of the scroller itself.
+  if (scrollView.hasVerticalScroller && scrollView.verticalScroller != nil) {
+    [scrollView.verticalScroller setNeedsDisplay:YES];
+  }
+  if (scrollView.hasHorizontalScroller && scrollView.horizontalScroller != nil) {
+    [scrollView.horizontalScroller setNeedsDisplay:YES];
   }
 }
 
@@ -4451,6 +4475,131 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitCodeWebViewCls(void)
 Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
 {
   return LiteLLMAppKitPersistentScrollIndicatorComponentView.class;
+}
+
+
+// The app's one busy wheel, as a React control.
+//
+// Every wait the app reports draws `AppKitBusySpinner.frames` — the busy button,
+// the provider wizard's model step, the 分组管理 sheet beside 密钥 — so a
+// standalone spinner must draw that same wheel rather than a second one from
+// another framework: `ActivityIndicator` renders AppKit's system progress
+// indicator, whose spokes, weight, and fade differ from the app's, and sizing
+// it into the app's 12 pt slot clipped the leading spokes as well.
+//
+// The frames are template images, so the wheel inherits whatever ink the row
+// draws beside it; the step timer is the only state this view owns.
+@interface LiteLLMAppKitBusySpinnerComponentView ()
+    <RCTLiteLLMAppKitBusySpinnerViewProtocol>
+@end
+
+@implementation LiteLLMAppKitBusySpinnerComponentView {
+  NSImageView *_wheel;
+  NSTimer *_stepTimer;
+  NSInteger _step;
+  BOOL _running;
+}
+
++ (ComponentDescriptorProvider)componentDescriptorProvider
+{
+  return concreteComponentDescriptorProvider<LiteLLMAppKitBusySpinnerComponentDescriptor>();
+}
+
+- (instancetype)initWithFrame:(CGRect)frame
+{
+  if (self = [super initWithFrame:frame]) {
+    static const auto defaultProps =
+        std::make_shared<const LiteLLMAppKitBusySpinnerProps>();
+    _props = defaultProps;
+    _running = YES;
+    _wheel = [[NSImageView alloc] initWithFrame:NSMakeRect(0, 0, AppKitBusySpinner.size, AppKitBusySpinner.size)];
+    _wheel.imageScaling = NSImageScaleNone;
+    _wheel.image = AppKitBusySpinner.frames.firstObject;
+    [self addSubview:_wheel];
+    self.accessibilityRole = NSAccessibilityImageRole;
+  }
+  return self;
+}
+
+// The wheel keeps the size the caller reserved for it and centres itself there:
+// a spinner's frame is a slot, never a stretched image.
+- (void)layout
+{
+  [super layout];
+  const CGFloat side = AppKitBusySpinner.size;
+  _wheel.frame = NSMakeRect(
+      (NSWidth(self.bounds) - side) / 2,
+      (NSHeight(self.bounds) - side) / 2,
+      side,
+      side);
+}
+
+- (void)updateProps:(const Props::Shared &)props oldProps:(const Props::Shared &)oldProps
+{
+  const auto &newViewProps =
+      *std::static_pointer_cast<const LiteLLMAppKitBusySpinnerProps>(props);
+  _running = newViewProps.running;
+  const std::string label = newViewProps.accessibilityLabel;
+  self.accessibilityLabel = label.empty()
+      ? nil
+      : [NSString stringWithUTF8String:label.c_str()];
+  [super updateProps:props oldProps:oldProps];
+  [self applyRunning];
+}
+
+- (void)applyRunning
+{
+  if (!_running) {
+    [_stepTimer invalidate];
+    _stepTimer = nil;
+    _wheel.image = AppKitBusySpinner.frames.firstObject;
+    return;
+  }
+  if (_stepTimer != nil || AppKitBusySpinner.frames.count == 0) return;
+  __weak LiteLLMAppKitBusySpinnerComponentView *weakSelf = self;
+  _stepTimer = [NSTimer timerWithTimeInterval:AppKitBusySpinner.stepInterval
+                                      repeats:YES
+                                        block:^(NSTimer *timer) {
+    [weakSelf advanceStep];
+  }];
+  // A modal run loop must not stop the wheel: the busy button registers its
+  // timer in the same common modes.
+  [[NSRunLoop mainRunLoop] addTimer:_stepTimer forMode:NSRunLoopCommonModes];
+}
+
+- (void)advanceStep
+{
+  const NSUInteger count = AppKitBusySpinner.frames.count;
+  if (count == 0) return;
+  _step = (_step + 1) % (NSInteger)count;
+  _wheel.image = AppKitBusySpinner.frames[(NSUInteger)_step];
+}
+
+- (void)prepareForRecycle
+{
+  [_stepTimer invalidate];
+  _stepTimer = nil;
+  [super prepareForRecycle];
+  static const auto defaultProps =
+      std::make_shared<const LiteLLMAppKitBusySpinnerProps>();
+  _props = defaultProps;
+  _running = YES;
+  _step = 0;
+  _wheel.image = AppKitBusySpinner.frames.firstObject;
+}
+
+- (void)invalidate
+{
+  [_stepTimer invalidate];
+  _stepTimer = nil;
+  [super invalidate];
+}
+
+@end
+
+Class<RCTComponentViewProtocol> LiteLLMAppKitBusySpinnerCls(void)
+{
+  return LiteLLMAppKitBusySpinnerComponentView.class;
 }
 
 

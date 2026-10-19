@@ -337,6 +337,117 @@ class RelayAccountsDomainTests(unittest.TestCase):
             # the failure was absorbed and the union list survived.
             self.assertEqual(["model-a", "model-b"], resources[0]["models"])
 
+    def test_a_newapi_group_that_serves_nothing_stops_inventing_the_union(self) -> None:
+        """A group the station answers empty for serves nothing at all.
+
+        The scoped read is an *answer*: ``{"data": []}`` says New API found no
+        channel for that group.  It used to be indistinguishable from the read
+        failing, because both answered ``[]`` and the caller fell back to
+        ``stored_list or models``.  So a key in a group the station serves
+        nothing for kept reporting the whole station's union — 分组管理 showed
+        30 models beside that group, and 获取模型 on the very same key answered
+        ``{"data": []}`` from its own ``/v1/models`` and said 供应商未返回模型.
+        One of the two panes was reading a list nobody had given it.
+        """
+
+        class ServedAndEmptyRelay(FakeRelayHTTPClient):
+            def json(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
+                if path == "/api/user/models?group=served":
+                    self.requests.append((origin, path, dict(headers)))
+                    return {"data": ["station-model-a"], "success": True}
+                if path == "/api/user/models?group=empty":
+                    # The station answered, and its answer is "no models".
+                    self.requests.append((origin, path, dict(headers)))
+                    return {"data": [], "success": True}
+                return super().json(origin, path, headers=headers)
+
+        with tempfile.TemporaryDirectory() as directory:
+            fake = ServedAndEmptyRelay(
+                {
+                    "/api/user/models": {"data": ["station-model-a", "station-model-b"]},
+                    "/api/token/?p=1&size=100": {
+                        "data": {
+                            "items": [
+                                {"id": 1, "name": "served", "status": 1, "key": "masked-1", "group": "served"},
+                                {"id": 2, "name": "empty", "status": 1, "key": "masked-2", "group": "empty"},
+                            ]
+                        }
+                    },
+                    "/api/user/self": {"data": {"quota": 1_000_000}},
+                    "/api/status": {"data": {"quota_per_unit": 500_000}},
+                }
+            )
+            # The station serves ``served`` and answers the union for it, so
+            # only ``empty`` is proof of the difference.
+            domain = RelayAccountsDomain(directory, http_client=fake)
+            account = domain.dispatch(
+                "account.add",
+                {"type": "newapi", "label": "New API", "origin": "https://relay.example.test"},
+            )["accounts"][0]
+            domain.accept_login_result(account["id"], username="person", access_token="replace-token")
+
+            resources = domain.refresh_resources(account["id"])["resources"]
+            by_name = {resource["name"]: resource["models"] for resource in resources}
+            self.assertEqual(["station-model-a"], by_name["served"])
+            self.assertEqual([], by_name["empty"])
+
+    def test_a_newapi_group_read_that_learned_nothing_falls_back_to_the_union(self) -> None:
+        """An unreadable group is not an empty one, and it says so differently.
+
+        The other half of the rule above: a transport failure, a rejected
+        session, a fork that refuses ``?group=``, or a 200 whose body is not a
+        model list at all learned nothing about the group, so the key keeps the
+        account's own union catalog.  Only an *answer* of no models may empty
+        the row.
+        """
+
+        class OneGroupStallsRelay(FakeRelayHTTPClient):
+            def json(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
+                if path == "/api/user/models?group=served":
+                    self.requests.append((origin, path, dict(headers)))
+                    return {"data": ["station-model-a"], "success": True}
+                if path == "/api/user/models?group=stalled":
+                    self.requests.append((origin, path, dict(headers)))
+                    raise RelayAccountsError("Relay is unavailable")
+                if path == "/api/user/models?group=unrecognised":
+                    # A 200 that is not a model list: an error envelope from a
+                    # proxy the station put in front of this endpoint.
+                    self.requests.append((origin, path, dict(headers)))
+                    return {"detail": "group is temporarily unavailable"}
+                return super().json(origin, path, headers=headers)
+
+        with tempfile.TemporaryDirectory() as directory:
+            fake = OneGroupStallsRelay(
+                {
+                    "/api/user/models": {"data": ["station-model-a", "station-model-b"]},
+                    "/api/token/?p=1&size=100": {
+                        "data": {
+                            "items": [
+                                {"id": 1, "name": "served", "status": 1, "key": "masked-1", "group": "served"},
+                                {"id": 2, "name": "stalled", "status": 1, "key": "masked-2", "group": "stalled"},
+                                {"id": 3, "name": "unrecognised", "status": 1, "key": "masked-3", "group": "unrecognised"},
+                            ]
+                        }
+                    },
+                    "/api/user/self": {"data": {"quota": 1_000_000}},
+                    "/api/status": {"data": {"quota_per_unit": 500_000}},
+                }
+            )
+            domain = RelayAccountsDomain(directory, http_client=fake)
+            account = domain.dispatch(
+                "account.add",
+                {"type": "newapi", "label": "New API", "origin": "https://relay.example.test"},
+            )["accounts"][0]
+            domain.accept_login_result(account["id"], username="person", access_token="replace-token")
+
+            resources = domain.refresh_resources(account["id"])["resources"]
+            by_name = {resource["name"]: resource["models"] for resource in resources}
+            # The group that answered keeps exactly its own list...
+            self.assertEqual(["station-model-a"], by_name["served"])
+            # ...and neither read that failed is read as "this group is empty".
+            self.assertEqual(["station-model-a", "station-model-b"], by_name["stalled"])
+            self.assertEqual(["station-model-a", "station-model-b"], by_name["unrecognised"])
+
     def test_sub2api_balance_comes_from_the_user_profile(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fake = FakeRelayHTTPClient(
@@ -3513,6 +3624,76 @@ class RelayAccountsDomainTests(unittest.TestCase):
                     key=lambda headers: headers["Authorization"],
                 ),
             )
+
+    def test_sub2api_a_gateway_answering_no_models_does_not_keep_the_union(self) -> None:
+        """One key serving nothing is an answer, not a read that failed.
+
+        The row above proves an unreadable gateway falls back to the page's
+        catalog, because a failure is not evidence about the key.  The gateway
+        *answering* with an empty list is evidence: this key calls nothing, and
+        the station says so for every request to it.  Keeping the union there
+        made 分组管理 list models beside that key while its own 获取模型 read
+        reported 供应商未返回模型 — the same station fact, read twice and
+        reported two ways.
+        """
+
+        class EmptyGatewayClient(FakeRelayHTTPClient):
+            def json(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
+                if path == "/v1/models":
+                    self.requests.append((origin, path, dict(headers)))
+                    if headers.get("Authorization", "").endswith("sk-replace-served-key"):
+                        return {"object": "list", "data": [{"id": "model-served"}]}
+                    return {"object": "list", "data": []}
+                return super().json(origin, path, headers=headers)
+
+        fake = EmptyGatewayClient(
+            {
+                "/api/v1/keys?page=1&page_size=100": {
+                    "code": 0,
+                    "data": {
+                        "items": [
+                            {"id": 4, "name": "Served", "status": "active", "key": "sk-replace-served-key", "group_id": 41},
+                            {"id": 5, "name": "Empty", "status": "active", "key": "sk-replace-empty-key", "group_id": 42},
+                        ]
+                    },
+                },
+                # The page describes one *other* group, so the deployment's own
+                # catalog is non-empty and neither key is described by it.  Both
+                # keys are then read directly, which is where the two answers
+                # below differ.
+                "/api/v1/channels/available": {
+                    "code": 0,
+                    "data": [
+                        {
+                            "name": "other",
+                            "platforms": [
+                                {
+                                    "platform": "openai",
+                                    "groups": [{"id": 43, "name": "Other"}],
+                                    "supported_models": [{"name": "union-model"}],
+                                }
+                            ],
+                        }
+                    ],
+                },
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RelayAccountsDomain(directory, http_client=fake)
+            account_id = domain.dispatch(
+                "add",
+                {"type": "sub2api", "label": "Sub Relay", "origin": "https://sub.example.test"},
+            )["accounts"][0]["id"]
+            domain.accept_login_result(
+                account_id,
+                username="sample@example.test",
+                access_token="replace-dashboard-token",
+            )
+
+            resources = domain.refresh_resources(account_id)["resources"]
+            by_name = {resource["name"]: resource["models"] for resource in resources}
+            self.assertEqual(["model-served"], by_name["Served"])
+            self.assertEqual([], by_name["Empty"])
 
     def test_sub2api_cookie_only_session_can_import_models(self) -> None:
         fake = FakeRelayHTTPClient(

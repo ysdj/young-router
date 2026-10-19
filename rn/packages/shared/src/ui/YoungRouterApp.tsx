@@ -212,13 +212,34 @@ function publicModelNameForLane(modelID: string): string {
     : modelID;
 }
 
+/**
+ * The picker groups the upstream publishes for its roster.
+ *
+ * The upstream names these itself, and Core carries the membership it stated:
+ * `our-free-model` is what this egress can use, `our-free-model-region` is what
+ * its regional gate refuses (kept visible, but isolated).  The constants are
+ * the upstream's own route ids, so neither side invents a heading.
+ */
+const LANE_ROUTE_MAIN = "our-free-model";
+const LANE_ROUTE_REGION = "our-free-model-region";
+
+/** The groups one roster states, in the order the picker shows them. */
+function laneRouteOrder(routes: readonly string[]): string[] {
+  const known = [LANE_ROUTE_MAIN, LANE_ROUTE_REGION].filter((route) => routes.includes(route));
+  return [...known, ...routes.filter((route) => !known.includes(route))];
+}
+
 /** The address each service is addressed by, used for the wizard's URL field. */
 const SERVICE_BASE_URLS: Record<ServiceID, string> = {
   openai: "https://api.openai.com/v1",
   claude: "https://api.anthropic.com",
   workbuddy: "https://copilot.tencent.com",
   workbuddyAI: "https://www.workbuddy.ai",
-  opencode2dsh: "https://opencode.ai/zen",
+  // dsh-our-free-model is served by a Core-owned worker on this machine, and
+  // its port is assigned at launch, so it has no fixed address to print here.
+  // The entry carries Core's own `os.environ/` reference instead, which is the
+  // only string that is true across runs.
+  opencode2dsh: "",
 };
 
 /** Service origins, so a hand-typed provider URL is recognized the same way. */
@@ -3181,7 +3202,9 @@ function nextServiceProviderName(providers: UnknownRecord[], kind: ServiceProvid
     : kind === "claude_login" ? "Claude"
       : kind === "workbuddy_login" ? "WorkBuddy"
         : kind === "workbuddy_ai_login" ? "WorkBuddy AI"
-          : "dsh-our-free-model";
+          // The entry is named after the type the picker shows, so the two
+          // never disagree about what the user added.
+          : "Our Free Model";
   const names = new Set(providers.map((provider) => stringValue(provider.display_name, stringValue(provider.name)).trim().toLocaleLowerCase()).filter(Boolean));
   if (!names.has(base.toLocaleLowerCase())) return base;
   let suffix = 2;
@@ -3239,6 +3262,10 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   const [modelName, setModelName] = useState("");
   const [upstreamModel, setUpstreamModel] = useState("");
   const [fetchedModelCandidates, setFetchedModelCandidates] = useState<string[]>([]);
+  // The picker groups the lane published with its roster, as route -> model
+  // ids.  The upstream decides this split, so the wizard groups by what it
+  // said instead of by a rule of its own.
+  const [laneRoutes, setLaneRoutes] = useState<Record<string, string[]>>({});
   const [fetchedModelCapabilities, setFetchedModelCapabilities] = useState<Record<string, UnknownRecord>>({});
   const [selectedModels, setSelectedModels] = useState<string[]>([]);
   const [manualModels, setManualModels] = useState<Array<{ id: string; name: string; upstream_model: string }>>([]);
@@ -3401,8 +3428,12 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   ];
   const servicePickerLabels = servicePickerItems.map((item) => item.label);
   // A service provider always carries its own address; only the custom entry
-  // edits the URL field.
-  const serviceBaseURL = providerType === "api" ? providerBaseURL : SERVICE_BASE_URLS[providerType];
+  // edits the URL field.  dsh-our-free-model's address is Core's own env
+  // reference (its worker picks a port per launch), so the field states that
+  // absence rather than printing a host the lane never contacts.
+  const serviceBaseURL = providerType === "api"
+    ? providerBaseURL
+    : SERVICE_BASE_URLS[providerType] || translate("common.notAvailable");
   const selectedServiceLabel = servicePickerItems.find((item) => item.type === providerType)?.label ?? servicePickerLabels[0] ?? "";
   const stepItems: Array<{ id: WizardStep; title: string }> = [
     { id: "provider", title: translate("providers.wizard.stepProvider") },
@@ -3772,9 +3803,19 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         return;
       }
       setFetchedModelCandidates(candidates);
-      // Every free model this lane serves is worth carrying by default; the
-      // user unchecks what they do not want before 完成.
-      setSelectedModels((current) => (current.length > 0 ? current : candidates));
+      // The groups this roster came with.  A read that states none leaves the
+      // list ungrouped rather than inventing a split.
+      const routes: Record<string, string[]> = {};
+      for (const [route, ids] of Object.entries(asRecord(summary.routes))) {
+        const names = stringList(ids).filter((name) => candidates.includes(name));
+        if (names.length > 0) routes[route] = names;
+      }
+      setLaneRoutes(routes);
+      // Nothing is checked until the user chooses.  A roster this long is not a
+      // shortlist: pre-selecting every free model would hand the entry a set
+      // nobody picked, and the same rule already governs every other service
+      // (a WorkBuddy entry is created with no models at all).
+      setSelectedModels((current) => current.filter((name) => candidates.includes(name)));
       setModelFetchState("ready");
     } finally {
       if (request === modelFetchRequest.current) modelFetchInFlight.current = false;
@@ -4520,7 +4561,11 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
                 {modelFetchState === "loading" ? <NativeBusySpinner label={translate("providers.wizard.fetchingModels")} /> : null}
                 <Text numberOfLines={2} style={styles.providerWizardHint}>{modelFetchState === "loading" ? translate("providers.wizard.fetchingModels") : modelCandidates.length > 0 ? translate("providers.wizard.modelsFound", { count: modelCandidates.length }) : modelFetchState === "unavailable" ? translate("providers.wizard.modelsUnavailable") : modelFetchState === "empty" ? translate("providers.wizard.modelsEmpty") : translate("providers.wizard.noModels")}</Text>
               </View>
-              <NativeButton title={translate("providers.wizard.refreshModels")} compact link busy={modelFetchState === "loading"} disabled={wizardBusy && modelFetchState !== "loading"} onPress={() => { void fetchOpenCode2DSHModels(); }} />
+              {/* The refresh button is gone while the read it starts is in
+                  flight: the row above already states that wait with the one
+                  wheel, and a control that would start the same read again has
+                  nothing to offer until this one answers. */}
+              {modelFetchState === "loading" ? null : <NativeButton title={translate("providers.wizard.refreshModels")} compact link disabled={wizardBusy} onPress={() => { void fetchOpenCode2DSHModels(); }} />}
             </View>
             {modelCandidates.length > 0 ? <View style={styles.providerWizardModelGroup}>
               <View style={styles.providerWizardModelGroupHeader}>
@@ -4534,8 +4579,24 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
                   <Text style={styles.providerWizardHint}>{translate("providers.wizard.selectedModels", { count: selectedModels.length })}</Text>
                 </View>
               </View>
+              {/* One block per group the upstream published, because the
+                  roster is not one list: what this egress can use and what its
+                  regional gate refuses are different answers about different
+                  models.  The split is the upstream's own — it states it beside
+                  the roster — so a row is never filed under a heading this pane
+                  decided for it. */}
               <View style={styles.providerWizardModelList}>
-                {modelCandidates.map((name) => <NativeCheckbox key={`lane:${name}`} label={name} value={selectedModels.includes(name)} disabled={wizardBusy} onValueChange={(checked) => { setSelectedModels((current) => checked ? (current.includes(name) ? current : [...current, name]) : current.filter((item) => item !== name)); setValidation(""); }} style={styles.providerWizardModelCheckbox} />)}
+                {laneRouteOrder(Object.keys(laneRoutes)).map((route) => {
+                  const names = laneRoutes[route] ?? [];
+                  if (names.length === 0) return null;
+                  return <View key={`lane-route:${route}`} style={styles.providerWizardModelSourceGroup}>
+                    <Text numberOfLines={1} style={styles.providerWizardHint}>{translate(route === LANE_ROUTE_REGION ? "providers.laneRoute.region" : "providers.laneRoute.main")} ({names.length})</Text>
+                    {names.map((name) => <NativeCheckbox key={`lane:${name}`} label={name} value={selectedModels.includes(name)} disabled={wizardBusy} onValueChange={(checked) => { setSelectedModels((current) => checked ? (current.includes(name) ? current : [...current, name]) : current.filter((item) => item !== name)); setValidation(""); }} style={styles.providerWizardModelCheckbox} />)}
+                  </View>;
+                })}
+                {/* A roster the upstream published no groups for is still a
+                    roster: it is listed whole, ungrouped, rather than hidden. */}
+                {Object.keys(laneRoutes).length === 0 ? modelCandidates.map((name) => <NativeCheckbox key={`lane:${name}`} label={name} value={selectedModels.includes(name)} disabled={wizardBusy} onValueChange={(checked) => { setSelectedModels((current) => checked ? (current.includes(name) ? current : [...current, name]) : current.filter((item) => item !== name)); setValidation(""); }} style={styles.providerWizardModelCheckbox} />) : null}
               </View>
             </View> : null}
             <Text style={styles.providerWizardModelSummary}>{translate("providers.wizard.modelsToAdd", { count: selectedModels.length })}</Text>
@@ -4545,21 +4606,20 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
             <View style={styles.providerWizardSectionHeader}><Text style={styles.providerWizardPanelTitle}>{translate("providers.wizard.models")}</Text><Text numberOfLines={1} style={styles.providerWizardHint}>{translate("providers.wizard.providerName")}: {selectedProviderName}</Text></View>
             {!usingProvidedKeyPath(keyPath) ? <View style={styles.providerWizardModelToolbar}>
               <View style={styles.providerWizardModelStatusRow}>
+                {/* One wheel for one wait.  The button beside this row draws
+                    its own when it is busy, so a spinner here as well spun two
+                    wheels for a single read; the body's block drew a third.
+                    What is left is the row's own, and the button states the
+                    same wait in the language of the control that started it. */}
                 {modelFetchState === "loading" ? <NativeBusySpinner label={translate("providers.wizard.fetchingModels")} /> : null}
                 <Text numberOfLines={2} style={styles.providerWizardHint}>{modelFetchState === "loading" ? translate("providers.wizard.fetchingModels") : modelCandidates.length > 0 ? translate("providers.wizard.modelsFound", { count: modelCandidates.length }) : modelFetchState === "unavailable" ? translate("providers.wizard.modelsUnavailable") : modelFetchState === "empty" ? translate("providers.wizard.modelsEmpty") : translate("providers.wizard.noModels")}</Text>
               </View>
-              <NativeButton title={translate("providers.wizard.refreshModels")} compact link busy={modelFetchState === "loading"} disabled={(wizardBusy && modelFetchState !== "loading") || !manualSelectedKeyName || (creatingProvider ? !serviceBaseURL.trim() : !providerID)} onPress={() => { void fetchWizardModels(); }} />
+              {modelFetchState === "loading" ? null : <NativeButton title={translate("providers.wizard.refreshModels")} compact link disabled={wizardBusy || !manualSelectedKeyName || (creatingProvider ? !serviceBaseURL.trim() : !providerID)} onPress={() => { void fetchWizardModels(); }} />}
             </View> : <View style={styles.providerWizardModelToolbar}>
               <Text numberOfLines={2} style={styles.providerWizardHint}>{modelCandidates.length > 0 ? translate("providers.wizard.modelsFound", { count: modelCandidates.length }) : translate("relay.resourcesNoModels")}</Text>
             </View>}{
-              /* The step has arrived and is working: the wheel says so in the
-                 body the user is looking at instead of leaving a still pane. */
-              modelFetchState === "loading"
-                ? <View style={styles.providerWizardModelLoading}>
-                    <NativeBusySpinner label={translate("providers.wizard.fetchingModels")} />
-                    <Text style={styles.providerWizardHint}>{translate("providers.wizard.fetchingModels")}</Text>
-                  </View>
-                : null
+              /* One wheel for one wait: the toolbar's row above already states
+                 it above, so no block repeats the same wait below. */
             }
             {modelCandidates.length > 0 ? <View style={styles.providerWizardModelGroup}>
               <View style={styles.providerWizardModelGroupHeader}><Text style={styles.providerWizardPanelTitle}>{translate(usingProvidedKeyPath(keyPath) ? "providers.wizard.providedModels" : "providers.wizard.discoveredModels")}</Text><Text style={styles.providerWizardHint}>{translate("providers.wizard.selectedModels", { count: selectedModels.length })}</Text></View>
@@ -6150,6 +6210,11 @@ function TablePane({ title, actions, wide, style, children }: { title: string; a
  * that own their own horizontal affordance.
  */
 const PersistentScrollView = React.forwardRef<ScrollView, ScrollViewProps & { onViewportHeightChange?: (height: number) => void; onContentHeightChange?: (height: number) => void }>(function PersistentScrollView({ style, contentContainerStyle, children, onViewportHeightChange, onContentHeightChange, onLayout, onContentSizeChange, ...props }, ref): React.JSX.Element {
+  // The indicator stays inside the scroll view: the native leaf resolves the
+  // scroll view by walking its ancestors (`nearestScrollView`), so lifting it
+  // out of the tree leaves it managing nothing.  It rides the content container
+  // instead, which is why its own frame must not depend on the content's
+  // height — see `persistentScrollIndicator`.
   return <ScrollView
     {...props}
     ref={ref}
@@ -6284,6 +6349,9 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
   // the number is zero — so the row is drawn only when there is one.
   const upstreamContextWindow = numberValue(model.upstream_context_window, 0) || undefined;
   const [upstreamContextHelpOpen, setUpstreamContextHelpOpen] = useState(false);
+  // Which pool of Our Free Model served this route.  Core derives it from the
+  // upstream id, so the pane reads it rather than re-deciding it.
+  const laneSource = stringValue(model.lane_source);
   // A managed slot is Core's own reference, so this route's key row answers
   // with the user's keys only; the auth-kind gate above then narrows that to
   // providers that have any.
@@ -6434,12 +6502,13 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
       {isDraftModel(model, translate) ? <Text style={styles.fieldHint}>{translate(selectedProviderKey ? "providers.draftModelHint" : "providers.draftModelKeylessHint")}</Text> : null}
       {providerKeyOptions.length > 0 ? <PickerField label={translate("providers.providerKey")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} allowShrink value={selectedProviderKey?.id ?? ""} values={[{ value: "", label: translate("providers.undefinedKey") }, ...providerKeyOptions]} disabled={busy} onSelect={selectProviderKey} /> : null}
       {bindingIssueText ? <Text style={styles.fieldHint}>{bindingIssueText}</Text> : null}
-      {service ? <View style={styles.formRow}>
+      {serviceRate.trim() ? <View style={styles.formRow}>
         <Text numberOfLines={1} style={styles.modelInspectorLabel}>{translate("providers.modelRate")}</Text>
-        {/* A rate the catalog states is printed as it states it.  A rate it
-            does not state stays blank: `无` would read as an upstream that
-            published no rate at all, which is a different fact from one whose
-            number this pane has not read yet. */}
+        {/* A rate the catalog states is printed as it states it.  A catalog
+            that states no rate draws no row at all: the label on its own would
+            read as a rate of nothing, and a blank beside a label is a value
+            the pane could not answer rather than one the upstream withheld.
+            The row therefore follows the number, not the service. */}
         <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{serviceRate.trim()}</Text>
       </View> : null}
       <TextField label={translate("providers.upstream")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} value={upstreamFieldValue} onDraftChange={(value) => drafts?.setModelUpstreamDraft(providerId, id, value)} onCommit={(upstream_model) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { upstream_model } })} />
@@ -6456,6 +6525,14 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
           <Text numberOfLines={1} style={styles.modelWindowText}>{publicModelTokensText(upstreamContextWindow, translate)}</Text>
           <HelpTip open={upstreamContextHelpOpen} text={translate("providers.upstreamContextWindowHelp")} title={translate("providers.upstreamContextWindowHelpTitle")} onToggle={() => setUpstreamContextHelpOpen((current) => !current)} />
         </View>
+      </View> : null}
+      {/* One lane serves several pools, and which one answered decides the
+          terms behind the row: the lane's own free roster is its own outlet,
+          while a namespaced id is one it forwards to.  A route from any other
+          provider has no source to state, so the row is absent there. */}
+      {laneSource ? <View style={styles.formRow}>
+        <Text numberOfLines={1} style={styles.modelInspectorLabel}>{translate("providers.laneSource")}</Text>
+        <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{translate(laneSource === LANE_ROUTE_REGION ? "providers.laneRoute.region" : "providers.laneRoute.main")}</Text>
       </View> : null}
       <View style={styles.orderEditorRow}>
         <TextField label={translate("providers.order")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} controlWidth={64} value={String(displayedOrder)} keyboardType="numeric" disabled={busy || followsMultiplier} onDraftChange={(value) => drafts?.setModelOrderDraft(providerId, id, value)} validate={(nextOrder) => {
@@ -6853,9 +6930,12 @@ function ProviderIdentityFields({ provider, providerID, relayStations, station, 
   // station is gone still states the address it kept.  A custom provider whose
   // URL happens to point at an official host stays a custom provider: `service`
   // is a fallback recognition for labels, never what decides a row here.
+  // dsh-our-free-model is addressed by Core's own `os.environ/` reference (its
+  // worker binds a port per launch), so its row reads that reference; the
+  // service table carries no address for it to show.
   const providerBaseURL = station
     ? station.origin
-    : isLogin ? SERVICE_BASE_URLS[kind as ServiceID]
+    : isLogin ? (SERVICE_BASE_URLS[kind as ServiceID] || stringValue(provider.endpoint, stringValue(provider.api_base)))
       : drafts?.providerBaseURL(provider) ?? stringValue(provider.endpoint, stringValue(provider.api_base));
   const commitBaseURL = (endpoint: string): void | Promise<void> => {
     if (station) return undefined;
@@ -10107,6 +10187,15 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
   const onlineUsageNext = Math.min(onlineUsageRemaining, ONLINE_USAGE_PAGE_ROWS);
   const onlineUsageLoadedPage = Math.max(1, numberValue(active?.page));
   const onlineUsagePageCount = Math.max(onlineUsageLoadedPage, numberValue(active?.page_count));
+  // What 上一页 actually returns is the page before this one, and only the last
+  // page can be short.  Keeping the window's own size: the step back is one
+  // page unless this is the last page, where the rows before it are the
+  // remainder.  A button that stated the page size on the first page promised
+  // 300 rows it would never load (`disabled` there), which is what read as a
+  // wrong count beside a six-row list.
+  const onlineUsagePrevious = onlineUsageLoadedPage > 1
+    ? Math.min(ONLINE_USAGE_PAGE_ROWS, onlineUsageTotal - (onlineUsageLoadedPage - 2) * ONLINE_USAGE_PAGE_ROWS)
+    : 0;
   const statusLine = [
     selected === "online-usage" && lineCount > 0
       ? translate("common.lines", { count: lineCount })
@@ -10416,7 +10505,12 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
         const option = onlineUsageTimeValues[nativeEvent.index];
         if (option) chooseOnlineUsageTime(option);
       }} style={styles.onlineUsageTimePicker} /></> : null}
-      <View style={styles.logActionsRow}>{selected === "online-usage" ? <NativePicker overlayLayer labels={onlineUsageSourceLabels} selectedValue={onlineUsagePendingLabel || (onlineUsageSourceIndex >= 0 ? onlineUsageSourceLabels[onlineUsageSourceIndex] ?? "" : "")} disabled={onlineUsageSourceLabels.length === 0} onChange={({ nativeEvent }) => { const source = onlineUsageSourceValues[nativeEvent.index]; if (source !== undefined) refreshOnlineUsage(source, onlineUsageSourceLabels[nativeEvent.index] ?? ""); }} style={styles.onlineUsageSourcePicker} /> : null}{selected === "recovery" ? <NativeButton title={translate("logs.clearRecoveryCooldown")} accessibilityLabel={translate("logs.clearRecoveryCooldown")} compact busy={cooldownClearPending} disabled={busy && !cooldownClearPending} onPress={clearCooldowns} style={styles.clearCooldownButton} /> : null}{onlineUsageLoadingSource ? <NativeBusySpinner label={translate("logs.onlineUsageLoading")} /> : null}<IconButton label="" symbol={paused ? "play" : "pause"} title={paused ? translate("common.resume") : translate("common.pause")} disabled={busy} onPress={togglePaused} /><IconButton label="" symbol="trash" title={translate("common.clearView")} disabled={busy} onPress={clearLogs} /></View>
+      {/* One wait, one wheel.  The empty surface below owns this wait: it draws
+          the wheel beside the sentence that names the source, and it keys on
+          `onlineUsageLoading`, which is every case this row's narrower
+          `onlineUsageLoadingSource` covered.  A wheel here as well spun two for
+          one read, the second one floating above the picker. */}
+      <View style={styles.logActionsRow}>{selected === "online-usage" ? <NativePicker overlayLayer labels={onlineUsageSourceLabels} selectedValue={onlineUsagePendingLabel || (onlineUsageSourceIndex >= 0 ? onlineUsageSourceLabels[onlineUsageSourceIndex] ?? "" : "")} disabled={onlineUsageSourceLabels.length === 0} onChange={({ nativeEvent }) => { const source = onlineUsageSourceValues[nativeEvent.index]; if (source !== undefined) refreshOnlineUsage(source, onlineUsageSourceLabels[nativeEvent.index] ?? ""); }} style={styles.onlineUsageSourcePicker} /> : null}{selected === "recovery" ? <NativeButton title={translate("logs.clearRecoveryCooldown")} accessibilityLabel={translate("logs.clearRecoveryCooldown")} compact busy={cooldownClearPending} disabled={busy && !cooldownClearPending} onPress={clearCooldowns} style={styles.clearCooldownButton} /> : null}<IconButton label="" symbol={paused ? "play" : "pause"} title={paused ? translate("common.resume") : translate("common.pause")} disabled={busy} onPress={togglePaused} /><IconButton label="" symbol="trash" title={translate("common.clearView")} disabled={busy} onPress={clearLogs} /></View>
     </View>
     {selected === "online-usage" ? <View style={styles.logRangeMessageSlot}>
       <Text numberOfLines={1} style={styles.logRangeError} accessibilityLiveRegion="polite">{onlineUsageRangeError}</Text>
@@ -10441,7 +10535,7 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
           html: readOnlyCodeEditorHtml(editorMenuLabels(translate)),
         });
       }} scrollToRow={selected === "online-usage" && onlineUsageScrollSourceRef.current === active?.source_id ? onlineUsageScrollToRow : -1} style={styles.logTable} /></View>{selected === "online-usage" ? <View style={styles.logPager}>
-        <NativeButton title={translate("logs.onlineUsagePrevious", { count: ONLINE_USAGE_PAGE_ROWS })} accessibilityLabel={translate("logs.onlineUsagePrevious", { count: ONLINE_USAGE_PAGE_ROWS })} compact disabled={onlineUsageLoadedPage <= 1 || onlineUsageLoading || onlineUsageTimePending} onPress={previousOnlineUsagePage} titleWidth="tight" />
+        <NativeButton title={translate("logs.onlineUsagePrevious", { count: onlineUsagePrevious })} accessibilityLabel={translate("logs.onlineUsagePrevious", { count: onlineUsagePrevious })} compact disabled={onlineUsageLoadedPage <= 1 || onlineUsageLoading || onlineUsageTimePending} onPress={previousOnlineUsagePage} titleWidth="tight" />
         <Text accessibilityLiveRegion="polite" style={styles.logPagerStatus}>{onlineUsagePagerStatus}</Text>
         <NativeButton title={onlineUsageLoadingMore ? translate("logs.onlineUsageLoadingMore") : translate("logs.onlineUsageNext", { count: onlineUsageNext })} accessibilityLabel={translate("logs.onlineUsageNext", { count: onlineUsageNext })} compact busy={onlineUsageLoadingMore} disabled={onlineUsageLoading || onlineUsageTimePending || onlineUsageRemaining <= 0} onPress={loadMoreOnlineUsage} titleWidth="tight" />
       </View> : null}</View>
@@ -11333,7 +11427,7 @@ const styles = StyleSheet.create({
   routeTraceNoSelectionText: { color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "center" },
   root: { flex: 1, minWidth: 420 },
   menuBarHost: { flex: 1 }, error: { margin: 20, color: systemColors.red, fontSize: UI_FONT_SIZE },
-  windowSurface: { flex: 1, position: "relative", backgroundColor: systemColors.window }, windowContent: { flexGrow: 1, paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, gap: 8 }, windowContentFixed: { flex: 1, minHeight: 0 }, fileEditorRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providersContent: { paddingBottom: 6, gap: 6 }, providerWizardRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providerWizardSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, logsContent: { paddingHorizontal: 12, paddingTop: 36, paddingBottom: 0 }, runtimeContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, dataManagementContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, assistantSettingsContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, windowTitleBlock: { paddingHorizontal: 20, paddingTop: 12, paddingBottom: 3, gap: 3 }, windowTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
+  windowSurface: { flex: 1, position: "relative", backgroundColor: systemColors.window }, windowContent: { flexGrow: 1, paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, gap: 8 }, windowContentFixed: { flex: 1, minHeight: 0 }, fileEditorRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providersContent: { paddingBottom: 6, gap: 6 }, providerWizardRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providerWizardSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, logsContent: { paddingHorizontal: 12, paddingTop: 12, paddingBottom: 0 }, runtimeContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, dataManagementContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, assistantSettingsContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, windowTitleBlock: { paddingHorizontal: 20, paddingTop: 12, paddingBottom: 3, gap: 3 }, windowTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
   // Settings window: a native source-list sidebar next to the active pane.
   settingsShell: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row" }, settingsSidebar: { width: 200, flexShrink: 0, minHeight: 0 }, settingsSidebarHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 16, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarAppIcon: { width: SETTINGS_HEADER_CONTENT_HEIGHT, height: SETTINGS_HEADER_CONTENT_HEIGHT, borderRadius: 4 }, settingsSidebarTitle: { color: systemColors.label, fontSize: SOURCE_LIST_FONT_SIZE, fontWeight: "600" }, settingsSidebarSpacer: { flex: 1, minHeight: 8 }, settingsSidebarList: { flex: 1, minHeight: 0 }, settingsRail: { width: SETTINGS_RAIL_WIDTH, flexShrink: 0, minHeight: 0, paddingTop: 6, overflow: "hidden" }, settingsRailList: { flex: 1, minHeight: 0 }, settingsRailDivider: { position: "absolute", top: 0, bottom: 0, right: 0, width: 1, backgroundColor: systemColors.separator }, settingsRailDetail: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsRailDetailHeader: { minHeight: 50, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 14, paddingVertical: 8, backgroundColor: systemColors.window }, settingsRailDetailTitleBlock: { flex: 1, minWidth: 0, gap: 2 }, settingsRailDetailActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, settingsRailDetailTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, settingsRailDetailHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16 }, settingsDetail: { minWidth: 0, flex: 1, paddingTop: SETTINGS_TITLEBAR_INSET }, settingsDetailBody: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsDetailBodyBare: { backgroundColor: "transparent" }, settingsDetailPane: { flex: 1, minWidth: 0 }, settingsPaneHeader: { flexShrink: 0, paddingHorizontal: 20, paddingTop: 10, paddingBottom: 8 }, settingsPaneTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600", lineHeight: SETTINGS_HEADER_CONTENT_HEIGHT },  routeStatusBar: { minHeight: 24, flexShrink: 0, justifyContent: "center", paddingHorizontal: 16, paddingVertical: 4, borderTopWidth: 1, borderTopColor: systemColors.separator }, routeStatusText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE },
   generalScroll: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, generalContent: { paddingTop: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, paddingBottom: 16, gap: 18 }, generalSection: { gap: 4 }, generalSectionTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, generalRow: { ...SETTINGS_FIELD_ROW_INDENTED }, generalRowLabel: { ...SETTINGS_FIELD_LABEL }, generalRowValue: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, generalToggle: { ...SETTINGS_FIELD_SWITCH_SLOT }, generalHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }, generalHelpText: { ...SETTINGS_FIELD_HELP_TEXT }, generalServiceAction: { minWidth: 96 }, providerToolbar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardToolbarButton: { minWidth: 104 }, toolbarSpacer: { flex: 1 }, windowTabsRow: { flex: 1, minWidth: 0, height: 28, flexDirection: "row", alignItems: "center", gap: 8 }, windowTabsToolbarRow: { flex: 1, minWidth: 0, width: "100%", height: 24, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 6, overflow: "hidden" }, windowTabs: { width: 224, height: 24 }, windowTabsWithActions: { flexShrink: 1 }, windowTabsActions: { flex: 1, minWidth: 0, maxWidth: 400, marginLeft: "auto", flexShrink: 0 },
@@ -11353,7 +11447,7 @@ const styles = StyleSheet.create({
   providerAuthLine: { color: systemColors.label, fontSize: UI_FONT_SIZE },
   officialActiveHint: { color: systemColors.green, fontSize: UI_TIP_FONT_SIZE, fontWeight: "600" },
   officialActionsRow: { minHeight: 28, flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 6 },
-  providerWizardHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerWizardDescription: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 17 }, providerWizardSectionHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardPanelTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerWizardFormSection: { width: "100%", maxWidth: 520, paddingVertical: 0, gap: 10 }, providerWizardModelScroll: { flex: 1, minHeight: 0, width: "100%" }, providerWizardModelScrollContent: { width: "100%", paddingBottom: 8 }, providerWizardModelToolbar: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 8 }, providerWizardModelStatusRow: { flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardModelLoading: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardModelGroup: { gap: 6, paddingTop: 4 }, providerWizardModelGroupHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }, providerWizardModelGroupTools: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, providerWizardModelList: { borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground, paddingHorizontal: 8, paddingVertical: 5, gap: 1 }, providerWizardModelCheckbox: { width: "100%", minHeight: 24 }, providerWizardManualModelRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardManualModelCheckbox: { flex: 1, minWidth: 0 }, providerWizardManualModelUpstream: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE }, providerWizardModelSummary: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "500", paddingTop: 4 }, providerWizardModeControl: { width: "100%", height: 26, flexShrink: 0 }, providerWizardPicker: { width: "100%", minWidth: 0, height: 26 }, providerWizardInput: { width: "100%", minHeight: 26, color: systemColors.label, fontSize: UI_FONT_SIZE }, providerWizardSecretInput: { width: "100%", minHeight: 26 }, providerWizardHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15, paddingVertical: 2 }, providerWizardFooter: { minHeight: 46, paddingHorizontal: 20, paddingVertical: 8, flexDirection: "row", alignItems: "center", gap: 6, borderTopWidth: 0, backgroundColor: systemColors.window }, providerWizardFooterSpacer: { flex: 1 }, providerWizardFooterStatus: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, providerWizardFooterActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 },
+  providerWizardHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerWizardDescription: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 17 }, providerWizardSectionHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardPanelTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerWizardFormSection: { width: "100%", maxWidth: 520, paddingVertical: 0, gap: 10 }, providerWizardModelScroll: { flex: 1, minHeight: 0, width: "100%" }, providerWizardModelScrollContent: { width: "100%", paddingBottom: 8 }, providerWizardModelToolbar: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 8 }, providerWizardModelStatusRow: { flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardModelGroup: { gap: 6, paddingTop: 4 }, providerWizardModelGroupHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }, providerWizardModelGroupTools: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, providerWizardModelList: { borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground, paddingHorizontal: 8, paddingVertical: 5, gap: 1 }, providerWizardModelSourceGroup: { minWidth: 0, gap: 1, paddingTop: 2 }, providerWizardModelCheckbox: { width: "100%", minHeight: 24 }, providerWizardManualModelRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardManualModelCheckbox: { flex: 1, minWidth: 0 }, providerWizardManualModelUpstream: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE }, providerWizardModelSummary: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "500", paddingTop: 4 }, providerWizardModeControl: { width: "100%", height: 26, flexShrink: 0 }, providerWizardPicker: { width: "100%", minWidth: 0, height: 26 }, providerWizardInput: { width: "100%", minHeight: 26, color: systemColors.label, fontSize: UI_FONT_SIZE }, providerWizardSecretInput: { width: "100%", minHeight: 26 }, providerWizardHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15, paddingVertical: 2 }, providerWizardFooter: { minHeight: 46, paddingHorizontal: 20, paddingVertical: 8, flexDirection: "row", alignItems: "center", gap: 6, borderTopWidth: 0, backgroundColor: systemColors.window }, providerWizardFooterSpacer: { flex: 1 }, providerWizardFooterStatus: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, providerWizardFooterActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 },
   routeTablePane: { flex: 1, minWidth: 0, minHeight: 0 },
   // The model detail's own label column, so every row in that pane — the
   // fields, the rate row, the protocol pickers, and the window row — draws its

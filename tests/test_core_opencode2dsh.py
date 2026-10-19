@@ -325,6 +325,32 @@ class OpenCode2DSHProviderTests(unittest.TestCase):
             self.assertEqual(summary["auth_kind"], "opencode2dsh_login")
             self.assertEqual(domain.snapshot()["providers"], [])
 
+    def test_the_store_summary_carries_the_account_kind_it_routes_on(self) -> None:
+        """A store summary states each provider's account kind, not just its key.
+
+        ``CoreStore.snapshot()['providers_models']['providers']`` is the list
+        the pane falls back to when the domain detail is absent, and the pane
+        routes each row to ``service_provider.delete`` or ``provider.delete``
+        on ``auth_kind``.  A summary that dropped it made every login-backed
+        row read as an API-key provider: the delete went to the ordinary
+        action, Core refused it ("Login providers are managed in Service
+        Provider Management"), and the lane entry could not be removed at all.
+        """
+
+        directory, domain, _config = self._domain()
+        with directory:
+            domain.dispatch("service_provider.add", {"kind": "opencode2dsh_login"})
+            store = CoreStore(domains=[domain])
+            summary = store.snapshot()["providers_models"]["providers"]
+            self.assertEqual(1, len(summary))
+            row = summary[0]
+            self.assertEqual("opencode2dsh_login", row["auth_kind"])
+            self.assertTrue(row["auth_status"])
+            # The detail record keeps saying the same thing, so a pane reading
+            # either projection reaches the same action for this row.
+            detail = store.snapshot()["domains"]["providers_models"]["providers"][0]
+            self.assertEqual(detail["auth_kind"], row["auth_kind"])
+
     def test_a_route_reports_the_window_the_lane_publishes_for_it(self) -> None:
         """The free lane's own catalog is the authority for its routes' windows.
 
@@ -414,6 +440,91 @@ class OpenCode2DSHProviderTests(unittest.TestCase):
                 "service_provider.add", {"kind": "opencode2dsh_login"}
             )["providers"][0]
             self.assertIsNone(provider["models"][0]["upstream_context_window"])
+
+    def test_a_snake_case_catalog_window_reaches_its_route(self) -> None:
+        """The lane states ``context_window``, and that is the spelling read.
+
+        WorkBuddy's catalog states camelCase (``contextWindow``) and this lane
+        states the snake_case keys a public OpenAI record uses.  Reading only
+        the camelCase ones recorded nothing at all for every dsh-our-free-model
+        route, so the model pane fell back to the registry's default for the
+        public name and showed a window the upstream never stated.
+        """
+
+        runtime = StubRuntime()
+        runtime.models = lambda provider=opencode2dsh.OPENCODE2DSH_PROVIDER, refresh=False: {
+            "available": True,
+            "detail": "",
+            "source": "adapter",
+            "models": [
+                {"id": "deepseek-v4.1-flash-free", "context_window": 1_048_576},
+                {"id": "jev-1.13-free", "context_window": 32_768},
+            ],
+            "status": runtime.provider_status(provider),
+        }
+        directory, domain, _config = self._domain(runtime)
+        with directory:
+            provider = domain.dispatch(
+                "service_provider.add", {"kind": "opencode2dsh_login"}
+            )["providers"][0]
+            windows = {
+                model["upstream_model"]: model["upstream_context_window"]
+                for model in provider["models"]
+            }
+            self.assertEqual(
+                {"deepseek-v4.1-flash-free": 1_048_576, "jev-1.13-free": 32_768},
+                windows,
+            )
+            # A catalog that states no picker groups gives no group label; the
+            # pane must not invent one from an id this side decided.
+            self.assertEqual(
+                {"deepseek-v4.1-flash-free": None, "jev-1.13-free": None},
+                {
+                    model["upstream_model"]: model["lane_source"]
+                    for model in provider["models"]
+                },
+            )
+
+    def test_each_route_states_the_group_the_upstream_put_it_in(self) -> None:
+        """The pane reports the upstream's picker groups, not one of its own.
+
+        The lane publishes two groups beside its roster — what this egress can
+        use, and what its regional gate refuses but keeps visible.  Which model
+        is in which is the upstream's answer, so a route reports the group named
+        in that same read; deriving it from the id shape here would file a model
+        under a heading the upstream never used.
+        """
+
+        runtime = StubRuntime()
+        runtime.models = lambda provider=opencode2dsh.OPENCODE2DSH_PROVIDER, refresh=False: {
+            "available": True,
+            "detail": "",
+            "source": "adapter",
+            "models": [
+                {"id": "usable-free", "context_window": 262_144},
+                {"id": "muse-spark-1.2-contributor-free", "context_window": 131_072},
+            ],
+            "routes": {
+                "our-free-model": ["usable-free"],
+                "our-free-model-region": ["muse-spark-1.2-contributor-free"],
+            },
+            "status": runtime.provider_status(provider),
+        }
+        directory, domain, _config = self._domain(runtime)
+        with directory:
+            provider = domain.dispatch(
+                "service_provider.add", {"kind": "opencode2dsh_login"}
+            )["providers"][0]
+            self.assertEqual(
+                {
+                    "usable-free": "our-free-model",
+                    "muse-spark-1.2-contributor-free": "our-free-model-region",
+                },
+                {
+                    model["upstream_model"]: model["lane_source"]
+                    for model in provider["models"]
+                },
+            )
 
     def test_the_model_pane_lists_the_lane_roster_instead_of_asking_the_wrong_address(self) -> None:
         """获取模型 on a lane provider reads the lane's own catalog.

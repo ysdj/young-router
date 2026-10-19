@@ -177,6 +177,24 @@ async function main(argv) {
     ...stores,
     attributionUserAgent: 'our-free-model',
   })
+  // The upstream publishes two picker routes for one roster: everything this
+  // egress can use, and the models its regional gate refuses.  Our gateway
+  // answers with one flat listing, so the split never reached this side and the
+  // pane could not show it.  It is read from the runtime's own membership — the
+  // same value the upstream's picker groups by — rather than re-derived here,
+  // so this side never invents a division the probe did not make.
+  const routeMembership = () => {
+    try {
+      const membership = runtime.state()?.membership ?? {}
+      const routes = {}
+      for (const [route, ids] of Object.entries(membership)) {
+        if (Array.isArray(ids)) routes[route] = ids.map(id => String(id))
+      }
+      return routes
+    } catch {
+      return {}
+    }
+  }
   let timer
   let refreshInFlight
   let initialRefresh
@@ -235,13 +253,13 @@ async function main(argv) {
       }
       if (req.method === 'GET' && url.pathname === '/control/models') {
         await (initialRefresh ?? Promise.resolve())
-        json(res, 200, { ok: true, models: await catalogueDocument(listener, token) })
+        json(res, 200, { ok: true, models: await catalogueDocument(listener, token), routes: routeMembership() })
         return
       }
       if (req.method === 'POST' && url.pathname === '/control/refresh') {
         const body = await readJson(req)
         await refreshCatalog(body.probe === true)
-        json(res, 200, { ok: true, models: await catalogueDocument(listener, token) })
+        json(res, 200, { ok: true, models: await catalogueDocument(listener, token), routes: routeMembership() })
         return
       }
       if (req.method === 'POST' && url.pathname === '/control/shutdown') {

@@ -25,6 +25,7 @@
         "LiteLLMAppKitTextEditor": "LiteLLMAppKitTextEditorComponentView",
         "LiteLLMAppKitCodeWebView": "LiteLLMAppKitCodeWebViewComponentView",
         "LiteLLMAppKitPersistentScrollIndicator": "LiteLLMAppKitPersistentScrollIndicatorComponentView",
+        "LiteLLMAppKitBusySpinner": "LiteLLMAppKitBusySpinnerComponentView",
         "LiteLLMAppKitSecureTextInput": "LiteLLMAppKitSecureTextInputComponentView",
         "LiteLLMAppKitSplitView": "LiteLLMAppKitSplitViewComponentView"
       }

@@ -2639,7 +2639,7 @@ private enum NativeRelayOriginPolicy {
         }
         switch route {
         case "home": return localized("routeHome", fallback: "Young Router")
-        case "provider-wizard": return "LiteLLM " + localized("routeProviderWizard", fallback: "Add Provider")
+        case "provider-wizard": return localized("routeProviderWizard", fallback: "Add Provider")
         case "file-editor": return localized("routeFileEditor", fallback: "Edit File")
         default: return nil
         }

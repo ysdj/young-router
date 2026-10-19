@@ -24,7 +24,7 @@ from young_router.core.domains.relay_accounts import RelayAccountsDomain
 from young_router.core.domains.runtime import RuntimeSettingsDomain
 from young_router.core.domains.webdav import WebDAVSettingsDomain
 from young_router.core.domains._shared import DomainError
-from young_router.core.operations import CoreServiceController
+from young_router.core.operations import CoreServiceController, _provider_config_source
 
 from young_router.webdav import core as webdav_core  # noqa: E402
 from young_router.core.persistence import PersistenceError
@@ -1130,6 +1130,57 @@ class CoreOperationsTests(unittest.TestCase):
                 source.read_bytes(),
                 (root / ".litellm-runtime" / "config.yaml").read_bytes(),
             )
+
+    def test_a_restage_stages_the_document_the_provider_editor_writes(self) -> None:
+        """Staging reads the editor's document, never a stale sibling beside it.
+
+        With ``LITELLM_CONFIG_FILE`` unset — which is the packaged default — the
+        service controller's ``paths.config`` resolves to ``<root>/config.yaml``
+        while the provider editor writes ``<root>/.litellm-runtime/config.yaml``.
+        Staging the former copied a document the editor never touched back over
+        the committed one, so a provider the user deleted came back on the next
+        restart and the pane could not make the deletion stick.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / ".litellm-runtime"
+            runtime.mkdir(parents=True)
+            committed = runtime / "config.yaml"
+            committed.write_text(
+                textwrap.dedent(
+                    """
+                    providers:
+                      kept: &kept_provider
+                        api_base: "https://kept.example/v1"
+                    model_list: []
+                    """
+                ).lstrip(),
+                encoding="utf-8",
+            )
+            # The stale sibling still names a provider the user deleted.  It is
+            # the file the packaged defaults made the old staging read.
+            (root / "config.yaml").write_text(
+                textwrap.dedent(
+                    """
+                    providers:
+                      kept: &kept_provider
+                        api_base: "https://kept.example/v1"
+                      deleted: &deleted_provider
+                        api_base: "https://deleted.example/v1"
+                    model_list: []
+                    """
+                ).lstrip(),
+                encoding="utf-8",
+            )
+
+            controller = CoreServiceController(root)
+            self.assertEqual(committed, _provider_config_source(controller.paths))
+            controller._stage_runtime_config()
+
+            staged = committed.read_text(encoding="utf-8")
+            self.assertIn("kept:", staged)
+            self.assertNotIn("deleted:", staged)
 
     def test_service_start_appends_proxy_output_to_service_log(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

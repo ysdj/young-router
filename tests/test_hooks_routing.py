@@ -61,6 +61,50 @@ class HookRoutingTests(HookTestCase):
         diagnostic = hooks._recovery_diagnostic(forbidden)
         self.assertNotIn("secret-token-should-not-appear", json.dumps(diagnostic))
 
+    def test_thinking_replay_refusal_keeps_looking_instead_of_ending_the_turn(self) -> None:
+        """A route that refuses a replay without its thinking is not the last word.
+
+        Observed on one DeepSeek thinking route: after the group's earlier routes
+        answered 429/502, this one refused the replayed history with HTTP 400
+        ``the `reasoning_text` in the thinking mode must be passed back to the
+        api``.  Read as a deterministic request error it ended the turn as
+        ``upstream_route_failure`` -- a retry tip the user cannot act on, for a
+        history another route answers fine.  The refusal belongs to the attempt,
+        never to the whole turn.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        self.set_env(hooks._RECOVERY_POLICY_REQUEST_ERROR_ENV, None)
+
+        reasoning_text = RuntimeError(
+            'litellm.BadRequestError: OpenAIException - {"error":{"message":'
+            '"the `reasoning_text` in the thinking mode must be passed back to the api."}}'
+        )
+        reasoning_text.status_code = 400
+        reasoning_content = RuntimeError(
+            "litellm.BadRequestError: OpenAIException - "
+            "The `reasoning_content` in the thinking mode must be passed back to the API."
+        )
+        reasoning_content.status_code = 400
+
+        for refusal in (reasoning_text, reasoning_content):
+            self.assertEqual(
+                hooks._recovery_policy_for_exception(refusal),
+                "recovery",
+            )
+            self.assertNotEqual(
+                hooks._recovery_policy_for_exception(refusal),
+                "error",
+            )
+            self.assertFalse(
+                hooks._is_deployment_compatible_bad_request_error(refusal),
+            )
+
+        # An ordinary 400 is still the request's own verdict.
+        invalid = RuntimeError("OpenAIException invalid_request_error: invalid input")
+        invalid.status_code = 400
+        self.assertEqual(hooks._recovery_policy_for_exception(invalid), "error")
+
     def test_recovery_policy_defaults_match_error_boundaries(self) -> None:
         hooks, _proxy_server = load_hook_module()
         self.set_env(hooks._RECOVERY_POLICY_RATE_LIMIT_ENV, None)

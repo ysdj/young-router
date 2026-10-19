@@ -16,6 +16,7 @@ import NativeAppKitSwitch from "./macos/NativeToggleNativeComponent";
 import NativeAppKitTable from "./macos/NativeTableNativeComponent";
 import NativeAppKitTextEditor from "./macos/NativeTextEditorNativeComponent";
 import NativeAppKitPersistentScrollIndicator from "./macos/NativePersistentScrollIndicatorNativeComponent";
+import NativeAppKitBusySpinner from "./macos/NativeBusySpinnerNativeComponent";
 import NativeAppKitSecureTextInput from "./macos/NativeSecureTextInputNativeComponent";
 import NativeAppKitSplitView from "./macos/NativeSplitViewNativeComponent";
 
@@ -99,6 +100,12 @@ export function AppKitTextEditor({ value, documentKey, readOnly, wrap, onChangeT
 
 export function AppKitPersistentScrollIndicator({ style }: { style?: StyleProp<ViewStyle> }): React.JSX.Element {
   return <NativeAppKitPersistentScrollIndicator enabled pointerEvents="none" style={style} />;
+}
+
+/// The app's one busy wheel (`AppKitBusySpinner`), mounted as a native view so a
+/// standalone wait spins exactly like the 分组管理 sheet's and the busy button's.
+export function AppKitBusySpinner({ accessibilityLabel, running = true, style }: { accessibilityLabel?: string; running?: boolean; style?: StyleProp<ViewStyle> }): React.JSX.Element {
+  return <NativeAppKitBusySpinner accessibilityLabel={accessibilityLabel} running={running} pointerEvents="none" style={style} />;
 }
 
 export type SecureTextInputState = {

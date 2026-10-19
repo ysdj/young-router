@@ -406,6 +406,9 @@ class ProvidersModelsDomain:
         # for, so no projection ever pays for one.
         self._catalog_windows: dict[str, dict[str, int]] = {}
         self._listing_windows: dict[str, dict[str, int]] = {}
+        # Which picker group each lane model belongs to, as the upstream stated
+        # it in the same answer that named the model.
+        self._lane_routes: dict[str, dict[str, str]] = {}
         self.revision = 0
         self.reload()
 
@@ -860,6 +863,13 @@ class ProvidersModelsDomain:
                         # same reason it is worth showing: no one here decides
                         # it, and it is what the route will actually accept.
                         "upstream_context_window": self._published_window(provider, model),
+                        # Which pool of this lane serves the route.  Derived
+                        # from the upstream id, exactly as the window above is
+                        # read from what the catalog states, so it survives
+                        # the round-trip through a saved document that keeps
+                        # only the keys it knows.  Absent for every lane but
+                        # this one, and for a route no catalog answered for.
+                        "lane_source": self._lane_source(provider, model),
                         "binding_health": self._binding_health(model, keys_by_id),
                         "enabled": model_enabled,
                         "model_enabled": model_enabled,
@@ -2502,6 +2512,10 @@ class ProvidersModelsDomain:
         # known before the provider exists: a route added from this roster
         # reports its upstream's number without paying for a second read.
         self._remember_published_windows(provider_id, document.get("models"))
+        # The picker split this roster came with.  Recorded beside the windows
+        # for the same reason: a saved route reports the group its own catalog
+        # put it in, and a projection may not guess one.
+        self._remember_lane_routes(provider_id, document.get("routes"))
         models: list[dict[str, Any]] = []
         for entry in document.get("models") or []:
             if not isinstance(entry, Mapping):
@@ -2830,13 +2844,26 @@ class ProvidersModelsDomain:
                 # made a route look full at a third of its capacity.  The
                 # accepted set is the larger number whenever the upstream
                 # states one at all.
+                #
+                # The spellings cover both vocabularies an integration uses.
+                # WorkBuddy's catalog states camelCase (``contextWindow``),
+                # while the free-model gateway states the snake_case ones a
+                # public OpenAI record uses (``context_window``,
+                # ``context_length``).  Reading only the camelCase keys left
+                # every dsh-our-free-model route with no recorded window at
+                # all, so the pane fell back to the registry's default for the
+                # public name and reported a number its own upstream never
+                # stated.
                 stated = [
                     number
                     for number in (
                         _positive_int(entry.get("maxInputTokens")),
                         _largest(entry.get("supportedContextWindows")),
                         _positive_int(entry.get("contextWindow")),
+                        _positive_int(entry.get("context_window")),
+                        _positive_int(entry.get("context_length")),
                         _positive_int(entry.get("defaultContextWindow")),
+                        _positive_int(entry.get("max_input_tokens")),
                     )
                     if number is not None
                 ]
@@ -2846,6 +2873,28 @@ class ProvidersModelsDomain:
                 windows[model_id] = window
         if windows:
             self._catalog_windows[provider_id] = windows
+
+    def _remember_lane_routes(self, provider_id: str, routes: object) -> None:
+        """Remember which picker group the upstream put each model in.
+
+        The lane publishes two groups — everything this egress can use, and the
+        models its regional gate refuses — and the membership is the upstream's
+        own answer, not something this side can derive from an id.  Kept beside
+        the published windows for the same reason: the pane reports it, and a
+        projection may not start a worker to ask again.
+        """
+
+        membership: dict[str, str] = {}
+        if isinstance(routes, Mapping):
+            for route, ids in routes.items():
+                name = str(route or "").strip()
+                if not name or not isinstance(ids, Sequence) or isinstance(ids, (str, bytes, bytearray)):
+                    continue
+                for model_id in ids:
+                    if isinstance(model_id, str) and model_id.strip():
+                        membership[model_id] = name
+        if membership:
+            self._lane_routes[provider_id] = membership
 
     def _remember_listing_windows(self, provider_id: str, windows: Mapping[str, int]) -> None:
         """Remember the windows one provider's own ``/v1/models`` listing stated.
@@ -2889,13 +2938,38 @@ class ProvidersModelsDomain:
         stored = self._catalog_windows.get(provider_id)
         return stored.get(model_id) if isinstance(stored, Mapping) else None
 
+    def _lane_source(
+        self,
+        provider: Mapping[str, Any],
+        model: Mapping[str, Any],
+    ) -> str | None:
+        """The picker group this lane serves one route from, or ``None``.
+
+        Read from the membership the upstream published with its roster, never
+        re-derived here: the upstream decides which models this egress can use
+        and which its regional gate refuses, and the saved document keeps no
+        such key.  Read only for a provider that authenticates as this lane, so
+        a custom provider addressing the same host by hand is not labelled with
+        a group it was never imported from.
+        """
+
+        if self._provider_auth_state(provider)["kind"] not in opencode2dsh_module.OPENCODE2DSH_AUTH_KINDS:
+            return None
+        model_id = self._wire_model_name(model)
+        if not model_id:
+            return None
+        provider_id = opencode2dsh_module.AUTH_KIND_TO_PROVIDER.get(
+            self._provider_auth_state(provider)["kind"]
+        )
+        stored = self._lane_routes.get(provider_id or "")
+        return stored.get(model_id) if isinstance(stored, Mapping) else None
+
     def _published_rate(
         self,
         provider: Mapping[str, Any],
         model: Mapping[str, Any],
     ) -> float | None:
         """The rate this route's own account publishes for it, if any."""
-
         auth_kind = self._provider_auth_state(provider)["kind"]
         if auth_kind not in managed_adapters.rate_publishing_auth_kinds():
             return None

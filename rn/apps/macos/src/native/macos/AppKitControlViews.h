@@ -35,6 +35,11 @@ NS_ASSUME_NONNULL_BEGIN
 @interface LiteLLMAppKitPersistentScrollIndicatorComponentView : RCTViewComponentView
 @end
 
+/// The app's one busy wheel as a React control: draws `AppKitBusySpinner`'s
+/// frames, so a standalone wait and the 分组管理 sheet spin alike.
+@interface LiteLLMAppKitBusySpinnerComponentView : RCTViewComponentView
+@end
+
 @interface LiteLLMAppKitSecureTextInputComponentView : RCTViewComponentView
 @end
 

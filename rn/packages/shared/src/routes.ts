@@ -67,9 +67,13 @@ export const DESKTOP_ROUTES: readonly AppRoute[] = ["home", ...ROUTES.map(({ id 
 
 export const LOG_TABS: readonly LogTab[] = [
   "requests",
+  // 路由跟踪 reads the same request stream as 请求 and sits beside it: the two
+  // answer the same question at different depths (what was sent, and which
+  // route carried it), so the tab that used to sit four places away moved
+  // next to the one it explains.
+  "route-trace",
   "service",
   "actions",
-  "route-trace",
   "recovery",
   "online-usage",
 ];

@@ -937,8 +937,21 @@ def _recovery_policy_for_exception(exception: Exception) -> str:
         or _is_upstream_gateway_bad_request_error(exception)
         or _is_image_parameter_or_capability_bad_request_error(exception)
         or _is_deployment_compatible_bad_request_error(exception)
-        or status_code in {400, 401, 403, 404, 405, 409, 422}
     ):
+        return _recovery_policy_setting(
+            _RECOVERY_POLICY_REQUEST_ERROR_ENV,
+            _RECOVERY_POLICY_ERROR,
+        )
+
+    if _is_thinking_replay_contract_error(exception):
+        # The route that refused is not broken -- it refuses a history that
+        # dropped its own out-of-band thinking, and another route can answer
+        # the same history. It is read as a refusal of this attempt, so the
+        # group keeps looking instead of ending the turn with
+        # ``upstream_route_failure`` after every other route had already
+        # refused for its own reason.
+        return _RECOVERY_POLICY_RECOVERY
+    if status_code in {400, 401, 403, 404, 405, 409, 422}:
         return _recovery_policy_setting(
             _RECOVERY_POLICY_REQUEST_ERROR_ENV,
             _RECOVERY_POLICY_ERROR,
@@ -7346,6 +7359,8 @@ def _is_responses_endpoint_not_found_error(
 def _is_deployment_compatible_bad_request_error(exception: Exception) -> bool:
     if _exception_status_code(exception) != 400:
         return False
+    if _is_thinking_replay_contract_error(exception):
+        return False
     if _is_responses_schema_unsupported_error(exception):
         return False
     if _is_upstream_gateway_bad_request_error(exception):
@@ -7393,6 +7408,32 @@ def _is_deployment_compatible_bad_request_error(exception: Exception) -> bool:
     ):
         return False
     return True
+
+
+def _is_thinking_replay_contract_error(exception: Exception) -> bool:
+    """Whether a route refused the replay because its thinking was not echoed.
+
+    A thinking-mode route (DeepSeek's ``deepseek-flash`` is the one observed)
+    keeps a per-turn reasoning field out of band: it answers a turn whose
+    thinking it produced and, on the next call, refuses a history that dropped
+    that field with ``the `reasoning_text` in the thinking mode must be passed
+    back to the api`` (some spellings say ``reasoning_content``).
+
+    That refusal is about *this* replay, not about the model, the account, or
+    the request's shape: another route answers the same history without it.
+    Reading it as a deterministic request error made the last route of a
+    cooled-down group end the turn as ``upstream_route_failure`` -- after every
+    other route had already refused for its own reason -- so the client showed
+    a retry tip for a failure the user could not act on. Classified here, the
+    group keeps looking for a route that can answer instead of ending the turn.
+    """
+
+    if _exception_status_code(exception) != 400:
+        return False
+    text = _exception_text(exception).lower()
+    if "thinking mode" not in text and "reasoning_text" not in text:
+        return False
+    return "must be passed back" in text or "reasoning_content" in text
 
 
 def _is_responses_schema_unsupported_error(exception: Exception) -> bool:

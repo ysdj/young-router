@@ -860,6 +860,34 @@ def _model_names(payload: object) -> list[str]:
         candidates = candidates.get("models", candidates.get("items", []))
     if not isinstance(candidates, Sequence) or isinstance(candidates, (str, bytes, bytearray)):
         return []
+    return _model_names_from(candidates)
+
+
+def _answered_model_names(payload: object) -> list[str] | None:
+    """This payload's model list, or ``None`` when it is not a model list at all.
+
+    ``_model_names`` answers ``[]`` for both an empty catalog and a body this
+    reader did not recognise, which is right for a stored value and wrong for a
+    live read: a station that answers ``{"detail": "..."}`` with status 200
+    taught this caller nothing, and reading that as "no models" is what let one
+    failed read empty a row.  A caller that persists an *answer* uses this one,
+    so an unrecognised body keeps the catalog it already has.
+    """
+
+    data = _json_data(payload)
+    if isinstance(data, Mapping):
+        if "models" in data:
+            data = data["models"]
+        elif "items" in data:
+            data = data["items"]
+        else:
+            return None
+    if not isinstance(data, Sequence) or isinstance(data, (str, bytes, bytearray)):
+        return None
+    return _model_names_from(data)
+
+
+def _model_names_from(candidates: Sequence[object]) -> list[str]:
     result: list[str] = []
     seen: set[str] = set()
     for item in candidates:
@@ -3985,7 +4013,7 @@ class RelayAccountsDomain:
                     values[token_id] = value
         return values
 
-    def _newapi_group_models(self, account: Mapping[str, Any], group_id: str) -> list[str]:
+    def _newapi_group_models(self, account: Mapping[str, Any], group_id: str) -> list[str] | None:
         """Return the models one New API group actually serves.
 
         The bare ``/api/user/models`` answer is a *union* over every group the
@@ -3996,12 +4024,23 @@ class RelayAccountsDomain:
         own group does not serve.  The endpoint takes ``?group=``, which answers
         that group alone, so a key's list is read from the group it names.
 
+        ``None`` and ``[]`` are different answers and the caller must not merge
+        them.  ``[]`` is the station stating that this group serves nothing (its
+        own ``/v1/models`` for the key agrees: 0 models, and a request is refused
+        with ``No available channel for model ... under group ...``).  ``None``
+        is this read learning nothing — a dropped connection, a rejected
+        session, or a fork that refuses the parameter — which is no evidence
+        about the group's catalog.  Collapsing the two made a group that serves
+        nothing keep reporting the whole station's union, so 分组管理 listed the
+        models while 获取模型 on the same key answered 供应商未返回模型: two panes
+        reading two different answers the same read had produced.
+
         The read is documentary: the group list is the key list's companion, and
         a stall on it must not lose the keys themselves.
         """
 
         if not group_id:
-            return []
+            return None
         try:
             payload = self._http.json(
                 account["origin"],
@@ -4012,11 +4051,11 @@ class RelayAccountsDomain:
             # An older or slimmer fork that rejects the parameter keeps the
             # union list the caller already read, so this stays an improvement
             # rather than a new way to lose a catalog.
-            return []
+            return None
         try:
-            return _model_names(payload)
+            return _answered_model_names(payload)
         except RelayAccountsError:
-            return []
+            return None
 
     def _newapi_resources(
         self,
@@ -4101,6 +4140,17 @@ class RelayAccountsDomain:
                     self._resource_secret_cache[
                         self._resource_cache_key(account["id"], f"newapi-{token_id}")
                     ] = value
+        # What each key reported last time, so a group read that learned nothing
+        # keeps that key's own catalog instead of widening it to the union.
+        previous_models: dict[str, list[str]] = {}
+        stored_resources = account.get("resources")
+        if isinstance(stored_resources, Sequence) and not isinstance(stored_resources, (str, bytes, bytearray)):
+            for stored in stored_resources:
+                if not isinstance(stored, Mapping):
+                    continue
+                names = _model_names(stored.get("models", []))
+                if names:
+                    previous_models[_resource_id(stored.get("id"))] = names
         resources: list[dict[str, Any]] = []
         for index, item in enumerate(tokens):
             if not isinstance(item, Mapping):
@@ -4110,6 +4160,21 @@ class RelayAccountsDomain:
                 continue
             resource_id, name = self._resource_label(item, index, prefix="newapi")
             group_id = _group_id(item.get("group"))
+            # The group's own answer decides the key's catalog.  Only a read that
+            # learned nothing (``None``) moves on: to the list this key reported
+            # before, then to the union.  An empty answer is the station saying
+            # this group serves nothing, and it is projected as such —
+            # substituting the union there is what let a key report models its
+            # group refuses, while the very same key's own 获取模型 read
+            # (``/v1/models``) answered none.
+            group_list = groups.get(group_id) if group_id else None
+            stored_list = previous_models.get(resource_id)
+            for candidate in (group_list, stored_list, models):
+                if candidate is not None:
+                    resource_models = list(candidate)
+                    break
+            else:
+                resource_models = []
             resources.append(
                 {
                     "id": resource_id,
@@ -4117,9 +4182,7 @@ class RelayAccountsDomain:
                     "api_base": f"{account['origin'].rstrip('/')}/v1",
                     "key_hint": self._key_hint(item.get("key")),
                     "enabled": _newapi_token_enabled(item.get("status")),
-                    # The key's own group, falling back to the union only while a
-                    # station refuses the per-group read.
-                    "models": groups.get(group_id) or models,
+                    "models": resource_models,
                     "group_id": group_id,
                     "group_name": group_id,
                     "_token_id": token_id,
@@ -4236,7 +4299,7 @@ class RelayAccountsDomain:
             and (not stable_group_catalog or entry[3] not in previous_models)
         ]
         if gateway_items:
-            def fetch_gateway_models(entry: tuple[int, str, bool, str, str, str, str]) -> tuple[int, list[str]]:
+            def fetch_gateway_models(entry: tuple[int, str, bool, str, str, str, str]) -> tuple[int, list[str] | None]:
                 index, key, _enabled, _resource_id, _name, _group_id_value, _group_name = entry
                 return index, self._gateway_catalog(account, key)
 
@@ -4247,20 +4310,27 @@ class RelayAccountsDomain:
 
         resources: list[dict[str, Any]] = []
         for index, key, enabled, resource_id, name, group_id, group_name in key_items:
-            group_list = group_models.get(group_id, [])
-            gateway_list = gateway_models.get(index, [])
+            group_list = group_models.get(group_id)
+            gateway_list = gateway_models.get(index)
             stored_list = previous_models.get(resource_id, [])
-            if group_list:
-                resource_models = group_list
-            elif gateway_list:
-                resource_models = gateway_list
-            elif for_apply:
-                # Materialization never keeps a stale catalog: the page's own
-                # list wins, and only a station that reports none keeps the
-                # list this key read earlier.
-                resource_models = models or stored_list
+            # Every rung here reads an *answer* before it reads a memory.  A
+            # group the page described answers for its own keys, including the
+            # answer "nothing"; a key the page omitted was read once, and only
+            # a read that learned nothing (``None``) lets an older list stand
+            # in.  ``or`` collapsed those two, so a group the station serves
+            # nothing for reported the deployment's whole catalog — 分组管理
+            # listed models that 获取模型 on the same key could not fetch, and a
+            # linked route was offered a model its key refuses.
+            for candidate in (
+                group_list,
+                gateway_list,
+                (models or stored_list) if for_apply else (stored_list or models),
+            ):
+                if candidate is not None:
+                    resource_models = candidate
+                    break
             else:
-                resource_models = stored_list or models
+                resource_models = []
             resources.append(
                 {
                     "id": resource_id,
@@ -5646,7 +5716,7 @@ class RelayAccountsDomain:
                 issues.append(self._apply_issue("refresh_failed", account_id=account_id))
         return {"refreshed_accounts": refreshed, "issues": issues}
 
-    def _gateway_catalog(self, account: Mapping[str, Any], api_key: object) -> list[str]:
+    def _gateway_catalog(self, account: Mapping[str, Any], api_key: object) -> list[str] | None:
         """Return the model list one relay key can actually call.
 
         The station's channel page describes each group, but its
@@ -5657,11 +5727,18 @@ class RelayAccountsDomain:
         key's own read is consequently the authority wherever it can be made;
         it stays off the refresh's critical path (``OPTIONAL_READ_PATHS``), so a
         station that stalls this read keeps the catalog the app already has.
+
+        ``None`` means this read learned nothing (no credential, a rejected or
+        dropped request), while ``[]`` is the gateway stating that this key can
+        call nothing.  The two are kept apart for the same reason the New API
+        group read keeps them apart: only an answer may empty a row, and a
+        failure that silently became an empty list also used to be able to take
+        a working catalog with it.
         """
 
         key = api_key.strip() if isinstance(api_key, str) else ""
         if not key:
-            return []
+            return None
         try:
             payload = self._http.json(
                 account["origin"],
@@ -5672,16 +5749,16 @@ class RelayAccountsDomain:
             # The gateway request is authenticated by the selected API key, not
             # by the dashboard session. A rejected key must not clear a valid
             # dashboard login.
-            return []
+            return None
         except Exception:
             # One key's catalog is optional: a station that breaks this probe
             # still reports its keys, and the dashboard catalog covers the
             # models for them.
-            return []
+            return None
         try:
-            return _model_names(payload)
+            return _answered_model_names(payload)
         except RelayAccountsError:
-            return []
+            return None
 
     def _cached_source_keys(self, raw_sources: Sequence[object]) -> dict[tuple[str, str], str]:
         """Snapshot the key values this Core already holds for these sources.
@@ -5969,11 +6046,16 @@ class RelayAccountsDomain:
             catalog = (
                 self._gateway_catalog(account, material.get("api_key", ""))
                 if reads_allowed
-                else []
+                else None
             )
-            # Whether this resolution could judge what the key may call.  A
-            # resolution that read no catalog learned nothing, so an absent model
-            # is not evidence about the key and must not refuse the write.
+            # Whether this resolution could judge what the key may call, which is
+            # whether the station was consulted about this key at all.  A
+            # slot-only resolution read nothing — it exists so a local model
+            # edit stays off the station — so an absent model there is not
+            # evidence and must not refuse the write.  A resolution that did
+            # consult the station keeps judging against its answer, and that
+            # answer includes the page's catalog when the key's own extra read
+            # could not be made: the page is still the station speaking.
             material["catalog_authoritative"] = reads_allowed
             if catalog:
                 listed = _model_names(material.get("models", []))

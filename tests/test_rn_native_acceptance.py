@@ -597,7 +597,10 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn('label={translate("providers.providerName")}', identity)
         self.assertIn('<Text style={styles.providerAuthStatusLabel}>{translate("providers.providerType")}</Text>', identity)
         self.assertIn('label={translate("providers.baseUrl")}', identity)
-        self.assertIn("isLogin ? SERVICE_BASE_URLS[kind as ServiceID]", identity)
+        # A login provider states the address its service gives it; a service
+        # the table names no address for (dsh-our-free-model, whose worker
+        # binds a per-launch port) states the address Core actually holds.
+        self.assertIn('isLogin ? (SERVICE_BASE_URLS[kind as ServiceID] || stringValue(provider.endpoint, stringValue(provider.api_base)))', identity)
         # No picker, no confirmation, no retarget dispatch: the whole surface
         # that used to switch a provider's type is gone from both hosts' shared
         # UI, so a provider's type has exactly one place it is decided.

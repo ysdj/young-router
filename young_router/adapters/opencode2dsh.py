@@ -22,6 +22,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from collections.abc import Sequence
 from typing import Any, Mapping
 
 from urllib.error import HTTPError, URLError
@@ -186,6 +187,28 @@ def validated_provider(value: object) -> str:
     if provider != OPENCODE2DSH_PROVIDER:
         raise ValueError("Unknown OpenCode provider")
     return provider
+
+
+def _route_membership(value: object) -> dict[str, list[str]]:
+    """The picker routes the upstream published, as id lists.
+
+    The upstream decides which models this egress can use and which its
+    regional gate refuses; this side only carries that answer.  An unreadable
+    or absent answer is an empty mapping rather than a guess, so a roster with
+    no verdicts shows one group instead of an invented second one.
+    """
+
+    if not isinstance(value, Mapping):
+        return {}
+    routes: dict[str, list[str]] = {}
+    for route, ids in value.items():
+        name = str(route or "").strip()
+        if not name or not isinstance(ids, Sequence) or isinstance(ids, (str, bytes, bytearray)):
+            continue
+        resolved = [str(model_id) for model_id in ids if isinstance(model_id, str) and model_id.strip()]
+        if resolved:
+            routes[name] = resolved
+    return routes
 
 
 def _free_port() -> int:
@@ -518,6 +541,12 @@ class OpenCode2DSHRuntime:
             "available": document.get("ok") is True,
             "source": "dsh-our-free-model",
             "models": list(document.get("models") or []),
+            # The upstream's own picker groups this roster into "what this
+            # egress can use" and "what its regional gate refuses".  Those
+            # routes travel as their membership lists rather than as a field on
+            # each row, because a row belongs to exactly one of them and the
+            # upstream decides which.
+            "routes": _route_membership(document.get("routes")),
         }
 
     def _request(

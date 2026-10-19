@@ -95,6 +95,39 @@ def _runtime_root(value: Path | str | None = None) -> Path:
     return Path(configured).expanduser() if configured else Path.home() / ".young-router"
 
 
+def _provider_config_source(paths: "RuntimePaths") -> Path:
+    """The document the provider editor writes, which is the one to stage.
+
+    ``paths.config`` is what ``LITELLM_CONFIG_FILE`` names, and a packaged
+    install sets that only in the preview profile.  Everywhere else it falls
+    back to ``<root>/config.yaml`` while the provider editor's own
+    ``_default_provider_config_path`` falls back to
+    ``<root>/.litellm-runtime/config.yaml`` — two different files, and only the
+    second one is ever written.  Staging the first copied a document the
+    editor never touched back over the committed one, so a deleted provider
+    reappeared on the next restart and the pane could not make it stick.
+
+    The editor's path is derived from this installation's own root rather than
+    read back through the environment: the staging controller already knows
+    the root it serves, and a process-wide default would answer for whichever
+    installation happened to set the variable first.
+    """
+
+    editor_path = paths.root / ".litellm-runtime" / "config.yaml"
+    if editor_path == paths.config:
+        return paths.config
+    # A preview profile names its own document explicitly; that setting wins
+    # only when it names a file, because the packaged default it displaces is
+    # the one the editor actually writes.
+    if paths.config != paths.root / "config.yaml" and paths.config.exists():
+        return paths.config
+    # Both live in this root, so whichever exists is the document in play; the
+    # editor's own path wins when both do, because that is the one it writes.
+    if editor_path.exists():
+        return editor_path
+    return paths.config
+
+
 def _bounded_text(value: object, *, limit: int = 240) -> str:
     return REDACT_TEXT(str(value))[:limit]
 
@@ -900,15 +933,27 @@ class CoreServiceController:
             return False
 
     def _stage_runtime_config(self) -> None:
-        if not self.paths.config.exists():
+        # Stage from the document the provider editor writes, not from
+        # ``paths.config``.  On a first-run install nothing sets
+        # ``LITELLM_CONFIG_FILE``, so ``paths.config`` falls back to
+        # ``<root>/config.yaml`` while the editor's
+        # ``_default_provider_config_path`` falls back to
+        # ``<root>/.litellm-runtime/config.yaml`` — two different files.  The
+        # editor then kept saving one of them and every restage copied the
+        # other, older one back over the document the proxy had to read: a
+        # deleted provider reappeared on the next restart, and the pane had no
+        # way to make the deletion stick.  Read the editor's own path so the
+        # staged document is always the one that was just committed.
+        source = _provider_config_source(self.paths)
+        if not source.exists():
             raise RuntimeError("Provider/model configuration is unavailable")
         from ..config.schema import _load_yaml
 
         try:
-            document = _load_yaml(self.paths.config)
+            document = _load_yaml(source)
             staged = _router_settings_with_retry_counts(document)
             if staged is None:
-                atomic_write_bytes(self.paths.runtime_config, self.paths.config.read_bytes())
+                atomic_write_bytes(self.paths.runtime_config, source.read_bytes())
             else:
                 import yaml
 

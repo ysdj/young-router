@@ -929,7 +929,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         for marker in (
             'busy={processing} disabled={wizardBusy && !processing}',
             'busy={loginBusy} disabled={(wizardBusy && !loginBusy)',
-            'busy={modelFetchState === "loading"}',
+            # The model listing states its one wait in the toolbar's own row and
+            # hides the button that would start the same read again, so neither a
+            # second wheel nor a control with nothing to offer appears.
+            '{modelFetchState === "loading" ? null : <NativeButton title={translate("providers.wizard.refreshModels")}',
             'busy={fetchModelsBusy} disabled={(busy && !fetchModelsBusy)',
             'busy={probing}',
             'busy={saving} disabled={(busy && !saving)',
@@ -3176,11 +3179,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("onlineUsagePagePending.current = false;", logs)
         self.assertIn("const onlineUsageRemaining = selected === \"online-usage\" ? numberValue(active?.remaining) : 0;", logs)
         self.assertIn("busy={onlineUsageLoadingMore}", logs)
-        # A first read, a source switch, and a page move each keep the shared
-        # wheel visible while their own action is pending. The source row keeps
-        # the switch state beside the picker that remains usable.
-        self.assertEqual(2, logs.count("<NativeBusySpinner"))
-        self.assertIn("{onlineUsageLoadingSource ? <NativeBusySpinner", logs)
+        # One wait, one wheel.  The empty surface owns the first read, the
+        # source switch, and the page move, and its own condition
+        # (`onlineUsageLoading`) covers the narrower `onlineUsageLoadingSource`
+        # the toolbar row used to key on, so a second wheel there spun the same
+        # wait twice — one of them above the picker.
+        self.assertEqual(1, logs.count("<NativeBusySpinner"))
+        self.assertNotIn("{onlineUsageLoadingSource ? <NativeBusySpinner", logs)
         self.assertIn('translate("logs.onlineUsageFiltering")', logs)
         self.assertIn("rows.length > 0 && !onlineUsageWaitingForSource", logs)
         empty_branch = logs.split("styles.logEmptySurface", 1)[1]
@@ -3883,7 +3888,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('{providerKindLabel(kind, translate)}', identity)
         self.assertIn('{translate("providers.type.relay")}', identity)
         self.assertIn('{translate("providers.type.apiKey")}', identity)
-        self.assertIn("isLogin ? SERVICE_BASE_URLS[kind as ServiceID]", identity)
+        # A login provider states the address its own service gives it, and
+        # falls back to the address Core holds when the service table names
+        # none — dsh-our-free-model is served by a Core-owned worker on a
+        # per-launch port, so its `os.environ/` reference is the only true
+        # address and the pane must not print an upstream host for it.
+        self.assertIn('isLogin ? (SERVICE_BASE_URLS[kind as ServiceID] || stringValue(provider.endpoint, stringValue(provider.api_base)))', identity)
         # The account surface keeps its rule, as the keys and the stations do.
         self.assertIn("{isOfficialAccount ? <View style={styles.officialAccountSection}>", editor)
         self.assertIn("providerAccountsHeader", editor)
@@ -4138,7 +4148,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # bound address, and the account — never a type picker, because the
             # provider's service is what it is already bound to.
             'label={translate("providers.providerName")}',
-            'isLogin ? SERVICE_BASE_URLS[kind as ServiceID]',
+            'isLogin ? (SERVICE_BASE_URLS[kind as ServiceID] || stringValue(provider.endpoint, stringValue(provider.api_base)))',
             # Every label column in the pane is the shared one, so a rate row
             # lines up with the fields beside it.  An unstated rate paints
             # blank, not 无: the upstream having published no rate and this
@@ -4178,6 +4188,36 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('"providers.wizard.workbuddySignInRequired": "请先在 WorkBuddy 桌面 App 中登录。"', self.zh)
         self.assertIn('"providers.serviceLinks": "服务商关联"', self.zh)
         self.assertIn('"providers.wizard.pathCustomKey": "自定义 API 密钥"', self.zh)
+
+    def test_a_fetched_roster_checks_nothing_by_default(self) -> None:
+        """A listing offers its models; it does not choose them.
+
+        Pre-selecting every row handed the new entry a set nobody picked, and
+        no other service does that — a WorkBuddy entry is created with no
+        models at all.  A read keeps what the user already ticked and leaves
+        the rest unchecked.
+        """
+
+        self.assertNotIn("current.length > 0 ? current : candidates", self.ui)
+        self.assert_ui_has("setSelectedModels((current) => current.filter((name) => candidates.includes(name)));")
+
+    def test_each_model_step_states_one_wait_with_one_wheel(self) -> None:
+        """One read draws one spinner, whichever step is asking.
+
+        The model listing used to answer a single fetch with three wheels — the
+        toolbar's own, a second on the button that started it, and a block in
+        the body repeating the same sentence — so the pane looked like three
+        things were running.  A wait is stated once, in the row that names it.
+        """
+
+        wizard = self.ui.split("function ProviderSetupWizard(", 1)[1].split("function ProviderWorkspace(", 1)[0]
+        # One standalone wheel per branch (the lane's roster and the generic
+        # listing), and the buttons that start those reads draw none of their
+        # own for the same wait.
+        self.assertEqual(2, wizard.count("<NativeBusySpinner"))
+        self.assertNotIn('busy={modelFetchState === "loading"}', wizard)
+        self.assertNotIn("providerWizardModelLoading", wizard)
+        self.assertNotIn("providerWizardModelLoading", self.ui)
 
     def test_the_opencode_free_lane_is_offered_without_an_account_step(self) -> None:
         """Our Free Model has no sign-in, so the wizard asks nothing.
@@ -4231,9 +4271,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         lane_keys = wizard.split("isOpenCode2DSHType ? <>", 1)[1].split("</> : isWorkBuddyType ? <>", 1)[0]
         self.assertNotIn("NativeSecureTextInput", lane_keys)
         self.assertNotIn("NativePicker", lane_keys)
-        # Both languages name the lane for the free tier it actually reaches.
-        self.assertIn('"providers.type.opencode2dsh": "dsh-our-free-model"', self.en)
-        self.assertIn('"providers.type.opencode2dsh": "dsh-our-free-model"', self.zh)
+        # Both languages name the type for the user, not for the integration:
+        # the picker and the entry's own name are "Our Free Model" even though
+        # the adapter that serves it is still `opencode2dsh` on disk.
+        self.assertIn('"providers.type.opencode2dsh": "Our Free Model"', self.en)
+        self.assertIn('"providers.type.opencode2dsh": "Our Free Model"', self.zh)
 
     def test_the_lane_free_suffix_rule_agrees_with_core(self) -> None:
         """The UI strips the lane's ``-free`` suffix exactly as Core does.
@@ -4774,7 +4816,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         controls = (ROOT / "rn/packages/shared/src/ui/NativeControls.tsx").read_text(encoding="utf-8")
         self.assertIn("compact && style === undefined ? { minWidth: pickerLabelWidth", controls)
         self.assertIn("const pickerLabelWidth =", controls)
-        self.assertIn('logsContent: { paddingHorizontal: 12, paddingTop: 36', self.ui)
+        # The tab strip sits directly under the window title: a 36 pt top inset
+        # here left a bare band above 请求 that no other pane has.
+        self.assertIn('logsContent: { paddingHorizontal: 12, paddingTop: 12', self.ui)
 
     def test_log_vocabulary_is_localized_in_both_languages(self) -> None:
         english = (ROOT / "rn/packages/shared/src/i18n/en.ts").read_text(encoding="utf-8")
@@ -7155,7 +7199,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # sidebar selection names the active pane.
         self.assertIn('if Self.settingsPaneRoutes.contains(canonicalRoute(route)) {', self.macos_leaf)
         self.assertIn('return localized("appTitle", fallback: "Young Router")', self.macos_leaf)
-        self.assertIn('case "provider-wizard": return "LiteLLM " + localized("routeProviderWizard", fallback: "Add Provider")', self.macos_leaf)
+        # The window title is the shared route word alone: the app's own name is
+        # the branded surface, so the title bar does not carry a second brand
+        # ahead of the provider wizard's name.
+        self.assertIn('case "provider-wizard": return localized("routeProviderWizard", fallback: "Add Provider")', self.macos_leaf)
         # macOS no longer draws a status-item menu, so there is no order to
         # keep: either mouse button opens the shared settings window.
         self.assertNotIn("statusMenuOrder", self.macos_leaf)

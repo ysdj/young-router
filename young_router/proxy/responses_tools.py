@@ -626,6 +626,27 @@ def _delegation_task_from_output(output: Any) -> Optional[str]:
     return text or None
 
 
+def _blank_assistant_message(item: Any) -> bool:
+    """Whether an assistant message states nothing a chat surface can read."""
+
+    if not isinstance(item, dict) or item.get("type") != "message":
+        return False
+    if item.get("role") != "assistant":
+        return False
+    content = item.get("content")
+    if isinstance(content, str):
+        return not content.strip()
+    if isinstance(content, list):
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            text = part.get("text")
+            if isinstance(text, str) and text.strip():
+                return False
+        return True
+    return True
+
+
 def _responses_chat_bridge_input(
     value: Any,
     tools: Any = None,
@@ -642,6 +663,7 @@ def _responses_chat_bridge_input(
     converted_custom_tool_calls = 0
     converted_custom_tool_outputs = 0
     flattened_namespace_calls = 0
+    dropped_blank_assistant_messages = 0
     lifted_delegation_tasks = 0
     # The tool call each delegation result belongs to, so the lifted turn can be
     # placed after the call and its result rather than between them: a chat
@@ -657,6 +679,17 @@ def _responses_chat_bridge_input(
             continue
         if isinstance(item, dict) and item.get("type") == "additional_tools":
             dropped_additional_tools += 1
+            continue
+        # A Codex turn that only calls tools is replayed as an assistant message
+        # whose text is a single space, because the Responses surface needs a
+        # carrier for its phase.  On a chat surface that becomes an assistant
+        # turn that says nothing, and a reasoning model answers it: DeepSeek
+        # emits a lone ""." as its own assistant message, which the client then
+        # renders as a stray dot and stores in the history it replays forever.
+        # The turn states no content by construction, so the bridge drops it
+        # instead of passing the placeholder on.
+        if _blank_assistant_message(item):
+            dropped_blank_assistant_messages += 1
             continue
         # A delegation result is read before anything else touches it: the
         # envelope and its task are what the replay is being judged on, and the
@@ -718,8 +751,15 @@ def _responses_chat_bridge_input(
                 updated_item["id"] = _responses_function_tool_item_id(
                     updated_item.get("id")
                 )
+            bridge_arguments = updated_item.get("arguments")
+            bridge_arguments = (
+                copy.deepcopy(bridge_arguments)
+                if isinstance(bridge_arguments, dict)
+                else {}
+            )
+            bridge_arguments["input"] = raw_input
             updated_item["arguments"] = json.dumps(
-                {"input": raw_input},
+                bridge_arguments,
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
@@ -740,6 +780,7 @@ def _responses_chat_bridge_input(
     if (
         dropped_tool_search == 0
         and dropped_additional_tools == 0
+        and dropped_blank_assistant_messages == 0
         and converted_custom_tool_calls == 0
         and converted_custom_tool_outputs == 0
         and flattened_namespace_calls == 0
@@ -755,6 +796,8 @@ def _responses_chat_bridge_input(
         stats["lifted_delegation_tasks"] = lifted_delegation_tasks
     if dropped_additional_tools:
         stats["dropped_additional_tools_items"] = dropped_additional_tools
+    if dropped_blank_assistant_messages:
+        stats["dropped_blank_assistant_messages"] = dropped_blank_assistant_messages
     if converted_custom_tool_calls:
         stats["converted_custom_tool_calls"] = converted_custom_tool_calls
     if converted_custom_tool_outputs:
