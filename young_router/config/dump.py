@@ -23,6 +23,7 @@ from .schema import (
     MENU_ORDER_MODE_KEY,
     MENU_PROVIDER_KEY_ID_KEY,
     MENU_PROVIDER_AUTH_KEY,
+    MENU_PROVIDER_CHANNEL_KEY,
     MENU_PROVIDER_SOURCE_KEY,
     MENU_RELAY_CATALOG_MODE_KEY,
     MENU_RELAY_KEYS_KEY,
@@ -41,6 +42,7 @@ from .schema import (
     _positive_int,
     _provider_key_id,
     _provider_auth,
+    _provider_channel,
     _provider_source,
     _relay_source,
     _stable_provider_key_id,
@@ -339,6 +341,14 @@ def _dump_providers_section(providers: list[dict[str, Any]]) -> str:
             extra.pop(MENU_PROVIDER_AUTH_KEY, None)
         else:
             extra[MENU_PROVIDER_AUTH_KEY] = auth
+        # Which channel this row is, for an integration that serves more than
+        # one.  Written only when the draft states one, so a provider outside
+        # such an integration keeps no key at all.
+        channel = _provider_channel(provider.get("channel"))
+        if channel:
+            extra[MENU_PROVIDER_CHANNEL_KEY] = channel
+        else:
+            extra.pop(MENU_PROVIDER_CHANNEL_KEY, None)
         for key, value in extra.items():
             lines.append(f"    {key}: {_plain_scalar(value)}")
     if len(lines) == 1:

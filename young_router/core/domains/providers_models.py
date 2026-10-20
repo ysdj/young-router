@@ -26,6 +26,7 @@ from urllib.parse import urlsplit
 from ...config.schema import (
     LITELLM_ADAPTER_PREFIXES,
     MENU_PROVIDER_AUTH_KEY,
+    MENU_PROVIDER_CHANNEL_KEY,
     MENU_PROVIDER_SOURCE_KEY,
     MENU_RELAY_KEYS_KEY,
     MENU_RELAY_KEYS_VERSION,
@@ -39,6 +40,7 @@ from ...config.schema import (
     _positive_int,
     _provider_key_id,
     _provider_auth,
+    _provider_channel,
     _provider_source,
     _relay_source,
     _stable_provider_key_id,
@@ -935,6 +937,9 @@ class ProvidersModelsDomain:
             "enabled": provider.get("enabled") is not False,
             "provider_type": provider_source["kind"],
             "relay_station_id": provider_source.get("station_id", ""),
+            # Which channel of its integration this row is, as a stored tag.  A
+            # pane that renamed a provider still reports the channel it serves.
+            "channel": self._provider_channel_state(provider),
             "auth_kind": provider_auth["kind"],
             "auth_status": self._provider_auth_status(provider, provider_auth),
             "auth_configured": self._provider_auth_configured(provider, provider_auth),
@@ -995,9 +1000,33 @@ class ProvidersModelsDomain:
             runtime_settings_path=_default_runtime_settings_path(),
             cache_path=default_context_cache_path(self.config_path.parent),
             refresh_enabled=False,
+            # The windows this pane already holds from the catalog reads it
+            # performed.  Handed over rather than written down: the numbers are
+            # the upstreams', and this domain is the only place that read them.
+            upstream_windows=self._live_upstream_windows,
         )
         self._model_context_registry = registry
         return registry
+
+    def _live_upstream_windows(self) -> dict[str, int]:
+        """Every window a catalog read has reported, keyed by model id.
+
+        Live, not stored: each entry is what an upstream answered the last time
+        this domain read it.  The two reads that record windows answer different
+        questions — one is a provider's own ``/v1/models`` listing, the other an
+        integration's catalog — so both are merged here and the nearest answer
+        wins by provider order.
+        """
+
+        windows: dict[str, int] = {}
+        for listing in (*self._catalog_windows.values(), *self._listing_windows.values()):
+            if not isinstance(listing, Mapping):
+                continue
+            for model_id, window in listing.items():
+                name = str(model_id or "").strip()
+                if name and isinstance(window, int) and not isinstance(window, bool) and window > 0:
+                    windows[name] = window
+        return windows
 
     def _model_context_projection(self) -> dict[str, Any]:
         """Registry defaults for every public model the draft exposes.
@@ -2489,6 +2518,46 @@ class ProvidersModelsDomain:
             raise DomainError("Provider source is invalid") from None
 
     @staticmethod
+    def _provider_channel_state(provider: Mapping[str, Any]) -> str:
+        """Read which channel of its integration this provider row is.
+
+        A stored identity rather than a label: the provider's name is the user's
+        to change, so deriving the channel from it would move a renamed row to
+        another channel — onto a wire it does not serve.  A draft field answers
+        first so an edit in progress is honoured, and the saved key answers
+        otherwise.
+        """
+
+        draft = provider.get("channel")
+        raw = draft if draft is not None else (
+            provider.get("extra", {}).get(MENU_PROVIDER_CHANNEL_KEY)
+            if isinstance(provider.get("extra"), Mapping)
+            else None
+        )
+        try:
+            return _provider_channel(raw)
+        except ValueError:
+            raise DomainError("Provider channel is invalid") from None
+
+    @staticmethod
+    def _set_provider_channel(provider: dict[str, Any], value: object) -> str:
+        """Record this row's channel, or clear it for a provider that has none."""
+
+        try:
+            channel = _provider_channel(value)
+        except ValueError:
+            raise DomainError("Provider channel is invalid") from None
+        extra = dict(provider.get("extra", {})) if isinstance(provider.get("extra"), Mapping) else {}
+        if channel:
+            provider["channel"] = channel
+            extra[MENU_PROVIDER_CHANNEL_KEY] = channel
+        else:
+            provider.pop("channel", None)
+            extra.pop(MENU_PROVIDER_CHANNEL_KEY, None)
+        provider["extra"] = extra
+        return channel
+
+    @staticmethod
     def _provider_auth_state(provider: Mapping[str, Any]) -> dict[str, str]:
         """Read secret-free authentication metadata independently of endpoint source."""
 
@@ -2622,13 +2691,7 @@ class ProvidersModelsDomain:
             elif wire == "chat":
                 model["upstream_url_surface"] = "openai/chat"
                 model["upstream_protocol_mode"] = "fixed"
-            # The window this row states, carried so the caller can declare it
-            # on the public model once the roster is assembled.  It is *not*
-            # written per route: a route declares no window of its own, and the
-            # group's number is what the client resolves.
-            window = windows.get(model_id) if isinstance(windows, Mapping) else None
-            if isinstance(window, int) and not isinstance(window, bool) and window > 0:
-                model["_stated_context_window"] = window
+
             models.append(model)
         if not models:
             raise DomainError("The Our Free Model catalog reported no models")
@@ -4054,7 +4117,12 @@ class ProvidersModelsDomain:
         # catalog is the roster, so a newly added lane imports exactly what the
         # lane can call today.
         our_free_model_module.OUR_FREE_MODEL_AUTH_KIND: {
-            "name": our_free_model_module.OUR_FREE_MODEL_DISPLAY_NAME,
+            # The lane's own channel states which channel it is, like the two
+            # beside it: the name is what Core reads back to know the channel, so
+            # a bare product name would leave the anonymous entry ambiguous.
+            "name": our_free_model_module.OUR_FREE_MODEL_DISPLAY_NAMES[
+                our_free_model_module.OUR_FREE_MODEL_PROVIDER
+            ],
         },
     }
 
@@ -4074,40 +4142,13 @@ class ProvidersModelsDomain:
             raise DomainError("The selected provider is managed in Providers & Models")
         return index
 
-    @staticmethod
-    def _declare_ours_free_model_windows(models: list[dict[str, Any]]) -> None:
-        """Declare each imported group's window from the number upstream stated.
 
-        The window belongs to the public model, and the public model is the
-        group of routes sharing one ``model_name``.  The import carries the
-        upstream's number per row on a private key; this promotes it to the
-        group's declaration and drops the carrier, so a route keeps carrying no
-        window of its own and the saved document holds exactly one spelling of
-        the number.
-
-        A group whose rows disagree keeps no declaration: one number for the
-        group cannot state two, and picking the larger would promise a window
-        part of the group does not accept.
-        """
-
-        stated: dict[str, set[int]] = {}
-        for model in models:
-            name = str(model.get("model_name", "")).strip()
-            window = model.pop("_stated_context_window", None)
-            if not name or not isinstance(window, int) or isinstance(window, bool):
-                continue
-            stated.setdefault(name, set()).add(window)
-        for model in models:
-            name = str(model.get("model_name", "")).strip()
-            windows = stated.get(name)
-            if windows and len(windows) == 1:
-                model[PUBLIC_MODEL_CONTEXT_KEY] = next(iter(windows))
 
     def _dispatch_service_provider_add(self, data: Mapping[str, Any]) -> None:
         value = data.get("provider", data.get("value", data))
         supplied = _copy_mapping(value, "service provider")
         unsupported = set(supplied).difference(
-            {"kind", "auth_kind", "name", "enabled", "models", "model"}
+            {"kind", "auth_kind", "name", "enabled", "models", "model", "channel"}
         )
         if unsupported:
             raise DomainError(
@@ -4116,6 +4157,18 @@ class ProvidersModelsDomain:
         kind = self._service_provider_kind(
             supplied.get("auth_kind", supplied.get("kind"))
         )
+        # Which channel of a multi-channel integration this add creates.  Stated
+        # by the caller as a tag; the lane's own channel is the empty tag.  Read
+        # here, before anything writes it, so the import, the stored key and the
+        # roster all describe the same channel.
+        lane_channel = ""
+        if kind in our_free_model_module.OUR_FREE_MODEL_AUTH_KINDS:
+            try:
+                lane_channel = _provider_channel(supplied.get("channel"))
+                if lane_channel:
+                    our_free_model_module.provider_for_channel_tag(lane_channel)
+            except ValueError:
+                raise DomainError("The requested Our Free Model channel is unavailable") from None
         defaults = self._SERVICE_PROVIDER_DEFAULTS[kind]
         name = str(supplied.get("name", "")).strip() or defaults["name"]
         if any(
@@ -4150,6 +4203,11 @@ class ProvidersModelsDomain:
         provider["api_base"] = ""
         provider["models"] = []
         self._set_provider_source(provider, {"kind": "custom"})
+        if kind in our_free_model_module.OUR_FREE_MODEL_AUTH_KINDS:
+            # Stored identity, written once at creation.  The name beside it is
+            # the user's to change; this key is what keeps the row on its channel
+            # when they do.
+            self._set_provider_channel(provider, lane_channel)
         existing_refs = {
             str(self._provider_auth_state(candidate).get("credential_ref", "")).strip()
             for candidate in self._draft.get("providers", [])
@@ -4170,11 +4228,15 @@ class ProvidersModelsDomain:
         if raw_models is None and kind in our_free_model_module.OUR_FREE_MODEL_AUTH_KINDS:
             # The lane serves three channels behind one login, and each is a
             # provider of its own.  Which one this add creates is the caller's,
-            # stated by name: adding a provider adds exactly that provider, so a
-            # user who wants only Kilo gets only Kilo.
-            raw_models = self._our_free_model_catalog_models(
-                kind, our_free_model_module.provider_for_name(name)
+            # stated as a channel tag: adding a provider adds exactly that
+            # provider, so a user who wants only Kilo gets only Kilo.  The tag is
+            # read rather than the name, so renaming a provider is a rename.
+            lane_provider = (
+                our_free_model_module.provider_for_channel_tag(lane_channel)
+                if lane_channel
+                else our_free_model_module.OUR_FREE_MODEL_PROVIDER
             )
+            raw_models = self._our_free_model_catalog_models(kind, lane_provider)
         if raw_models is None:
             raw_model = supplied.get("model")
             raw_models = [raw_model] if isinstance(raw_model, Mapping) else [
@@ -4208,7 +4270,6 @@ class ProvidersModelsDomain:
         # through to the registry, which knows no free-lane id: the pane then
         # reported the unknown-model fallback (272,000) for a row whose own
         # catalog entry stated 1,048,576.
-        self._declare_ours_free_model_windows(models)
         self._apply_auth_to_models(provider, kind)
         self._register_new_provider(provider)
         self._draft["providers"].append(provider)

@@ -617,7 +617,6 @@ export const zhHans: Record<TranslationKey, string> = {
   "providers.followMultiplier": "跟随倍率",
   "providers.addWizard": "添加向导...",
   "providers.wizard.title": "配置供应商",
-  "providers.wizard.description": "分几步完成供应商、认证方式和模型配置。",
   "providers.wizard.stepProvider": "供应商",
   "providers.wizard.stepKeys": "密钥",
   "providers.wizard.providerType": "供应商类型",
@@ -655,7 +654,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "providers.type.apiKey": "API 密钥",
   "providers.type.workbuddy": "WorkBuddy",
   "providers.type.workbuddyAI": "WorkBuddy AI",
-  "providers.type.ourFreeModel": "Our Free Model · OpenCode 免费通道",
+  "providers.type.ourFreeModel": "Our Free Model · OpenCode 通道",
   "providers.type.ourFreeModelKilo": "Our Free Model · Kilo 通道",
   "providers.type.ourFreeModelEAC": "Our Free Model · EAC 协付通道",
   // The picker groups Our Free Model publishes for its roster: what this

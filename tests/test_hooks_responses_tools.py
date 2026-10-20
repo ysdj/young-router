@@ -445,6 +445,106 @@ class HookResponsesToolBridgeTests(HookTestCase):
             "looked at it",
         )
 
+    def test_chat_bridge_keeps_parallel_tool_results_with_their_call_group(self) -> None:
+        """A message may not split the results of one parallel tool-call batch.
+
+        Codex can replay a resize notice between the two image outputs of one
+        parallel ``view_image`` batch.  LiteLLM turns that notice into a
+        developer message, so the later output no longer immediately follows
+        the assistant message that carries the batch.  WorkBuddy rejects that
+        history with HTTP 400 ``工具记录不完整，请新建任务``.  Moving the
+        barrier after the completed batch keeps the calls, results, and notice
+        without teaching the upstream an incomplete record.
+        """
+
+        hooks, _ = load_hook_module()
+        canonical = [
+            {
+                "type": "function_call",
+                "id": "fc_first",
+                "call_id": "call_first",
+                "name": "view_image",
+                "arguments": '{"path":"first.png"}',
+            },
+            {
+                "type": "function_call",
+                "id": "fc_second",
+                "call_id": "call_second",
+                "name": "view_image",
+                "arguments": '{"path":"second.png"}',
+            },
+            {
+                "type": "function_call_output",
+                "id": "fco_first",
+                "call_id": "call_first",
+                "output": "first",
+            },
+            {
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "resize notice"}],
+            },
+            {
+                "type": "function_call_output",
+                "id": "fco_second",
+                "call_id": "call_second",
+                "output": "second",
+            },
+        ]
+
+        bridged, stats = hooks._responses_chat_bridge_input(canonical)
+
+        self.assertEqual(
+            [item.get("type") for item in bridged],
+            [
+                "function_call",
+                "function_call",
+                "function_call_output",
+                "function_call_output",
+                "message",
+            ],
+        )
+        self.assertEqual(
+            [item.get("call_id") for item in bridged if item.get("type") == "function_call_output"],
+            ["call_first", "call_second"],
+        )
+        self.assertEqual(bridged[-1]["content"][0]["text"], "resize notice")
+        self.assertEqual(stats["moved_tool_record_barriers"], 1)
+
+    def test_chat_bridge_leaves_an_incomplete_tool_group_unchanged(self) -> None:
+        """Only a complete parallel batch is safe to reorder."""
+
+        hooks, _ = load_hook_module()
+        canonical = [
+            {
+                "type": "function_call",
+                "call_id": "call_first",
+                "name": "view_image",
+                "arguments": '{"path":"first.png"}',
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_second",
+                "name": "view_image",
+                "arguments": '{"path":"second.png"}',
+            },
+            {
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "resize notice"}],
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_first",
+                "output": "first",
+            },
+        ]
+
+        bridged, stats = hooks._responses_chat_bridge_input(canonical)
+
+        self.assertEqual(bridged, canonical)
+        self.assertFalse(stats["changed"])
+
     def test_chat_bridge_preserves_legacy_exec_patch_arguments(self) -> None:
         hooks, _ = load_hook_module()
         patch = "*** Begin Patch\n*** Update File: a.js\n*** End Patch"

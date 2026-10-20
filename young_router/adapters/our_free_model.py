@@ -78,8 +78,12 @@ OUR_FREE_MODEL_DISPLAY_NAME_BASE = "Our Free Model"
 OUR_FREE_MODEL_DISPLAY_NAME = "Our Free Model"
 #: One heading per channel, so the provider list itself states which channel
 #: a row is served from instead of leaving it to a tag inside the roster.
+# Every channel states which one it is, including the lane's own: three entries
+# named after the same product would be indistinguishable in the provider list,
+# and "Our Free Model" alone would read as the whole product rather than the one
+# anonymised channel inside it.
 OUR_FREE_MODEL_DISPLAY_NAMES = {
-    OUR_FREE_MODEL_PROVIDER: OUR_FREE_MODEL_DISPLAY_NAME_BASE,
+    OUR_FREE_MODEL_PROVIDER: f"{OUR_FREE_MODEL_DISPLAY_NAME_BASE} · OpenCode",
     OUR_FREE_MODEL_KILO_PROVIDER: f"{OUR_FREE_MODEL_DISPLAY_NAME_BASE} · Kilo",
     OUR_FREE_MODEL_EAC_PROVIDER: f"{OUR_FREE_MODEL_DISPLAY_NAME_BASE} · EAC",
 }
@@ -261,21 +265,20 @@ def provider_for_channel(channel: object) -> str:
     return CHANNEL_TO_PROVIDER.get(str(channel or "").strip(), OUR_FREE_MODEL_PROVIDER)
 
 
-def provider_for_name(name: object) -> str:
-    """The channel a provider name addresses; the lane when it names none.
+def provider_for_channel_tag(channel: object) -> str:
+    """The provider a channel tag addresses; the lane when the tag names none.
 
-    A channel's provider is named after the channel, so an entry the user named
-    "Our Free Model" is the anonymous lane and "Our Free Model · Kilo" is Kilo.
-    A name the user invented addresses no channel of this lane's own making, so
-    it falls back to the lane itself rather than refusing the add: naming a
-    provider is the user's to do.
+    The tag is the stored identity, so this is the one place that maps it.  A tag
+    this build does not know is refused rather than folded into the lane: it came
+    from a document this code cannot describe, and guessing would route its rows
+    over another channel's wire.
     """
 
-    wanted = str(name or "").strip().casefold()
-    for provider, label in OUR_FREE_MODEL_DISPLAY_NAMES.items():
-        if wanted == label.casefold():
-            return provider
-    return OUR_FREE_MODEL_PROVIDER
+    tag = str(channel or "").strip().casefold()
+    try:
+        return CHANNEL_TO_PROVIDER[tag]
+    except KeyError:
+        raise ValueError(f"Unknown Our Free Model channel: {tag}") from None
 
 
 def _route_membership(value: object) -> dict[str, list[str]]:
@@ -324,25 +327,6 @@ def _wire_membership(value: object) -> dict[str, str]:
             continue
         wires[name] = surface
     return wires
-
-
-def _window_membership(value: object) -> dict[str, int]:
-    """The context window each row states for itself, as the catalog publishes it.
-
-    Kept as the upstream's own number so a route reports the window it will
-    actually accept.  A row that states none is absent, and the caller then
-    falls back to whatever policy it would have used anyway.
-    """
-
-    if not isinstance(value, Mapping):
-        return {}
-    windows: dict[str, int] = {}
-    for model_id, window in value.items():
-        name = str(model_id or "").strip()
-        if not name or isinstance(window, bool) or not isinstance(window, int) or window <= 0:
-            continue
-        windows[name] = window
-    return windows
 
 
 def _channel_membership(value: object) -> dict[str, str]:
@@ -741,10 +725,6 @@ class OurFreeModelRuntime:
             # upstream routes per row: a provider-level default cannot describe
             # a roster whose inner split is its own.
             "wires": _wire_membership(document.get("wires")),
-            # The window each row states.  Carried beside the wires for the same
-            # reason: both are the upstream's answer about one row, and neither
-            # is derivable from the id.
-            "windows": _window_membership(document.get("windows")),
         }
 
     def _request(
@@ -819,7 +799,7 @@ __all__ = [
     "PROVIDER_TO_AUTH_KIND",
     "PROVIDER_TO_CHANNEL",
     "provider_for_channel",
-    "provider_for_name",
+    "provider_for_channel_tag",
     "OurFreeModelRuntime",
     "OurFreeModelCatalogUnavailable",
     "OurFreeModelUnavailable",

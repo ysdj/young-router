@@ -599,7 +599,6 @@ export type TranslationKey =
   | "providers.followMultiplier"
   | "providers.addWizard"
   | "providers.wizard.title"
-  | "providers.wizard.description"
   | "providers.wizard.stepProvider"
   | "providers.wizard.stepKeys"
   | "providers.wizard.providerType"

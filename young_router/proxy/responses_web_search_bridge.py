@@ -5555,6 +5555,48 @@ async def _external_web_search_keepalives_until_done(
         )
 
 
+def _external_web_search_output_items_are_deliverable(payload: Any) -> bool:
+    """Whether one recovered payload states something the client can act on.
+
+    A passthrough tool call is a finished turn: the bridge hands the model's
+    own request back so the client runs it.  An empty message item is not,
+    because it is what a stream states before its answer exists.
+    """
+    if not isinstance(payload, dict):
+        return False
+    output = payload.get("output")
+    if not isinstance(output, list):
+        return False
+    if _external_web_search_output_has_deliverable_items(output):
+        return True
+    return False
+
+
+def _external_web_search_stream_events_carry_tool_call(events: list[Any]) -> bool:
+    """Whether a polled stream already spent itself on a tool call.
+
+    Recovery exists to produce the answer a route interrupted.  A poll frame
+    that carries a function call is not that answer, and reading the frames
+    for text is how a call's arguments ended up in the client's message.
+    """
+    for chunk in events:
+        dumped = _streaming_module._stream_chunk_dump(chunk)
+        if not isinstance(dumped, dict):
+            continue
+        items = [dumped.get("item")]
+        response = dumped.get("response")
+        if isinstance(response, dict):
+            response_output = response.get("output")
+            if isinstance(response_output, list):
+                items.extend(response_output)
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") in _WEB_SEARCH_FUNCTION_CALL_ITEM_TYPES:
+                return True
+    return False
+
+
 def _external_web_search_stream_events_text(events: list[Any]) -> str:
     from .streaming import _stream_chunk_text_fragment
 
@@ -5689,8 +5731,16 @@ async def _external_web_search_stream_route_recovery_or_fallback(
                 recovery_request,
             ):
                 return recovered_payload
-            if _responses_output_module._response_text(recovered_payload).strip():
+            if _external_web_search_output_items_are_deliverable(recovered_payload):
                 return recovered_payload
+            # The poll's own frames are not a finished answer: a run of
+            # ``output_text.delta`` is an answer that a route started writing,
+            # and a frame carrying a function call is the call itself.  Turning
+            # either into a reply is how a tool call's arguments reached the
+            # client as an assistant message; the caller's own fallback keeps
+            # the turn instead.
+            if _external_web_search_stream_events_carry_tool_call(events):
+                return None
             try:
                 recovered_text = _external_web_search_stream_events_text(events)
             except Exception:
@@ -6158,6 +6208,12 @@ async def _resolve_web_search_function_calls_stream_rounds(
             finally:
                 if not recovery_task.done():
                     recovery_task.cancel()
+            if final_response is None:
+                # The poll carried the interrupted turn instead of an answer;
+                # keeping that turn is the point, so it ends the loop here.
+                final_response = current_response
+                client_tool_passthrough = True
+                break
             if _has_web_search_actions_for_request(
                 final_response,
                 request_kwargs,
@@ -6282,6 +6338,8 @@ async def _resolve_web_search_function_calls_stream_rounds(
             finally:
                 if not recovery_task.done():
                     recovery_task.cancel()
+            if final_response is None:
+                final_response = current_response
 
     synthesized_payload, output_items = _external_web_search_output_items_from_response(
         final_response,
@@ -6349,6 +6407,12 @@ async def _resolve_web_search_function_calls_stream_rounds(
         finally:
             if not recovery_task.done():
                 recovery_task.cancel()
+        if recovered_response is None:
+            yield _streaming_module._synthesized_failed_response_event(
+                request_kwargs or {},
+                exception,
+            )
+            return
         recovered_payload, recovered_output = _external_web_search_output_items_from_response(
             recovered_response,
             request_kwargs,

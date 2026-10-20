@@ -108,6 +108,14 @@ PUBLIC_MODEL_CONTEXT_KEY = "max_input_tokens"
 PUBLIC_MODEL_LIMIT_KEYS = (PUBLIC_MODEL_CONTEXT_KEY,)
 MENU_PROVIDER_SOURCE_KEY = "x-young-router-provider-source"
 MENU_PROVIDER_AUTH_KEY = "x-young-router-provider-auth"
+#: Which channel of a multi-channel integration a provider row is.
+#:
+#: A stored identity, not a label: one login can reach several producers behind
+#: one gateway, and each answers on its own surface.  The provider's *name*
+#: cannot carry this — a name is the user's to change, and reading it back would
+#: make a rename silently move the row to another channel, onto a wire it does
+#: not have.
+MENU_PROVIDER_CHANNEL_KEY = "x-young-router-provider-channel"
 PROVIDER_KEY_SOURCE_KINDS = {"independent", "relay"}
 PROVIDER_SOURCE_KINDS = {"custom", "relay"}
 PROVIDER_AUTH_KINDS = {
@@ -323,6 +331,27 @@ def _relay_source(value: Any, *, required: bool = False) -> dict[str, str]:
     for key in ("station_id", "account_id", "resource_id"):
         source[key] = _menu_metadata_text(value.get(key), f"Relay {key}", required=True)
     return source
+
+
+def _provider_channel(value: Any) -> str:
+    """Validate one provider's channel tag.
+
+    The empty string is a real answer: it names the channel that has no name of
+    its own, which is the free lane's anonymous producer.  Anything but a short
+    lowercase tag is refused, because this value is compared against the
+    integration's own channel names and is never shown as user text.
+    """
+
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValueError("Provider channel is invalid")
+    tag = value.strip()
+    if not tag:
+        return ""
+    if len(tag) > 32 or not all(character.isalnum() or character in "_-" for character in tag):
+        raise ValueError("Provider channel is invalid")
+    return tag.casefold()
 
 
 def _provider_source(value: Any, *, required: bool = False) -> dict[str, str]:
@@ -686,6 +715,14 @@ def _validate_current_schema(data: dict[str, Any], path: pathlib.Path) -> None:
             except ValueError as exc:
                 raise ValueError(
                     f"{path.name} provider {provider_name} {MENU_PROVIDER_AUTH_KEY} is invalid"
+                ) from exc
+        provider_channel = provider.get(MENU_PROVIDER_CHANNEL_KEY)
+        if provider_channel is not None:
+            try:
+                _provider_channel(provider_channel)
+            except ValueError as exc:
+                raise ValueError(
+                    f"{path.name} provider {provider_name} {MENU_PROVIDER_CHANNEL_KEY} is invalid"
                 ) from exc
 
     section_names = (DISABLED_MODELS_KEY,) if is_disabled_file else ("model_list",)

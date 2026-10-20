@@ -165,30 +165,6 @@ function wireMembership(upstream, runtime) {
   }
 }
 
-/**
- * The window each row states for itself, as the catalog publishes it.
- *
- * A route's public window was resolved from the bundled registry, which does
- * not know a free-lane id: every row therefore reported the unknown-model
- * fallback (272,000) while the same row's catalog entry stated 1,048,576.  The
- * upstream's number is the one the route will actually accept, so it is
- * carried across rather than left for a lookup that cannot answer.
- */
-function windowMembership(runtime) {
-  try {
-    const catalog = runtime.state()?.catalog
-    if (!Array.isArray(catalog)) return {}
-    const windows = {}
-    for (const entry of catalog) {
-      if (typeof entry?.id !== 'string' || entry.id === '') continue
-      if (Number.isInteger(entry.contextWindow) && entry.contextWindow > 0) windows[entry.id] = entry.contextWindow
-    }
-    return windows
-  } catch {
-    return {}
-  }
-}
-
 function channelMembership(runtime) {
   try {
     const catalog = runtime.state()?.catalog
@@ -351,13 +327,13 @@ async function main(argv) {
       }
       if (req.method === 'GET' && url.pathname === '/control/models') {
         await (initialRefresh ?? Promise.resolve())
-        json(res, 200, { ok: true, models: await catalogueDocument(listener, token), routes: routeMembership(), channels: channelMembership(runtime), wires: wireMembership(upstream.upstream, runtime), windows: windowMembership(runtime) })
+        json(res, 200, { ok: true, models: await catalogueDocument(listener, token), routes: routeMembership(), channels: channelMembership(runtime), wires: wireMembership(upstream.upstream, runtime) })
         return
       }
       if (req.method === 'POST' && url.pathname === '/control/refresh') {
         const body = await readJson(req)
         await refreshCatalog(body.probe === true)
-        json(res, 200, { ok: true, models: await catalogueDocument(listener, token), routes: routeMembership(), channels: channelMembership(runtime), wires: wireMembership(upstream.upstream, runtime), windows: windowMembership(runtime) })
+        json(res, 200, { ok: true, models: await catalogueDocument(listener, token), routes: routeMembership(), channels: channelMembership(runtime), wires: wireMembership(upstream.upstream, runtime) })
         return
       }
       if (req.method === 'POST' && url.pathname === '/control/shutdown') {

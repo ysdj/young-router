@@ -1806,3 +1806,165 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
             [tool.get("name") for tool in bridge["tools"]],
             ["web_search", "fetch_content"],
         )
+
+    def test_response_text_joins_one_answers_delta_frames(self) -> None:
+        """One answer cut into delta frames is one answer, not one token a line.
+
+        A recovered stream is a list of events, and every ``output_text.delta``
+        carries a fragment of the same message.  Joining those fragments with
+        newlines rebuilt the answer one token per line, so the client rendered
+        the whole message vertically.
+        """
+
+        hooks, _ = load_hook_module()
+        events = [
+            {"type": "response.output_text.delta", "delta": "cd "},
+            {"type": "response.output_text.delta", "delta": "/tmp"},
+        ]
+
+        self.assertEqual(hooks._response_text(events), "cd /tmp")
+
+    def test_response_text_never_reads_a_tool_call_arguments(self) -> None:
+        """A call's ``arguments`` is not answer text.
+
+        The walk reads the answer keys of a response; ``arguments`` is the JSON
+        a model wrote into a call and belongs to the client's tool, never to the
+        message the user reads.
+        """
+
+        hooks, _ = load_hook_module()
+        arguments = '{"command":"ls"}'
+        response = {
+            "output": [
+                {
+                    "type": "function_call",
+                    "id": "call_1",
+                    "call_id": "call_1",
+                    "name": "bash",
+                    "arguments": arguments,
+                }
+            ]
+        }
+
+        self.assertEqual(hooks._response_text(response), "")
+
+    async def test_web_search_route_recovery_keeps_a_called_tool_instead_of_an_answer(self) -> None:
+        """A poll that carried the interrupted tool call must not become prose.
+
+        The continuation was rejected because the model asked for the client's
+        own tool.  The recovery poll then streamed that same call in per-character
+        argument frames, and reading those frames for text turned the arguments
+        into an assistant message: the client was handed its own command written
+        one character per line, with the tool call thrown away.
+        """
+
+        hooks, _ = load_hook_module()
+        web_search_bridge_module = importlib.import_module(
+            "young_router.proxy.responses_web_search_bridge"
+        )
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
+        original_route_recovery_poll = streaming_module._stream_route_recovery_poll
+
+        arguments = json.dumps({"command": "cd /tmp && ls -la"})
+        polled_events = [
+            {
+                "type": "response.created",
+                "response": {"id": "resp_polled", "object": "response", "output": []},
+            },
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_polled",
+                    "call_id": "call_polled",
+                    "name": "bash",
+                    "arguments": "",
+                },
+            },
+            *[
+                {
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": "fc_polled",
+                    "output_index": 0,
+                    "delta": character,
+                }
+                for character in arguments
+            ],
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_polled",
+                    "call_id": "call_polled",
+                    "name": "bash",
+                    "arguments": arguments,
+                    "status": "completed",
+                },
+            },
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_polled",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "id": "fc_polled",
+                            "call_id": "call_polled",
+                            "name": "bash",
+                            "arguments": arguments,
+                            "status": "completed",
+                        }
+                    ],
+                },
+            },
+        ]
+
+        async def fake_route_recovery_poll(request_data, exception):
+            for event in polled_events:
+                yield event
+
+        streaming_module._stream_route_recovery_poll = fake_route_recovery_poll
+        self.addCleanup(
+            setattr,
+            streaming_module,
+            "_stream_route_recovery_poll",
+            original_route_recovery_poll,
+        )
+
+        async def run_recovery():
+            failure = RuntimeError(
+                "external web_search continuation returned an invalid response: "
+                "mixed_client_and_server_tool_calls"
+            )
+            failure.status_code = 503
+            return await web_search_bridge_module._external_web_search_stream_route_recovery_or_fallback(
+                failure,
+                request_kwargs={
+                    "model": "openai/vendor-chat",
+                    "input": "Investigate.",
+                    "stream": True,
+                    "litellm_metadata": {
+                        "external_web_search_continuation": True,
+                    },
+                },
+                search_results="Retrieved evidence observed so far: sample",
+                queries=["sample"],
+            )
+
+        recovered = await run_recovery()
+
+        output = recovered["output"]
+        self.assertEqual(len(output), 1)
+        self.assertEqual(output[0].get("type"), "function_call")
+        self.assertEqual(output[0].get("name"), "bash")
+        # The bridge re-serializes the value it delivers; the call is what matters.
+        self.assertEqual(
+            json.loads(output[0].get("arguments")),
+            json.loads(arguments),
+        )
+        self.assertNotIn("resp_hosted_tool_unsupported", recovered["id"])
+        self.assertNotIn("\n", recovered.get("output_text") or "")

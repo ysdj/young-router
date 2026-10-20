@@ -13,6 +13,7 @@ import unittest
 from unittest import mock
 
 from young_router.adapters import our_free_model
+from young_router.config.schema import PUBLIC_MODEL_CONTEXT_KEY
 from young_router.core.domains import DomainError
 from young_router.core.domains.providers_models import ProvidersModelsDomain
 from young_router.core.provider_auth import ProviderAuthManager
@@ -82,7 +83,6 @@ class StubRuntime:
             # rows here are served over Chat Completions; the Responses rows are
             # the `muse-spark` pair, which this stub does not carry.
             "wires": {"big-pickle": "chat", "mimo-v2.6-flash-free": "chat"},
-            "windows": {"big-pickle": 200_000, "mimo-v2.6-flash-free": 1_048_576},
             "status": self.provider_status(provider),
         }
 
@@ -127,7 +127,10 @@ class OurFreeModelProviderTests(unittest.TestCase):
             self.assertEqual(summary["auth_status"], "signed_in")
 
             provider = domain.snapshot()["providers"][0]
-            self.assertEqual(provider["name"], our_free_model.OUR_FREE_MODEL_DISPLAY_NAME)
+            self.assertEqual(
+                provider["name"],
+                our_free_model.OUR_FREE_MODEL_DISPLAY_NAMES[our_free_model.OUR_FREE_MODEL_PROVIDER],
+            )
             self.assertEqual(provider["auth_status"], "signed_in")
             self.assertEqual(provider["key_states"][0]["name"], our_free_model.API_KEY_NAME)
             self.assertEqual(
@@ -150,10 +153,10 @@ class OurFreeModelProviderTests(unittest.TestCase):
             # the pin asked an endpoint the row does not have.
             self.assertEqual(first["upstream_url_surface"], "openai/chat")
             self.assertEqual(first["upstream_protocol_mode"], "fixed")
-            # The window the upstream states is the route's declared window, so
-            # the public window is the upstream's number rather than the
-            # unknown-model fallback the registry would have answered with.
-            self.assertEqual(first["max_input_tokens"], 200_000)
+            # The window is resolved from the live catalog read, never copied
+            # onto the route: it is the upstream's number and it changes when
+            # the upstream changes, so a stored copy would outlive its source.
+            self.assertIsNone(first["max_input_tokens"])
             self.assertEqual(first["api_key_name"], our_free_model.API_KEY_NAME)
             self.assertTrue(provider["key_states"][0]["configured"])
 
@@ -255,7 +258,7 @@ class OurFreeModelProviderTests(unittest.TestCase):
             domain.dispatch("service_provider.add", {"kind": "our_free_model_login"})
             providers = {item["name"]: item for item in domain.snapshot()["providers"]}
             self.assertIs(providers["mine"]["key_states"][0]["managed"], False)
-            self.assertIs(providers[our_free_model.OUR_FREE_MODEL_DISPLAY_NAME]["key_states"][0]["managed"], True)
+            self.assertIs(providers[our_free_model.OUR_FREE_MODEL_DISPLAY_NAMES[our_free_model.OUR_FREE_MODEL_PROVIDER]]["key_states"][0]["managed"], True)
             # A user's own slot stays writable, including on a deployment that
             # also runs the lane: the refusal is about the slot, not the file.
             domain.stage_secret("api_key", "mine\x1fpersonal", "sk-rotated")
@@ -1044,6 +1047,7 @@ class ChannelProviderSplitTests(unittest.TestCase):
                 {
                     "kind": "our_free_model_login",
                     "name": our_free_model.OUR_FREE_MODEL_DISPLAY_NAMES[provider_id],
+                    "channel": our_free_model.PROVIDER_TO_CHANNEL[provider_id],
                 },
             )
 
@@ -1087,27 +1091,37 @@ class ChannelProviderSplitTests(unittest.TestCase):
             # to Responses is what made the probe report a missing protocol.
             model, _ = routes["big-pickle"]
             self.assertEqual(model["upstream_url_surface"], "openai/chat")
-            # The stated window is the group's declaration, so the public model
-            # reports the upstream's number rather than the unknown fallback.
-            self.assertEqual(model["max_input_tokens"], 200_000)
+            # No route declares a window; the group resolves one from the live
+            # catalog read, so the public model reports the upstream's number
+            # rather than the unknown-model fallback.
+            self.assertIsNone(model["max_input_tokens"])
 
             model, _ = routes["kilo-auto/free"]
             self.assertEqual(model["upstream_url_surface"], "openai/chat")
-            self.assertEqual(model["max_input_tokens"], 131_072)
+            self.assertIsNone(model["max_input_tokens"])
 
             # Kilo's own row states a different number, and it is kept whole:
             # one channel's window is not another's.
             model, _ = routes["eac-model"]
-            self.assertEqual(model["max_input_tokens"], 1_048_576)
+            self.assertIsNone(model["max_input_tokens"])
+            # The projection resolves from the saved document, so it is read
+            # after Apply — the same order a pane sees it in.
+            domain.apply()
+            contexts = domain.snapshot()["model_contexts"]
+            self.assertEqual(contexts["big-pickle"]["context_window"], 200_000)
+            self.assertEqual(contexts["kilo-auto/free"]["context_window"], 131_072)
+            self.assertEqual(contexts["eac-model"]["context_window"], 1_048_576)
 
 
 class ChannelRuntime(StubRuntime):
     """A lane that serves three channels, one row each."""
 
+    # The gateway states `context_window` on each row, and that is the only
+    # place the number lives: a parallel map would be the same fact twice.
     ROWS = [
-        {"id": "big-pickle", "name": "big-pickle"},
-        {"id": "kilo-auto/free", "name": "kilo-auto/free"},
-        {"id": "eac-model", "name": "eac-model"},
+        {"id": "big-pickle", "name": "big-pickle", "context_window": 200_000},
+        {"id": "kilo-auto/free", "name": "kilo-auto/free", "context_window": 131_072},
+        {"id": "eac-model", "name": "eac-model", "context_window": 1_048_576},
     ]
 
     def models(self, provider=our_free_model.OUR_FREE_MODEL_PROVIDER, *, refresh=False):  # noqa: D102
@@ -1118,7 +1132,6 @@ class ChannelRuntime(StubRuntime):
             "models": [dict(row) for row in self.ROWS],
             "channels": {"big-pickle": "", "kilo-auto/free": "kilo", "eac-model": "eac"},
             "wires": {"big-pickle": "chat", "kilo-auto/free": "chat", "eac-model": "chat"},
-            "windows": {"big-pickle": 200_000, "kilo-auto/free": 131_072, "eac-model": 1_048_576},
             "status": self.provider_status(provider),
         }
 
@@ -1127,116 +1140,108 @@ class StatedWindowIsDisplayedTests(unittest.TestCase):
     """The window the pane shows is the group's own, not the registry's guess.
 
     The projection used ``default_record_for``, which resolves registry metadata
-    while *ignoring* the user's declaration.  An imported route declares the
-    window its upstream stated, so the pane displayed the unknown-model fallback
-    (272,000) for a row whose own catalog entry said 1,048,576 -- the number was
-    in the document and the pane read around it.
+    while *ignoring* the user's declaration.  An imported route states its window
+    through its own upstream, so the pane displayed the unknown-model fallback
+    (272,000) for a row whose own catalog entry said 1,048,576 — the number was
+    in hand and the pane read around it.
     """
 
-    def test_an_imported_window_reaches_the_pane(self) -> None:
+    def _domain(self, runtime):
         directory = tempfile.TemporaryDirectory()
+        root = Path(directory.name)
+        config = root / "config.yaml"
+        config.write_text("providers: {}\nmodel_list: []\n", encoding="utf-8")
+        domain = ProvidersModelsDomain(
+            config, auth_manager=ProviderAuthManager(root), our_free_model=runtime
+        )
+        return directory, domain
+
+    def test_an_upstream_window_reaches_the_pane(self) -> None:
+        directory, domain = self._domain(ChannelRuntime())
         with directory:
-            root = Path(directory.name)
-            config = root / "config.yaml"
-            config.write_text("providers: {}\nmodel_list: []\n", encoding="utf-8")
-            domain = ProvidersModelsDomain(
-                config,
-                auth_manager=ProviderAuthManager(root),
-                our_free_model=ChannelRuntime(),
-            )
             for provider_id in our_free_model.OUR_FREE_MODEL_PROVIDERS:
                 domain.dispatch(
                     "service_provider.add",
                     {
                         "kind": "our_free_model_login",
+                        "channel": our_free_model.PROVIDER_TO_CHANNEL[provider_id],
                         "name": our_free_model.OUR_FREE_MODEL_DISPLAY_NAMES[provider_id],
                     },
                 )
             domain.apply()
             # The projection reads the saved document, so it is taken after the
             # write, the same way a pane sees it.
-            domain.reload()
             contexts = domain.snapshot()["model_contexts"]
             self.assertEqual(contexts["big-pickle"]["context_window"], 200_000)
             self.assertEqual(contexts["kilo-auto/free"]["context_window"], 131_072)
             self.assertEqual(contexts["eac-model"]["context_window"], 1_048_576)
 
+    def test_a_user_declaration_wins_over_the_upstream(self) -> None:
+        """The user knows the relay in front of the route; their number is kept.
 
-class AddOneChannelTests(unittest.TestCase):
-    """Adding a channel adds that channel, and nothing else.
+        A declared window is a decision about the group, so it is neither
+        replaced by the upstream's number nor averaged with it.  Without this,
+        trimming a route to what a relay will accept would be undone on the next
+        catalog read.
+        """
 
-    The channels are parallel entries the user picks from, not a bundle: one
-    login reaches all three, but a user who wants only Kilo must be able to add
-    only Kilo, and a user who adds one thing must not find three rows.
-    """
-
-    def _domain(self):
-        directory = tempfile.TemporaryDirectory()
-        root = Path(directory.name)
-        config = root / "config.yaml"
-        config.write_text("providers: {}\nmodel_list: []\n", encoding="utf-8")
-        domain = ProvidersModelsDomain(
-            config, auth_manager=ProviderAuthManager(root), our_free_model=ChannelRuntime()
-        )
-        return directory, domain
-
-    def test_adding_kilo_adds_only_kilo(self) -> None:
-        directory, domain = self._domain()
+        directory, domain = self._domain(ChannelRuntime())
         with directory:
             domain.dispatch(
                 "service_provider.add",
-                {"kind": "our_free_model_login", "name": our_free_model.OUR_FREE_MODEL_DISPLAY_NAMES[our_free_model.OUR_FREE_MODEL_KILO_PROVIDER]},
+                {"kind": "our_free_model_login", "channel": "", "name": "OpenCode"},
             )
-            providers = domain.snapshot()["providers"]
-            self.assertEqual(len(providers), 1)
+            provider = domain.snapshot()["providers"][0]
+            domain.dispatch(
+                "public_model.patch",
+                {"public_model": "big-pickle", "changes": {PUBLIC_MODEL_CONTEXT_KEY: 64_000}},
+            )
+            domain.apply()
             self.assertEqual(
-                providers[0]["name"],
-                our_free_model.OUR_FREE_MODEL_DISPLAY_NAMES[our_free_model.OUR_FREE_MODEL_KILO_PROVIDER],
+                domain.snapshot()["model_contexts"]["big-pickle"]["context_window"], 64_000
             )
-            self.assertEqual([m["model_name"] for m in providers[0]["models"]], ["kilo-auto/free"])
 
-    def test_the_default_name_addresses_the_anonymous_lane(self) -> None:
-        directory, domain = self._domain()
+    def test_a_group_takes_the_smallest_window_its_routes_state(self) -> None:
+        """One group, two routes, two upstreams: the narrowest one governs.
+
+        A group is only as usable as its narrowest route, so declaring the
+        largest would promise a window part of the group cannot accept.
+        """
+
+        class TwoWindows(StubRuntime):
+            def models(self, provider=our_free_model.OUR_FREE_MODEL_PROVIDER, *, refresh=False):  # noqa: D102
+                return {
+                    "available": True,
+                    "detail": "",
+                    "source": "adapter",
+                    "models": [
+                        {"id": "big-pickle", "context_window": 1_048_576},
+                        {"id": "mimo-v2.6-flash-free", "context_window": 131_072},
+                    ],
+                    "channels": {"big-pickle": "", "mimo-v2.6-flash-free": ""},
+                    "wires": {"big-pickle": "chat", "mimo-v2.6-flash-free": "chat"},
+                    "status": self.provider_status(provider),
+                }
+
+        directory, domain = self._domain(TwoWindows())
         with directory:
-            domain.dispatch("service_provider.add", {"kind": "our_free_model_login"})
-            providers = domain.snapshot()["providers"]
-            self.assertEqual(len(providers), 1)
-            self.assertEqual(providers[0]["name"], our_free_model.OUR_FREE_MODEL_DISPLAY_NAMES[our_free_model.OUR_FREE_MODEL_PROVIDER])
-            self.assertEqual([m["model_name"] for m in providers[0]["models"]], ["big-pickle"])
-
-
-class CatalogReadIsPerChannelTests(unittest.TestCase):
-    """A provider's roster is its own channel's rows, not the whole lane's.
-
-    One worker serves every channel, so its answer is the whole roster.  Passing
-    that answer through unchanged put the Kilo rows under the anonymous
-    channel's heading: the picker groups by channel, and a roster handed to it
-    *for* that channel gave it no reason to doubt the rows were that channel's.
-    """
-
-    ROSTER = [{"id": "big-pickle"}, {"id": "kilo-auto/free"}, {"id": "eac-model"}]
-    CHANNELS = {"big-pickle": "", "kilo-auto/free": "kilo", "eac-model": "eac"}
-
-    def test_a_channel_read_returns_only_that_channel(self) -> None:
-        listed = {
-            provider: [
-                entry["id"]
-                for entry in self.ROSTER
-                if our_free_model.provider_for_channel(self.CHANNELS.get(entry["id"])) == provider
-            ]
-            for provider in our_free_model.OUR_FREE_MODEL_PROVIDERS
-        }
-        self.assertEqual(listed[our_free_model.OUR_FREE_MODEL_PROVIDER], ["big-pickle"])
-        self.assertEqual(listed[our_free_model.OUR_FREE_MODEL_KILO_PROVIDER], ["kilo-auto/free"])
-        self.assertEqual(listed[our_free_model.OUR_FREE_MODEL_EAC_PROVIDER], ["eac-model"])
-
-    def test_the_read_filters_by_the_requested_provider(self) -> None:
-        """The filter is in the read itself, not left to every caller."""
-
-        source = (
-            Path(__file__).resolve().parent.parent / "young_router/adapters/our_free_model.py"
-        ).read_text(encoding="utf-8")
-        read = source.split("def models(", 1)[1].split("def _request(", 1)[0]
-        self.assertIn("PROVIDER_TO_CHANNEL[provider]", read)
-        self.assertIn("provider_for_channel(", read)
-        self.assertIn('"models": models,', read)
+            domain.dispatch(
+                "service_provider.add",
+                {
+                    "kind": "our_free_model_login",
+                    "channel": "",
+                    "name": "OpenCode",
+                    "models": [
+                        # One public name, two upstreams with different windows.
+                        {"name": "shared", "upstream_model": "big-pickle"},
+                        {"name": "shared", "upstream_model": "mimo-v2.6-flash-free"},
+                    ],
+                },
+            )
+            # A supplied roster skips the import, so the catalog read that
+            # records upstream windows happens as the pane's own 获取模型 does.
+            domain.dispatch("our_free_model_models", {"refresh": True})
+            domain.apply()
+            self.assertEqual(
+                domain.snapshot()["model_contexts"]["shared"]["context_window"], 131_072
+            )

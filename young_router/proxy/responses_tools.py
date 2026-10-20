@@ -647,6 +647,103 @@ def _blank_assistant_message(item: Any) -> bool:
     return True
 
 
+def _tool_record_identifiers(item: Any) -> set[str]:
+    """Return the identifiers a replayed tool call or output can pair by."""
+
+    if not isinstance(item, dict):
+        return set()
+    return {
+        value
+        for key in ("call_id", "id")
+        if isinstance((value := item.get(key)), str) and value
+    }
+
+
+def _with_contiguous_responses_chat_tool_records(
+    items: list[Any],
+) -> tuple[list[Any], int]:
+    """Keep every result in a parallel tool-call group beside its calls.
+
+    LiteLLM converts consecutive Responses function calls into one assistant
+    message with several ``tool_calls``.  Some clients replay an image resize
+    notice or another message between the results of that same parallel batch.
+    On the resulting Chat history the second tool message follows a developer
+    message instead of the assistant call, and the upstream rejects the whole
+    request as an incomplete tool record (observed from WorkBuddy: HTTP 400
+    ``工具记录不完整，请新建任务``).  Move only the barrier messages after the
+    complete batch; their content and order remain intact.
+    """
+
+    rewritten: list[Any] = []
+    moved_barriers = 0
+    index = 0
+    call_types = {"function_call", "custom_tool_call"}
+    output_types = {"function_call_output", "custom_tool_call_output"}
+    while index < len(items):
+        item = items[index]
+        if not isinstance(item, dict) or item.get("type") not in call_types:
+            rewritten.append(item)
+            index += 1
+            continue
+
+        calls: list[Any] = []
+        pending_calls: list[set[str]] = []
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, dict) or item.get("type") not in call_types:
+                break
+            identifiers = _tool_record_identifiers(item)
+            calls.append(item)
+            pending_calls.append(identifiers)
+            index += 1
+
+        if len(calls) < 2 or any(not identifiers for identifiers in pending_calls):
+            rewritten.extend(calls)
+            continue
+
+        outputs: list[Any] = []
+        barriers: list[Any] = []
+        barrier_indices: list[int] = []
+        while index < len(items) and pending_calls:
+            item = items[index]
+            item_type = item.get("type") if isinstance(item, dict) else None
+            if item_type in output_types:
+                identifiers = _tool_record_identifiers(item)
+                matching_call = next(
+                    (
+                        call_index
+                        for call_index, call_identifiers in enumerate(pending_calls)
+                        if identifiers & call_identifiers
+                    ),
+                    None,
+                )
+                if matching_call is None:
+                    break
+                pending_calls.pop(matching_call)
+                outputs.append(item)
+                index += 1
+                continue
+            if item_type in call_types:
+                break
+            barriers.append(item)
+            barrier_indices.append(index)
+            index += 1
+
+        if pending_calls:
+            # This is not a complete group whose calls and outputs are in this
+            # replay. Leave it untouched rather than changing a partial record.
+            rewritten.extend(calls)
+            index = barrier_indices[0] if barrier_indices else index
+            continue
+
+        rewritten.extend(calls)
+        rewritten.extend(outputs)
+        rewritten.extend(barriers)
+        moved_barriers += len(barriers)
+
+    return rewritten, moved_barriers
+
+
 def _responses_chat_bridge_input(
     value: Any,
     tools: Any = None,
@@ -777,6 +874,10 @@ def _responses_chat_bridge_input(
             converted_custom_tool_outputs += 1
         filtered.append(updated_item)
 
+    filtered.extend(closing_delegations)
+    filtered, moved_tool_record_barriers = (
+        _with_contiguous_responses_chat_tool_records(filtered)
+    )
     if (
         dropped_tool_search == 0
         and dropped_additional_tools == 0
@@ -785,9 +886,9 @@ def _responses_chat_bridge_input(
         and converted_custom_tool_outputs == 0
         and flattened_namespace_calls == 0
         and lifted_delegation_tasks == 0
+        and moved_tool_record_barriers == 0
     ):
         return value, {"changed": False, "dropped_tool_search_items": 0}
-    filtered.extend(closing_delegations)
     stats = {
         "changed": True,
         "dropped_tool_search_items": dropped_tool_search,
@@ -804,6 +905,8 @@ def _responses_chat_bridge_input(
         stats["converted_custom_tool_outputs"] = converted_custom_tool_outputs
     if flattened_namespace_calls:
         stats["flattened_namespace_calls"] = flattened_namespace_calls
+    if moved_tool_record_barriers:
+        stats["moved_tool_record_barriers"] = moved_tool_record_barriers
     return filtered, stats
 
 

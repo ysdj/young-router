@@ -614,7 +614,6 @@ export const en: Record<TranslationKey, string> = {
   "providers.followMultiplier": "Follow multiplier",
   "providers.addWizard": "Add with wizard",
   "providers.wizard.title": "Configure provider",
-  "providers.wizard.description": "Set up a provider, authentication, and model in a few steps.",
   "providers.wizard.stepProvider": "Provider",
   "providers.wizard.stepKeys": "Keys",
   "providers.wizard.providerType": "Provider type",
@@ -652,7 +651,7 @@ export const en: Record<TranslationKey, string> = {
   "providers.type.apiKey": "API key",
   "providers.type.workbuddy": "WorkBuddy",
   "providers.type.workbuddyAI": "WorkBuddy AI",
-  "providers.type.ourFreeModel": "Our Free Model · OpenCode free lane",
+  "providers.type.ourFreeModel": "Our Free Model · OpenCode channel",
   "providers.type.ourFreeModelKilo": "Our Free Model · Kilo channel",
   "providers.type.ourFreeModelEAC": "Our Free Model · EAC channel",
   // The picker groups Our Free Model publishes for its roster: what this

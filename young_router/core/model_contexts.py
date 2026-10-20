@@ -610,6 +610,7 @@ class ModelContextRegistry:
         refresh_enabled: bool | None = None,
         fetcher: Callable[[str], object] | None = None,
         clock: Callable[[], float] | None = None,
+        upstream_windows: Callable[[], Mapping[str, int]] | None = None,
     ) -> None:
         self.runtime_config_path = Path(runtime_config_path).expanduser() if runtime_config_path else None
         self.runtime_settings_path = Path(runtime_settings_path).expanduser() if runtime_settings_path else None
@@ -620,6 +621,12 @@ class ModelContextRegistry:
         self.refresh_enabled = bool(runtime_settings_path) if refresh_enabled is None else bool(refresh_enabled)
         self._fetcher = fetcher or self._fetch_json
         self._clock = clock or time.time
+        # The window each route's own upstream states, as the live catalog read
+        # reported it.  Injected rather than stored: the number is the
+        # upstream's, it changes when the upstream changes, and copying it into
+        # the configuration would make a stale reading outlive the read that
+        # produced it.
+        self._upstream_windows = upstream_windows
         self._records: dict[str, dict[str, Any]] = RecordLookupIndex()
         # The record keys grouped by their last path segment, for `_lookup`.
         self._record_tail_index: dict[str, tuple[str, ...]] = {}
@@ -993,8 +1000,9 @@ class ModelContextRegistry:
         return True
 
     @staticmethod
+    @staticmethod
     def _deployment_context(deployment: Mapping[str, Any]) -> int | None:
-        """Read the user's public-model context window from one deployment."""
+        """The window the *user* declared for one route, if they declared one."""
 
         model_info = deployment.get("model_info")
         if not isinstance(model_info, Mapping):
@@ -1002,13 +1010,40 @@ class ModelContextRegistry:
         return _positive_int(model_info.get("max_input_tokens"))
 
     def _custom_contexts(self, public_name: str) -> list[int]:
-        """Collect the explicitly configured windows of every route in a group."""
+        """Collect every window the routes of one group answer with.
 
+        Three answers count, in the order the group resolves them: the window
+        the user declared on a route, the window that route's own upstream
+        stated in its live catalog, and — when neither exists for any route —
+        whatever the registry infers later.  The group takes the smallest of
+        them, because a group is only as usable as its narrowest route.
+
+        The upstream's number is read through ``upstream_windows`` rather than
+        from the deployment: it belongs to the upstream, it changes when the
+        upstream changes, and the caller that performed the read is the one that
+        knows it.  Storing it in the configuration would make one stale reading
+        outlive every read after it.
+        """
+
+        deployments = self._load_route_deployments(public_name)
+        stated = self._upstream_windows() if self._upstream_windows else {}
         contexts: list[int] = []
-        for deployment in self._load_route_deployments(public_name):
-            context = self._deployment_context(deployment)
-            if context is not None:
-                contexts.append(context)
+        for deployment in deployments:
+            declared = self._deployment_context(deployment)
+            if declared is not None:
+                contexts.append(declared)
+                continue
+            # The upstream's answer about *this route's* wire, keyed by the
+            # model id the route addresses.
+            params = deployment.get("litellm_params")
+            if not isinstance(params, Mapping):
+                continue
+            model_id = str(params.get("model", "")).strip()
+            for candidate in _candidate_ids(model_id):
+                window = stated.get(candidate) if isinstance(stated, Mapping) else None
+                if isinstance(window, int) and not isinstance(window, bool) and window > 0:
+                    contexts.append(window)
+                    break
         return contexts
 
     def _resolved_route_records(self, public_name: str) -> list[dict[str, Any]]:

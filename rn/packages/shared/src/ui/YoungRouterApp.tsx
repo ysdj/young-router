@@ -346,12 +346,25 @@ function serviceCatalogRead(service: ServiceID, channel?: string): { action: str
   return undefined;
 }
 
-/** The provider each lane channel is created as, from the wizard's type. */
-const OUR_FREE_MODEL_CHANNEL_PROVIDER: Record<string, string> = {
-  ourFreeModel: "our-free-model",
-  ourFreeModelKilo: "our-free-model-kilo",
-  ourFreeModelEAC: "our-free-model-eac",
+/**
+ * The provider each lane channel is created as, with its stored channel tag.
+ *
+ * `tag` is the identity and `name` is only the suggested label: Core stores the
+ * tag, so a user who renames the entry keeps it on its own channel.  The names
+ * must stay identical to `OUR_FREE_MODEL_DISPLAY_NAMES` in
+ * `young_router/adapters/our_free_model.py`.  The anonymous channel's tag is the
+ * empty string, which is a real answer rather than a missing one.
+ */
+const OUR_FREE_MODEL_CHANNEL: Record<string, { providerId: string; tag: string; name: string }> = {
+  ourFreeModel: { providerId: "our-free-model", tag: "", name: "Our Free Model · OpenCode" },
+  ourFreeModelKilo: { providerId: "our-free-model-kilo", tag: "kilo", name: "Our Free Model · Kilo" },
+  ourFreeModelEAC: { providerId: "our-free-model-eac", tag: "eac", name: "Our Free Model · EAC" },
 };
+
+/** The provider id one wizard type creates; the lane when the type names none. */
+function ourFreeModelProviderIDFor(type: string): string {
+  return OUR_FREE_MODEL_CHANNEL[type]?.providerId ?? "our-free-model";
+}
 
 /**
  * One service's own catalog, or `undefined` when no catalog answered.
@@ -3242,18 +3255,14 @@ function serviceProviderKindLabel(kind: ServiceProviderKind, translate: Translat
  * the short name is not in Core's `_SERVICE_PROVIDER_KINDS`, so a dispatch
  * that sent it would be refused as an unavailable login type.
  */
-function nextServiceProviderName(providers: UnknownRecord[], kind: ServiceProviderKind, channelProvider?: string): string {
+function nextServiceProviderName(providers: UnknownRecord[], kind: ServiceProviderKind, laneChannelName?: string): string {
   const base = kind === "openai_login" ? "OpenAI"
     : kind === "claude_login" ? "Claude"
       : kind === "workbuddy_login" ? "WorkBuddy"
         : kind === "workbuddy_ai_login" ? "WorkBuddy AI"
           // A lane channel states its own name: the name is what Core reads to
           // know which channel an entry is, so three entries cannot share one.
-          : channelProvider === "our-free-model-kilo" ? "Our Free Model · Kilo"
-            : channelProvider === "our-free-model-eac" ? "Our Free Model · EAC"
-              // The entry is named after the type the picker shows, so the two
-              // never disagree about what the user added.
-              : "Our Free Model";
+          : laneChannelName || "Our Free Model · OpenCode";
   const names = new Set(providers.map((provider) => stringValue(provider.display_name, stringValue(provider.name)).trim().toLocaleLowerCase()).filter(Boolean));
   if (!names.has(base.toLocaleLowerCase())) return base;
   let suffix = 2;
@@ -3369,7 +3378,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     ? undefined
     : isOurFreeModelType ? "ourFreeModel" : providerType;
   /** The provider this entry creates; the wizard names it. */
-  const ourFreeModelProviderID = OUR_FREE_MODEL_CHANNEL_PROVIDER[providerType] ?? "our-free-model";
+  const ourFreeModelProviderID = ourFreeModelProviderIDFor(providerType);
   const isLoginType = isOfficialLoginType || isWorkBuddyType || isOurFreeModelType;
   const workbuddyProvider = providerType === "workbuddyAI" ? "workbuddy-ai" : "workbuddy";
   const workbuddyAuthKind: ServiceProviderKind = providerType === "workbuddyAI" ? "workbuddy_ai_login" : "workbuddy_login";
@@ -3504,9 +3513,20 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     ? providerBaseURL
     : SERVICE_BASE_URLS[serviceType] || translate("common.notAvailable");
   const selectedServiceLabel = servicePickerItems.find((item) => item.type === providerType)?.label ?? servicePickerLabels[0] ?? "";
+  // The wizard asks for 基础 URL only where the user can state one.  A service
+  // whose address belongs to Core (Our Free Model) or to a desktop app
+  // (WorkBuddy) has no value to print, and a required field reading 「不适用」
+  // asks for something that cannot be given.
+  const wizardEditsBaseURL = !isWorkBuddyType && !isOurFreeModelType;
+  // The free lane and WorkBuddy carry no secret of their own — the lane imports
+  // its roster on create, and the desktop app owns WorkBuddy's sign-in — so 密钥
+  // is not a step of theirs at all.  A step that only says "nothing to type
+  // here" is a page the user walks through for no reason; both the rail and the
+  // walk between 供应商 and 模型 reflect that.
+  const needsKeyStep = !isOurFreeModelType && !isWorkBuddyType;
   const stepItems: Array<{ id: WizardStep; title: string }> = [
     { id: "provider", title: translate("providers.wizard.stepProvider") },
-    { id: "keys", title: translate("providers.wizard.stepKeys") },
+    ...(needsKeyStep ? [{ id: "keys" as WizardStep, title: translate("providers.wizard.stepKeys") }] : []),
     { id: "model", title: translate("providers.wizard.stepModel") },
   ];
 
@@ -3547,9 +3567,10 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       setValidation(translate("providers.wizard.duplicateName"));
       return false;
     }
-    // A custom provider carries its own address, and the step that asks for
-    // it is where its absence is stated.
-    if (providerMode === "new" && !serviceBaseURL.trim()) {
+    // A provider carries its own address only when this step asks for one: the
+    // keyless types print none, so requiring a value here refused a step whose
+    // field is not on screen and disabled 下一步 for good.
+    if (providerMode === "new" && wizardEditsBaseURL && !serviceBaseURL.trim()) {
       setValidation(translate("providers.wizard.required"));
       return false;
     }
@@ -3663,7 +3684,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     // (empty) address: one worker on this machine serves all of them.
     const chosenService: ServiceID | undefined = value === "api"
       ? undefined
-      : OUR_FREE_MODEL_CHANNEL_PROVIDER[value]
+      : OUR_FREE_MODEL_CHANNEL[value]
         ? "ourFreeModel"
         : value as ServiceID;
     setProviderBaseURL(chosenService === undefined ? "" : SERVICE_BASE_URLS[chosenService]);
@@ -3671,10 +3692,10 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     // same account has to stay distinguishable.  A lane channel states its own
     // name, because the name is what Core reads to know which channel the entry
     // is: three entries cannot all be called "Our Free Model".
-    const channelProvider = OUR_FREE_MODEL_CHANNEL_PROVIDER[value];
+    const channelName = OUR_FREE_MODEL_CHANNEL[value]?.name;
     setProviderName(value === "workbuddy" ? nextServiceProviderName(providers, "workbuddy_login")
       : value === "workbuddyAI" ? nextServiceProviderName(providers, "workbuddy_ai_login")
-        : channelProvider ? nextServiceProviderName(providers, "our_free_model_login", channelProvider)
+        : channelName ? nextServiceProviderName(providers, "our_free_model_login", channelName)
           : value === "openai" ? nextServiceProviderName(providers, "openai_login")
             : value === "claude" ? nextServiceProviderName(providers, "claude_login")
               : "");
@@ -3695,8 +3716,12 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         : providerType === "ourFreeModel" ? "our_free_model_login"
           : providerType === "claude" ? "claude_login"
             : "openai_login";
-    const baseName = nextServiceProviderName([], kind);
-    const suggested = nextServiceProviderName(providers, kind);
+    // The channel states its own name here too, or this repair would rewrite a
+    // Kilo entry's suggestion back to the lane's default the moment the
+    // provider list arrived.
+    const laneChannelName = OUR_FREE_MODEL_CHANNEL[providerType]?.name;
+    const baseName = nextServiceProviderName([], kind, laneChannelName);
+    const suggested = nextServiceProviderName(providers, kind, laneChannelName);
     setProviderName((current) => (current.trim() === "" || current.trim() === baseName ? suggested : current));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [providers, providerType, providerMode, keyPath, step]);
@@ -4039,8 +4064,9 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       }
       const next = await dispatchWithOutcome("service_provider.add", {
         kind: "our_free_model_login",
-        // The name is what tells Core which channel this entry is, since all
-        // three share one login kind.
+        // The channel is stored identity; the name beside it is a label the
+        // user may change later.
+        channel: OUR_FREE_MODEL_CHANNEL[providerType]?.tag ?? "",
         name,
         // The public name is the upstream's own id, unchanged: renaming a
         // model is the user's to do in the pane.  Core applies the same rule
@@ -4249,6 +4275,21 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     stepRef.current = "model";
     setStep("model");
   };
+  /**
+   * Leave 供应商 for this type's next step: 密钥 when it carries a secret of its
+   * own, 模型 when it does not.  The lane's roster is the model step's own read,
+   * so the ticket that starts it is raised here as it is from 密钥.
+   */
+  const advanceFromProviderStep = (): void => {
+    if (needsKeyStep) {
+      setStep("keys");
+      stepRef.current = "keys";
+      return;
+    }
+    if (isOurFreeModelType) setModelFetchState("loading");
+    advanceStepToModel();
+    if (isOurFreeModelType) setModelFetchTicket((current) => current + 1);
+  };
   const goNext = async (): Promise<void> => {
     // The primary button keeps reporting its own progress, so the guard that
     // used to come from `disabled` lives here.
@@ -4262,7 +4303,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     // The guard's ref moves with the step this call is about to take.  A
     // deferred branch still names its own value through `advanceStepToModel`,
     // so both routes leave the ref equal to the step that will render.
-    stepRef.current = step === "provider" ? "keys" : "model";
+    stepRef.current = step === "provider" ? (needsKeyStep ? "keys" : "model") : "model";
     setValidation("");
     if (step === "provider") {
       if (providerMode === "new") {
@@ -4271,14 +4312,14 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         // both wait for it), and an official account is created by the press
         // that signs in to it.
         if (!providerStepValid()) return;
-        setStep("keys");
+        advanceFromProviderStep();
         return;
       }
       if (!providerID) {
         setValidation(translate("providers.wizard.required"));
         return;
       }
-      setStep("keys");
+      advanceFromProviderStep();
       return;
     }
     if (step === "keys") {
@@ -4506,8 +4547,9 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       return;
     }
     if (step === "model") {
-      setStep("keys");
-      stepRef.current = "keys";
+      const previous = needsKeyStep ? "keys" : "provider";
+      setStep(previous);
+      stepRef.current = previous;
     } else if (step === "keys") {
       setStep("provider");
       stepRef.current = "provider";
@@ -4521,11 +4563,11 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   return <View style={styles.providerWizardSurface} accessibilityViewIsModal>
     <View style={styles.providerWizardSetupContent}>
       <View style={[styles.providerWizardSetupSurface, step === "model" && styles.providerWizardSetupSurfaceModel]}>
+        {/* The progress rail already names the wizard, and its active step
+            names what this window is configuring: a title restating that plus
+            a sentence about the steps the rail itself draws is the redundant
+            in-content heading the compact density forbids. */}
         <NativeWizardProgress steps={stepItems.map((item) => item.title)} activeIndex={stepItems.findIndex((item) => item.id === step)} />
-        <View style={styles.providerWizardHeader}>
-          <Text style={styles.providerWizardTitle}>{translate("providers.wizard.title")}</Text>
-          <Text style={styles.providerWizardDescription}>{translate("providers.wizard.description")}</Text>
-        </View>
         {loginPhase === "sign-in" ? <View style={styles.providerWizardSignInPanel}>
           <Text style={styles.providerWizardPanelTitle}>{translate("relay.stepSignIn")}</Text>
         </View> : <>
@@ -4541,10 +4583,10 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
           </NativeFormRow> : null}
           {providerMode === "existing" ? <NativeFormRow required label={translate("providers.wizard.selectProvider")}><NativePicker labels={providerPickerLabels} selectedValue={selectedProviderPickerLabel} disabled={wizardBusy || providerPickerLabels.length === 0} onChange={({ nativeEvent }) => { const option = providerOptions[nativeEvent.index]; if (option) chooseExistingProvider(option.value); }} style={styles.providerWizardPicker} /></NativeFormRow> : null}
           {providerMode === "new" ? <>
-            <NativeFormRow required label={translate("providers.wizard.baseUrl")}><NativeTextField value={serviceBaseURL} placeholder={translate("providers.wizard.baseUrlPlaceholder")} editable={providerType === "api" && !wizardBusy} autoCapitalize="none" autoCorrect={false} onChangeText={updateProviderBaseURL} accessibilityLabel={translate("providers.wizard.baseUrl")} style={styles.providerWizardInput} /></NativeFormRow>
+            {wizardEditsBaseURL ? <NativeFormRow required label={translate("providers.wizard.baseUrl")}><NativeTextField value={serviceBaseURL} placeholder={translate("providers.wizard.baseUrlPlaceholder")} editable={providerType === "api" && !wizardBusy} autoCapitalize="none" autoCorrect={false} onChangeText={updateProviderBaseURL} accessibilityLabel={translate("providers.wizard.baseUrl")} style={styles.providerWizardInput} /></NativeFormRow> : null}
             <NativeFormRow required label={translate("providers.wizard.providerName")}><NativeTextField value={providerName} placeholder={translate("providers.wizard.providerNamePlaceholder")} editable={!wizardBusy} autoCapitalize="none" autoCorrect={false} onChangeText={updateProviderName} accessibilityLabel={translate("providers.wizard.providerName")} style={styles.providerWizardInput} /></NativeFormRow>
           </> : null}
-          {providerMode === "new" && providerType !== "api" ? <Text style={styles.providerWizardHint}>{translate("providers.wizard.serviceUrlFixed")}</Text> : null}
+          {providerMode === "new" && wizardEditsBaseURL && providerType !== "api" ? <Text style={styles.providerWizardHint}>{translate("providers.wizard.serviceUrlFixed")}</Text> : null}
           {providerMode === "new" && isOfficialLoginType && keyPath === "login" ? <Text style={styles.providerWizardHint}>{providerType === "openai" ? translate("relay.officialProviderWebViewHint") : translate("relay.officialProviderBrowserHint")}</Text> : null}
           {providerMode === "new" && isWorkBuddyType ? <Text style={styles.providerWizardHint}>{translate("providers.wizard.workbuddyAppHint")}</Text> : null}
           {providerMode === "new" && isOurFreeModelType ? <Text style={styles.providerWizardHint}>{translate("providers.wizard.ourFreeModelHint")}</Text> : null}
@@ -4640,35 +4682,25 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         </View> : isWorkBuddyType ? <View style={styles.providerWizardFormSection}>
           <View style={styles.providerWizardSectionHeader}><Text style={styles.providerWizardPanelTitle}>{translate("providers.wizard.models")}</Text><Text numberOfLines={1} style={styles.providerWizardHint}>{translate("providers.wizard.providerName")}: {selectedProviderName}</Text></View>
           <Text style={styles.providerWizardHint}>{translate("providers.wizard.workbuddyAssociationHint")}</Text>
-        </View> : isOurFreeModelType ? <PersistentScrollView style={styles.providerWizardModelScroll} contentContainerStyle={styles.providerWizardModelScrollContent} showsVerticalScrollIndicator keyboardShouldPersistTaps="handled">
-          <View style={styles.providerWizardFormSection}>
+        </View> : isOurFreeModelType ? <View style={styles.providerWizardModelPane}>
+          <View style={styles.providerWizardModelFormSection}>
             <View style={styles.providerWizardSectionHeader}><Text style={styles.providerWizardPanelTitle}>{translate("providers.wizard.models")}</Text><Text numberOfLines={1} style={styles.providerWizardHint}>{translate("providers.wizard.providerName")}: {selectedProviderName}</Text></View>
-            {/* This lane lists its free roster live, so the step offers the same
-                pick every other provider does: choose which free models this
-                entry carries, and 刷新 asks the lane again. */}
+            {/* The toolbar is the roster's controls and nothing else: 全选, 反选,
+                and 重新获取模型.  How many models came back and how many are
+                picked are both visible from the list below, so a sentence
+                restating them was a tip standing where a tool belongs.  While a
+                read is in flight the row is the wheel alone, and the refresh
+                control returns with it. */}
             <View style={styles.providerWizardModelToolbar}>
-              <View style={styles.providerWizardModelStatusRow}>
-                {modelFetchState === "loading" ? <NativeBusySpinner label={translate("providers.wizard.fetchingModels")} /> : null}
-                <Text numberOfLines={2} style={styles.providerWizardHint}>{modelFetchState === "loading" ? translate("providers.wizard.fetchingModels") : modelCandidates.length > 0 ? translate("providers.wizard.modelsFound", { count: modelCandidates.length }) : modelFetchState === "unavailable" ? translate("providers.wizard.modelsUnavailable") : modelFetchState === "empty" ? translate("providers.wizard.modelsEmpty") : translate("providers.wizard.noModels")}</Text>
-              </View>
-              {/* The refresh button is gone while the read it starts is in
-                  flight: the row above already states that wait with the one
-                  wheel, and a control that would start the same read again has
-                  nothing to offer until this one answers. */}
-              {modelFetchState === "loading" ? null : <NativeButton title={translate("providers.wizard.refreshModels")} compact link disabled={wizardBusy} onPress={() => { void fetchOurFreeModelModels(ourFreeModelProviderID); }} />}
-            </View>
-            {modelCandidates.length > 0 ? <View style={styles.providerWizardModelGroup}>
-              <View style={styles.providerWizardModelGroupHeader}>
-                <Text style={styles.providerWizardPanelTitle}>{translate("providers.wizard.discoveredModels")}</Text>
-                {/* The same two tools the model chooser offers: one press for
-                    everything, and one for the complement, so a nine-model
-                    roster is not nine clicks in either direction. */}
-                <View style={styles.providerWizardModelGroupTools}>
+              {modelFetchState === "loading" ? <NativeBusySpinner label={translate("providers.wizard.fetchingModels")} /> : <>
+                {modelCandidates.length > 0 ? <>
                   <NativeButton title={translate(selectedModels.length === modelCandidates.length ? "dataManagement.deselectAll" : "dataManagement.selectAll")} compact link disabled={wizardBusy} onPress={() => { setSelectedModels(selectedModels.length === modelCandidates.length ? [] : [...modelCandidates]); setValidation(""); }} />
                   <NativeButton title={translate("modelChooser.invert")} compact link disabled={wizardBusy} onPress={() => { setSelectedModels((current) => modelCandidates.filter((name) => !current.includes(name))); setValidation(""); }} />
-                  <Text style={styles.providerWizardHint}>{translate("providers.wizard.selectedModels", { count: selectedModels.length })}</Text>
-                </View>
-              </View>
+                </> : null}
+                <NativeButton title={translate("providers.wizard.refreshModels")} compact link disabled={wizardBusy} onPress={() => { void fetchOurFreeModelModels(ourFreeModelProviderID); }} />
+              </>}
+            </View>
+            {modelCandidates.length > 0 ? <View style={styles.providerWizardModelGroup}>
               {/* One block per producer, because the roster is not one list:
                   these models are served from different upstreams, and a flat
                   list read as one source.  The producer is the upstream
@@ -4679,7 +4711,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
                   Inside a producer the availability split still applies: what
                   this egress can use, and what its regional gate refuses.  Both
                   splits are the upstream's; neither is inferred here. */}
-              <View style={styles.providerWizardModelList}>
+              <View style={styles.providerWizardModelListFrame}><PersistentScrollView style={styles.providerWizardModelListScroll} contentContainerStyle={styles.providerWizardModelList} showsVerticalScrollIndicator keyboardShouldPersistTaps="handled">
                 {laneChannelOrder(Array.from(new Set(Object.values(laneChannels)))).map((channel) => {
                   const names = modelCandidates.filter((name) => (laneChannels[name] ?? LANE_CHANNEL_FREE) === channel);
                   if (names.length === 0) return null;
@@ -4713,35 +4745,26 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
                 {/* A roster the upstream stated no producer for is still a
                     roster: it is listed whole rather than hidden. */}
                 {modelCandidates.every((name) => !(name in laneChannels)) ? modelCandidates.map((name) => <NativeCheckbox key={`lane:${name}`} label={name} value={selectedModels.includes(name)} disabled={wizardBusy} onValueChange={(checked) => { setSelectedModels((current) => checked ? (current.includes(name) ? current : [...current, name]) : current.filter((item) => item !== name)); setValidation(""); }} style={styles.providerWizardModelCheckbox} />) : null}
-              </View>
+              </PersistentScrollView></View>
             </View> : null}
-            <Text style={styles.providerWizardModelSummary}>{translate("providers.wizard.modelsToAdd", { count: selectedModels.length })}</Text>
           </View>
-        </PersistentScrollView> : <PersistentScrollView style={styles.providerWizardModelScroll} contentContainerStyle={styles.providerWizardModelScrollContent} showsVerticalScrollIndicator keyboardShouldPersistTaps="handled">
-          <View style={styles.providerWizardFormSection}>
+        </View> : <View style={styles.providerWizardModelPane}>
+          <View style={styles.providerWizardModelFormSection}>
             <View style={styles.providerWizardSectionHeader}><Text style={styles.providerWizardPanelTitle}>{translate("providers.wizard.models")}</Text><Text numberOfLines={1} style={styles.providerWizardHint}>{translate("providers.wizard.providerName")}: {selectedProviderName}</Text></View>
             {!usingProvidedKeyPath(keyPath) ? <View style={styles.providerWizardModelToolbar}>
-              <View style={styles.providerWizardModelStatusRow}>
-                {/* One wheel for one wait.  The button beside this row draws
-                    its own when it is busy, so a spinner here as well spun two
-                    wheels for a single read; the body's block drew a third.
-                    What is left is the row's own, and the button states the
-                    same wait in the language of the control that started it. */}
-                {modelFetchState === "loading" ? <NativeBusySpinner label={translate("providers.wizard.fetchingModels")} /> : null}
-                <Text numberOfLines={2} style={styles.providerWizardHint}>{modelFetchState === "loading" ? translate("providers.wizard.fetchingModels") : modelCandidates.length > 0 ? translate("providers.wizard.modelsFound", { count: modelCandidates.length }) : modelFetchState === "unavailable" ? translate("providers.wizard.modelsUnavailable") : modelFetchState === "empty" ? translate("providers.wizard.modelsEmpty") : translate("providers.wizard.noModels")}</Text>
-              </View>
-              {modelFetchState === "loading" ? null : <NativeButton title={translate("providers.wizard.refreshModels")} compact link disabled={wizardBusy || !manualSelectedKeyName || (creatingProvider ? !serviceBaseURL.trim() : !providerID)} onPress={() => { void fetchWizardModels(); }} />}
-            </View> : <View style={styles.providerWizardModelToolbar}>
-              <Text numberOfLines={2} style={styles.providerWizardHint}>{modelCandidates.length > 0 ? translate("providers.wizard.modelsFound", { count: modelCandidates.length }) : translate("relay.resourcesNoModels")}</Text>
-            </View>}{
+              {/* One wheel for one wait: the row is the wheel while the read it
+                  started is running, and the button carries the same wait in
+                  the control that owns it once it answers. */}
+              {modelFetchState === "loading" ? <NativeBusySpinner label={translate("providers.wizard.fetchingModels")} /> : <NativeButton title={translate("providers.wizard.refreshModels")} compact link disabled={wizardBusy || !manualSelectedKeyName || (creatingProvider ? !serviceBaseURL.trim() : !providerID)} onPress={() => { void fetchWizardModels(); }} />}
+            </View> : null}{
               /* One wheel for one wait: the toolbar's row above already states
                  it above, so no block repeats the same wait below. */
             }
             {modelCandidates.length > 0 ? <View style={styles.providerWizardModelGroup}>
-              <View style={styles.providerWizardModelGroupHeader}><Text style={styles.providerWizardPanelTitle}>{translate(usingProvidedKeyPath(keyPath) ? "providers.wizard.providedModels" : "providers.wizard.discoveredModels")}</Text><Text style={styles.providerWizardHint}>{translate("providers.wizard.selectedModels", { count: selectedModels.length })}</Text></View>
-              <View style={styles.providerWizardModelList}>
+              <View style={styles.providerWizardModelGroupHeader}><Text style={styles.providerWizardPanelTitle}>{translate(usingProvidedKeyPath(keyPath) ? "providers.wizard.providedModels" : "providers.wizard.discoveredModels")}</Text></View>
+              <View style={styles.providerWizardModelListFrame}><PersistentScrollView style={styles.providerWizardModelListScroll} contentContainerStyle={styles.providerWizardModelList} showsVerticalScrollIndicator keyboardShouldPersistTaps="handled">
                 {modelCandidates.map((name) => <NativeCheckbox key={`discovered:${name}`} label={name} value={selectedModels.includes(name)} disabled={wizardBusy} onValueChange={(checked) => { setSelectedModels((current) => checked ? (current.includes(name) ? current : [...current, name]) : current.filter((item) => item !== name)); setValidation(""); }} style={styles.providerWizardModelCheckbox} />)}
-              </View>
+              </PersistentScrollView></View>
             </View> : null}
             {!usingProvidedKeyPath(keyPath) ? <View style={styles.providerWizardModelGroup}>
               <Text style={styles.providerWizardPanelTitle}>{translate("providers.wizard.manualModels")}</Text>
@@ -4754,9 +4777,8 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
               <NativeFormRow label={translate("providers.wizard.upstreamModel")}><NativeTextField value={upstreamModel} placeholder={translate("providers.wizard.upstreamModelPlaceholder")} editable={!wizardBusy} autoCapitalize="none" autoCorrect={false} onChangeText={setUpstreamModel} accessibilityLabel={translate("providers.wizard.upstreamModel")} style={styles.providerWizardInput} /></NativeFormRow>
               <NativeButton title={translate("providers.wizard.addManualModel")} compact link disabled={wizardBusy} onPress={addManualModel} />
             </View> : null}
-            <Text style={styles.providerWizardModelSummary}>{translate("providers.wizard.modelsToAdd", { count: usingProvidedKeyPath(keyPath) ? selectedModels.length : selectedModels.length + selectedManualModelIDs.length + Number(Boolean(modelName.trim() && upstreamModel.trim())) })}</Text>
           </View>
-        </PersistentScrollView> : null}
+        </View> : null}
         </>}
       </View>
     </View>
@@ -4944,8 +4966,14 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   // nothing until this pane measures the route it now has.
   const [droppedProbeResults, setDroppedProbeResults] = useState<Record<string, true>>({});
   const shownChallenge = useRef<Record<string, string>>({});
+  // A provider that holds no key of its own has nothing for 获取模型 to pick:
+  // WorkBuddy's sign-in belongs to the desktop app, and the free lane imports
+  // its roster on create.  Listing a synthesized "key" for them only put a
+  // picker with one meaningless name beside 获取模型.
+  const providerHoldsNoKey = providerKindSelected === "workbuddy" || providerKindSelected === "workbuddyAI"
+    || providerKindSelected === "ourFreeModel";
   const fetchKeyChoices = useMemo(() => {
-    if (!provider || providerKindSelected === "openai" || providerKindSelected === "claude") return [];
+    if (!provider || providerKindSelected === "openai" || providerKindSelected === "claude" || providerHoldsNoKey) return [];
     const choices = providerKeyChoices(provider, relaySources, providerBaseURL(provider));
     // A service that mints its own slot carries that slot nowhere in the
     // list above, and this row is how a lane is asked for its roster — so a
@@ -4956,7 +4984,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     if (choices.length > 0) return choices;
     const slot = providerKeyStates(provider).find((key) => key.managed && managedServiceForSlot(key.managed, providerAuthKind(provider)));
     return slot ? [{ id: slot.id, name: slot.name, kind: "independent" as const, state: slot }] : [];
-  }, [provider, providerBaseURL, providerKindSelected, relaySources]);
+  }, [provider, providerBaseURL, providerKindSelected, relaySources, providerHoldsNoKey]);
   const fetchKeyOptions = useMemo(
     () => fetchKeyChoices.map((choice) => ({
       value: choice.id,
@@ -5198,16 +5226,23 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     // The fetch button reports its own progress instead of graying out, so a
     // second press must not run a parallel fetch.
     if (fetchModelsBusy) return;
+    if (!provider) return;
+    // A provider with no key of its own names no slot: 获取模型 asks the service
+    // that owns the roster (the desktop app, or the lane's worker) through the
+    // catalog its adapter publishes, the way the wizard's model step does.
+    const ownerService = providerHoldsNoKey
+      ? managedServiceForSlot(true, providerAuthKind(provider))
+      : "";
     const choice = fetchKeyChoices.find((item) => item.id === selectedFetchKey);
-    if (!provider || !choice) return;
-    const relaySource = choice.kind === "relay" ? choice.source : undefined;
+    if (!ownerService && !choice) return;
+    const relaySource = choice?.kind === "relay" ? choice.source : undefined;
     // A service that mints its own slot has no user credential to address and
     // no address this app may request: its roster is read through the catalog
     // its own adapter publishes, exactly as the wizard's model step reads it,
     // and the same read that paints the 倍率 column.
-    const laneService = choice.kind === "independent"
+    const laneService = ownerService || (choice?.kind === "independent"
       ? managedServiceForSlot(choice.state?.managed ?? false, providerAuthKind(provider))
-      : "";
+      : "");
     const action = laneService
       ? serviceCatalogRead(laneService)?.action ?? ""
       : relaySource ? "provider.fetch_relay_resource_models" : "providers.fetch_models";
@@ -5219,7 +5254,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       resource_id: relaySource.resourceID,
     } : {
       provider_id: providerId,
-      api_key_name: choice.name,
+      api_key_name: choice?.name ?? "",
     };
     setFetchModelsBusy(true);
     try {
@@ -5831,7 +5866,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
           <View style={styles.providerMiddlePane}>
             <TablePane style={[styles.modelListPane]} title={translate("providers.models")} actions={<>{provider && providerKindSelected !== "openai" && providerKindSelected !== "claude" ? <IconButton label="+" title={translate("providers.newModel")} disabled={busy} onPress={addModel} /> : null}{model ? <IconButton label="⧉" title={translate("common.copy")} disabled={busy} onPress={duplicateModel} /> : null}{model ? <IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteModel} /> : null}</>}>
               <View style={styles.nativeModelTable} onLayout={({ nativeEvent }) => setModelTableWidth(nativeEvent.layout.width)}><NativeTable columns={modelTableColumns(modelTableWidth, translate)} rows={modelRows} disabledRowKeys={disabledModelKeys} alertRowKeys={alertModelKeys} selectedKey={selectedModel ?? ""} compact firstColumnHorizontalPadding={0} preserveColumnWidths onSelectionChange={(key) => { setSelectedModel(key); setProviderSourceModel(undefined); }} style={styles.modelTable} /></View>
-              {provider && providerKindSelected !== "openai" && providerKindSelected !== "claude" ? <View style={styles.tableBottomRow}><NativePicker labels={fetchKeyOptions.length > 0 ? fetchKeyOptions.map((option) => option.label) : [translate("common.default")]} selectedValue={fetchKeyOptions.find((option) => option.value === selectedFetchKey)?.label ?? translate("common.default")} disabled={busy || fetchKeyChoices.length === 0} onChange={({ nativeEvent }) => { const option = fetchKeyOptions[nativeEvent.index]; if (option) setFetchKeyID(option.value); }} style={styles.fetchKeyPicker} /><ActionButton title={translate("providers.fetch")} busy={fetchModelsBusy} disabled={(busy && !fetchModelsBusy) || !selectedFetchKey} onPress={() => { void fetchModels(); }} /></View> : null}
+              {provider && providerKindSelected !== "openai" && providerKindSelected !== "claude" ? <View style={styles.tableBottomRow}>{fetchKeyChoices.length > 0 ? <NativePicker labels={fetchKeyOptions.length > 0 ? fetchKeyOptions.map((option) => option.label) : [translate("common.default")]} selectedValue={fetchKeyOptions.find((option) => option.value === selectedFetchKey)?.label ?? translate("common.default")} disabled={busy} onChange={({ nativeEvent }) => { const option = fetchKeyOptions[nativeEvent.index]; if (option) setFetchKeyID(option.value); }} style={styles.fetchKeyPicker} /> : null}<ActionButton title={translate("providers.fetch")} busy={fetchModelsBusy} disabled={(busy && !fetchModelsBusy) || (fetchKeyChoices.length > 0 && !selectedFetchKey)} onPress={() => { void fetchModels(); }} /></View> : null}
             </TablePane>
           </View>
         </View>
@@ -11567,8 +11602,22 @@ const styles = StyleSheet.create({
   providerAuthLine: { color: systemColors.label, fontSize: UI_FONT_SIZE },
   officialActiveHint: { color: systemColors.green, fontSize: UI_TIP_FONT_SIZE, fontWeight: "600" },
   officialActionsRow: { minHeight: 28, flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 6 },
-  providerWizardHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerWizardDescription: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 17 }, providerWizardSectionHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardPanelTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerWizardFormSection: { width: "100%", maxWidth: 520, paddingVertical: 0, gap: 10 }, providerWizardModelScroll: { flex: 1, minHeight: 0, width: "100%" }, providerWizardModelScrollContent: { width: "100%", paddingBottom: 8 }, providerWizardModelToolbar: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 8 }, providerWizardModelStatusRow: { flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardModelGroup: { gap: 6, paddingTop: 4 }, providerWizardModelGroupHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }, providerWizardModelGroupTools: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, providerWizardModelList: { borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground, paddingHorizontal: 8, paddingVertical: 5, gap: 1 }, providerWizardModelSourceGroup: { minWidth: 0, gap: 1, paddingTop: 2 }, // The producer heading is the picker's one level above a route heading, so it // carries the label ink and weight the route heading does not.
-  providerWizardModelSourceHeading: { color: systemColors.label, fontSize: UI_TIP_FONT_SIZE, fontWeight: "600", lineHeight: 15, paddingTop: 3 }, providerWizardModelCheckbox: { width: "100%", minHeight: 24 }, providerWizardManualModelRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardManualModelCheckbox: { flex: 1, minWidth: 0 }, providerWizardManualModelUpstream: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE }, providerWizardModelSummary: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "500", paddingTop: 4 }, providerWizardModeControl: { width: "100%", height: 26, flexShrink: 0 }, providerWizardPicker: { width: "100%", minWidth: 0, height: 26 }, providerWizardInput: { width: "100%", minHeight: 26, color: systemColors.label, fontSize: UI_FONT_SIZE }, providerWizardSecretInput: { width: "100%", minHeight: 26 }, providerWizardHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15, paddingVertical: 2 }, providerWizardFooter: { minHeight: 46, paddingHorizontal: 20, paddingVertical: 8, flexDirection: "row", alignItems: "center", gap: 6, borderTopWidth: 0, backgroundColor: systemColors.window }, providerWizardFooterSpacer: { flex: 1 }, providerWizardFooterStatus: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, providerWizardFooterActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 },
+  providerWizardSectionHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardPanelTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerWizardFormSection: { width: "100%", maxWidth: 520, minHeight: 0, paddingVertical: 0, gap: 10 }, providerWizardModelFormSection: { flex: 1, minHeight: 0, width: "100%", maxWidth: 520, paddingVertical: 0, gap: 10 }, // The model step scrolls in exactly one place: the roster box.  The step body is an
+ // ordinary column, so the pane can never grow a second scroller beside the list.
+ providerWizardModelPane: { flex: 1, minHeight: 0, width: "100%", justifyContent: "flex-start", paddingBottom: 8 }, // One row, so the state sentence is the part that gives way: it shrinks and
+  // ellipsizes, while the controls beside it keep the width their labels need.
+  // Nothing here wraps, because a second line is the crossed block this row
+  // exists to avoid.
+  providerWizardModelToolbar: { minHeight: 26, flexDirection: "row", flexWrap: "nowrap", alignItems: "center", gap: 6 }, providerWizardModelGroup: { flex: 1, minHeight: 0, gap: 6, paddingTop: 4 }, providerWizardModelGroupHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }, providerWizardModelList: { paddingHorizontal: 8, paddingTop: 5, paddingBottom: 10, gap: 1 }, // The roster's box is drawn by a plain wrapper, never by the scroll view inside
+ // it: a scroll view clips what it draws to its own viewport, so the bottom edge
+ // disappeared exactly when the roster overflowed, and a `maxHeight` frame
+ // shrank to its content and lost that edge even without overflow.  The wrapper
+ // owns the one height, all four borders, and the clipping; the scroll view
+ // inside it only scrolls, and the capsule scroller rides that viewport.
+ providerWizardModelListFrame: { flex: 1, minHeight: 120, width: "100%", borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground, overflow: "hidden" },
+  providerWizardModelListScroll: { flex: 1, minHeight: 0, width: "100%" },
+ providerWizardModelSourceGroup: { minWidth: 0, gap: 1, paddingTop: 2 }, // The producer heading is the picker's one level above a route heading, so it // carries the label ink and weight the route heading does not.
+  providerWizardModelSourceHeading: { color: systemColors.label, fontSize: UI_TIP_FONT_SIZE, fontWeight: "600", lineHeight: 15, paddingTop: 3 }, providerWizardModelCheckbox: { width: "100%", minHeight: 24 }, providerWizardManualModelRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardManualModelCheckbox: { flex: 1, minWidth: 0 }, providerWizardManualModelUpstream: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE }, providerWizardModeControl: { width: "100%", height: 26, flexShrink: 0 }, providerWizardPicker: { width: "100%", minWidth: 0, height: 26 }, providerWizardInput: { width: "100%", minHeight: 26, color: systemColors.label, fontSize: UI_FONT_SIZE }, providerWizardSecretInput: { width: "100%", minHeight: 26 }, providerWizardHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15, paddingVertical: 2 }, providerWizardFooter: { minHeight: 46, paddingHorizontal: 20, paddingVertical: 8, flexDirection: "row", alignItems: "center", gap: 6, borderTopWidth: 0, backgroundColor: systemColors.window }, providerWizardFooterSpacer: { flex: 1 }, providerWizardFooterStatus: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, providerWizardFooterActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 },
   routeTablePane: { flex: 1, minWidth: 0, minHeight: 0 },
   // The model detail's own label column, so every row in that pane — the
   // fields, the rate row, the protocol pickers, and the window row — draws its

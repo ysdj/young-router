@@ -937,10 +937,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         for marker in (
             'busy={processing} disabled={wizardBusy && !processing}',
             'busy={loginBusy} disabled={(wizardBusy && !loginBusy)',
-            # The model listing states its one wait in the toolbar's own row and
-            # hides the button that would start the same read again, so neither a
-            # second wheel nor a control with nothing to offer appears.
-            '{modelFetchState === "loading" ? null : <NativeButton title={translate("providers.wizard.refreshModels")}',
+            # The toolbar row is the wheel alone while a listing runs, and the
+            # control that started it returns with the answer: neither a second
+            # wheel nor a button with nothing to offer appears.
+            '{modelFetchState === "loading" ? <NativeBusySpinner label={translate("providers.wizard.fetchingModels")} /> : <NativeButton title={translate("providers.wizard.refreshModels")}',
             'busy={fetchModelsBusy} disabled={(busy && !fetchModelsBusy)',
             'busy={probing}',
             'busy={saving} disabled={(busy && !saving)',
@@ -1054,7 +1054,17 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('<ProviderIdentityFields')
         self.assert_ui_has("<NativePersistentScrollIndicator style={styles.persistentScrollIndicator} />")
         self.assert_ui_has('showsHorizontalScrollIndicator={false}\n    onLayout=')
-        self.assert_ui_has('<PersistentScrollView style={styles.providerWizardModelScroll} contentContainerStyle={styles.providerWizardModelScrollContent} showsVerticalScrollIndicator keyboardShouldPersistTaps="handled">')
+        # The model step scrolls in exactly one place, and it is the roster box:
+        # the step body is a plain column, so the pane cannot grow a second
+        # scroller beside the list, and the box's own frame carries the border
+        # (a border drawn by scrolled content is cut where that content is cut).
+        self.assert_ui_has("providerWizardModelPane: { flex: 1, minHeight: 0, width: 100%".replace("100%", '"100%"') + ", justifyContent: \"flex-start\", paddingBottom: 8 }")
+        self.assertNotIn("providerWizardModelScrollContent", self.ui)
+        self.assert_ui_has('providerWizardModelListFrame: { flex: 1, minHeight: 120, width: "100%", borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground, overflow: "hidden" }')
+        self.assert_ui_has('providerWizardModelListScroll: { flex: 1, minHeight: 0, width: "100%" }')
+        self.assert_ui_has('<View style={styles.providerWizardModelListFrame}><PersistentScrollView style={styles.providerWizardModelListScroll} contentContainerStyle={styles.providerWizardModelList} showsVerticalScrollIndicator keyboardShouldPersistTaps="handled">')
+        self.assert_ui_has("providerWizardModelList: { paddingHorizontal: 8, paddingTop: 5, paddingBottom: 10, gap: 1 }")
+        self.assert_ui_has('<PersistentScrollView style={styles.providerWizardModelListScroll} contentContainerStyle={styles.providerWizardModelList} showsVerticalScrollIndicator keyboardShouldPersistTaps="handled">')
         self.assert_ui_has('providersLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }')
         self.assert_ui_has('providerModelColumns: { flex: 1, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }')
         self.assert_ui_has('inspectorContent: { paddingLeft: 0, paddingRight: 6')
@@ -4260,10 +4270,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # picker offers each of them and Core reads the name to know which.
             '{ type: "ourFreeModelKilo", label: translate("providers.type.ourFreeModelKilo") },',
             '{ type: "ourFreeModelEAC", label: translate("providers.type.ourFreeModelEAC") },',
-            'const ourFreeModelProviderID = OUR_FREE_MODEL_CHANNEL_PROVIDER[providerType] ?? "our-free-model";',
+            'const ourFreeModelProviderID = ourFreeModelProviderIDFor(providerType);',
             # A channel's entry is named after the channel, because the name is
             # what Core reads to know which one it is.
-            'channelProvider ? nextServiceProviderName(providers, "our_free_model_login", channelProvider)',
+            'const laneChannelName = OUR_FREE_MODEL_CHANNEL[providerType]?.name;',
+            # The channel is stored identity, so a rename cannot retarget the row.
+            'channel: OUR_FREE_MODEL_CHANNEL[providerType]?.tag ?? "",',
+            'ourFreeModel: { providerId: "our-free-model", tag: "", name: "Our Free Model · OpenCode" },',
+            ': channelName ? nextServiceProviderName(providers, "our_free_model_login", channelName)',
             'const OUR_FREE_MODEL_KEY_NAME = "our-free-model-local";',
             # The 密钥 step names the one slot the entry carries, never the
             # provider name where a key name belongs.
@@ -4306,10 +4320,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # adapter that serves it is `our_free_model` on disk.
         # Each channel is a parallel entry, and the entry states which one it is:
         # the name is what Core reads to know the channel.
-        self.assertIn('"providers.type.ourFreeModel": "Our Free Model · OpenCode free lane"', self.en)
+        self.assertIn('"providers.type.ourFreeModel": "Our Free Model · OpenCode channel"', self.en)
         self.assertIn('"providers.type.ourFreeModelKilo": "Our Free Model · Kilo channel"', self.en)
         self.assertIn('"providers.type.ourFreeModelEAC": "Our Free Model · EAC channel"', self.en)
-        self.assertIn('"providers.type.ourFreeModel": "Our Free Model · OpenCode 免费通道"', self.zh)
+        self.assertIn('"providers.type.ourFreeModel": "Our Free Model · OpenCode 通道"', self.zh)
         self.assertIn('"providers.type.ourFreeModelKilo": "Our Free Model · Kilo 通道"', self.zh)
         self.assertIn('"providers.type.ourFreeModelEAC": "Our Free Model · EAC 协付通道"', self.zh)
         # One roster, several upstreams: each producer heading is its own word
@@ -6215,7 +6229,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("target={stagedKeyTarget}", wizard)
         # 下一步 walks the steps; it never mints the provider.
         self.assertNotIn("createProvider", wizard)
-        self.assertIn('if (!providerStepValid()) return;\n        setStep("keys");\n        return;', wizard)
+        # The first exit is the same one both branches take: a type with a key
+        # step lands on 密钥, the keyless ones go straight to 模型.
+        self.assertIn('if (!providerStepValid()) return;\n        advanceFromProviderStep();\n        return;', wizard)
         self.assertIn('if (creatingProvider) {', wizard)
         self.assertIn("const targetProviderID = providerID || await commitWizardProvider();", wizard)
         self.assertIn('dispatchWithOutcome("provider.add", {\n      provider: {', wizard)
@@ -6301,7 +6317,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # so its Return key equivalent can deliver the action a second time and
         # would otherwise walk 供应商 → 密钥 → 模型 and skip 密钥.
         self.assertIn("if (processing || stepRef.current !== step) return;", wizard)
-        self.assertIn('stepRef.current = step === "provider" ? "keys" : "model";', wizard)
+        # A type that carries no secret of its own has no 密钥 step to walk
+        # through: its next step after 供应商 is 模型.
+        self.assertIn("const needsKeyStep = !isOurFreeModelType && !isWorkBuddyType;", wizard)
+        self.assertIn('stepRef.current = step === "provider" ? (needsKeyStep ? "keys" : "model") : "model";', wizard)
+        self.assertIn("const advanceFromProviderStep = (): void => {", wizard)
+        self.assertIn('...(needsKeyStep ? [{ id: "keys" as WizardStep, title: translate("providers.wizard.stepKeys") }] : []),', wizard)
         self.assertIn("const advanceStepToModel = (): void => {", wizard)
         self.assertIn('stepRef.current = "model";\n    setStep("model");', wizard)
         # The guard's ref is declared with the step it mirrors.

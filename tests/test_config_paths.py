@@ -144,3 +144,23 @@ class StagingRefusesARetiredDocumentTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProviderChannelTagTests(unittest.TestCase):
+    """A provider's channel is a stored tag, not a reading of its name.
+
+    The name is the user's to change, so deriving the channel from it made a
+    rename silently retarget the row: a Kilo entry renamed to anything else read
+    back as the anonymous channel and its models were then routed over a wire
+    that channel does not serve.
+    """
+
+    def test_an_unknown_tag_is_refused_and_the_empty_one_is_kept(self) -> None:
+        from young_router.config.schema import _provider_channel
+
+        self.assertEqual(_provider_channel(""), "")
+        self.assertEqual(_provider_channel(None), "")
+        self.assertEqual(_provider_channel(" Kilo "), "kilo")
+        for rejected in (5, "a b", "x" * 40, ["kilo"]):
+            with self.assertRaises(ValueError):
+                _provider_channel(rejected)

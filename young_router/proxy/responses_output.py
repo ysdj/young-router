@@ -121,29 +121,100 @@ def _response_types(response: Any) -> List[str]:
     return found
 
 
+_STREAM_TEXT_EVENT_TYPES = {
+    "response.output_text.delta",
+    "response.output_text.done",
+    "response.refusal.delta",
+    "response.refusal.done",
+    "response.reasoning_text.delta",
+    "response.reasoning_text.done",
+    "response.reasoning_summary_text.delta",
+    "response.reasoning_summary_text.done",
+}
+
+
+def _is_stream_text_event_type(event_type: Any) -> bool:
+    return isinstance(event_type, str) and event_type in _STREAM_TEXT_EVENT_TYPES
+
+
+def _stream_frame_as_dict(value: Any) -> dict:
+    """One stream frame as a plain dict, whatever object carries it."""
+    if isinstance(value, dict):
+        return value
+    for attribute in ("model_dump", "dict"):
+        exporter = getattr(value, attribute, None)
+        if not callable(exporter):
+            continue
+        try:
+            dumped = exporter()
+        except Exception:
+            continue
+        if isinstance(dumped, dict):
+            return dumped
+    return {}
+
+
+def _stream_frame_text(value: Any) -> str:
+    """The text one text-bearing stream frame contributes, or "".
+
+    A delta frame carries the fragment in ``delta``; the matching done frame
+    carries the whole answer in ``text``.  Only text events answer here, so a
+    function call's ``arguments`` is never mistaken for answer text.
+    """
+    frame = _stream_frame_as_dict(value)
+    if not _is_stream_text_event_type(frame.get("type")):
+        return ""
+    text = frame.get("text")
+    if isinstance(text, str):
+        return text
+    delta = frame.get("delta")
+    return delta if isinstance(delta, str) else ""
+
+
 def _response_text(response: Any) -> str:
+    """The visible answer text one response or event list states.
+
+    An event list is not a list of answers: one answer arrives cut into
+    ``response.output_text.delta`` frames, so the frames are concatenated where
+    they are found.  Joining them like separate answers instead rebuilt the
+    text one token per line, which is what a recovered stream used to hand a
+    client as its answer.
+    """
+
     chunks: List[str] = []
 
     def walk(value: Any) -> None:
         if value is None or isinstance(value, str):
             return
-        if isinstance(value, list):
+        if hasattr(value, "model_dump"):
+            try:
+                value = value.model_dump()
+            except Exception:
+                return
+        if isinstance(value, (list, tuple)):
+            fragments = [
+                frame_text
+                for frame_text in (_stream_frame_text(item) for item in value)
+                if frame_text
+            ]
+            if fragments:
+                chunks.append("".join(fragments))
+                return
             for item in value:
                 walk(item)
             return
         if isinstance(value, dict):
+            if _is_stream_text_event_type(value.get("type")):
+                frame_text = _stream_frame_text(value)
+                if frame_text:
+                    chunks.append(frame_text)
+                return
             for key in ("output_text", "text", "content", "delta"):
                 text = value.get(key)
                 if isinstance(text, str):
                     chunks.append(text)
             for item in value.values():
                 walk(item)
-            return
-        if hasattr(value, "model_dump"):
-            try:
-                walk(value.model_dump())
-            except Exception:
-                return
 
     output_text = getattr(response, "output_text", None)
     if isinstance(output_text, str):
