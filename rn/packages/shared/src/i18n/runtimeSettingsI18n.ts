@@ -13,7 +13,7 @@ const categories: Record<string, string> = {
   "Logs": "日志",
   "Network": "网络",
   "Service": "服务",
-  "dsh-our-free-model": "免费模型",
+  "Our Free Model": "Our Free Model",
 };
 
 const units: Record<string, string> = {

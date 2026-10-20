@@ -1070,7 +1070,11 @@ class CoreOperationsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             controller = CoreServiceController(root)
-            (root / "config.yaml").write_text(
+            # The document the editor writes *is* the configuration; there is
+            # no second file for staging to prefer or ignore.
+            runtime = root / ".litellm-runtime"
+            runtime.mkdir(parents=True)
+            (runtime / "config.yaml").write_text(
                 textwrap.dedent(
                     """
                     model_list: []
@@ -1111,7 +1115,9 @@ class CoreOperationsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             controller = CoreServiceController(root)
-            source = root / "config.yaml"
+            runtime = root / ".litellm-runtime"
+            runtime.mkdir(parents=True)
+            source = runtime / "config.yaml"
             source.write_text(
                 textwrap.dedent(
                     """
@@ -1123,23 +1129,23 @@ class CoreOperationsTests(unittest.TestCase):
                 ).lstrip(),
                 encoding="utf-8",
             )
+            before = source.read_bytes()
 
             controller._stage_runtime_config()
 
+            # Nothing to move, so the staged copy is the source byte for byte.
             self.assertEqual(
-                source.read_bytes(),
+                before,
                 (root / ".litellm-runtime" / "config.yaml").read_bytes(),
             )
 
     def test_a_restage_stages_the_document_the_provider_editor_writes(self) -> None:
         """Staging reads the editor's document, never a stale sibling beside it.
 
-        With ``LITELLM_CONFIG_FILE`` unset — which is the packaged default — the
-        service controller's ``paths.config`` resolves to ``<root>/config.yaml``
-        while the provider editor writes ``<root>/.litellm-runtime/config.yaml``.
-        Staging the former copied a document the editor never touched back over
-        the committed one, so a provider the user deleted came back on the next
-        restart and the pane could not make the deletion stick.
+        The retired root-level document is not a candidate.  It used to be one:
+        staging preferred ``<root>/config.yaml`` when it existed, so a provider
+        the user deleted came back on the next restart.  The root-level file now
+        has no reader at all, and this test keeps it that way.
         """
 
         with tempfile.TemporaryDirectory() as directory:

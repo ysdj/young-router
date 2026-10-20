@@ -221,6 +221,10 @@ def _model_to_editor(
     entry = _as_dict(model)
     params = _as_dict(entry.get("litellm_params"))
     model_info = _as_dict(entry.get("model_info"))
+    # A route names the provider it belongs to, and a document written before
+    # the rename names it by the retired id.  Left alone, that route matches no
+    # provider at all and the load silently drops it: the provider would come
+    # back with its key slot and none of its models.
     provider = _string_value(model_info.get("provider")).strip()
     api_base = _string_value(params.get("api_base"))
     api_key = _string_value(params.get("api_key"))

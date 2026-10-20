@@ -814,7 +814,7 @@ class CoreStore:
         file_capabilities: FileCapabilityRegistry | None = None,
         service_handlers: Mapping[str, Callable[[str], object]] | None = None,
         workbuddy_runtime: object | None = None,
-        opencode2dsh_runtime: object | None = None,
+        our_free_model_runtime: object | None = None,
     ) -> None:
         self._lock = threading.RLock()
         self._metadata_store = AtomicJSONStore(metadata_path) if metadata_path else None
@@ -824,9 +824,9 @@ class CoreStore:
         # The WorkBuddy worker is Core-owned: it must not outlive the process
         # that keeps its credential copy and its loopback bearer.
         self._workbuddy_runtime = workbuddy_runtime
-        # The dsh-our-free-model worker is Core-owned for the same reason: it must
+        # The Our Free Model worker is Core-owned for the same reason: it must
         # not outlive the process that holds its loopback bearer.
-        self._opencode2dsh_runtime = opencode2dsh_runtime
+        self._our_free_model_runtime = our_free_model_runtime
         self._domains: dict[str, DomainAdapter] = {}
         self._baselines: dict[str, object] = {}
         self._drafts: dict[str, dict[str, Any]] = {}
@@ -917,7 +917,7 @@ class CoreStore:
         from .operations import CoreServiceController
         from .provider_auth import ProviderAuthManager
         from ..adapters.workbuddy import WorkBuddyRuntime
-        from ..adapters.opencode2dsh import OpenCode2DSHRuntime
+        from ..adapters.our_free_model import OurFreeModelRuntime
 
         controller = CoreServiceController(runtime_root)
         provider_auth = ProviderAuthManager(runtime_root)
@@ -937,11 +937,11 @@ class CoreStore:
         # so the proxy child receives the very base URLs it is serving.
         workbuddy_runtime = WorkBuddyRuntime(resolved_runtime_root)
         controller.attach_workbuddy(workbuddy_runtime)
-        # One worker per Core process serves every dsh-our-free-model route; the
+        # One worker per Core process serves every Our Free Model route; the
         # service controller and the provider domain share that instance so the
         # proxy child receives the very base URL it is serving.
         runtime_settings = RuntimeSettingsDomain(resolved_runtime_settings_path)
-        opencode2dsh_runtime = OpenCode2DSHRuntime(
+        our_free_model_runtime = OurFreeModelRuntime(
             resolved_runtime_root,
             settings={
                 "defaultMaxTokens": runtime_settings.snapshot()["values"][
@@ -961,12 +961,12 @@ class CoreStore:
                 ],
             },
         )
-        runtime_settings.attach_our_free_model(opencode2dsh_runtime)
-        controller.attach_opencode2dsh(opencode2dsh_runtime)
+        runtime_settings.attach_our_free_model(our_free_model_runtime)
+        controller.attach_our_free_model(our_free_model_runtime)
         # A saved route's loopback base is resolved by the managed proxy and by
         # Core's own catalog/probe reads. Start its worker once, at Core launch;
         # a fresh provider adopts the same worker when it is created later.
-        from ..adapters import opencode2dsh as opencode2dsh_module
+        from ..adapters import our_free_model as our_free_model_module
         from ..config import load as config_load
         import yaml
 
@@ -988,7 +988,7 @@ class CoreStore:
                 str(provider.get("name") or "")
                 for provider in draft["providers"]
                 if isinstance(provider, Mapping)
-                and provider.get("auth_kind") in opencode2dsh_module.OPENCODE2DSH_AUTH_KINDS
+                and provider.get("auth_kind") in our_free_model_module.OUR_FREE_MODEL_AUTH_KINDS
             }
             adopted_route = any(
                 model.get("provider") in adopted_provider_names
@@ -998,7 +998,7 @@ class CoreStore:
                 if isinstance(model, Mapping)
             )
             if adopted_route:
-                opencode2dsh_runtime.autostart_if_configured()
+                our_free_model_runtime.autostart_if_configured()
         except (OSError, ValueError, yaml.YAMLError):
             # The Providers pane owns the error for a malformed optional
             # document; it must not prevent the other settings from opening.
@@ -1011,7 +1011,7 @@ class CoreStore:
                     resolved_config_path,
                     auth_manager=provider_auth,
                     workbuddy=workbuddy_runtime,
-                    opencode2dsh=opencode2dsh_runtime,
+                    our_free_model=our_free_model_runtime,
                 ),
             ),
             (
@@ -1097,7 +1097,7 @@ class CoreStore:
             domains=adapters,
             service_handlers=service_handlers,
             workbuddy_runtime=workbuddy_runtime,
-            opencode2dsh_runtime=opencode2dsh_runtime,
+            our_free_model_runtime=our_free_model_runtime,
         )
         if isinstance(initial_service, Mapping):
             store._set_service_from_result(initial_service, increment=False)
@@ -1135,7 +1135,7 @@ class CoreStore:
     def _stop_managed_workers(self) -> None:
         """Stop every Core-owned worker; never fail Core shutdown."""
 
-        for runtime in (self._workbuddy_runtime, self._opencode2dsh_runtime):
+        for runtime in (self._workbuddy_runtime, self._our_free_model_runtime):
             if runtime is None:
                 continue
             try:
@@ -3238,8 +3238,8 @@ class CoreStore:
                             "workbuddy_status": "workbuddy_status",
                             "workbuddy_models": "workbuddy_models",
                             "workbuddy_login": "workbuddy_login",
-                            "opencode2dsh_status": "opencode2dsh_status",
-                            "opencode2dsh_models": "opencode2dsh_models",
+                            "our_free_model_status": "our_free_model_status",
+                            "our_free_model_models": "our_free_model_models",
                             "model_import_service_catalog": "model_import_service_catalog",
                         }.get(normalized_action)
                         if (

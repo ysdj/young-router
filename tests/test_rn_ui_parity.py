@@ -611,6 +611,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '? translate("providers.probeInlineRefused")',
             '? translate("providers.probeInlineTimeout")',
             'const uniformStatus = surfaceStatuses.size === 1 ? [...surfaceStatuses][0] : "";',
+            '? translate("providers.probeInlineEgressBlocked")',
             '? translate("providers.probeInlineAuthError")',
             '? translate("providers.probeInlineUnsupported")',
             'const compactReason = (deepTestIncluded ? degradationLine : "")',
@@ -697,6 +698,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '? translate("providers.probeInlineRefused")',
             '? translate("providers.probeInlineTimeout")',
             'const uniformStatus = surfaceStatuses.size === 1 ? [...surfaceStatuses][0] : "";',
+            '? translate("providers.probeInlineEgressBlocked")',
             '? translate("providers.probeInlineAuthError")',
             '? translate("providers.probeInlineUnsupported")',
             'const compactReason = (deepTestIncluded ? degradationLine : "")',
@@ -720,6 +722,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'function probeFailureKey(degradation: UnknownRecord): TranslationKey {',
             'case "auth_error":',
             'return "providers.probeInlineAuthError";',
+            'case "egress_blocked":',
+            'return "providers.probeInlineEgressBlocked";',
         ):
             self.assert_ui_has(marker)
         for marker in (
@@ -745,6 +749,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('"providers.probeAvailabilityCount": "{available}/{total} available"', self.en)
         self.assertIn('"providers.probeInlineRefused": "Refused"', self.en)
         self.assertIn('"providers.probeInlineAuthError": "Key refused"', self.en)
+        # A 403 that refused the network has its own word, so the pane never
+        # sends a user to a key that the upstream never read.
+        self.assertIn('"providers.probeInlineEgressBlocked": "Egress refused"', self.en)
+        self.assertIn('"providers.probeInlineEgressBlocked": "出口被拒"', self.zh)
         for marker in (
             'function nativeButtonTightWidth(title: string, plainLink = false): number {',
             'return Math.max(44, Math.ceil(nativeControlTextWidth(title) + 20));',
@@ -3007,7 +3015,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.assertIn(f"  {key}: {{ label:", localized)
         # The Relay and Computer Facade categories disappeared with their only
         # settings; retired dead controls must not stay translated in the pane.
-        for category in ("Timeouts", "Recovery", "Web Search", "Vision Router", "Model Context", "Fallback", "MCP", "Logs", "Network", "Service", "dsh-our-free-model"):
+        for category in ("Timeouts", "Recovery", "Web Search", "Vision Router", "Model Context", "Fallback", "MCP", "Logs", "Network", "Service", "Our Free Model"):
             self.assertIn(f'  "{category}":', localized)
         self.assertNotIn('  "Relay":', localized)
         self.assertNotIn('  "Computer Facade":', localized)
@@ -3890,7 +3898,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('{translate("providers.type.apiKey")}', identity)
         # A login provider states the address its own service gives it, and
         # falls back to the address Core holds when the service table names
-        # none — dsh-our-free-model is served by a Core-owned worker on a
+        # none — Our Free Model is served by a Core-owned worker on a
         # per-launch port, so its `os.environ/` reference is the only true
         # address and the pane must not print an upstream host for it.
         self.assertIn('isLogin ? (SERVICE_BASE_URLS[kind as ServiceID] || stringValue(provider.endpoint, stringValue(provider.api_base)))', identity)
@@ -4058,7 +4066,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # table, so a scan for the name alone would stop seeing the reads this
         # table exists to name.
         self.assert_ui_has('if (service === "workbuddy") return { action: "workbuddy_models", providerId: "workbuddy" };')
-        self.assert_ui_has('if (service === "opencode2dsh") return { action: "opencode2dsh_models", providerId: "opencode2dsh" };')
+        # The channel is what Core filters the roster by, so the id travels with
+        # the read instead of being fixed to the anonymous lane.
+        self.assert_ui_has('if (service === "ourFreeModel") return { action: "our_free_model_models", providerId: channel ?? "our-free-model" };')
         live_reads = 0
         for index, line in enumerate(self.ui.splitlines()):
             for helper in ("dispatchWithOutcome(", "dispatchSnapshot("):
@@ -4104,7 +4114,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
     def test_workbuddy_provider_types_borrow_the_desktop_app_sign_in(self) -> None:
         """WorkBuddy keeps its sign-in and its model catalog in its own app."""
         for marker in (
-            'type WizardType = "api" | "openai" | "claude" | "workbuddy" | "workbuddyAI" | "opencode2dsh";',
+            'type WizardType = "api" | "openai" | "claude" | "workbuddy" | "workbuddyAI" | "ourFreeModel" | "ourFreeModelKilo" | "ourFreeModelEAC";',
             'const isWorkBuddyType = providerType === "workbuddy" || providerType === "workbuddyAI";',
             'const workbuddyAuthKind: ServiceProviderKind = providerType === "workbuddyAI" ? "workbuddy_ai_login" : "workbuddy_login";',
             'dispatchWithOutcome("workbuddy_status", { refresh }, "providers_models", true);',
@@ -4139,8 +4149,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # The same cached catalog is what Core learns each model's window
             # from, so the read is addressed through the one table that names
             # both a service's action and the id its worker document uses.
-            'function serviceCatalogRead(service: ServiceID): { action: string; providerId: string } | undefined {',
-            'if (service === "opencode2dsh") return { action: "opencode2dsh_models", providerId: "opencode2dsh" };',
+            'function serviceCatalogRead(service: ServiceID, channel?: string): { action: string; providerId: string } | undefined {',
+            'if (service === "ourFreeModel") return { action: "our_free_model_models", providerId: channel ?? "our-free-model" };',
             # A service provider's type is an ordinary editable field: the
             # pane offers the same picker the wizard does, so WorkBuddy is
             # wired and retargeted like any other service.
@@ -4170,7 +4180,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # pane-wide wait is counted only by the runs that ask for it.
             'await dispatchWithOutcome("workbuddy_status", { refresh }, "providers_models", true);',
             'const busyRuns = useRef(0);',
-            'if (!keepControlsEnabled) {\n        busyRuns.current = Math.max(busyRuns.current - 1, 0);\n        if (busyRuns.current === 0) setBusy(false);\n      }',
+            # The block that releases the wait, distinguished from the one that
+            # acquires it by the decrement it performs.
+            'busyRuns.current = Math.max(busyRuns.current - 1, 0);',
+            'if (busyRuns.current === 0) setBusy(false);',
         ):
             self.assert_ui_has(marker)
         # The wizard's keys step never asks a WorkBuddy user for a secret.
@@ -4231,33 +4244,50 @@ class ReactNativeUiParityTests(unittest.TestCase):
         """
 
         for marker in (
-            '{ type: "opencode2dsh", label: translate("providers.type.opencode2dsh") },',
-            'const isOpenCode2DSHType = providerType === "opencode2dsh";',
-            'if (isOpenCode2DSHType) {',
-            'kind: "opencode2dsh_login",',
-            'translate("providers.wizard.opencode2dshHint")',
-            '"opencode2dsh_status",',
-            '"opencode2dsh_models",',
+            '{ type: "ourFreeModel", label: translate("providers.type.ourFreeModel") },',
+            'const isOurFreeModelType = providerType === "ourFreeModel" || providerType === "ourFreeModelKilo" || providerType === "ourFreeModelEAC";',
+            'if (isOurFreeModelType) {',
+            'kind: "our_free_model_login",',
+            'translate("providers.wizard.ourFreeModelHint")',
+            '"our_free_model_status",',
+            '"our_free_model_models",',
             # The model step lists the lane's own free roster, so the user picks
             # what the entry carries instead of being handed the whole catalog.
-            'const fetchOpenCode2DSHModels = async (): Promise<void> => {',
-            'void (isOpenCode2DSHType ? fetchOpenCode2DSHModels() : fetchWizardModels());',
-            'void fetchOpenCode2DSHModels();',
-            'const OPENCODE2DSH_KEY_NAME = "our-free-model-local";',
+            'const fetchOurFreeModelModels = async (providerID = ourFreeModelProviderID): Promise<void> => {',
+            'void (isOurFreeModelType ? fetchOurFreeModelModels(ourFreeModelProviderID) : fetchWizardModels());',
+            'void fetchOurFreeModelModels(ourFreeModelProviderID);',
+            # One entry per channel: adding a channel adds that channel, so the
+            # picker offers each of them and Core reads the name to know which.
+            '{ type: "ourFreeModelKilo", label: translate("providers.type.ourFreeModelKilo") },',
+            '{ type: "ourFreeModelEAC", label: translate("providers.type.ourFreeModelEAC") },',
+            'const ourFreeModelProviderID = OUR_FREE_MODEL_CHANNEL_PROVIDER[providerType] ?? "our-free-model";',
+            # A channel's entry is named after the channel, because the name is
+            # what Core reads to know which one it is.
+            'channelProvider ? nextServiceProviderName(providers, "our_free_model_login", channelProvider)',
+            'const OUR_FREE_MODEL_KEY_NAME = "our-free-model-local";',
             # The 密钥 step names the one slot the entry carries, never the
             # provider name where a key name belongs.
-            '{isOpenCode2DSHType ? OPENCODE2DSH_KEY_NAME : selectedProviderName}',
+            '{isOurFreeModelType ? OUR_FREE_MODEL_KEY_NAME : selectedProviderName}',
             # 完成 creates with the models the user kept.
             'const kept = modelCandidates.filter((name) => selectedModels.includes(name));',
             # The list carries the same two tools the model chooser offers:
             # one press for everything, one for the complement.
             'translate(selectedModels.length === modelCandidates.length ? "dataManagement.deselectAll" : "dataManagement.selectAll")',
             'translate("modelChooser.invert")',
+            # The picker groups by the producer the upstream catalog tagged, and
+            # a producer heading is one level above the availability split.
+            'const [laneChannels, setLaneChannels] = useState<Record<string, string>>({});',
+            'function laneChannelOrder(channels: readonly string[]): string[] {',
+            'function laneChannelLabel(channel: string, translate: Translate): string {',
+            'const names = modelCandidates.filter((name) => (laneChannels[name] ?? LANE_CHANNEL_FREE) === channel);',
+            'laneChannelLabel(channel, translate)} ({names.length})',
+            'const showRouteHeadings = splitRoutes.length > 1',
+            'setLaneChannels(channels);',
             # The header names the provider for what it is, so a bare name
             # beside 模型 is never read as a model id.
             'translate("providers.wizard.providerName")}: {selectedProviderName}',
-            # The lane's own ``-free`` suffix is dropped from the public name
-            # while the route keeps the upstream's real id.
+            # The imported public name is the upstream's own id; renaming is
+            # the user's decision, not the importer's.
             'function publicModelNameForLane(modelID: string): string {',
             'models: kept.map((model_id) => ({ name: publicModelNameForLane(model_id), upstream_model: model_id, enabled: true, order: 0 })),',
             # Deleting the entry goes through the account-backed action, which
@@ -4268,37 +4298,59 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.assert_ui_has(marker)
         # The keys step states the lane and asks for no secret or picker.
         wizard = self.ui.split("function ProviderSetupWizard(", 1)[1].split("function ProviderWorkspace(", 1)[0]
-        lane_keys = wizard.split("isOpenCode2DSHType ? <>", 1)[1].split("</> : isWorkBuddyType ? <>", 1)[0]
+        lane_keys = wizard.split("isOurFreeModelType ? <>", 1)[1].split("</> : isWorkBuddyType ? <>", 1)[0]
         self.assertNotIn("NativeSecureTextInput", lane_keys)
         self.assertNotIn("NativePicker", lane_keys)
         # Both languages name the type for the user, not for the integration:
-        # the picker and the entry's own name are "Our Free Model" even though
-        # the adapter that serves it is still `opencode2dsh` on disk.
-        self.assertIn('"providers.type.opencode2dsh": "Our Free Model"', self.en)
-        self.assertIn('"providers.type.opencode2dsh": "Our Free Model"', self.zh)
+        # the picker and the entry's own name are "Our Free Model" and the
+        # adapter that serves it is `our_free_model` on disk.
+        # Each channel is a parallel entry, and the entry states which one it is:
+        # the name is what Core reads to know the channel.
+        self.assertIn('"providers.type.ourFreeModel": "Our Free Model · OpenCode free lane"', self.en)
+        self.assertIn('"providers.type.ourFreeModelKilo": "Our Free Model · Kilo channel"', self.en)
+        self.assertIn('"providers.type.ourFreeModelEAC": "Our Free Model · EAC channel"', self.en)
+        self.assertIn('"providers.type.ourFreeModel": "Our Free Model · OpenCode 免费通道"', self.zh)
+        self.assertIn('"providers.type.ourFreeModelKilo": "Our Free Model · Kilo 通道"', self.zh)
+        self.assertIn('"providers.type.ourFreeModelEAC": "Our Free Model · EAC 协付通道"', self.zh)
+        # One roster, several upstreams: each producer heading is its own word
+        # in both languages, because the ids cannot tell the lanes apart.
+        for key, zh in (
+            ("providers.laneChannel.free", "OpenCode 免费通道"),
+            ("providers.laneChannel.kilo", "Kilo 通道"),
+            ("providers.laneChannel.eac", "EAC 协付通道"),
+        ):
+            self.assertIn(f'"{key}": "{zh}"', self.zh, key)
+        for key, en in (
+            ("providers.laneChannel.free", "OpenCode free lane"),
+            ("providers.laneChannel.kilo", "Kilo channel"),
+            ("providers.laneChannel.eac", "EAC co-paid channel"),
+        ):
+            self.assertIn(f'"{key}": "{en}"', self.en, key)
 
-    def test_the_lane_free_suffix_rule_agrees_with_core(self) -> None:
-        """The UI strips the lane's ``-free`` suffix exactly as Core does.
+    def test_an_imported_lane_name_is_the_upstream_id_unchanged(self) -> None:
+        """Importing a roster does not rename its models.
 
-        The wizard builds its create payload in TypeScript while Core also
-        imports the roster on its own, so the two must apply one rule: a public
-        name without the lane's suffix, and an upstream id that keeps it.  The
-        suffix-only id is the boundary — stripping it would leave a public name
-        that names no model.
+        A lane id is the upstream's public name.  Stripping a suffix from it
+        invented a spelling no upstream document contains, and left the same
+        model with two names depending on whether it arrived through the wizard
+        or a fresh catalog read.  Renaming is the user's, in the pane.
         """
 
         from young_router.core.domains import providers_models as module
 
-        for model_id, expected in (
-            ("cat-jam-free", "cat-jam"),
-            ("big-pickle", "big-pickle"),
-            ("-free", "-free"),
-            ("free", "free"),
+        for model_id in (
+            "cat-jam-free",
+            "big-pickle",
+            "-free",
+            "free",
+            "openrouter/free",
+            "kilo-auto/free",
         ):
-            self.assertEqual(module._public_name_without_lane_suffix(model_id), expected, model_id)
+            self.assertEqual(module._public_name_for_lane_id(model_id), model_id)
         # The UI states the identical rule, so neither side can drift alone.
-        self.assert_ui_has('const suffix = "-free";')
-        self.assert_ui_has("modelID.endsWith(suffix) && modelID.length > suffix.length")
+        self.assert_ui_has("function publicModelNameForLane(modelID: string): string {")
+        self.assert_ui_has("  return modelID;")
+        self.assert_ui_not_has('const suffix = "-free";')
 
     def test_a_workbuddy_entry_states_the_account_and_its_credit(self) -> None:
         """Opening a WorkBuddy provider shows the积分, not just the account.
@@ -4420,7 +4472,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '  | "claude_login"\n'
             '  | "workbuddy_login"\n'
             '  | "workbuddy_ai_login"\n'
-            '  | "opencode2dsh_login";',
+            '  | "our_free_model_login";',
             types,
         )
         self.assertIn("auth_status?: ProviderAuthStatus;", types)
@@ -5796,7 +5848,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("const isLogin = isLoginProviderKind(kind);", identity)
         # The predicate itself names every login service, the lane included.
         self.assert_ui_has(
-            'return kind === "openai" || kind === "claude" || kind === "workbuddy" || kind === "workbuddyAI" || kind === "opencode2dsh";'
+            'return kind === "openai" || kind === "claude" || kind === "workbuddy" || kind === "workbuddyAI" || kind === "ourFreeModel";'
         )
         # ...and the panel refuses Core's own slot itself, so the guarantee does
         # not rest on every caller naming the service correctly.

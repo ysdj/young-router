@@ -177,15 +177,9 @@ def _utc_now_iso() -> str:
 
 
 def default_config_path() -> pathlib.Path:
-    configured = os.environ.get("LITELLM_CONFIG_FILE", "").strip()
-    if configured:
-        return pathlib.Path(configured).expanduser()
-    root = os.environ.get("LITELLM_RUNTIME_ROOT", "").strip() or os.environ.get(
-        "YOUNG_ROUTER_HOME", ""
-    ).strip()
-    if root:
-        return pathlib.Path(root).expanduser() / "config.yaml"
-    return pathlib.Path.home() / ".young-router" / "config.yaml"
+    from ..config_paths import provider_config_path
+
+    return provider_config_path()
 
 
 def active_usage_targets(path: pathlib.Path) -> list[UsageTarget]:

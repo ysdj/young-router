@@ -46,7 +46,7 @@ from ...config.schema import (
 )
 
 from ...adapters import veridrop
-from ...adapters import opencode2dsh as opencode2dsh_module
+from ...adapters import our_free_model as our_free_model_module
 from ...adapters import workbuddy as workbuddy_module
 from ... import adapters as managed_adapters
 from ...browser_identity import browser_request_headers
@@ -80,23 +80,18 @@ from ._shared import (
 # catalog's own enumeration into a routing decision nobody made.
 IMPORTED_MODEL_ORDER = 0
 
-# The suffix the upstream free lane puts on its ids (``cat-jam-free``).
-# It states the lane, not the model, and the public name a client sees must not
-# carry it: the same model reached through a paid route would then have two
-# public names for one thing.  Only the public name is stripped — the upstream
-# model keeps the lane's own id, which is what actually addresses it.
-OPENCODE2DSH_FREE_SUFFIX = "-free"
+def _public_name_for_lane_id(model_id: str) -> str:
+    """The public name an imported lane id starts on: the upstream's own id.
 
-
-def _public_name_without_lane_suffix(model_id: str) -> str:
-    """The public name of a lane id, with the lane's own suffix removed.
-
-    An id that is nothing but the suffix (``-free``) is left alone: stripping it
-    would leave an empty public name, which names no model at all.
+    This used to strip the free lane's ``-free`` suffix, on the theory that the
+    suffix states the lane rather than the model.  That reasoning does not hold
+    for a roster whose ids are the upstream's *public* names: ``big-pickle`` and
+    ``openrouter/free`` are the names clients call, and rewriting them invented
+    a second spelling that no upstream document contains.  Renaming a model is
+    the user's decision, made in the pane that lists them, so an import carries
+    the id unchanged and leaves the naming to them.
     """
 
-    if model_id.endswith(OPENCODE2DSH_FREE_SUFFIX) and len(model_id) > len(OPENCODE2DSH_FREE_SUFFIX):
-        return model_id[: -len(OPENCODE2DSH_FREE_SUFFIX)]
     return model_id
 
 
@@ -240,7 +235,7 @@ def _environment_reference(name: str) -> str:
     value = os.environ.get(name, "").strip()
     if value:
         return value
-    for module in (workbuddy_module, opencode2dsh_module):
+    for module in (workbuddy_module, our_free_model_module):
         published = str(module.published_environment().get(name, "")).strip()
         if published:
             return published
@@ -354,12 +349,12 @@ class ProvidersModelsDomain:
         *,
         auth_manager: object | None = None,
         workbuddy: object | None = None,
-        opencode2dsh: object | None = None,
+        our_free_model: object | None = None,
     ):
         self.config_path = Path(config_path).expanduser() if config_path else _default_provider_config_path()
         self.auth_manager = auth_manager
         self.workbuddy = workbuddy
-        self.opencode2dsh = opencode2dsh
+        self.our_free_model = our_free_model
         self._raw: dict[str, Any] = {}
         self._draft: dict[str, Any] = {}
         self._probe_overlay: dict[str, dict[str, dict[str, Any]]] = {}
@@ -409,6 +404,13 @@ class ProvidersModelsDomain:
         # Which picker group each lane model belongs to, as the upstream stated
         # it in the same answer that named the model.
         self._lane_routes: dict[str, dict[str, str]] = {}
+        # The producer the lane's catalog stated for each model id.  Kept beside
+        # the routes for the same reason: an import that has to disambiguate a
+        # public name must name the producer its own catalog named, not one this
+        # side guessed from an id.
+        self._lane_channels_by_id: dict[str, dict[str, str]] = {}
+        # The surface each row answers on, per lane, as the upstream routed it.
+        self._lane_wires_by_id: dict[str, dict[str, str]] = {}
         self.revision = 0
         self.reload()
 
@@ -428,14 +430,14 @@ class ProvidersModelsDomain:
             self.workbuddy = WorkBuddyRuntime(self.config_path.parent)
         return self.workbuddy
 
-    def _opencode2dsh(self):
-        """The dsh-our-free-model worker owner; created on demand for a bare domain."""
+    def _our_free_model_runtime(self):
+        """The Our Free Model worker owner; created on demand for a bare domain."""
 
-        if self.opencode2dsh is None:
-            from ...adapters.opencode2dsh import OpenCode2DSHRuntime
+        if self.our_free_model is None:
+            from ...adapters.our_free_model import OurFreeModelRuntime
 
-            self.opencode2dsh = OpenCode2DSHRuntime(self.config_path.parent)
-        return self.opencode2dsh
+            self.our_free_model = OurFreeModelRuntime(self.config_path.parent)
+        return self.our_free_model
 
     def _workbuddy_remember(self, document: Mapping[str, Any]) -> None:
         """Record what one live WorkBuddy read reported, per variant."""
@@ -677,9 +679,16 @@ class ProvidersModelsDomain:
             # The WorkBuddy worker mounts Chat Completions alone, so a route on
             # this account never probes a Responses endpoint that cannot exist.
             return "openai/chat", "fixed"
-        if auth_kind in opencode2dsh_module.OPENCODE2DSH_AUTH_KINDS:
-            # The upstream gateway serves both Chat Completions and Responses.
-            return "openai/responses", "fixed"
+        if auth_kind in our_free_model_module.OUR_FREE_MODEL_AUTH_KINDS:
+            # The gateway serves both surfaces but each *row* answers on the one
+            # the package routes it to, and only the catalog states which.  A
+            # provider-level default here would be a guess about the row: this
+            # used to pin every route to Responses, and the rows the package
+            # serves over Chat Completions answered 404 -- reported as "no such
+            # protocol" for a protocol the row never offered.  A route states
+            # its own surface (the import writes it); one that states none gets
+            # no pin, so the inference on ``litellm_model`` decides.
+            return "", "fallback"
         if auth_kind == "api_key":
             return "", "fallback"
         return "", "fixed"
@@ -1025,7 +1034,14 @@ class ProvidersModelsDomain:
         projection: dict[str, Any] = {}
         for name in names:
             try:
-                record = registry.default_record_for(name)
+                # The number the pane shows is the one the group resolves, so it
+                # is read with the user's own declaration in it.  Reading
+                # ``default_record_for`` here answered the registry's opinion and
+                # ignored the declaration this very document carries: an
+                # imported route that declared 1,048,576 from its own upstream
+                # was displayed as the unknown-model fallback, 272,000, because
+                # the registry knows no free-lane id.
+                record = registry.record_for(name)
             except Exception:
                 continue
             projection[name] = {
@@ -1750,7 +1766,7 @@ class ProvidersModelsDomain:
                     body = response.read(cls._MAX_MODEL_PROBE_BYTES + 1)
                 break
             except urllib.error.HTTPError as exc:
-                return result(False, cls._probe_status_for_http_code(exc.code))
+                return result(False, cls._probe_status_for_http_error(exc))
             except Exception as exc:
                 failure = cls._probe_failure_status(exc)
                 if attempt + 1 >= cls._MODEL_PROBE_ATTEMPTS or not cls._probe_transport_retryable(exc):
@@ -1839,17 +1855,60 @@ class ProvidersModelsDomain:
 
         return cls._probe_failure_status(error) == "refused"
 
-    @staticmethod
-    def _probe_status_for_http_code(code: int) -> str:
+    @classmethod
+    def _probe_status_for_http_error(cls, error: urllib.error.HTTPError) -> str:
+        """Name one rejected probe for what the upstream actually refused.
+
+        A 403 is only a refused credential when it says so.  A free lane whose
+        upstream blocks the egress answers 403 with a permission body that
+        names no key (``LANE_LOCKED``: "this isn't related to your account"),
+        and reporting that as ``auth_error`` told the pane to look at a key
+        that was never the problem.  A credential failure the upstream spells
+        out still keeps its own name, so a real rejection is not softened.
+        """
+
+        code = error.code
+        if code in {401, 403}:
+            return (
+                "egress_blocked"
+                if cls._probe_body_names_no_credential_fault(error)
+                else "auth_error"
+            )
         return (
             "unsupported"
             if code in {404, 405}
-            else "auth_error"
-            if code in {401, 403}
             else "rate_limited"
             if code == 429
             else "http_error"
         )
+
+    @staticmethod
+    def _probe_body_names_no_credential_fault(error: urllib.error.HTTPError) -> bool:
+        """Whether a 403 body describes access rather than the credential.
+
+        Read from the error's own body without letting it decide what the probe
+        reports when it cannot be read: an undecodable body keeps the historical
+        ``auth_error``, because a rejection this side could not read has not
+        earned a specific name.
+        """
+
+        try:
+            body = error.read(ProvidersModelsDomain._MAX_MODEL_PROBE_BYTES + 1)
+        except Exception:
+            return False
+        if not body:
+            return False
+        try:
+            decoded = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return False
+        payload = decoded.get("error") if isinstance(decoded, Mapping) else None
+        if not isinstance(payload, Mapping):
+            return False
+        # The upstream's permission vocabulary: a lane the egress cannot enter,
+        # a region that is refused, or an explicit denial.  A wrong or expired
+        # key answers with an authentication type instead and keeps auth_error.
+        return str(payload.get("type", "")).strip() == "permission_error"
 
     @classmethod
     def _degradation_timeout_seconds(cls) -> float:
@@ -2489,24 +2548,36 @@ class ProvidersModelsDomain:
             raise DomainError("The WorkBuddy account reported no models")
         return models
 
-    def _opencode2dsh_catalog_models(self, auth_kind: str) -> list[dict[str, Any]]:
-        """Import the staged adapter's live free-model roster as this lane's models.
+    def _our_free_model_catalog_models(
+        self,
+        auth_kind: str,
+        provider_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Import one channel of the staged adapter's live roster as its models.
 
-        The upstream owns which free models it serves and their capabilities,
-        so the roster is read from the adapter rather than guessed here.
+        The upstream owns which free models it serves, which channel serves
+        each, and which surface that channel answers on, so all three are read
+        from the adapter rather than guessed here.
+
+        One provider per channel is why this filters: the roster arrives whole,
+        because one worker serves every channel, but a provider row only lists
+        the rows its own channel serves.  Importing the whole roster into each
+        row would list every model three times and route each of them over a
+        wire two of the three rows do not have.
         """
 
-        provider_id = opencode2dsh_module.AUTH_KIND_TO_PROVIDER[auth_kind]
+        provider_id = provider_id or our_free_model_module.AUTH_KIND_TO_PROVIDER[auth_kind]
+        channel = our_free_model_module.PROVIDER_TO_CHANNEL[provider_id]
         try:
-            document = self._opencode2dsh().models(provider_id, refresh=True)
-        except opencode2dsh_module.OpenCode2DSHCatalogUnavailable:
-            self._opencode2dsh().ensure_configured()
+            document = self._our_free_model_runtime().models(provider_id, refresh=True)
+        except our_free_model_module.OurFreeModelCatalogUnavailable:
+            self._our_free_model_runtime().ensure_configured()
             return []
         except Exception:
-            raise DomainError("The dsh-our-free-model catalog is unavailable") from None
+            raise DomainError("The Our Free Model catalog is unavailable") from None
         if document.get("available") is not True:
             raise DomainError(
-                "The dsh-our-free-model integration could not be reached from this machine"
+                "The Our Free Model integration could not be reached from this machine"
             )
         # The import just read the lane's catalog, so the windows it states are
         # known before the provider exists: a route added from this roster
@@ -2516,6 +2587,11 @@ class ProvidersModelsDomain:
         # for the same reason: a saved route reports the group its own catalog
         # put it in, and a projection may not guess one.
         self._remember_lane_routes(provider_id, document.get("routes"))
+        self._remember_lane_channels(provider_id, document.get("channels"))
+        self._remember_lane_wires(provider_id, document.get("wires"))
+        channels = document.get("channels") or {}
+        wires = document.get("wires") or {}
+        windows = document.get("windows") or {}
         models: list[dict[str, Any]] = []
         for entry in document.get("models") or []:
             if not isinstance(entry, Mapping):
@@ -2523,15 +2599,39 @@ class ProvidersModelsDomain:
             model_id = str(entry.get("id", "")).strip()
             if not model_id:
                 continue
+            # Which channel serves this row is the upstream's answer, and it is
+            # what decides whether this provider lists it at all.
+            if our_free_model_module.provider_for_channel(
+                channels.get(model_id) if isinstance(channels, Mapping) else ""
+            ) != provider_id:
+                continue
             model: dict[str, Any] = {
-                "name": _public_name_without_lane_suffix(model_id),
+                "name": _public_name_for_lane_id(model_id),
                 "upstream_model": model_id,
                 "enabled": True,
                 "order": IMPORTED_MODEL_ORDER,
             }
+            # The surface this row answers on, as the upstream routes it.  Pinned
+            # because no other surface exists for it: the package picks one per
+            # id, and a fallback that "tried" the other would report a protocol
+            # the row never offered.
+            wire = wires.get(model_id) if isinstance(wires, Mapping) else None
+            if wire == "responses":
+                model["upstream_url_surface"] = "openai/responses"
+                model["upstream_protocol_mode"] = "fixed"
+            elif wire == "chat":
+                model["upstream_url_surface"] = "openai/chat"
+                model["upstream_protocol_mode"] = "fixed"
+            # The window this row states, carried so the caller can declare it
+            # on the public model once the roster is assembled.  It is *not*
+            # written per route: a route declares no window of its own, and the
+            # group's number is what the client resolves.
+            window = windows.get(model_id) if isinstance(windows, Mapping) else None
+            if isinstance(window, int) and not isinstance(window, bool) and window > 0:
+                model["_stated_context_window"] = window
             models.append(model)
         if not models:
-            raise DomainError("The dsh-our-free-model catalog reported no models")
+            raise DomainError("The Our Free Model catalog reported no models")
         return models
 
     def _workbuddy_operation(self, action: str, data: Mapping[str, Any]) -> None:
@@ -2652,22 +2752,22 @@ class ProvidersModelsDomain:
             }
             return
         try:
-            provider_id = opencode2dsh_module.validated_provider(provider_id)
+            provider_id = our_free_model_module.validated_provider(provider_id)
         except ValueError:
-            raise DomainError("The requested dsh-our-free-model provider is unavailable") from None
+            raise DomainError("The requested Our Free Model provider is unavailable") from None
         try:
-            document = self._opencode2dsh().models(provider_id, refresh=refresh)
+            document = self._our_free_model_runtime().models(provider_id, refresh=refresh)
         except Exception:
-            raise DomainError("The dsh-our-free-model integration is unavailable") from None
+            raise DomainError("The Our Free Model integration is unavailable") from None
         self._remember_published_windows(provider_id, document.get("models"))
         self._last_operation = {
-            "operation": "opencode2dsh_models",
+            "operation": "our_free_model_models",
             "provider": provider_id,
-            "display_name": opencode2dsh_module.OPENCODE2DSH_DISPLAY_NAME,
+            "display_name": our_free_model_module.OUR_FREE_MODEL_DISPLAY_NAME,
             **document,
         }
 
-    def _opencode2dsh_operation(self, action: str, data: Mapping[str, Any]) -> None:
+    def _our_free_model_operation(self, action: str, data: Mapping[str, Any]) -> None:
         """Answer the wizard's catalog and status questions.
 
         This lane has no account to report and no sign-in this app can start or
@@ -2676,14 +2776,14 @@ class ProvidersModelsDomain:
         """
 
         try:
-            provider_id = opencode2dsh_module.validated_provider(
-                data.get("provider", opencode2dsh_module.OPENCODE2DSH_PROVIDER)
+            provider_id = our_free_model_module.validated_provider(
+                data.get("provider", our_free_model_module.OUR_FREE_MODEL_PROVIDER)
             )
         except ValueError:
-            raise DomainError("The requested dsh-our-free-model provider is unavailable") from None
-        runtime = self._opencode2dsh()
+            raise DomainError("The requested Our Free Model provider is unavailable") from None
+        runtime = self._our_free_model_runtime()
         try:
-            if action == "opencode2dsh_status":
+            if action == "our_free_model_status":
                 document = runtime.status(refresh=bool(data.get("refresh", False)))
                 providers = document.get("providers")
                 self._last_operation = {
@@ -2700,15 +2800,16 @@ class ProvidersModelsDomain:
             # would fetch the whole Zen directory again on every model switch.
             document = runtime.models(provider_id, refresh=bool(data.get("refresh", False)))
         except Exception:
-            raise DomainError("The dsh-our-free-model integration is unavailable") from None
+            raise DomainError("The Our Free Model integration is unavailable") from None
         # The lane's catalog is where its own window per free model is read, so
         # the same answer that lists the roster also becomes what a projection
         # reports for a route on it.
         self._remember_published_windows(provider_id, document.get("models"))
+        self._remember_lane_channels(provider_id, document.get("channels"))
         self._last_operation = {
             "operation": action,
             "provider": provider_id,
-            "display_name": opencode2dsh_module.OPENCODE2DSH_DISPLAY_NAME,
+            "display_name": our_free_model_module.OUR_FREE_MODEL_DISPLAY_NAME,
             **document,
         }
 
@@ -2850,7 +2951,7 @@ class ProvidersModelsDomain:
                 # while the free-model gateway states the snake_case ones a
                 # public OpenAI record uses (``context_window``,
                 # ``context_length``).  Reading only the camelCase keys left
-                # every dsh-our-free-model route with no recorded window at
+                # every Our Free Model route with no recorded window at
                 # all, so the pane fell back to the registry's default for the
                 # public name and reported a number its own upstream never
                 # stated.
@@ -2895,6 +2996,46 @@ class ProvidersModelsDomain:
                         membership[model_id] = name
         if membership:
             self._lane_routes[provider_id] = membership
+
+    def _remember_lane_channels(self, provider_id: str, channels: object) -> None:
+        """Remember which producer serves each row, as the catalog stated it.
+
+        A row's id does not identify its producer, so this is the only record of
+        it.  The anonymous lane names no producer and is stored as the empty
+        string: an import that disambiguates a name still has to know that this
+        row belongs to the lane that states nothing, rather than to whatever
+        producer sorted first.
+        """
+
+        if not isinstance(channels, Mapping):
+            return
+        stored: dict[str, str] = {}
+        for model_id, channel in channels.items():
+            name = str(model_id or "").strip()
+            if name:
+                stored[name] = str(channel or "").strip()
+        if stored:
+            self._lane_channels_by_id[provider_id] = stored
+
+    def _remember_lane_wires(self, provider_id: str, wires: object) -> None:
+        """Remember which surface the upstream serves each row on.
+
+        A provider-level default cannot state this: the package routes per id,
+        and one channel's rows do not share one surface.  Kept beside the
+        channels for the same reason -- the pane reports it, and a projection
+        may not start a worker to ask again.
+        """
+
+        if not isinstance(wires, Mapping):
+            return
+        stored: dict[str, str] = {}
+        for model_id, wire in wires.items():
+            name = str(model_id or "").strip()
+            surface = str(wire or "").strip()
+            if name and surface in {"responses", "chat"}:
+                stored[name] = surface
+        if stored:
+            self._lane_wires_by_id[provider_id] = stored
 
     def _remember_listing_windows(self, provider_id: str, windows: Mapping[str, int]) -> None:
         """Remember the windows one provider's own ``/v1/models`` listing stated.
@@ -2953,12 +3094,12 @@ class ProvidersModelsDomain:
         a group it was never imported from.
         """
 
-        if self._provider_auth_state(provider)["kind"] not in opencode2dsh_module.OPENCODE2DSH_AUTH_KINDS:
+        if self._provider_auth_state(provider)["kind"] not in our_free_model_module.OUR_FREE_MODEL_AUTH_KINDS:
             return None
         model_id = self._wire_model_name(model)
         if not model_id:
             return None
-        provider_id = opencode2dsh_module.AUTH_KIND_TO_PROVIDER.get(
+        provider_id = our_free_model_module.AUTH_KIND_TO_PROVIDER.get(
             self._provider_auth_state(provider)["kind"]
         )
         stored = self._lane_routes.get(provider_id or "")
@@ -3115,12 +3256,12 @@ class ProvidersModelsDomain:
     ) -> bool:
         if auth.get("kind") in workbuddy_module.WORKBUDDY_AUTH_KINDS:
             return self._workbuddy_projection_status(auth, allow_live=allow_live)[1]
-        if auth.get("kind") in opencode2dsh_module.OPENCODE2DSH_AUTH_KINDS:
+        if auth.get("kind") in our_free_model_module.OUR_FREE_MODEL_AUTH_KINDS:
             # This lane authenticates itself: there is no credential of the
             # user's to be configured, so the lane is ready exactly when its
             # worker owner is present -- the same owner every read goes through,
             # which a bare domain supplies and a staged package backs.
-            return self.opencode2dsh is not None or opencode2dsh_module.available()
+            return self.our_free_model is not None or our_free_model_module.available()
         if auth.get("kind") in {"openai_login", "claude_login"}:
             # The OpenAI status is a local file read plus a token-expiry check,
             # so a projection may take it.  Claude's device login is answered
@@ -3147,10 +3288,10 @@ class ProvidersModelsDomain:
             return self._workbuddy_projection_status(auth, allow_live=allow_live)[0] or (
                 "signed_out" if workbuddy_module.available() else "unsupported"
             )
-        if kind in opencode2dsh_module.OPENCODE2DSH_AUTH_KINDS:
+        if kind in our_free_model_module.OUR_FREE_MODEL_AUTH_KINDS:
             # No sign-in exists for this lane, so there is no login this app can
             # start or end: the state reports the integration, not an account.
-            return "signed_in" if self.opencode2dsh is not None or opencode2dsh_module.available() else "unsupported"
+            return "signed_in" if self.our_free_model is not None or our_free_model_module.available() else "unsupported"
         if kind in {"openai_login", "claude_login"}:
             credential_ref = str(auth.get("credential_ref", "")).strip()
             if not credential_ref:
@@ -3306,21 +3447,21 @@ class ProvidersModelsDomain:
                     }
                 ],
             )
-        elif auth_kind in opencode2dsh_module.OPENCODE2DSH_AUTH_KINDS:
+        elif auth_kind in our_free_model_module.OUR_FREE_MODEL_AUTH_KINDS:
             # The provider points at this Core's own loopback worker, never at
             # the Zen upstream: the worker owns the request fingerprint and
             # every wire quirk.  Both the base URL and the key stay environment
             # references, so the worker port and its bearer never enter
             # config.yaml.
-            provider_id = opencode2dsh_module.AUTH_KIND_TO_PROVIDER[auth_kind]
-            provider["api_base"] = opencode2dsh_module.api_base_reference(provider_id)
+            provider_id = our_free_model_module.AUTH_KIND_TO_PROVIDER[auth_kind]
+            provider["api_base"] = our_free_model_module.api_base_reference(provider_id)
             cls._sync_primary_api_key(
                 provider,
                 [
                     {
                         "id": cls._new_provider_key_id(),
-                        "name": opencode2dsh_module.API_KEY_NAME,
-                        "value": opencode2dsh_module.api_key_reference(provider_id),
+                        "name": our_free_model_module.API_KEY_NAME,
+                        "value": our_free_model_module.api_key_reference(provider_id),
                         "source": {"kind": "independent"},
                     }
                 ],
@@ -3351,7 +3492,7 @@ class ProvidersModelsDomain:
             if auth_kind in {
                 "claude_login",
                 *workbuddy_module.WORKBUDDY_AUTH_KINDS,
-                *opencode2dsh_module.OPENCODE2DSH_AUTH_KINDS,
+                *our_free_model_module.OUR_FREE_MODEL_AUTH_KINDS,
             } and keys
             else None
         )
@@ -3886,7 +4027,7 @@ class ProvidersModelsDomain:
             "openai_login",
             "claude_login",
             *workbuddy_module.WORKBUDDY_AUTH_KINDS,
-            *opencode2dsh_module.OPENCODE2DSH_AUTH_KINDS,
+            *our_free_model_module.OUR_FREE_MODEL_AUTH_KINDS,
         }
     )
     _SERVICE_PROVIDER_DEFAULTS: dict[str, dict[str, str]] = {
@@ -3909,11 +4050,11 @@ class ProvidersModelsDomain:
         workbuddy_module.WORKBUDDY_AI_AUTH_KIND: {
             "name": workbuddy_module.WORKBUDDY_DISPLAY_NAMES[workbuddy_module.WORKBUDDY_AI_PROVIDER],
         },
-        # dsh-our-free-model carries no default model: the staged adapter's own
+        # Our Free Model carries no default model: the staged adapter's own
         # catalog is the roster, so a newly added lane imports exactly what the
         # lane can call today.
-        opencode2dsh_module.OPENCODE2DSH_AUTH_KIND: {
-            "name": opencode2dsh_module.OPENCODE2DSH_DISPLAY_NAME,
+        our_free_model_module.OUR_FREE_MODEL_AUTH_KIND: {
+            "name": our_free_model_module.OUR_FREE_MODEL_DISPLAY_NAME,
         },
     }
 
@@ -3932,6 +4073,35 @@ class ProvidersModelsDomain:
         if self._provider_auth_state(provider)["kind"] not in self._SERVICE_PROVIDER_KINDS:
             raise DomainError("The selected provider is managed in Providers & Models")
         return index
+
+    @staticmethod
+    def _declare_ours_free_model_windows(models: list[dict[str, Any]]) -> None:
+        """Declare each imported group's window from the number upstream stated.
+
+        The window belongs to the public model, and the public model is the
+        group of routes sharing one ``model_name``.  The import carries the
+        upstream's number per row on a private key; this promotes it to the
+        group's declaration and drops the carrier, so a route keeps carrying no
+        window of its own and the saved document holds exactly one spelling of
+        the number.
+
+        A group whose rows disagree keeps no declaration: one number for the
+        group cannot state two, and picking the larger would promise a window
+        part of the group does not accept.
+        """
+
+        stated: dict[str, set[int]] = {}
+        for model in models:
+            name = str(model.get("model_name", "")).strip()
+            window = model.pop("_stated_context_window", None)
+            if not name or not isinstance(window, int) or isinstance(window, bool):
+                continue
+            stated.setdefault(name, set()).add(window)
+        for model in models:
+            name = str(model.get("model_name", "")).strip()
+            windows = stated.get(name)
+            if windows and len(windows) == 1:
+                model[PUBLIC_MODEL_CONTEXT_KEY] = next(iter(windows))
 
     def _dispatch_service_provider_add(self, data: Mapping[str, Any]) -> None:
         value = data.get("provider", data.get("value", data))
@@ -3997,11 +4167,14 @@ class ProvidersModelsDomain:
             # live catalog is the source of truth, and importing it is the
             # whole point of adding the account.
             raw_models = self._workbuddy_catalog_models(kind)
-        if raw_models is None and kind in opencode2dsh_module.OPENCODE2DSH_AUTH_KINDS:
-            # The dsh-our-free-model lane owns no free-text roster either: the staged
-            # adapter's live catalog is the source of truth, and importing it is
-            # the whole point of adding the lane.
-            raw_models = self._opencode2dsh_catalog_models(kind)
+        if raw_models is None and kind in our_free_model_module.OUR_FREE_MODEL_AUTH_KINDS:
+            # The lane serves three channels behind one login, and each is a
+            # provider of its own.  Which one this add creates is the caller's,
+            # stated by name: adding a provider adds exactly that provider, so a
+            # user who wants only Kilo gets only Kilo.
+            raw_models = self._our_free_model_catalog_models(
+                kind, our_free_model_module.provider_for_name(name)
+            )
         if raw_models is None:
             raw_model = supplied.get("model")
             raw_models = [raw_model] if isinstance(raw_model, Mapping) else [
@@ -4030,6 +4203,12 @@ class ProvidersModelsDomain:
             ):
                 raise DomainError("Service provider model credentials must use native secure input")
             self._append_model_row(provider, models, self._new_model(provider, raw_model, used_deployment_ids))
+        # The upstream stated a window for this route, so the public model
+        # declares it.  Without this the group resolved no declaration and fell
+        # through to the registry, which knows no free-lane id: the pane then
+        # reported the unknown-model fallback (272,000) for a row whose own
+        # catalog entry stated 1,048,576.
+        self._declare_ours_free_model_windows(models)
         self._apply_auth_to_models(provider, kind)
         self._register_new_provider(provider)
         self._draft["providers"].append(provider)
@@ -4541,7 +4720,7 @@ class ProvidersModelsDomain:
         """Add picked models from one managed service's own catalog.
 
         A service that publishes a catalog owns its routes' upstream names, its
-        public names (which drop the lane's own suffix), and the credential each
+        public names (which are the catalog's own ids), and the credential each
         route answers with — the slot Core minted for the account.  A pane that
         rebuilt those three from a listing it read would drift from the
         adapter that owns them, so the pick arrives here and the catalog is
@@ -4601,6 +4780,19 @@ class ProvidersModelsDomain:
             for model in candidate.get("models", [])
             if isinstance(model, Mapping) and str(model.get("deployment_id", "")).strip()
         }
+        # Two producers can serve the same model under different ids —
+        # ``nemotron-3.5-super-vl-free`` on the anonymous lane and
+        # ``nvidia/nemotron-3.5-super-vl:free`` on Kilo.  The ids differ, so the
+        # import adds both, but the public names collide, and two routes with one
+        # public name is a group a client cannot tell apart.  A colliding row
+        # states its producer in the public name instead, which keeps both
+        # reachable while naming where each one comes from.
+        taken_names = {
+            str(model.get("model_name", "")).strip()
+            for model in models
+            if isinstance(model, Mapping) and str(model.get("model_name", "")).strip()
+        }
+        channels = self._lane_channels(edited)
         added = 0
         for model_id in requested:
             if model_id in existing:
@@ -4609,13 +4801,14 @@ class ProvidersModelsDomain:
             row = self._new_model(
                 edited,
                 {
-                    "name": _public_name_without_lane_suffix(model_id),
+                    "name": self._unique_lane_name(model_id, channels, taken_names),
                     "upstream_model": model_id,
                     "enabled": True,
                     "order": IMPORTED_MODEL_ORDER,
                 },
                 used_deployment_ids,
             )
+            taken_names.add(str(row.get("model_name", "")).strip())
             self._append_model_row(edited, models, row)
             existing.add(model_id)
             added += 1
@@ -4627,6 +4820,48 @@ class ProvidersModelsDomain:
             "api_key_name": str(self._provider_auth_state(edited).get("kind", "")),
             "imported": added,
         }
+
+    def _lane_channels(self, provider: Mapping[str, Any]) -> dict[str, str]:
+        """The producer the lane's catalog stated for each model id, if any."""
+
+        provider_id = our_free_model_module.AUTH_KIND_TO_PROVIDER.get(
+            self._provider_auth_state(provider)["kind"]
+        )
+        stored = self._lane_channels_by_id.get(provider_id or "")
+        return dict(stored) if isinstance(stored, Mapping) else {}
+
+    @staticmethod
+    def _unique_lane_name(
+        model_id: str,
+        channels: Mapping[str, str],
+        taken: set[str],
+    ) -> str:
+        """The public name a new rows starts on: its own id unless one is taken.
+
+        Renaming on import is the user's decision, so a name that does not
+        collide is left exactly as the catalog spells it.  A name that *would*
+        collide is disambiguated by the producer's own tag, because a second
+        route sharing a public name is not something the user can fix from the
+        picker — the pane showed two identical rows and no way to tell them
+        apart.
+        """
+
+        name = _public_name_for_lane_id(model_id)
+        if name not in taken:
+            return name
+        channel = str(channels.get(model_id, "") or "").strip()
+        if channel:
+            candidate = f"{name} ({channel})"
+            if candidate not in taken:
+                return candidate
+        # No producer tag to borrow, or that tag is taken too.  Returning the id
+        # is not a fallback here: when the name collided because two rows share
+        # an id, the id is exactly what was taken.  The suffix is what makes the
+        # second row distinguishable at all.
+        suffix = 2
+        while f"{model_id} ({suffix})" in taken:
+            suffix += 1
+        return f"{model_id} ({suffix})"
 
     def _append_model_row(
         self,
@@ -6795,8 +7030,8 @@ class ProvidersModelsDomain:
             self._delete_public_model(data)
         elif name in {"workbuddy_status", "workbuddy_models", "workbuddy_login"}:
             self._workbuddy_operation(name, data)
-        elif name in {"opencode2dsh_status", "opencode2dsh_models"}:
-            self._opencode2dsh_operation(name, data)
+        elif name in {"our_free_model_status", "our_free_model_models"}:
+            self._our_free_model_operation(name, data)
         elif name in {"provider_auth_start", "provider_auth_cancel", "provider_auth_logout", "provider_auth_status"}:
             self._provider_auth_operation(name, data)
         elif name.startswith("service_provider_") or name in {

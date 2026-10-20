@@ -34,6 +34,7 @@ from ..lifecycle import (
     proxy_drain_grace_seconds,
 )
 from .. import adapters as managed_adapters
+from .. import config_paths
 from ..dsh_config_keys import (
     DSH_VISION_ROUTER_CONFIG_KEY as _DSH_VISION_ROUTER_CONFIG_KEY,
     DSH_VISION_ROUTER_LOCAL_QUICK_KEYS as _DSH_VISION_ROUTER_LOCAL_QUICK_KEYS,
@@ -98,34 +99,16 @@ def _runtime_root(value: Path | str | None = None) -> Path:
 def _provider_config_source(paths: "RuntimePaths") -> Path:
     """The document the provider editor writes, which is the one to stage.
 
-    ``paths.config`` is what ``LITELLM_CONFIG_FILE`` names, and a packaged
-    install sets that only in the preview profile.  Everywhere else it falls
-    back to ``<root>/config.yaml`` while the provider editor's own
-    ``_default_provider_config_path`` falls back to
-    ``<root>/.litellm-runtime/config.yaml`` — two different files, and only the
-    second one is ever written.  Staging the first copied a document the
-    editor never touched back over the committed one, so a deleted provider
-    reappeared on the next restart and the pane could not make it stick.
-
-    The editor's path is derived from this installation's own root rather than
-    read back through the environment: the staging controller already knows
-    the root it serves, and a process-wide default would answer for whichever
-    installation happened to set the variable first.
+    There is exactly one answer, and it comes from the same resolver the editor
+    itself uses.  This function used to reconstruct a preference order over two
+    paths — the editor's and the older root-level default — which made a stale
+    root-level file a *candidate* for what the proxy should load.  The order is
+    gone: a retired document is reported by ``retire_stale_document`` and never
+    read, because a file that nothing writes must not be able to steer the
+    document everything reads.
     """
 
-    editor_path = paths.root / ".litellm-runtime" / "config.yaml"
-    if editor_path == paths.config:
-        return paths.config
-    # A preview profile names its own document explicitly; that setting wins
-    # only when it names a file, because the packaged default it displaces is
-    # the one the editor actually writes.
-    if paths.config != paths.root / "config.yaml" and paths.config.exists():
-        return paths.config
-    # Both live in this root, so whichever exists is the document in play; the
-    # editor's own path wins when both do, because that is the one it writes.
-    if editor_path.exists():
-        return editor_path
-    return paths.config
+    return config_paths.provider_config_path(paths.root)
 
 
 def _bounded_text(value: object, *, limit: int = 240) -> str:
@@ -224,9 +207,13 @@ class RuntimePaths:
     def from_root(cls, root: Path | str | None = None) -> "RuntimePaths":
         base = _runtime_root(root)
         runtime = base / ".litellm-runtime"
+        # ``config`` names the document the JSON config API and the WebDAV
+        # bundle read; ``runtime_config`` is the staged copy the proxy loads.
+        # Both derive from one resolver, so an installation is one document and
+        # its staged copy rather than two documents that can disagree.
         return cls(
             root=base,
-            config=Path(os.environ.get("LITELLM_CONFIG_FILE", base / "config.yaml")).expanduser(),
+            config=config_paths.provider_config_path(base),
             runtime_config=Path(os.environ.get("LITELLM_RUNTIME_CONFIG", runtime / "config.yaml")).expanduser(),
             settings=Path(os.environ.get("YOUNG_ROUTER_RUNTIME_SETTINGS_FILE", base / "runtime-settings.env")).expanduser(),
             pid=Path(os.environ.get("LITELLM_NATIVE_PID_FILE", runtime / "litellm.pid")).expanduser(),
@@ -276,19 +263,19 @@ class CoreServiceController:
         # Set by ``attach_workbuddy`` when Core owns a WorkBuddy worker; a
         # bare controller (tests, CLI probes) simply has none.
         self._workbuddy: object | None = None
-        # Set by ``attach_opencode2dsh`` when Core owns the dsh-our-free-model
+        # Set by ``attach_our_free_model`` when Core owns the Our Free Model
         # worker; a bare controller (tests, CLI probes) simply has none.
-        self._opencode2dsh: object | None = None
+        self._our_free_model: object | None = None
 
     def attach_workbuddy(self, runtime: object | None) -> None:
         """Share the Core-owned WorkBuddy worker with this controller."""
 
         self._workbuddy = runtime
 
-    def attach_opencode2dsh(self, runtime: object | None) -> None:
-        """Share the Core-owned dsh-our-free-model worker with this controller."""
+    def attach_our_free_model(self, runtime: object | None) -> None:
+        """Share the Core-owned Our Free Model worker with this controller."""
 
-        self._opencode2dsh = runtime
+        self._our_free_model = runtime
 
     def _runtime_config_references_workbuddy(self) -> bool:
         """Whether the staged config routes anything through a managed worker.
@@ -333,17 +320,19 @@ class CoreServiceController:
             # WorkBuddy routes unusable; every other provider must still start.
             return {}
 
-    def _opencode2dsh_environment(self, *, autostart: bool) -> dict[str, str]:
-        """The free-model worker's loopback base URL and bearer."""
+    def _our_free_model_environment(self, *, autostart: bool) -> dict[str, str]:
+        """The Our Free Model worker's loopback base URL and bearer."""
 
-        runtime = self._opencode2dsh
+        runtime = self._our_free_model
         if runtime is None:
             return {}
         try:
             if autostart:
                 # The worker starts only when the saved config names the base
                 # reference it publishes.
-                reference = "os.environ/YOUNG_ROUTER_OPENCODE2DSH_BASE"
+                from ..adapters import our_free_model as our_free_model_module
+
+                reference = f"os.environ/{next(iter(our_free_model_module.API_BASE_ENV.values()))}"
                 if reference in self.paths.runtime_config.read_text(encoding="utf-8"):
                     return runtime.environment(autostart=True)
                 runtime.stop()
@@ -362,7 +351,7 @@ class CoreServiceController:
         """
 
         environment = self._workbuddy_environment(autostart=autostart)
-        environment.update(self._opencode2dsh_environment(autostart=autostart))
+        environment.update(self._our_free_model_environment(autostart=autostart))
         return environment
 
     def _invalidate_status_cache(self) -> None:
@@ -933,20 +922,13 @@ class CoreServiceController:
             return False
 
     def _stage_runtime_config(self) -> None:
-        # Stage from the document the provider editor writes, not from
-        # ``paths.config``.  On a first-run install nothing sets
-        # ``LITELLM_CONFIG_FILE``, so ``paths.config`` falls back to
-        # ``<root>/config.yaml`` while the editor's
-        # ``_default_provider_config_path`` falls back to
-        # ``<root>/.litellm-runtime/config.yaml`` — two different files.  The
-        # editor then kept saving one of them and every restage copied the
-        # other, older one back over the document the proxy had to read: a
-        # deleted provider reappeared on the next restart, and the pane had no
-        # way to make the deletion stick.  Read the editor's own path so the
-        # staged document is always the one that was just committed.
+        # Stage the one document this installation has.  ``config`` and the
+        # editor's own default both come from ``config_paths``, so there is no
+        # longer a second candidate whose older contents could be copied back
+        # over the document the proxy has to read.
         source = _provider_config_source(self.paths)
         if not source.exists():
-            raise RuntimeError("Provider/model configuration is unavailable")
+            raise RuntimeError(self._missing_configuration_problem())
         from ..config.schema import _load_yaml
 
         try:
@@ -971,6 +953,24 @@ class CoreServiceController:
             raise
         except Exception:
             raise RuntimeError("Provider/model configuration is invalid") from None
+
+    def _missing_configuration_problem(self) -> str:
+        """Why staging had nothing to read, named so the old copy is findable.
+
+        A root-level ``config.yaml`` beside the live document is the fingerprint
+        of the two-path layout this installation no longer has.  Saying only
+        "unavailable" left the user with a stale file nothing writes and no way
+        to know the configuration they had been editing was in it.
+        """
+
+        retired = config_paths.stale_document(self.paths.root)
+        if retired is not None:
+            return (
+                f"Provider/model configuration is unavailable: the live document is "
+                f"{self.paths.config}, and {retired} is a retired copy this app no "
+                f"longer reads (move it into place or remove it)"
+            )
+        return "Provider/model configuration is unavailable"
 
     def stage_runtime_config(self, _operation: object = None) -> dict[str, Any]:
         """Restage the runtime document and answer what the proxy would read.

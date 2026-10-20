@@ -10,6 +10,7 @@ import stat
 import sys
 import tempfile
 import textwrap
+import yaml
 import threading
 import time
 import unittest
@@ -1916,6 +1917,67 @@ class ProvidersModelsDomainTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertFalse(result["unreachable"])
 
+    def test_model_probe_names_a_403_permission_body_as_an_egress_block(self) -> None:
+        """A 403 that refused the network is not a refused credential.
+
+        The free lane's upstream answers its blocked hosts with 403 and
+        ``"type": "permission_error"``, stating in the body that the refusal is
+        unrelated to the account.  Reporting that as ``auth_error`` sent the
+        pane to "密钥被拒" and the user to re-enter a key that was never read.
+        A 403 that does blame the credential keeps the old name.
+        """
+
+        cases = {
+            "egress_blocked": {
+                "error": {
+                    "message": (
+                        "OpenCode's free models aren't available from your current "
+                        "network because we've detected abusive traffic from this IP "
+                        "address. This isn't related to your account."
+                    ),
+                    "type": "permission_error",
+                }
+            },
+            "auth_error": {
+                "error": {"message": "invalid api key", "type": "authentication_error"}
+            },
+        }
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802 - stdlib handler hook
+                body = json.dumps(cases[self.server.answer]).encode("utf-8")
+                self.send_response(403)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            statuses = {}
+            for answer in cases:
+                server.answer = answer  # type: ignore[attr-defined]
+                result = ProvidersModelsDomain._surface_probe(
+                    surface="openai/responses",
+                    api_base=f"http://127.0.0.1:{port}/v1",
+                    credential="local-token",
+                    model_name="deepseek-v4.1-flash-free",
+                )
+                statuses[answer] = result["status"]
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.assertEqual("egress_blocked", statuses["egress_blocked"])
+        self.assertEqual("auth_error", statuses["auth_error"])
+
     def test_model_probe_retries_a_dropped_connection_once(self) -> None:
         """A relay edge that drops the first connection must not read as unavailable."""
         attempts: list[str] = []
@@ -3409,3 +3471,60 @@ class WebDAVSettingsDomainTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RetiredAuthKindLoadsTests(unittest.TestCase):
+    """Renaming an identifier must not make a document unreadable.
+
+    The auth kind is validated against a whitelist, so retiring a spelling from
+    that set made every installation written by the previous build fail to load:
+    the app refused its own configuration and the affected provider disappeared
+    from the list.  The old spelling stays *readable* — the pane then shows the
+    current name and the next save stores it — while an unknown kind is still
+    refused.
+    """
+
+    def test_a_retired_auth_kind_is_loaded_under_its_current_name(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(
+                textwrap.dedent(
+                    """
+                    providers:
+                      ofm:
+                        api_base: "os.environ/YOUNG_ROUTER_OPENCODE2DSH_BASE"
+                        api_keys:
+                          - name: our-free-model-local
+                            value: "os.environ/YOUNG_ROUTER_OPENCODE2DSH_KEY"
+                        x-young-router-provider-auth: {kind: opencode2dsh_login, credential_ref: provider-auth-a}
+                    model_list:
+                      - model_name: space-bunny
+                        litellm_params:
+                          model: openai/space-bunny-free
+                          api_base: "os.environ/YOUNG_ROUTER_OPENCODE2DSH_BASE"
+                          api_key: "os.environ/YOUNG_ROUTER_OPENCODE2DSH_KEY"
+                        model_info: {provider: ofm, auth_kind: opencode2dsh_login, model_enabled: true}
+                    """
+                ).lstrip(),
+                encoding="utf-8",
+            )
+            domain = ProvidersModelsDomain(path)
+            provider = domain.snapshot()["providers"][0]
+            self.assertEqual("our_free_model_login", provider["auth_kind"])
+            # The user's own provider name is not the app's to rewrite: only
+            # the vocabulary this build owns is normalised.
+            self.assertEqual("ofm", provider["name"])
+            self.assertEqual(["space-bunny"], [m["model_name"] for m in provider["models"]])
+
+            domain.apply()
+            saved = yaml.safe_load(path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                "our_free_model_login",
+                saved["providers"]["ofm"]["x-young-router-provider-auth"]["kind"],
+            )
+
+    def test_an_unknown_auth_kind_is_still_refused(self) -> None:
+        from young_router.config.schema import _provider_auth
+
+        with self.assertRaises(ValueError):
+            _provider_auth({"kind": "not_a_login_kind", "credential_ref": "x"})

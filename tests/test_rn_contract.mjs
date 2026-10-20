@@ -30,7 +30,7 @@ try {
     + '  | "claude_login"\n'
     + '  | "workbuddy_login"\n'
     + '  | "workbuddy_ai_login"\n'
-    + '  | "opencode2dsh_login";'));
+    + '  | "our_free_model_login";'));
   assert.ok(original.includes("auth_status?: ProviderAuthStatus;"));
 
   const valid = run(original);

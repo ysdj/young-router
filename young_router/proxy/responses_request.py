@@ -3231,33 +3231,6 @@ def _elided_tool_call_note(size_chars: int) -> str:
     )
 
 
-def _elided_tool_call_placeholder(note: str) -> str:
-    return json.dumps({"elided": note}, ensure_ascii=False)
-
-
-def _elided_peer_call(item: dict, note: str) -> Optional[dict]:
-    """Return the call of a record this pass emptied.
-
-    An older call whose output is *outside* the window is left alone, because it
-    already reads as prose the model produced: rewriting it would edit a
-    transcript the model never wrote.  The call the gateway refuses on is the
-    one whose record this pass just blanked, which is why the rewrite is driven
-    by the elided outputs rather than by every old call.  The fields the client
-    reads for identity -- id, call_id, namespace, name, status -- travel with
-    the placeholder.
-    """
-
-    if item.get("type") == "function_call":
-        arguments = item.get("arguments")
-        if isinstance(arguments, str):
-            return dict(item, arguments=_elided_tool_call_placeholder(note))
-        return None
-    script = item.get("input")
-    if isinstance(script, str):
-        return dict(item, input=note)
-    return None
-
-
 def _tool_call_lane_by_index(input_items: list) -> dict[int, str]:
     """Map every tool-record index to the lane it belongs to.
 
@@ -3385,43 +3358,20 @@ def _with_elided_oversized_tool_outputs(request_kwargs: dict) -> Optional[dict]:
             elided_by_index[index] = updated
     if not elided_by_index:
         return None
-    # The call of every record this pass emptied is rewritten with it, so the
-    # replay never carries a call whose record arrived blank.  The pairing is
-    # by position, the way the client writes its own transcript: the call item
-    # that introduced the output sits immediately before it, or one reasoning
-    # item above it.  The identifiers are not used for the pairing because a
-    # replayed wire may carry only one of ``call_id`` / ``id`` on either side.
-    peer_updates: dict[int, dict] = {}
-    for index in sorted(elided_by_index):
-        if not input_items[index].get("type", "").endswith("_output"):
-            continue
-        for offset in (1, 2):
-            peer_index = index - offset
-            if peer_index < 0:
-                break
-            peer = input_items[peer_index]
-            if not isinstance(peer, dict):
-                continue
-            if _history_tool_call_record_kind(peer.get("type")) is None:
-                continue
-            if peer.get("type", "").endswith("_output"):
-                break
-            updated = _elided_peer_call(
-                peer,
-                _elided_tool_call_note(_tool_record_weight(input_items[index])),
-            )
-            if updated is not None:
-                peer_updates[peer_index] = updated
-            break
-    elided_by_index.update(peer_updates)
+    # The call of an emptied record keeps its own arguments.  Rewriting them
+    # into a placeholder that carried the note looked like the way to keep the
+    # pair consistent, but a replayed call is the model's own few-shot example
+    # of how to call that tool: one ``view_image`` whose arguments became
+    # ``{"elided": "[N characters elided: ...]"}`` taught the model to emit
+    # exactly that shape, and Codex's router answered every following turn with
+    # ``failed to parse function arguments: missing field `path``` -- 233 times
+    # in one thread, because the placeholder replays on every turn.  The output
+    # note already tells the model the payload is gone; the call stays as it
+    # was issued, so nothing in the replay teaches an invalid call.
     rewritten = [
         elided_by_index.get(index, item) for index, item in enumerate(input_items)
     ]
-    elided_outputs = sum(
-        1
-        for index, updated in elided_by_index.items()
-        if updated.get("type", "").endswith("_output")
-    )
+    elided_outputs = len(elided_by_index)
     elided_chars = sum(
         max(
             0,
@@ -3430,8 +3380,6 @@ def _with_elided_oversized_tool_outputs(request_kwargs: dict) -> Optional[dict]:
         )
         for index, updated in elided_by_index.items()
     )
-    if not elided_outputs:
-        return None
     result = dict(request_kwargs)
     result["input"] = rewritten
     _trace_module._route_trace(

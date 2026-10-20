@@ -225,7 +225,7 @@ export type ProviderAuthKind =
   | "claude_login"
   | "workbuddy_login"
   | "workbuddy_ai_login"
-  | "opencode2dsh_login";
+  | "our_free_model_login";
 
 export type ProviderAuthStatus = "signed_out" | "authorizing" | "signed_in" | "expired" | "error" | "unsupported";
 

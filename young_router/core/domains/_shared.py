@@ -8,6 +8,7 @@ from pathlib import Path
 from collections.abc import Mapping
 from typing import Any
 
+from ... import config_paths
 from ..persistence import PersistenceError, read_bytes
 from ..security import safe_exception_message
 
@@ -50,15 +51,14 @@ def _same_file(path: Path, expected: bytes | None) -> bool:
 
 
 def _default_runtime_root() -> Path:
-    configured = os.environ.get("LITELLM_RUNTIME_ROOT", "").strip() or os.environ.get(
-        "YOUNG_ROUTER_HOME", ""
-    ).strip()
-    return Path(configured).expanduser() if configured else Path.home() / ".young-router"
+    return config_paths.runtime_root()
 
 
 def _default_provider_config_path() -> Path:
-    configured = os.environ.get("LITELLM_CONFIG_FILE", "").strip()
-    return Path(configured).expanduser() if configured else _default_runtime_root() / ".litellm-runtime" / "config.yaml"
+    # One resolver, not this module's own: the usage-log reader, the Codex
+    # editor, the WebDAV bundle and the JSON config API must all name the
+    # document the provider editor writes, or an installation holds two.
+    return config_paths.provider_config_path()
 
 
 def _default_runtime_settings_path() -> Path:

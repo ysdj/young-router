@@ -1,4 +1,4 @@
-"""The existing OpenCode provider backed by dsh-our-free-model.
+"""The Our Free Model lane, backed by the bundled upstream package.
 
 The upstream protocol is staged unchanged at build time, so these tests drive
 the seam instead of the network: a stub runtime stands in for the worker.
@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from young_router.adapters import opencode2dsh
+from young_router.adapters import our_free_model
 from young_router.core.domains import DomainError
 from young_router.core.domains.providers_models import ProvidersModelsDomain
 from young_router.core.provider_auth import ProviderAuthManager
@@ -53,10 +53,10 @@ class StubRuntime:
         return {
             "available": True,
             "detail": "",
-            "providers": {opencode2dsh.OPENCODE2DSH_PROVIDER: self.provider_status()},
+            "providers": {our_free_model.OUR_FREE_MODEL_PROVIDER: self.provider_status()},
         }
 
-    def provider_status(self, provider: str = opencode2dsh.OPENCODE2DSH_PROVIDER) -> dict[str, object]:
+    def provider_status(self, provider: str = our_free_model.OUR_FREE_MODEL_PROVIDER) -> dict[str, object]:
         self.calls.append(("provider_status", provider))
         if not self.available:
             return {}
@@ -68,7 +68,7 @@ class StubRuntime:
         }
 
     def models(
-        self, provider: str = opencode2dsh.OPENCODE2DSH_PROVIDER, *, refresh: bool = False
+        self, provider: str = our_free_model.OUR_FREE_MODEL_PROVIDER, *, refresh: bool = False
     ) -> dict[str, object]:
         self.calls.append(("models", provider))
         if not self.available:
@@ -78,13 +78,18 @@ class StubRuntime:
             "detail": "",
             "source": "adapter",
             "models": [dict(entry) for entry in CATALOG],
+            # The surface each row answers on, as the upstream routes it.  Both
+            # rows here are served over Chat Completions; the Responses rows are
+            # the `muse-spark` pair, which this stub does not carry.
+            "wires": {"big-pickle": "chat", "mimo-v2.6-flash-free": "chat"},
+            "windows": {"big-pickle": 200_000, "mimo-v2.6-flash-free": 1_048_576},
             "status": self.provider_status(provider),
         }
 
     def environment(self, *, autostart: bool = False) -> dict[str, str]:
         return {
-            opencode2dsh.API_BASE_ENV[opencode2dsh.OPENCODE2DSH_PROVIDER]: "http://127.0.0.1:1/v1",
-            opencode2dsh.API_KEY_ENV[opencode2dsh.OPENCODE2DSH_PROVIDER]: "local-token",
+            our_free_model.API_BASE_ENV[our_free_model.OUR_FREE_MODEL_PROVIDER]: "http://127.0.0.1:1/v1",
+            our_free_model.API_KEY_ENV[our_free_model.OUR_FREE_MODEL_PROVIDER]: "local-token",
         }
 
     def environment_values(self) -> dict[str, str]:
@@ -97,7 +102,7 @@ class StubRuntime:
         self.stopped += 1
 
 
-class OpenCode2DSHProviderTests(unittest.TestCase):
+class OurFreeModelProviderTests(unittest.TestCase):
     def _domain(self, runtime: StubRuntime | None = None):
         directory = tempfile.TemporaryDirectory()
         root = Path(directory.name)
@@ -106,7 +111,7 @@ class OpenCode2DSHProviderTests(unittest.TestCase):
         domain = ProvidersModelsDomain(
             config,
             auth_manager=ProviderAuthManager(root),
-            opencode2dsh=runtime if runtime is not None else StubRuntime(),
+            our_free_model=runtime if runtime is not None else StubRuntime(),
         )
         return directory, domain, config
 
@@ -116,32 +121,40 @@ class OpenCode2DSHProviderTests(unittest.TestCase):
         directory, domain, config = self._domain()
         with directory:
             summary = domain.dispatch(
-                "service_provider.add", {"kind": "opencode2dsh_login"}
+                "service_provider.add", {"kind": "our_free_model_login"}
             )["operation_summary"]
-            self.assertEqual(summary["auth_kind"], "opencode2dsh_login")
+            self.assertEqual(summary["auth_kind"], "our_free_model_login")
             self.assertEqual(summary["auth_status"], "signed_in")
 
             provider = domain.snapshot()["providers"][0]
-            self.assertEqual(provider["name"], opencode2dsh.OPENCODE2DSH_DISPLAY_NAME)
+            self.assertEqual(provider["name"], our_free_model.OUR_FREE_MODEL_DISPLAY_NAME)
             self.assertEqual(provider["auth_status"], "signed_in")
-            self.assertEqual(provider["key_states"][0]["name"], opencode2dsh.API_KEY_NAME)
+            self.assertEqual(provider["key_states"][0]["name"], our_free_model.API_KEY_NAME)
             self.assertEqual(
-                provider["api_base"], opencode2dsh.api_base_reference(opencode2dsh.OPENCODE2DSH_PROVIDER)
+                provider["api_base"], our_free_model.api_base_reference(our_free_model.OUR_FREE_MODEL_PROVIDER)
             )
             # An imported roster is a set of peers, not a ranked list: every
             # route starts on the same order instead of the catalog's own 1, 2.
             self.assertEqual([model["order"] for model in provider["models"]], [0, 0])
-            # The lane's own ``-free`` suffix is dropped from the public name,
-            # while the route keeps addressing the upstream's real id.
+            # The public name is the upstream id unchanged: renaming is the
+            # user's, and the route addresses the same id either way.
             self.assertEqual(
                 [(model["model_name"], model["upstream_model"]) for model in provider["models"]],
-                [("big-pickle", "big-pickle"), ("mimo-v2.6-flash", "mimo-v2.6-flash-free")],
+                [("big-pickle", "big-pickle"), ("mimo-v2.6-flash-free", "mimo-v2.6-flash-free")],
             )
             first = provider["models"][0]
             self.assertEqual(first["litellm_model"], "openai/big-pickle")
-            self.assertEqual(first["upstream_url_surface"], "openai/responses")
+            # The row answers on Chat Completions, and the route says so.  It
+            # used to be pinned to Responses because the gateway serves both
+            # surfaces -- which is true of the gateway and false of this row, so
+            # the pin asked an endpoint the row does not have.
+            self.assertEqual(first["upstream_url_surface"], "openai/chat")
             self.assertEqual(first["upstream_protocol_mode"], "fixed")
-            self.assertEqual(first["api_key_name"], opencode2dsh.API_KEY_NAME)
+            # The window the upstream states is the route's declared window, so
+            # the public window is the upstream's number rather than the
+            # unknown-model fallback the registry would have answered with.
+            self.assertEqual(first["max_input_tokens"], 200_000)
+            self.assertEqual(first["api_key_name"], our_free_model.API_KEY_NAME)
             self.assertTrue(provider["key_states"][0]["configured"])
 
             self.assertTrue(domain.validate()["valid"])
@@ -149,8 +162,8 @@ class OpenCode2DSHProviderTests(unittest.TestCase):
             document = config.read_text(encoding="utf-8")
             # Only environment references reach the file: the worker port and
             # its bearer stay inside the Core process.
-            self.assertIn("os.environ/YOUNG_ROUTER_OPENCODE2DSH_BASE", document)
-            self.assertIn("os.environ/YOUNG_ROUTER_OPENCODE2DSH_KEY", document)
+            self.assertIn("os.environ/YOUNG_ROUTER_OUR_FREE_MODEL_BASE", document)
+            self.assertIn("os.environ/YOUNG_ROUTER_OUR_FREE_MODEL_KEY", document)
             self.assertNotIn("127.0.0.1", document)
             self.assertNotIn("local-token", document)
             self.assertIn("model: openai/big-pickle", document)
@@ -161,20 +174,20 @@ class OpenCode2DSHProviderTests(unittest.TestCase):
         directory, domain, _config = self._domain(StubRuntime(available=False))
         with directory:
             with self.assertRaisesRegex(DomainError, "could not be reached"):
-                domain.dispatch("service_provider.add", {"kind": "opencode2dsh_login"})
+                domain.dispatch("service_provider.add", {"kind": "our_free_model_login"})
 
     def test_the_status_and_catalog_reads_answer_through_the_operation_summary(self) -> None:
         directory, domain, _config = self._domain()
         with directory:
-            status = domain.dispatch("opencode2dsh_status", {})["operation_summary"]
-            self.assertEqual(status["operation"], "opencode2dsh_status")
+            status = domain.dispatch("our_free_model_status", {})["operation_summary"]
+            self.assertEqual(status["operation"], "our_free_model_status")
             self.assertTrue(status["available"])
             self.assertEqual(
-                status["providers"][opencode2dsh.OPENCODE2DSH_PROVIDER]["state"], "ready"
+                status["providers"][our_free_model.OUR_FREE_MODEL_PROVIDER]["state"], "ready"
             )
 
-            catalog = domain.dispatch("opencode2dsh_models", {})["operation_summary"]
-            self.assertEqual(catalog["operation"], "opencode2dsh_models")
+            catalog = domain.dispatch("our_free_model_models", {})["operation_summary"]
+            self.assertEqual(catalog["operation"], "our_free_model_models")
             self.assertTrue(catalog["available"])
             self.assertEqual(
                 [entry["id"] for entry in catalog["models"]],
@@ -186,7 +199,7 @@ class OpenCode2DSHProviderTests(unittest.TestCase):
 
         directory, domain, config = self._domain()
         with directory:
-            domain.dispatch("service_provider.add", {"kind": "opencode2dsh_login"})
+            domain.dispatch("service_provider.add", {"kind": "our_free_model_login"})
             provider = domain.snapshot()["providers"][0]
             self.assertEqual(len(provider["key_states"]), 1)
             domain.apply()
@@ -207,9 +220,9 @@ class OpenCode2DSHProviderTests(unittest.TestCase):
 
         directory, domain, _config = self._domain()
         with directory:
-            domain.dispatch("service_provider.add", {"kind": "opencode2dsh_login"})
+            domain.dispatch("service_provider.add", {"kind": "our_free_model_login"})
             slot = domain.snapshot()["providers"][0]["key_states"][0]
-            self.assertEqual(slot["name"], opencode2dsh.API_KEY_NAME)
+            self.assertEqual(slot["name"], our_free_model.API_KEY_NAME)
             self.assertIs(slot["managed"], True)
             self.assertEqual(slot["source"], {"kind": "independent"})
 
@@ -229,7 +242,7 @@ class OpenCode2DSHProviderTests(unittest.TestCase):
                 "  - model_name: unused\n"
                 "    litellm_params:\n"
                 "      model: openai/unused\n"
-                "      api_base: os.environ/YOUNG_ROUTER_OPENCODE2DSH_BASE\n"
+                "      api_base: os.environ/YOUNG_ROUTER_OUR_FREE_MODEL_BASE\n"
                 "    model_info:\n"
                 "      upstream_url_surface: openai/responses\n",
                 encoding="utf-8",
@@ -237,12 +250,12 @@ class OpenCode2DSHProviderTests(unittest.TestCase):
             domain = ProvidersModelsDomain(
                 config,
                 auth_manager=ProviderAuthManager(Path(directory.name)),
-                opencode2dsh=StubRuntime(),
+                our_free_model=StubRuntime(),
             )
-            domain.dispatch("service_provider.add", {"kind": "opencode2dsh_login"})
+            domain.dispatch("service_provider.add", {"kind": "our_free_model_login"})
             providers = {item["name"]: item for item in domain.snapshot()["providers"]}
             self.assertIs(providers["mine"]["key_states"][0]["managed"], False)
-            self.assertIs(providers[opencode2dsh.OPENCODE2DSH_DISPLAY_NAME]["key_states"][0]["managed"], True)
+            self.assertIs(providers[our_free_model.OUR_FREE_MODEL_DISPLAY_NAME]["key_states"][0]["managed"], True)
             # A user's own slot stays writable, including on a deployment that
             # also runs the lane: the refusal is about the slot, not the file.
             domain.stage_secret("api_key", "mine\x1fpersonal", "sk-rotated")
@@ -262,14 +275,14 @@ class OpenCode2DSHProviderTests(unittest.TestCase):
 
         directory, domain, _config = self._domain()
         with directory:
-            domain.dispatch("service_provider.add", {"kind": "opencode2dsh_login"})
+            domain.dispatch("service_provider.add", {"kind": "our_free_model_login"})
             provider = domain.snapshot()["providers"][0]
-            target = f"{provider['name']}\x1f{opencode2dsh.API_KEY_NAME}"
+            target = f"{provider['name']}\x1f{our_free_model.API_KEY_NAME}"
             with self.assertRaises(DomainError):
                 domain.stage_secret("api_key", target, "sk-attacker")
             self.assertEqual(
                 domain.trusted_secret_value("api_key", target),
-                opencode2dsh.api_key_reference(opencode2dsh.OPENCODE2DSH_PROVIDER),
+                our_free_model.api_key_reference(our_free_model.OUR_FREE_MODEL_PROVIDER),
             )
 
     def test_the_owned_slot_rule_is_provenance_not_the_auth_kind(self) -> None:
@@ -285,7 +298,7 @@ class OpenCode2DSHProviderTests(unittest.TestCase):
 
         references = managed_key_references()
         self.assertIn(
-            opencode2dsh.api_key_reference(opencode2dsh.OPENCODE2DSH_PROVIDER),
+            our_free_model.api_key_reference(our_free_model.OUR_FREE_MODEL_PROVIDER),
             references,
         )
         for reference in references:
@@ -307,7 +320,7 @@ class OpenCode2DSHProviderTests(unittest.TestCase):
         directory, domain, _config = self._domain()
         with directory:
             provider = domain.dispatch(
-                "service_provider.add", {"kind": "opencode2dsh_login"}
+                "service_provider.add", {"kind": "our_free_model_login"}
             )["providers"][0]
             provider_id = provider["id"]
             self.assertEqual(len(domain.snapshot()["providers"]), 1)
@@ -322,7 +335,7 @@ class OpenCode2DSHProviderTests(unittest.TestCase):
                 "service_provider.delete", {"provider_id": provider_id}
             )["operation_summary"]
             self.assertEqual(summary["operation"], "service_provider_delete")
-            self.assertEqual(summary["auth_kind"], "opencode2dsh_login")
+            self.assertEqual(summary["auth_kind"], "our_free_model_login")
             self.assertEqual(domain.snapshot()["providers"], [])
 
     def test_the_store_summary_carries_the_account_kind_it_routes_on(self) -> None:
@@ -339,12 +352,12 @@ class OpenCode2DSHProviderTests(unittest.TestCase):
 
         directory, domain, _config = self._domain()
         with directory:
-            domain.dispatch("service_provider.add", {"kind": "opencode2dsh_login"})
+            domain.dispatch("service_provider.add", {"kind": "our_free_model_login"})
             store = CoreStore(domains=[domain])
             summary = store.snapshot()["providers_models"]["providers"]
             self.assertEqual(1, len(summary))
             row = summary[0]
-            self.assertEqual("opencode2dsh_login", row["auth_kind"])
+            self.assertEqual("our_free_model_login", row["auth_kind"])
             self.assertTrue(row["auth_status"])
             # The detail record keeps saying the same thing, so a pane reading
             # either projection reaches the same action for this row.
@@ -364,7 +377,7 @@ class OpenCode2DSHProviderTests(unittest.TestCase):
         directory, domain, _config = self._domain()
         with directory:
             provider = domain.dispatch(
-                "service_provider.add", {"kind": "opencode2dsh_login"}
+                "service_provider.add", {"kind": "our_free_model_login"}
             )["providers"][0]
             windows = {
                 model["upstream_model"]: model["upstream_context_window"]
@@ -402,13 +415,13 @@ class OpenCode2DSHProviderTests(unittest.TestCase):
 
         directory, domain, config = self._domain()
         with directory:
-            domain.dispatch("service_provider.add", {"kind": "opencode2dsh_login"})
+            domain.dispatch("service_provider.add", {"kind": "our_free_model_login"})
             domain.apply()
 
             reloaded = ProvidersModelsDomain(
                 config,
                 auth_manager=ProviderAuthManager(config.parent),
-                opencode2dsh=StubRuntime(),
+                our_free_model=StubRuntime(),
             )
             before = reloaded.snapshot()["providers"][0]["models"]
             self.assertEqual(
@@ -416,7 +429,7 @@ class OpenCode2DSHProviderTests(unittest.TestCase):
                 [model["upstream_context_window"] for model in before],
             )
 
-            reloaded.dispatch("opencode2dsh_models", {"provider": "opencode2dsh"})
+            reloaded.dispatch("our_free_model_models", {"provider": "our-free-model"})
             after = reloaded.snapshot()["providers"][0]["models"]
             self.assertEqual(
                 [200_000, 1_048_576],
@@ -427,7 +440,7 @@ class OpenCode2DSHProviderTests(unittest.TestCase):
         """An upstream that published nothing leaves the row off, not at zero."""
 
         runtime = StubRuntime()
-        runtime.models = lambda provider=opencode2dsh.OPENCODE2DSH_PROVIDER, refresh=False: {
+        runtime.models = lambda provider=our_free_model.OUR_FREE_MODEL_PROVIDER, refresh=False: {
             "available": True,
             "detail": "",
             "source": "adapter",
@@ -437,7 +450,7 @@ class OpenCode2DSHProviderTests(unittest.TestCase):
         directory, domain, _config = self._domain(runtime)
         with directory:
             provider = domain.dispatch(
-                "service_provider.add", {"kind": "opencode2dsh_login"}
+                "service_provider.add", {"kind": "our_free_model_login"}
             )["providers"][0]
             self.assertIsNone(provider["models"][0]["upstream_context_window"])
 
@@ -446,13 +459,13 @@ class OpenCode2DSHProviderTests(unittest.TestCase):
 
         WorkBuddy's catalog states camelCase (``contextWindow``) and this lane
         states the snake_case keys a public OpenAI record uses.  Reading only
-        the camelCase ones recorded nothing at all for every dsh-our-free-model
+        the camelCase ones recorded nothing at all for every Our Free Model
         route, so the model pane fell back to the registry's default for the
         public name and showed a window the upstream never stated.
         """
 
         runtime = StubRuntime()
-        runtime.models = lambda provider=opencode2dsh.OPENCODE2DSH_PROVIDER, refresh=False: {
+        runtime.models = lambda provider=our_free_model.OUR_FREE_MODEL_PROVIDER, refresh=False: {
             "available": True,
             "detail": "",
             "source": "adapter",
@@ -465,7 +478,7 @@ class OpenCode2DSHProviderTests(unittest.TestCase):
         directory, domain, _config = self._domain(runtime)
         with directory:
             provider = domain.dispatch(
-                "service_provider.add", {"kind": "opencode2dsh_login"}
+                "service_provider.add", {"kind": "our_free_model_login"}
             )["providers"][0]
             windows = {
                 model["upstream_model"]: model["upstream_context_window"]
@@ -496,7 +509,7 @@ class OpenCode2DSHProviderTests(unittest.TestCase):
         """
 
         runtime = StubRuntime()
-        runtime.models = lambda provider=opencode2dsh.OPENCODE2DSH_PROVIDER, refresh=False: {
+        runtime.models = lambda provider=our_free_model.OUR_FREE_MODEL_PROVIDER, refresh=False: {
             "available": True,
             "detail": "",
             "source": "adapter",
@@ -513,7 +526,7 @@ class OpenCode2DSHProviderTests(unittest.TestCase):
         directory, domain, _config = self._domain(runtime)
         with directory:
             provider = domain.dispatch(
-                "service_provider.add", {"kind": "opencode2dsh_login"}
+                "service_provider.add", {"kind": "our_free_model_login"}
             )["providers"][0]
             self.assertEqual(
                 {
@@ -541,13 +554,13 @@ class OpenCode2DSHProviderTests(unittest.TestCase):
         directory, domain, _config = self._domain()
         with directory:
             provider = domain.dispatch(
-                "service_provider.add", {"kind": "opencode2dsh_login"}
+                "service_provider.add", {"kind": "our_free_model_login"}
             )["providers"][0]
             summary = domain.dispatch(
                 "providers.fetch_models",
                 {"provider_id": provider["id"]},
             )["operation_summary"]
-            self.assertEqual(summary["operation"], "opencode2dsh_models")
+            self.assertEqual(summary["operation"], "our_free_model_models")
             self.assertIs(summary["available"], True)
             self.assertEqual(
                 [entry["id"] for entry in summary["models"]],
@@ -557,16 +570,16 @@ class OpenCode2DSHProviderTests(unittest.TestCase):
     def test_a_picked_lane_model_lands_on_the_slot_core_minted(self) -> None:
         """The pick goes through the account, which owns the roster's three facts.
 
-        The public name a client sees drops the lane's ``-free`` suffix, the
-        route addresses the upstream's real id, and both answer with the minted
-        slot.  A pane that rebuilt those from a listing would own a second copy
-        of what the adapter publishes, and this is the write that keeps it one.
+        The public name a client sees is the catalog's own id, the route
+        addresses that same id, and both answer with the minted slot.  A pane
+        that rebuilt those from a listing would own a second copy of what the
+        adapter publishes, and this is the write that keeps it one.
         """
 
         directory, domain, _config = self._domain()
         with directory:
             provider = domain.dispatch(
-                "service_provider.add", {"kind": "opencode2dsh_login"}
+                "service_provider.add", {"kind": "our_free_model_login"}
             )["providers"][0]
             summary = domain.dispatch(
                 "model.import_service_catalog",
@@ -576,11 +589,11 @@ class OpenCode2DSHProviderTests(unittest.TestCase):
             models = domain.snapshot()["providers"][0]["models"]
             self.assertEqual(
                 [model["name"] for model in models],
-                ["big-pickle", "mimo-v2.6-flash"],
+                ["big-pickle", "mimo-v2.6-flash-free"],
             )
             for model, entry in zip(models, CATALOG):
                 self.assertEqual(model["upstream_model"], entry["id"])
-                self.assertEqual(model["api_key_name"], opencode2dsh.API_KEY_NAME)
+                self.assertEqual(model["api_key_name"], our_free_model.API_KEY_NAME)
                 self.assertTrue(model["provider_key_id"])
 
     def test_re_picking_a_lane_roster_adds_nothing_twice(self) -> None:
@@ -589,7 +602,7 @@ class OpenCode2DSHProviderTests(unittest.TestCase):
         directory, domain, _config = self._domain()
         with directory:
             provider = domain.dispatch(
-                "service_provider.add", {"kind": "opencode2dsh_login"}
+                "service_provider.add", {"kind": "our_free_model_login"}
             )["providers"][0]
             summary = domain.dispatch(
                 "model.import_service_catalog",
@@ -604,7 +617,7 @@ class OpenCode2DSHProviderTests(unittest.TestCase):
         directory, domain, _config = self._domain()
         with directory:
             provider = domain.dispatch(
-                "service_provider.add", {"kind": "opencode2dsh_login"}
+                "service_provider.add", {"kind": "our_free_model_login"}
             )["providers"][0]
             with self.assertRaises(DomainError):
                 domain.dispatch(
@@ -630,7 +643,7 @@ class OpenCode2DSHProviderTests(unittest.TestCase):
             domain = ProvidersModelsDomain(
                 config,
                 auth_manager=ProviderAuthManager(Path(directory.name)),
-                opencode2dsh=StubRuntime(),
+                our_free_model=StubRuntime(),
             )
             provider = domain.snapshot()["providers"][0]
             summary = domain.dispatch(
@@ -645,7 +658,7 @@ class OpenCode2DSHProviderTests(unittest.TestCase):
                 )
 
 
-class OpenCode2DSHStoreTests(unittest.TestCase):
+class OurFreeModelStoreTests(unittest.TestCase):
     def test_core_launch_starts_only_a_saved_free_model_route(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -653,27 +666,27 @@ class OpenCode2DSHStoreTests(unittest.TestCase):
             config_path.write_text(
                 "providers:\n"
                 "  mine: &mine\n"
-                "    api_base: os.environ/YOUNG_ROUTER_OPENCODE2DSH_BASE\n"
+                "    api_base: os.environ/YOUNG_ROUTER_OUR_FREE_MODEL_BASE\n"
                 "    api_keys:\n"
                 "      - name: our-free-model-local\n"
-                "        value: os.environ/YOUNG_ROUTER_OPENCODE2DSH_KEY\n"
-                "    x-young-router-provider-auth: {kind: opencode2dsh_login, credential_ref: configured}\n"
+                "        value: os.environ/YOUNG_ROUTER_OUR_FREE_MODEL_KEY\n"
+                "    x-young-router-provider-auth: {kind: our_free_model_login, credential_ref: configured}\n"
                 "model_list:\n"
                 "  - model_name: ours-model\n"
-                "    litellm_params: {model: openai/model, api_base: *mine, api_key: os.environ/YOUNG_ROUTER_OPENCODE2DSH_KEY}\n"
+                "    litellm_params: {model: openai/model, api_base: *mine, api_key: os.environ/YOUNG_ROUTER_OUR_FREE_MODEL_KEY}\n"
                 "    model_info: {provider: mine}\n",
                 encoding="utf-8",
             )
             runtime = StubRuntime()
-            with mock.patch.object(opencode2dsh, "OpenCode2DSHRuntime", lambda root, settings=None: runtime), mock.patch.object(CoreStore, "_set_service_from_result", lambda *args, **kwargs: None):
+            with mock.patch.object(our_free_model, "OurFreeModelRuntime", lambda root, settings=None: runtime), mock.patch.object(CoreStore, "_set_service_from_result", lambda *args, **kwargs: None):
                 store = CoreStore.with_default_domains(config_path=config_path, runtime_root=root, metadata_path=root / "state.json")
-                self.assertIs(store._opencode2dsh_runtime, runtime)
+                self.assertIs(store._our_free_model_runtime, runtime)
             self.assertIn(("autostart", "launch"), runtime.calls)
             store.shutdown()
 
             config_path.write_text("providers: {}\nmodel_list: []\n", encoding="utf-8")
             runtime = StubRuntime()
-            with mock.patch.object(opencode2dsh, "OpenCode2DSHRuntime", lambda root, settings=None: runtime):
+            with mock.patch.object(our_free_model, "OurFreeModelRuntime", lambda root, settings=None: runtime):
                 store = CoreStore.with_default_domains(
                     config_path=config_path,
                     runtime_root=root,
@@ -690,14 +703,14 @@ class OpenCode2DSHStoreTests(unittest.TestCase):
             config_path.write_text(
                 "providers:\n"
                 "  ours: &ours\n"
-                "    api_base: os.environ/YOUNG_ROUTER_OPENCODE2DSH_BASE\n"
+                "    api_base: os.environ/YOUNG_ROUTER_OUR_FREE_MODEL_BASE\n"
                 "    api_keys:\n"
                 "      - name: our-free-model-local\n"
-                "        value: os.environ/YOUNG_ROUTER_OPENCODE2DSH_KEY\n"
-                "    x-young-router-provider-auth: {kind: opencode2dsh_login, credential_ref: configured}\n"
+                "        value: os.environ/YOUNG_ROUTER_OUR_FREE_MODEL_KEY\n"
+                "    x-young-router-provider-auth: {kind: our_free_model_login, credential_ref: configured}\n"
                 "model_list:\n"
                 "  - model_name: ours-model\n"
-                "    litellm_params: {model: openai/model, api_base: *ours, api_key: os.environ/YOUNG_ROUTER_OPENCODE2DSH_KEY}\n"
+                "    litellm_params: {model: openai/model, api_base: *ours, api_key: os.environ/YOUNG_ROUTER_OUR_FREE_MODEL_KEY}\n"
                 "    model_info: {provider: ours}\n",
                 encoding="utf-8",
             )
@@ -707,7 +720,7 @@ class OpenCode2DSHStoreTests(unittest.TestCase):
                 "LITELLM_CONFIG_FILE": str(config_path),
             }
             with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(
-                opencode2dsh, "OpenCode2DSHRuntime", lambda root, settings=None: runtime
+                our_free_model, "OurFreeModelRuntime", lambda root, settings=None: runtime
             ), mock.patch.object(CoreStore, "_set_service_from_result", lambda *args, **kwargs: None):
                 store = CoreStore.with_default_domains(
                     runtime_root=root,
@@ -727,7 +740,7 @@ class OpenCode2DSHStoreTests(unittest.TestCase):
                 "LITELLM_CONFIG_FILE": str(config_path),
             }
             with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(
-                opencode2dsh, "OpenCode2DSHRuntime", lambda root, settings=None: runtime
+                our_free_model, "OurFreeModelRuntime", lambda root, settings=None: runtime
             ), mock.patch.object(CoreStore, "_set_service_from_result", lambda *args, **kwargs: None):
                 store = CoreStore.with_default_domains(
                     runtime_root=root,
@@ -751,7 +764,7 @@ class OpenCode2DSHStoreTests(unittest.TestCase):
             metadata_path=root / "core-state.json",
             domains=[],
             service_handlers={},
-            opencode2dsh_runtime=runtime,
+            our_free_model_runtime=runtime,
         )
         store.shutdown()
         self.assertEqual(runtime.stopped, 1)
@@ -779,54 +792,59 @@ class OpenCode2DSHStoreTests(unittest.TestCase):
                 pass
 
         controller.attach_workbuddy(
-            Runtime({opencode2dsh.API_KEY_ENV[opencode2dsh.OPENCODE2DSH_PROVIDER]: "wb"})
+            Runtime({our_free_model.API_KEY_ENV[our_free_model.OUR_FREE_MODEL_PROVIDER]: "wb"})
         )
-        controller.attach_opencode2dsh(
-            Runtime({opencode2dsh.API_BASE_ENV[opencode2dsh.OPENCODE2DSH_PROVIDER]: "http://x"})
+        controller.attach_our_free_model(
+            Runtime({our_free_model.API_BASE_ENV[our_free_model.OUR_FREE_MODEL_PROVIDER]: "http://x"})
         )
         merged = controller._managed_worker_environment(autostart=False)
         self.assertEqual(
-            merged[opencode2dsh.API_KEY_ENV[opencode2dsh.OPENCODE2DSH_PROVIDER]], "wb"
+            merged[our_free_model.API_KEY_ENV[our_free_model.OUR_FREE_MODEL_PROVIDER]], "wb"
         )
         self.assertEqual(
-            merged[opencode2dsh.API_BASE_ENV[opencode2dsh.OPENCODE2DSH_PROVIDER]], "http://x"
+            merged[our_free_model.API_BASE_ENV[our_free_model.OUR_FREE_MODEL_PROVIDER]], "http://x"
         )
 
 
-class OpenCode2DSHAdapterTests(unittest.TestCase):
+class OurFreeModelAdapterTests(unittest.TestCase):
     def test_the_staged_root_and_references_are_named_after_the_integration(self) -> None:
-        self.assertEqual(opencode2dsh.staged_root().name, "opencode2dsh")
-        self.assertEqual(opencode2dsh.load_root().name, "opencode2dsh")
-        esbuild = opencode2dsh.load_root() / "node_modules" / ".bin" / "esbuild"
+        self.assertEqual(our_free_model.staged_root().name, "our-free-model")
+        self.assertEqual(our_free_model.load_root().name, "our-free-model")
+        esbuild = our_free_model.load_root() / "node_modules" / ".bin" / "esbuild"
         self.assertEqual(
-            opencode2dsh.upstream_environment(),
+            our_free_model.upstream_environment(),
             {"ESBUILD_BINARY_PATH": str(esbuild)} if esbuild.is_file() else {},
         )
-        self.assertEqual(opencode2dsh.worker_path().name, "opencode2dsh_worker.mjs")
+        self.assertEqual(our_free_model.worker_path().name, "our_free_model_worker.mjs")
         self.assertEqual(
-            opencode2dsh.api_base_reference("opencode2dsh"),
-            "os.environ/YOUNG_ROUTER_OPENCODE2DSH_BASE",
+            our_free_model.api_base_reference("our-free-model"),
+            "os.environ/YOUNG_ROUTER_OUR_FREE_MODEL_BASE",
         )
         self.assertEqual(
-            opencode2dsh.api_key_reference("opencode2dsh"),
-            "os.environ/YOUNG_ROUTER_OPENCODE2DSH_KEY",
+            our_free_model.api_key_reference("our-free-model"),
+            "os.environ/YOUNG_ROUTER_OUR_FREE_MODEL_KEY",
         )
+        # The lane has exactly one spelling, and an unknown id is refused rather
+        # than resolved to a reference nothing publishes.
+        for unknown in ("opencode2dsh", "workbuddy", ""):
+            with self.assertRaises(ValueError):
+                our_free_model.api_base_reference(unknown)
         with self.assertRaises(ValueError):
-            opencode2dsh.validated_provider("workbuddy")
+            our_free_model.validated_provider("workbuddy")
 
     def test_available_requires_the_staged_manifest_and_worker(self) -> None:
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
-        saved = os.environ.get("YOUNG_ROUTER_OPENCODE2DSH_DIR")
+        saved = os.environ.get("YOUNG_ROUTER_OUR_FREE_MODEL_DIR")
         saved_source = os.environ.get("YOUNG_ROUTER_OUR_FREE_MODEL_SOURCE_DIR")
-        os.environ["YOUNG_ROUTER_OPENCODE2DSH_DIR"] = directory.name
+        os.environ["YOUNG_ROUTER_OUR_FREE_MODEL_DIR"] = directory.name
         os.environ["YOUNG_ROUTER_OUR_FREE_MODEL_SOURCE_DIR"] = directory.name
 
         def restore() -> None:
             if saved is None:
-                os.environ.pop("YOUNG_ROUTER_OPENCODE2DSH_DIR", None)
+                os.environ.pop("YOUNG_ROUTER_OUR_FREE_MODEL_DIR", None)
             else:
-                os.environ["YOUNG_ROUTER_OPENCODE2DSH_DIR"] = saved
+                os.environ["YOUNG_ROUTER_OUR_FREE_MODEL_DIR"] = saved
             if saved_source is None:
                 os.environ.pop("YOUNG_ROUTER_OUR_FREE_MODEL_SOURCE_DIR", None)
             else:
@@ -834,22 +852,22 @@ class OpenCode2DSHAdapterTests(unittest.TestCase):
 
         self.addCleanup(restore)
         staged = Path(directory.name)
-        self.assertFalse(opencode2dsh.available())
+        self.assertFalse(our_free_model.available())
         (staged / "package.json").write_text("{}", encoding="utf-8")
-        saved_worker = os.environ.get("YOUNG_ROUTER_OPENCODE2DSH_WORKER")
-        worker = staged / "opencode2dsh_worker.mjs"
-        os.environ["YOUNG_ROUTER_OPENCODE2DSH_WORKER"] = str(worker)
-        self.assertFalse(opencode2dsh.available())
+        saved_worker = os.environ.get("YOUNG_ROUTER_OUR_FREE_MODEL_WORKER")
+        worker = staged / "our_free_model_worker.mjs"
+        os.environ["YOUNG_ROUTER_OUR_FREE_MODEL_WORKER"] = str(worker)
+        self.assertFalse(our_free_model.available())
         worker.write_text("", encoding="utf-8")
         try:
-            self.assertTrue(opencode2dsh.available())
+            self.assertTrue(our_free_model.available())
             (staged / "package.json").unlink()
-            self.assertFalse(opencode2dsh.available())
+            self.assertFalse(our_free_model.available())
         finally:
             if saved_worker is None:
-                os.environ.pop("YOUNG_ROUTER_OPENCODE2DSH_WORKER", None)
+                os.environ.pop("YOUNG_ROUTER_OUR_FREE_MODEL_WORKER", None)
             else:
-                os.environ["YOUNG_ROUTER_OPENCODE2DSH_WORKER"] = saved_worker
+                os.environ["YOUNG_ROUTER_OUR_FREE_MODEL_WORKER"] = saved_worker
 
     def test_runtime_settings_reach_the_bridge_only_when_committed(self) -> None:
         from young_router.core.domains.runtime import RuntimeSettingsDomain
@@ -884,5 +902,304 @@ class OpenCode2DSHAdapterTests(unittest.TestCase):
             self.assertEqual(bridge.stops, 1)
 
 
+class LaneChannelTests(unittest.TestCase):
+    """A roster is served from several upstreams, and the picker has to say so.
+
+    The gateway's ``/v1/models`` is an OpenAI-shaped list: every row answers
+    ``owned_by: 'our-free-model'`` whatever producer actually serves it, so the
+    wizard showed 28 models from two upstreams under one heading.  An id cannot
+    recover the producer either — ``big-pickle`` is the anonymous lane and
+    ``kilo-auto/free`` is Kilo, and both are just ids — so the upstream's own
+    catalog ``channel`` tag is carried through instead.
+    """
+
+    def test_the_anonymous_lane_is_an_answer_not_a_missing_one(self) -> None:
+        """The free lane names no channel, and that must survive the bridge.
+
+        Reporting it as absent would let a consumer drop those rows into
+        whichever named producer happened to sort first, which is the flat list
+        this exists to prevent.
+        """
+
+        self.assertEqual(
+            {"big-pickle": "", "kilo-auto/free": "kilo"},
+            our_free_model._channel_membership(
+                {"big-pickle": "", "kilo-auto/free": "kilo"}
+            ),
+        )
+
+    def test_an_unreadable_answer_states_no_producer(self) -> None:
+        for value in (None, [], "kilo", 7):
+            self.assertEqual({}, our_free_model._channel_membership(value))
+
+    def test_a_row_without_an_id_is_dropped(self) -> None:
+        self.assertEqual(
+            {"kilo-auto/free": "kilo"},
+            our_free_model._channel_membership({"": "kilo", "kilo-auto/free": "kilo"}),
+        )
+
+    def test_the_catalog_document_carries_the_producer_beside_the_routes(self) -> None:
+        """One read states both splits, because a row belongs to both.
+
+        ``routes`` answers "can this egress use it"; ``channels`` answers "who
+        serves it".  A picker that had to make two reads could show the two
+        answers from two different catalogs.
+        """
+
+        runtime = mock.Mock()
+        runtime._request.return_value = {
+            "ok": True,
+            "models": [{"id": "big-pickle"}, {"id": "kilo-auto/free"}],
+            "routes": {"our-free-model": ["big-pickle", "kilo-auto/free"]},
+            "channels": {"big-pickle": "", "kilo-auto/free": "kilo"},
+        }
+        runtime._process = mock.Mock(poll=lambda: None)
+        document = our_free_model.OurFreeModelRuntime.models(runtime)
+        self.assertEqual(
+            {"big-pickle": "", "kilo-auto/free": "kilo"}, document["channels"]
+        )
+        self.assertEqual(
+            {"our-free-model": ["big-pickle", "kilo-auto/free"]}, document["routes"]
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class LaneNameCollisionTests(unittest.TestCase):
+    """Two producers, one model, one public name is not a usable roster.
+
+    The roster really does carry the same model twice — the anonymous lane calls
+    it ``nemotron-3.5-super-vl-free`` and Kilo calls it
+    ``nvidia/nemotron-3.5-super-vl:free``.  The ids differ, so an id-keyed import
+    keeps both, and the user then sees two rows they cannot tell apart and two
+    LiteLLM deployments sharing one public name.
+    """
+
+    def test_a_colliding_name_states_its_producer(self) -> None:
+        self.assertEqual(
+            "nemotron-3.5-super-vl-free (kilo)",
+            ProvidersModelsDomain._unique_lane_name(
+                "nemotron-3.5-super-vl-free",
+                {"nemotron-3.5-super-vl-free": "kilo"},
+                {"nemotron-3.5-super-vl-free"},
+            ),
+        )
+
+    def test_an_unclaimed_name_is_left_exactly_as_the_catalog_spells_it(self) -> None:
+        """Renaming on import is the user's decision, not the importer's."""
+
+        self.assertEqual(
+            "weird-vendor/model:free",
+            ProvidersModelsDomain._unique_lane_name(
+                "weird-vendor/model:free", {"weird-vendor/model:free": "kilo"}, set()
+            ),
+        )
+
+    def test_a_row_with_no_producer_gets_a_counted_suffix(self) -> None:
+        # The anonymous lane states no producer.  Borrowing one would file the
+        # row under a source it does not come from, and returning the id would
+        # hand back the very name that was taken.
+        self.assertEqual(
+            "big-pickle-free (2)",
+            ProvidersModelsDomain._unique_lane_name(
+                "big-pickle-free", {"big-pickle-free": ""}, {"big-pickle-free"}
+            ),
+        )
+
+    def test_a_producer_tag_that_is_also_taken_falls_back_further(self) -> None:
+        self.assertEqual(
+            "x-free (3)",
+            ProvidersModelsDomain._unique_lane_name(
+                "x-free", {"x-free": "kilo"}, {"x-free", "x-free (kilo)", "x-free (2)"}
+            ),
+        )
+
+
+class ChannelProviderSplitTests(unittest.TestCase):
+    """One provider per upstream channel, and none of them guesses a wire.
+
+    A channel decides two things about a row that a provider row is the only
+    thing in this app able to state: which surface it answers on, and which
+    window it accepts.  Sharing one provider across three channels forced every
+    row onto one surface, and the rows that answered on the other were reported
+    as "no such protocol" -- a protocol they never offered.
+    """
+
+    def _domain(self, runtime):
+        directory = tempfile.TemporaryDirectory()
+        root = Path(directory.name)
+        config = root / "config.yaml"
+        config.write_text("providers: {}\nmodel_list: []\n", encoding="utf-8")
+        domain = ProvidersModelsDomain(
+            config, auth_manager=ProviderAuthManager(root), our_free_model=runtime
+        )
+        return directory, domain, config
+
+    def _add_every_channel(self, domain) -> None:
+        for provider_id in our_free_model.OUR_FREE_MODEL_PROVIDERS:
+            domain.dispatch(
+                "service_provider.add",
+                {
+                    "kind": "our_free_model_login",
+                    "name": our_free_model.OUR_FREE_MODEL_DISPLAY_NAMES[provider_id],
+                },
+            )
+
+    def test_every_channel_gets_its_own_provider_with_only_its_own_rows(self) -> None:
+        directory, domain, _config = self._domain(ChannelRuntime())
+        with directory:
+            self._add_every_channel(domain)
+            providers = {p["name"]: p for p in domain.snapshot()["providers"]}
+            self.assertEqual(
+                sorted(providers),
+                sorted(our_free_model.OUR_FREE_MODEL_DISPLAY_NAMES.values()),
+            )
+            listed = {
+                name: [m["model_name"] for m in provider["models"]]
+                for name, provider in providers.items()
+            }
+            # Each row appears under the channel that serves it, exactly once.
+            self.assertEqual(
+                listed[our_free_model.OUR_FREE_MODEL_DISPLAY_NAMES[our_free_model.OUR_FREE_MODEL_PROVIDER]],
+                ["big-pickle"],
+            )
+            self.assertEqual(
+                listed[our_free_model.OUR_FREE_MODEL_DISPLAY_NAMES[our_free_model.OUR_FREE_MODEL_KILO_PROVIDER]],
+                ["kilo-auto/free"],
+            )
+            self.assertEqual(
+                listed[our_free_model.OUR_FREE_MODEL_DISPLAY_NAMES[our_free_model.OUR_FREE_MODEL_EAC_PROVIDER]],
+                ["eac-model"],
+            )
+
+    def test_each_route_states_the_surface_and_window_its_channel_uses(self) -> None:
+        directory, domain, _config = self._domain(ChannelRuntime())
+        with directory:
+            self._add_every_channel(domain)
+            routes = {}
+            for provider in domain.snapshot()["providers"]:
+                for model in provider["models"]:
+                    routes[model["model_name"]] = (model, provider)
+
+            # The anonymous lane's row answers on Chat Completions: pinning it
+            # to Responses is what made the probe report a missing protocol.
+            model, _ = routes["big-pickle"]
+            self.assertEqual(model["upstream_url_surface"], "openai/chat")
+            # The stated window is the group's declaration, so the public model
+            # reports the upstream's number rather than the unknown fallback.
+            self.assertEqual(model["max_input_tokens"], 200_000)
+
+            model, _ = routes["kilo-auto/free"]
+            self.assertEqual(model["upstream_url_surface"], "openai/chat")
+            self.assertEqual(model["max_input_tokens"], 131_072)
+
+            # Kilo's own row states a different number, and it is kept whole:
+            # one channel's window is not another's.
+            model, _ = routes["eac-model"]
+            self.assertEqual(model["max_input_tokens"], 1_048_576)
+
+
+class ChannelRuntime(StubRuntime):
+    """A lane that serves three channels, one row each."""
+
+    ROWS = [
+        {"id": "big-pickle", "name": "big-pickle"},
+        {"id": "kilo-auto/free", "name": "kilo-auto/free"},
+        {"id": "eac-model", "name": "eac-model"},
+    ]
+
+    def models(self, provider=our_free_model.OUR_FREE_MODEL_PROVIDER, *, refresh=False):  # noqa: D102
+        return {
+            "available": True,
+            "detail": "",
+            "source": "adapter",
+            "models": [dict(row) for row in self.ROWS],
+            "channels": {"big-pickle": "", "kilo-auto/free": "kilo", "eac-model": "eac"},
+            "wires": {"big-pickle": "chat", "kilo-auto/free": "chat", "eac-model": "chat"},
+            "windows": {"big-pickle": 200_000, "kilo-auto/free": 131_072, "eac-model": 1_048_576},
+            "status": self.provider_status(provider),
+        }
+
+
+class StatedWindowIsDisplayedTests(unittest.TestCase):
+    """The window the pane shows is the group's own, not the registry's guess.
+
+    The projection used ``default_record_for``, which resolves registry metadata
+    while *ignoring* the user's declaration.  An imported route declares the
+    window its upstream stated, so the pane displayed the unknown-model fallback
+    (272,000) for a row whose own catalog entry said 1,048,576 -- the number was
+    in the document and the pane read around it.
+    """
+
+    def test_an_imported_window_reaches_the_pane(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        with directory:
+            root = Path(directory.name)
+            config = root / "config.yaml"
+            config.write_text("providers: {}\nmodel_list: []\n", encoding="utf-8")
+            domain = ProvidersModelsDomain(
+                config,
+                auth_manager=ProviderAuthManager(root),
+                our_free_model=ChannelRuntime(),
+            )
+            for provider_id in our_free_model.OUR_FREE_MODEL_PROVIDERS:
+                domain.dispatch(
+                    "service_provider.add",
+                    {
+                        "kind": "our_free_model_login",
+                        "name": our_free_model.OUR_FREE_MODEL_DISPLAY_NAMES[provider_id],
+                    },
+                )
+            domain.apply()
+            # The projection reads the saved document, so it is taken after the
+            # write, the same way a pane sees it.
+            domain.reload()
+            contexts = domain.snapshot()["model_contexts"]
+            self.assertEqual(contexts["big-pickle"]["context_window"], 200_000)
+            self.assertEqual(contexts["kilo-auto/free"]["context_window"], 131_072)
+            self.assertEqual(contexts["eac-model"]["context_window"], 1_048_576)
+
+
+class AddOneChannelTests(unittest.TestCase):
+    """Adding a channel adds that channel, and nothing else.
+
+    The channels are parallel entries the user picks from, not a bundle: one
+    login reaches all three, but a user who wants only Kilo must be able to add
+    only Kilo, and a user who adds one thing must not find three rows.
+    """
+
+    def _domain(self):
+        directory = tempfile.TemporaryDirectory()
+        root = Path(directory.name)
+        config = root / "config.yaml"
+        config.write_text("providers: {}\nmodel_list: []\n", encoding="utf-8")
+        domain = ProvidersModelsDomain(
+            config, auth_manager=ProviderAuthManager(root), our_free_model=ChannelRuntime()
+        )
+        return directory, domain
+
+    def test_adding_kilo_adds_only_kilo(self) -> None:
+        directory, domain = self._domain()
+        with directory:
+            domain.dispatch(
+                "service_provider.add",
+                {"kind": "our_free_model_login", "name": our_free_model.OUR_FREE_MODEL_DISPLAY_NAMES[our_free_model.OUR_FREE_MODEL_KILO_PROVIDER]},
+            )
+            providers = domain.snapshot()["providers"]
+            self.assertEqual(len(providers), 1)
+            self.assertEqual(
+                providers[0]["name"],
+                our_free_model.OUR_FREE_MODEL_DISPLAY_NAMES[our_free_model.OUR_FREE_MODEL_KILO_PROVIDER],
+            )
+            self.assertEqual([m["model_name"] for m in providers[0]["models"]], ["kilo-auto/free"])
+
+    def test_the_default_name_addresses_the_anonymous_lane(self) -> None:
+        directory, domain = self._domain()
+        with directory:
+            domain.dispatch("service_provider.add", {"kind": "our_free_model_login"})
+            providers = domain.snapshot()["providers"]
+            self.assertEqual(len(providers), 1)
+            self.assertEqual(providers[0]["name"], our_free_model.OUR_FREE_MODEL_DISPLAY_NAMES[our_free_model.OUR_FREE_MODEL_PROVIDER])
+            self.assertEqual([m["model_name"] for m in providers[0]["models"]], ["big-pickle"])

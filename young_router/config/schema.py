@@ -33,17 +33,11 @@ def _positive_int(value: Any) -> int | None:
 
 
 def _default_config_yaml() -> pathlib.Path:
-    config_file = os.environ.get("LITELLM_CONFIG_FILE", "").strip()
-    if config_file:
-        return pathlib.Path(config_file).expanduser()
+    # The editor used to name ``<root>/config.yaml`` while the provider pane
+    # wrote ``<root>/.litellm-runtime/config.yaml``.  One resolver decides now.
+    from ..config_paths import provider_config_path
 
-    runtime_root = os.environ.get("LITELLM_RUNTIME_ROOT", "").strip()
-    if not runtime_root:
-        runtime_root = os.environ.get("YOUNG_ROUTER_HOME", "").strip()
-    if runtime_root:
-        return pathlib.Path(runtime_root).expanduser() / "config.yaml"
-
-    return pathlib.Path.home() / ".young-router" / "config.yaml"
+    return provider_config_path()
 
 
 CONFIG_YAML = _default_config_yaml()
@@ -122,8 +116,19 @@ PROVIDER_AUTH_KINDS = {
     "claude_login",
     "workbuddy_login",
     "workbuddy_ai_login",
-    "opencode2dsh_login",
+    "our_free_model_login",
 }
+
+#: Provider authentication kinds this build no longer writes, mapped to the one
+#: that replaced them.
+#:
+#: Read this as a *validation* rule, not a migration: a kind outside a strict
+#: whitelist fails the whole document, so renaming one identifier made every
+#: installation written by the previous build unreadable — the app refused its
+#: own configuration and the affected provider simply vanished from the list.
+#: Accepting the old spelling and answering with the current one keeps such a
+#: document loadable; the panes show the new name, and the next save stores it.
+RETIRED_PROVIDER_AUTH_KINDS = {"opencode2dsh_login": "our_free_model_login"}
 MODEL_CATALOG_MODES = {"independent", "relay_linked"}
 MODEL_ORDER_MODES = {"manual", "relay_multiplier"}
 RANDOM_DEPLOYMENT_ID_RE = re.compile(r"^[0-9a-f]{8}$")
@@ -356,7 +361,8 @@ def _provider_auth(value: Any, *, required: bool = False) -> dict[str, str]:
         return {"kind": "api_key"}
     if not isinstance(value, dict) or set(value).difference({"kind", "credential_ref"}):
         raise ValueError("Provider authentication is invalid")
-    kind = value.get("kind", "api_key")
+    stored = value.get("kind", "api_key")
+    kind = RETIRED_PROVIDER_AUTH_KINDS.get(stored, stored) if isinstance(stored, str) else stored
     if not isinstance(kind, str) or kind not in PROVIDER_AUTH_KINDS:
         raise ValueError("Provider authentication is invalid")
     credential_ref = _menu_metadata_text(

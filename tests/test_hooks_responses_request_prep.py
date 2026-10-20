@@ -4876,13 +4876,17 @@ class HookResponsesToolOutputReplayWindowTests(HookTestCase):
         # The newest record survives whole, so the model still works from it.
         self.assertEqual(outputs[-1]["output"], "x" * 30_000)
 
-    def test_a_dropped_output_leaves_no_incomplete_tool_record(self) -> None:
-        """A call whose output was elided is rewritten with it.
+    def test_a_dropped_output_keeps_its_call_arguments_verbatim(self) -> None:
+        """An emptied record leaves the call that introduced it untouched.
 
-        Keeping the call and dropping the record it introduced is exactly the
-        incomplete tool record the gateway rejects, and the client replays its
-        corrected transcript back to us on the next turn, so the position stays
-        wrong for the rest of the thread.
+        The replay is the model's own few-shot example of how to call a tool.
+        Rewriting an emptied ``view_image`` call's arguments into
+        ``{"elided": "[N characters elided: ...]"}`` therefore taught the
+        model to emit that exact shape: Codex's router answered
+        ``failed to parse function arguments: missing field `path``` on 233
+        calls in one thread, because the placeholder replays every turn.  The
+        output note already says the payload is gone, so the call keeps the
+        arguments it was issued with and the pair stays complete.
         """
 
         hooks, _ = load_hook_module()
@@ -4894,18 +4898,118 @@ class HookResponsesToolOutputReplayWindowTests(HookTestCase):
         self.assertIsNotNone(updated)
         assert updated is not None
         items = updated["input"]
+        elided_calls = 0
         for index, item in enumerate(items):
             if item["type"] != "function_call":
                 continue
             output = items[index + 1]
             self.assertEqual(output["type"], "function_call_output")
+            # Every call still names its own arguments, elided or not.
+            self.assertEqual(item["arguments"], '{"cmd":"ls"}')
+            self.assertEqual(item["call_id"], output["call_id"])
             if output["output"] == "x" * 30_000:
                 continue
-            self.assertIn("elided", item["arguments"])
-            # Identity, name and namespace travel with the placeholder.
-            self.assertEqual(item["call_id"], output["call_id"])
-            self.assertEqual(item["name"], "exec_command")
-            self.assertEqual(item["namespace"], "functions")
+            elided_calls += 1
+            # The note belongs to the output only.
+            self.assertIn("elided", output["output"][0]["text"])
+        self.assertTrue(elided_calls)
+
+    def test_a_view_image_output_is_elided_without_breaking_its_call(self) -> None:
+        """The ``view_image`` shape that poisoned a real Codex thread.
+
+        Its call carries ``{"path": ..., "detail": ...}`` and its output is
+        one inline image.  The elision replaced the output with its note and,
+        in the same pass, replaced the call's arguments with the note object,
+        so the replayed call no longer parsed as a ``view_image`` call and the
+        model copied the broken shape on the next turn.  The call must keep its
+        path and detail exactly as issued.
+        """
+
+        hooks, _ = load_hook_module()
+        # The siblings stay under the per-record floor, so the oversized image
+        # is the one record this window empties.
+        self.set_env(hooks._HISTORY_TOOL_OUTPUT_KEPT_CHARS_ENV, "60_000")
+        arguments = '{"path":"/tmp/shot.png","detail":"original"}'
+        request = {
+            "call_type": "aresponses",
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+            },
+            "input": [
+                {
+                    "type": "function_call",
+                    "id": "fc_view",
+                    "name": "view_image",
+                    "namespace": "functions",
+                    "arguments": arguments,
+                    "call_id": "call_view",
+                },
+                {
+                    "type": "function_call_output",
+                    "id": "fco_view",
+                    "call_id": "call_view",
+                    "output": [
+                        {
+                            "type": "input_image",
+                            "image_url": "data:image/png;base64," + ("C" * 150_000),
+                        }
+                    ],
+                },
+            ]
+            # Sibling records stay under the per-record floor, so the oversized
+            # image is the one record this window empties.
+            + sum(
+                (
+                    [
+                        {
+                            "type": "function_call",
+                            "id": f"fc_{index}",
+                            "name": "exec_command",
+                            "namespace": "functions",
+                            "arguments": '{"cmd":"ls"}',
+                            "call_id": f"call_{index}",
+                        },
+                        {
+                            "type": "function_call_output",
+                            "id": f"fco_{index}",
+                            "call_id": f"call_{index}",
+                            "output": "x" * 15_000,
+                        },
+                    ]
+                    for index in range(6)
+                ),
+                [],
+            ),
+        }
+
+        updated = hooks._with_elided_oversized_tool_outputs(request)
+
+        self.assertIsNotNone(updated)
+        assert updated is not None
+        view_call = updated["input"][0]
+        self.assertEqual(view_call["arguments"], arguments)
+        self.assertEqual(view_call["name"], "view_image")
+        # Its own output still carries the note rather than the image bytes.
+        output = updated["input"][1]["output"]
+        self.assertIn("elided", output[0]["text"])
+        self.assertNotIn("data:image/png", json.dumps(output, ensure_ascii=False))
+
+    def test_no_elided_placeholder_reaches_a_replayed_call(self) -> None:
+        """Nothing this pass writes into a call may confuse the tool schema."""
+
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._HISTORY_TOOL_OUTPUT_KEPT_CHARS_ENV, "60_000")
+        request = self._request(pairs=8, payload_chars=30_000)
+
+        updated = hooks._with_elided_oversized_tool_outputs(request)
+
+        self.assertIsNotNone(updated)
+        assert updated is not None
+        for item in updated["input"]:
+            if not item["type"].endswith("_call"):
+                continue
+            self.assertNotIn("elided", item.get("arguments") or "")
+            self.assertNotIn("characters elided", item.get("input") or "")
 
     def test_a_history_that_fits_is_left_byte_for_byte(self) -> None:
         hooks, _ = load_hook_module()

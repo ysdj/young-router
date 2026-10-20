@@ -25,7 +25,7 @@ New-Item -ItemType Directory -Force -Path $StagingCache | Out-Null
 $PiPackage = Join-Path $StagingCache "pi-web-access"
 $VeridropWork = Join-Path $StagingCache "veridrop"
 $WorkBuddyConnectWork = Join-Path $StagingCache "workbuddy-connect"
-$OpenCode2DshWork = Join-Path $StagingCache "opencode2dsh"
+$OurFreeModelWork = Join-Path $StagingCache "our-free-model"
 $DshVisionRouterWork = Join-Path $StagingCache "dsh-vision-router"
 
 function Copy-CoreSource {
@@ -60,10 +60,10 @@ try {
   $WorkBuddyConnectUpdater = Join-Path $ProjectRoot "scripts\update_workbuddy_connect.py"
   & uv run --no-project --python 3.12 $WorkBuddyConnectUpdater --output $WorkBuddyConnectWork
   if ($LASTEXITCODE -ne 0) { throw "Could not update the bundled dsh-workbuddy-connect package." }
-  # The existing OpenCode provider stages dsh-our-free-model's upstream sources.
-  $OpenCode2DshUpdater = Join-Path $ProjectRoot "scripts\update_opencode2dsh.py"
-  & uv run --no-project --python 3.12 $OpenCode2DshUpdater --output $OpenCode2DshWork
-  if ($LASTEXITCODE -ne 0) { throw "Could not update the bundled dsh-our-free-model package." }
+  # The Our Free Model lane stages the upstream package's sources.
+  $OurFreeModelUpdater = Join-Path $ProjectRoot "scripts\update_our_free_model.py"
+  & uv run --no-project --python 3.12 $OurFreeModelUpdater --output $OurFreeModelWork
+  if ($LASTEXITCODE -ne 0) { throw "Could not update the bundled Our Free Model package." }
   # The vision fallback routes through the staged upstream package rather than a
   # copy of its chain, so every artifact build re-resolves its latest release.
   $DshVisionRouterUpdater = Join-Path $ProjectRoot "scripts\update_dsh_vision_router.py"
@@ -82,7 +82,7 @@ try {
   Copy-CoreSource $PiPackage (Join-Path $Core "young_router\adapters\pi-web-access")
   Copy-CoreSource $VeridropWork (Join-Path $Core "young_router\adapters\veridrop")
   Copy-CoreSource $WorkBuddyConnectWork (Join-Path $Core "young_router\adapters\workbuddy-connect")
-  Copy-CoreSource $OpenCode2DshWork (Join-Path $Core "young_router\adapters\opencode2dsh")
+  Copy-CoreSource $OurFreeModelWork (Join-Path $Core "young_router\adapters\our-free-model")
   Copy-CoreSource $DshVisionRouterWork (Join-Path $Core "young_router\adapters\dsh-vision-router")
   Get-ChildItem -LiteralPath $Core -Recurse -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force
   Get-ChildItem -LiteralPath $Core -Recurse -File -Include "*.pyc", "*.pyo" | Remove-Item -Force
@@ -175,12 +175,12 @@ print('young-router-veridrop-import-ok')
   if (-not (Test-Path (Join-Path $Core "young_router\adapters\workbuddy-connect\lib\index.js"))) {
     throw "The bundled dsh-workbuddy-connect package is missing."
   }
-  if (-not (Test-Path (Join-Path $Core "young_router\adapters\opencode2dsh_worker.mjs"))) {
-    throw "The Windows build output does not contain young_router/adapters/opencode2dsh_worker.mjs."
+  if (-not (Test-Path (Join-Path $Core "young_router\adapters\our_free_model_worker.mjs"))) {
+    throw "The Windows build output does not contain young_router/adapters/our_free_model_worker.mjs."
   }
-  if (-not (Test-Path (Join-Path $Core "young_router\adapters\opencode2dsh\src\core\runtime.js")) -or
-      -not (Test-Path (Join-Path $Core "young_router\adapters\opencode2dsh\src\forward.js"))) {
-    throw "The bundled dsh-our-free-model sources are missing."
+  if (-not (Test-Path (Join-Path $Core "young_router\adapters\our-free-model\src\core\runtime.js")) -or
+      -not (Test-Path (Join-Path $Core "young_router\adapters\our-free-model\src\forward.js"))) {
+    throw "The bundled Our Free Model sources are missing."
   }
   if (-not (Test-Path (Join-Path $Core "young_router\adapters\dsh-vision-router\lib\core-primitives.js"))) {
     throw "The bundled dsh-vision-router package is missing."

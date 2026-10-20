@@ -33,7 +33,7 @@ if str(SCRIPTS) not in sys.path:
 update_common = importlib.import_module("update_common")
 pi_web_access = importlib.import_module("update_pi_web_access")
 workbuddy_connect = importlib.import_module("update_workbuddy_connect")
-opencode2dsh = importlib.import_module("update_opencode2dsh")
+our_free_model = importlib.import_module("update_our_free_model")
 dsh_vision_router = importlib.import_module("update_dsh_vision_router")
 
 
@@ -428,11 +428,11 @@ class PiWebAccessNodeStagingTests(unittest.TestCase):
         self.assertTrue(mode & 0o111, "the staged Node must stay executable")
 
 
-class OpenCode2DSHStagingTests(unittest.TestCase):
-    """The existing OpenCode provider stages dsh-our-free-model intact."""
+class OurFreeModelStagingTests(unittest.TestCase):
+    """The Our Free Model lane stages its upstream package intact."""
 
-    @mock.patch.object(opencode2dsh, "_install_peers", autospec=True)
-    @mock.patch.object(opencode2dsh, "find_npm", return_value="npm")
+    @mock.patch.object(our_free_model, "_install_peers", autospec=True)
+    @mock.patch.object(our_free_model, "find_npm", return_value="npm")
     def test_the_upstream_source_is_copied_without_a_protocol_rewrite(
         self, _find_npm: mock.Mock, install_peers: mock.Mock
     ) -> None:
@@ -440,7 +440,7 @@ class OpenCode2DSHStagingTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, temporary, ignore_errors=True)
         source = temporary / "dsh-our-free-model"
         source.mkdir()
-        for relative in opencode2dsh.REQUIRED_FILES:
+        for relative in our_free_model.REQUIRED_FILES:
             path = source / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("upstream\\n", encoding="utf-8")
@@ -450,22 +450,22 @@ class OpenCode2DSHStagingTests(unittest.TestCase):
                     "name": "dsh-our-free-model",
                     "version": "2.4.0",
                     "peerDependencies": {
-                        name: "*" for name in opencode2dsh.REQUIRED_PEERS
+                        name: "*" for name in our_free_model.REQUIRED_PEERS
                     },
                 }
             ),
             encoding="utf-8",
         )
-        output = temporary / "output" / "opencode2dsh"
+        output = temporary / "output" / "our_free_model"
 
         def install_peers_once(_command, *, npm_root, **_kwargs) -> None:
-            for name in opencode2dsh.REQUIRED_PEERS:
+            for name in our_free_model.REQUIRED_PEERS:
                 path = npm_root / "node_modules" / name
                 path.mkdir(parents=True)
                 (path / "package.json").write_text("{}", encoding="utf-8")
 
         install_peers.side_effect = install_peers_once
-        version = opencode2dsh.update(output, source_url=f"file://{source}")
+        version = our_free_model.update(output, source_url=f"file://{source}")
         original_record = (output / update_common.STAGED_RELEASE_MARKER).read_text(
             encoding="utf-8"
         )
@@ -490,11 +490,273 @@ class OpenCode2DSHStagingTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, source, ignore_errors=True)
         (source / "package.json").write_text("{}", encoding="utf-8")
         with self.assertRaises(update_common.UpdateError):
-            opencode2dsh.update(
+            our_free_model.update(
                 source.parent / "output",
                 source_url=f"file://{source}",
             )
 
+
+def _copy_fixture_to_checkout(source: Path):
+    """Stand in for the tag clone in a test that has no network."""
+
+    def clone(_source_url: str, _ref: str, destination: Path, _timeout: int) -> None:
+        shutil.copytree(source, destination, symlinks=True)
+
+    return clone
+
+
+def _install_fake_peers(_command, *, npm_root: Path, **_kwargs) -> None:
+    """The peer install a fixture stands in for: the declared peer directories."""
+
+    for name in our_free_model.REQUIRED_PEERS:
+        path = npm_root / "node_modules" / name
+        path.mkdir(parents=True)
+        (path / "package.json").write_text("{}", encoding="utf-8")
+
+
+
+class OurFreeModelReleaseResolutionTests(unittest.TestCase):
+    """Every artifact build pins the newest published release, never a branch.
+
+    ``main`` moves without a version, so a build that cloned it could not say
+    which release it had shipped and could package unreviewed work.  These
+    tests hold both halves of that: the release is resolved on every run, and a
+    lookup that cannot answer fails the build instead of falling back.
+    """
+
+    def test_a_prerelease_tag_is_never_chosen(self) -> None:
+        self.assertEqual(
+            ("v2.5.5", "2.5.5"),
+            self.tag_and_version(
+                [
+                    ("v2.5.5", "abc", False, False),
+                    ("v2.6.0-beta.1", "def", False, False),
+                    ("v3.0.0", "ghi", False, True),
+                    ("v2.5.4-macos-unofficial", "jkl", False, False),
+                ]
+            ),
+        )
+
+    def test_a_draft_release_is_never_chosen(self) -> None:
+        self.assertEqual(
+            ("v2.5.5", "2.5.5"),
+            self.tag_and_version(
+                [("v2.5.5", "abc", False, False), ("v2.6.0", "def", True, False)]
+            ),
+        )
+
+    def test_a_repository_with_no_versioned_release_resolves_nothing(self) -> None:
+        self.assertIsNone(
+            our_free_model._highest_release_candidate([("nightly", "abc", False, False)])
+        )
+
+    @staticmethod
+    def tag_and_version(tags) -> tuple[str, str] | None:
+        release = our_free_model._highest_release_candidate(tags)
+        return None if release is None else (release.tag, release.version)
+
+    def test_the_tag_list_names_the_release_and_its_commit(self) -> None:
+        """The commit is the identity, so the lookup has to carry it.
+
+        A tag can be moved and two spellings can reach one tree; the commit
+        cannot be either.  It is also what lets a repeat build answer "is this
+        the release I already hold" without cloning the release to find out.
+        """
+
+        with mock.patch.object(
+            our_free_model,
+            "_remote_tags",
+            return_value=[
+                ("v2.5.4", "aaa", False, False),
+                ("v2.5.5", "25151bab43ff28bfc0eef5a3dbec4443ecc6d2f2", False, False),
+            ],
+        ), mock.patch.object(our_free_model, "_releases_api", return_value=[]):
+            release = our_free_model.latest_release(our_free_model.SOURCE_URL)
+        self.assertEqual("v2.5.5", release.tag)
+        self.assertEqual("2.5.5", release.version)
+        self.assertEqual(
+            "25151bab43ff28bfc0eef5a3dbec4443ecc6d2f2", release.revision
+        )
+
+    def test_an_unavailable_release_api_still_resolves_from_the_tags(self) -> None:
+        # The GitHub API allows sixty anonymous reads an hour per address, so a
+        # build machine that resolves releases all day must still be able to
+        # name one.  The git remote carries the same tags without that budget.
+        with mock.patch.object(
+            our_free_model,
+            "_remote_tags",
+            return_value=[("v2.5.5", "abc", False, False)],
+        ), mock.patch.object(
+            our_free_model,
+            "_releases_api",
+            side_effect=update_common.UpdateError("HTTP Error 403: rate limit exceeded"),
+        ):
+            self.assertEqual(
+                "v2.5.5", our_free_model.latest_release(our_free_model.SOURCE_URL).tag
+            )
+
+    def test_a_release_marked_prerelease_by_the_api_is_skipped(self) -> None:
+        """A prerelease is not always spelled as one in its tag.
+
+        The tag list cannot see GitHub's prerelease mark, so the API's verdict
+        has to be able to remove a candidate the tags alone would have chosen.
+        """
+
+        with mock.patch.object(
+            our_free_model,
+            "_remote_tags",
+            return_value=[
+                ("v2.5.5", "abc", False, False),
+                ("v2.6.0", "def", False, False),
+            ],
+        ), mock.patch.object(
+            our_free_model,
+            "_releases_api",
+            return_value=[
+                ("v2.5.5", "", False, False),
+                ("v2.6.0", "", False, True),
+            ],
+        ):
+            release = our_free_model.latest_release(our_free_model.SOURCE_URL)
+        self.assertEqual("v2.5.5", release.tag)
+
+    def test_a_build_with_no_resolvable_release_fails(self) -> None:
+        """No release anywhere is a build failure, not a fallback.
+
+        Falling back to ``main`` here is exactly what let an artifact ship a
+        branch, so the failure has to surface as the staging job failing.
+        """
+
+        with mock.patch.object(
+            our_free_model,
+            "_remote_tags",
+            side_effect=update_common.UpdateError("could not resolve host"),
+        ):
+            with self.assertRaises(update_common.UpdateError) as raised:
+                our_free_model.latest_release(our_free_model.SOURCE_URL)
+        self.assertIn("could not resolve host", str(raised.exception))
+
+    def test_a_mislabelled_release_is_refused_before_it_is_staged(self) -> None:
+        """A tag whose tree declares another version is refused, not recorded.
+
+        The record is what a later build compares against, so writing a version
+        the lookup never resolved would make the next build either reinstall a
+        release it already has or trust one it does not.
+        """
+
+        source = Path(tempfile.mkdtemp(prefix="young-router-ofm-mislabelled-"))
+        self.addCleanup(shutil.rmtree, source, ignore_errors=True)
+        for relative in our_free_model.REQUIRED_FILES:
+            path = source / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("upstream\n", encoding="utf-8")
+        (source / "package.json").write_text(
+            json.dumps(
+                {
+                    "name": "dsh-our-free-model",
+                    "version": "2.5.4",
+                    "peerDependencies": {
+                        name: "*" for name in our_free_model.REQUIRED_PEERS
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        with mock.patch.object(
+            our_free_model,
+            "latest_release",
+            return_value=our_free_model.Release("v2.5.5", "2.5.5", "abc"),
+        ), mock.patch.object(
+            our_free_model, "_clone_tag", side_effect=_copy_fixture_to_checkout(source)
+        ), mock.patch.object(
+            our_free_model, "_install_peers", autospec=True
+        ) as install_peers:
+            install_peers.side_effect = _install_fake_peers
+            with self.assertRaises(update_common.UpdateError) as raised:
+                our_free_model.update(
+                    source.parent / "output",
+                    source_url="https://example.test/repo.git",
+                )
+        self.assertIn("mislabelled release", str(raised.exception))
+
+    def test_a_repeat_build_reuses_the_staged_release_without_cloning_it(self) -> None:
+        """The decision costs one `ls-remote`; the clone is the whole point.
+
+        A repeat local build fetched a 38 MB tag archive only to compute a
+        digest it then compared with the staged tree and discarded.  The commit
+        the tag points at answers the same question in about a second, so a
+        build that already holds the release must not clone at all.
+        """
+
+        output = Path(tempfile.mkdtemp(prefix="young-router-ofm-reuse-")) / "staged"
+        self.addCleanup(shutil.rmtree, output.parent, ignore_errors=True)
+        output.mkdir(parents=True, exist_ok=True)
+        update_common.record_staged_release(
+            output,
+            package_name=our_free_model.PACKAGE_NAME,
+            version="2.5.5",
+            integrity="25151bab43ff28bfc0eef5a3dbec4443ecc6d2f2",
+        )
+        for relative in our_free_model.REQUIRED_FILES:
+            path = output / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("staged\n", encoding="utf-8")
+        for name in our_free_model.REQUIRED_PEERS:
+            (output / "node_modules" / name).mkdir(parents=True)
+
+        with mock.patch.object(
+            our_free_model,
+            "latest_release",
+            return_value=our_free_model.Release(
+                "v2.5.5", "2.5.5", "25151bab43ff28bfc0eef5a3dbec4443ecc6d2f2"
+            ),
+        ), mock.patch.object(our_free_model, "_clone_tag") as clone, mock.patch.object(
+            our_free_model, "_install_peers", autospec=True
+        ) as install_peers:
+            version = our_free_model.update(output, source_url="https://example.test/repo.git")
+
+        self.assertEqual("2.5.5", version)
+        clone.assert_not_called()
+        install_peers.assert_not_called()
+
+    def test_a_moved_tag_forces_a_restage(self) -> None:
+        """Same version, different commit is a different release.
+
+        An upstream that retags an existing version has shipped different bytes
+        under the same number, and a version-only comparison would keep serving
+        the old tree forever.
+        """
+
+        output = Path(tempfile.mkdtemp(prefix="young-router-ofm-moved-")) / "staged"
+        self.addCleanup(shutil.rmtree, output.parent, ignore_errors=True)
+        output.mkdir(parents=True, exist_ok=True)
+        update_common.record_staged_release(
+            output,
+            package_name=our_free_model.PACKAGE_NAME,
+            version="2.5.5",
+            integrity="old-commit",
+        )
+        for relative in our_free_model.REQUIRED_FILES:
+            path = output / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("staged\n", encoding="utf-8")
+        for name in our_free_model.REQUIRED_PEERS:
+            (output / "node_modules" / name).mkdir(parents=True)
+
+        with mock.patch.object(
+            our_free_model,
+            "latest_release",
+            return_value=our_free_model.Release("v2.5.5", "2.5.5", "new-commit"),
+        ), mock.patch.object(
+            our_free_model, "_clone_tag"
+        ) as clone, mock.patch.object(
+            our_free_model, "_install_peers", autospec=True
+        ) as install_peers:
+            clone.side_effect = update_common.UpdateError("stop here")
+            install_peers.side_effect = _install_fake_peers
+            with self.assertRaises(update_common.UpdateError):
+                our_free_model.update(output, source_url="https://example.test/repo.git")
+        clone.assert_called_once()
 
 if __name__ == "__main__":
     unittest.main()

@@ -26,8 +26,9 @@ def _runtime_root() -> Path:
 
 
 def _runtime_config_path() -> Path:
-    configured = os.environ.get("LITELLM_CONFIG_FILE", "").strip()
-    return Path(configured).expanduser() if configured else _runtime_root() / "config.yaml"
+    from ..config_paths import provider_config_path
+
+    return provider_config_path(_runtime_root())
 
 
 def _runtime_settings_path() -> Path:

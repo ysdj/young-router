@@ -598,7 +598,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn('<Text style={styles.providerAuthStatusLabel}>{translate("providers.providerType")}</Text>', identity)
         self.assertIn('label={translate("providers.baseUrl")}', identity)
         # A login provider states the address its service gives it; a service
-        # the table names no address for (dsh-our-free-model, whose worker
+        # the table names no address for (Our Free Model, whose worker
         # binds a per-launch port) states the address Core actually holds.
         self.assertIn('isLogin ? (SERVICE_BASE_URLS[kind as ServiceID] || stringValue(provider.endpoint, stringValue(provider.api_base)))', identity)
         # No picker, no confirmation, no retarget dispatch: the whole surface

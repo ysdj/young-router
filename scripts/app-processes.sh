@@ -64,13 +64,13 @@ descendants() {
 
 orphaned_workers() {
   local app_path="$1" pid parent command
-  local worker="$app_path/Contents/Resources/Core/young_router/adapters/opencode2dsh_worker.mjs"
+  local worker="$app_path/Contents/Resources/Core/young_router/adapters/our_free_model_worker.mjs"
   # A failed install can retire an entire app bundle while its Core is still
   # starting its managed worker. The worker is then reparented before the next
   # install can capture it through the host tree. A live Core from any bundle
   # owns its own worker; every other process running this bundle's exact worker
   # script is a survivor of that bundle's retired process tree.
-  for pid in $(pgrep -f "opencode2dsh_worker\.mjs" 2>/dev/null || true); do
+  for pid in $(pgrep -f "our_free_model_worker\.mjs" 2>/dev/null || true); do
     parent="$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ')"
     command="$(ps -p "$parent" -o command= 2>/dev/null || true)"
     if [[ -n "$parent" && "$command" != *"young_router.core"* ]] \

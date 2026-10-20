@@ -3250,6 +3250,66 @@ class HookRoutingTests(HookTestCase):
             "image_generation_tool_unavailable",
         )
 
+    def test_fallback_stops_after_each_image_tool_route_rejected_it(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+
+        class FakeRouter:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [
+                    {
+                        "model_info": {
+                            "id": "route-a",
+                            "order": 1,
+                            "provider": "provider-a",
+                            "api_key_name": "key-a",
+                        },
+                        "litellm_params": {
+                            "model": "openai/route-a",
+                            "api_base": "https://route-a.example/v1",
+                        },
+                    },
+                    {
+                        "model_info": {
+                            "id": "route-b",
+                            "order": 2,
+                            "provider": "provider-b",
+                            "api_key_name": "key-b",
+                        },
+                        "litellm_params": {
+                            "model": "openai/route-b",
+                            "api_base": "https://route-b.example/v1",
+                        },
+                    },
+                ]
+
+        error = RuntimeError(
+            "invalid_request_error: unsupported tool type image_generation"
+        )
+        error.status_code = 422
+        error.failed_deployment_id = "route-b"
+        error.failed_deployment_order = 2
+        request_kwargs = {
+            "model": "default-chat",
+            "stream": True,
+            "tools": [{"type": "image_generation"}],
+            "litellm_metadata": {
+                hooks._IMAGE_GENERATION_TOOL_UNSUPPORTED_METADATA_KEY: [
+                    "id:route-a",
+                ]
+            },
+        }
+
+        entry = hooks._ordered_deployment_fallback_entry(
+            FakeRouter(),
+            error,
+            request_kwargs,
+        )
+
+        self.assertIsNone(entry)
+        self.assertTrue(
+            hooks._is_image_generation_all_deployments_unsupported_error(error)
+        )
+
     def test_account_pool_exhaustion_is_reported_as_route_capacity(self) -> None:
         hooks, _proxy_server = load_hook_module()
         error = RuntimeError("all available accounts exhausted")

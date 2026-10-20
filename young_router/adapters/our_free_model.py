@@ -1,14 +1,13 @@
-"""Bridge the existing OpenCode provider to the bundled free-model plugin.
+"""The Our Free Model lane: process lifecycle around the bundled upstream.
 
-The upstream project (https://github.com/Ebony-Vinyl/dsh-our-free-model) owns
-the OpenCode-compatible request protocol, free-model routing, model metadata,
-and loopback server. Its public core exports are imported in place by
-``opencode2dsh_worker.mjs`` and ``scripts/update_opencode2dsh.py`` stages the
-verified upstream tree for every artifact build.
+The upstream project (https://github.com/Ebony-Vinyl/dsh-our-free-model) owns the
+request protocol, the multi-producer model roster, the routing, and the loopback
+gateway.  Its public core exports are imported in place by
+``our_free_model_worker.mjs``, and ``scripts/update_our_free_model.py`` stages
+the verified release tree for every artifact build.
 
 This adapter owns only the Core-side process lifecycle and the two environment
-references the managed LiteLLM child resolves. The provider id remains
-``opencode2dsh`` so saved routes keep their identity.
+references the managed LiteLLM child resolves.
 """
 
 from __future__ import annotations
@@ -32,34 +31,78 @@ from ..core.persistence import PersistenceError, read_json
 from ..node_runtime import node_command as node_runtime_command
 
 
-OPENCODE2DSH_PROVIDER = "opencode2dsh"
-# The persisted auth-kind spelling keeps existing provider rows connected.
-OPENCODE2DSH_AUTH_KIND = "opencode2dsh_login"
-OPENCODE2DSH_AUTH_KINDS = (OPENCODE2DSH_AUTH_KIND,)
-AUTH_KIND_TO_PROVIDER = {OPENCODE2DSH_AUTH_KIND: OPENCODE2DSH_PROVIDER}
-PROVIDER_TO_AUTH_KIND = {OPENCODE2DSH_PROVIDER: OPENCODE2DSH_AUTH_KIND}
-CATALOG_AUTH_KINDS = frozenset(OPENCODE2DSH_AUTH_KINDS)
+# The provider ids a saved route addresses this lane by, and the auth kind that
+# says a provider row *is* this lane.  All of them are persisted identifiers.
+#
+# One provider per upstream channel, because a channel is not a label on a row:
+# it decides which wire the row is reached over and which window it accepts, and
+# a provider is the only unit this app pins a transport to.  Keeping one provider
+# for three channels meant every route had to share one surface, and the rows
+# that answered on another were reported as "no such protocol".
+OUR_FREE_MODEL_PROVIDER = "our-free-model"
+OUR_FREE_MODEL_KILO_PROVIDER = "our-free-model-kilo"
+OUR_FREE_MODEL_EAC_PROVIDER = "our-free-model-eac"
+OUR_FREE_MODEL_AUTH_KIND = "our_free_model_login"
+
+#: Channel tag (as the upstream catalog states it) → the provider that serves it.
+#: The anonymous free lane states no channel, which is the empty string.
+CHANNEL_TO_PROVIDER = {
+    "": OUR_FREE_MODEL_PROVIDER,
+    "kilo": OUR_FREE_MODEL_KILO_PROVIDER,
+    "eac": OUR_FREE_MODEL_EAC_PROVIDER,
+}
+PROVIDER_TO_CHANNEL = {provider: channel for channel, provider in CHANNEL_TO_PROVIDER.items()}
+OUR_FREE_MODEL_PROVIDERS = tuple(CHANNEL_TO_PROVIDER.values())
+
+#: Per-channel names, because one gateway URL serves three providers and a
+#: provider row addresses its own.  The lane's original name is kept for the
+#: anonymous channel so a document written before the split still resolves.
+_CHANNEL_ENV_SUFFIX = {
+    OUR_FREE_MODEL_PROVIDER: "",
+    OUR_FREE_MODEL_KILO_PROVIDER: "KILO_",
+    OUR_FREE_MODEL_EAC_PROVIDER: "EAC_",
+}
+API_BASE_ENV = {provider: f"YOUNG_ROUTER_OUR_FREE_MODEL_{suffix}BASE" for provider, suffix in _CHANNEL_ENV_SUFFIX.items()}
+API_KEY_ENV = {provider: f"YOUNG_ROUTER_OUR_FREE_MODEL_{suffix}KEY" for provider, suffix in _CHANNEL_ENV_SUFFIX.items()}
+
+#: Every provider row that belongs to this lane authenticates the same way: one
+#: login reaches all three channels, so the auth kind states "this is the lane",
+#: and the provider id states which of its channels the row is.
+AUTH_KIND_TO_PROVIDER = {OUR_FREE_MODEL_AUTH_KIND: OUR_FREE_MODEL_PROVIDER}
+PROVIDER_TO_AUTH_KIND = {provider: OUR_FREE_MODEL_AUTH_KIND for provider in OUR_FREE_MODEL_PROVIDERS}
+OUR_FREE_MODEL_AUTH_KINDS = (OUR_FREE_MODEL_AUTH_KIND,)
+CATALOG_AUTH_KINDS = frozenset(OUR_FREE_MODEL_AUTH_KINDS)
 CATALOG_AUTH_KIND_TO_PROVIDER = dict(AUTH_KIND_TO_PROVIDER)
 
-OPENCODE2DSH_DISPLAY_NAME = "dsh-our-free-model"
-API_BASE_ENV = {OPENCODE2DSH_PROVIDER: "YOUNG_ROUTER_OPENCODE2DSH_BASE"}
-API_KEY_ENV = {OPENCODE2DSH_PROVIDER: "YOUNG_ROUTER_OPENCODE2DSH_KEY"}
+OUR_FREE_MODEL_DISPLAY_NAME_BASE = "Our Free Model"
+OUR_FREE_MODEL_DISPLAY_NAME = "Our Free Model"
+#: One heading per channel, so the provider list itself states which channel
+#: a row is served from instead of leaving it to a tag inside the roster.
+OUR_FREE_MODEL_DISPLAY_NAMES = {
+    OUR_FREE_MODEL_PROVIDER: OUR_FREE_MODEL_DISPLAY_NAME_BASE,
+    OUR_FREE_MODEL_KILO_PROVIDER: f"{OUR_FREE_MODEL_DISPLAY_NAME_BASE} · Kilo",
+    OUR_FREE_MODEL_EAC_PROVIDER: f"{OUR_FREE_MODEL_DISPLAY_NAME_BASE} · EAC",
+}
+#: The staged upstream package, as its own manifest names it.
+UPSTREAM_PACKAGE_NAME = "dsh-our-free-model"
 API_KEY_NAME = "our-free-model-local"
 
-_OPENCODE2DSH_DIR_ENV = "YOUNG_ROUTER_OPENCODE2DSH_DIR"
-_OPENCODE2DSH_NODE_ENV = "YOUNG_ROUTER_OPENCODE2DSH_NODE"
-_OPENCODE2DSH_WORKER_ENV = "YOUNG_ROUTER_OPENCODE2DSH_WORKER"
-_OPENCODE2DSH_START_TIMEOUT_SECONDS = 45.0
-_OPENCODE2DSH_STATUS_TIMEOUT_SECONDS = 30.0
-_OPENCODE2DSH_MODELS_TIMEOUT_SECONDS = 90.0
+#: The staged upstream tree, named for the package it holds.
+_STAGED_DIRECTORY = "our-free-model"
+_DIR_ENV = "YOUNG_ROUTER_OUR_FREE_MODEL_DIR"
+_NODE_ENV = "YOUNG_ROUTER_OUR_FREE_MODEL_NODE"
+_WORKER_ENV = "YOUNG_ROUTER_OUR_FREE_MODEL_WORKER"
+_START_TIMEOUT_SECONDS = 45.0
+_STATUS_TIMEOUT_SECONDS = 30.0
+_MODELS_TIMEOUT_SECONDS = 90.0
 _SOURCE_STATE = "sourceDir"
 
 
-class OpenCode2DSHUnavailable(RuntimeError):
+class OurFreeModelUnavailable(RuntimeError):
     """The staged free-model integration cannot serve."""
 
 
-class OpenCode2DSHCatalogUnavailable(OpenCode2DSHUnavailable):
+class OurFreeModelCatalogUnavailable(OurFreeModelUnavailable):
     """The worker answers, but the remote catalog cannot be read."""
 
 
@@ -102,24 +145,31 @@ def _unlock_handle(handle: Any) -> None:
 
 
 def staged_root() -> Path:
-    configured = os.environ.get(_OPENCODE2DSH_DIR_ENV, "").strip()
+    """Where the build staged the upstream release.
+
+    The directory is the upstream package's own name, hyphenated: a hyphenated
+    directory cannot be imported, so it can never shadow ``our_free_model.py``
+    the way a same-named package directory would.
+    """
+
+    configured = os.environ.get(_DIR_ENV, "").strip()
     if configured:
         return Path(configured).expanduser()
-    return Path(__file__).with_name("opencode2dsh")
+    return Path(__file__).with_name(_STAGED_DIRECTORY)
 
 
 def worker_path() -> Path:
-    configured = os.environ.get(_OPENCODE2DSH_WORKER_ENV, "").strip()
+    configured = os.environ.get(_WORKER_ENV, "").strip()
     if configured:
         return Path(configured).expanduser()
-    return Path(__file__).with_name("opencode2dsh_worker.mjs")
+    return Path(__file__).with_name("our_free_model_worker.mjs")
 
 
 def node_command() -> str:
     return node_runtime_command(
-        env_name=_OPENCODE2DSH_NODE_ENV,
-        label=OPENCODE2DSH_DISPLAY_NAME,
-        unavailable=OpenCode2DSHUnavailable,
+        env_name=_NODE_ENV,
+        label=OUR_FREE_MODEL_DISPLAY_NAME,
+        unavailable=OurFreeModelUnavailable,
     )
 
 
@@ -167,14 +217,22 @@ def load_root() -> Path:
     ).strip()
     if configured:
         return Path(configured).expanduser()
-    configured = os.environ.get(_OPENCODE2DSH_DIR_ENV, "").strip()
+    configured = os.environ.get(_DIR_ENV, "").strip()
     if configured:
         return Path(configured).expanduser()
-    adjacent = worker_path().parent / "opencode2dsh"
+    adjacent = worker_path().parent / _STAGED_DIRECTORY
     return adjacent if (adjacent / "package.json").is_file() else staged_root()
 
 
 def api_base_reference(provider: str) -> str:
+    """The ``os.environ/`` base reference one stored provider id resolves.
+
+    A config from an older build names the legacy variable and the proxy child
+    resolves references by the name the document carries, so this answers with
+    the reference that matches the id it was given rather than always the new
+    one.  A route is therefore still startable before its document is rewritten.
+    """
+
     return f"os.environ/{API_BASE_ENV[validated_provider(provider)]}"
 
 
@@ -183,10 +241,41 @@ def api_key_reference(provider: str) -> str:
 
 
 def validated_provider(value: object) -> str:
+    """One of this lane's provider ids, as stored, or a refusal.
+
+    Every channel is its own provider, so every one of them is a valid answer.
+    The answer is the spelling that was asked about, not a normalised one: every
+    caller uses it to address a stored row or a published environment name, and
+    both of those use the stored spelling.
+    """
+
     provider = str(value or "").strip()
-    if provider != OPENCODE2DSH_PROVIDER:
-        raise ValueError("Unknown OpenCode provider")
+    if provider not in OUR_FREE_MODEL_PROVIDERS:
+        raise ValueError("Unknown Our Free Model provider")
     return provider
+
+
+def provider_for_channel(channel: object) -> str:
+    """The provider that serves one upstream channel; the lane when unnamed."""
+
+    return CHANNEL_TO_PROVIDER.get(str(channel or "").strip(), OUR_FREE_MODEL_PROVIDER)
+
+
+def provider_for_name(name: object) -> str:
+    """The channel a provider name addresses; the lane when it names none.
+
+    A channel's provider is named after the channel, so an entry the user named
+    "Our Free Model" is the anonymous lane and "Our Free Model · Kilo" is Kilo.
+    A name the user invented addresses no channel of this lane's own making, so
+    it falls back to the lane itself rather than refusing the add: naming a
+    provider is the user's to do.
+    """
+
+    wanted = str(name or "").strip().casefold()
+    for provider, label in OUR_FREE_MODEL_DISPLAY_NAMES.items():
+        if wanted == label.casefold():
+            return provider
+    return OUR_FREE_MODEL_PROVIDER
 
 
 def _route_membership(value: object) -> dict[str, list[str]]:
@@ -211,6 +300,79 @@ def _route_membership(value: object) -> dict[str, list[str]]:
     return routes
 
 
+def _wire_membership(value: object) -> dict[str, str]:
+    """The surface each row is served on, as the upstream routes it.
+
+    An imported route used to be pinned to ``openai/responses`` on the grounds
+    that the gateway serves both surfaces.  It does — but not for every row: the
+    package routes all but a couple of ids to ``/inference/v1/chat/completions``,
+    so a pinned Responses route asked an endpoint that row does not have and the
+    probe answered "no such protocol".
+
+    Only the two surface names this bridge can express are kept.  A row the
+    upstream says nothing about is absent, and the caller then keeps its own
+    default rather than reading a missing answer as Chat.
+    """
+
+    if not isinstance(value, Mapping):
+        return {}
+    wires: dict[str, str] = {}
+    for model_id, wire in value.items():
+        name = str(model_id or "").strip()
+        surface = str(wire or "").strip()
+        if not name or surface not in {"responses", "chat"}:
+            continue
+        wires[name] = surface
+    return wires
+
+
+def _window_membership(value: object) -> dict[str, int]:
+    """The context window each row states for itself, as the catalog publishes it.
+
+    Kept as the upstream's own number so a route reports the window it will
+    actually accept.  A row that states none is absent, and the caller then
+    falls back to whatever policy it would have used anyway.
+    """
+
+    if not isinstance(value, Mapping):
+        return {}
+    windows: dict[str, int] = {}
+    for model_id, window in value.items():
+        name = str(model_id or "").strip()
+        if not name or isinstance(window, bool) or not isinstance(window, int) or window <= 0:
+            continue
+        windows[name] = window
+    return windows
+
+
+def _channel_membership(value: object) -> dict[str, str]:
+    """The producer each row belongs to, as the upstream catalog states it.
+
+    The upstream serves three producers behind one gateway — the anonymous free
+    lane, the Kilo channel, and the co-paid lane — and its catalog entries carry
+    the producer in ``channel``.  The gateway's OpenAI-shaped ``/v1/models``
+    cannot express it (every row answers ``owned_by: 'our-free-model'``), and an
+    id cannot be used to recover it: ``big-pickle`` and ``kilo-auto/free`` are
+    both just ids.  This carries the upstream's own answer instead of deriving
+    one from a spelling.
+
+    The anonymous lane has no channel name.  It is reported as the empty string
+    rather than dropped, because "this row is on the lane that names no
+    producer" is an answer, and dropping it would file those rows under whatever
+    heading happened to be left.
+    """
+
+    if not isinstance(value, Mapping):
+        return {}
+    channels: dict[str, str] = {}
+    for model_id, channel in value.items():
+        name = str(model_id or "").strip()
+        if not name:
+            continue
+        channels[name] = str(channel or "").strip()
+    return channels
+
+
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.bind(("127.0.0.1", 0))
@@ -221,10 +383,10 @@ def _safe_problem(error: object) -> str:
     """One line from a worker failure, without request bodies or headers."""
 
     text = str(error or "").strip().splitlines()
-    return text[0][:800] if text else "dsh-our-free-model worker failed"
+    return text[0][:800] if text else f"{OUR_FREE_MODEL_DISPLAY_NAME} worker failed"
 
 
-class OpenCode2DSHRuntime:
+class OurFreeModelRuntime:
     """Own one worker serving the upstream's free-model runtime."""
 
     def __init__(
@@ -234,7 +396,7 @@ class OpenCode2DSHRuntime:
         settings: Mapping[str, str] | None = None,
     ) -> None:
         base = Path(runtime_root) if runtime_root is not None else Path.home() / ".young-router"
-        self.root = base / ".litellm-runtime" / OPENCODE2DSH_PROVIDER
+        self.root = base / ".litellm-runtime" / OUR_FREE_MODEL_PROVIDER
         self.root.mkdir(parents=True, exist_ok=True)
         self.settings = dict(settings or {})
         self._lock = threading.RLock()
@@ -265,7 +427,7 @@ class OpenCode2DSHRuntime:
 
         with self._lock:
             if self._process is None or self._process.poll() is not None:
-                raise OpenCode2DSHUnavailable("The dsh-our-free-model worker is not running")
+                raise OurFreeModelUnavailable(f"The {OUR_FREE_MODEL_DISPLAY_NAME} worker is not running")
             self._request("/health", timeout=2.0, authenticated=False)
             return True
 
@@ -281,8 +443,8 @@ class OpenCode2DSHRuntime:
             staged = load_root()
             manifest = staged / "package.json"
             if not manifest.is_file() or not worker_path().is_file():
-                raise OpenCode2DSHUnavailable(
-                    f"The bundled free-model integration is missing: {staged}"
+                raise OurFreeModelUnavailable(
+                    f"The bundled {OUR_FREE_MODEL_DISPLAY_NAME} package is missing: {staged}"
                 )
             port = _free_port()
             token = secrets.token_urlsafe(32)
@@ -371,8 +533,8 @@ class OpenCode2DSHRuntime:
                 worker_lock.close()
                 _unlock_handle(handoff)
                 handoff.close()
-                raise OpenCode2DSHUnavailable(
-                    f"dsh-our-free-model worker could not start: {_safe_problem(exc)}"
+                raise OurFreeModelUnavailable(
+                    f"{OUR_FREE_MODEL_DISPLAY_NAME} worker could not start: {_safe_problem(exc)}"
                 ) from exc
         self._ready_pipe = handoff
         self._worker_lock = worker_lock
@@ -381,17 +543,17 @@ class OpenCode2DSHRuntime:
     def _wait_ready(self, process: subprocess.Popen[bytes], port: int) -> None:
         handoff = self._ready_pipe
         if handoff is None:
-            raise OpenCode2DSHUnavailable("The dsh-our-free-model worker hand-off is unavailable")
-        deadline = time.monotonic() + _OPENCODE2DSH_START_TIMEOUT_SECONDS
+            raise OurFreeModelUnavailable(f"The {OUR_FREE_MODEL_DISPLAY_NAME} worker hand-off is unavailable")
+        deadline = time.monotonic() + _START_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
             # The worker creates its lease while the handoff remains held.
             worker_lock = self._worker_lock
             if worker_lock is None:
-                raise OpenCode2DSHUnavailable("The dsh-our-free-model worker hand-off was lost")
+                raise OurFreeModelUnavailable(f"The {OUR_FREE_MODEL_DISPLAY_NAME} worker hand-off was lost")
             _unlock_handle(handoff)
             handoff.flush()
             if process.poll() is not None:
-                raise OpenCode2DSHUnavailable(self._worker_failure(process, port))
+                raise OurFreeModelUnavailable(self._worker_failure(process, port))
             try:
                 _lock_handle(worker_lock, wait=False)
             except OSError:
@@ -406,10 +568,10 @@ class OpenCode2DSHRuntime:
             self._worker_lock = None
             break
         else:
-            raise OpenCode2DSHUnavailable("The dsh-our-free-model worker did not start in time")
+            raise OurFreeModelUnavailable(f"The {OUR_FREE_MODEL_DISPLAY_NAME} worker did not start in time")
         ready_path = self.root / "online.json"
         if ready_path.stat().st_mode & 0o077:
-            raise OpenCode2DSHUnavailable("The dsh-our-free-model readiness file is not private")
+            raise OurFreeModelUnavailable(f"The {OUR_FREE_MODEL_DISPLAY_NAME} readiness file is not private")
         ready = read_json(ready_path, default={})
         try:
             control_port = ready["controlPort"]
@@ -417,7 +579,7 @@ class OpenCode2DSHRuntime:
             if type(control_port) is not int or type(gateway_port) is not int:
                 raise TypeError
         except (KeyError, TypeError):
-            raise OpenCode2DSHUnavailable("The dsh-our-free-model readiness file is invalid") from None
+            raise OurFreeModelUnavailable(f"The {OUR_FREE_MODEL_DISPLAY_NAME} readiness file is invalid") from None
         self._port = control_port
         self._gateway_port = gateway_port
         handoff.close()
@@ -441,10 +603,14 @@ class OpenCode2DSHRuntime:
         if not gateway_port:
             return {}
         base = f"http://127.0.0.1:{gateway_port}"
-        return {
-            API_BASE_ENV[OPENCODE2DSH_PROVIDER]: f"{base}/v1",
-            API_KEY_ENV[OPENCODE2DSH_PROVIDER]: self._token,
-        }
+        # Three provider rows, one gateway: the channels are routing inside the
+        # package, not separate hosts, so every row publishes the same address
+        # and token under its own name.
+        values: dict[str, str] = {}
+        for provider in OUR_FREE_MODEL_PROVIDERS:
+            values[API_BASE_ENV[provider]] = f"{base}/v1"
+            values[API_KEY_ENV[provider]] = self._token
+        return values
 
     def environment_values(self) -> dict[str, str]:
         with self._lock:
@@ -491,29 +657,35 @@ class OpenCode2DSHRuntime:
     def status(self, *, refresh: bool = False) -> dict[str, Any]:
         document = self._request(
             "/control/status",
-            timeout=_OPENCODE2DSH_STATUS_TIMEOUT_SECONDS,
+            timeout=_STATUS_TIMEOUT_SECONDS,
         )
+        # One worker answers for the whole lane, so every channel row reports
+        # the same version and lane state.  Stating it per row keeps every
+        # provider in the list answering for itself instead of leaving the two
+        # that are not the original row silent.
+        state = "ready" if document.get("ok") is True else "failed"
         return {
             "providers": {
-                OPENCODE2DSH_PROVIDER: {
-                    "provider": OPENCODE2DSH_PROVIDER,
-                    "state": "ready" if document.get("ok") is True else "failed",
+                provider: {
+                    "provider": provider,
+                    "state": state,
                     **{
                         key: document[key]
                         for key in ("version", "laneState")
                         if document.get(key) is not None
                     },
                 }
+                for provider in OUR_FREE_MODEL_PROVIDERS
             }
         }
 
-    def provider_status(self, provider: str = OPENCODE2DSH_PROVIDER) -> dict[str, Any]:
+    def provider_status(self, provider: str = OUR_FREE_MODEL_PROVIDER) -> dict[str, Any]:
         validated_provider(provider)
         return dict(self.status().get("providers", {}).get(provider, {}))
 
     def models(
         self,
-        provider: str = OPENCODE2DSH_PROVIDER,
+        provider: str = OUR_FREE_MODEL_PROVIDER,
         *,
         refresh: bool = False,
     ) -> dict[str, Any]:
@@ -526,17 +698,17 @@ class OpenCode2DSHRuntime:
                 "/control/refresh" if refresh else "/control/models",
                 method="POST" if refresh else "GET",
                 body={"probe": False} if refresh else None,
-                timeout=_OPENCODE2DSH_MODELS_TIMEOUT_SECONDS,
+                timeout=_MODELS_TIMEOUT_SECONDS,
             )
         except Exception as exc:
-            raise OpenCode2DSHCatalogUnavailable("The free-model catalog is unavailable") from exc
+            raise OurFreeModelCatalogUnavailable("The free-model catalog is unavailable") from exc
         if refresh and not document.get("models"):
             document = self._request(
                 "/control/models",
-                timeout=_OPENCODE2DSH_MODELS_TIMEOUT_SECONDS,
+                timeout=_MODELS_TIMEOUT_SECONDS,
             )
         return {
-            "operation": "opencode2dsh_models",
+            "operation": "our_free_model_models",
             "provider": provider,
             "available": document.get("ok") is True,
             "source": "dsh-our-free-model",
@@ -547,6 +719,19 @@ class OpenCode2DSHRuntime:
             # each row, because a row belongs to exactly one of them and the
             # upstream decides which.
             "routes": _route_membership(document.get("routes")),
+            # Which producer serves each row.  Separate from ``routes`` because
+            # the two answer different questions: ``routes`` is the availability
+            # split the picker groups by, this is the upstream the row is
+            # actually served from.
+            "channels": _channel_membership(document.get("channels")),
+            # Which surface each row answers on.  Stated per row because the
+            # upstream routes per row: a provider-level default cannot describe
+            # a roster whose inner split is its own.
+            "wires": _wire_membership(document.get("wires")),
+            # The window each row states.  Carried beside the wires for the same
+            # reason: both are the upstream's answer about one row, and neither
+            # is derivable from the id.
+            "windows": _window_membership(document.get("windows")),
         }
 
     def _request(
@@ -563,7 +748,7 @@ class OpenCode2DSHRuntime:
             target_port = port or self._port
             token = self._token
         if not target_port:
-            raise OpenCode2DSHUnavailable("The dsh-our-free-model worker is not running")
+            raise OurFreeModelUnavailable(f"The {OUR_FREE_MODEL_DISPLAY_NAME} worker is not running")
         headers = {"Accept": "application/json"}
         if authenticated:
             headers["Authorization"] = f"Bearer {token}"
@@ -581,23 +766,23 @@ class OpenCode2DSHRuntime:
             with urlopen(request, timeout=timeout) as response:
                 parsed = json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
-            raise OpenCode2DSHUnavailable(
-                f"The dsh-our-free-model worker answered HTTP {exc.code}"
+            raise OurFreeModelUnavailable(
+                f"The {OUR_FREE_MODEL_DISPLAY_NAME} worker answered HTTP {exc.code}"
             ) from exc
         except (URLError, OSError, UnicodeDecodeError, ValueError) as exc:
-            raise OpenCode2DSHUnavailable(_safe_problem(exc)) from exc
+            raise OurFreeModelUnavailable(_safe_problem(exc)) from exc
         if not isinstance(parsed, dict):
-            raise OpenCode2DSHUnavailable("The dsh-our-free-model worker returned an invalid document")
+            raise OurFreeModelUnavailable(f"The {OUR_FREE_MODEL_DISPLAY_NAME} worker returned an invalid document")
         return parsed
 
 
 def unsupported_status() -> dict[str, Any]:
+    """Every channel row reports the same absence: one worker serves them all."""
+
     return {
         "providers": {
-            OPENCODE2DSH_PROVIDER: {
-                "provider": OPENCODE2DSH_PROVIDER,
-                "state": "missing",
-            }
+            provider: {"provider": provider, "state": "missing"}
+            for provider in OUR_FREE_MODEL_PROVIDERS
         }
     }
 
@@ -609,13 +794,22 @@ __all__ = [
     "AUTH_KIND_TO_PROVIDER",
     "CATALOG_AUTH_KINDS",
     "CATALOG_AUTH_KIND_TO_PROVIDER",
-    "OPENCODE2DSH_AUTH_KIND",
-    "OPENCODE2DSH_AUTH_KINDS",
-    "OPENCODE2DSH_DISPLAY_NAME",
-    "OPENCODE2DSH_PROVIDER",
-    "OpenCode2DSHRuntime",
-    "OpenCode2DSHCatalogUnavailable",
-    "OpenCode2DSHUnavailable",
+    "OUR_FREE_MODEL_AUTH_KIND",
+    "OUR_FREE_MODEL_AUTH_KINDS",
+    "CHANNEL_TO_PROVIDER",
+    "OUR_FREE_MODEL_DISPLAY_NAME",
+    "OUR_FREE_MODEL_DISPLAY_NAMES",
+    "OUR_FREE_MODEL_EAC_PROVIDER",
+    "OUR_FREE_MODEL_KILO_PROVIDER",
+    "OUR_FREE_MODEL_PROVIDER",
+    "OUR_FREE_MODEL_PROVIDERS",
+    "PROVIDER_TO_AUTH_KIND",
+    "PROVIDER_TO_CHANNEL",
+    "provider_for_channel",
+    "provider_for_name",
+    "OurFreeModelRuntime",
+    "OurFreeModelCatalogUnavailable",
+    "OurFreeModelUnavailable",
     "api_base_reference",
     "api_key_reference",
     "available",

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Young Router's process and control surface around dsh-our-free-model. The
+ * Young Router's process and control surface around the upstream package. The
  * upstream's public core modules own the OpenCode protocol and wire layer.
  */
 
@@ -43,7 +43,7 @@ function parseArguments(argv) {
 
 function usage() {
   process.stdout.write(
-    'usage: opencode2dsh_worker.mjs --port <n> --root <dir> --handoff <fd> --lease <fd> --entry <package.json> [--setting key=value]\n',
+    'usage: our_free_model_worker.mjs --port <n> --root <dir> --handoff <fd> --lease <fd> --entry <package.json> [--setting key=value]\n',
   )
 }
 
@@ -85,8 +85,11 @@ async function readJson(req) {
 
 /** Load the upstream sources from the staged package's root. */
 async function loadUpstream(configured) {
+  // The staged upstream tree is named for the package it holds.  The
+  // directory is hyphenated so it can never be imported as a module and shadow
+  // the adapter beside it.
   const packageFile = resolve(
-    configured || join(dirname(fileURLToPath(import.meta.url)), 'opencode2dsh', 'package.json'),
+    configured || join(dirname(fileURLToPath(import.meta.url)), 'our-free-model', 'package.json'),
   )
   const sourceRoot = dirname(packageFile)
   if (!existsSync(packageFile)) throw new Error(`the upstream package.json is missing: ${packageFile}`)
@@ -96,7 +99,12 @@ async function loadUpstream(configured) {
   const { startForwardServer } = await import(
     pathToFileURL(join(sourceRoot, 'src', 'forward.js')).href,
   )
-  return { createModelRuntime, createRuntimeStores, startForwardServer, sourceRoot, packageFile }
+  // The upstream decides a row's wire itself (`isResponsesModel`), and that
+  // decision is not derivable from the id: it is a set the package owns.  The
+  // membership below is therefore read from the same functions the adapter
+  // routes with, never re-derived from a spelling on this side.
+  const upstream = await import(pathToFileURL(join(sourceRoot, 'src', 'upstream.js')).href)
+  return { createModelRuntime, createRuntimeStores, startForwardServer, sourceRoot, packageFile, upstream }
 }
 
 /** Read the public rows from the upstream's loopback gateway. */
@@ -107,6 +115,96 @@ async function catalogueDocument(listener, token) {
   if (!response.ok) throw new Error(`the upstream model list answered HTTP ${response.status}`)
   const document = await response.json()
   return Array.isArray(document?.data) ? document.data : []
+}
+
+/**
+ * Which producer serves each row, as the upstream's own catalog states it.
+ *
+ * The gateway's `/v1/models` is an OpenAI-shaped list and says `owned_by:
+ * 'our-free-model'` for every row, which erased the one fact the picker needs:
+ * a row's ids do not identify its channel (`big-pickle` is the anonymous free
+ * lane, `kilo-auto/free` is Kilo, and both are just ids).  The upstream's
+ * catalog entries carry `channel` end to end, so this reads that field from the
+ * same runtime object the roster came from rather than inferring a producer
+ * from a spelling.
+ *
+ * A row the catalog does not carry is absent from the answer, and the caller
+ * treats that as "no channel stated" instead of guessing one.
+ */
+/**
+ * The wire each row is served on, as the upstream's own routing decides it.
+ *
+ * Every route this lane imported used to be pinned to `openai/responses`,
+ * because the gateway serves both surfaces.  Serving a surface and serving it
+ * for *this row* are different claims: the upstream routes all but a couple of
+ * ids to `/inference/v1/chat/completions`, so a pinned Responses route asked
+ * for an endpoint the row does not have and the probe reported "no such
+ * protocol" — a protocol the upstream never claimed to offer there.
+ *
+ * The answer is `'responses'` or `'chat'`, stated per id by the package's own
+ * `isResponsesModel`, so a wire change upstream reaches this side without a
+ * second table here.
+ */
+function wireMembership(upstream, runtime) {
+  try {
+    const catalog = runtime.state()?.catalog
+    if (!Array.isArray(catalog)) return {}
+    const wires = {}
+    for (const entry of catalog) {
+      if (typeof entry?.id !== 'string' || entry.id === '') continue
+      // A row that states its own wire is taken at its word: the Kilo and EAC
+      // channels carry `wire` on every row, and the package routes by that
+      // field. Only a row that states none is answered from the id set the
+      // anonymous lane routes with.
+      if (typeof entry.wire === 'string' && entry.wire !== '') wires[entry.id] = entry.wire
+      else if (typeof upstream?.isResponsesModel === 'function') wires[entry.id] = upstream.isResponsesModel(entry.id) ? 'responses' : 'chat'
+    }
+    return wires
+  } catch {
+    return {}
+  }
+}
+
+/**
+ * The window each row states for itself, as the catalog publishes it.
+ *
+ * A route's public window was resolved from the bundled registry, which does
+ * not know a free-lane id: every row therefore reported the unknown-model
+ * fallback (272,000) while the same row's catalog entry stated 1,048,576.  The
+ * upstream's number is the one the route will actually accept, so it is
+ * carried across rather than left for a lookup that cannot answer.
+ */
+function windowMembership(runtime) {
+  try {
+    const catalog = runtime.state()?.catalog
+    if (!Array.isArray(catalog)) return {}
+    const windows = {}
+    for (const entry of catalog) {
+      if (typeof entry?.id !== 'string' || entry.id === '') continue
+      if (Number.isInteger(entry.contextWindow) && entry.contextWindow > 0) windows[entry.id] = entry.contextWindow
+    }
+    return windows
+  } catch {
+    return {}
+  }
+}
+
+function channelMembership(runtime) {
+  try {
+    const catalog = runtime.state()?.catalog
+    if (!Array.isArray(catalog)) return {}
+    const channels = {}
+    for (const entry of catalog) {
+      if (typeof entry?.id !== 'string' || entry.id === '') continue
+      // `channel` is optional: the anonymous free lane is the absence of one,
+      // which is a real answer and is reported as the empty string.
+      if (entry.channel === undefined) channels[entry.id] = ''
+      else if (typeof entry.channel === 'string') channels[entry.id] = entry.channel
+    }
+    return channels
+  } catch {
+    return {}
+  }
 }
 
 async function main(argv) {
@@ -253,13 +351,13 @@ async function main(argv) {
       }
       if (req.method === 'GET' && url.pathname === '/control/models') {
         await (initialRefresh ?? Promise.resolve())
-        json(res, 200, { ok: true, models: await catalogueDocument(listener, token), routes: routeMembership() })
+        json(res, 200, { ok: true, models: await catalogueDocument(listener, token), routes: routeMembership(), channels: channelMembership(runtime), wires: wireMembership(upstream.upstream, runtime), windows: windowMembership(runtime) })
         return
       }
       if (req.method === 'POST' && url.pathname === '/control/refresh') {
         const body = await readJson(req)
         await refreshCatalog(body.probe === true)
-        json(res, 200, { ok: true, models: await catalogueDocument(listener, token), routes: routeMembership() })
+        json(res, 200, { ok: true, models: await catalogueDocument(listener, token), routes: routeMembership(), channels: channelMembership(runtime), wires: wireMembership(upstream.upstream, runtime), windows: windowMembership(runtime) })
         return
       }
       if (req.method === 'POST' && url.pathname === '/control/shutdown') {

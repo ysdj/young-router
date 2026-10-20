@@ -2132,7 +2132,7 @@ model_list:
                 "model_list:\n  - model_name: healthy\n    litellm_params:\n      model: openai/healthy\n",
                 encoding="utf-8",
             )
-            with mock.patch.dict(os.environ, {"HOME": str(root), "YOUNG_ROUTER_OPENCODE2DSH_DIR": ""}):
+            with mock.patch.dict(os.environ, {"HOME": str(root), "YOUNG_ROUTER_OUR_FREE_MODEL_DIR": ""}):
                 core = CoreStore.with_default_domains(
                     metadata_path=runtime_root / "metadata.json",
                     reset_transient_routing_state=False,

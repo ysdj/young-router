@@ -514,6 +514,7 @@ export const en: Record<TranslationKey, string> = {
   "providers.probeInlineMixed": "Conn. trouble",
   "providers.probeInlineBlocked": "Unusable route",
   "providers.probeInlineAuthError": "Key refused",
+  "providers.probeInlineEgressBlocked": "Egress refused",
   "providers.probeInlineUnsupported": "No such route",
   "providers.probeInlineHttpError": "Upstream error",
   "providers.probeInlineInvalidResponse": "Bad reply",
@@ -651,7 +652,9 @@ export const en: Record<TranslationKey, string> = {
   "providers.type.apiKey": "API key",
   "providers.type.workbuddy": "WorkBuddy",
   "providers.type.workbuddyAI": "WorkBuddy AI",
-  "providers.type.opencode2dsh": "Our Free Model",
+  "providers.type.ourFreeModel": "Our Free Model · OpenCode free lane",
+  "providers.type.ourFreeModelKilo": "Our Free Model · Kilo channel",
+  "providers.type.ourFreeModelEAC": "Our Free Model · EAC channel",
   // The picker groups Our Free Model publishes for its roster: what this
   // network egress can use now, and what its regional gate refuses but keeps
   // visible and isolated.  The headings are the upstream's own, so the pane and
@@ -659,7 +662,10 @@ export const en: Record<TranslationKey, string> = {
   "providers.laneSource": "Group",
   "providers.laneRoute.main": "Our Free Model",
   "providers.laneRoute.region": "Our Free Model · region-limited",
-  "providers.wizard.opencode2dshHint": "The bundled free-model integration provides these models. They are imported directly, with no account or key to enter.",
+  "providers.laneChannel.free": "OpenCode free lane",
+  "providers.laneChannel.kilo": "Kilo channel",
+  "providers.laneChannel.eac": "EAC co-paid channel",
+  "providers.wizard.ourFreeModelHint": "The bundled free-model integration provides these models. They are imported directly, with no account or key to enter.",
   "providers.workbuddyAccountHint": "WorkBuddy’s own desktop app owns this sign-in and its model catalog; this app only borrows them.",
   "providers.workbuddyAccount": "Account",
   "providers.workbuddyCreditUnavailable": "Unavailable",

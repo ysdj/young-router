@@ -117,7 +117,7 @@ type WebDavSyncAction = "sync" | "push" | "pull";
  */
 type ResultMessage = string | null | ((value: unknown) => string | null);
 
-const PROVIDER_AUTH_OPTIONS = ["api_key", "openai_login", "claude_login", "workbuddy_login", "workbuddy_ai_login", "opencode2dsh_login"] as const satisfies readonly ProviderAuthKind[];
+const PROVIDER_AUTH_OPTIONS = ["api_key", "openai_login", "claude_login", "workbuddy_login", "workbuddy_ai_login", "our_free_model_login"] as const satisfies readonly ProviderAuthKind[];
 
 
 function providerAuthKind(provider: UnknownRecord | undefined): ProviderAuthKind {
@@ -132,7 +132,7 @@ function providerAuthStatus(provider: UnknownRecord | undefined): ProviderAuthSt
 }
 
 /** The merged workspace shows every provider kind; this drives row labels. */
-type ProviderKind = "relay" | "openai" | "claude" | "workbuddy" | "workbuddyAI" | "opencode2dsh" | "apiKey";
+type ProviderKind = "relay" | "openai" | "claude" | "workbuddy" | "workbuddyAI" | "ourFreeModel" | "apiKey";
 
 function providerKind(provider: UnknownRecord | undefined): ProviderKind {
   const auth = providerAuthKind(provider);
@@ -140,7 +140,7 @@ function providerKind(provider: UnknownRecord | undefined): ProviderKind {
   if (auth === "claude_login") return "claude";
   if (auth === "workbuddy_login") return "workbuddy";
   if (auth === "workbuddy_ai_login") return "workbuddyAI";
-  if (auth === "opencode2dsh_login") return "opencode2dsh";
+  if (auth === "our_free_model_login") return "ourFreeModel";
   return stringValue(provider?.provider_type, "custom") === "relay" ? "relay" : "apiKey";
 }
 
@@ -154,18 +154,18 @@ function providerKind(provider: UnknownRecord | undefined): ProviderKind {
  * which address a provider carries, and whether its association section reads
  * as a service link rather than a relay station link.
  */
-type ServiceID = "openai" | "claude" | "workbuddy" | "workbuddyAI" | "opencode2dsh";
+type ServiceID = "openai" | "claude" | "workbuddy" | "workbuddyAI" | "ourFreeModel";
 
 /**
- * The key slot every dsh-our-free-model entry carries.
+ * The key slot every Our Free Model entry carries.
  *
  * The lane needs no credential of the user's, but LiteLLM still requires a
  * non-empty key for an OpenAI-compatible route, so Core mints one loopback
  * slot.  Its name is stated here so the 密钥 step can name the slot the entry
  * will have instead of printing the provider name where a key name belongs;
- * it must stay identical to `API_KEY_NAME` in `young_router/adapters/opencode2dsh.py`.
+ * it must stay identical to `API_KEY_NAME` in `young_router/adapters/our_free_model.py`.
  */
-const OPENCODE2DSH_KEY_NAME = "our-free-model-local";
+const OUR_FREE_MODEL_KEY_NAME = "our-free-model-local";
 
 /**
  * The auth kinds that own the key slot their provider mints.
@@ -180,7 +180,7 @@ const OPENCODE2DSH_KEY_NAME = "our-free-model-local";
 const MANAGED_SLOT_AUTH_KINDS = new Set<ProviderAuthKind>([
   "workbuddy_login",
   "workbuddy_ai_login",
-  "opencode2dsh_login",
+  "our_free_model_login",
 ]);
 
 /**
@@ -196,20 +196,16 @@ function managedServiceForSlot(managed: boolean, authKind: ProviderAuthKind): Se
 }
 
 /**
- * The public name of one upstream free-lane model id.
+ * The public name an imported lane id starts on: the upstream's own id.
  *
- * The lane marks its free ids with a ``-free`` suffix (``cat-jam-free``).  That
- * states the lane rather than the model, so the public name a client sees drops
- * it while the route keeps addressing the upstream's real id.  An id that is
- * nothing but the suffix is left whole, because stripping it would leave a
- * public name that names no model.  Core states the same rule
- * (`_public_name_without_lane_suffix`).
+ * This used to strip the free lane's ``-free`` suffix.  A roster id is the
+ * upstream's public name, so rewriting it invented a spelling no upstream
+ * document contains and gave one model two names depending on how it arrived.
+ * Renaming belongs to the user, in the pane that lists the models.  Core states
+ * the same rule (`_public_name_for_lane_id`).
  */
 function publicModelNameForLane(modelID: string): string {
-  const suffix = "-free";
-  return modelID.endsWith(suffix) && modelID.length > suffix.length
-    ? modelID.slice(0, -suffix.length)
-    : modelID;
+  return modelID;
 }
 
 /**
@@ -229,17 +225,56 @@ function laneRouteOrder(routes: readonly string[]): string[] {
   return [...known, ...routes.filter((route) => !known.includes(route))];
 }
 
+/**
+ * The producers one roster is served from, in the order the picker shows them.
+ *
+ * The upstream's catalog tags every row with the channel that serves it, and
+ * the tag is the whole point: an id does not identify its producer, so a flat
+ * list of 28 ids read as one source when it was three.  The free lane's own
+ * models carry no channel tag — it *is* the lane the others are merged onto — so
+ * they are filed under its own heading rather than absorbed into whichever named
+ * producer happened to sort first.
+ *
+ * A producer this build does not know is still shown — under its own upstream
+ * tag — because a heading the pane cannot translate is better than a row filed
+ * under a source it does not come from.
+ */
+const LANE_CHANNEL_FREE = "";
+const LANE_CHANNEL_ORDER = [LANE_CHANNEL_FREE, "kilo", "eac"] as const;
+
+function laneChannelOrder(channels: readonly string[]): string[] {
+  const known = LANE_CHANNEL_ORDER.filter((channel) => channels.includes(channel));
+  return [...known, ...channels.filter((channel) => !(LANE_CHANNEL_ORDER as readonly string[]).includes(channel))];
+}
+
+/** The heading for one producer: the upstream's tag, or the free lane's name. */
+function laneChannelLabel(channel: string, translate: Translate): string {
+  switch (channel) {
+    case LANE_CHANNEL_FREE:
+      return translate("providers.laneChannel.free");
+    case "kilo":
+      return translate("providers.laneChannel.kilo");
+    case "eac":
+      return translate("providers.laneChannel.eac");
+    default:
+      // An upstream tag this build has no wording for is shown as it stated it,
+      // so a new producer appears in the picker instead of hiding under another
+      // one's heading.
+      return channel;
+  }
+}
+
 /** The address each service is addressed by, used for the wizard's URL field. */
 const SERVICE_BASE_URLS: Record<ServiceID, string> = {
   openai: "https://api.openai.com/v1",
   claude: "https://api.anthropic.com",
   workbuddy: "https://copilot.tencent.com",
   workbuddyAI: "https://www.workbuddy.ai",
-  // dsh-our-free-model is served by a Core-owned worker on this machine, and
+  // Our Free Model is served by a Core-owned worker on this machine, and
   // its port is assigned at launch, so it has no fixed address to print here.
   // The entry carries Core's own `os.environ/` reference instead, which is the
   // only string that is true across runs.
-  opencode2dsh: "",
+  ourFreeModel: "",
 };
 
 /** Service origins, so a hand-typed provider URL is recognized the same way. */
@@ -257,7 +292,7 @@ function serviceFromURL(value: string): ServiceID | undefined {
   const matches = (suffix: string): boolean => host === suffix || host.endsWith(`.${suffix}`);
   if (matches("workbuddy.ai")) return "workbuddyAI";
   if (matches("codebuddy.ai") || matches("codebuddy.cn") || matches("copilot.tencent.com")) return "workbuddy";
-  if (matches("opencode.ai")) return "opencode2dsh";
+  if (matches("opencode.ai")) return "ourFreeModel";
   if (matches("api.openai.com") || matches("openai.com") || matches("chatgpt.com")) return "openai";
   if (matches("api.anthropic.com") || matches("anthropic.com") || matches("claude.ai")) return "claude";
   return undefined;
@@ -266,7 +301,7 @@ function serviceFromURL(value: string): ServiceID | undefined {
 /** The service behind one provider entry: its kind first, then its address. */
 function providerService(provider: UnknownRecord | undefined): ServiceID | undefined {
   const kind = providerKind(provider ?? {});
-  if (kind === "openai" || kind === "claude" || kind === "workbuddy" || kind === "workbuddyAI" || kind === "opencode2dsh") return kind;
+  if (kind === "openai" || kind === "claude" || kind === "workbuddy" || kind === "workbuddyAI" || kind === "ourFreeModel") return kind;
   return serviceFromURL(stringValue(provider?.endpoint, stringValue(provider?.api_base)));
 }
 
@@ -301,12 +336,22 @@ function hasFreshServiceRates(service: ServiceID | undefined): boolean {
  * document names its own variants (`workbuddy`, `workbuddy-ai`), which are not
  * the auth kinds the configuration stores.
  */
-function serviceCatalogRead(service: ServiceID): { action: string; providerId: string } | undefined {
+function serviceCatalogRead(service: ServiceID, channel?: string): { action: string; providerId: string } | undefined {
   if (service === "workbuddy") return { action: "workbuddy_models", providerId: "workbuddy" };
   if (service === "workbuddyAI") return { action: "workbuddy_models", providerId: "workbuddy-ai" };
-  if (service === "opencode2dsh") return { action: "opencode2dsh_models", providerId: "opencode2dsh" };
+  // One worker serves every channel, so the id decides which slice of the
+  // roster comes back.  Defaulting to the lane's own id would list the
+  // anonymous channel's rows for a Kilo entry.
+  if (service === "ourFreeModel") return { action: "our_free_model_models", providerId: channel ?? "our-free-model" };
   return undefined;
 }
+
+/** The provider each lane channel is created as, from the wizard's type. */
+const OUR_FREE_MODEL_CHANNEL_PROVIDER: Record<string, string> = {
+  ourFreeModel: "our-free-model",
+  ourFreeModelKilo: "our-free-model-kilo",
+  ourFreeModelEAC: "our-free-model-eac",
+};
 
 /**
  * One service's own catalog, or `undefined` when no catalog answered.
@@ -497,8 +542,8 @@ function providerKindLabel(kind: ProviderKind, translate: Translate): string {
           ? translate("providers.type.workbuddy")
           : kind === "workbuddyAI"
             ? translate("providers.type.workbuddyAI")
-            : kind === "opencode2dsh"
-              ? translate("providers.type.opencode2dsh")
+            : kind === "ourFreeModel"
+              ? translate("providers.type.ourFreeModel")
               : translate("providers.type.apiKey");
 }
 
@@ -506,7 +551,7 @@ function providerKindLabel(kind: ProviderKind, translate: Translate): string {
  * name, address, and key all belong to the service surface rather than to the
  * provider editor. */
 function isLoginProviderKind(kind: ProviderKind): boolean {
-  return kind === "openai" || kind === "claude" || kind === "workbuddy" || kind === "workbuddyAI" || kind === "opencode2dsh";
+  return kind === "openai" || kind === "claude" || kind === "workbuddy" || kind === "workbuddyAI" || kind === "ourFreeModel";
 }
 
 const DATA_PACKAGE_SECTIONS: ReadonlyArray<{ domain: ConfigDomain; labelKey: string }> = [
@@ -1144,8 +1189,8 @@ const TRANSIENT_READ_ACTIONS: ReadonlySet<string> = new Set([
   "workbuddy_status",
   "workbuddy_models",
   "workbuddy_login",
-  "opencode2dsh_status",
-  "opencode2dsh_models",
+  "our_free_model_status",
+  "our_free_model_models",
   "service_provider_auth_status",
   "provider_auth_status",
 ]);
@@ -3159,7 +3204,7 @@ function providerWizardKeyTarget(token: string, keyName: string): string {
   return `${WIZARD_PENDING_KEY_PREFIX}${token}\u001f${keyName}`;
 }
 
-type ServiceProviderKind = "openai_login" | "claude_login" | "workbuddy_login" | "workbuddy_ai_login" | "opencode2dsh_login";
+type ServiceProviderKind = "openai_login" | "claude_login" | "workbuddy_login" | "workbuddy_ai_login" | "our_free_model_login";
 
 /**
  * Every provider the snapshot carries, whatever its kind.
@@ -3197,14 +3242,18 @@ function serviceProviderKindLabel(kind: ServiceProviderKind, translate: Translat
  * the short name is not in Core's `_SERVICE_PROVIDER_KINDS`, so a dispatch
  * that sent it would be refused as an unavailable login type.
  */
-function nextServiceProviderName(providers: UnknownRecord[], kind: ServiceProviderKind): string {
+function nextServiceProviderName(providers: UnknownRecord[], kind: ServiceProviderKind, channelProvider?: string): string {
   const base = kind === "openai_login" ? "OpenAI"
     : kind === "claude_login" ? "Claude"
       : kind === "workbuddy_login" ? "WorkBuddy"
         : kind === "workbuddy_ai_login" ? "WorkBuddy AI"
-          // The entry is named after the type the picker shows, so the two
-          // never disagree about what the user added.
-          : "Our Free Model";
+          // A lane channel states its own name: the name is what Core reads to
+          // know which channel an entry is, so three entries cannot share one.
+          : channelProvider === "our-free-model-kilo" ? "Our Free Model · Kilo"
+            : channelProvider === "our-free-model-eac" ? "Our Free Model · EAC"
+              // The entry is named after the type the picker shows, so the two
+              // never disagree about what the user added.
+              : "Our Free Model";
   const names = new Set(providers.map((provider) => stringValue(provider.display_name, stringValue(provider.name)).trim().toLocaleLowerCase()).filter(Boolean));
   if (!names.has(base.toLocaleLowerCase())) return base;
   let suffix = 2;
@@ -3214,7 +3263,7 @@ function nextServiceProviderName(providers: UnknownRecord[], kind: ServiceProvid
 
 function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayStations, busy, translate, dispatchWithOutcome, onSecretState, onStatus, onClose, onKeyToken, relay, addOfficialAccount, status }: { snapshot?: CoreSnapshot; native: NativeLeafAdapter; providers: UnknownRecord[]; relaySources: RelaySourceOption[]; relayStations: RelayStationOption[]; busy: boolean; translate: Translate; dispatchWithOutcome: (type: string, payload?: UnknownRecord, domain?: ConfigDomain, keepControlsEnabled?: boolean) => Promise<CoreSnapshot | undefined>; onSecretState: (state: SecretState) => void; onStatus: (status?: string) => void; onClose: () => void; onKeyToken: (token: string) => void; relay: RelayWorkspaceBridge; addOfficialAccount: (kind: ServiceProviderKind, name?: string) => Promise<string>; /** The window's own result: a child window keeps no strip, so its footer states it. */ status?: string }): React.JSX.Element {
   type WizardStep = "provider" | "keys" | "model";
-  type WizardType = "api" | "openai" | "claude" | "workbuddy" | "workbuddyAI" | "opencode2dsh";
+  type WizardType = "api" | "openai" | "claude" | "workbuddy" | "workbuddyAI" | "ourFreeModel" | "ourFreeModelKilo" | "ourFreeModelEAC";
   const [step, setStep] = useState<WizardStep>("provider");
   // The step the last advance left, so one press cannot advance twice.
   const stepRef = useRef<WizardStep | undefined>("provider");
@@ -3266,6 +3315,10 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   // ids.  The upstream decides this split, so the wizard groups by what it
   // said instead of by a rule of its own.
   const [laneRoutes, setLaneRoutes] = useState<Record<string, string[]>>({});
+  // The producer each row is served from, as the upstream catalog stated it.
+  // Kept apart from `laneRoutes`: that one is the availability split, this one
+  // is the source, and a row has both.
+  const [laneChannels, setLaneChannels] = useState<Record<string, string>>({});
   const [fetchedModelCapabilities, setFetchedModelCapabilities] = useState<Record<string, UnknownRecord>>({});
   const [selectedModels, setSelectedModels] = useState<string[]>([]);
   const [manualModels, setManualModels] = useState<Array<{ id: string; name: string; upstream_model: string }>>([]);
@@ -3304,11 +3357,20 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
 
   const isOfficialLoginType = providerType === "openai" || providerType === "claude";
   const isWorkBuddyType = providerType === "workbuddy" || providerType === "workbuddyAI";
-  // dsh-our-free-model has no sign-in and no user secret at all: its provider is
+  // Our Free Model has no sign-in and no user secret at all: its provider is
   // created straight from the provider step, so it shares neither the key
   // step's fields nor the official services' web login.
-  const isOpenCode2DSHType = providerType === "opencode2dsh";
-  const isLoginType = isOfficialLoginType || isWorkBuddyType || isOpenCode2DSHType;
+  // Every lane channel is its own entry, so every one of them is "this type"
+  // for the steps that differ from a key entry: no account, a minted key slot,
+  // and a catalog read instead of a typed model list.
+  const isOurFreeModelType = providerType === "ourFreeModel" || providerType === "ourFreeModelKilo" || providerType === "ourFreeModelEAC";
+  /** The service this entry belongs to; all three channels are one service. */
+  const serviceType: ServiceID | undefined = providerType === "api"
+    ? undefined
+    : isOurFreeModelType ? "ourFreeModel" : providerType;
+  /** The provider this entry creates; the wizard names it. */
+  const ourFreeModelProviderID = OUR_FREE_MODEL_CHANNEL_PROVIDER[providerType] ?? "our-free-model";
+  const isLoginType = isOfficialLoginType || isWorkBuddyType || isOurFreeModelType;
   const workbuddyProvider = providerType === "workbuddyAI" ? "workbuddy-ai" : "workbuddy";
   const workbuddyAuthKind: ServiceProviderKind = providerType === "workbuddyAI" ? "workbuddy_ai_login" : "workbuddy_login";
   const selectedProvider = providers.find((entry) => editorIdentifier(entry) === providerSelection);
@@ -3407,7 +3469,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   }, [fetchedModelCandidates, selectedProvidedChoice?.models]);
   // "Select an existing provider" matches by service: an official address
   // typed by hand is the same service as the one the wizard injects.
-  const wizardService: ServiceID | undefined = providerType === "api" ? undefined : providerType;
+  const wizardService: ServiceID | undefined = serviceType;
   const providerOptions = providers
     .filter((entry) => wizardService === undefined
       ? providerKind(entry) === "apiKey" || providerKind(entry) === "relay"
@@ -3424,16 +3486,23 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     { type: "claude", label: translate("providers.type.claude") },
     { type: "workbuddy", label: translate("providers.type.workbuddy") },
     { type: "workbuddyAI", label: translate("providers.type.workbuddyAI") },
-    { type: "opencode2dsh", label: translate("providers.type.opencode2dsh") },
+    // One entry per upstream channel, because each channel is a provider of its
+    // own: a channel decides the wire its rows answer on and the window they
+    // accept, and a provider is the only unit this app states those on. Adding
+    // one thing must not create three rows the user did not ask for, and a user
+    // who wants only Kilo must be able to add only Kilo.
+    { type: "ourFreeModel", label: translate("providers.type.ourFreeModel") },
+    { type: "ourFreeModelKilo", label: translate("providers.type.ourFreeModelKilo") },
+    { type: "ourFreeModelEAC", label: translate("providers.type.ourFreeModelEAC") },
   ];
   const servicePickerLabels = servicePickerItems.map((item) => item.label);
   // A service provider always carries its own address; only the custom entry
-  // edits the URL field.  dsh-our-free-model's address is Core's own env
+  // edits the URL field.  Our Free Model's address is Core's own env
   // reference (its worker picks a port per launch), so the field states that
   // absence rather than printing a host the lane never contacts.
-  const serviceBaseURL = providerType === "api"
+  const serviceBaseURL = serviceType === undefined
     ? providerBaseURL
-    : SERVICE_BASE_URLS[providerType] || translate("common.notAvailable");
+    : SERVICE_BASE_URLS[serviceType] || translate("common.notAvailable");
   const selectedServiceLabel = servicePickerItems.find((item) => item.type === providerType)?.label ?? servicePickerLabels[0] ?? "";
   const stepItems: Array<{ id: WizardStep; title: string }> = [
     { id: "provider", title: translate("providers.wizard.stepProvider") },
@@ -3590,12 +3659,22 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     setProvidedKeySelection("");
     // A non-custom type carries the service's own address, so the URL field is
     // filled from the service table and every later step treats it as fixed.
-    setProviderBaseURL(value === "api" ? "" : SERVICE_BASE_URLS[value]);
+    // The lane's three channels are one service, so each answers with the same
+    // (empty) address: one worker on this machine serves all of them.
+    const chosenService: ServiceID | undefined = value === "api"
+      ? undefined
+      : OUR_FREE_MODEL_CHANNEL_PROVIDER[value]
+        ? "ourFreeModel"
+        : value as ServiceID;
+    setProviderBaseURL(chosenService === undefined ? "" : SERVICE_BASE_URLS[chosenService]);
     // The entry is named after its own product, and a second entry for the
-    // same account has to stay distinguishable.
+    // same account has to stay distinguishable.  A lane channel states its own
+    // name, because the name is what Core reads to know which channel the entry
+    // is: three entries cannot all be called "Our Free Model".
+    const channelProvider = OUR_FREE_MODEL_CHANNEL_PROVIDER[value];
     setProviderName(value === "workbuddy" ? nextServiceProviderName(providers, "workbuddy_login")
       : value === "workbuddyAI" ? nextServiceProviderName(providers, "workbuddy_ai_login")
-        : value === "opencode2dsh" ? nextServiceProviderName(providers, "opencode2dsh_login")
+        : channelProvider ? nextServiceProviderName(providers, "our_free_model_login", channelProvider)
           : value === "openai" ? nextServiceProviderName(providers, "openai_login")
             : value === "claude" ? nextServiceProviderName(providers, "claude_login")
               : "");
@@ -3613,7 +3692,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     if (step !== "provider" || providerMode !== "new" || providerType === "api") return;
     const kind: ServiceProviderKind = providerType === "workbuddy" ? "workbuddy_login"
       : providerType === "workbuddyAI" ? "workbuddy_ai_login"
-        : providerType === "opencode2dsh" ? "opencode2dsh_login"
+        : providerType === "ourFreeModel" ? "our_free_model_login"
           : providerType === "claude" ? "claude_login"
             : "openai_login";
     const baseName = nextServiceProviderName([], kind);
@@ -3778,20 +3857,22 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
    * List the lane's own free roster for the model step.
    *
    * This lane has no key to fetch with and no address to probe, so its roster
-   * comes from the staged adapter through ``opencode2dsh_models``.  The answer
+   * comes from the staged adapter through ``our_free_model_models``.  The answer
    * is the same pick the generic path offers: the user chooses which free
    * models this entry carries, and 刷新 asks again.
    */
-  const fetchOpenCode2DSHModels = async (): Promise<void> => {
+  const fetchOurFreeModelModels = async (providerID = ourFreeModelProviderID): Promise<void> => {
     if (modelFetchInFlight.current) return;
     const request = ++modelFetchRequest.current;
     modelFetchInFlight.current = true;
     setModelFetchState("loading");
     try {
-      const next = await dispatchWithOutcome("opencode2dsh_models", { refresh: true }, "providers_models", true);
+      // The channel is what Core filters by: one worker serves all three, so
+      // the id in the request decides which slice of the roster comes back.
+      const next = await dispatchWithOutcome("our_free_model_models", { provider: providerID, refresh: true }, "providers_models", true);
       if (request !== modelFetchRequest.current) return;
       const summary = asRecord(asRecord(next?.action_summaries?.providers_models).operation_summary);
-      if (stringValue(summary.operation) !== "opencode2dsh_models" || summary.available !== true) {
+      if (stringValue(summary.operation) !== "our_free_model_models" || summary.available !== true) {
         setModelFetchState("unavailable");
         return;
       }
@@ -3811,6 +3892,13 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         if (names.length > 0) routes[route] = names;
       }
       setLaneRoutes(routes);
+      // The source each row is served from.  A read that states none leaves the
+      // roster under the lane's own heading rather than inventing producers.
+      const channels: Record<string, string> = {};
+      for (const [name, channel] of Object.entries(asRecord(summary.channels))) {
+        if (candidates.includes(name)) channels[name] = stringValue(channel);
+      }
+      setLaneChannels(channels);
       // Nothing is checked until the user chooses.  A roster this long is not a
       // shortlist: pre-selecting every free model would hand the entry a set
       // nobody picked, and the same rule already governs every other service
@@ -3907,7 +3995,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     if (modelFetchTicket === 0 || step !== "model") return;
     // This lane lists its roster from the staged adapter; every other provider
     // lists from the key/address its keys step staged.
-    void (isOpenCode2DSHType ? fetchOpenCode2DSHModels() : fetchWizardModels());
+    void (isOurFreeModelType ? fetchOurFreeModelModels(ourFreeModelProviderID) : fetchWizardModels());
     // The ticket is the trigger; the listing's own inputs are read from this
     // render, which is the model step's.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -3941,7 +4029,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       setProviderSelection(createdServiceID);
       return createdServiceID;
     }
-    if (isOpenCode2DSHType) {
+    if (isOurFreeModelType) {
       // The lane owns no account and no user secret: the create carries the
       // name and the models the user kept on the model step.
       const kept = modelCandidates.filter((name) => selectedModels.includes(name));
@@ -3950,11 +4038,13 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         return undefined;
       }
       const next = await dispatchWithOutcome("service_provider.add", {
-        kind: "opencode2dsh_login",
+        kind: "our_free_model_login",
+        // The name is what tells Core which channel this entry is, since all
+        // three share one login kind.
         name,
-        // The public name drops the lane's own ``-free`` suffix (Core applies
-        // the same rule when it imports the roster itself); the route still
-        // addresses the upstream's real id.
+        // The public name is the upstream's own id, unchanged: renaming a
+        // model is the user's to do in the pane.  Core applies the same rule
+        // when it imports the roster itself.
         models: kept.map((model_id) => ({ name: publicModelNameForLane(model_id), upstream_model: model_id, enabled: true, order: 0 })),
       });
       if (!next) return undefined;
@@ -4198,7 +4288,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         advanceStepToModel();
         return;
       }
-      if (isOpenCode2DSHType) {
+      if (isOurFreeModelType) {
         // Nothing is typed here either: the lane signs itself in.  The roster
         // is listed on the model step, where the user picks what to carry.
         setModelFetchState("loading");
@@ -4319,9 +4409,9 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       }
       return;
     }
-    // dsh-our-free-model imported its roster with the create too, so 完成 only has
+    // Our Free Model imported its roster with the create too, so 完成 only has
     // to mint the entry; nothing is selected or typed on this step.
-    if (isOpenCode2DSHType) {
+    if (isOurFreeModelType) {
       setProcessing(true);
       try {
         const created = providerID || await commitWizardProvider();
@@ -4441,7 +4531,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         </View> : <>
         {step === "provider" ? <View style={styles.providerWizardFormSection}>
           <NativeFormRow label={translate("providers.wizard.providerType")}>
-            <NativePicker labels={servicePickerLabels} selectedValue={selectedServiceLabel} disabled={wizardBusy} onChange={({ nativeEvent }) => { const kinds: WizardType[] = ["api", "openai", "claude", "workbuddy", "workbuddyAI", "opencode2dsh"]; chooseProviderType(kinds[nativeEvent.index] ?? "api"); }} style={styles.providerWizardPicker} />
+            <NativePicker labels={servicePickerLabels} selectedValue={selectedServiceLabel} disabled={wizardBusy} onChange={({ nativeEvent }) => { const kinds: WizardType[] = ["api", "openai", "claude", "workbuddy", "workbuddyAI", "ourFreeModel", "ourFreeModelKilo", "ourFreeModelEAC"]; chooseProviderType(kinds[nativeEvent.index] ?? "api"); }} style={styles.providerWizardPicker} />
           </NativeFormRow>
           {providerMode === "new" && isOfficialLoginType ? <NativeFormRow label={translate("providers.wizard.authPath")}>
             <NativePicker labels={[translate("providers.wizard.pathWebLogin"), translate("providers.wizard.pathCustomKey")]} selectedValue={keyPath === "login" ? translate("providers.wizard.pathWebLogin") : translate("providers.wizard.pathCustomKey")} disabled={wizardBusy} onChange={({ nativeEvent }) => { chooseOfficialAuthPath(nativeEvent.index === 1 ? "manual" : "login"); }} style={styles.providerWizardPicker} />
@@ -4457,7 +4547,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
           {providerMode === "new" && providerType !== "api" ? <Text style={styles.providerWizardHint}>{translate("providers.wizard.serviceUrlFixed")}</Text> : null}
           {providerMode === "new" && isOfficialLoginType && keyPath === "login" ? <Text style={styles.providerWizardHint}>{providerType === "openai" ? translate("relay.officialProviderWebViewHint") : translate("relay.officialProviderBrowserHint")}</Text> : null}
           {providerMode === "new" && isWorkBuddyType ? <Text style={styles.providerWizardHint}>{translate("providers.wizard.workbuddyAppHint")}</Text> : null}
-          {providerMode === "new" && isOpenCode2DSHType ? <Text style={styles.providerWizardHint}>{translate("providers.wizard.opencode2dshHint")}</Text> : null}
+          {providerMode === "new" && isOurFreeModelType ? <Text style={styles.providerWizardHint}>{translate("providers.wizard.ourFreeModelHint")}</Text> : null}
           {providerMode === "existing" && selectedProvider ? <Text numberOfLines={1} style={styles.providerWizardHint}>{activeProviderBaseURL || translate("common.notAvailable")}</Text> : null}
         </View> : null}
         {step === "keys" ? <View style={styles.providerWizardFormSection}>
@@ -4465,7 +4555,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
               This lane has no key of the user's to choose — its one slot is the
               loopback bearer — so the step states that instead of printing the
               provider name where a key name belongs. */}
-          <View style={styles.providerWizardSectionHeader}><Text style={styles.providerWizardPanelTitle}>{translate("providers.wizard.stepKeys")}</Text><Text numberOfLines={1} style={styles.providerWizardHint}>{isOpenCode2DSHType ? OPENCODE2DSH_KEY_NAME : selectedProviderName}</Text></View>
+          <View style={styles.providerWizardSectionHeader}><Text style={styles.providerWizardPanelTitle}>{translate("providers.wizard.stepKeys")}</Text><Text numberOfLines={1} style={styles.providerWizardHint}>{isOurFreeModelType ? OUR_FREE_MODEL_KEY_NAME : selectedProviderName}</Text></View>
           {isOfficialLoginType && keyPath === "login" ? <>
             <Text style={styles.providerWizardHint}>{translate("providers.wizard.loginKeyHint")}</Text>
             <View style={styles.providerWizardAuthRow}>
@@ -4476,10 +4566,10 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
                   ? <NativeButton title={translate("relay.officialProviderCancel")} compact disabled={wizardBusy} onPress={() => { void cancelOfficialLogin(); }} />
                   : <NativeButton title={translate("relay.officialProviderLogin")} primary compact disabled={wizardBusy} onPress={() => { void startOfficialLogin(); }} />}
             </View>
-          </> : isOpenCode2DSHType ? <>
+          </> : isOurFreeModelType ? <>
             {/* The lane signs itself in and its free roster is imported by the
                 create, so this step states that and asks for nothing. */}
-            <Text style={styles.providerWizardHint}>{translate("providers.wizard.opencode2dshHint")}</Text>
+            <Text style={styles.providerWizardHint}>{translate("providers.wizard.ourFreeModelHint")}</Text>
           </> : isWorkBuddyType ? <>
             {/* The account is associated in the provider's own 「服务商关联」
                 section, so this step only states the desktop app's sign-in and
@@ -4550,7 +4640,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         </View> : isWorkBuddyType ? <View style={styles.providerWizardFormSection}>
           <View style={styles.providerWizardSectionHeader}><Text style={styles.providerWizardPanelTitle}>{translate("providers.wizard.models")}</Text><Text numberOfLines={1} style={styles.providerWizardHint}>{translate("providers.wizard.providerName")}: {selectedProviderName}</Text></View>
           <Text style={styles.providerWizardHint}>{translate("providers.wizard.workbuddyAssociationHint")}</Text>
-        </View> : isOpenCode2DSHType ? <PersistentScrollView style={styles.providerWizardModelScroll} contentContainerStyle={styles.providerWizardModelScrollContent} showsVerticalScrollIndicator keyboardShouldPersistTaps="handled">
+        </View> : isOurFreeModelType ? <PersistentScrollView style={styles.providerWizardModelScroll} contentContainerStyle={styles.providerWizardModelScrollContent} showsVerticalScrollIndicator keyboardShouldPersistTaps="handled">
           <View style={styles.providerWizardFormSection}>
             <View style={styles.providerWizardSectionHeader}><Text style={styles.providerWizardPanelTitle}>{translate("providers.wizard.models")}</Text><Text numberOfLines={1} style={styles.providerWizardHint}>{translate("providers.wizard.providerName")}: {selectedProviderName}</Text></View>
             {/* This lane lists its free roster live, so the step offers the same
@@ -4565,7 +4655,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
                   flight: the row above already states that wait with the one
                   wheel, and a control that would start the same read again has
                   nothing to offer until this one answers. */}
-              {modelFetchState === "loading" ? null : <NativeButton title={translate("providers.wizard.refreshModels")} compact link disabled={wizardBusy} onPress={() => { void fetchOpenCode2DSHModels(); }} />}
+              {modelFetchState === "loading" ? null : <NativeButton title={translate("providers.wizard.refreshModels")} compact link disabled={wizardBusy} onPress={() => { void fetchOurFreeModelModels(ourFreeModelProviderID); }} />}
             </View>
             {modelCandidates.length > 0 ? <View style={styles.providerWizardModelGroup}>
               <View style={styles.providerWizardModelGroupHeader}>
@@ -4579,24 +4669,50 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
                   <Text style={styles.providerWizardHint}>{translate("providers.wizard.selectedModels", { count: selectedModels.length })}</Text>
                 </View>
               </View>
-              {/* One block per group the upstream published, because the
-                  roster is not one list: what this egress can use and what its
-                  regional gate refuses are different answers about different
-                  models.  The split is the upstream's own — it states it beside
-                  the roster — so a row is never filed under a heading this pane
-                  decided for it. */}
+              {/* One block per producer, because the roster is not one list:
+                  these models are served from different upstreams, and a flat
+                  list read as one source.  The producer is the upstream
+                  catalog's own `channel` tag — an id does not identify it, and
+                  a rule of this pane's would file rows under a source they do
+                  not come from.
+
+                  Inside a producer the availability split still applies: what
+                  this egress can use, and what its regional gate refuses.  Both
+                  splits are the upstream's; neither is inferred here. */}
               <View style={styles.providerWizardModelList}>
-                {laneRouteOrder(Object.keys(laneRoutes)).map((route) => {
-                  const names = laneRoutes[route] ?? [];
+                {laneChannelOrder(Array.from(new Set(Object.values(laneChannels)))).map((channel) => {
+                  const names = modelCandidates.filter((name) => (laneChannels[name] ?? LANE_CHANNEL_FREE) === channel);
                   if (names.length === 0) return null;
-                  return <View key={`lane-route:${route}`} style={styles.providerWizardModelSourceGroup}>
-                    <Text numberOfLines={1} style={styles.providerWizardHint}>{translate(route === LANE_ROUTE_REGION ? "providers.laneRoute.region" : "providers.laneRoute.main")} ({names.length})</Text>
-                    {names.map((name) => <NativeCheckbox key={`lane:${name}`} label={name} value={selectedModels.includes(name)} disabled={wizardBusy} onValueChange={(checked) => { setSelectedModels((current) => checked ? (current.includes(name) ? current : [...current, name]) : current.filter((item) => item !== name)); setValidation(""); }} style={styles.providerWizardModelCheckbox} />)}
+                  const routes = laneRouteOrder(Object.keys(laneRoutes));
+                  // The producer heading already names this group, so an
+                  // availability heading that repeats it inside is not a
+                  // second fact: a producer serving everything this egress can
+                  // reach needs no inner heading at all.  Only a producer that
+                  // also carries region-refused rows splits, and then the inner
+                  // heading says which half the rows belong to.
+                  const splitRoutes = routes.filter((route) => route === LANE_ROUTE_REGION || (laneRoutes[route] ?? []).some((name) => names.includes(name)))
+                    .filter((route) => route === LANE_ROUTE_REGION || (laneRoutes[route] ?? []).filter((name) => names.includes(name)).length > 0);
+                  const showRouteHeadings = splitRoutes.length > 1
+                    || splitRoutes.some((route) => route === LANE_ROUTE_REGION);
+                  return <View key={`lane-channel:${channel}`} style={styles.providerWizardModelSourceGroup}>
+                    <Text numberOfLines={1} style={styles.providerWizardModelSourceHeading}>{laneChannelLabel(channel, translate)} ({names.length})</Text>
+                    {showRouteHeadings ? routes.map((route) => {
+                      const routeNames = (laneRoutes[route] ?? []).filter((name) => names.includes(name));
+                      if (routeNames.length === 0) return null;
+                      return <View key={`lane-channel:${channel}:route:${route}`} style={styles.providerWizardModelSourceGroup}>
+                        <Text numberOfLines={1} style={styles.providerWizardHint}>{translate(route === LANE_ROUTE_REGION ? "providers.laneRoute.region" : "providers.laneRoute.main")} ({routeNames.length})</Text>
+                        {routeNames.map((name) => <NativeCheckbox key={`lane:${name}`} label={name} value={selectedModels.includes(name)} disabled={wizardBusy} onValueChange={(checked) => { setSelectedModels((current) => checked ? (current.includes(name) ? current : [...current, name]) : current.filter((item) => item !== name)); setValidation(""); }} style={styles.providerWizardModelCheckbox} />)}
+                      </View>;
+                    }) : names.map((name) => <NativeCheckbox key={`lane:${name}`} label={name} value={selectedModels.includes(name)} disabled={wizardBusy} onValueChange={(checked) => { setSelectedModels((current) => checked ? (current.includes(name) ? current : [...current, name]) : current.filter((item) => item !== name)); setValidation(""); }} style={styles.providerWizardModelCheckbox} />)}
+                    {/* A producer whose rows the availability split did not
+                        mention is still a producer: its rows are listed under
+                        it rather than dropped from the picker. */}
+                    {names.filter((name) => !routes.some((route) => (laneRoutes[route] ?? []).includes(name))).map((name) => <NativeCheckbox key={`lane:${name}`} label={name} value={selectedModels.includes(name)} disabled={wizardBusy} onValueChange={(checked) => { setSelectedModels((current) => checked ? (current.includes(name) ? current : [...current, name]) : current.filter((item) => item !== name)); setValidation(""); }} style={styles.providerWizardModelCheckbox} />)}
                   </View>;
                 })}
-                {/* A roster the upstream published no groups for is still a
-                    roster: it is listed whole, ungrouped, rather than hidden. */}
-                {Object.keys(laneRoutes).length === 0 ? modelCandidates.map((name) => <NativeCheckbox key={`lane:${name}`} label={name} value={selectedModels.includes(name)} disabled={wizardBusy} onValueChange={(checked) => { setSelectedModels((current) => checked ? (current.includes(name) ? current : [...current, name]) : current.filter((item) => item !== name)); setValidation(""); }} style={styles.providerWizardModelCheckbox} />) : null}
+                {/* A roster the upstream stated no producer for is still a
+                    roster: it is listed whole rather than hidden. */}
+                {modelCandidates.every((name) => !(name in laneChannels)) ? modelCandidates.map((name) => <NativeCheckbox key={`lane:${name}`} label={name} value={selectedModels.includes(name)} disabled={wizardBusy} onValueChange={(checked) => { setSelectedModels((current) => checked ? (current.includes(name) ? current : [...current, name]) : current.filter((item) => item !== name)); setValidation(""); }} style={styles.providerWizardModelCheckbox} />) : null}
               </View>
             </View> : null}
             <Text style={styles.providerWizardModelSummary}>{translate("providers.wizard.modelsToAdd", { count: selectedModels.length })}</Text>
@@ -6930,7 +7046,7 @@ function ProviderIdentityFields({ provider, providerID, relayStations, station, 
   // station is gone still states the address it kept.  A custom provider whose
   // URL happens to point at an official host stays a custom provider: `service`
   // is a fallback recognition for labels, never what decides a row here.
-  // dsh-our-free-model is addressed by Core's own `os.environ/` reference (its
+  // Our Free Model is addressed by Core's own `os.environ/` reference (its
   // worker binds a port per launch), so its row reads that reference; the
   // service table carries no address for it to show.
   const providerBaseURL = station
@@ -7068,7 +7184,7 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
   const isWorkBuddyAccount = kind === "workbuddy" || kind === "workbuddyAI";
   // The one predicate, not a second spelling of it: a login service owns its
   // key, so no key editor may be drawn for it.  Re-deriving this locally from
-  // the two kinds this pane also branches on left the dsh-our-free-model lane
+  // the two kinds this pane also branches on left the Our Free Model lane
   // out, and its minted loopback slot — whose value is a Core-owned
   // ``os.environ/`` reference, not a secret of the user's — was offered in the
   // 密钥 editor as an editable, copyable API key.
@@ -11061,7 +11177,9 @@ function modelProbePresentation(model: UnknownRecord, result: IpcResults["probe"
             ? translate("providers.probeInlineTimeout")
             : transport === "mixed"
               ? translate("providers.probeInlineMixed")
-              : uniformStatus === "auth_error"
+              : uniformStatus === "egress_blocked"
+                ? translate("providers.probeInlineEgressBlocked")
+                : uniformStatus === "auth_error"
                 ? translate("providers.probeInlineAuthError")
                 : uniformStatus === "unsupported"
                   ? translate("providers.probeInlineUnsupported")
@@ -11137,6 +11255,8 @@ function probeFailureKey(degradation: UnknownRecord): TranslationKey {
       return "providers.probeInlineTimeout";
     case "auth_error":
       return "providers.probeInlineAuthError";
+    case "egress_blocked":
+      return "providers.probeInlineEgressBlocked";
     case "unsupported":
       return "providers.probeInlineUnsupported";
     case "http_error":
@@ -11447,7 +11567,8 @@ const styles = StyleSheet.create({
   providerAuthLine: { color: systemColors.label, fontSize: UI_FONT_SIZE },
   officialActiveHint: { color: systemColors.green, fontSize: UI_TIP_FONT_SIZE, fontWeight: "600" },
   officialActionsRow: { minHeight: 28, flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 6 },
-  providerWizardHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerWizardDescription: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 17 }, providerWizardSectionHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardPanelTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerWizardFormSection: { width: "100%", maxWidth: 520, paddingVertical: 0, gap: 10 }, providerWizardModelScroll: { flex: 1, minHeight: 0, width: "100%" }, providerWizardModelScrollContent: { width: "100%", paddingBottom: 8 }, providerWizardModelToolbar: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 8 }, providerWizardModelStatusRow: { flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardModelGroup: { gap: 6, paddingTop: 4 }, providerWizardModelGroupHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }, providerWizardModelGroupTools: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, providerWizardModelList: { borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground, paddingHorizontal: 8, paddingVertical: 5, gap: 1 }, providerWizardModelSourceGroup: { minWidth: 0, gap: 1, paddingTop: 2 }, providerWizardModelCheckbox: { width: "100%", minHeight: 24 }, providerWizardManualModelRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardManualModelCheckbox: { flex: 1, minWidth: 0 }, providerWizardManualModelUpstream: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE }, providerWizardModelSummary: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "500", paddingTop: 4 }, providerWizardModeControl: { width: "100%", height: 26, flexShrink: 0 }, providerWizardPicker: { width: "100%", minWidth: 0, height: 26 }, providerWizardInput: { width: "100%", minHeight: 26, color: systemColors.label, fontSize: UI_FONT_SIZE }, providerWizardSecretInput: { width: "100%", minHeight: 26 }, providerWizardHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15, paddingVertical: 2 }, providerWizardFooter: { minHeight: 46, paddingHorizontal: 20, paddingVertical: 8, flexDirection: "row", alignItems: "center", gap: 6, borderTopWidth: 0, backgroundColor: systemColors.window }, providerWizardFooterSpacer: { flex: 1 }, providerWizardFooterStatus: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, providerWizardFooterActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 },
+  providerWizardHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerWizardDescription: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 17 }, providerWizardSectionHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardPanelTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerWizardFormSection: { width: "100%", maxWidth: 520, paddingVertical: 0, gap: 10 }, providerWizardModelScroll: { flex: 1, minHeight: 0, width: "100%" }, providerWizardModelScrollContent: { width: "100%", paddingBottom: 8 }, providerWizardModelToolbar: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 8 }, providerWizardModelStatusRow: { flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardModelGroup: { gap: 6, paddingTop: 4 }, providerWizardModelGroupHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }, providerWizardModelGroupTools: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, providerWizardModelList: { borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground, paddingHorizontal: 8, paddingVertical: 5, gap: 1 }, providerWizardModelSourceGroup: { minWidth: 0, gap: 1, paddingTop: 2 }, // The producer heading is the picker's one level above a route heading, so it // carries the label ink and weight the route heading does not.
+  providerWizardModelSourceHeading: { color: systemColors.label, fontSize: UI_TIP_FONT_SIZE, fontWeight: "600", lineHeight: 15, paddingTop: 3 }, providerWizardModelCheckbox: { width: "100%", minHeight: 24 }, providerWizardManualModelRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardManualModelCheckbox: { flex: 1, minWidth: 0 }, providerWizardManualModelUpstream: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE }, providerWizardModelSummary: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "500", paddingTop: 4 }, providerWizardModeControl: { width: "100%", height: 26, flexShrink: 0 }, providerWizardPicker: { width: "100%", minWidth: 0, height: 26 }, providerWizardInput: { width: "100%", minHeight: 26, color: systemColors.label, fontSize: UI_FONT_SIZE }, providerWizardSecretInput: { width: "100%", minHeight: 26 }, providerWizardHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15, paddingVertical: 2 }, providerWizardFooter: { minHeight: 46, paddingHorizontal: 20, paddingVertical: 8, flexDirection: "row", alignItems: "center", gap: 6, borderTopWidth: 0, backgroundColor: systemColors.window }, providerWizardFooterSpacer: { flex: 1 }, providerWizardFooterStatus: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, providerWizardFooterActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 },
   routeTablePane: { flex: 1, minWidth: 0, minHeight: 0 },
   // The model detail's own label column, so every row in that pane — the
   // fields, the rate row, the protocol pickers, and the window row — draws its

@@ -32,6 +32,7 @@ from .schema import (
     MODEL_ORDER_MODES,
     PUBLIC_MODEL_CONTEXT_KEY,
     RANDOM_DEPLOYMENT_ID_RE,
+    RETIRED_PROVIDER_AUTH_KINDS,
     UPSTREAM_PROTOCOL_MODE_KEY,
     UPSTREAM_URL_SURFACE_KEY,
     _as_dict,
@@ -326,8 +327,11 @@ def _dump_providers_section(providers: list[dict[str, Any]]) -> str:
         auth_kind = _string_value(provider.get("auth_kind")).strip()
         credential_ref = _string_value(provider.get("auth_credential_ref")).strip()
         if auth_kind or credential_ref:
+            # Same vocabulary on the way out: a draft read from a document that
+            # still names a retired kind must not write it back.
+            stored_kind = auth_kind or "api_key"
             raw_auth = {
-                "kind": auth_kind or "api_key",
+                "kind": RETIRED_PROVIDER_AUTH_KINDS.get(stored_kind, stored_kind),
                 **({"credential_ref": credential_ref} if credential_ref else {}),
             }
         auth = _provider_auth(raw_auth)

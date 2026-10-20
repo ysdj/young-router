@@ -469,7 +469,7 @@ PI_WEB_ACCESS_NODE_WORK="$RUNTIME_WORK/node"
 mkdir -p "$STAGING_CACHE"
 WORKBUDDY_CONNECT_WORK="$STAGING_CACHE/workbuddy-connect"
 VERIDROP_WORK="$STAGING_CACHE/veridrop"
-OPENCODE2DSH_WORK="$STAGING_CACHE/opencode2dsh"
+OUR_FREE_MODEL_WORK="$STAGING_CACHE/our-free-model"
 DSH_VISION_ROUTER_WORK="$STAGING_CACHE/dsh-vision-router"
 # Each job is started in this shell, not inside a command substitution: a
 # substitution runs in a subshell, so a job it launches is not a child of the
@@ -483,17 +483,17 @@ STAGING_PIDS+=("$!")
 "${PI_WEB_ACCESS_UPDATE_COMMAND[@]}" "$PROJECT_ROOT/scripts/update_dsh_vision_router.py" \
   --output "$DSH_VISION_ROUTER_WORK" &
 STAGING_PIDS+=("$!")
-# OpenCode Zen's free lane is reached through the published third-party plugin,
-# so it joins the same re-check: every artifact build resolves the current
-# release instead of shipping whichever version was reviewed last.
+# Our Free Model is reached through the published third-party package, so it
+# joins the same re-check: every artifact build resolves the current release
+# instead of shipping whichever version was reviewed last.
 # No ``--node-source`` here: that argument is ``pi-web-access``'s, because that
-# integration ships a Node of its own.  The opencode2dsh worker is a module the
-# Core imports and runs with the runtime it already installs
+# integration ships a Node of its own.  The Our Free Model worker is a module
+# the Core imports and runs with the runtime it already installs
 # (``Core/runtime/bin/node``), so handing this stager a Node to copy would only
 # add a second 90 MB runtime to the bundle.
-OPENCODE2DSH_NODE_ARGS=("$PROJECT_ROOT/scripts/update_opencode2dsh.py"
-  --output "$OPENCODE2DSH_WORK")
-"${PI_WEB_ACCESS_UPDATE_COMMAND[@]}" "${OPENCODE2DSH_NODE_ARGS[@]}" &
+OUR_FREE_MODEL_STAGE_ARGS=("$PROJECT_ROOT/scripts/update_our_free_model.py"
+  --output "$OUR_FREE_MODEL_WORK")
+"${PI_WEB_ACCESS_UPDATE_COMMAND[@]}" "${OUR_FREE_MODEL_STAGE_ARGS[@]}" &
 STAGING_PIDS+=("$!")
 
 pnpm install --frozen-lockfile
@@ -787,7 +787,7 @@ start_copy copy_tree "$PI_WEB_ACCESS_PACKAGE_WORK" "$CORE/young_router/adapters/
 start_copy copy_tree "$VERIDROP_WORK" "$CORE/young_router/adapters/veridrop"
 start_copy copy_tree "$WORKBUDDY_CONNECT_WORK" "$CORE/young_router/adapters/workbuddy-connect"
 start_copy copy_tree "$DSH_VISION_ROUTER_WORK" "$CORE/young_router/adapters/dsh-vision-router"
-start_copy copy_tree "$OPENCODE2DSH_WORK" "$CORE/young_router/adapters/opencode2dsh"
+start_copy copy_tree "$OUR_FREE_MODEL_WORK" "$CORE/young_router/adapters/our-free-model"
 
 if [[ -n "$RUNTIME_SOURCE" ]]; then
   if [[ ! -d "$RUNTIME_SOURCE/python" \

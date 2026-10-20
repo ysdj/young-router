@@ -514,6 +514,10 @@ export const zhHans: Record<TranslationKey, string> = {
   "providers.probeInlineMixed": "连接异常",
   "providers.probeInlineBlocked": "协议不通",
   "providers.probeInlineAuthError": "密钥被拒",
+  // A 403 that refused the network, not the key: the free lane answers this
+  // way when the upstream sees the egress as abusive, and saying "密钥被拒"
+  // sent the user to re-enter a credential that was never the problem.
+  "providers.probeInlineEgressBlocked": "出口被拒",
   "providers.probeInlineUnsupported": "无此协议",
   "providers.probeInlineHttpError": "上游报错",
   "providers.probeInlineInvalidResponse": "返回异常",
@@ -651,7 +655,9 @@ export const zhHans: Record<TranslationKey, string> = {
   "providers.type.apiKey": "API 密钥",
   "providers.type.workbuddy": "WorkBuddy",
   "providers.type.workbuddyAI": "WorkBuddy AI",
-  "providers.type.opencode2dsh": "Our Free Model",
+  "providers.type.ourFreeModel": "Our Free Model · OpenCode 免费通道",
+  "providers.type.ourFreeModelKilo": "Our Free Model · Kilo 通道",
+  "providers.type.ourFreeModelEAC": "Our Free Model · EAC 协付通道",
   // The picker groups Our Free Model publishes for its roster: what this
   // network egress can use now, and what its regional gate refuses but keeps
   // visible and isolated.  The headings are the upstream's own, so the pane and
@@ -659,7 +665,13 @@ export const zhHans: Record<TranslationKey, string> = {
   "providers.laneSource": "分组",
   "providers.laneRoute.main": "Our Free Model",
   "providers.laneRoute.region": "Our Free Model · region-limited",
-  "providers.wizard.opencode2dshHint": "由内置的免费模型集成提供模型，模型会直接导入，无需账号或填写密钥。",
+  // The producers one roster is served from, as the upstream catalog tags them.
+  // A row's id does not identify its producer, so these headings are the only
+  // thing that tells an anonymous-lane model from a Kilo one.
+  "providers.laneChannel.free": "OpenCode 免费通道",
+  "providers.laneChannel.kilo": "Kilo 通道",
+  "providers.laneChannel.eac": "EAC 协付通道",
+  "providers.wizard.ourFreeModelHint": "由内置的免费模型集成提供模型，模型会直接导入，无需账号或填写密钥。",
   "providers.workbuddyAccountHint": "登录与模型目录都由 WorkBuddy 自己的桌面 App 维护，本应用只负责调用。",
   "providers.workbuddyAccount": "账号",
   "providers.workbuddyCreditUnavailable": "暂不可用",
