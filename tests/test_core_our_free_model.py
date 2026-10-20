@@ -1203,3 +1203,40 @@ class AddOneChannelTests(unittest.TestCase):
             self.assertEqual(len(providers), 1)
             self.assertEqual(providers[0]["name"], our_free_model.OUR_FREE_MODEL_DISPLAY_NAMES[our_free_model.OUR_FREE_MODEL_PROVIDER])
             self.assertEqual([m["model_name"] for m in providers[0]["models"]], ["big-pickle"])
+
+
+class CatalogReadIsPerChannelTests(unittest.TestCase):
+    """A provider's roster is its own channel's rows, not the whole lane's.
+
+    One worker serves every channel, so its answer is the whole roster.  Passing
+    that answer through unchanged put the Kilo rows under the anonymous
+    channel's heading: the picker groups by channel, and a roster handed to it
+    *for* that channel gave it no reason to doubt the rows were that channel's.
+    """
+
+    ROSTER = [{"id": "big-pickle"}, {"id": "kilo-auto/free"}, {"id": "eac-model"}]
+    CHANNELS = {"big-pickle": "", "kilo-auto/free": "kilo", "eac-model": "eac"}
+
+    def test_a_channel_read_returns_only_that_channel(self) -> None:
+        listed = {
+            provider: [
+                entry["id"]
+                for entry in self.ROSTER
+                if our_free_model.provider_for_channel(self.CHANNELS.get(entry["id"])) == provider
+            ]
+            for provider in our_free_model.OUR_FREE_MODEL_PROVIDERS
+        }
+        self.assertEqual(listed[our_free_model.OUR_FREE_MODEL_PROVIDER], ["big-pickle"])
+        self.assertEqual(listed[our_free_model.OUR_FREE_MODEL_KILO_PROVIDER], ["kilo-auto/free"])
+        self.assertEqual(listed[our_free_model.OUR_FREE_MODEL_EAC_PROVIDER], ["eac-model"])
+
+    def test_the_read_filters_by_the_requested_provider(self) -> None:
+        """The filter is in the read itself, not left to every caller."""
+
+        source = (
+            Path(__file__).resolve().parent.parent / "young_router/adapters/our_free_model.py"
+        ).read_text(encoding="utf-8")
+        read = source.split("def models(", 1)[1].split("def _request(", 1)[0]
+        self.assertIn("PROVIDER_TO_CHANNEL[provider]", read)
+        self.assertIn("provider_for_channel(", read)
+        self.assertIn('"models": models,', read)

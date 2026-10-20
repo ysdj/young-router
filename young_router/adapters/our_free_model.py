@@ -707,12 +707,25 @@ class OurFreeModelRuntime:
                 "/control/models",
                 timeout=_MODELS_TIMEOUT_SECONDS,
             )
+        # One worker serves every channel, so its answer is the whole roster.
+        # A caller that asked for one provider asked for that channel's slice:
+        # returning all of it made the Kilo rows appear under the anonymous
+        # channel's heading, because the picker groups by channel and had no
+        # reason to doubt a roster it was handed for that channel.
+        channel = PROVIDER_TO_CHANNEL[provider]
+        channels = _channel_membership(document.get("channels"))
+        models = [
+            dict(entry)
+            for entry in document.get("models") or []
+            if isinstance(entry, Mapping)
+            and provider_for_channel(channels.get(str(entry.get("id", "")).strip())) == provider
+        ]
         return {
             "operation": "our_free_model_models",
             "provider": provider,
             "available": document.get("ok") is True,
             "source": "dsh-our-free-model",
-            "models": list(document.get("models") or []),
+            "models": models,
             # The upstream's own picker groups this roster into "what this
             # egress can use" and "what its regional gate refuses".  Those
             # routes travel as their membership lists rather than as a field on
