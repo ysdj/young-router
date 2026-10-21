@@ -504,6 +504,13 @@ def _responses_stream_chunk_for_delivery(
             chunk,
             request_data,
         )
+        if (
+            _stream_chunk_type(chunk).startswith("response.reasoning_summary_")
+            and not _responses_web_search_bridge_module._public_reasoning_is_allowed(
+                request_data
+            )
+        ):
+            return None
         return chunk
     if isinstance(chunk, (str, bytes)):
         normalized = _normalize_sse_response_completed_chunk(
@@ -555,6 +562,15 @@ def _responses_stream_chunk_for_delivery(
             json_chunk,
             request_data,
         )
+        if (
+            _stream_chunk_type(json_chunk).startswith(
+                "response.reasoning_summary_"
+            )
+            and not _responses_web_search_bridge_module._public_reasoning_is_allowed(
+                request_data
+            )
+        ):
+            return None
         return _json_stream_event(json_chunk)
     return chunk
 
@@ -925,6 +941,7 @@ def _is_young_router_terminal_failure_event(chunk: Any) -> bool:
         "upstream_auth_or_balance",
         "upstream_compaction_failure",
         "upstream_compaction_unsupported",
+        "upstream_context_too_large",
         "upstream_relay_capacity",
         "upstream_request_body_too_large",
         "upstream_route_failure",
@@ -1536,6 +1553,25 @@ def _synthesized_failed_response_event(
         )
         error_type = "server_error"
         error_code = "upstream_auth_or_balance"
+    elif _routing_module._is_context_size_error(exception):
+        # The conversation itself is what the upstream refused, not the route:
+        # every candidate route would refuse the same bytes, so a generic
+        # "route failed / retry later" sentence sends the user into a retry
+        # loop the client keeps re-running.  Naming the limit is the one thing
+        # the reader can act on, and ``invalid_request_error`` is what stops a
+        # client from treating it as a transport hiccup worth reconnecting.
+        model_group = (
+            _responses_execution_module._request_model_group(request_data)
+            or request_data.get("model")
+            or "the requested model"
+        )
+        message = (
+            f"The upstream rejected this conversation as longer than "
+            f"{model_group}'s context window on every candidate route. Compact "
+            "or start a new task so the history sent upstream is smaller."
+        )
+        error_type = "invalid_request_error"
+        error_code = "upstream_context_too_large"
     elif _routing_module._request_body_size_rejected(request_data):
         # Every candidate route refused these bytes.  The rejection is the
         # request's own size, not a route outage, so the client is told what to
@@ -1553,7 +1589,19 @@ def _synthesized_failed_response_event(
         error_type = "invalid_request_error"
         error_code = "upstream_request_body_too_large"
     else:
-        message = "The upstream model route failed before a final assistant response was available."
+        # Nothing this router knows can explain the stop, so the sentence says
+        # exactly that and no more.  The generic "the route failed before an
+        # answer was available" wording this branch used to carry is banned
+        # repo-wide (tests/test_proxy_module_integrity.py): clients render it as
+        # a retry tip and re-send a request the router already knows is dead,
+        # which is the reconnect loop a generic sentence causes.  A failure that
+        # has a cause gets its own branch above; one that does not says so
+        # plainly and stops.
+        message = (
+            "The turn ended before the assistant answered, and the router "
+            "could not classify the stop. The route trace for this request "
+            "records the upstream status and the exception that ended it."
+        )
         error_type = "server_error"
         error_code = "upstream_route_failure"
     response = {
@@ -1602,11 +1650,27 @@ def _synthesized_native_stream_error_chunk(
     )
     error_code = _native_stream_error_code(exception)
     message = _native_stream_error_message(model, exception, request_data)
+    # A refusal the client can act on is not a server failure.  Labelling a
+    # context-window refusal ``server_error`` is what made a client reconnect
+    # and resend the same oversized history; the wire type is what stops it.
+    error_type = (
+        "invalid_request_error"
+        if error_code
+        in {
+            "upstream_context_too_large",
+            "upstream_prompt_rejected",
+            "image_generation_tool_unavailable",
+            "upstream_request_body_too_large",
+        }
+        else "server_error"
+    )
     if _request_is_anthropic_messages_stream(request_data):
         payload = {
             "type": "error",
             "error": {
-                "type": "api_error",
+                "type": "invalid_request_error"
+                if error_type == "invalid_request_error"
+                else "api_error",
                 "message": message,
             },
         }
@@ -1614,7 +1678,7 @@ def _synthesized_native_stream_error_chunk(
         return f"event: error\ndata: {encoded}\n\n".encode("utf-8")
     return {
         "error": {
-            "type": "server_error",
+            "type": error_type,
             "code": error_code,
             "message": message,
         }
@@ -1667,6 +1731,21 @@ def _native_stream_error_message(
             "The upstream model route stopped sending this response, so the "
             "turn was cut short. Send the message again or choose another "
             "model route."
+        )
+    if _routing_module._is_context_size_error(exception):
+        # A terminal ``response.failed`` event for a context refusal is read by
+        # the client as an ordinary route failure unless this event says
+        # otherwise, which is what produced the endless "reconnecting 5/5"
+        # loop over a request no retry can ever fit.
+        model_group = (
+            _responses_execution_module._request_model_group(request_data)
+            or request_data.get("model")
+            or "the requested model"
+        )
+        return (
+            f"The upstream rejected this conversation as longer than "
+            f"{model_group}'s context window. Compact or start a new task so "
+            "the history sent upstream is smaller."
         )
     if getattr(exception, "stream_incomplete", False):
         return (
@@ -3949,7 +4028,10 @@ async def _collect_responses_stream_completed_payload(
         saw_visible_output=saw_visible_output,
         initial_chunk_count=completion_state.event_count or len(buffer),
     ):
-        sanitized_chunk = _responses_web_search_bridge_module._sanitize_web_search_stream_chunk(chunk)
+        sanitized_chunk = _responses_web_search_bridge_module._sanitize_web_search_stream_chunk(
+            chunk,
+            request_data,
+        )
         if sanitized_chunk is None:
             continue
         completion_state.remember(sanitized_chunk)
@@ -4005,13 +4087,15 @@ async def _yield_validated_structured_codex_compaction_stream(
 
     def remember(chunk: Any) -> Optional[str]:
         sanitized_chunk = _responses_web_search_bridge_module._sanitize_web_search_stream_chunk(
-            chunk
+            chunk,
+            request_data,
         )
         if sanitized_chunk is None:
             return None
         sanitized_chunk = _responses_web_search_bridge_module._sanitize_raw_tool_call_text_stream_chunk(
             sanitized_chunk,
             raw_tool_call_text_filter,
+            request_data,
         )
         if sanitized_chunk is None:
             return None
@@ -4377,6 +4461,7 @@ async def _yield_guarded_original_stream(
         return _responses_web_search_bridge_module._sanitize_raw_tool_call_text_stream_chunk(
             chunk,
             raw_tool_call_text_filter,
+            request_data,
         )
 
     def should_consume_bridge_calls() -> bool:
@@ -5355,7 +5440,10 @@ async def _yield_guarded_original_stream(
         _responses_web_search_bridge_module._mark_provider_native_web_search_event(
             request_data, chunk
         )
-        sanitized_chunk = _responses_web_search_bridge_module._sanitize_web_search_stream_chunk(chunk)
+        sanitized_chunk = _responses_web_search_bridge_module._sanitize_web_search_stream_chunk(
+            chunk,
+            request_data,
+        )
         if sanitized_chunk is None:
             continue
         sanitized_chunk = sanitize_visible_text_chunk(sanitized_chunk)
@@ -5504,7 +5592,10 @@ async def _yield_guarded_original_stream(
             _responses_web_search_bridge_module._mark_provider_native_web_search_event(
                 request_data, chunk
             )
-            sanitized_chunk = _responses_web_search_bridge_module._sanitize_web_search_stream_chunk(chunk)
+            sanitized_chunk = _responses_web_search_bridge_module._sanitize_web_search_stream_chunk(
+                chunk,
+                request_data,
+            )
             if sanitized_chunk is None:
                 continue
             sanitized_chunk = sanitize_visible_text_chunk(sanitized_chunk)
@@ -6271,12 +6362,16 @@ async def _yield_start_buffered_stream_with_error_fallback(
             _responses_web_search_bridge_module._mark_provider_native_web_search_event(
                 request_data, chunk
             )
-            sanitized_chunk = _responses_web_search_bridge_module._sanitize_web_search_stream_chunk(chunk)
+            sanitized_chunk = _responses_web_search_bridge_module._sanitize_web_search_stream_chunk(
+                chunk,
+                request_data,
+            )
             if sanitized_chunk is None:
                 continue
             sanitized_chunk = _responses_web_search_bridge_module._sanitize_raw_tool_call_text_stream_chunk(
                 sanitized_chunk,
                 raw_tool_call_text_filter,
+                request_data,
             )
             if sanitized_chunk is None:
                 continue

@@ -165,6 +165,34 @@ class SessionAffinityFilterTests(HookTestCase):
             self.assertEqual(len(candidates), 1)
             self.assertEqual(candidates[0]["model_info"]["id"], "dep-b")
 
+    def test_higher_order_sticky_deployment_does_not_hide_lowest_order(self) -> None:
+        hooks, _ = load_hook_module()
+        with tempfile.TemporaryDirectory() as directory:
+            self.set_env(
+                hooks._SESSION_DEPLOYMENT_AFFINITY_FILE_ENV,
+                str(Path(directory) / "session-deployment-affinity.json"),
+            )
+            hooks._record_session_deployment_affinity(
+                {
+                    "proxy_server_request": {"headers": {"session_id": "sess-123"}},
+                    "model_info": {"id": "dep-sticky"},
+                    "metadata": {"model_group": "default-chat"},
+                }
+            )
+            candidates = [
+                _deployment("dep-sticky", order=0.15),
+                _deployment("dep-preferred", order=0.11),
+            ]
+
+            unchanged, sticky, applied = hooks._with_session_deployment_affinity(
+                candidates,
+                self._request(),
+                "default-chat",
+            )
+            self.assertFalse(applied)
+            self.assertEqual(sticky, "dep-sticky")
+            self.assertEqual(unchanged, candidates)
+
     def test_no_sticky_or_absent_sticky_keeps_candidates(self) -> None:
         hooks, _ = load_hook_module()
         with tempfile.TemporaryDirectory() as directory:
@@ -269,6 +297,40 @@ class HookFilterSessionAffinityTests(HookTestCase):
             )
             self.assertEqual(len(filtered), 1)
             self.assertEqual(filtered[0]["model_info"]["id"], "dep-b")
+
+    async def test_filter_deployments_leaves_order_for_litellm_to_apply(self) -> None:
+        hooks, _ = load_hook_module()
+        hook = hooks.YoungRouterHook()
+        with tempfile.TemporaryDirectory() as directory:
+            self.set_env(
+                hooks._SESSION_DEPLOYMENT_AFFINITY_FILE_ENV,
+                str(Path(directory) / "session-deployment-affinity.json"),
+            )
+            request_kwargs = {
+                "proxy_server_request": {"headers": {"session_id": "sess-123"}},
+                "model": "default-chat",
+                "stream": True,
+                "input": "hi",
+            }
+            hooks._record_session_deployment_affinity(
+                {
+                    "proxy_server_request": {"headers": {"session_id": "sess-123"}},
+                    "model_info": {"id": "dep-sticky"},
+                    "metadata": {"model_group": "default-chat"},
+                }
+            )
+            candidates = [
+                _deployment("dep-sticky", order=0.15),
+                _deployment("dep-preferred", order=0.11),
+            ]
+
+            filtered = await hook.async_filter_deployments(
+                model="default-chat",
+                healthy_deployments=candidates,
+                messages=None,
+                request_kwargs=request_kwargs,
+            )
+            self.assertEqual(filtered, candidates)
 
     async def test_sticky_deployment_in_cooldown_falls_back_to_peer(self) -> None:
         """Affinity never forces a cooled deployment: the peer wins instead."""

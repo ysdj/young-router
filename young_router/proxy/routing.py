@@ -1547,10 +1547,12 @@ def _with_session_deployment_affinity(
 ) -> tuple[Any, Optional[str], bool]:
     """Narrow eligible candidates to the session's cache-affinity deployment.
 
-    Applied last, after order/cooldown/capability filtering, so the sticky
-    deployment is always fully eligible. When it is absent (cooldown,
-    capability exclusion, retry exclusion), selection is unchanged; a later
-    success on another deployment re-points the affinity.
+    This callback runs before LiteLLM applies its own route-order filter, so
+    affinity may only choose a deployment in the pool's lowest order tier.
+    Otherwise a warm route at a higher order would hide a newly available,
+    lower-order route and make the configured order ineffective. When the
+    sticky deployment is absent or outside that tier, selection is unchanged;
+    a later success on another deployment re-points the affinity.
     """
 
     if not _session_deployment_affinity_enabled():
@@ -1560,10 +1562,39 @@ def _with_session_deployment_affinity(
     sticky = _session_affinity_deployment_id(request_kwargs, model_group)
     if not sticky:
         return candidates, None, False
+    sticky_deployment = None
     for deployment in candidates:
         if _responses_request_module._deployment_id(deployment) == sticky:
-            return [deployment], sticky, True
-    return candidates, sticky, False
+            sticky_deployment = deployment
+            break
+    if sticky_deployment is None:
+        return candidates, sticky, False
+
+    candidate_orders = [
+        order
+        for deployment in candidates
+        if (order := _deployment_configured_order(deployment)) is not None
+    ]
+    if candidate_orders:
+        sticky_order = _deployment_configured_order(sticky_deployment)
+        if sticky_order is None or sticky_order != min(candidate_orders):
+            return candidates, sticky, False
+    return [sticky_deployment], sticky, True
+
+
+def _deployment_configured_order(deployment: Any) -> Optional[_RouteOrder]:
+    """The explicit order LiteLLM compares when selecting a route tier."""
+
+    if not isinstance(deployment, dict):
+        return None
+    for section_name in ("litellm_params", "model_info"):
+        section = deployment.get(section_name)
+        if not isinstance(section, dict):
+            continue
+        order = _coerce_order(section.get("order"))
+        if order is not None:
+            return order
+    return None
 
 
 _CODEX_COMPACTION_CAPABILITY_PROBE_TIMEOUT_SECONDS = 15.0

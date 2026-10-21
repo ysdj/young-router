@@ -271,7 +271,22 @@ def disabled_models_path(config_path: pathlib.Path) -> pathlib.Path:
 
 
 def relay_accounts_path(config_path: pathlib.Path) -> pathlib.Path:
-    return config_path.parent / ".litellm-runtime" / "relay-accounts.json"
+    """The relay account document that belongs beside this configuration.
+
+    The configuration lives in the runtime directory itself
+    (``<root>/.litellm-runtime/config.yaml``), so joining another
+    ``.litellm-runtime`` under its parent names a second document one level
+    too deep.  That path is exactly where an old layout left an empty file, so
+    appending the directory unconditionally silently pointed every reader at a
+    relay list nobody writes: the panes showed no accounts while the real
+    document sat beside the configuration.  Append the directory only when the
+    configuration is not already inside it.
+    """
+
+    parent = config_path.parent
+    if parent.name == ".litellm-runtime":
+        return parent / "relay-accounts.json"
+    return parent / ".litellm-runtime" / "relay-accounts.json"
 
 
 def _timestamp() -> str:

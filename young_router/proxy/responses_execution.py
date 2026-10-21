@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from . import image_generation as _image_generation_module
+from . import deepseek_reasoning as _deepseek_reasoning_module
 from . import responses_output as _responses_output_module
 from . import image_inputs as _image_inputs_module
 from . import responses_request as _responses_request_module
@@ -58,6 +59,21 @@ def _chat_stream_delta_text(chunk: Any) -> str:
     delta = _chat_stream_object_get(choice, "delta")
     content = _chat_stream_object_get(delta, "content")
     return content if isinstance(content, str) else ""
+
+
+def _chat_stream_delta_reasoning(
+    chunk: Any,
+    *,
+    include_raw: bool,
+) -> str:
+    if not include_raw:
+        return ""
+    choice = _chat_stream_first_choice(chunk)
+    delta = _chat_stream_object_get(choice, "delta")
+    reasoning = _chat_stream_object_get(delta, "reasoning_content")
+    if not isinstance(reasoning, str):
+        reasoning = _chat_stream_object_get(delta, "reasoning")
+    return reasoning if isinstance(reasoning, str) else ""
 
 
 def _chat_completion_message_text(response: Any) -> str:
@@ -183,7 +199,6 @@ def _chat_bridge_stream_payload(
         "stream": True,
         "stream_options": {"include_usage": True},
     }
-
     max_completion_tokens = _request_context_module._positive_int_value(
         bridge_kwargs.get("max_completion_tokens")
     )
@@ -227,6 +242,7 @@ async def _responses_chat_bridge_text_stream_from_chat_stream(
     bridge_kwargs: dict,
 ) -> Any:
     response_id = f"resp_chat_bridge_{time.time_ns()}"
+    reasoning_id = f"rs_chat_bridge_{time.time_ns()}"
     message_id = f"msg_chat_bridge_{time.time_ns()}"
     model = (
         _request_selected_deployment_model_group(bridge_kwargs)
@@ -235,6 +251,10 @@ async def _responses_chat_bridge_text_stream_from_chat_stream(
         or "unknown"
     )
     text_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    include_deepseek_raw = _deepseek_reasoning_module.raw_reasoning_requested(
+        bridge_kwargs
+    )
     usage = None
 
     yield {
@@ -256,7 +276,6 @@ async def _responses_chat_bridge_text_stream_from_chat_stream(
             "type": "message",
             "status": "in_progress",
             "role": "assistant",
-            "phase": "final_answer",
             "content": [],
         },
     }
@@ -272,6 +291,12 @@ async def _responses_chat_bridge_text_stream_from_chat_stream(
         chunk_usage = _chat_stream_usage(chunk)
         if chunk_usage is not None:
             usage = chunk_usage
+        reasoning_delta = _chat_stream_delta_reasoning(
+            chunk,
+            include_raw=include_deepseek_raw,
+        )
+        if reasoning_delta:
+            reasoning_parts.append(reasoning_delta)
         delta = _chat_stream_delta_text(chunk)
         if not delta:
             continue
@@ -285,12 +310,27 @@ async def _responses_chat_bridge_text_stream_from_chat_stream(
         }
 
     text = "".join(text_parts)
+    reasoning = "".join(reasoning_parts)
+    if reasoning:
+        reasoning_item = {
+            "id": reasoning_id,
+            "type": "reasoning",
+            "status": "completed",
+            "role": "assistant",
+            "summary": [{"type": "summary_text", "text": reasoning}],
+        }
+        yield {
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": reasoning_item,
+        }
+    else:
+        reasoning_item = None
     message = {
         "id": message_id,
         "type": "message",
         "status": "completed",
         "role": "assistant",
-        "phase": "final_answer",
         "content": [
             {
                 "type": "output_text",
@@ -327,7 +367,7 @@ async def _responses_chat_bridge_text_stream_from_chat_stream(
             "status": "completed",
             "model": model,
             "output_text": text,
-            "output": [message],
+            "output": [item for item in (reasoning_item, message) if item is not None],
         },
     }
     if usage is not None:

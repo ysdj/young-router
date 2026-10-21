@@ -341,6 +341,13 @@ export interface ProviderModelSummary {
   binding_health?: ModelBindingHealth;
   upstream_protocol_mode?: "fallback" | "fixed";
   upstream_url_surface?: ProbeSurfaceName;
+  /**
+   * The surfaces this route can be measured on.  One entry means the route is
+   * served by a worker this deployment runs, which mounts a single wire: the
+   * pane states that protocol instead of offering a choice the route cannot
+   * honour.  Absent on a projection that predates the field.
+   */
+  probe_surfaces?: string[];
   deep_probe?: ModelDeepProbePlan;
   probe?: {
     available: boolean;

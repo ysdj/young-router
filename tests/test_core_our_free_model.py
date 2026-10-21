@@ -599,6 +599,44 @@ class OurFreeModelProviderTests(unittest.TestCase):
                 self.assertEqual(model["api_key_name"], our_free_model.API_KEY_NAME)
                 self.assertTrue(model["provider_key_id"])
 
+    def test_a_pick_does_not_pay_for_a_second_full_catalog_refresh(self) -> None:
+        """The picker was painted by a read, so the write must not repeat it.
+
+        Importing a picked row used to ask the worker to refresh its whole
+        remote directory before a single row could appear, so the ＋ in the
+        picker sheet sat for the length of one upstream round trip per press.
+        The pick is a write against a roster this pane already holds; a
+        non-refresh read is the record the pick was made against, and the
+        worker answers it only after its own first refresh has landed.
+        """
+
+        directory, domain, _config = self._domain()
+        with directory:
+            provider = domain.dispatch(
+                "service_provider.add", {"kind": "our_free_model_login"}
+            )["providers"][0]
+            refreshes: list[str] = []
+            original = domain._service_catalog_operation
+
+            def watched(requested_provider: str, *, refresh: bool) -> None:
+                refreshes.append(f"refresh={refresh}")
+                original(requested_provider, refresh=refresh)
+
+            with mock.patch.object(
+                ProvidersModelsDomain, "_service_catalog_operation", side_effect=watched
+            ):
+                domain.dispatch(
+                    "model.import_service_catalog",
+                    {"provider_id": provider["id"], "models": [entry["id"] for entry in CATALOG]},
+                )
+
+        self.assertEqual(["refresh=False"], refreshes)
+        models = domain.snapshot()["providers"][0]["models"]
+        self.assertEqual(
+            [model["upstream_model"] for model in models],
+            [entry["id"] for entry in CATALOG],
+        )
+
     def test_re_picking_a_lane_roster_adds_nothing_twice(self) -> None:
         """A refresh over what the provider already carries is not a second copy."""
 

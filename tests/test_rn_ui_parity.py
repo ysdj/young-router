@@ -613,6 +613,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'const uniformStatus = surfaceStatuses.size === 1 ? [...surfaceStatuses][0] : "";',
             '? translate("providers.probeInlineEgressBlocked")',
             '? translate("providers.probeInlineAuthError")',
+            '? translate("providers.probeInlineRateLimited")',
             '? translate("providers.probeInlineUnsupported")',
             'const compactReason = (deepTestIncluded ? degradationLine : "")',
             'const degradationMeasured = availableCount > 0 || Boolean(stringValue(degradation.verdict));',
@@ -641,6 +642,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '<ProtocolPicker providerId={providerId}',
             'function ProtocolPicker(',
             'const mode = stringValue(model.upstream_protocol_mode, "fallback");',
+            'const singleSurface = stringList(model.probe_surfaces);',
+            'const onlySurface = singleSurface.length === 1 ? singleSurface[0] : "";',
+            'if (onlySurface) {',
             'PickerField label={translate("providers.protocolMode")}',
             'value={fixed ? "fixed" : "fallback"}',
             'label={fixed ? translate("providers.fixedProtocol") : translate("providers.fallbackProtocol")}',
@@ -700,6 +704,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'const uniformStatus = surfaceStatuses.size === 1 ? [...surfaceStatuses][0] : "";',
             '? translate("providers.probeInlineEgressBlocked")',
             '? translate("providers.probeInlineAuthError")',
+            '? translate("providers.probeInlineRateLimited")',
             '? translate("providers.probeInlineUnsupported")',
             'const compactReason = (deepTestIncluded ? degradationLine : "")',
             'const degradationMeasured = availableCount > 0 || Boolean(stringValue(degradation.verdict));',
@@ -724,6 +729,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'return "providers.probeInlineAuthError";',
             'case "egress_blocked":',
             'return "providers.probeInlineEgressBlocked";',
+            'case "rate_limited":',
+            'return "providers.probeInlineRateLimited";',
         ):
             self.assert_ui_has(marker)
         for marker in (
@@ -753,6 +760,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # sends a user to a key that the upstream never read.
         self.assertIn('"providers.probeInlineEgressBlocked": "Egress refused"', self.en)
         self.assertIn('"providers.probeInlineEgressBlocked": "出口被拒"', self.zh)
+        # A 429 is an answer, not a refusal: it must never borrow the word for
+        # "this protocol does not work here".
+        self.assertIn('"providers.probeInlineRateLimited": "Rate limited"', self.en)
+        self.assertIn('"providers.probeInlineRateLimited": "被限流"', self.zh)
+        self.assertIn(
+            '| "providers.probeInlineRateLimited"',
+            (ROOT / "rn/packages/shared/src/i18n/types.ts").read_text(encoding="utf-8"),
+        )
         for marker in (
             'function nativeButtonTightWidth(title: string, plainLink = false): number {',
             'return Math.max(44, Math.ceil(nativeControlTextWidth(title) + 20));',
@@ -853,6 +868,26 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # The tip follows the live mode, and a chosen value answers it.
         self.assert_ui_has('setTipOpen(false);\n    void dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { upstream_protocol_mode } });')
         self.assert_ui_has('setTipOpen(false);\n    void dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { upstream_url_surface } });')
+        # A route Core says answers on one surface only gets no pickers: both
+        # would offer a choice the route cannot honour.  The fact stays readable
+        # as one value row, with the sentence explaining why on its mark.
+        for marker in (
+            'const singleSurface = stringList(model.probe_surfaces);',
+            'const onlySurface = singleSurface.length === 1 ? singleSurface[0] : "";',
+            'if (onlySurface) {',
+            'const surfaceLabel = probeSurfaceLabel(onlySurface, translate);',
+            'const fixedHint = translate("providers.protocolSurfaceFixedHint", { surface: surfaceLabel });',
+            'translate("providers.protocolSurfaceFixed")',
+            'accessibilityLabel={fixedHint}',
+        ):
+            self.assert_ui_has(marker)
+        for locale in (self.zh, self.en):
+            self.assertIn('"providers.protocolSurfaceFixed":', locale)
+            self.assertIn('"providers.protocolSurfaceFixedHint":', locale)
+        self.assertIn(
+            '| "providers.protocolSurfaceFixed"',
+            (ROOT / "rn/packages/shared/src/i18n/types.ts").read_text(encoding="utf-8"),
+        )
 
     def test_provider_probe_button_reports_progress_without_graying_out(self) -> None:
         self.assert_ui_has(
@@ -3283,6 +3318,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "logs.cost",
             "logs.tokenPair",
             "logs.type",
+            "logs.account",
             "logs.onlineUsageLoadMore",
             "logs.onlineUsageLoadingMore",
             "logs.onlineUsageFiltering",
@@ -3312,6 +3348,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # carries the station's full name rather than an alias.
         renderer = self.ui.split("function renderOnlineUsageRecord", 1)[1].split("function renderLogRecord", 1)[0]
         self.assertIn('compactLogValue(value.source_label)', renderer)
+        self.assertIn("const account = compactLogValue(value.source_account);", renderer)
+        self.assertIn('[translate("logs.account"), account],', renderer)
         self.assertIn("const family = compactLogValue(value.source_family);", renderer)
         self.assertIn("[translate(\"logs.type\"), family],", renderer)
         self.assertNotIn('value.source_label) || compactLogValue(value.source)', renderer)
@@ -3325,6 +3363,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # The relay's name stops at its own ceiling, so a short name does not
         # stretch across the window; the model column takes the slack.
         self.assertIn('{ label: translate("logs.source"), width: 118, maxWidth: 168, flex: true, value: (row) => row.source }', columns)
+        # One relay can host several logins, and only the account column says
+        # whose usage a row is.  It is declared the same way the status column
+        # is: drawn only when a row actually carries one.
+        self.assertIn('...(hasAccount ? [{ label: translate("logs.account"), width: 96, value: (row: RenderedLogRecord) => row.account }] : []),', columns)
+        self.assertIn("selected === \"online-usage\" && rows.some((row) => Boolean(row.account)),", self.ui)
         self.assertIn('{ label: translate("logs.type"), width: 82, value: (row) => row.family }', columns)
         self.assertIn('{ label: translate("providers.publicModel"), width: 164, flex: true, value: (row) => row.model }', columns)
         self.assertIn('{ label: translate("logs.tokenPair"), width: 128, value: (row) => row.tokens }', columns)
@@ -3332,7 +3375,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # without scrolling sideways. The timestamp is the widest fixed column,
         # and only the relay column absorbs what is left over.
         widths = [168, 82, 164, 128, 62]
-        self.assertLess(sum(widths) + 118, 860)
+        # The account column is only there when the relay has more than one
+        # login, and it must still fit inside the pane at its narrowest: the
+        # other fixed columns plus the relay's floor leave it room.
+        self.assertLess(sum(widths) + 118 + 96, 860)
         # Several flexible columns share one pool of leftover width, so a data
         # column may absorb only up to its ceiling and the rest is the detail
         # column's: giving each flexible column `remaining` would hand the
@@ -3355,7 +3401,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # The status column is drawn only when a row carries one: a summary
         # endpoint has no per-request outcome to report.
         self.assertIn('...(hasStatus ? [{ ...status, width: 64 }] : []),', columns)
-        self.assertIn("function logColumns(tab: LogTab, translate: Translate, hasStatus = true): LogColumn[] {", self.ui)
+        self.assertIn("function logColumns(tab: LogTab, translate: Translate, hasStatus = true, hasAccount = false): LogColumn[] {", self.ui)
         # The row's own fields travel in the detail, one per line, rather than
         # as a re-splitting of the joined string.
         self.assertIn("const details = detailFields.flatMap", renderer)
@@ -3902,16 +3948,27 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn("providers.switchTypeTitle", self.en)
         # Each kind states its own type: a service provider names its service,
         # a relay-bound provider names the station that addresses it, and a
-        # custom provider is a key provider.
-        self.assertIn('{providerKindLabel(kind, translate)}', identity)
+        # custom provider is a key provider.  A type label is longer than its
+        # column, so the value carries the whole name as its hover hint rather
+        # than losing the tail to the ellipsis.
+        self.assertIn('const providerTypeText = providerKindLabel(kind, translate);', identity)
+        self.assertIn('tooltip={providerTypeText} accessibilityLabel={providerTypeText}', identity)
         self.assertIn('{translate("providers.type.relay")}', identity)
         self.assertIn('{translate("providers.type.apiKey")}', identity)
         # A login provider states the address its own service gives it, and
         # falls back to the address Core holds when the service table names
         # none — Our Free Model is served by a Core-owned worker on a
         # per-launch port, so its `os.environ/` reference is the only true
-        # address and the pane must not print an upstream host for it.
+        # address and the pane must not print an upstream host for it.  That
+        # reference is not an address to show either: it names a variable, it
+        # cannot be edited here, and it is cut off in the column, so the row is
+        # drawn only when the provider has a real address.
         self.assertIn('isLogin ? (SERVICE_BASE_URLS[kind as ServiceID] || stringValue(provider.endpoint, stringValue(provider.api_base)))', identity)
+        self.assertIn('const providerAddressIsReference = providerBaseURL.trim().startsWith("os.environ/");', identity)
+        self.assertIn('const showBaseURL = Boolean(providerBaseURL.trim()) && !providerAddressIsReference;', identity)
+        self.assertIn('{showBaseURL ? <View style={styles.officialStatusRow}>', identity)
+        self.assertNotIn('>{providerBaseURL}</Text>', identity)
+        self.assertIn('tooltip={providerBaseURL} accessibilityLabel={providerBaseURL}', identity)
         # The account surface keeps its rule, as the keys and the stations do.
         self.assertIn("{isOfficialAccount ? <View style={styles.officialAccountSection}>", editor)
         self.assertIn("providerAccountsHeader", editor)

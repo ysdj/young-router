@@ -5,11 +5,14 @@ from __future__ import annotations
 import copy
 from contextlib import contextmanager
 import hashlib
+import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 import threading
 import time
+import tomllib
 from collections.abc import Mapping, Sequence
 from typing import Any, Iterator
 
@@ -45,6 +48,13 @@ from ._shared import (
 
 _CODEX_ENVIRONMENT_LOCK = threading.RLock()
 _CATALOG_SOURCE_REFRESH_SECONDS = 0.5
+_CODEX_APP_RESOURCES = (
+    Path("/Applications/ChatGPT.app/Contents/Resources"),
+    Path("/Applications/Codex.app/Contents/Resources"),
+    Path.home() / "Applications" / "ChatGPT.app" / "Contents" / "Resources",
+    Path.home() / "Applications" / "Codex.app" / "Contents" / "Resources",
+)
+_BUNDLED_MARKETPLACE = Path("plugins") / "openai-bundled"
 
 # App-private bookkeeping for the managed catalog.  Codex only ever reads the
 # catalog itself (through ``model_catalog_json``): the pinned inheritance
@@ -101,6 +111,312 @@ def _direct_model_id(value: str) -> str:
         if model.startswith(prefix) and model[len(prefix) :].strip():
             return model[len(prefix) :].strip()
     return model
+
+
+def _installed_codex_cli(codex_home: Path) -> Path | None:
+    """Find the Codex executable belonging to this home, then the installed app."""
+
+    for path in (
+        codex_home / "plugins" / "cache" / "openai-bundled" / "codex-cli"
+        / "CodexCLI.app" / "Contents" / "MacOS" / "codex",
+        Path("/Applications/ChatGPT.app/Contents/Resources/codex-cli")
+        / "CodexCLI.app" / "Contents" / "MacOS" / "codex",
+    ):
+        if path.is_file() and os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def _codex_cli(codex_home: Path) -> Path:
+    """Return the installed Codex CLI or explain why its plugins cannot be installed."""
+
+    executable = _installed_codex_cli(codex_home)
+    if executable is None:
+        raise DomainError("Codex is not installed, so its Browser and Computer Use plugins cannot be enabled")
+    return executable
+
+
+def _ensure_browser_plugins(
+    codex_home: Path,
+    codex_cli: Path,
+    plugin_ids: Sequence[str],
+) -> list[dict[str, Any]]:
+    """Install and enable the requested bundled plugins.
+
+    Reading only the plugin bundle leaves an empty ``skills`` directory in
+    Codex's cache after an application restart.  The Codex-owned installer
+    materializes those files and its plugin registry together, so every new
+    desktop chat can discover Browser and Computer Use.
+    """
+
+    env = os.environ.copy()
+    env["CODEX_HOME"] = str(codex_home)
+    plugins: list[dict[str, Any]] = []
+    for plugin_id in plugin_ids:
+        result = subprocess.run(
+            [str(codex_cli), "plugin", "add", plugin_id, "--json"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+            timeout=60,
+            check=False,
+        )
+        try:
+            installed = json.loads(result.stdout)
+        except ValueError:
+            installed = None
+        if result.returncode != 0 or not isinstance(installed, Mapping):
+            detail = result.stderr.strip() or result.stdout.strip()
+            raise DomainError(
+                f"Codex plugin {plugin_id} could not be installed"
+                + (f": {detail}" if detail else "")
+            )
+        plugins.append({"id": plugin_id, "enabled": True})
+    return plugins
+
+
+def _installed_surface_plugins(
+    codex_home: Path,
+) -> tuple[dict[str, str], str | None]:
+    """Return ``feature -> plugin id`` from the installed Desktop runtime."""
+
+    resources = next(
+        (
+            path
+            for path in _CODEX_APP_RESOURCES
+            if (path / _BUNDLED_MARKETPLACE / ".agents" / "plugins" / "marketplace.json").is_file()
+        ),
+        None,
+    )
+    if resources is None:
+        return {}, None
+
+    marketplace_path = (
+        resources / _BUNDLED_MARKETPLACE / ".agents" / "plugins"
+        / "marketplace.json"
+    )
+    try:
+        marketplace = json.loads(marketplace_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise DomainError("Codex bundled plugin marketplace is malformed") from exc
+    entries = marketplace.get("plugins") if isinstance(marketplace, Mapping) else None
+    if not isinstance(entries, list):
+        raise DomainError("Codex bundled plugin marketplace is malformed")
+
+    plugins: dict[str, tuple[str, Path]] = {}
+    for item in entries:
+        if not isinstance(item, Mapping):
+            continue
+        name = item.get("name")
+        source = item.get("source")
+        relative = source.get("path") if isinstance(source, Mapping) else None
+        if not isinstance(name, str) or not isinstance(relative, str):
+            continue
+        root = (resources / _BUNDLED_MARKETPLACE / relative).resolve()
+        if root.is_dir():
+            plugins[name] = (relative, root)
+
+    runtime: tuple[str, str, Path] | None = None
+    for name, (relative, root) in plugins.items():
+        config_path = resources / _BUNDLED_MARKETPLACE / relative / ".mcp.json"
+        if not config_path.is_file():
+            continue
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        servers = config.get("mcpServers") if isinstance(config, Mapping) else None
+        if not isinstance(servers, Mapping) or "cua_repl" not in servers:
+            continue
+        server = servers.get("cua_repl")
+        env = server.get("env") if isinstance(server, Mapping) else None
+        surfaces = env.get("CUA_REPL_ENABLED_SURFACES") if isinstance(env, Mapping) else None
+        if not isinstance(surfaces, str):
+            surfaces = _runtime_surfaces_from_cache(
+                codex_home / "plugins" / "cache" / _BUNDLED_MARKETPLACE.parts[0],
+                name,
+            )
+        if isinstance(surfaces, str):
+            runtime = (name, surfaces, root)
+            break
+    if runtime is None:
+        return {}, None
+
+    runtime_name, surfaces, _ = runtime
+    feature_plugins: dict[str, str] = {}
+    for surface in (value.strip() for value in surfaces.split(",")):
+        if not surface:
+            continue
+        feature = f"{surface}_use"
+        plugin_name = next(
+            (
+                name for name, (_, root) in plugins.items()
+                if _plugin_serves_surface(root, surface)
+            ),
+            None,
+        )
+        if plugin_name is not None:
+            feature_plugins[feature] = _bundled_plugin_id(plugin_name)
+    return feature_plugins, _bundled_plugin_id(runtime_name)
+
+
+def _plugin_serves_surface(root: Path, surface: str) -> bool:
+    skills = root / "skills"
+    if not skills.is_dir():
+        return False
+    return any(
+        path.is_dir() and (path.name == surface or surface in path.name)
+        for path in skills.iterdir()
+    )
+
+
+def _bundled_plugin_id(name: str) -> str:
+    return name if "@" in name else f"{name}@openai-bundled"
+
+
+def _runtime_surfaces_from_cache(cache_root: Path, plugin_name: str) -> str | None:
+    for path in sorted(cache_root.glob(f"{plugin_name}/*/.mcp.json")):
+        try:
+            config = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        servers = config.get("mcpServers") if isinstance(config, Mapping) else None
+        server = servers.get("cua_repl") if isinstance(servers, Mapping) else None
+        env = server.get("env") if isinstance(server, Mapping) else None
+        surfaces = env.get("CUA_REPL_ENABLED_SURFACES") if isinstance(env, Mapping) else None
+        if isinstance(surfaces, str):
+            return surfaces
+    return None
+
+
+def _surface_sync_patch(
+    codex_home: Path,
+    features: Mapping[str, Any],
+    plugins: Sequence[Mapping[str, Any]],
+    *,
+    override: Mapping[str, bool] | None = None,
+    sync_plugins: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """Synchronize discovered surface plugins with explicit Codex choices.
+
+    An absent feature keeps its absent state. An explicit ``true`` enables the
+    matching plugin and runtime; an explicit ``false`` disables them. The
+    feature/plugin mapping comes from the installed Desktop release, so new
+    surfaces need no Young Router allowlist.
+    """
+
+    feature_plugins, runtime_id = _installed_surface_plugins(codex_home)
+    if not feature_plugins:
+        if override and any(value is True for value in override.values()):
+            raise DomainError("Codex did not declare the requested desktop surface")
+        return dict(override or {})
+
+    effective = dict(features)
+    if override is not None:
+        effective.update(override)
+    if override and runtime_id is not None:
+        missing = set(override) - set(feature_plugins)
+        if missing and any(value is True for value in override.values()):
+            raise DomainError("Codex did not declare the requested desktop surface")
+    selected_features = {
+        feature
+        for feature in feature_plugins
+        if sync_plugins is None or feature in sync_plugins
+    }
+    selected_override = {
+        feature: state
+        for feature, state in (override or {}).items()
+        if feature in feature_plugins
+    }
+    if sync_plugins is not None and override is None and not selected_features:
+        return {}
+    plugin_states = {
+        str(item.get("id") or ""): item.get("enabled")
+        for item in plugins
+    }
+    desired_plugins = {
+        plugin_id: plugin_states.get(plugin_id) is True
+        for feature, plugin_id in feature_plugins.items()
+        if feature in selected_features
+    }
+    for feature in selected_features:
+        plugin_id = feature_plugins[feature]
+        state = effective.get(feature)
+        if state is True:
+            desired_plugins[plugin_id] = True
+        elif state is False:
+            desired_plugins[plugin_id] = False
+
+    explicit = [effective.get(feature) for feature in selected_features]
+    desired_runtime = (
+        True if any(state is True for state in explicit)
+        else False if explicit and all(state is False for state in explicit)
+        else plugin_states.get(runtime_id) if runtime_id is not None else None
+    )
+
+    patch_plugins = [
+        {"id": plugin_id, "enabled": enabled}
+        for plugin_id, enabled in sorted(desired_plugins.items())
+        if (
+            (enabled and plugin_states.get(plugin_id) is not True)
+            or (not enabled and plugin_states.get(plugin_id) is True)
+        )
+    ]
+    if runtime_id is not None and desired_runtime is not None:
+        if plugin_states.get(runtime_id) is not desired_runtime:
+            patch_plugins.append({"id": runtime_id, "enabled": desired_runtime})
+
+    install = sorted(
+        plugin_id
+        for plugin_id, enabled in desired_plugins.items()
+        if enabled and plugin_states.get(plugin_id) is not True
+    )
+    if desired_runtime is True and runtime_id is not None and plugin_states.get(runtime_id) is not True:
+        install.append(runtime_id)
+    if install:
+        _ensure_browser_plugins(
+            codex_home,
+            _codex_cli(codex_home),
+            sorted(set(install)),
+        )
+
+    patch: dict[str, Any] = {}
+    if patch_plugins:
+        patch["plugins"] = patch_plugins
+    if selected_override:
+        patch["features"] = selected_override
+    return patch
+
+
+def _remove_legacy_computer_mcp(text: str) -> str:
+    """Drop the pre-unified Computer Use server without touching other MCPs.
+
+    The desktop app supplies ``cua_repl`` through its plugin runtime now, while
+    older Young Router settings also wrote a standalone Computer Use server.
+    Keeping both makes the Browser and Computer Use skills target a runtime
+    that the conversation does not expose.
+    """
+
+    lines = text.splitlines(keepends=True)
+    in_target = False
+    retained: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_target = stripped == "[mcp_servers.computer-use]"
+        if not in_target:
+            retained.append(line)
+    now = tomllib.loads("".join(retained))
+    if isinstance(now.get("mcp_servers"), Mapping):
+        servers = now.get("mcp_servers", {})
+        if isinstance(servers, Mapping) and not servers:
+            retained = [
+                line for line in retained
+                if line.strip() != "[mcp_servers]"
+            ]
+    return "".join(retained)
 
 
 @contextmanager
@@ -905,6 +1221,8 @@ class CodexSettingsDomain:
             # model id would leave it asking for a model the proxy cannot
             # resolve.
             patch = self._local_api_patch()
+            patch.update(self._surface_sync_patch())
+            config_text = _remove_legacy_computer_mcp(config_text)
             model = str(data.get("model") or "").strip()
             if model:
                 patch["model"] = model
@@ -913,6 +1231,27 @@ class CodexSettingsDomain:
             # Restore the client directly onto one saved provider route: the
             # chosen model, that provider's own endpoint, and the route's key.
             self._draft = self._sync(config_text, auth_text, self._saved_model_patch(data))
+        elif name == "codex_feature_set":
+            feature = data.get("feature")
+            enabled_value = data.get("enabled")
+            if not isinstance(feature, str) or not feature.endswith("_use") or not isinstance(enabled_value, bool):
+                raise DomainError("The Codex feature switch is invalid")
+            current = self._draft.get("structured")
+            current = current if isinstance(current, Mapping) else {}
+            current_features = current.get("features")
+            current_plugins = current.get("plugins")
+            patch = _surface_sync_patch(
+                self.codex_home_path(),
+                current_features if isinstance(current_features, Mapping) else {},
+                [item for item in current_plugins if isinstance(item, Mapping)]
+                if isinstance(current_plugins, list) else [],
+                override={feature: enabled_value},
+            )
+            self._draft = self._sync(
+                config_text,
+                auth_text,
+                patch,
+            )
         elif name in {"reset", "cancel", "reload", "restore_defaults"}:
             self._draft = copy.deepcopy(self._raw)
         else:
@@ -1195,6 +1534,42 @@ class CodexSettingsDomain:
         base_url, key = local_proxy_endpoint()
         self._local_api_base_url = base_url
         return self._active_provider_patch(base_url=base_url, key=key, wire_api="responses")
+
+    def _surface_sync_patch(
+        self,
+        override: Mapping[str, bool] | None = None,
+    ) -> dict[str, Any]:
+        """Synchronize the installed desktop surfaces with Codex settings.
+
+        A Codex app restart recreates the plugin cache even when the registry
+        says the plugin is installed. Let ``/plugins`` install the missing
+        files. The installed marketplace and CUA runtime declare the surfaces,
+        so a later Desktop release can add one without a Young Router update.
+        """
+
+        structured = self._draft.get("structured")
+        structured = structured if isinstance(structured, Mapping) else {}
+        features = structured.get("features")
+        if not isinstance(features, Mapping):
+            raise DomainError("Codex feature settings are unavailable")
+        plugins = structured.get("plugins")
+        feature_plugins, _runtime_id = _installed_surface_plugins(self.codex_home_path())
+        selected_features = tuple(
+            feature
+            for feature in feature_plugins
+            if override is not None or features.get(feature) is not None
+        )
+        if not selected_features:
+            return {}
+        patch = _surface_sync_patch(
+            self.codex_home_path(),
+            features,
+            [item for item in plugins if isinstance(item, Mapping)]
+            if isinstance(plugins, list) else [],
+            override=override,
+            sync_plugins=selected_features,
+        )
+        return patch
 
     def follow_local_api_endpoint(self) -> bool:
         """Rewrite a client that uses this app's proxy onto its current endpoint.

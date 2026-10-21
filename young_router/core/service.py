@@ -2293,7 +2293,10 @@ class CoreStore:
                             public = None
                         if public is None and not unreachable:
                             try:
-                                public = password_restorer(str(account_id))
+                                # The probe above already answered for this
+                                # credential, so the sign-in is reached with
+                                # that answer in hand rather than repeating it.
+                                public = password_restorer(str(account_id), force=True)
                             except RelayTransportError:
                                 unreachable = True
                             except RelaySessionLimitError:

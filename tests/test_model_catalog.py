@@ -522,6 +522,8 @@ class ModelCatalogTests(unittest.TestCase):
             "model_messages": {"instructions_template": "Native prompt"},
             "shell_type": "unified_exec",
             "tool_mode": "code_mode_only",
+            "include_plugin_usage_instructions": False,
+            "include_skills_usage_instructions": False,
         }
 
         with mock.patch(
@@ -532,6 +534,8 @@ class ModelCatalogTests(unittest.TestCase):
 
         self.assertEqual("unified_exec", model["shell_type"])
         self.assertEqual("code_mode_only", model["tool_mode"])
+        self.assertFalse(model["include_plugin_usage_instructions"])
+        self.assertFalse(model["include_skills_usage_instructions"])
 
     def test_catalog_carries_known_context_window_to_codex(self) -> None:
         with mock.patch(

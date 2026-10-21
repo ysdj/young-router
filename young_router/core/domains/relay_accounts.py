@@ -1292,6 +1292,10 @@ class RelayAccountsDomain:
         # what ran out.  Process-local on purpose: a restart is a new reason to
         # ask.  See ``_renew_remembered_session``.
         self._login_refusals: dict[str, float] = {}
+        # Which of those refusals were the station's concurrent-session cap.
+        # A cap outlives the one-minute wait a rejected password is held for, so
+        # the two are recorded apart and read back with their own windows.
+        self._capped_refusals: dict[str, bool] = {}
         # A native browser-session erase can fail after account deletion. Keep
         # only an opaque tombstone so the UI can retry after a restart.
         self._pending_credential_cleanups: list[dict[str, str]] = []
@@ -3649,7 +3653,7 @@ class RelayAccountsDomain:
         self.revision += 1
         return _public_account(self._accounts[index])
 
-    def restore_saved_password(self, account_id: str) -> dict[str, Any]:
+    def restore_saved_password(self, account_id: str, *, force: bool = False) -> dict[str, Any]:
         """Attempt a non-UI login from an explicitly remembered password.
 
         This is the one place in Core that asks a station to mint a session, so
@@ -3659,9 +3663,17 @@ class RelayAccountsDomain:
         else would leave a path that still asks once per entry.  Asking again is
         exactly what an account at the site's session cap must not do.
 
-        ``force`` is the explicit-sign-in override: a user who has just signed
-        in through the account pane, or whose credentials have changed, is a new
-        fact rather than a repeat of the refusal.
+        The stored session is therefore *asked* first, for the same reason
+        :meth:`_renew_remembered_session` asks before it renews: a sign-in is the
+        one-way step, and a cookie that still works makes it unnecessary.  Every
+        automatic caller reaches a sign-in only after its own session probe
+        failed, but the pane's explicit 去登录 does not, and neither does a
+        restart whose stored session is still valid -- both used to ask the
+        station to mint another session while a perfectly usable one sat on
+        disk, which is how an account reaches the site's concurrent-session cap
+        without the user touching anything.  ``force`` states that the probe was
+        already answered by the caller (its credential changed, or the station
+        refused it) so it is not repeated here.
         """
 
         index = self._index(account_id)
@@ -3677,15 +3689,42 @@ class RelayAccountsDomain:
             or not username
             or not callable(login)
         ):
+            # Nothing to sign in with.  No request is sent: a form filled with an
+            # empty password can only be answered as a rejected credential, and
+            # the app would then hold that station-side rejection for an account
+            # whose real state is simply "nothing remembered" -- at the cost of
+            # one more login attempt on an account that was never going to sign
+            # in.  The login is recorded as the secret-free non-answer it is.
             return self.set_login_status(account_id, "signed_out")
         remaining = self._login_refusal_remaining(account_id)
         if remaining > 0:
             raise RelayLoginBackoffError(remaining)
+        if not force and self._has_session_credentials(account):
+            # A credential the station still accepts needs no replacement, and
+            # probing it mints nothing.
+            try:
+                restored = self.restore_saved_session(account_id)
+            except RelayTransportError:
+                raise
+            except Exception:
+                restored = None
+            if isinstance(restored, Mapping) and restored.get("login_status") == "signed_in":
+                self.clear_login_refusal(account_id)
+                return restored
         try:
             result = login(account["origin"], account["type"], username, password)
         except RelayTransportError:
             # The station was never reached, so nothing was refused and there is
             # nothing to wait out.
+            raise
+        except RelaySessionLimitError:
+            # The station will not mint another session because this account
+            # already holds as many as the site allows.  That refusal is not
+            # about the password and cannot be waited out on a short window: it
+            # lasts exactly as long as the sessions filling the cap, so the wait
+            # it starts is the cap's own (see
+            # ``_relay_login_backoff_seconds_for``).
+            self._note_login_refusal(account_id, capped=True)
             raise
         except RelayLoginRefusedError:
             # The station answered and would not mint a session.  Waiting before
@@ -4434,6 +4473,16 @@ class RelayAccountsDomain:
     # ask immediately, because those are new facts rather than a repeat.
     LOGIN_REFUSAL_BACKOFF_SECONDS = 60.0
     LOGIN_REFUSAL_BACKOFF_KEY = "YOUNG_ROUTER_RELAY_LOGIN_BACKOFF_SECONDS"
+    # A refusal that names the site's concurrent-session cap is not a moment's
+    # answer: the cap stays reached for as long as the sessions filling it
+    # live, and a station issues those for about a day.  Asking again on the
+    # one-minute window above spent another session attempt every minute for as
+    # long as a pane was open, which is how the account kept getting flagged.
+    # The wait therefore outlasts the sessions that caused it, so nothing this
+    # app does automatically asks again until the station's own sessions have
+    # had time to age out.
+    LOGIN_SESSION_LIMIT_BACKOFF_SECONDS = 6 * 60 * 60.0
+    LOGIN_SESSION_LIMIT_BACKOFF_KEY = "YOUNG_ROUTER_RELAY_SESSION_LIMIT_BACKOFF_SECONDS"
 
     def _login_refusal_seconds(self) -> float:
         """The configured wait after a refused sign-in, in seconds.
@@ -4443,18 +4492,34 @@ class RelayAccountsDomain:
         place instead of disabling the throttle.
         """
 
+        return self._runtime_seconds(self.LOGIN_REFUSAL_BACKOFF_KEY, self.LOGIN_REFUSAL_BACKOFF_SECONDS)
+
+    def _session_limit_refusal_seconds(self) -> float:
+        """The configured wait after the station answers its session cap."""
+
+        return self._runtime_seconds(
+            self.LOGIN_SESSION_LIMIT_BACKOFF_KEY, self.LOGIN_SESSION_LIMIT_BACKOFF_SECONDS
+        )
+
+    def _runtime_seconds(self, key: str, default: float) -> float:
+        """One duration from the runtime settings file, or ``default``.
+
+        A settings file that cannot be read leaves the default in place instead
+        of disabling the throttle it configures.
+        """
+
         from ._shared import _default_runtime_settings_path
 
         try:
             from ..runtime_settings_io import load_specs, read_settings_file
 
             values = read_settings_file(_default_runtime_settings_path(), load_specs())
-            raw = str(values.get(self.LOGIN_REFUSAL_BACKOFF_KEY, "")).strip()
-            seconds = float(raw) if raw else self.LOGIN_REFUSAL_BACKOFF_SECONDS
+            raw = str(values.get(key, "")).strip()
+            seconds = float(raw) if raw else default
         except Exception:
-            seconds = self.LOGIN_REFUSAL_BACKOFF_SECONDS
+            seconds = default
         if not math.isfinite(seconds) or seconds < 0:
-            return self.LOGIN_REFUSAL_BACKOFF_SECONDS
+            return default
         return seconds
 
     def _login_refusal_remaining(self, account_id: str) -> float:
@@ -4463,18 +4528,28 @@ class RelayAccountsDomain:
         stamped = self._login_refusals.get(str(account_id))
         if not isinstance(stamped, (int, float)) or isinstance(stamped, bool):
             return 0.0
-        remaining = self._login_refusal_seconds() - (time.monotonic() - float(stamped))
+        # The wait the refusal itself started is kept beside it: a cap is not a
+        # rejected password, and reading the short window for both is what let a
+        # capped account be asked once a minute forever.
+        window = self._session_limit_refusal_seconds() if self._capped_refusals.get(str(account_id)) \
+            else self._login_refusal_seconds()
+        remaining = window - (time.monotonic() - float(stamped))
         return remaining if remaining > 0 else 0.0
 
-    def _note_login_refusal(self, account_id: str) -> None:
+    def _note_login_refusal(self, account_id: str, *, capped: bool = False) -> None:
         """Start this account's wait, so the next entry does not re-ask."""
 
         self._login_refusals[str(account_id)] = time.monotonic()
+        if capped:
+            self._capped_refusals[str(account_id)] = True
+        else:
+            self._capped_refusals.pop(str(account_id), None)
 
     def clear_login_refusal(self, account_id: str) -> None:
         """Forget a refusal because the login itself succeeded."""
 
         self._login_refusals.pop(str(account_id), None)
+        self._capped_refusals.pop(str(account_id), None)
 
     def _renew_remembered_session(self, account_id: str) -> bool:
         """Make one station session usable again, probing before signing in.
@@ -4523,7 +4598,9 @@ class RelayAccountsDomain:
         if not account.get("password") or not account.get("username"):
             return False
         try:
-            restored = self.restore_saved_password(account_id)
+            # The probe above is this credential's answer, so the sign-in does
+            # not repeat it.
+            restored = self.restore_saved_password(account_id, force=True)
         except RelayTransportError:
             raise
         except RelaySessionLimitError:

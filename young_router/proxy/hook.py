@@ -563,7 +563,10 @@ class YoungRouterHook(CustomLogger):
                 _responses_web_search_bridge_module._mark_provider_native_web_search_event(
                     request_data, chunk
                 )
-                sanitized_chunk = _responses_web_search_bridge_module._sanitize_web_search_stream_chunk(chunk)
+                sanitized_chunk = _responses_web_search_bridge_module._sanitize_web_search_stream_chunk(
+                    chunk,
+                    request_data,
+                )
                 if sanitized_chunk is None:
                     continue
                 chunk = sanitized_chunk

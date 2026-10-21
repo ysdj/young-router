@@ -1514,10 +1514,198 @@ class HookResponsesChatBridgeTests(HookTestCase):
             if chunk.get("type") == "response.output_item.added"
             and chunk.get("item", {}).get("type") == "message"
         ]
-        self.assertEqual(message_starts[0]["phase"], "final_answer")
-        self.assertEqual(chunks[-1]["response"]["output"][0]["phase"], "final_answer")
+        self.assertNotIn("phase", message_starts[0])
+        self.assertEqual(
+            {
+                chunk["item"].get("type"): chunk.get("output_index")
+                for chunk in chunks
+                if chunk.get("type") == "response.output_item.added"
+            },
+            {"message": 0},
+        )
+        output_message = next(
+            item for item in chunks[-1]["response"]["output"]
+            if item.get("type") == "message"
+        )
+        self.assertNotIn("phase", output_message)
         self.assertEqual(chunks[-1]["response"]["usage"]["input_tokens"], 4)
         self.assertEqual(chunks[-1]["response"]["usage"]["output_tokens"], 2)
+
+    async def test_chat_bridge_does_not_publish_other_provider_reasoning_content(
+        self,
+    ) -> None:
+        hooks, proxy_server = load_hook_module()
+
+        async def chat_stream():
+            yield {"choices": [{"delta": {"reasoning_content": "Inspect the request."}}]}
+            yield {"choices": [{"delta": {"content": "hello"}}]}
+
+        class FakeRouter:
+            async def acompletion(self, **_payload):
+                return chat_stream()
+
+        proxy_server.llm_router = FakeRouter()
+        request_kwargs = {
+            "original_generic_function": lambda **_kwargs: None,
+        }
+        hooks._with_generic_deployment_failover_wrapper(request_kwargs)
+
+        response = await request_kwargs["original_generic_function"](
+            call_type="aresponses",
+            model="chat-only-model",
+            input="Say hello.",
+            stream=True,
+            model_info={
+                "id": "experimental_provider-chat",
+                "model_group": "chat-only-model",
+                "upstream_url_surface": "openai/chat",
+                "supported_upstream_url_surfaces": ["openai/chat"],
+            },
+        )
+        chunks = [jsonable_stream_chunk(chunk) async for chunk in response]
+
+        message = [
+            item
+            for item in chunks[-1]["response"]["output"]
+            if item.get("type") == "message"
+        ]
+        self.assertEqual(
+            [
+                item
+                for item in chunks[-1]["response"]["output"]
+                if item.get("type") == "reasoning"
+            ],
+            [],
+        )
+        self.assertEqual(message[0]["content"][0]["text"], "hello")
+
+    async def test_chat_bridge_does_not_publish_reasoning_without_content(
+        self,
+    ) -> None:
+        hooks, proxy_server = load_hook_module()
+
+        async def chat_stream():
+            yield {"choices": [{"delta": {"reasoning": "hidden"}}]}
+            yield {"choices": [{"delta": {"content": "hello"}}]}
+
+        class FakeRouter:
+            async def acompletion(self, **_payload):
+                return chat_stream()
+
+        proxy_server.llm_router = FakeRouter()
+        request_kwargs = {
+            "original_generic_function": lambda **_kwargs: None,
+        }
+        hooks._with_generic_deployment_failover_wrapper(request_kwargs)
+
+        response = await request_kwargs["original_generic_function"](
+            call_type="aresponses",
+            model="gemini-4-argon",
+            input="Say hello.",
+            stream=True,
+            model_info={
+                "id": "experimental_provider-gemini",
+                "model_group": "gemini-4-argon",
+                "upstream_url_surface": "openai/chat",
+                "supported_upstream_url_surfaces": ["openai/chat"],
+            },
+        )
+        chunks = [jsonable_stream_chunk(chunk) async for chunk in response]
+
+        self.assertEqual(
+            [
+                item
+                for item in chunks[-1]["response"]["output"]
+                if item.get("type") == "reasoning"
+            ],
+            [],
+        )
+
+    async def test_chat_bridge_publishes_deepseek_raw_reasoning(
+        self,
+    ) -> None:
+        hooks, proxy_server = load_hook_module()
+
+        async def chat_stream():
+            yield {"choices": [{"delta": {"reasoning": "raw thought"}}]}
+            yield {"choices": [{"delta": {"content": "hello"}}]}
+
+        class FakeRouter:
+            async def acompletion(self, **_payload):
+                return chat_stream()
+
+        proxy_server.llm_router = FakeRouter()
+        request_kwargs = {
+            "original_generic_function": lambda **_kwargs: None,
+        }
+        hooks._with_generic_deployment_failover_wrapper(request_kwargs)
+
+        response = await request_kwargs["original_generic_function"](
+            call_type="aresponses",
+            model="deepseek-v4.1-flash",
+            input="Say hello.",
+            reasoning={"effort": "high", "summary": "raw"},
+            stream=True,
+            model_info={
+                "id": "experimental_provider-deepseek",
+                "model_group": "deepseek-v4.1-flash",
+                "upstream_url_surface": "openai/chat",
+                "supported_upstream_url_surfaces": ["openai/chat"],
+            },
+        )
+        chunks = [jsonable_stream_chunk(chunk) async for chunk in response]
+
+        reasoning = next(
+            item
+            for item in chunks[-1]["response"]["output"]
+            if item.get("type") == "reasoning"
+        )
+        self.assertEqual(reasoning["summary"][0]["text"], "raw thought")
+        self.assertEqual(chunks[-1]["response"]["output_text"], "hello")
+
+    async def test_chat_bridge_hides_deepseek_reasoning_for_auto_summary(
+        self,
+    ) -> None:
+        hooks, proxy_server = load_hook_module()
+
+        async def chat_stream():
+            yield {"choices": [{"delta": {"reasoning": "raw thought"}}]}
+            yield {"choices": [{"delta": {"content": "hello"}}]}
+
+        class FakeRouter:
+            async def acompletion(self, **_payload):
+                return chat_stream()
+
+        proxy_server.llm_router = FakeRouter()
+        request_kwargs = {
+            "original_generic_function": lambda **_kwargs: None,
+        }
+        hooks._with_generic_deployment_failover_wrapper(request_kwargs)
+
+        response = await request_kwargs["original_generic_function"](
+            call_type="aresponses",
+            model="deepseek-v4.1-flash",
+            input="Say hello.",
+            reasoning={"effort": "high", "summary": "auto"},
+            stream=True,
+            model_info={
+                "id": "experimental_provider-deepseek",
+                "model_group": "deepseek-v4.1-flash",
+                "upstream_url_surface": "openai/chat",
+                "supported_upstream_url_surfaces": ["openai/chat"],
+            },
+        )
+        chunks = [jsonable_stream_chunk(chunk) async for chunk in response]
+
+        self.assertEqual(
+            [
+                item
+                for item in chunks[-1]["response"]["output"]
+                if item.get("type") == "reasoning"
+            ],
+            [],
+        )
+        self.assertEqual(chunks[-1]["response"]["output_text"], "hello")
 
     async def test_chat_only_bridge_preserves_codex_additional_tools_and_tool_call(self) -> None:
         hooks, _ = load_hook_module()

@@ -936,9 +936,15 @@ struct LoginState {
   std::atomic_bool canceled{false};
   std::atomic_bool checking{false};
   bool auto_probe_pending = false;
-  bool auto_submit_saved_password_pending = false;
   bool did_auto_submit_saved_password = false;
-  bool auto_login_attempt = false;
+  // Whether this attempt has shown the station refusing a credential.  Only
+  // that answer justifies replacing the session on hand with a sign-in.
+  bool attempt_saw_refusal = false;
+  // Whether this presentation may submit the remembered password at all.  It is
+  // opened by having no session to preserve, or by a station's refusal of the
+  // one it had, and it stays closed afterwards: each submission is one more
+  // session against the account's cap.
+  bool login_submit_authorized = false;
   bool dialog_closed_during_commit = false;
   std::shared_ptr<RelayLoginAttempt> active_attempt;
 };
@@ -1002,6 +1008,11 @@ void HideLoginDialog(std::shared_ptr<LoginState> const& state) {
   } catch (...) {
   }
 }
+
+// Declared ahead of ``ProbeLogin``: the failure paths of a check are what
+// decide whether the remembered password may be submitted, and that decision
+// belongs to the same flow.
+winrt::fire_and_forget SubmitSavedPassword(std::shared_ptr<LoginState> state);
 
 winrt::fire_and_forget ProbeLogin(
     std::shared_ptr<LoginState> state,
@@ -1072,9 +1083,19 @@ winrt::fire_and_forget ProbeLogin(
     }
     co_await winrt::resume_background();
     if (state->canceled.load() || state->finished.load() || !attempt->IsPending()) co_return;
-    auto verified = ProbeEndpoint(state->options, state->origin, cookie_header, access_token, refresh_token, user_id);
+    bool confirmed_authentication_rejection = false;
+    auto verified = ProbeEndpoint(state->options, state->origin, cookie_header, access_token, refresh_token, user_id,
+                                  &confirmed_authentication_rejection);
     if (state->canceled.load() || state->finished.load() || !attempt->IsPending()) co_return;
-    if (!verified) throw winrt::hresult_error(E_ACCESSDENIED);
+    if (!verified) {
+      // Only a refusal the station actually stated opens the way to a sign-in.
+      // A station this app could not reach, or one that answered a shape this
+      // probe cannot read, says nothing about the session on hand -- the same
+      // rule Core applies to its own check.  The window is left for the user
+      // instead of spending a session to answer a question nobody asked.
+      if (confirmed_authentication_rejection) state->attempt_saw_refusal = true;
+      throw winrt::hresult_error(E_ACCESSDENIED);
+    }
     StoredSession session{verified->family.empty() ? state->options.account_type : verified->family,
                           state->options.origin, verified->cookie,
                           verified->access_token.value_or(""), verified->refresh_token.value_or(""),
@@ -1153,10 +1174,12 @@ winrt::fire_and_forget ProbeLogin(
           state->finished.store(true);
           return;
         }
-        if (state->auto_login_attempt) {
-          state->auto_login_attempt = false;
-          state->finished.store(true);
-          try { state->dialog.Close(); } catch (...) {}
+        // No session on hand survived, and the station said so itself.  Only
+        // now is the remembered password submitted, and only once per
+        // presentation.
+        if (state->attempt_saw_refusal && state->restored_password &&
+            !state->restored_password->empty() && !state->did_auto_submit_saved_password) {
+          SubmitSavedPassword(state);
           return;
         }
         state->check.IsEnabled(true);
@@ -1198,10 +1221,11 @@ winrt::fire_and_forget ProbeLogin(
         state->finished.store(true);
         return;
       }
-      if (state->auto_login_attempt) {
-        state->auto_login_attempt = false;
-        state->finished.store(true);
-        try { state->dialog.Close(); } catch (...) {}
+      // No session on hand survived, and the station said so itself.  Only now
+      // is the remembered password submitted, and only once per presentation.
+      if (state->attempt_saw_refusal && state->restored_password &&
+          !state->restored_password->empty() && !state->did_auto_submit_saved_password) {
+        SubmitSavedPassword(state);
         return;
       }
       state->check.IsEnabled(true);
@@ -1225,7 +1249,52 @@ void StartLoginCheck(std::shared_ptr<LoginState> const& state) {
   auto attempt = std::make_shared<RelayLoginAttempt>();
   state->active_attempt = attempt;
   state->dialog_closed_during_commit = false;
+  // Every check starts from "the station has refused nothing yet": only an
+  // answer this attempt receives may justify a sign-in.
+  state->attempt_saw_refusal = false;
   ProbeLogin(state, std::move(attempt));
+}
+
+// Submit the remembered password, because the station refused everything else.
+//
+// This is the only place the Windows flow asks a station to mint a session of
+// its own, and it runs only after ``ProbeLogin`` showed that neither the
+// restored session nor the page's own session is usable.  A station caps an
+// account's concurrent sessions, so each submission is one attempt against
+// that cap; submitting before the credential on hand was actually refused is
+// what turned every window open into another session until the account was
+// signed out everywhere.
+winrt::fire_and_forget SubmitSavedPassword(std::shared_ptr<LoginState> state) {
+  if (!state || state->canceled.load() || state->finished.load() ||
+      !state->login_submit_authorized ||
+      !state->restored_password || state->restored_password->empty() ||
+      state->did_auto_submit_saved_password) co_return;
+  state->did_auto_submit_saved_password = true;
+  std::wstring script = LR"JS((() => {
+    const user = document.querySelector('input[type=email],input[type=text],input:not([type]),input[name=email],input[name=username],input[autocomplete=username],input[placeholder*="用户名"],input[placeholder*="email" i]');
+    const password = document.querySelector('input[type=password],input[autocomplete=current-password]');
+    if (!user || !password || !user.value || !password.value) return false;
+    const form = password.form;
+    const submit = form?.querySelector('button[type="submit"],input[type="submit"],button:not([type])')
+      ?? Array.from(document.querySelectorAll('button')).find(node => /sign in|log in|登录/i.test((node.textContent || node.getAttribute('aria-label') || '').trim()));
+    if (submit instanceof HTMLElement) submit.click();
+    else if (form instanceof HTMLFormElement && typeof form.requestSubmit === 'function') form.requestSubmit();
+    return true;
+  })())JS";
+  bool submitted = false;
+  try {
+    submitted = co_await state->webview.ExecuteScriptAsync(script) == L"true";
+  } catch (...) {}
+  if (!submitted && !state->finished.load()) {
+    // A form that is gone or incomplete did not submit: the station was still
+    // not asked anything, so a later check may try again.
+    state->did_auto_submit_saved_password = false;
+    co_return;
+  }
+  if (state->canceled.load() || state->finished.load()) co_return;
+  try {
+    state->status.Text(Text(state->options, L"Waiting for sign-in...", L"等待完成登录..."));
+  } catch (...) {}
 }
 
 winrt::fire_and_forget InitializeBrowser(std::shared_ptr<LoginState> state) {
@@ -1280,6 +1349,13 @@ winrt::fire_and_forget InitializeBrowser(std::shared_ptr<LoginState> state) {
         manager.AddOrUpdateCookie(cookie);
       }
       state->auto_probe_pending = true;
+      // A presentation holding a session asks it first; only a refusal of that
+      // session may replace it with a sign-in.
+      state->login_submit_authorized = false;
+    } else {
+      // Nothing is on hand to preserve, so the remembered password is the only
+      // way in and filling it is the sign-in the user asked for.
+      state->login_submit_authorized = state->restored_password && !state->restored_password->empty();
     }
     // Deployments do not share a stable login path. Start at the configured
     // origin and let the site's own navigation expose its sign-in control.
@@ -1396,9 +1472,6 @@ std::optional<WindowsRelayLoginResult> RunWindowsRelayLogin(
     auto password = current->restored_password.value_or("");
     auto access = current->restored_session ? current->restored_session->access_token : "";
     auto refresh = current->restored_session ? current->restored_session->refresh_token : "";
-    bool auto_submit_saved_password = !password.empty() &&
-        !current->auto_submit_saved_password_pending && !current->did_auto_submit_saved_password;
-    if (auto_submit_saved_password) current->auto_submit_saved_password_pending = true;
     auto password_assignment = (L"set(document.querySelector('input[type=password],input[autocomplete=current-password]'), " + JsonLiteral(password) + L");");
     std::wstring script = LR"JS((() => {
       const set = (node,value) => { if (!node || !value || node.value) return; const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')?.set; setter?.call(node,value); node.dispatchEvent(new Event('input',{bubbles:true})); node.dispatchEvent(new Event('change',{bubbles:true})); };
@@ -1430,13 +1503,6 @@ std::optional<WindowsRelayLoginResult> RunWindowsRelayLogin(
       }
       if (refresh) localStorage.setItem('refresh_token',refresh);
       const hasCredentials = Boolean(userInput?.value && passwordInput?.value);
-      if (hasCredentials && )JS" + std::wstring(auto_submit_saved_password ? L"true" : L"false") + LR"JS() {
-        const form = passwordInput?.form;
-        const submit = form?.querySelector('button[type="submit"],input[type="submit"],button:not([type])')
-          ?? Array.from(document.querySelectorAll('button')).find(node => /sign in|log in|登录/i.test((node.textContent || node.getAttribute('aria-label') || '').trim()));
-        if (submit instanceof HTMLElement) submit.click();
-        else if (form instanceof HTMLFormElement && typeof form.requestSubmit === 'function') form.requestSubmit();
-      }
       const agreementPattern = /agree|terms|privacy|consent|协议|同意|隐私|用户协议/i;
       const agreement = Array.from(document.querySelectorAll('input[type="checkbox"],[role="checkbox"]')).find((node) => {
         const scope = node.closest('label,li,form,section,div') || node.parentElement || node;
@@ -1445,23 +1511,32 @@ std::optional<WindowsRelayLoginResult> RunWindowsRelayLogin(
       if (agreement) (agreement.closest('label,li,form,section') || agreement).scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'auto' });
       return hasCredentials;
     })())JS";
-    auto after = [current, script = std::move(script), auto_submit_saved_password]() -> winrt::fire_and_forget {
-      bool submitted_saved_password = false;
+    // Filling the form is all this pass does.  Submitting it is the one action
+    // that asks the station to mint a session, and a station caps how many an
+    // account may hold at once -- so only a station's own refusal of the
+    // credential on hand (see ``StartLoginCheck``) opens the way to
+    // ``SubmitSavedPassword``.  A page that still shows its sign-in form is not
+    // that refusal: a station that just accepted this browser's session may not
+    // have left the sign-in route yet, and a restored session that still works
+    // renders exactly the same form while its cookies are being installed.
+    // Submitting on that evidence is what minted one session per window open
+    // until the account was locked out.
+    auto after = [current]() -> winrt::fire_and_forget {
+      std::wstring result;
       try {
-        auto result = co_await current->webview.ExecuteScriptAsync(script);
-        submitted_saved_password = auto_submit_saved_password && result == L"true";
+        result = co_await current->webview.ExecuteScriptAsync(script);
       } catch (...) {}
-      if (auto_submit_saved_password) {
-        current->auto_submit_saved_password_pending = false;
-        current->did_auto_submit_saved_password = submitted_saved_password;
-      }
       if (current->canceled.load() || current->finished.load()) co_return;
       current->check.IsEnabled(true);
-      if (submitted_saved_password) co_await winrt::resume_after(std::chrono::milliseconds(1200));
-      if (current->canceled.load() || current->finished.load()) co_return;
-      if (current->auto_probe_pending || submitted_saved_password) {
+      // With nothing on hand to preserve, this form *is* the sign-in the user
+      // asked for, so the filled password is submitted once.  A presentation
+      // holding a session submits only after that session was refused.
+      if (result == L"true" && current->login_submit_authorized) {
+        co_await SubmitSavedPassword(current);
+        co_return;
+      }
+      if (current->auto_probe_pending) {
         current->auto_probe_pending = false;
-        current->auto_login_attempt = submitted_saved_password;
         StartLoginCheck(current);
       }
     };

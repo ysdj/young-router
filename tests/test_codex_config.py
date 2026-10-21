@@ -875,6 +875,28 @@ class CodexConfigTests(unittest.TestCase):
             self.assertNotIn("sandbox_mode", parsed)
             self.assertNotIn("default_permissions", parsed)
 
+    def test_editor_writes_a_new_surface_feature(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory)
+            runtime_config = temp / "config.yaml"
+            codex_home = temp / "codex"
+            self.write_runtime_config(runtime_config)
+            result = self.run_command(
+                runtime_config,
+                codex_home,
+                "sync",
+                input_text=self.editor_request(
+                    "",
+                    "{}\n",
+                    {"features": {"future_use": True}},
+                )
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["structured"]["features"]["future_use"])
+            self.assertTrue(tomllib.loads(payload["config_text"])["features"]["future_use"])
+
     def test_editor_switches_between_legacy_and_profile_permissions(self) -> None:
         """The mutually exclusive policy keys must be replaced, not merely toggled in UI."""
 

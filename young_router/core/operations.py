@@ -53,7 +53,13 @@ from .domains.logs import active_cooldown_states, active_recovery_states
 
 
 MAX_OPERATION_OUTPUT_BYTES = 128 * 1024
-MAX_USAGE_ROWS = 10_000
+# How many usage rows one refresh may carry. The log view itself is bounded by
+# MAX_VIEW_BYTES and trims the oldest rows when the encoded view would exceed
+# it, so a cap well above that budget would read history the pane can never be
+# shown: the station would pay for pages whose rows are then dropped on the way
+# out. A row is ~400 bytes, which keeps this under the view budget with room for
+# the metadata the view also carries.
+MAX_USAGE_ROWS = 6_000
 SERVICE_STATES = frozenset({"starting", "running", "unhealthy", "stopped", "unknown"})
 OWNER_RECORD_VERSION = 2
 # Local proxy port used when no valid preference is configured.

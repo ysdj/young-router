@@ -1507,13 +1507,13 @@ if ! open "$DESTINATION" >/dev/null 2>&1; then
 fi
 
 RESTART_ARMED=0
-# The retired bundle is about a gigabyte and nothing reads it again, so removing
-# it does not hold the install open: the build is finished the moment the
-# replacement is running and answering, which is what the caller waits for.  The
-# path is captured first because the failure paths below own the variable.
-retired_app="$PREVIOUS_APP"
+# The process owner has left the retired bundle, but filesystem cleanup still
+# belongs to this install.  A detached background removal can disappear with
+# the invoking shell and leave every previous bundle in /Applications; finish
+# the removal before declaring the replacement installed so a failure remains
+# visible and cannot accumulate gigabytes per build.
+rm -rf "$PREVIOUS_APP"
 PREVIOUS_APP=""
-( rm -rf "$retired_app" ) &
 INSTALL_COMPLETE=1
 
 printf '%s\n' "Young Router: running ($DESTINATION)"

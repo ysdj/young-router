@@ -3167,7 +3167,7 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
     {route === "providers-models" ? <ProviderWorkspace snapshot={snapshot} ipc={ipc} onSnapshot={onSnapshot} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onStatus={setResult} onSecretState={onSecretState} applyProbedSurface={applyProbedSurface} onOpenWizard={() => { if (Platform.OS === "windows") onNavigate("provider-wizard"); native.window.open("provider-wizard"); }} relay={relayBridge} addOfficialAccount={addOfficialAccount} onActivateAndRestart={activateProviderAndRestart} /> : null}
     {route === "file-editor" ? <FileEditorWorkspace file={inlineEditorFile} fileId={fileIdRequest} nativeAction={nativeAction} ipc={ipc} native={native} translate={translate} busy={busy} onEditorConflict={resolveRawEditorConflict} reloadToken={settingsRawReloadToken} baselineToken={settingsRawBaselineToken} syncRevision={snapshot?.revision} onFlushPendingFields={flushPendingFields} onClose={closeRoute} /> : null}
     {route === "provider-wizard" ? <ProviderSetupWizard snapshot={snapshot} native={native} providers={providerWizardProviders} relaySources={providerWizardRelaySources} relayStations={providerWizardRelayStations} busy={busy} translate={translate} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onStatus={setResult} onClose={closeRoute} onKeyToken={registerProviderWizardKeyToken} relay={relayBridge} addOfficialAccount={addOfficialAccount} status={result} /> : null}
-    {settingsRoute ? <AssistantSettingsWorkspace busy={busy} native={native} codexModels={codexModelRows} codexModelCatalogEnabled={codexModelCatalogEnabled} clientProvider={codexClientProvider} clientModel={codexClientModel} localApiActive={codexUsesLocalApi} onToggleCodexModelCatalog={(enabled) => dispatch("codex.model_catalog.set", { enabled }, "codex")} onUseLocalApi={(selection) => dispatch("use_local_api", selection, "codex")} onUseSavedModel={(selection) => dispatch("use_saved_model", selection, "codex")} translate={translate} ipc={ipc} filesToken={settingsRawBaselineToken} onOpenFile={openAssistantFile} /> : null}
+    {settingsRoute ? <AssistantSettingsWorkspace busy={busy} native={native} codexModels={codexModelRows} codexModelCatalogEnabled={codexModelCatalogEnabled} codexFeatures={(domainState(snapshot, "codex").structured as UnknownRecord | undefined)?.features as UnknownRecord | undefined} clientProvider={codexClientProvider} clientModel={codexClientModel} localApiActive={codexUsesLocalApi} onToggleCodexModelCatalog={(enabled) => dispatch("codex.model_catalog.set", { enabled }, "codex")} onToggleCodexFeature={(feature, enabled) => dispatch("codex.feature.set", { feature, enabled }, "codex")} onUseLocalApi={(selection) => dispatch("use_local_api", selection, "codex")} onUseSavedModel={(selection) => dispatch("use_saved_model", selection, "codex")} translate={translate} ipc={ipc} filesToken={settingsRawBaselineToken} onOpenFile={openAssistantFile} /> : null}
     {route === "logs" ? <LogsWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} translate={translate} dispatch={dispatch} onStatus={setResult} requestedTab={nativeAction?.id === "open-recovery" ? "recovery" : logTabRequest} requestedTabKey={nativeAction?.sequence ?? 0} /> : null}
     {route === "general-settings" ? <GeneralWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} dispatch={dispatch} dispatchServiceAction={enqueueServiceDispatch} translate={translate} onStatus={setResult} onSnapshot={onSnapshot} /> : null}
     {route === "runtime-settings" ? <RuntimeWorkspace snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} clearSecret={clearSecret} /> : null}
@@ -6766,6 +6766,14 @@ function ProtocolPicker({ providerId, model, busy, translate, dispatch }: { prov
   ];
   const fixed = mode === "fixed";
   const protocolHint = translate(fixed ? "providers.protocolModeFixedHint" : "providers.protocolModeFallbackHint");
+  // A route served by a worker this deployment runs mounts exactly one wire,
+  // and Core says so by listing one probe surface for it.  Both pickers then
+  // offer a choice the route cannot honour: the mode selects a fallback the
+  // worker never serves, and the protocol list names two surfaces that would
+  // answer 404.  The fact still has to be readable, so the row states the one
+  // protocol instead of dropping it.
+  const singleSurface = stringList(model.probe_surfaces);
+  const onlySurface = singleSurface.length === 1 ? singleSurface[0] : "";
   // Choosing either value answers the question the tip was opened for, so the
   // panel closes with the change instead of lingering over the next row.
   const selectMode = (upstream_protocol_mode: string): void => {
@@ -6776,6 +6784,17 @@ function ProtocolPicker({ providerId, model, busy, translate, dispatch }: { prov
     setTipOpen(false);
     void dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { upstream_url_surface } });
   };
+  if (onlySurface) {
+    const surfaceLabel = probeSurfaceLabel(onlySurface, translate);
+    const fixedHint = translate("providers.protocolSurfaceFixedHint", { surface: surfaceLabel });
+    return <View style={styles.protocolSettings}>
+      <View style={[styles.formRow, compactStyles.formRow]}>
+        <Text style={styles.modelInspectorLabel}>{translate("providers.protocolSurfaceFixed")}</Text>
+        <TooltipText numberOfLines={1} ellipsizeMode="tail" tooltip={fixedHint} accessibilityLabel={fixedHint} style={styles.providerAuthStatusValue}>{surfaceLabel}</TooltipText>
+        <HelpTip open={tipOpen} text={fixedHint} title={translate("providers.protocolModeHelp")} onToggle={() => setTipOpen((current) => !current)} />
+      </View>
+    </View>;
+  }
   return <View style={styles.protocolSettings}>
     <PickerField label={translate("providers.protocolMode")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} allowShrink value={fixed ? "fixed" : "fallback"} values={modeOptions} disabled={busy} onSelect={selectMode} />
     <PickerField label={fixed ? translate("providers.fixedProtocol") : translate("providers.fallbackProtocol")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} allowShrink value={protocol} values={options} disabled={busy} onSelect={selectProtocol} accessory={<HelpTip open={tipOpen} text={protocolHint} title={translate("providers.protocolModeHelp")} onToggle={() => setTipOpen((current) => !current)} />} />
@@ -7088,6 +7107,15 @@ function ProviderIdentityFields({ provider, providerID, relayStations, station, 
     ? station.origin
     : isLogin ? (SERVICE_BASE_URLS[kind as ServiceID] || stringValue(provider.endpoint, stringValue(provider.api_base)))
       : drafts?.providerBaseURL(provider) ?? stringValue(provider.endpoint, stringValue(provider.api_base));
+  // A login provider whose address Core owns holds an `os.environ/` reference,
+  // not a URL: the worker binds a port per launch, so the reference is the only
+  // string that is true across runs.  Printing it told the user nothing — it is
+  // truncated to a prefix, it is not editable, and it names a variable rather
+  // than a destination — so the row is not drawn at all.  The type above already
+  // states which service the address belongs to.
+  const providerAddressIsReference = providerBaseURL.trim().startsWith("os.environ/");
+  const showBaseURL = Boolean(providerBaseURL.trim()) && !providerAddressIsReference;
+  const providerTypeText = providerKindLabel(kind, translate);
   const commitBaseURL = (endpoint: string): void | Promise<void> => {
     if (station) return undefined;
     const nextStation = relayStationForBaseUrl(endpoint, relayStations);
@@ -7150,12 +7178,16 @@ function ProviderIdentityFields({ provider, providerID, relayStations, station, 
       />
       <View style={styles.officialStatusRow}>
         <Text style={styles.providerAuthStatusLabel}>{translate("providers.providerType")}</Text>
-        <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{providerKindLabel(kind, translate)}</Text>
+        {/* A type label is longer than the column it sits in (“Our Free Model ·
+            OpenCode channel” is cut after OpenCod…), so the whole name rides
+            the value as its hover hint and its accessibility label instead of
+            being lost to the ellipsis. */}
+        <TooltipText numberOfLines={1} ellipsizeMode="tail" tooltip={providerTypeText} accessibilityLabel={providerTypeText} style={styles.providerAuthStatusValue}>{providerTypeText}</TooltipText>
       </View>
-      <View style={styles.officialStatusRow}>
+      {showBaseURL ? <View style={styles.officialStatusRow}>
         <Text style={styles.providerAuthStatusLabel}>{translate("providers.baseUrl")}</Text>
-        <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{providerBaseURL}</Text>
-      </View>
+        <TooltipText numberOfLines={1} ellipsizeMode="tail" tooltip={providerBaseURL} accessibilityLabel={providerBaseURL} style={styles.providerAuthStatusValue}>{providerBaseURL}</TooltipText>
+      </View> : null}
     </> : station ? <>
       <TextField
         key={`provider-name:${station.id}:${sourceResetToken}`}
@@ -7858,7 +7890,7 @@ const NATIVE_ACTION_MENU_ITEM_LIMIT = 32;
 /** One saved provider route, as the pane's controls name and send it. */
 type ClientRoute = { model: string; provider: string; deployment_id: string; label: string };
 
-function AssistantSettingsWorkspace({ busy, native, codexModels, codexModelCatalogEnabled, clientProvider, clientModel, localApiActive, onToggleCodexModelCatalog, onUseLocalApi, onUseSavedModel, translate, ipc, filesToken, onOpenFile }: { busy: boolean; native: NativeLeafAdapter; codexModels: UnknownRecord[]; codexModelCatalogEnabled: boolean; clientProvider: string; clientModel: string; localApiActive: boolean; onToggleCodexModelCatalog: (enabled: boolean) => Promise<void>; onUseLocalApi: (selection: UnknownRecord) => Promise<void>; onUseSavedModel: (selection: UnknownRecord) => Promise<void>; translate: Translate; ipc: IpcClient; filesToken: number; onOpenFile: (file: ClientFile) => void }): React.JSX.Element {
+function AssistantSettingsWorkspace({ busy, native, codexModels, codexModelCatalogEnabled, codexFeatures, clientProvider, clientModel, localApiActive, onToggleCodexModelCatalog, onToggleCodexFeature, onUseLocalApi, onUseSavedModel, translate, ipc, filesToken, onOpenFile }: { busy: boolean; native: NativeLeafAdapter; codexModels: UnknownRecord[]; codexModelCatalogEnabled: boolean; codexFeatures?: UnknownRecord; clientProvider: string; clientModel: string; localApiActive: boolean; onToggleCodexModelCatalog: (enabled: boolean) => Promise<void>; onToggleCodexFeature: (feature: string, enabled: boolean) => Promise<void>; onUseLocalApi: (selection: UnknownRecord) => Promise<void>; onUseSavedModel: (selection: UnknownRecord) => Promise<void>; translate: Translate; ipc: IpcClient; filesToken: number; onOpenFile: (file: ClientFile) => void }): React.JSX.Element {
   const [files, setFiles] = useState<ClientFile[]>();
   const [error, setError] = useState<string>();
   // The rail selects one client; its detail lists that client's files only.
@@ -8079,6 +8111,10 @@ function AssistantSettingsWorkspace({ busy, native, codexModels, codexModelCatal
       />
     : null;
 
+  const featureKeys = Object.keys(codexFeatures ?? {}).filter((feature) => feature.endsWith("_use"));
+  const codexFeatureRows = featureKeys.includes("browser_use") && featureKeys.includes("computer_use")
+    ? ["browser_use", "computer_use", ...featureKeys.filter((feature) => feature !== "browser_use" && feature !== "computer_use").sort()]
+    : featureKeys.sort();
   return <View style={styles.externalSettingsWorkspace}>
     <SettingsRail
       rows={railRows}
@@ -8134,6 +8170,28 @@ function AssistantSettingsWorkspace({ busy, native, codexModels, codexModelCatal
             </View>
             <View style={styles.externalSettingsHelpSlot}><Text style={styles.externalSettingsHelpText}>{translate("codex.modelCatalogHint")}</Text></View>
           </View>
+          {codexFeatureRows.map((feature) => {
+            const label = translate(feature === "browser_use"
+              ? "codex.browserUse"
+              : feature === "computer_use"
+                ? "codex.computerUse"
+                : "codex.surfaceFeature");
+            return <View key={feature} style={styles.externalSettingsField}>
+              <View style={styles.externalSettingsInputRow}>
+                <TooltipText numberOfLines={1} tooltip={label} style={styles.externalSettingsFieldLabel} accessibilityLabel={label}>{label}</TooltipText>
+                <View style={styles.externalSettingsValueSlot}>
+                  <NativeToggle
+                    accessibilityLabel={label}
+                    value={codexFeatures?.[feature] === true}
+                    disabled={busy}
+                    onValueChange={(enabled) => void onToggleCodexFeature(feature, enabled)}
+                    style={styles.externalSettingsBooleanControl}
+                  />
+                </View>
+              </View>
+              <View style={styles.externalSettingsHelpSlot}><Text style={styles.externalSettingsHelpText}>{translate(feature === "browser_use" ? "codex.browserUseHint" : feature === "computer_use" ? "codex.computerUseHint" : "codex.surfaceFeatureHint")}</Text></View>
+            </View>;
+          })}
         </View> : null}
         {error !== undefined
           ? <Text style={assistantFileSurfaceStyles.filesStatus}>{error}</Text>
@@ -8947,6 +9005,8 @@ type RenderedLogRecord = {
   tokens: string;
   /** The relay's control plane (NewAPI / Sub2API), kept apart from its name. */
   family: string;
+  /** Which login of the relay the row belongs to, when the station has more than one. */
+  account: string;
   detail: string;
   original: string;
 };
@@ -9481,6 +9541,7 @@ function parseTextLogRecord(record: string, tab: LogTab, _index: number, transla
     duration: "",
     tokens,
     family: "",
+    account: "",
     detail,
     original: record,
   };
@@ -9529,6 +9590,10 @@ function renderOnlineUsageRecord(record: unknown, value: UnknownRecord, translat
   // The relay's own name is the source; the control plane that answered is the
   // type. They are two facts and two columns, so neither one widens the other.
   const source = compactLogValue(value.source_label) || translate("logs.onlineUsageSource");
+  // One relay can hold several dashboard logins, and each login answers only
+  // its own traffic. The account is therefore its own fact: the source column
+  // keeps the station's name, and this column says whose login the row is.
+  const account = compactLogValue(value.source_account);
   const family = compactLogValue(value.source_family);
   const model = compactLogValue(value.model);
   // A per-request log feed reports its own outcome; a credential-scoped usage
@@ -9539,6 +9604,7 @@ function renderOnlineUsageRecord(record: unknown, value: UnknownRecord, translat
   const tokens = logTokenPair(value);
   const detailFields: Array<[string, string]> = [
     [translate("logs.source"), source],
+    [translate("logs.account"), account],
     [translate("logs.type"), family],
     [translate("providers.publicModel"), model],
     [translate("logs.status"), status],
@@ -9555,7 +9621,7 @@ function renderOnlineUsageRecord(record: unknown, value: UnknownRecord, translat
   const details = detailFields.flatMap(([label, field]) => (field ? [`${label}: ${field}`] : []));
   const directDetail = compactLogValue(value.detail);
   if (directDetail) details.unshift(directDetail);
-  const requestKey = `online-usage:${time || "un-timed"}:${source}:${model}`;
+  const requestKey = `online-usage:${time || "un-timed"}:${source}:${account}:${model}`;
   return {
     key: logRecordBaseKey("online-usage", time, requestKey, "", "", JSON.stringify(value)),
     requestKey,
@@ -9567,6 +9633,7 @@ function renderOnlineUsageRecord(record: unknown, value: UnknownRecord, translat
     upstreamModel: "",
     provider: "",
     family,
+    account,
     apiKeyName: compactLogValue(value.key_name),
     event: "",
     action: "",
@@ -9690,6 +9757,7 @@ function renderLogRecord(record: unknown, tab: LogTab, index: number, translate:
     duration,
     tokens,
     family: "",
+    account: "",
     detail: details.filter(Boolean).join(" | "),
     original,
   };
@@ -9800,7 +9868,7 @@ const LOG_DETAIL_COLUMN_FLOOR = 240;
 // 148, which clipped the tail of the widest digit runs into an ellipsis.
 const LOG_TIME_COLUMN_WIDTH = 168;
 
-function logColumns(tab: LogTab, translate: Translate, hasStatus = true): LogColumn[] {
+function logColumns(tab: LogTab, translate: Translate, hasStatus = true, hasAccount = false): LogColumn[] {
   const time = { label: translate("logs.localTime"), width: LOG_TIME_COLUMN_WIDTH, value: (row: RenderedLogRecord) => row.time };
   const status = { label: translate("common.status"), width: 68, value: (row: RenderedLogRecord) => row.status };
   const detail = { label: translate("logs.detail"), width: 260, flex: true, detailFlex: true, value: (row: RenderedLogRecord) => row.detail };
@@ -9831,9 +9899,9 @@ function logColumns(tab: LogTab, translate: Translate, hasStatus = true): LogCol
   ];
   if (tab === "online-usage") return [
     time,
-    // A usage row is read by name, type, model, tokens, and how long it took.
-    // Every other field is what the row's own double-click detail is for, so
-    // the table stays inside its frame instead of scrolling sideways.
+    // A usage row is read by name, account, type, model, tokens, and how long
+    // it took. Every other field is what the row's own double-click detail is
+    // for, so the table stays inside its frame instead of scrolling sideways.
     //
     // The widths are sized to the content these columns actually carry (a
     // relay name, `Sub2API`, `gemini-3.1-pro-preview`, `34113.8 / 88.5`). The
@@ -9842,6 +9910,10 @@ function logColumns(tab: LogTab, translate: Translate, hasStatus = true): LogCol
     // name's own width and the model column — whose values are the longest on
     // the row — absorbs the rest.
     { label: translate("logs.source"), width: 118, maxWidth: 168, flex: true, value: (row) => row.source },
+    // One relay can host several dashboard logins, and only this column says
+    // whose usage a row is. It is drawn only when a row actually carries one:
+    // a station with one login would otherwise stand empty down the table.
+    ...(hasAccount ? [{ label: translate("logs.account"), width: 96, value: (row: RenderedLogRecord) => row.account }] : []),
     { label: translate("logs.type"), width: 82, value: (row) => row.family },
     { label: translate("providers.publicModel"), width: 164, flex: true, value: (row) => row.model },
     // A credential-scoped usage summary states no per-request outcome, so the
@@ -10231,9 +10303,16 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
   );
   const columns = useMemo(
     // The online-usage tab draws its status column only when the relay it read
-    // reports one, so a summary endpoint does not leave an empty column.
+    // reports one, so a summary endpoint does not leave an empty column. Its
+    // account column is drawn the same way: one relay with two logins needs it
+    // to tell two people's rows apart, and one login would leave it blank.
     () => fitLogColumns(
-      logColumns(selected, translate, selected !== "online-usage" || rows.some((row) => Boolean(row.status))),
+      logColumns(
+        selected,
+        translate,
+        selected !== "online-usage" || rows.some((row) => Boolean(row.status)),
+        selected === "online-usage" && rows.some((row) => Boolean(row.account)),
+      ),
       tableWidth,
     ),
     [rows, selected, tableWidth, translate],
@@ -11216,6 +11295,8 @@ function modelProbePresentation(model: UnknownRecord, result: IpcResults["probe"
                 ? translate("providers.probeInlineEgressBlocked")
                 : uniformStatus === "auth_error"
                 ? translate("providers.probeInlineAuthError")
+                : uniformStatus === "rate_limited"
+                  ? translate("providers.probeInlineRateLimited")
                 : uniformStatus === "unsupported"
                   ? translate("providers.probeInlineUnsupported")
                   : uniformStatus === "http_error"
@@ -11292,6 +11373,8 @@ function probeFailureKey(degradation: UnknownRecord): TranslationKey {
       return "providers.probeInlineAuthError";
     case "egress_blocked":
       return "providers.probeInlineEgressBlocked";
+    case "rate_limited":
+      return "providers.probeInlineRateLimited";
     case "unsupported":
       return "providers.probeInlineUnsupported";
     case "http_error":

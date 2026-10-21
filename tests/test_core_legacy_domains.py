@@ -2374,10 +2374,13 @@ class ProvidersModelsDomainTests(unittest.TestCase):
 
 
 class CodexSettingsDomainTests(unittest.TestCase):
+
+
     def test_use_local_api_rewrites_the_selected_provider_in_place(self) -> None:
         """The pane's Codex action adopts this app's own proxy as the backend."""
 
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch("young_router.core.domains.codex._ensure_browser_plugins"):
             from young_router.core.domains._shared import local_proxy_endpoint
 
             root = Path(directory)
@@ -2431,7 +2434,8 @@ class CodexSettingsDomainTests(unittest.TestCase):
     def test_use_local_api_follows_a_built_in_openai_selection(self) -> None:
         """A built-in OpenAI selection takes Codex's own base-url override."""
 
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch("young_router.core.domains.codex._ensure_browser_plugins"):
             from young_router.core.domains._shared import local_proxy_endpoint
 
             root = Path(directory)
@@ -2463,7 +2467,8 @@ class CodexSettingsDomainTests(unittest.TestCase):
     def test_use_local_api_follows_the_runtime_port_and_master_key(self) -> None:
         """A client on the proxy follows the endpoint the runtime settings own."""
 
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch("young_router.core.domains.codex._ensure_browser_plugins"):
             from young_router.core.domains import _shared
 
             root = Path(directory)
@@ -2665,6 +2670,200 @@ class CodexSettingsDomainTests(unittest.TestCase):
             applied = domain.apply()
             self.assertTrue(applied["config_exists"])
             self.assertTrue(applied["auth_file_exists"])
+
+    @mock.patch("young_router.core.domains.codex._ensure_browser_plugins", return_value=[])
+    @mock.patch("young_router.core.domains.codex._installed_surface_plugins")
+    def test_surface_sync_follows_each_explicit_codex_feature(
+        self,
+        installed_surfaces: mock.Mock,
+        _ensure_plugins: mock.Mock,
+    ) -> None:
+        installed_surfaces.return_value = (
+            {
+                "browser_use": "browser@openai-bundled",
+                "computer_use": "computer-use@openai-bundled",
+                "future_use": "future@openai-bundled",
+            },
+            "unified-computer-use@openai-bundled",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            home = root / "codex"
+            home.mkdir()
+            (home / "config.toml").write_text(
+                "[features]\n"
+                "js_repl = false\n"
+                "browser_use = true\n"
+                "computer_use = false\n"
+                "future_use = false\n\n"
+                "[plugins.\"browser@openai-bundled\"]\nenabled = false\n\n"
+                "[plugins.\"computer-use@openai-bundled\"]\nenabled = true\n\n"
+                "[plugins.\"future@openai-bundled\"]\nenabled = true\n\n"
+                "[plugins.\"unified-computer-use@openai-bundled\"]\nenabled = true\n\n"
+                "[mcp_servers.computer-use]\nenabled = true\ncommand = \"old-client\"\n",
+                encoding="utf-8",
+            )
+            (home / "auth.json").write_text("{}\n", encoding="utf-8")
+            domain = CodexSettingsDomain(runtime, codex_home=home)
+
+            snapshot = domain.dispatch("use_local_api", {"model": "default-chat"})
+            features = snapshot["structured"]["features"]
+            self.assertTrue(features["browser_use"])
+            self.assertFalse(features["computer_use"])
+            self.assertFalse(features["future_use"])
+            self.assertFalse(features["js_repl"])
+            plugins = {item["id"]: item["enabled"] for item in snapshot["structured"]["plugins"]}
+            self.assertTrue(plugins["browser@openai-bundled"])
+            self.assertFalse(plugins["computer-use@openai-bundled"])
+            self.assertFalse(plugins["future@openai-bundled"])
+            self.assertNotIn("unified-computer-use@openai-bundled", plugins)
+            self.assertNotIn("computer-use", snapshot["structured"]["mcp_servers"] or [])
+            self.assertEqual(
+                ["browser@openai-bundled"],
+                _ensure_plugins.call_args.args[2],
+            )
+
+    @mock.patch("young_router.core.domains.codex._ensure_browser_plugins", return_value=[])
+    @mock.patch("young_router.core.domains.codex._installed_surface_plugins")
+    def test_new_desktop_feature_keeps_an_unset_choice_unset(
+        self,
+        installed_surfaces: mock.Mock,
+        _ensure_plugins: mock.Mock,
+    ) -> None:
+        installed_surfaces.return_value = (
+            {"future_use": "future@openai-bundled"},
+            "future-runtime@openai-bundled",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            home = root / "codex"
+            home.mkdir()
+            (home / "config.toml").write_text(
+                "[features]\njs_repl = false\n",
+                encoding="utf-8",
+            )
+            (home / "auth.json").write_text("{}\n", encoding="utf-8")
+            with mock.patch(
+                "young_router.core.codex_config._installed_surface_feature_keys",
+                return_value=("future_use",),
+            ):
+                domain = CodexSettingsDomain(runtime, codex_home=home)
+                snapshot = domain.dispatch("use_local_api", {"model": "default-chat"})
+            self.assertIsNone(snapshot["structured"]["features"].get("future_use"))
+            self.assertFalse(snapshot["structured"]["features"]["js_repl"])
+            plugins = {item["id"]: item["enabled"] for item in snapshot["structured"]["plugins"]}
+            self.assertNotIn("future@openai-bundled", plugins)
+            self.assertNotIn("future-runtime@openai-bundled", plugins)
+            _ensure_plugins.assert_not_called()
+
+    @mock.patch("young_router.core.domains.codex._ensure_browser_plugins", return_value=[])
+    @mock.patch("young_router.core.domains.codex._installed_surface_plugins")
+    def test_new_desktop_switch_writes_and_syncs_its_discovered_plugin(
+        self,
+        installed_surfaces: mock.Mock,
+        _ensure_plugins: mock.Mock,
+    ) -> None:
+        installed_surfaces.return_value = (
+            {"future_use": "future@openai-bundled"},
+            "future-runtime@openai-bundled",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            home = root / "codex"
+            home.mkdir()
+            (home / "config.toml").write_text(
+                "[features]\njs_repl = false\n",
+                encoding="utf-8",
+            )
+            (home / "auth.json").write_text("{}\n", encoding="utf-8")
+            domain = CodexSettingsDomain(runtime, codex_home=home)
+
+            snapshot = domain.dispatch(
+                "codex_feature_set",
+                {"feature": "future_use", "enabled": True},
+            )
+            self.assertTrue(snapshot["structured"]["features"]["future_use"])
+            self.assertFalse(snapshot["structured"]["features"]["js_repl"])
+            plugins = {item["id"]: item["enabled"] for item in snapshot["structured"]["plugins"]}
+            self.assertTrue(plugins["future@openai-bundled"])
+            self.assertTrue(plugins["future-runtime@openai-bundled"])
+            self.assertEqual(
+                ["future-runtime@openai-bundled", "future@openai-bundled"],
+                _ensure_plugins.call_args.args[2],
+            )
+
+    @mock.patch("young_router.core.domains.codex._ensure_browser_plugins", return_value=[])
+    @mock.patch("young_router.core.domains.codex._installed_surface_plugins")
+    def test_surface_sync_leaves_unrelated_discovered_switches_unset(
+        self,
+        installed_surfaces: mock.Mock,
+        _ensure_plugins: mock.Mock,
+    ) -> None:
+        installed_surfaces.return_value = (
+            {
+                "browser_use": "browser@openai-bundled",
+                "future_use": "future@openai-bundled",
+            },
+            "unified-computer-use@openai-bundled",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            home = root / "codex"
+            home.mkdir()
+            (home / "config.toml").write_text(
+                "[features]\n"
+                "browser_use = true\n\n"
+                "[plugins.\"browser@openai-bundled\"]\nenabled = false\n\n"
+                "[plugins.\"future@openai-bundled\"]\nenabled = false\n",
+                encoding="utf-8",
+            )
+            (home / "auth.json").write_text("{}\n", encoding="utf-8")
+            domain = CodexSettingsDomain(runtime, codex_home=home)
+
+            snapshot = domain.dispatch("use_local_api", {"model": "default-chat"})
+            features = snapshot["structured"]["features"]
+            self.assertTrue(features["browser_use"])
+            self.assertIsNone(features.get("future_use"))
+            plugins = {item["id"]: item["enabled"] for item in snapshot["structured"]["plugins"]}
+            self.assertTrue(plugins["browser@openai-bundled"])
+            self.assertNotIn("future@openai-bundled", plugins)
+            self.assertEqual(
+                {
+                    "browser@openai-bundled",
+                    "unified-computer-use@openai-bundled",
+                },
+                set(_ensure_plugins.call_args.args[2]),
+            )
+
+    @mock.patch("young_router.core.domains.codex._installed_surface_plugins")
+    def test_surface_sync_refuses_an_unknown_switch(
+        self,
+        installed_surfaces: mock.Mock,
+    ) -> None:
+        installed_surfaces.return_value = ({}, None)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            home = root / "codex"
+            home.mkdir()
+            (home / "config.toml").write_text("[features]\n", encoding="utf-8")
+            (home / "auth.json").write_text("{}\n", encoding="utf-8")
+            domain = CodexSettingsDomain(runtime, codex_home=home)
+
+            with self.assertRaisesRegex(DomainError, "did not declare"):
+                domain.dispatch(
+                    "codex_feature_set",
+                    {"feature": "future_use", "enabled": True},
+                )
 
     @mock.patch("young_router.core.codex_config._local_exposed_models", return_value=(['default-chat'], True))
     def test_menu_catalog_toggle_preserves_staged_codex_edits_and_tracks_public_models(self, _live_models) -> None:

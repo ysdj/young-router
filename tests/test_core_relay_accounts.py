@@ -2235,6 +2235,175 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 domain.restore_saved_password(account_id)
             self.assertEqual(2, station.logins)
 
+    def test_a_stored_session_is_asked_before_a_saved_password_is_posted(self) -> None:
+        """No sign-in is sent while a cookie on hand still works.
+
+        A sign-in is the one-way step: it asks the station to mint another
+        session, and a station caps how many an account may hold at once.  The
+        pane's own 去登录 and a Core restart both used to reach a sign-in with a
+        perfectly usable session already on disk, so every attempt spent one
+        more slot of that cap for an answer the cookie would have given for
+        free -- which is how an account reaches the cap without the user
+        signing in anywhere else.  The credential on hand is therefore asked
+        first, exactly as the automatic renewal path already asked it.
+        """
+
+        class WorkingCookieStation:
+            """The remembered cookie works; the password form would be capped."""
+
+            def __init__(self) -> None:
+                self.logins = 0
+
+            def json(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
+                del origin, path, headers
+                return {"data": {"username": "sample-user", "id": 80}}
+
+            def password_login(self, origin: str, account_type: str, username: str, password: str) -> object:
+                del origin, account_type, username, password
+                self.logins += 1
+                raise RelaySessionLimitError()
+
+        with tempfile.TemporaryDirectory() as directory:
+            station = WorkingCookieStation()
+            domain = RelayAccountsDomain(directory, http_client=station)
+            account_id = domain.dispatch(
+                "add",
+                {"type": "newapi", "label": "Relay", "origin": "https://relay.example.test", "remember_password": True},
+            )["accounts"][0]["id"]
+            domain.accept_login_result(
+                account_id,
+                username="sample-user",
+                cookie="session=replace-cookie",
+                password="replace-password",
+            )
+
+            restored = domain.restore_saved_password(account_id)
+
+            self.assertEqual("signed_in", restored["login_status"])
+            # The station was never asked to mint anything.
+            self.assertEqual(0, station.logins)
+
+    def test_no_saved_credential_is_stated_instead_of_posted(self) -> None:
+        """An account that remembers no password never fills an empty form.
+
+        A form with an empty password can only be answered as a rejected
+        credential, and the app would then hold that station-side rejection for
+        an account whose real state is simply "nothing remembered".  It also
+        costs the station a login attempt on an account that was never going to
+        sign in, which is the traffic that looks like an attack.
+        """
+
+        class NothingStoredStation:
+
+            def __init__(self) -> None:
+                self.logins = 0
+
+            def json(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
+                raise RelayTransportError()
+
+            def password_login(self, origin: str, account_type: str, username: str, password: str) -> object:
+                del origin, account_type, username, password
+                self.logins += 1
+                return {"username": "sample-user", "cookie": "session=new"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            station = NothingStoredStation()
+            domain = RelayAccountsDomain(directory, http_client=station)
+            account_id = domain.dispatch(
+                "add",
+                {"type": "newapi", "label": "Relay", "origin": "https://relay.example.test", "remember_password": True},
+            )["accounts"][0]["id"]
+
+            restored = domain.restore_saved_password(account_id)
+
+            self.assertEqual("signed_out", restored["login_status"])
+            self.assertEqual(0, station.logins)
+
+    def test_a_session_cap_refusal_outlasts_the_password_retry_wait(self) -> None:
+        """A capped account is not re-asked on the short retry window.
+
+        The session cap is the station saying the account already holds as many
+        sessions as it allows -- not that the password is wrong.  Waiting the
+        ordinary retry window and asking again is the same request against the
+        same full cap: it cannot succeed, and every attempt is one more
+        session request on an account the station is already watching.  The
+        wait a cap starts therefore outlasts the sessions that caused it, so
+        nothing this app does automatically asks again while they live.
+        """
+
+        class CappedStation:
+
+            def __init__(self) -> None:
+                self.logins = 0
+
+            def json(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
+                raise RelayAccountsError("Relay login has expired")
+
+            def password_login(self, origin: str, account_type: str, username: str, password: str) -> object:
+                del origin, account_type, username, password
+                self.logins += 1
+                raise RelaySessionLimitError()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            station = CappedStation()
+            domain = RelayAccountsDomain(root, http_client=station)
+            account_id = domain.dispatch(
+                "add",
+                {"type": "newapi", "label": "Relay", "origin": "https://relay.example.test", "remember_password": True},
+            )["accounts"][0]["id"]
+            # A remembered credential is what a sign-in could actually be sent
+            # with; without one nothing is posted and nothing is refused.
+            domain.accept_login_result(
+                account_id,
+                username="sample-user",
+                cookie="session=replace-cookie",
+                password="replace-password",
+            )
+
+            with self.assertRaises(RelaySessionLimitError):
+                domain.restore_saved_password(account_id)
+            self.assertEqual(1, station.logins)
+
+            # The ordinary retry window has passed; a cap that outlives it must
+            # still hold this account back.
+            domain._login_refusals[account_id] = time.monotonic() - (domain._login_refusal_seconds() + 1)
+            with self.assertRaises(RelayLoginBackoffError):
+                domain.restore_saved_password(account_id)
+            self.assertEqual(1, station.logins)
+
+            # Only its own, longer window releases it.
+            domain._login_refusals[account_id] = time.monotonic() - (domain._session_limit_refusal_seconds() + 1)
+            with self.assertRaises(RelaySessionLimitError):
+                domain.restore_saved_password(account_id)
+            self.assertEqual(2, station.logins)
+
+            # A rejected password is still held only for the ordinary window.
+            class WrongPasswordStation(CappedStation):
+                def password_login(self, origin: str, account_type: str, username: str, password: str) -> object:
+                    del origin, account_type, username, password
+                    self.logins += 1
+                    raise RelayAccountsError("Relay username or password is invalid")
+
+            wrong = WrongPasswordStation()
+            other = RelayAccountsDomain(Path(directory) / "other", http_client=wrong)
+            other_id = other.dispatch(
+                "add",
+                {"type": "newapi", "label": "Relay", "origin": "https://relay.example.test", "remember_password": True},
+            )["accounts"][0]["id"]
+            other.accept_login_result(
+                other_id,
+                username="sample-user",
+                cookie="session=replace-cookie",
+                password="replace-password",
+            )
+            with self.assertRaises(RelayAccountsError):
+                other.restore_saved_password(other_id)
+            other._login_refusals[other_id] = time.monotonic() - (other._login_refusal_seconds() + 1)
+            with self.assertRaises(RelayAccountsError):
+                other.restore_saved_password(other_id)
+            self.assertEqual(2, wrong.logins)
+
     def test_a_determined_signed_out_is_settled_instead_of_re_probed(self) -> None:
         """A determined 未登录 answers later checks; a placeholder answers none.
 

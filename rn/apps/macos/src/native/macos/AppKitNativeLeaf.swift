@@ -6283,6 +6283,8 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         signInProbeAttempts = 0
         clearCapturedCredentials()
         didAutoSubmitSavedPassword = false
+        attemptSawRefusal = false
+        loginSubmitAuthorized = false
         loginPrefillProbe?.cancel()
         loginPrefillProbe = nil
         loginPrefillAttempts = 0
@@ -6635,6 +6637,14 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         // Swift resolve the call to the array being defined, which fails the
         // build with "cannot call value of non-function type '[Any]'" .
         let restoredCookies = restoredSession.map { cookies(fromHeader: $0.cookie) } ?? []
+        // A presentation with no session on hand has nothing to preserve, so the
+        // remembered password is the only way in and filling it is the sign-in
+        // the user asked for.  A presentation that *does* hold a session is the
+        // opposite case: its cookie is asked first, and only a refusal of that
+        // cookie (see ``probe``) may replace it.  Core applies the same rule to
+        // its own restore, and both exist because each sign-in is one session
+        // against the account's cap.
+        loginSubmitAuthorized = restoredSession == nil
         guard !restoredCookies.isEmpty else {
             webView.load(URLRequest(url: loginURL))
             return
@@ -6707,11 +6717,20 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     /// Fill the station's sign-in form from what the app already knows.
     ///
     /// The account's username is always filled.  When the user chose to be
-    /// remembered, the password Core keeps is filled beside it and the form is
-    /// submitted, so a station the app has a working credential for does not
-    /// ask the user to retype it.  A page whose credentials are already
-    /// complete is submitted once: the flag is what keeps a resolved page from
-    /// being submitted again on the next probe.
+    /// remembered, the password Core keeps is filled beside it -- but only once
+    /// the page is known to be an unauthenticated form that the user actually
+    /// has to answer.  Submitting it is the one action here that asks the
+    /// station to mint a session, and a station caps how many an account may
+    /// hold at once, answering a further request with
+    /// ``AUTH_SESSION_LIMIT``.  A page that still carries its sign-in form is
+    /// therefore *not* enough evidence to submit it: a station that has just
+    /// accepted this browser's own session may not have left /login yet, and a
+    /// restored session that still works renders exactly the same form while its
+    /// cookies are being installed.  The flow verifies one of those first
+    /// (:meth:`startSignInCheck`) and only a station's own refusal of every
+    /// credential it was shown opens the way to :meth:`submitSavedPassword`.
+    /// A form entered while that answer is still outstanding is what kept this
+    /// app minting one session per entry until the account was locked out.
     private func prefillLoginWhenReady() {
         guard mode == .login, isBrowserFlowLive, let username = presetUsername, !username.isEmpty else { return }
         // Let a restored session seed local storage and reload before looking
@@ -6723,11 +6742,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         guard !didFillLoginFields, loginPrefillAttempts < Self.loginPrefillMaxAttempts else { return }
         loginPrefillAttempts += 1
         let safeUser = jsonLiteral(username)
-        let password = restoredPassword
-        let safePassword = jsonLiteral(password ?? "")
-        let autoSubmit = password == nil
-            ? "false"
-            : (didAutoSubmitSavedPassword ? "false" : "true")
+        let safePassword = jsonLiteral(restoredPassword ?? "")
         let script = """
         (() => {
           const user = document.querySelector('input[type=email], input[type=text], input:not([type]), input[name=email], input[name=username], input[autocomplete=username], input[placeholder*="用户名"], input[placeholder*="email" i]');
@@ -6747,15 +6762,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
           };
           set(user, \(safeUser));
           set(password, \(safePassword));
-          if (\(autoSubmit) && user && password && user.value && password.value) {
-            const form = password.form;
-            const submit = form?.querySelector('button[type=submit],input[type=submit],button:not([type])')
-              ?? Array.from(document.querySelectorAll('button')).find((node) => /sign in|log in|登录/i.test((node.textContent || node.getAttribute('aria-label') || '').trim()));
-            if (submit instanceof HTMLElement) submit.click();
-            else if (form instanceof HTMLFormElement && typeof form.requestSubmit === 'function') form.requestSubmit();
-            return true;
-          }
-          return false;
+          return true;
         })();
         """
         // A station that renders its shell first and its form later (a client
@@ -6769,8 +6776,12 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
             self.webView.evaluateJavaScript(script) { [weak self] value, _ in
                 guard let self, self.isBrowserFlowLive else { return }
                 if value as? Bool == true {
-                    self.didAutoSubmitSavedPassword = true
                     self.didFillLoginFields = true
+                    // With no session on hand, this form is the sign-in: the
+                    // user opened the account pane to sign in, so submitting it
+                    // is what they asked for.  A presentation that holds a
+                    // session submits only after that session was refused.
+                    if self.loginSubmitAuthorized { self.submitSavedPassword() }
                     return
                 }
                 // The password the app holds is what makes the form complete;
@@ -6788,6 +6799,50 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             guard let self else { return }
             self.prefillLoginWhenReady()
+        }
+    }
+
+    /// Submit the saved password, because the station refused everything else.
+    ///
+    /// This is the only place this flow asks a station to mint a session of its
+    /// own, and it runs only after the sign-in check showed that neither the
+    /// restored session nor the page's own session is usable
+    /// (:meth:`startSignInCheck`).  A station caps an account's concurrent
+    /// sessions, so each submission is one attempt against that cap; asking
+    /// before the credential on hand was actually refused is what turned every
+    /// pane entry into another session until the account was signed out
+    /// everywhere.  The flag makes the submission once per presentation.
+    private func submitSavedPassword() {
+        guard mode == .login,
+              isBrowserFlowLive,
+              loginSubmitAuthorized,
+              let password = restoredPassword,
+              !password.isEmpty,
+              !didAutoSubmitSavedPassword else { return }
+        didAutoSubmitSavedPassword = true
+        let script = """
+        (() => {
+          const password = document.querySelector('input[type=password], input[autocomplete=current-password]');
+          const user = document.querySelector('input[type=email], input[type=text], input:not([type]), input[name=email], input[name=username], input[autocomplete=username], input[placeholder*="用户名"], input[placeholder*="email" i]');
+          if (!user || !password || !user.value || !password.value) return false;
+          const form = password.form;
+          const submit = form?.querySelector('button[type=submit],input[type=submit],button:not([type])')
+            ?? Array.from(document.querySelectorAll('button')).find((node) => /sign in|log in|登录/i.test((node.textContent || node.getAttribute('aria-label') || '').trim()));
+          if (submit instanceof HTMLElement) submit.click();
+          else if (form instanceof HTMLFormElement && typeof form.requestSubmit === 'function') form.requestSubmit();
+          return true;
+        })();
+        """
+        webView.evaluateJavaScript(script) { [weak self] value, _ in
+            guard let self, self.isBrowserFlowLive else { return }
+            guard value as? Bool == true else {
+                // A form that is gone or incomplete did not submit: the station
+                // was still not asked anything, so the next probe may try
+                // again.
+                self.didAutoSubmitSavedPassword = false
+                return
+            }
+            self.setStatus(self.waitingForSignInStatus)
         }
     }
 
@@ -6810,6 +6865,10 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         let attempt = NativeRelayLoginAttempt()
         activeCheck = attempt
         checking = true
+        // Each check starts from "the station has not refused anything yet":
+        // only an answer this attempt received may justify a sign-in, so a
+        // previous attempt's refusal never lends its authority to this one.
+        attemptSawRefusal = false
         checkStartedAt = Date()
         panelClosedDuringCommit = false
         automaticCheckProbe?.cancel()
@@ -6985,9 +7044,36 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         }
     }
 
+    /// Whether this attempt has shown the station refusing a credential.
+    ///
+    /// A 401/403 is the station's own answer about the session it was shown, and
+    /// that is the only outcome that justifies replacing it with a sign-in.  A
+    /// timeout, a refused connection, a 5xx, or a 2xx body this probe cannot
+    /// read states nothing about the session, so none of them may be read as
+    /// "the credential is dead" -- submitting the saved password on one of those
+    /// is the app spending a session to answer a question the station never
+    /// spoke to.
+    private var attemptSawRefusal = false
+    /// Whether this presentation may submit the remembered password at all.
+    ///
+    /// It is opened only by a station's refusal of the session on hand, and only
+    /// once: a sign-in the station then refuses must not be followed by another
+    /// one on the next probe, because each attempt is one more session against
+    /// the account's cap.
+    private var loginSubmitAuthorized = false
+
     private func probe(index: Int, cookieHeader: String?, attempt: NativeRelayLoginAttempt, automatically: Bool = false) {
         guard isCurrentCheck(attempt) else { return }
         guard index < probes.count else {
+            // Every surface this station knows about was asked and none accepted
+            // the session on hand.  Only a refusal the station actually stated
+            // opens the way to a sign-in; a station this app could not reach or
+            // could not read leaves the login exactly as it was, which is the
+            // same rule Core applies to its own session check.
+            if attemptSawRefusal, restoredPassword?.isEmpty == false {
+                loginSubmitAuthorized = true
+                submitSavedPassword()
+            }
             finishCheckingFailure(
                 text("No valid sign-in was found. Complete sign-in in the page and try again.", "未检测到有效登录状态。请完成登录后重试。"),
                 attempt: attempt,
@@ -7030,8 +7116,13 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
             guard let response = response as? HTTPURLResponse, (200..<300).contains(response.statusCode),
                   let data, data.count <= 2 * 1024 * 1024,
                   let object = try? JSONSerialization.jsonObject(with: data) else {
+                // A status the station chose is an answer; a missing response or
+                // an unreadable body is not.  Only the former says anything about
+                // the session on hand.
+                let refused = (response as? HTTPURLResponse).map { $0.statusCode == 401 || $0.statusCode == 403 } ?? false
                 DispatchQueue.main.async { [weak self, weak attempt] in
                     guard let self, let attempt, self.isCurrentCheck(attempt) else { return }
+                    if refused { self.attemptSawRefusal = true }
                     self.probe(index: index + 1, cookieHeader: cookieHeader, attempt: attempt, automatically: automatically)
                 }
                 return
@@ -7474,6 +7565,14 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
 
     private func scheduleAutomaticSignInCheck() {
         guard mode == .login, isBrowserFlowLive, !checking else { return }
+        // Once this window is allowed to submit the remembered password, the
+        // automatic check has done its job: the page is now the station's own
+        // answer surface.  A further check could only repeat the refusal the
+        // submission was authorized by, and each round trip is one more request
+        // against an account whose session count is what runs out, so the loop
+        // hands the decision back to the user (who can finish the sign-in in the
+        // page and press 验证登录).
+        guard !loginSubmitAuthorized else { return }
         // A station whose sign-in never answers is not retried forever: past the
         // bound the window states what it found and puts the check back in the
         // user's hands, through the same control that performs it on demand.

@@ -890,6 +890,14 @@ class ProvidersModelsDomain:
                         "deployment_id": str(model.get("deployment_id", "")),
                         "upstream_url_surface": str(model.get("upstream_url_surface", "")),
                         "upstream_protocol_mode": str(model.get("upstream_protocol_mode", "fallback")),
+                        # The surfaces this route can be measured on.  The pane
+                        # offers a protocol choice on a route that has one; a
+                        # route served by a worker this deployment runs answers
+                        # on exactly one, so offering the other two would be
+                        # offering a choice the route cannot honour.
+                        "probe_surfaces": self._probe_surfaces(
+                            self._model_api_base(provider, model), model, provider
+                        ),
                         "supports_responses_image_generation_tool": bool(model.get("supports_responses_image_generation_tool")),
                         "supports_responses_image_generation_tool_present": bool(model.get("supports_responses_image_generation_tool_present")),
                         "litellm_extra": safe_litellm_extra,
@@ -2347,6 +2355,13 @@ class ProvidersModelsDomain:
                 for surface, result in surface_results.items()
             },
         }
+        # A 429 is the upstream answering on the surface it was asked about: it
+        # read the request and refused the pace, not the protocol.  Naming it
+        # here keeps the pane from reporting a rate limit as "no usable surface"
+        # and from offering a protocol switch that would change nothing.
+        rate_limited_surfaces = [
+            surface for surface in priority if statuses.get(surface) == "rate_limited"
+        ]
         return {
             "ok": recommended is not None,
             "available": recommended is not None,
@@ -2367,6 +2382,10 @@ class ProvidersModelsDomain:
             if recommendation_blocked
             else "The model endpoint could not be reached"
             if unreachable_surfaces and len(unreachable_surfaces) == len(priority)
+            else "The upstream rate-limited the probe (HTTP 429 on "
+            + "; ".join(rate_limited_surfaces)
+            + "); no protocol change is recommended"
+            if rate_limited_surfaces
             else "No usable model API surface was found",
             "provider_id": provider_id,
             "model_id": model_id,
@@ -4810,7 +4829,13 @@ class ProvidersModelsDomain:
         provider_id = managed_adapters.catalog_provider_id(auth_kind)
         if not provider_id:
             raise DomainError("The selected provider publishes no catalog of its own")
-        self._service_catalog_operation(provider_id, refresh=True)
+        # The picker the user just chose from was painted by this same catalog,
+        # so re-reading it from upstream here would buy nothing and cost a full
+        # remote directory read before a single row could appear.  The remembered
+        # answer is the authority the pick was made against, and the worker
+        # answers a non-refresh read only once its own first refresh has
+        # finished, so this is never an empty roster.
+        self._service_catalog_operation(provider_id, refresh=False)
         catalog = self._last_operation.get("models")
         entries = {
             str(entry.get("id", "")).strip(): entry

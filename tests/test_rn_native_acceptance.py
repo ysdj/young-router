@@ -601,6 +601,10 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # the table names no address for (Our Free Model, whose worker
         # binds a per-launch port) states the address Core actually holds.
         self.assertIn('isLogin ? (SERVICE_BASE_URLS[kind as ServiceID] || stringValue(provider.endpoint, stringValue(provider.api_base)))', identity)
+        # An address Core holds is a reference, not a destination: the row is
+        # drawn only for a real URL so the pane never prints (and truncates) an
+        # `os.environ/` variable the user can neither read nor edit.
+        self.assertIn('const showBaseURL = Boolean(providerBaseURL.trim()) && !providerAddressIsReference;', identity)
         # No picker, no confirmation, no retarget dispatch: the whole surface
         # that used to switch a provider's type is gone from both hosts' shared
         # UI, so a provider's type has exactly one place it is decided.
@@ -1937,14 +1941,27 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("let capturedPassword = self.capturedPassword", mac_leaf)
         self.assertIn("password: rememberPassword == true ? capturedPassword : nil", mac_leaf)
         # A remembered account has both fields filled from what the app already
-        # knows: the password Core keeps for this account is read through the
-        # native plaintext lease, typed into the station's own form beside the
-        # username, and the completed form is submitted once.
-        prefill = mac_leaf.split("private func prefillLoginWhenReady()", 1)[1].split("private func jsonLiteral", 1)[0]
+        # knows, but the submission is a separate, authorized step: it asks the
+        # station to mint a session, so it runs only after the station refused
+        # the session on hand (or when there was none to preserve).  Submitting
+        # on a rendered form alone is what minted one session per pane entry
+        # until the account was refused its own sign-in.
+        prefill = mac_leaf.split("private func prefillLoginWhenReady()", 1)[1].split("private func scheduleLoginPrefill", 1)[0]
         self.assertIn("field: \"password\"", mac_leaf)
         self.assertIn("const password = document.querySelector('input[type=password], input[autocomplete=current-password]');", prefill)
         self.assertIn("set(password, \\(safePassword));", prefill)
-        self.assertIn("requestSubmit", prefill)
+        self.assertNotIn("requestSubmit", prefill)
+        submit = mac_leaf.split("private func submitSavedPassword()", 1)[1].split("private func jsonLiteral", 1)[0]
+        self.assertIn("requestSubmit", submit)
+        # The only evidence that may open that submission is the station's own
+        # refusal of the credential it was shown.
+        self.assertIn("private var attemptSawRefusal = false", mac_leaf)
+        self.assertIn("private var loginSubmitAuthorized = false", mac_leaf)
+        self.assertIn("loginSubmitAuthorized = restoredSession == nil", mac_leaf)
+        check = mac_leaf.split("private func probe(index: Int", 1)[1].split("private func persistVerifiedLogin", 1)[0]
+        self.assertIn("if refused { self.attemptSawRefusal = true }", check)
+        self.assertIn("if attemptSawRefusal, restoredPassword?.isEmpty == false {", check)
+        self.assertIn("loginSubmitAuthorized = true", check)
         self.assertIn("private var restoredPassword: String?", mac_leaf)
         self.assertIn("private var didAutoSubmitSavedPassword = false", mac_leaf)
         self.assertIn("private func restoreRememberedPassword()", mac_leaf)
@@ -2067,9 +2084,14 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("ProfileName(ProfileName(state->options.account_id))", windows_relay)
         self.assertIn("CredWriteW", windows_relay)
         self.assertIn("ProbeEndpoint(state->options", windows_relay)
-        self.assertIn("auto_submit_saved_password_pending", windows_relay)
+        # The saved password is submitted only after the station refused the
+        # session on hand, so a station cap is never asked for a second session
+        # on evidence that is not a refusal.
+        self.assertIn("SubmitSavedPassword", windows_relay)
+        self.assertIn("attempt_saw_refusal", windows_relay)
+        self.assertIn("login_submit_authorized", windows_relay)
+        self.assertNotIn("auto_submit_saved_password_pending", windows_relay)
         self.assertIn("did_auto_submit_saved_password", windows_relay)
-        self.assertIn("auto_login_attempt", windows_relay)
         self.assertIn("localStorage.getItem('user')", windows_relay)
         self.assertIn("user.token=access", windows_relay)
         self.assertIn("userInput.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'auto' });", windows_relay)
@@ -3434,7 +3456,9 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # viewport behavior is still covered by the settings editors above;
         # the log surface must not regress to a giant raw text editor.
         self.assertNotIn('documentKey={`logs:${selected}`}', ui)
-        self.assertIn("logColumns(selected, translate, selected !== \"online-usage\" || rows.some((row) => Boolean(row.status)))", ui)
+        self.assertIn("logColumns(", ui)
+        self.assertIn("selected !== \"online-usage\" || rows.some((row) => Boolean(row.status)),", ui)
+        self.assertIn("selected === \"online-usage\" && rows.some((row) => Boolean(row.account)),", ui)
         self.assertIn("const nativeTableColumns = useMemo(", ui)
         self.assertIn("<NativeTable columns={nativeTableColumns}", ui)
         self.assertIn("REACT_FIELD(documentKey)", windows_codegen)

@@ -225,6 +225,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "logs.tokenCount": "令牌数",
   "logs.tokenCountK": "令牌数(k)",
   "logs.apiKeyName": "密钥名",
+  "logs.account": "账号",
   "logs.paused": "已暂停",
   "logs.failed": "失败",
   "logs.originalRecord": "日志原文",
@@ -328,8 +329,18 @@ export const zhHans: Record<TranslationKey, string> = {
   "providers.protocolModeFallbackHint": "优先沿用当前请求协议；上游不支持时切换到备用协议。",
   "providers.protocolModeFixedHint": "所有请求始终使用指定协议调用上游。",
   "providers.protocolModeHelp": "协议说明",
+  // A route served by a worker this deployment runs answers on one surface
+  // only, so its protocol is a fact to state rather than a choice to offer.
+  "providers.protocolSurfaceFixed": "接口协议",
+  "providers.protocolSurfaceFixedHint": "这条路由由本机服务提供，只应答 {surface}，所以协议方式与备用协议都不适用。",
   "codex.modelCatalog": "漾路由模型列表",
   "codex.modelCatalogHint": "勾选后，Codex 的模型列表替换为漾路由公开的模型列表；取消勾选则恢复 Codex 自带的模型列表。",
+  "codex.browserUse": "内置浏览器",
+  "codex.browserUseHint": "跟随 Codex config.toml 中的 Browser 开关，并同步内置 Browser 运行时。终端 Playwright 是另一项独立工具。",
+  "codex.computerUse": "电脑使用",
+  "codex.computerUseHint": "跟随 Codex config.toml 中的 Computer Use 开关，并同步对应运行时。",
+  "codex.surfaceFeature": "桌面能力",
+  "codex.surfaceFeatureHint": "从已安装的 Codex 应用中发现的新桌面能力；插件运行时跟随 config.toml 中对应开关。",
   "codex.modelCatalogEditTitle": "编辑模型列表文件",
   "codex.modelCatalogEditBody": "该文件由漾路由根据公开模型列表自动生成，并会在模型列表变化、保存配置或“模型上下文刷新间隔”到期时重写（默认每 6 小时，可在“运行时”中调整），手动修改可能被覆盖。仍要编辑吗？",
   "codex.modelCatalogEditConfirm": "仍要编辑",
@@ -518,6 +529,10 @@ export const zhHans: Record<TranslationKey, string> = {
   // way when the upstream sees the egress as abusive, and saying "密钥被拒"
   // sent the user to re-enter a credential that was never the problem.
   "providers.probeInlineEgressBlocked": "出口被拒",
+  // A 429 is the upstream answering, not refusing: it read the request and
+  // refused the pace.  Saying “协议不通” for it claimed the protocol was the
+  // problem and pointed the user at a setting that would change nothing.
+  "providers.probeInlineRateLimited": "被限流",
   "providers.probeInlineUnsupported": "无此协议",
   "providers.probeInlineHttpError": "上游报错",
   "providers.probeInlineInvalidResponse": "返回异常",
@@ -817,7 +832,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "relay.loginResourcesUnavailable": "登录成功，但无法加载 API 资源。请点击“刷新”重试。",
   "relay.loginNotCompleted": "登录已取消，或未检测到有效登录状态。",
   "relay.loginRefusedElsewhere": "中转站拒绝签发新的登录会话（该账号的同时在线会话数已达上限，多次重复登录也会累积占满）。已保存的会话仍会被优先复用，不会因此被清除；请先在已登录的设备上退出其他登录会话，或重置站点密码。",
-  "relay.loginBackoff": "刚被中转站拒绝过登录，暂不重复尝试，稍后会自动重试。已保存的会话仍会被优先复用。",
+  "relay.loginBackoff": "刚被中转站拒绝过登录，暂不重复尝试；会话数达上限时会等较长时间再重试。已保存的会话仍会被优先复用。",
   "relay.operationFailed": "操作失败，请重试。",
   "relay.credentialsCleanupPending": "账号已删除，但仍需清除“{label}”的本机凭据。",
   "relay.retryCleanup": "重试清理本机凭据",

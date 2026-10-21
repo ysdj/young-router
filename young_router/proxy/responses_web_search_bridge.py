@@ -1924,6 +1924,17 @@ def _is_public_reasoning_summary_stream_event(chunk_type: str) -> bool:
     return chunk_type.startswith("response.reasoning_summary_")
 
 
+def _public_reasoning_is_allowed(request_kwargs: Optional[dict]) -> bool:
+    """Whether this request explicitly asked for provider-visible reasoning."""
+
+    if not isinstance(request_kwargs, dict):
+        return False
+    reasoning = request_kwargs.get("reasoning")
+    if not isinstance(reasoning, dict):
+        return False
+    return reasoning.get("summary") == "raw"
+
+
 def _sanitize_reasoning_output_item(item: Any) -> Optional[Any]:
     """Keep the public summary and opaque replay token, never raw reasoning."""
     if not isinstance(item, dict) or item.get("type") != "reasoning":
@@ -2010,7 +2021,10 @@ def _has_structured_output_item(output: Any) -> bool:
     return False
 
 
-def _sanitize_response_reasoning_items(response: Any) -> Any:
+def _sanitize_response_reasoning_items(
+    response: Any,
+    request_kwargs: Optional[dict] = None,
+) -> Any:
     payload = _streaming_module._jsonable(response)
     if not isinstance(payload, dict):
         return response
@@ -2022,6 +2036,7 @@ def _sanitize_response_reasoning_items(response: Any) -> Any:
         if _is_reasoning_output_item(item):
             reasoning_fragments.update(_reasoning_text_fragments(item))
     has_structured_output = _has_structured_output_item(output)
+    allow_public_reasoning = _public_reasoning_is_allowed(request_kwargs)
     clean_output: list[Any] = []
     changed = False
     for item in output:
@@ -2031,6 +2046,13 @@ def _sanitize_response_reasoning_items(response: Any) -> Any:
                 continue
             clean_reasoning_item = _sanitize_reasoning_output_item(item)
             if clean_reasoning_item is None:
+                changed = True
+                continue
+            if (
+                not allow_public_reasoning
+                and isinstance(clean_reasoning_item, dict)
+                and clean_reasoning_item.get("summary") not in (None, [], ())
+            ):
                 changed = True
                 continue
             clean_output.append(clean_reasoning_item)
@@ -2072,13 +2094,15 @@ def _sanitize_response_stream_payload(
     return _sanitize_response_reasoning_items(
         _sanitize_response_raw_tool_call_text(
             _sanitize_response_web_search_call_items(response, request_kwargs)
-        )
+        ),
+        request_kwargs,
     )
 
 
 def _sanitize_raw_tool_call_text_stream_chunk(
     chunk: Any,
     text_filter: Optional[_RawToolCallTextFilter] = None,
+    request_data: Optional[dict] = None,
 ) -> Optional[Any]:
     dumped = _streaming_module._stream_chunk_dump(chunk)
     if not isinstance(dumped, dict) or not dumped:
@@ -2135,7 +2159,10 @@ def _sanitize_raw_tool_call_text_stream_chunk(
 
     if chunk_type == "response.completed":
         response = dumped.get("response")
-        clean_response = _sanitize_response_stream_payload(response)
+        clean_response = _sanitize_response_stream_payload(
+            response,
+            request_data,
+        )
         raw_tool_calls = (
             text_filter.take_raw_tool_call_items()
             if text_filter is not None
@@ -2172,14 +2199,17 @@ def _sanitize_raw_tool_call_text_stream_chunk(
     return chunk
 
 
-def _sanitize_web_search_stream_chunk(chunk: Any) -> Optional[Any]:
+def _sanitize_web_search_stream_chunk(
+    chunk: Any,
+    request_kwargs: Optional[dict] = None,
+) -> Optional[Any]:
     dumped = _streaming_module._stream_chunk_dump(chunk)
     if not isinstance(dumped, dict) or not dumped:
         return chunk
 
     chunk_type = _streaming_module._stream_chunk_type(dumped)
     if _is_public_reasoning_summary_stream_event(chunk_type):
-        return chunk
+        return chunk if _public_reasoning_is_allowed(request_kwargs) else None
     if chunk_type.startswith("response.reasoning"):
         return None
 
@@ -2190,6 +2220,12 @@ def _sanitize_web_search_stream_chunk(chunk: Any) -> Optional[Any]:
                 return None
             clean_item = _sanitize_reasoning_output_item(item)
             if clean_item is None:
+                return None
+            if (
+                not _public_reasoning_is_allowed(request_kwargs)
+                and isinstance(clean_item, dict)
+                and clean_item.get("summary") not in (None, [], ())
+            ):
                 return None
             if clean_item is item:
                 return chunk
@@ -2232,7 +2268,10 @@ def _sanitize_web_search_stream_chunk(chunk: Any) -> Optional[Any]:
 
     if chunk_type == "response.completed":
         response = dumped.get("response")
-        clean_response = _sanitize_response_stream_payload(response)
+        clean_response = _sanitize_response_stream_payload(
+            response,
+            request_kwargs,
+        )
         if clean_response is response:
             return chunk
         clean_chunk = copy.deepcopy(dumped)

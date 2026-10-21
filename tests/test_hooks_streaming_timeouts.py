@@ -1012,6 +1012,10 @@ class HookStreamingTimeoutTests(HookTestCase):
             "model": "balanced-chat",
             "input": [{"role": "user", "content": "Say visible."}],
             "stream": True,
+            # The summary frames below are delivered because this client asked
+            # for raw reasoning; a request without it hides them, because a
+            # provider's thinking is not the turn's answer.
+            "reasoning": {"effort": "high", "summary": "raw"},
             "model_info": {"id": "chatroute", "order": 1},
         }
 

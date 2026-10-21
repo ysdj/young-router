@@ -806,11 +806,18 @@ def _install_selected_deployment_marker_patch() -> None:
         False,
     ):
 
+        # LiteLLM keeps adding optional switches to this method -- 1.107 added
+        # ``splits_stream_timeout`` for the Responses handlers. Whatever this
+        # wrapper does not interpret must reach the original: a pinned
+        # signature raises ``TypeError`` inside deployment selection, before
+        # the route is called, so every request on that handler answers as a
+        # terminal route failure with no upstream attempt behind it.
         def patched_update_kwargs_with_deployment(
             self: Any,
             deployment: dict,
             kwargs: dict,
             function_name: Optional[str] = None,
+            **upstream_kwargs: Any,
         ) -> None:
             _responses_execution_module._remember_request_model_group_before_deployment_update(kwargs)
             surface = _routing_module._request_surface_for_deployment(kwargs, deployment)
@@ -828,7 +835,11 @@ def _install_selected_deployment_marker_patch() -> None:
                 _routing_module._remember_selected_deployment(deployment)
                 force_browser_headers = _responses_request_module._request_forces_browser_compatible_headers(kwargs)
                 result = original_update_kwargs_with_deployment(
-                    self, deployment, kwargs, function_name=function_name
+                    self,
+                    deployment,
+                    kwargs,
+                    function_name=function_name,
+                    **upstream_kwargs,
                 )
                 _routing_module._remember_selected_deployment_for_request(kwargs, deployment)
                 if force_browser_headers:
@@ -879,6 +890,7 @@ def _install_selected_deployment_marker_patch() -> None:
                 deployment,
                 kwargs,
                 function_name=function_name,
+                **upstream_kwargs,
             )
             _routing_module._remember_selected_deployment_for_request(kwargs, deployment)
             _routing_module._apply_surface_adapter_to_request(
@@ -1308,6 +1320,15 @@ def _install_generic_deployment_failover_patch() -> None:
                     wrapped_original_function,
                     **kwargs,
                 )
+                if getattr(
+                    response,
+                    "_young_router_terminal_failed_stream",
+                    False,
+                ) is True:
+                    # A terminal response.failed stream is the answer for this
+                    # request. Treating the async iterable as a successful
+                    # answer sends its refusal again as a new prompt.
+                    return response
                 marker = _routing_module._selected_deployment_marker_from_response(
                     response
                 )
@@ -1808,22 +1829,30 @@ def _install_responses_completion_stream_patch() -> None:
             patched_return_default_done_events
         )
 
-    original_emit_response_completed_event = getattr(
-        LiteLLMCompletionStreamingIterator,
-        "_emit_response_completed_event",
-        None,
-    )
-    if original_emit_response_completed_event is not None and not getattr(
-        original_emit_response_completed_event,
-        _RESPONSES_COMPLETION_STREAM_COMPLETED_PATCH_ATTR,
-        False,
-    ):
+    # LiteLLM renamed this emitter to ``_emit_terminal_response_event`` (it
+    # can now answer an incomplete terminal event too): 1.104 still called the
+    # old name, 1.106 only has the new one. Patch whichever name the installed
+    # release carries: a patch that silently stops applying leaves the managed
+    # WebSocket transport's completed event unnormalized, because that
+    # transport bypasses the SSE pipeline that normalizes usage.
+    def _patch_completed_event_emitter(attribute_name: str) -> None:
+        original_emit_completed_event = getattr(
+            LiteLLMCompletionStreamingIterator,
+            attribute_name,
+            None,
+        )
+        if original_emit_completed_event is None or getattr(
+            original_emit_completed_event,
+            _RESPONSES_COMPLETION_STREAM_COMPLETED_PATCH_ATTR,
+            False,
+        ):
+            return
 
-        def patched_emit_response_completed_event(
+        def patched_emit_completed_event(
             self: Any,
             litellm_model_response: Any,
         ) -> Any:
-            response_completed_event = original_emit_response_completed_event(
+            response_completed_event = original_emit_completed_event(
                 self,
                 litellm_model_response,
             )
@@ -1834,18 +1863,23 @@ def _install_responses_completion_stream_patch() -> None:
             return response_completed_event
 
         setattr(
-            patched_emit_response_completed_event,
+            patched_emit_completed_event,
             _RESPONSES_COMPLETION_STREAM_COMPLETED_PATCH_ATTR,
             True,
         )
         setattr(
-            patched_emit_response_completed_event,
-            "_original_emit_response_completed_event",
-            original_emit_response_completed_event,
+            patched_emit_completed_event,
+            "_original_emit_completed_event",
+            original_emit_completed_event,
         )
-        LiteLLMCompletionStreamingIterator._emit_response_completed_event = (
-            patched_emit_response_completed_event
+        setattr(
+            LiteLLMCompletionStreamingIterator,
+            attribute_name,
+            patched_emit_completed_event,
         )
+
+    _patch_completed_event_emitter("_emit_response_completed_event")
+    _patch_completed_event_emitter("_emit_terminal_response_event")
 
 def _install_responses_tool_search_bridge_patch() -> None:
     try:

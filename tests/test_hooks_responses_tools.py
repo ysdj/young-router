@@ -1731,7 +1731,13 @@ class HookResponsesToolBridgeTests(HookTestCase):
             ],
         }
 
-        sanitized = hooks._sanitize_response_reasoning_items(response)
+        # A public reasoning summary is delivered only to a client that asked
+        # for raw reasoning: non-final thinking is not assistant output, so the
+        # unrequested default hides it instead of pasting it into the turn.
+        sanitized = hooks._sanitize_response_reasoning_items(
+            response,
+            {"reasoning": {"summary": "raw"}},
+        )
 
         self.assertNotIn("output_text", sanitized)
         self.assertEqual(

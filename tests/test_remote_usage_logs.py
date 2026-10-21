@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import tempfile
 import textwrap
 import unittest
@@ -37,6 +38,53 @@ class FakeResponse:
 
 
 class RemoteUsageLogsTests(unittest.TestCase):
+    @staticmethod
+    def write_relay_station(path: Path, origin: str, station_type: str = "newapi", account_id: str = "") -> None:
+        """Register a relay station the way the relay panes record one.
+
+        The usage tab lists relay _stations_, and the relay panes' own document
+        is what records them.  A provider with no entry there is a plain
+        provider pointed at a vendor's API, which is what the reader must not
+        offer.
+        """
+
+        document = Path(path).parent / ".litellm-runtime" / "relay-accounts.json"
+        document.parent.mkdir(parents=True, exist_ok=True)
+        station_id = "station-test"
+        document.write_text(
+            json.dumps(
+                {
+                    "version": 3,
+                    "stations": [
+                        {
+                            "id": station_id,
+                            "name": "relay",
+                            "origin": origin,
+                            "type": station_type,
+                        }
+                    ],
+                    "accounts": (
+                        [
+                            {
+                                "id": account_id,
+                                "station_id": station_id,
+                                "type": station_type,
+                                "label": "tester",
+                                "origin": origin,
+                                "username": "tester@example.test",
+                                "session": {"access_token": "session-token"},
+                                "resources": [],
+                            }
+                        ]
+                        if account_id
+                        else []
+                    ),
+                    "pending_credential_cleanups": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
     def write_config(self) -> Path:
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -65,6 +113,69 @@ class RemoteUsageLogsTests(unittest.TestCase):
             ).lstrip(),
             encoding="utf-8",
         )
+        self.write_relay_station(path, "https://relay.example.test")
+        return path
+
+    def write_two_account_config(self) -> Path:
+        """One station reached through two dashboard logins."""
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "config.yaml"
+        path.write_text(
+            textwrap.dedent(
+                """
+                providers:
+                  relay:
+                    api_base: https://relay.example.test/v1
+                    api_keys:
+                      - id: slot-a
+                        name: a
+                        value: replace-me-a
+                      - id: slot-b
+                        name: b
+                        value: replace-me-b
+                    x-young-router-relay-keys:
+                      version: 1
+                      slots:
+                        - id: slot-a
+                          api_key_name: a
+                          source:
+                            kind: relay
+                            station_id: station-one
+                            account_id: login-a
+                            resource_id: newapi-1
+                        - id: slot-b
+                          api_key_name: b
+                          source:
+                            kind: relay
+                            station_id: station-one
+                            account_id: login-b
+                            resource_id: newapi-2
+                model_list:
+                  - model_name: one
+                    litellm_params:
+                      model: openai/one
+                      api_base: https://relay.example.test/v1
+                    model_info:
+                      id: a1b2c3d4
+                      provider: relay
+                      api_key_name: a
+                      x-young-router-provider-key-id: slot-a
+                  - model_name: two
+                    litellm_params:
+                      model: openai/two
+                      api_base: https://relay.example.test/v1
+                    model_info:
+                      id: e5f6a7b8
+                      provider: relay
+                      api_key_name: b
+                      x-young-router-provider-key-id: slot-b
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        self.write_relay_station(path, "https://relay.example.test")
         return path
 
     def test_newapi_logs_are_sanitized_and_do_not_print_path_or_credential(self) -> None:
@@ -260,7 +371,7 @@ class RemoteUsageLogsTests(unittest.TestCase):
         )
 
 
-    def test_one_station_is_one_target_however_many_keys_it_carries(self) -> None:
+    def test_keys_of_one_account_are_one_target(self) -> None:
         path = self.write_config()
 
         # Four routes reaching the same control plane are one relay to read.
@@ -269,6 +380,65 @@ class RemoteUsageLogsTests(unittest.TestCase):
         self.assertEqual(1, len(sources))
         target = remote_usage_logs.active_usage_targets(path)[0]
         self.assertEqual(1, len(target.credentials()))
+
+    def test_one_station_with_two_accounts_is_two_targets(self) -> None:
+        """A station's logins are separate read scopes, not one history.
+
+        Each dashboard login answers only the traffic its own keys served, so a
+        target per station merged two people's usage under one name and could
+        never read the second login at all.
+        """
+
+        path = self.write_two_account_config()
+
+        targets = remote_usage_logs.active_usage_targets(path)
+
+        self.assertEqual(2, len(targets))
+        # Each target reads only its own account's credential, and the two
+        # handles the dropdown hands back are distinct.
+        self.assertEqual(
+            [("login-a", "replace-me-a"), ("login-b", "replace-me-b")],
+            [(target.account_id, target.api_key) for target in targets],
+        )
+        self.assertNotEqual(targets[0].source_id, targets[1].source_id)
+        # The station stays the relay's name; the account is what the dropdown
+        # entry adds, so the source column still reads as the relay.
+        self.assertEqual("relay", targets[0].provider)
+        self.assertIn("login-a", targets[0].display())
+
+    def test_a_second_accounts_rows_are_read_with_its_own_key(self) -> None:
+        """Selecting one account must never answer with the other's rows."""
+
+        path = self.write_two_account_config()
+        targets = remote_usage_logs.active_usage_targets(path)
+        second = next(target for target in targets if target.account_id == "login-b")
+        seen: list[str] = []
+
+        def opener(request, timeout):
+            seen.append(request.get_header("Authorization"))
+            return FakeResponse(
+                {
+                    "success": True,
+                    "data": {
+                        "items": [
+                            {
+                                "model_name": "second-account-model",
+                                "total_tokens": 4,
+                                "token_name": "b",
+                            }
+                        ]
+                    },
+                }
+            )
+
+        with patch("young_router.core.remote_usage_logs.isolated_http_opener") as opener_factory:
+            opener_factory.return_value.open.side_effect = opener
+            records, status = remote_usage_logs.collect(path, 1, second.source_id)
+
+        self.assertEqual("", status)
+        self.assertEqual(["Bearer replace-me-b"], seen)
+        self.assertEqual("second-account-model", records[0]["model"])
+        self.assertEqual("login-b", records[0]["account_id"])
 
     def test_a_stations_other_credentials_are_kept_as_fallbacks(self) -> None:
         directory = tempfile.TemporaryDirectory()
@@ -306,10 +476,14 @@ class RemoteUsageLogsTests(unittest.TestCase):
             ).lstrip(),
             encoding="utf-8",
         )
+        self.write_relay_station(path, "https://relay.example.test")
 
         target = remote_usage_logs.active_usage_targets(path)[0]
 
         self.assertEqual("replace-me-first", target.api_key)
+        # Both keys were pasted by hand, so neither belongs to a relay account:
+        # they stay one target's credentials instead of one target per key.
+        self.assertEqual("", target.account_id)
         self.assertEqual(("replace-me-second",), target.fallback_keys)
         self.assertEqual(
             ("replace-me-first", "replace-me-second"),
@@ -541,6 +715,219 @@ class RemoteUsageLogsTests(unittest.TestCase):
 
         self.assertEqual([], seen)
         self.assertEqual(remote_usage_logs.USAGE_REASON_UNKNOWN_SOURCE, output)
+
+    def test_a_sub2api_account_reads_its_per_request_ledger_not_the_summary(self) -> None:
+        """The ledger is the only shape that can fill a log table.
+
+        The compatible ``/v1/usage`` document answers one always-current row per
+        model, so a station with four models showed four rows whatever its
+        history held, and no time filter could select anything.  The dashboard
+        ledger holds one row per request with its own timestamp, which is what
+        the columns and the range filter actually read.
+        """
+
+        target = remote_usage_logs.UsageTarget(
+            provider="relay",
+            api_base="https://relay.example.test/v1",
+            api_key="replace-me",
+            account="someone",
+            account_id="login-one",
+            station_type="sub2api",
+            session_headers=(("Authorization", "Bearer session-token"),),
+        )
+        seen: list[str] = []
+
+        def opener(request, timeout):
+            seen.append(request.full_url)
+            if "/api/v1/usage" in request.full_url:
+                return FakeResponse(
+                    {
+                        "code": 0,
+                        "data": {
+                            "page": 1,
+                            "pages": 1,
+                            "page_size": 200,
+                            "total": 3,
+                            "items": [
+                                {
+                                    "model": f"ledger-model-{index}",
+                                    "input_tokens": 10 + index,
+                                    "output_tokens": 2,
+                                    "created_at": f"2026-10-0{index + 1}T10:00:00Z",
+                                }
+                                for index in range(3)
+                            ],
+                        },
+                    }
+                )
+            raise HTTPError(request.full_url, 404, "not found", {}, io.BytesIO())
+
+        with patch("young_router.core.remote_usage_logs.isolated_http_opener") as opener_factory:
+            opener_factory.return_value.open.side_effect = opener
+            kind, records = remote_usage_logs.fetch_target(target, 1)
+
+        self.assertEqual("sub2api", kind)
+        self.assertEqual(
+            ["ledger-model-0", "ledger-model-1", "ledger-model-2"],
+            [record["model"] for record in records],
+        )
+        # Three distinct request instants, not one stamp shared by every row.
+        self.assertEqual(
+            ["2026-10-01T10:00:00Z", "2026-10-02T10:00:00Z", "2026-10-03T10:00:00Z"],
+            [record["timestamp"] for record in records],
+        )
+        self.assertIn("/api/v1/usage", seen[0])
+
+    def test_a_newapi_log_feed_is_read_past_its_first_page(self) -> None:
+        """One page is not an account's history.
+
+        The feed is paginated and its first page is a page, not the whole list;
+        reading only it reported the busiest account's usage as however many
+        rows the station's default page happened to carry.
+        """
+
+        target = remote_usage_logs.UsageTarget(
+            provider="relay",
+            api_base="https://relay.example.test/v1",
+            api_key="replace-me",
+        )
+        page_size = remote_usage_logs._NEWAPI_MIN_PAGE
+
+        def opener(request, timeout):
+            query = request.full_url.split("?", 1)[1] if "?" in request.full_url else ""
+            params = dict(part.split("=", 1) for part in query.split("&") if "=" in part)
+            page = int(params.get("p", "0"))
+            return FakeResponse(
+                {
+                    "success": True,
+                    "data": {
+                        "items": [
+                            {
+                                "created_at": 1784368800 + page * 1000 + index,
+                                "model_name": f"model-{page}",
+                                "total_tokens": 1,
+                            }
+                            for index in range(page_size)
+                        ]
+                    },
+                }
+            )
+
+        with patch("young_router.core.remote_usage_logs.isolated_http_opener") as opener_factory:
+            opener_factory.return_value.open.side_effect = opener
+            _kind, records = remote_usage_logs.fetch_target(target, 1)
+
+        # The first page plus the pages after it, up to the reader's bound.
+        self.assertGreater(len(records), page_size)
+        self.assertGreater(
+            len({record["model"] for record in records}),
+            1,
+            "a feed that answered full pages was read once and cut short",
+        )
+
+    def test_an_empty_ledger_says_no_rows_not_unsupported(self) -> None:
+        """An account that has served nothing is not a station without a feed.
+
+        The two read the same in the table — nothing to list — but only one of
+        them is something the user can act on, so the pane must be told which.
+        """
+
+        target = remote_usage_logs.UsageTarget(
+            provider="relay",
+            api_base="https://relay.example.test/v1",
+            api_key="replace-me",
+            account="someone",
+            account_id="login-empty",
+            station_type="sub2api",
+            session_headers=(("Authorization", "Bearer session-token"),),
+        )
+
+        def opener(request, timeout):
+            if "/api/v1/usage" in request.full_url:
+                return FakeResponse(
+                    {"code": 0, "data": {"items": [], "total": 0, "page": 1, "pages": 1}}
+                )
+            raise HTTPError(request.full_url, 404, "not found", {}, io.BytesIO())
+
+        with patch("young_router.core.remote_usage_logs.isolated_http_opener") as opener_factory:
+            opener_factory.return_value.open.side_effect = opener
+            _kind, rows = remote_usage_logs.fetch_target(target, 1)
+
+        self.assertEqual([], rows)
+
+    def test_a_provider_that_is_not_a_relay_is_never_offered(self) -> None:
+        """The dropdown lists relay stations, not every provider.
+
+        A provider pointed straight at an upstream vendor (a hand-pasted key on
+        `api.deepseek.com`) has no dashboard, so there is nothing this reader
+        could ask it.  Listing it offered a choice whose every answer was
+        "unsupported", and it crowded the relays the user actually meant.
+        """
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        path = root / "config.yaml"
+        path.write_text(
+            textwrap.dedent(
+                """
+                providers:
+                  relay:
+                    api_base: https://relay.example.test/v1
+                    api_keys:
+                      - name: default
+                        value: replace-me-relay
+                  vendor:
+                    api_base: https://api.vendor.example.test/v1
+                    api_keys:
+                      - name: default
+                        value: replace-me-vendor
+                model_list:
+                  - model_name: relay-chat
+                    litellm_params:
+                      model: openai/relay-chat
+                      api_base: https://relay.example.test/v1
+                    model_info:
+                      id: a1b2c3d4
+                      provider: relay
+                      api_key_name: default
+                  - model_name: vendor-chat
+                    litellm_params:
+                      model: openai/vendor-chat
+                      api_base: https://api.vendor.example.test/v1
+                    model_info:
+                      id: e5f6a7b8
+                      provider: vendor
+                      api_key_name: default
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        # Only the relay is a station; the vendor provider is not.
+        relay_doc = root / ".litellm-runtime" / "relay-accounts.json"
+        relay_doc.parent.mkdir(parents=True, exist_ok=True)
+        relay_doc.write_text(
+            json.dumps(
+                {
+                    "version": 3,
+                    "stations": [
+                        {
+                            "id": "station-relay",
+                            "name": "relay",
+                            "origin": "https://relay.example.test",
+                            "type": "newapi",
+                        }
+                    ],
+                    "accounts": [],
+                    "pending_credential_cleanups": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        sources = remote_usage_logs.usage_sources(path)
+
+        self.assertEqual(["relay"], [source["label"] for source in sources])
 
 
 if __name__ == "__main__":

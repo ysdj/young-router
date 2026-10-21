@@ -1739,3 +1739,109 @@ class HookStreamingToolCallArgumentsTests(HookTestCase):
             json.loads(state.arguments_by_item_id["call_1"]),
             json.loads(valid),
         )
+
+
+class ContextWindowRefusalTerminalTests(HookTestCase):
+    async def test_a_context_window_refusal_is_not_reported_as_a_route_failure(self) -> None:
+        """A conversation that no route can fit must not read as an outage.
+
+        The upstream answers 400 with "maximum context length" wording on every
+        candidate route.  Reporting that as the generic route failure sends the
+        client into a reconnect-and-resend loop over bytes no retry can shrink,
+        so the terminal event has to name the limit and carry an
+        ``invalid_request_error`` the client will not retry.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
+
+        class BadRequestError(Exception):
+            pass
+
+        exception = BadRequestError(
+            "litellm.BadRequestError: OpenAIException - "
+            '{"error":{"message":"Your request resulted in more tokens than '
+            "this model's maximum context length allows. Please reduce the "
+            'length of the messages.","type":"invalid_request_error",'
+            '"code":"client_error"}}'
+        )
+        exception.status_code = 400
+        request_data = {
+            "model": "deepseek-v4.1-flash",
+            "input": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        }
+
+        event = streaming_module._synthesized_failed_response_event(request_data, exception)
+        payload = event if isinstance(event, dict) else json.loads(event.data or "{}")
+        error = payload["response"]["error"]
+
+        self.assertEqual("invalid_request_error", error["type"])
+        self.assertEqual("upstream_context_too_large", error["code"])
+        self.assertIn("context window", error["message"])
+        self.assertIn("deepseek-v4.1-flash", error["message"])
+        # The sentence that turned a sized-down retry into an endless
+        # "reconnecting 5/5" must not be what the client is shown.
+        self.assertNotIn(
+            "failed before a final assistant response was available",
+            error["message"],
+        )
+        # It is a terminal event, so the delivery path passes it through once.
+        self.assertTrue(getattr(event, "_young_router_terminal_failure", False))
+        self.assertTrue(hooks._is_context_size_error(exception))
+
+    def test_an_unclassified_stop_does_not_tell_the_client_to_resend(self) -> None:
+        """The generic terminal branch may not read as a retry tip.
+
+        Nothing in this router can explain such a stop -- the run behind this
+        test was the router's own deployment-selection wrapper raising inside
+        the request, not the upstream refusing anything. A message that sends
+        the client back with the same bytes is the reconnect loop the branch
+        exists to end, so the sentence names the unclassified stop and stops.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
+        exception = TypeError(
+            "patched_update_kwargs_with_deployment() got an unexpected "
+            "keyword argument 'splits_stream_timeout'"
+        )
+        request_data = {
+            "model": "deepseek-v4.1-flash",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+        }
+
+        event = streaming_module._synthesized_failed_response_event(
+            request_data,
+            exception,
+        )
+        payload = event if isinstance(event, dict) else json.loads(event.data or "{}")
+        error = payload["response"]["error"]
+
+        self.assertEqual("server_error", error["type"])
+        self.assertEqual("upstream_route_failure", error["code"])
+        self.assertIn("could not classify the stop", error["message"])
+        self.assertIn("route trace", error["message"])
+        lowered = error["message"].lower()
+        for retry_tip in ("send it again", "send the message again", "retry", "try again"):
+            self.assertNotIn(retry_tip, lowered)
+        self.assertNotIn("failed before a final assistant response", lowered)
+        self.assertTrue(getattr(event, "_young_router_terminal_failure", False))
+
+    async def test_a_context_window_refusal_reaches_a_chat_client_as_invalid_request(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
+
+        class BadRequestError(Exception):
+            pass
+
+        exception = BadRequestError("context length exceeded: input is too long")
+        exception.status_code = 400
+        chunk = streaming_module._synthesized_native_stream_error_chunk(
+            {"model": "some-model", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+            exception,
+        )
+
+        self.assertEqual("invalid_request_error", chunk["error"]["type"])
+        self.assertEqual("upstream_context_too_large", chunk["error"]["code"])

@@ -178,11 +178,83 @@ class HookReasoningWrapperTests(HookTestCase):
         self.assertEqual(done["item"]["type"], "message")
         self.assertEqual(done["output_index"], 3)
         self.assertEqual(done["item"]["content"][0]["text"], LEAKED_TAIL)
-        self.assertEqual(
-            reasoning["delta"],
-            "<thinking>not message text</thinking>",
-        )
+        self.assertIsNone(reasoning)
         self.assertEqual(part["part"]["text"], "<thinking>kept</thinking>")
+
+    def test_public_reasoning_requires_the_raw_summary_request(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        chunk = {
+            "type": "response.reasoning_summary_text.delta",
+            "item_id": "rs_1",
+            "delta": "We need inspect the state.",
+        }
+        response = {
+            "id": "resp_1",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [
+                        {"type": "summary_text", "text": "We need inspect the state."}
+                    ],
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "done"}],
+                },
+            ],
+        }
+
+        self.assertIsNone(
+            hooks._sanitize_web_search_stream_chunk(
+                chunk,
+                {"reasoning": {"effort": "high", "summary": "auto"}},
+            )
+        )
+        self.assertIsNone(
+            hooks._sanitize_web_search_stream_chunk(
+                {
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "reasoning",
+                        "id": "rs_1",
+                        "summary": [
+                            {
+                                "type": "summary_text",
+                                "text": "We need inspect the state.",
+                            }
+                        ],
+                    },
+                },
+                {"reasoning": {"effort": "high", "summary": "auto"}},
+            )
+        )
+        sanitized = hooks._sanitize_response_stream_payload(
+            response,
+            {"reasoning": {"effort": "high", "summary": "auto"}},
+        )
+        self.assertEqual(
+            [item["type"] for item in sanitized["output"]],
+            ["message"],
+        )
+
+        self.assertEqual(
+            hooks._sanitize_web_search_stream_chunk(
+                chunk,
+                {"reasoning": {"effort": "high", "summary": "raw"}},
+            ),
+            chunk,
+        )
+        raw = hooks._sanitize_response_stream_payload(
+            response,
+            {"reasoning": {"effort": "high", "summary": "raw"}},
+        )
+        self.assertEqual(
+            [item["type"] for item in raw["output"]],
+            ["reasoning", "message"],
+        )
 
     def test_delivery_sanitizes_the_finished_payloads(self) -> None:
         hooks, _proxy_server = load_hook_module()
@@ -284,7 +356,11 @@ class HookReasoningWrapperTests(HookTestCase):
 
     def test_whole_response_sanitizer_preserves_the_item_identity(self) -> None:
         hooks, _proxy_server = load_hook_module()
-        request_data = {"model": "default-chat", "input": "go"}
+        request_data = {
+            "model": "default-chat",
+            "input": "go",
+            "reasoning": {"effort": "high", "summary": "raw"},
+        }
         payload = {
             "id": "resp_1",
             "object": "response",

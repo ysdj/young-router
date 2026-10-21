@@ -35,6 +35,30 @@ def _parsed_files():
 
 
 class ProxyModuleIntegrityTests(unittest.TestCase):
+    def test_no_client_or_source_states_the_banned_route_failure_sentence(self) -> None:
+        """The generic "failed before a final assistant response" line is gone.
+
+        Clients render that sentence as a retry tip and re-send a request the
+        router already knows is dead, which is exactly the reconnect loop it
+        used to cause: a context-window refusal — the most common real failure it
+        covered — is unfixable by resending.  The rule is absolute, so it is
+        checked here rather than left to a review: a cause that has a name gets
+        its own branch, and the branch for unclassified stops says what happened
+        without inviting the client to try the same bytes again.
+        """
+
+        banned = "failed before a final assistant response"
+        offenders = []
+        for path in sorted(PACKAGE.rglob("*.py")):
+            text = path.read_text(encoding="utf-8", errors="replace").lower()
+            if banned in text:
+                offenders.append(str(path.relative_to(ROOT)))
+        self.assertEqual(
+            offenders,
+            [],
+            "user-visible retry-tip sentence reintroduced in:\n" + "\n".join(offenders),
+        )
+
     def test_no_function_continues_after_an_unconditional_return(self):
         """A ``return`` that ends a function leaves the rest of the body dead.
 

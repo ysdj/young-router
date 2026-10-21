@@ -129,7 +129,7 @@ class ReactNativeReleaseTests(unittest.TestCase):
         )
         arm_restart = installer.index("RESTART_ARMED=1")
         start_replacement = installer.rindex('if ! start_installed_app "$OLD_PIDS"; then')
-        delete_previous = installer.rindex('retired_app="$PREVIOUS_APP"')
+        delete_previous = installer.rindex('rm -rf "$PREVIOUS_APP"')
         mark_complete = installer.rindex("INSTALL_COMPLETE=1")
         native_build = installer.index("node scripts/bootstrap-rnmacos-085.mjs")
         self.assertLess(select_installed_runtime, native_build)
@@ -148,7 +148,7 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn("restore_previous_app", installer)
         self.assertLess(start_replacement, delete_previous)
         self.assertLess(delete_previous, mark_complete)
-        self.assertIn('( rm -rf "$retired_app" ) &', installer)
+        self.assertNotIn('( rm -rf "$retired_app" ) &', installer)
 
     def test_repeat_builds_reuse_only_what_their_inputs_pin(self) -> None:
         script = (ROOT / "scripts" / "build-and-install-macos.sh").read_text(

@@ -3591,10 +3591,8 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
         self.assertNotIn("Signal Source", dumped)
         self.assertNotIn("https://example.test/erk", dumped)
         self.assertIn('"type": "response.failed"', dumped)
-        self.assertIn(
-            "The upstream model route failed before a final assistant response was available.",
-            dumped,
-        )
+        self.assertNotIn("failed before a final assistant response", dumped)
+        self.assertIn("before the assistant answered", dumped)
         self.assertNotIn("Temporary upstream route failure", dumped)
         self.assertNotIn("LiteLLM fallback retries", dumped)
         self.assertNotIn("Retry later", dumped)

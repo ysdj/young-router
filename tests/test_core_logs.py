@@ -2291,6 +2291,27 @@ model_list:
 """,
                 encoding="utf-8",
             )
+            # The relay panes' own document is what records a station; a provider
+            # with no entry there is a vendor API, and the usage tab deliberately
+            # does not offer one.
+            (provider_root / "relay-accounts.json").write_text(
+                json.dumps(
+                    {
+                        "version": 3,
+                        "stations": [
+                            {
+                                "id": "station-relay",
+                                "name": "relay",
+                                "origin": "http://127.0.0.1:45678",
+                                "type": "newapi",
+                            }
+                        ],
+                        "accounts": [],
+                        "pending_credential_cleanups": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
             with mock.patch.dict(os.environ, {"HOME": str(runtime_root.parent)}):
                 core = CoreStore.with_default_domains(
                     metadata_path=runtime_root / "metadata.json",

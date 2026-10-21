@@ -30,7 +30,13 @@ from young_router.api_base import isolated_http_opener, service_root
 from young_router.browser_identity import browser_request_headers
 
 
-MAX_TARGETS = 4
+# One target per *account* of a station, not per station: a relay that hosts two
+# dashboards (one per login) answers two different usage histories through two
+# different keys, and a dropdown that showed the station once could never read
+# the second account's rows.  The bound therefore has to clear the accounts a
+# user actually configures (a handful of stations times a handful of logins),
+# because a station dropped from the list is one the pane cannot select at all.
+MAX_TARGETS = 64
 MAX_WORKERS = 4
 # How many rows one key of one station may contribute. The log view holds up
 # to MAX_LINES and states its own limit in the status strip, so a reader cap
@@ -75,13 +81,26 @@ def _credential_value(value: Any) -> str:
     return "" if "\r" in resolved or "\n" in resolved else resolved
 
 
-def _provider_keys(provider: dict[str, Any]) -> tuple[dict[str, str], dict[str, str], list[str]]:
+def _provider_keys(
+    provider: dict[str, Any],
+) -> tuple[dict[str, str], dict[str, str], list[str], dict[str, str], dict[str, str]]:
+    """Index a provider's credentials, keeping the account each one belongs to.
+
+    A key's station account is what a usage read is scoped by: the same station
+    can hold one dashboard login per person, and each login answers only the
+    traffic its own keys served.  The account is therefore read from the relay
+    slot the key was minted from (``source``), which is the only place the
+    provider document records it without ever repeating a credential.
+    """
+
     by_name: dict[str, str] = {}
     by_id: dict[str, str] = {}
+    account_by_name: dict[str, str] = {}
+    account_by_id: dict[str, str] = {}
     ordered: list[str] = []
     raw_keys = provider.get("api_keys")
     if not isinstance(raw_keys, list):
-        return by_name, by_id, ordered
+        return by_name, by_id, ordered, account_by_name, account_by_id
     for index, item in enumerate(raw_keys, start=1):
         if not isinstance(item, dict):
             continue
@@ -93,15 +112,34 @@ def _provider_keys(provider: dict[str, Any]) -> tuple[dict[str, str], dict[str, 
         key_id = _string(item.get("id"))
         if key_id:
             by_id[key_id] = value
+        account = _key_account(item)
+        if account:
+            account_by_name[name] = account
+            if key_id:
+                account_by_id[key_id] = account
         ordered.append(value)
-    return by_name, by_id, ordered
+    return by_name, by_id, ordered, account_by_name, account_by_id
+
+
+def _key_account(item: dict[str, Any]) -> str:
+    """The relay account one configured key was minted from, if any.
+
+    Only a key that came from a dashboard login names one.  A key the user
+    pasted by hand belongs to no account, and reading it as somebody else's
+    would put a station's newest account label on an unrelated credential.
+    """
+
+    source = item.get("source")
+    if not isinstance(source, dict) or _string(source.get("kind")) != "relay":
+        return ""
+    return _string(source.get("account_id"))
 
 
 def _credential_for_model(provider: dict[str, Any], model: dict[str, Any]) -> str:
     direct = _credential_value(model.get("api_key"))
     if direct:
         return direct
-    by_name, by_id, ordered = _provider_keys(provider)
+    by_name, by_id, ordered, _account_by_name, _account_by_id = _provider_keys(provider)
     # The slot is the key the route uses, and a name only decides when no slot is
     # stated.  A route that states a key this provider does not carry has no
     # usage to read: answering with the provider's default (or its only key)
@@ -119,16 +157,46 @@ def _credential_for_model(provider: dict[str, Any], model: dict[str, Any]) -> st
 
 @dataclass(frozen=True)
 class UsageTarget:
+    """One selectable read scope: one account of one relay station.
+
+    The scope is the *account*, not the station.  A relay that hosts several
+    dashboard logins keeps each login's traffic apart, so a station-wide read
+    answered with whichever account's key was reached first while the others'
+    rows were merged into the same list — two people's usage under one name.
+    ``provider`` and ``origin`` still name the station (the row's own column),
+    and ``account`` names which of its logins the rows belong to.
+    """
+
     provider: str
     api_base: str
     api_key: str
-    # The station's other configured credentials, tried in order when the
-    # first cannot read the feed. A station keeps one identity in the dropdown
-    # however many keys it carries.
+    # The account whose keys these are, so two logins of one station stay two
+    # entries.  Empty for a key the user pasted by hand: it belongs to no
+    # login, and claiming one would mislabel the rows it reads.
+    account: str = ""
+    # The same account's stable id, which is what the source handle is derived
+    # from.  It is not the label: a user can rename a login in the relay panes,
+    # and a selection stored across that rename must still name one account.
+    account_id: str = ""
+    # The account's other configured credentials, tried in order when the
+    # first cannot read the feed.
     fallback_keys: tuple[str, ...] = ()
+    # The station family, so a read asks for the endpoint that station installs
+    # before falling back to the other shape.
+    station_type: str = ""
+    # Dashboard headers for this login, when the app holds a session for it.
+    # A Sub2API ledger is only readable through the login that owns it, and the
+    # session must never leave this module: it is not part of any record, label,
+    # or IPC payload.
+    session_headers: tuple[tuple[str, str], ...] = ()
 
     def credentials(self) -> tuple[str, ...]:
-        return (self.api_key, *self.fallback_keys)
+        return (self.api_key, *self.fallback_keys) if self.api_key else self.fallback_keys
+
+    def headers(self) -> dict[str, str]:
+        """The login's own headers, as a fresh mapping per read."""
+
+        return dict(self.session_headers)
 
     @property
     def origin(self) -> str:
@@ -137,16 +205,16 @@ class UsageTarget:
         return service_root(self.api_base) or self.api_base
 
     def display(self) -> str:
-        """The relay's name as the user knows it.
+        """The relay and the account the rows belong to, as the user knows them.
 
         ``provider`` is the name the user gave the station when they added it
-        (``sisct2``), which is what the relay panes list and what the user is
-        looking for in a dropdown.  The family that answered is carried
-        separately as ``source_family``, because it is its own column and
-        fusing it to the name only made the name column too wide to read.
+        (``sisct2``), which is what the relay panes list.  The account is
+        appended only when the station actually holds more than one, because
+        the common case is one login per station and naming it there would
+        spend the column on a word the user already assumes.
         """
 
-        return self.provider
+        return f"{self.provider} · {self.account}" if self.account else self.provider
 
     @staticmethod
     def family_label(family: str) -> str:
@@ -158,15 +226,20 @@ class UsageTarget:
 
     @property
     def source_id(self) -> str:
-        """A stable, non-secret handle for one configured relay station.
+        """A stable, non-secret handle for one account of one relay station.
 
-        The id names the *station*, never a credential: it is derived from the
-        control-plane root alone, so every route that points at one station
-        resolves to the same entry, and the React side hands a selection back
-        without ever seeing the API key it selects.
+        The id names the station *and* the account, never a credential: the
+        control-plane root and the account's stable id are hashed together, so
+        every route that points at one login resolves to the same entry and
+        the React side hands a selection back without ever seeing the API key
+        it selects.  A hand-pasted key carries no account, so it falls back to
+        the station alone — which is what it is.
         """
 
-        digest = hashlib.sha256(self.origin.encode("utf-8")).hexdigest()
+        identity = self.origin
+        if self.account_id:
+            identity = f"{identity}\x1f{self.account_id}"
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
         return digest[:16]
 
 
@@ -183,13 +256,21 @@ def default_config_path() -> pathlib.Path:
 
 
 def active_usage_targets(path: pathlib.Path) -> list[UsageTarget]:
-    """Return one safe read target for each configured relay station.
+    """Return one safe read target for each relay account the app knows.
 
-    A station is reached by whichever of its credentials can read the usage
-    feed, so its keys are collected onto one target instead of becoming
-    several: reading the same station once per key would list the same rows
-    again, and a station with more keys than the target budget would crowd
-    every other station out of the dropdown.
+    The scope is the *account*, not the station.  One relay can host several
+    dashboard logins (a shared team station, one login per person), and each
+    login answers only the traffic its own keys served; grouping by station
+    merged those histories under a single name and could never read the second
+    account at all.
+
+    The logins come from the relay panes' own account document, not only from
+    the keys currently bound into routes.  A login whose keys have not been
+    imported yet is still an account this app holds a session for, and it still
+    has usage to read — deriving the list from bound routes made that account
+    unreachable in the dropdown, which read as "this app only knows one
+    account".  A hand-pasted key belongs to no login and keeps the station
+    alone, so a station configured without relay links still lists once.
     """
     try:
         payload = load_config(path)
@@ -199,13 +280,28 @@ def active_usage_targets(path: pathlib.Path) -> list[UsageTarget]:
     if not isinstance(raw_providers, list):
         raise UsageConfigError("The LiteLLM configuration has no provider list.")
 
-    # The station's own root is its identity: several configured routes (and
-    # several keys within one route) that point at the same control plane are
-    # one relay to read and one entry to choose.
-    order: list[str] = []
-    roots: dict[str, str] = {}
-    labels: dict[str, str] = {}
-    credentials: dict[str, list[str]] = {}
+    # A station's own root names it, and the account a key was minted from
+    # names the login inside it.  Several routes that point at one account (its
+    # groups, its models) are one relay account to read and one entry to choose.
+    order: list[tuple[str, str]] = []
+    roots: dict[tuple[str, str], str] = {}
+    labels: dict[tuple[str, str], str] = {}
+    credentials: dict[tuple[str, str], list[str]] = {}
+    # Every provider's routes are collected first, because whether one is a
+    # *relay* is decided by the relay panes' own document, not by the provider
+    # entry: the panes record a station (or a login) for each relay they created,
+    # and a provider they never created has no entry there at all.  A provider
+    # pointed straight at an upstream vendor — a hand-pasted key on
+    # `api.deepseek.com` — is exactly that, and listing it offered a choice whose
+    # every answer was "unsupported".
+    accounts = _relay_accounts(path)
+    stations = _relay_stations(path)
+    station_roots = set(stations) | {
+        service_root(_string(account.get("origin")) + "/v1")
+        or _string(account.get("origin")).rstrip("/")
+        for account in accounts.values()
+        if _string(account.get("origin"))
+    }
     for raw_provider in raw_providers:
         if not isinstance(raw_provider, dict):
             continue
@@ -222,32 +318,176 @@ def active_usage_targets(path: pathlib.Path) -> list[UsageTarget]:
             root = service_root(api_base)
             if not root:
                 continue
-            if root not in roots:
-                order.append(root)
-                roots[root] = api_base
-                labels[root] = provider_name
-                credentials[root] = []
-            if api_key and api_key not in credentials[root]:
-                credentials[root].append(api_key)
+            # A route states its key by slot, and the slot is where the
+            # account it belongs to is recorded.  A route that names no
+            # readable key still contributes its station, because another
+            # route of the same station may name one.
+            account_id = _account_for_model(raw_provider, raw_model)
+            scope = (root, account_id)
+            if scope not in roots:
+                order.append(scope)
+                roots[scope] = api_base
+                labels[scope] = provider_name
+                credentials[scope] = []
+            if api_key and api_key not in credentials[scope]:
+                credentials[scope].append(api_key)
+
+    # A login the relay panes hold is an account with usage to read even when
+    # no route carries one of its keys yet: it answers through its own session,
+    # and leaving it out made the dropdown name only the logins that had already
+    # been imported.
+    for account_id, account in accounts.items():
+        origin = _string(account.get("origin"))
+        has_session = bool(account.get("session"))
+        if not account_id or not origin or not has_session:
+            continue
+        scope = (service_root(origin + "/v1") or origin.rstrip("/"), account_id)
+        if scope in roots:
+            continue
+        order.append(scope)
+        roots[scope] = origin
+        labels[scope] = _station_label(origin) or _string(account.get("label")) or origin
+        credentials[scope] = []
+
+    # Keep only relay stations.  A hand-pasted key on a vendor's own API
+    # (`api.deepseek.com`) cannot be read here at all: there is no dashboard and
+    # no usage feed.  A station the panes never registered is dropped with it,
+    # because the alternative — offering every provider — is what put a vendor in
+    # the dropdown.  The relay document is the only authority on which is which.
+    order = [scope for scope in order if scope[0] in station_roots]
 
     targets: list[UsageTarget] = []
-    for root in order:
-        keys = credentials[root]
-        if not keys:
-            # A station with no readable credential has no usage to read, and
-            # offering it would be a dropdown entry that always answers empty.
+    for scope in order:
+        root, account_id = scope
+        keys = credentials[scope]
+        account = accounts.get(account_id, {})
+        # Every account is named: the dropdown is where the login is chosen, so
+        # leaving its name off the entry that is *about* that login was what made
+        # a station with two logins look like a station with one.
+        label = _string(account.get("label")) or account_id
+        if not keys and not account.get("session"):
+            # No readable credential and no dashboard session: there is nothing
+            # this entry could ever answer, and offering it would be a choice
+            # that always comes back empty.
             continue
         targets.append(
             UsageTarget(
-                provider=labels[root],
-                api_base=roots[root],
-                api_key=keys[0],
+                provider=labels[scope],
+                api_base=roots[scope],
+                api_key=keys[0] if keys else "",
+                account=label,
+                account_id=account_id,
                 fallback_keys=tuple(keys[1:]),
+                station_type=_string(account.get("type"))
+                or _string(stations.get(root, "")),
+                session_headers=tuple(_session_headers(account).items()),
             )
         )
         if len(targets) >= MAX_TARGETS:
             break
     return targets
+
+
+def _station_label(origin: str) -> str:
+    """The relay's own name for a station, as the panes title it."""
+
+    try:
+        parsed = urllib.parse.urlsplit(origin)
+    except ValueError:
+        return ""
+    host = parsed.netloc.strip().lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+def _account_for_model(provider: dict[str, Any], model: dict[str, Any]) -> str:
+    """The relay account one configured route's credential was minted from."""
+
+    _by_name, by_id, _ordered, by_account_name, by_account_id = _provider_keys(provider)
+    key_id = _string(model.get("provider_key_id"))
+    if key_id:
+        return by_account_id.get(key_id, "")
+    preferred_name = _string(model.get("api_key_name"))
+    if preferred_name:
+        return by_account_name.get(preferred_name, "")
+    return ""
+
+
+def _relay_document(path: pathlib.Path) -> dict[str, Any]:
+    """Read the relay panes' own account document, or an empty one."""
+
+    try:
+        from ..webdav.core import relay_accounts_path
+
+        document = json.loads(
+            relay_accounts_path(path).read_text(encoding="utf-8", errors="replace")
+        )
+    except Exception:
+        return {}
+    return document if isinstance(document, dict) else {}
+
+
+def _relay_stations(path: pathlib.Path) -> dict[str, str]:
+    """The relay stations this app knows: control-plane root -> station type.
+
+    This is what decides whether a provider is a *relay*.  A provider pointed
+    straight at an upstream vendor has no entry here, so it is not a station and
+    has no usage feed to read however many keys it carries.
+    """
+
+    raw_stations = _relay_document(path).get("stations")
+    if not isinstance(raw_stations, list):
+        return {}
+    stations: dict[str, str] = {}
+    for raw in raw_stations:
+        if not isinstance(raw, dict):
+            continue
+        origin = _string(raw.get("origin"))
+        if not origin:
+            continue
+        root = service_root(origin + "/v1") or origin.rstrip("/")
+        stations[root] = _string(raw.get("type"))
+    return stations
+
+
+def _relay_accounts(path: pathlib.Path) -> dict[str, dict[str, Any]]:
+    """The relay logins this app holds, keyed by account id.
+
+    Only the fields a usage read needs travel further: the station the login
+    belongs to, its own session, and the name the panes show.  Nothing here is
+    returned to the UI — the session stays inside this module and exists for the
+    duration of one read.
+    """
+
+    document = _relay_document(path)
+    raw_accounts = document.get("accounts") if isinstance(document, dict) else None
+    if not isinstance(raw_accounts, list):
+        return {}
+    stations = {}
+    raw_stations = document.get("stations")
+    if isinstance(raw_stations, list):
+        for raw in raw_stations:
+            if isinstance(raw, dict) and _string(raw.get("id")):
+                stations[_string(raw.get("id"))] = raw
+    accounts: dict[str, dict[str, Any]] = {}
+    for raw in raw_accounts:
+        if not isinstance(raw, dict):
+            continue
+        account_id = _string(raw.get("id"))
+        if not account_id or account_id in accounts:
+            continue
+        username = _string(raw.get("username"))
+        name = username.split("@", 1)[0].strip() or username or _string(raw.get("label"))
+        station = stations.get(_string(raw.get("station_id")), {})
+        accounts[account_id] = {
+            "id": account_id,
+            "label": name[:64],
+            "origin": _string(raw.get("origin"))
+            or _string(station.get("origin")),
+            "type": _string(raw.get("type")) or _string(station.get("type")),
+            "user_id": raw.get("user_id"),
+            "session": raw.get("session") if isinstance(raw.get("session"), dict) else {},
+        }
+    return accounts
 
 
 def _control_api_root(api_base: str) -> str | None:
@@ -276,11 +516,183 @@ def _endpoint_candidates(api_base: str) -> list[tuple[str, str, str]]:
         # normal gateway key.  It is the appropriate source for a Menu route,
         # which stores gateway credentials rather than dashboard sessions.
         ("newapi", f"{control_root}/log/token", "bearer"),
-        # Sub2API exposes a credential-scoped aggregated usage document at
-        # the compatible gateway path.  It is not a per-request log feed, but
-        # it retains the latest usage by model without dashboard credentials.
+        # Sub2API's compatible usage document lives on the API root, not under
+        # its control-plane prefix: one answered per model and is stamped with
+        # the moment of the read, so it is a summary and never the log feed.
         ("sub2api", f"{root}/v1/usage", "bearer"),
     ]
+
+
+# The per-request ledger a Sub2API dashboard keeps, read with the account's own
+# session rather than a gateway key: the gateway key is scoped to the traffic it
+# served, while the dashboard answers the login's whole history.
+_SUB2API_LEDGER_PATH = "/api/v1/usage"
+# One page of the ledger. The station caps its own page size, and asking for
+# more than it offers is answered with the cap instead of an error.
+_SUB2API_PAGE_SIZE = 200
+# How many ledger pages one refresh reads, and how many are fetched at once.
+# The account's history is unbounded (it routinely holds tens of thousands of
+# requests), and the pane pages through what a refresh loaded, so the read is
+# bounded by pages.  Pages are independent reads of one list, so they are
+# fetched in parallel: a sequential walk of the same pages took over a minute,
+# which is not a refresh the pane can wait on.  30 pages of 200 rows is one
+# refresh's ceiling: enough history for the pane's pages and its range filter,
+# and short enough that a slow station still finishes during the wait indicator.
+_SUB2API_MAX_PAGES = 30
+_SUB2API_PAGE_WORKERS = 8
+# A New API log page shorter than this is the account's whole history, not a
+# page of it, so the reader does not follow pagination that cannot exist.
+_NEWAPI_MIN_PAGE = 50
+_NEWAPI_MAX_PAGES = 100
+
+
+def _session_headers(account: dict[str, Any]) -> dict[str, str]:
+    """Dashboard headers for one relay account, from its own stored session.
+
+    A Sub2API login can carry a bearer token, a cookie, or both; the station
+    accepts either.  ``New-Api-User`` belongs to the New API family alone and
+    is never sent to a Sub2API station.  Nothing here is logged or returned:
+    the headers exist only for the duration of one read.
+    """
+
+    session = account.get("session")
+    if not isinstance(session, dict):
+        return {}
+    headers: dict[str, str] = {}
+    cookie = _string(session.get("cookie"))
+    token = _string(session.get("access_token"))
+    if cookie:
+        headers["Cookie"] = cookie
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if headers and _string(account.get("type")) == "newapi":
+        user_id = _string(account.get("user_id"))
+        if user_id.isdigit():
+            headers["New-Api-User"] = user_id
+    return headers
+
+
+def _fetch_json_with_headers(
+    url: str,
+    headers: dict[str, str],
+    timeout: float,
+) -> tuple[str, dict[str, Any] | None]:
+    """Read one dashboard document with already-resolved headers."""
+
+    request = urllib.request.Request(
+        url,
+        headers={**browser_request_headers(), **headers},
+        method="GET",
+    )
+    try:
+        with isolated_http_opener().open(request, timeout=timeout) as response:
+            status = int(getattr(response, "status", response.getcode()))
+            body = response.read(MAX_RESPONSE_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        if exc.code in {401, 403}:
+            return "refused", None
+        return "unsupported", None
+    except (socket.timeout, TimeoutError):
+        return "timeout", None
+    except (urllib.error.URLError, OSError):
+        return "network", None
+    if not 200 <= status < 300 or len(body) > MAX_RESPONSE_BYTES:
+        return "unsupported", None
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return "unsupported", None
+    if not isinstance(payload, dict):
+        return "unsupported", None
+    if payload.get("success") is False:
+        return "unsupported", None
+    code = payload.get("code")
+    if isinstance(code, int) and not isinstance(code, bool) and code != 0:
+        return "unsupported", None
+    return "ok", payload
+
+
+def _sub2api_ledger_rows(
+    headers: dict[str, str],
+    origin: str,
+    timeout: float,
+) -> list[dict[str, Any]] | None:
+    """Read the account's per-request usage ledger, newest page first.
+
+    The dashboard reports each request with its own model, token counts,
+    duration, and timestamp, which is what the pane's columns and its time
+    filter actually need.  The compatible ``/v1/usage`` summary beside it has
+    none of those: it answers one always-current row per model, so a range
+    filter can never select anything and the table can only ever show as many
+    rows as the account has models.  Reading the ledger is what makes both
+    honest.
+
+    A failure on a later page keeps the pages already read: a long history is
+    the common case, and losing all of it to one slow page would answer
+    "nothing" for an account that had thousands of rows.
+    """
+
+    if not headers:
+        return None
+    origin = origin.rstrip("/")
+    if not origin:
+        return None
+
+    def read_page(page: int) -> tuple[list[dict[str, Any]] | None, int]:
+        query = urllib.parse.urlencode(
+            {"page": page, "page_size": _SUB2API_PAGE_SIZE}
+        )
+        result, payload = _fetch_json_with_headers(
+            f"{origin}{_SUB2API_LEDGER_PATH}?{query}", headers, timeout
+        )
+        if result != "ok" or payload is None:
+            return None, 0
+        data = payload.get("data")
+        items = data.get("items") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            return None, 0
+        pages = data.get("pages") if isinstance(data, dict) else None
+        total = (
+            pages
+            if isinstance(pages, int) and not isinstance(pages, bool) and pages > 0
+            else 0
+        )
+        return [item for item in items if isinstance(item, dict)], total
+
+    # The first page settles how many pages exist, and it is the one the pane
+    # draws first (the newest requests), so it is read before the fan-out.
+    first, total_pages = read_page(1)
+    if not first:
+        return None
+    rows: list[dict[str, Any]] = list(first)
+    if len(first) < _SUB2API_PAGE_SIZE:
+        return rows
+    wanted = total_pages or _SUB2API_MAX_PAGES
+    wanted = min(_SUB2API_MAX_PAGES, wanted)
+    rest = list(range(2, wanted + 1))
+    if not rest:
+        return rows
+    # Later pages are independent reads of one list, so a slow history is not
+    # paid for one page at a time.  A page that fails ends the walk: the rows
+    # already read are the newest ones, and answering with them is honest.
+    workers = min(_SUB2API_PAGE_WORKERS, len(rest))
+    pages: dict[int, list[dict[str, Any]]] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(read_page, page): page for page in rest}
+        for future in concurrent.futures.as_completed(futures):
+            page = futures[future]
+            try:
+                page_rows, _total = future.result()
+            except Exception:
+                page_rows = None
+            if page_rows is None:
+                break
+            pages[page] = page_rows
+    for page in sorted(pages):
+        rows.extend(pages[page])
+        if len(pages[page]) < _SUB2API_PAGE_SIZE:
+            break
+    return rows or None
 
 
 def _fetch_json(
@@ -520,7 +932,12 @@ def _row_record(
     family: str,
     fallback_timestamp: str,
 ) -> dict[str, Any] | None:
-    """Build one usage record carrying its relay's full name and its fields."""
+    """Build one usage record carrying its relay's own name and its fields.
+
+    The record names the *account* as well as the station: a station with two
+    logins shows two rows histories in one table, and the relay column is how
+    the user tells whose traffic a row is.
+    """
 
     timestamp = _safe_timestamp(
         raw.get("created_at", raw.get("createdAt", raw.get("timestamp")))
@@ -534,7 +951,9 @@ def _row_record(
         "timestamp": timestamp,
         "source": family,
         "source_id": target.source_id,
-        "source_label": target.display(),
+        "source_label": target.provider,
+        "source_account": target.account,
+        "account_id": target.account_id,
         "source_family": target.family_label(family),
     }
     record.update(details)
@@ -546,14 +965,14 @@ def fetch_target(
     timeout: float,
     fallback_timestamp: str | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
-    """Read every one of the station's keys and merge what they report.
+    """Read every one of the account's keys and merge what they report.
 
-    A station scopes its log feed per key, so one key answers for the traffic
-    it served and nothing else: the key an account happens to list first can
-    legitimately answer zero rows while another is the busiest.  Reading only
-    the first key that answered therefore reported "no usage" for a station
-    the router was actively serving, which is why every key is read and their
-    rows are merged.
+    The feed is scoped per key, so one key answers for the traffic it served
+    and nothing else: the key an account happens to list first can legitimately
+    answer zero rows while another is the busiest.  Every key of *this account*
+    is therefore read and their rows merged.  A station's other logins are
+    other targets with their own keys, so this read never answers for a login
+    the user did not select.
 
     Which endpoint shape a station installs is a property of the *station*,
     not of a key, so it is settled once and the keys are then read against
@@ -563,6 +982,17 @@ def fetch_target(
     """
 
     fallback_timestamp = fallback_timestamp or _utc_now_iso()
+    # A Sub2API station keeps its per-request ledger behind the dashboard login,
+    # which is the only shape that carries a timestamp, a duration, and a row
+    # per request.  Reading the compatible summary document instead answered one
+    # always-current row per model, so the pane could never show more rows than
+    # the account had models and no time filter could select anything.
+    if target.station_type == "sub2api" and target.session_headers:
+        ledger = _sub2api_ledger_rows(target.headers(), target.origin, timeout)
+        if ledger:
+            return "sub2api", _deduplicated_records(
+                _records_from(ledger, target, "sub2api", fallback_timestamp)
+            )
     for kind, endpoint, authorization_scheme in _endpoint_candidates(target.api_base):
         credentials = target.credentials()
         if not credentials:
@@ -600,7 +1030,13 @@ def _fetch_key(
     timeout: float,
     kind: str,
 ) -> tuple[str, dict[str, Any] | None, list[dict[str, Any]] | None]:
-    """Read one key's page: its result, the payload, and the recognized rows."""
+    """Read one key's page: its result, the payload, and the recognized rows.
+
+    New API's log feed is paginated and the first page is a single page, not the
+    account's history: reading only that page reported the busiest account's
+    rows as the few hundred a default page happens to carry.  The remaining
+    pages are read while the station says more exist.
+    """
 
     _kind, endpoint, authorization_scheme = probe
     result, payload = _fetch_json(endpoint, api_key, timeout, authorization_scheme)
@@ -609,7 +1045,45 @@ def _fetch_key(
     rows = _items(payload)
     if rows is None and kind == "sub2api":
         rows = _summary_rows(payload)
+    if rows is None:
+        return result, payload, None
+    if kind == "newapi":
+        rows = _newapi_all_pages(rows, endpoint, payload, api_key, timeout, authorization_scheme)
     return result, payload, rows
+
+
+def _newapi_all_pages(
+    first_rows: list[dict[str, Any]],
+    endpoint: str,
+    payload: dict[str, Any],
+    api_key: str,
+    timeout: float,
+    authorization_scheme: str,
+) -> list[dict[str, Any]]:
+    """Follow a New API log feed's own pagination up to the reader's bound."""
+
+    rows = list(first_rows)
+    page_size = len(first_rows)
+    if page_size < _NEWAPI_MIN_PAGE or len(rows) >= MAX_ROWS_PER_TARGET:
+        return rows
+    # New API answers ``p`` as a zero-based page and ``page_size`` as the page's
+    # own length; reuse the length the station just returned rather than
+    # guessing a size it may reject.
+    for page in range(1, _NEWAPI_MAX_PAGES + 1):
+        if len(rows) >= MAX_ROWS_PER_TARGET:
+            break
+        separator = "&" if "?" in endpoint else "?"
+        url = f"{endpoint}{separator}p={page}&page_size={page_size}"
+        result, more = _fetch_json(url, api_key, timeout, authorization_scheme)
+        if result != "ok" or more is None:
+            break
+        page_rows = _items(more)
+        if not page_rows:
+            break
+        rows.extend(page_rows)
+        if len(page_rows) < page_size:
+            break
+    return rows
 
 
 def _records_from(
@@ -634,13 +1108,16 @@ def _deduplicated_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]
     A key-scoped feed can overlap, and the same request appearing twice would
     read as two requests the user made.  Rows are identified by what the
     station stated about them, so a genuine repeat (same model, same status,
-    same counts at the same instant) is the only thing collapsed.
+    same counts at the same instant) is the only thing collapsed.  The account
+    is part of the identity: two logins of one relay can serve the same model
+    at the same second, and those are two people's requests.
     """
 
     seen: set[tuple[Any, ...]] = set()
     unique: list[dict[str, Any]] = []
     for record in records:
         identity = (
+            record.get("account_id"),
             record.get("timestamp"),
             record.get("model"),
             record.get("status"),
@@ -725,13 +1202,21 @@ def collect(
 
     records: list[dict[str, Any]] = []
     readable = False
+    answered_empty = False
     for (source, rows) in results:
         if not source:
             continue
         readable = True
+        if not rows:
+            # The station answered and its ledger is empty: an account whose keys
+            # have not served anything yet is a different fact from a station
+            # that installs no feed, and the pane says which.
+            answered_empty = True
         records.extend(rows)
     if not readable:
         return [], USAGE_REASON_UNSUPPORTED
+    if not records and answered_empty:
+        return [], USAGE_REASON_NO_ROWS
     return records, ""
 
 
@@ -750,8 +1235,11 @@ def render(
     groups: dict[str, list[str]] = {}
     for record in records:
         label = str(record.get("source_label") or "Relay")
+        account = str(record.get("source_account") or "")
         kind = str(record.get("source_family") or "")
-        heading = f"{label} ({kind})" if kind else label
+        heading = f"{label} · {account}" if account else label
+        if kind:
+            heading = f"{heading} ({kind})"
         groups.setdefault(heading, []).append(_row_text(record, _utc_now_iso()))
     sections = [f"{heading}\n" + "\n".join(rows) for heading, rows in groups.items()]
     return f"Updated {_utc_now_iso()}\n\n" + "\n\n".join(sections)

@@ -498,6 +498,65 @@ class HookPatchTests(HookTestCase):
             self.assertEqual(kwargs["custom_llm_provider"], provider)
             self.assertEqual(kwargs.get("use_chat_completions_api") is True, uses_chat)
 
+    def test_selected_deployment_marker_forwards_upstream_keywords_it_does_not_read(self) -> None:
+        """A keyword LiteLLM adds to deployment selection must reach it.
+
+        LiteLLM 1.107 calls ``_update_kwargs_with_deployment(...,
+        splits_stream_timeout=True)`` for the Responses handlers.  A wrapper
+        pinned to the signature it was written against raised ``TypeError``
+        there -- before any route was called -- so every ``/v1/responses``
+        request on a Responses-capable route answered as a terminal route
+        failure with no upstream attempt behind it.
+        """
+
+        hooks, _ = load_hook_module()
+        router_module = types.ModuleType("litellm.router")
+        forwarded: list[bool] = []
+
+        class Router:
+            def _update_kwargs_with_deployment(
+                self,
+                deployment,
+                kwargs,
+                function_name=None,
+                splits_stream_timeout=False,
+            ):
+                forwarded.append(splits_stream_timeout)
+                kwargs["litellm_params"] = dict(deployment["litellm_params"])
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_selected_deployment_marker_patch()
+        deployments = [
+            {
+                "litellm_params": {"model": "openai/vendor/model", "order": 1},
+                "model_info": {
+                    "id": "surface-route",
+                    "upstream_url_surface": "openai/responses",
+                },
+            },
+            {
+                "litellm_params": {"model": "openai/vendor/model", "order": 1},
+                "model_info": {"id": "direct-route"},
+            },
+        ]
+
+        for deployment in deployments:
+            with self.subTest(route=deployment["model_info"]["id"]):
+                kwargs = {"model": "default-chat"}
+                Router()._update_kwargs_with_deployment(
+                    deployment,
+                    kwargs,
+                    splits_stream_timeout=True,
+                )
+                self.assertEqual(
+                    kwargs["litellm_params"]["model"],
+                    "openai/vendor/model",
+                )
+
+        # One call per branch: the surface adapter and the direct route.
+        self.assertEqual(forwarded, [True, True])
+
     def test_selected_deployment_marker_normalizes_full_api_base_for_each_protocol(self) -> None:
         hooks, _ = load_hook_module()
         router_module = types.ModuleType("litellm.router")
@@ -651,6 +710,47 @@ class HookPatchTests(HookTestCase):
         self.assertEqual(error.failed_deployment_id, "picked-deployment")
         self.assertIsNone(getattr(error, "failed_deployment_order", None))
         self.assertEqual(error.num_retries, 0)
+
+    async def test_generic_helper_returns_a_terminal_failed_stream_once(self) -> None:
+        hooks, _ = load_hook_module()
+        router_module = types.ModuleType("litellm.router")
+        calls = []
+
+        class FailedStream:
+            _young_router_terminal_failed_stream = True
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise StopAsyncIteration
+
+        failed = FailedStream()
+
+        class Router:
+            async def _ageneric_api_call_with_fallbacks_helper(
+                self,
+                model,
+                original_generic_function,
+                **kwargs,
+            ):
+                calls.append(kwargs)
+                return await original_generic_function(**kwargs)
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_generic_deployment_failover_patch()
+
+        async def original_generic_function(**kwargs):
+            return failed
+
+        response = await Router()._ageneric_api_call_with_fallbacks_helper(
+            "default-chat",
+            original_generic_function,
+        )
+
+        self.assertIs(response, failed)
+        self.assertEqual(len(calls), 1)
 
     async def test_generic_helper_retries_invalid_parameter_combination_on_configured_protocol(self) -> None:
         hooks, _ = load_hook_module()

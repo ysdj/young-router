@@ -70,6 +70,73 @@ class HookStreamingToolEventTests(HookTestCase):
             )
         )
 
+    def test_responses_completion_stream_patch_covers_the_renamed_terminal_emitter(self) -> None:
+        """The completed-event patch must follow the emitter's current name.
+
+        LiteLLM renamed ``_emit_response_completed_event`` to
+        ``_emit_terminal_response_event`` in the release this bundle stages.
+        The managed WebSocket transport
+        bypasses the SSE pipeline that normalizes ``response.completed``, so a
+        patch guarding only the old name left that transport without the
+        client's usage shape and with the empty assistant message the SSE path
+        strips.
+        """
+
+        hooks, _ = load_hook_module()
+        responses_module = types.ModuleType("litellm.responses")
+        bridge_module = types.ModuleType("litellm.responses.litellm_completion_transformation")
+        streaming_module = types.ModuleType(
+            "litellm.responses.litellm_completion_transformation.streaming_iterator"
+        )
+
+        class LiteLLMCompletionStreamingIterator:
+            def _emit_terminal_response_event(self, litellm_model_response):
+                return {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_renamed_emitter",
+                        "output": [
+                            {
+                                "type": "function_call",
+                                "call_id": "call_1",
+                                "name": "shell",
+                                "arguments": "{}",
+                            },
+                            {"type": "message", "role": "assistant", "content": []},
+                        ],
+                        "usage": {
+                            "input_tokens": 10,
+                            "output_tokens": 2,
+                            "total_tokens": 12,
+                        },
+                    },
+                }
+
+        streaming_module.LiteLLMCompletionStreamingIterator = LiteLLMCompletionStreamingIterator
+        sys.modules["litellm.responses"] = responses_module
+        sys.modules["litellm.responses.litellm_completion_transformation"] = bridge_module
+        sys.modules[
+            "litellm.responses.litellm_completion_transformation.streaming_iterator"
+        ] = streaming_module
+
+        hooks._install_responses_completion_stream_patch()
+        self.assertTrue(
+            getattr(
+                LiteLLMCompletionStreamingIterator._emit_terminal_response_event,
+                hooks._RESPONSES_COMPLETION_STREAM_COMPLETED_PATCH_ATTR,
+            )
+        )
+
+        event = LiteLLMCompletionStreamingIterator()._emit_terminal_response_event(None)
+        self.assertEqual(
+            [item["type"] for item in event["response"]["output"]],
+            ["function_call"],
+        )
+        self.assertEqual(
+            event["response"]["usage"]["input_tokens_details"],
+            {"cached_tokens": 0},
+        )
+
     def test_responses_tool_search_bridge_patch_rewrites_non_streaming_tool_calls(self) -> None:
         hooks, _ = load_hook_module()
         responses_module = types.ModuleType("litellm.responses")

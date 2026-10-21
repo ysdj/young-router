@@ -208,10 +208,15 @@ def assert_upstream_route_failed_terminal(testcase, chunks):
     testcase.assertEqual(response.get("status"), "failed")
     error = response.get("error", {})
     testcase.assertEqual(error.get("code"), "upstream_route_failure")
-    testcase.assertEqual(
-        error.get("message"),
-        "The upstream model route failed before a final assistant response was available.",
+    # The sentence a client renders as a retry tip is banned here: it told the
+    # reader nothing and made every unexplained stop look like a route outage
+    # worth resending.  A cause that has a name gets its own branch; this is the
+    # branch for stops that have none.
+    testcase.assertNotIn(
+        "failed before a final assistant response",
+        error.get("message", ""),
     )
+    testcase.assertIn("before the assistant answered", error.get("message", ""))
     testcase.assertNotIn("Temporary upstream route failure", error.get("message", ""))
     testcase.assertNotIn("LiteLLM fallback retries", error.get("message", ""))
     testcase.assertNotIn("Retry later", error.get("message", ""))

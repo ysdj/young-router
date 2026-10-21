@@ -117,6 +117,67 @@ SUPPORTED_FEATURE_KEYS = (
     "personality",
 )
 
+
+def _installed_surface_feature_keys() -> tuple[str, ...]:
+    """Return feature names declared by the installed Desktop CUA runtime."""
+
+    cache_root = codex_home() / "plugins" / "cache" / "openai-bundled"
+    paths = sorted(cache_root.glob("*/*/.mcp.json"))
+    resources = next(
+        (
+            root
+            for root in (
+                pathlib.Path("/Applications/ChatGPT.app/Contents/Resources"),
+                pathlib.Path("/Applications/Codex.app/Contents/Resources"),
+                pathlib.Path.home() / "Applications" / "ChatGPT.app" / "Contents" / "Resources",
+                pathlib.Path.home() / "Applications" / "Codex.app" / "Contents" / "Resources",
+            )
+            if (
+                root / "plugins" / "openai-bundled" / ".agents" / "plugins"
+                / "marketplace.json"
+            ).is_file()
+        ),
+        None,
+    )
+    if resources is not None:
+        marketplace = (
+            resources / "plugins" / "openai-bundled" / ".agents" / "plugins"
+            / "marketplace.json"
+        )
+        try:
+            payload = json.loads(marketplace.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            payload = {}
+        for item in payload.get("plugins", []) if isinstance(payload, dict) else []:
+            source = item.get("source") if isinstance(item, dict) else None
+            relative = source.get("path") if isinstance(source, dict) else None
+            if isinstance(relative, str):
+                paths.append(
+                    resources / "plugins" / "openai-bundled" / relative / ".mcp.json"
+                )
+
+    for path in paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        servers = payload.get("mcpServers") if isinstance(payload, dict) else None
+        server = servers.get("cua_repl") if isinstance(servers, dict) else None
+        env = server.get("env") if isinstance(server, dict) else None
+        surfaces = env.get("CUA_REPL_ENABLED_SURFACES") if isinstance(env, dict) else None
+        if isinstance(surfaces, str):
+            return tuple(
+                sorted(
+                    f"{surface}_use"
+                    for surface in (
+                        part.strip() for part in surfaces.split(",")
+                    )
+                    if surface
+                )
+            )
+    return ()
+
+
 # Codex's built-in provider IDs cannot be overridden through
 # ``model_providers``.  The three locally selectable built-ins are called out
 # explicitly in the configuration schema/product UI; rejecting only these
@@ -902,6 +963,11 @@ def structured_config(config: dict[str, Any], auth: dict[str, Any]) -> dict[str,
         key: raw_features.get(key) if isinstance(raw_features.get(key), bool) else None
         for key in SUPPORTED_FEATURE_KEYS
     }
+    for key, value in raw_features.items():
+        if isinstance(key, str) and key.endswith("_use"):
+            structured["features"][key] = value if isinstance(value, bool) else None
+    for key in _installed_surface_feature_keys():
+        structured["features"].setdefault(key, None)
 
     sandbox = _get_mapping(config.get("sandbox_workspace_write"))
     structured["permissions"] = {
@@ -1412,7 +1478,9 @@ def _apply_permissions_patch(text: str, value: object) -> str:
 def _apply_features_patch(text: str, value: object) -> str:
     features = _require_mapping(value, "features")
     for key, flag in features.items():
-        if key not in SUPPORTED_FEATURE_KEYS:
+        if key not in SUPPORTED_FEATURE_KEYS and not (
+            isinstance(key, str) and key.endswith("_use")
+        ):
             raise EditorError(f"features.{key} is not editable in the structured UI")
         if flag is None:
             text = remove_table_value(text, ("features",), key)

@@ -491,6 +491,36 @@ class WebDAVSyncBundleTests(unittest.TestCase):
                 json.loads(local_relay.read_text(encoding="utf-8"))["stations"][0]["name"],
             )
 
+    def test_relay_document_sits_beside_a_runtime_directory_configuration(self) -> None:
+        """The configuration already inside the runtime directory keeps one level.
+
+        ``<root>/.litellm-runtime/config.yaml`` names the runtime directory
+        itself, so appending another ``.litellm-runtime`` under its parent
+        answered with ``.../.litellm-runtime/.litellm-runtime/relay-accounts.json``
+        — a path an older layout left behind as a stale empty document.  Every
+        reader that followed it saw no relay accounts while the real document
+        sat next to the configuration, which is exactly how the relay panes
+        came up empty.
+        """
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = Path(temp_dir) / ".litellm-runtime"
+            runtime.mkdir()
+            config = runtime / "config.yaml"
+            config.write_text("providers: {}\nmodel_list: []\n", encoding="utf-8")
+
+            relay_path = webdav_core.relay_accounts_path(config)
+
+            self.assertEqual(runtime / "relay-accounts.json", relay_path)
+            # A configuration outside the runtime directory keeps the directory
+            # this app creates beside it.
+            other = Path(temp_dir) / "custom.yaml"
+            other.write_text("providers: {}\nmodel_list: []\n", encoding="utf-8")
+            self.assertEqual(
+                Path(temp_dir) / ".litellm-runtime" / "relay-accounts.json",
+                webdav_core.relay_accounts_path(other),
+            )
+
     def test_current_version_three_relay_document_is_accepted_by_the_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
