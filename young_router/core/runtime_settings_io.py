@@ -29,6 +29,10 @@ RETIRED_PERSISTED_SETTINGS = frozenset(
         "LITELLM_RUNTIME_VERIFY_WAIT_SECONDS",
         "LITELLM_SERVICE_LIFECYCLE_LOCK_WAIT_SECONDS",
         "YOUNG_ROUTER_RELAY_AUTO_GROUP_INTERVAL_MINUTES",
+        # The engine document is the same idea under an honest name; an
+        # installation that still carries the old key would otherwise fail to
+        # load its settings file at all.
+        "YOUNG_ROUTER_PI_WEB_ACCESS_CONFIG_JSON",
         # The computer-use facade had no executor the router could drive itself.
         "YOUNG_ROUTER_COMPUTER_FACADE_BACKEND",
         "YOUNG_ROUTER_COMPUTER_FACADE_MODEL",
@@ -44,6 +48,21 @@ RETIRED_PERSISTED_SETTINGS = frozenset(
         "YOUNG_ROUTER_VISION_BRIDGE_TIMEOUT_SECONDS",
         "YOUNG_ROUTER_VISION_BRIDGE_PROMPT",
         "YOUNG_ROUTER_VISION_BRIDGE_LOCAL_FORMAT",
+        # The proxy executes no web search of its own, so every knob that sized
+        # or enabled the local search bridge lost its reader. Retiring the keys
+        # keeps an existing settings file loadable and lets the next save drop
+        # them.
+        "YOUNG_ROUTER_WEB_FETCH_TIMEOUT_SECONDS",
+        "YOUNG_ROUTER_WEB_SEARCH_MAX_RESULTS",
+        "YOUNG_ROUTER_WEB_SEARCH_READ_CHARS",
+        "YOUNG_ROUTER_WEB_SEARCH_MAX_ROUNDS",
+        "YOUNG_ROUTER_WEB_SEARCH_MAX_QUERIES",
+        "YOUNG_ROUTER_WEB_SEARCH_MAX_OPEN_PAGES",
+        "YOUNG_ROUTER_WEB_SEARCH_MAX_FIND_IN_PAGE",
+        "YOUNG_ROUTER_EXTERNAL_WEB_SEARCH_MODEL_RETRIES",
+        "YOUNG_ROUTER_EXTERNAL_WEB_SEARCH_MODEL_RETRY_DELAY_SECONDS",
+        "YOUNG_ROUTER_WEB_SEARCH_BRIDGE_ENABLED",
+        "YOUNG_ROUTER_WEB_SEARCH_CONFIG_JSON",
     }
 )
 

@@ -11,11 +11,11 @@ Young Router is a native macOS and Windows app that runs a local AI gateway (bui
 - **Never stops.** Every model can have several routes, failing over same-order → next-order → wraparound. Incompatible protocols switch automatically and are remembered for 10 minutes. Failing routes cool down (2 failures / 300 s by default) and a background loop restores them as soon as they answer; stalled streams fail over instead of hanging. The app owns the service — start, health checks, shutdown — and the local port steps forward when busy.
 - **Public-model context you control.** The **Routes** view groups every route under its public model; click a group to rename it across all of its routes and set the context window the whole group declares (Codex 上下文). The model detail states that number read-only under 公开模型, with a 设置 button that opens the public-model pane where it is written: the window tells a Codex client (with the model catalog enabled) how much conversation the model can hold before it compacts on its own — it does not cap the proxy. Leave the field empty to keep the value pi.dev and the built-in registry resolve.
 - **Vision bridge.** When a route explicitly rejects image input, Young Router describes the image (local OCR, Ollama / LM Studio, your HTTP vision providers, or a free fallback) and retries the same route with text context. Routes that support vision always get the original image untouched.
-- **Search bridge.** Native hosted web search where supported; otherwise the bundled [pi-web-access](https://github.com/nicobailon/pi-web-access) worker does real searches and page fetches. OpenRouter routes use their native search tool. Transient failures are never remembered as "unsupported".
+- **Search belongs to the upstream.** A hosted `web_search` declaration reaches the route exactly as the client sent it; capability flags only decide whether the protocol has to be converted, never whether the proxy searches. When a route refuses the tool, its own error is what the client sees — no local search engine and no synthesized answer stand in for it. Provider-native search items that do come back are still translated into the standard `web_search_call` lifecycle.
 - **Relay-station management.** Add a New API / Sub2API station by URL — the app detects its type, you sign in inside the app, and it loads your API keys, groups, models, and balance. Key changes save and sync to the station as you make them; deleting a key first shows which models depend on it; keys auto-bind to providers with the same Base URL. Official OpenAI / Claude accounts live in the same window.
 - **Authenticity deep test.** The model detail pane's probe names what it will run: when the model is one the bundled [Veridrop](https://github.com/canarybyte/veridrop) tables carry, it also runs Veridrop's `quick` suite against the route and reports whether the endpoint answers as the model it claims — identity, thinking signature, model consistency, protocol conformance, and message ids. A failed check is only reported — the model keeps its enable checkbox and its routing stays yours to change.
 - **Image generation bridge.** Image-generation requests are routed to the deployments that support them, with a forced retry when a capable route returns nothing.
-- **WorkBuddy accounts (China and international).** Add the product in the provider wizard, then link the WorkBuddy desktop app's own sign-in in the provider's **Service links** section: Young Router imports that app's model roster, keeps the token refreshed, and serves it through the bundled [dsh-workbuddy-connect](https://github.com/corrinehu/dsh-workbuddy-connect) worker, which stays the single owner of the upstream protocol. Both products can coexist and each keeps its own account, catalog, and credit.
+- **WorkBuddy accounts (China and international).** Add the product in the provider wizard, then link the WorkBuddy desktop app's own sign-in in the provider's **Service links** section: Young Router imports that app's model roster, keeps the token refreshed, and serves it through the bundled [dsh-connect-workbuddy](https://github.com/dingminhua/dsh-connect-workbuddy) worker, which stays the single owner of the upstream protocol. The two gateways coexist as two regions, each keeping its own account, catalog, and credit.
 - **Our Free Model.** The wizard's **Our Free Model** type reuses the bundled [dsh-our-free-model](https://github.com/Ebony-Vinyl/dsh-our-free-model) package. A small process bridge imports that package's protocol and loopback gateway in place; there is no account or key to enter. Its roster is served by several upstream producers, and the picker groups each model under the producer the upstream's own catalog names. Its model, region visibility, refresh, and probe settings live in **Runtime**.
 - **Codex & Claude in one click.** Codex Settings writes the local endpoint and key without touching your other settings, and adds model catalog, fast tier, compaction, reasoning-effort compatibility, and usage normalization. Claude Settings offers **Use local API**, plus models, permissions, and sandbox.
 - **Private by default.** Prompts, message bodies, authorization headers, and API keys never enter the request log.
@@ -30,7 +30,7 @@ Also included: route-trace HTML reports, online usage, and optional WebDAV confi
 2. Open Young Router — the local service starts automatically; the menu bar / tray icon shows its state.
 3. Open **Service Provider Management…** to sign in to OpenAI / Claude, or add a New API / Sub2API station by URL. Keys and models load automatically.
    Prefer plain API keys? Add them in **Providers & Models…**, or import your current Codex / Claude setup.
-   WorkBuddy users: in the wizard pick WorkBuddy or WorkBuddy AI — the wizard fills the service's own address — then link the desktop app's account in the provider's **Service links** block and press **Manage models** to pick the models to import.
+   WorkBuddy users: in the wizard pick WorkBuddy or WorkBuddy Global (the domestic and the international gateway) — the wizard fills that gateway's own address — then link the desktop app's account in the provider's **Service links** block and press **Manage models** to pick the models to import.
    Our Free Model users: in the wizard pick **Our Free Model** — nothing is typed there — and press Finish; the bundled package imports the roster with the entry. If the anonymous producer refuses the current network location, that provider's probe reports the refusal on its own row instead of blaming the key.
 4. Connect your tools:
    - **Codex** → **Codex Settings…** → choose a LiteLLM deployment
@@ -66,14 +66,14 @@ Source builds also need Xcode, CocoaPods, Node.js 22+, pnpm 11, and [uv](https:/
 
 ## Configuration
 
-Editable config: `~/.young-router/config.yaml` (sanitized example: [`config.example.yaml`](./config.example.yaml)). Every edit is validated as it is written and the service reloads itself when a saved change requires it; only the provider wizard, the raw file editor, and 分组管理 stage their edits until their own Save/Close. Runtime knobs (timeouts, cool-downs, port, vision / search / computer settings) live in **Runtime**; per-deployment capability flags (`upstream_protocol_mode`, `upstream_url_surface`, `supports_responses_web_search`, `supports_responses_image_generation_tool`, `supports_responses_compaction`) are documented in the example file.
+Editable config: `~/.young-router/config.yaml` (sanitized example: [`config.example.yaml`](./config.example.yaml)). Every edit is validated as it is written and the service reloads itself when a saved change requires it; only the provider wizard, the raw file editor, and 分组管理 stage their edits until their own Save/Close. Runtime knobs (timeouts, cool-downs, port, vision / computer settings) live in **Runtime**; per-deployment capability flags (`upstream_protocol_mode`, `upstream_url_surface`, `supports_responses_web_search`, `supports_responses_image_generation_tool`, `supports_responses_compaction`) are documented in the example file.
 
 <details>
 <summary>Import / export, sync, deep links, development</summary>
 
 - **Import/export:** bring providers in from Codex / Claude settings, files, or New API / CC Switch links; export configuration sections as JSON. Confirming the detected sections writes them right away. Optional WebDAV smart sync (push / pull / merge) is available under **Backup & Sync**.
 - **Deep links:** open any screen directly — `open "young-router://open/<route>"` with `home`, `providers-models`, `provider-wizard`, `codex-settings`, `claude-settings`, `runtime-settings`, `relay-accounts`, `data-management`, or `logs?tab=…` (`requests`, `service`, `route-trace`, `recovery`, `online-usage`). Links cannot carry values or trigger a configuration write.
-- **Development:** contributor guide in [`AGENTS.md`](./AGENTS.md); focused Python tests live in `tests/`; run `pnpm exec tsc --noEmit` inside `rn/`. `scripts/version.py` keeps `VERSION`, manifests, and the Cask in sync; builds advance `LITELLM_VERSION` to the latest stable release and bundle a matching pi-web-access + Node.js 22 runtime.
+- **Development:** contributor guide in [`AGENTS.md`](./AGENTS.md); focused Python tests live in `tests/`; run `pnpm exec tsc --noEmit` inside `rn/`. `scripts/version.py` keeps `VERSION`, manifests, and the Cask in sync; builds advance `LITELLM_VERSION` to the latest stable release and bundle a matching Node.js 22 runtime.
 
 </details>
 
@@ -102,11 +102,11 @@ MIT License. See [LICENSE](./LICENSE).
 
 - **永不停歇。** 每个模型可以配置多条线路，按同序 → 下一顺序 → 环绕自动回退；协议不兼容时自动切换并记忆 10 分钟；失败线路默认冷却（连续 2 次 / 300 秒），后台每 5 秒探测、恢复后自动重新启用；流式响应卡住会改走其他线路而不是一直挂起。服务由应用托管（启动、健康检查、退出关闭），本地端口被占用时自动顺延。
 - **识图桥接。** 线路明确拒绝图片输入时，自动生成图片描述（本机 OCR、Ollama / LM Studio、你配置的 HTTP 视觉供应商或免费回退），转成文本后重试原线路；真正支持视觉的线路始终收到未被改动的原图。
-- **搜索桥接。** 支持原生联网搜索时优先用原生；不支持时由内置的 [pi-web-access](https://github.com/nicobailon/pi-web-access) worker 执行真实搜索与网页抓取；OpenRouter 线路使用其原生搜索工具。瞬时失败不会被误记为“不支持”。
+- **联网搜索由上游负责。** 客户端声明的 hosted `web_search` 原样送到线路；能力标志只决定是否需要协议转换，不代表代理会去搜索。线路拒绝该工具时，客户端看到的就是上游自己的报错——不会用本地搜索引擎或编造的答案替代。上游确实返回的原生搜索条目仍会被转换成标准的 `web_search_call` 生命周期。
 - **中转站智能管理。** 填一个 URL 即可添加 New API / Sub2API 中转站：自动识别类型、在应用内登录、自动加载 API 密钥、分组、模型和余额。密钥改动即时保存并同步到中转站；删除前会提示哪些模型正在使用；Base URL 相同的供应商会自动绑定这些密钥。OpenAI / Claude 官方账号也在同一个窗口管理。
 - **真伪探测。** 模型详情页的按钮会说明它将要执行什么：模型名在内置 [Veridrop](https://github.com/canarybyte/veridrop) 的模型表内时，对该线路跑一遍 Veridrop 的 `quick` 套件，核验它是否真的由所声称的模型作答（身份一致性、思维签名、模型一致性、协议规范性、消息标识规范）。核验未通过只作为结果展示——不会取消模型的启用勾选，路由怎么改仍由你决定。
 - **图像生成桥接。** 图像生成请求会被路由到真正支持该能力的线路；能力线路返回空响应时会强制重试，避免请求白跑。
-- **WorkBuddy 账号（国内版与国际版）。** 在添加向导中选出产品，再在供应商详情页的**服务商关联**里关联 WorkBuddy 桌面 App 自己的登录：漾路由据此导入该 App 的模型列表并自动续期，通过内置的 [dsh-workbuddy-connect](https://github.com/corrinehu/dsh-workbuddy-connect) worker 调用——上游协议始终由这个第三方包负责。两版可以并存，各自使用自己的账号、模型列表与积分。
+- **WorkBuddy 账号（国内版与国际版）。** 在添加向导中选出产品，再在供应商详情页的**服务商关联**里关联 WorkBuddy 桌面 App 自己的登录：漾路由据此导入该 App 的模型列表并自动续期，通过内置的 [dsh-connect-workbuddy](https://github.com/dingminhua/dsh-connect-workbuddy) worker 调用——上游协议始终由这个第三方包负责。两个网关作为两个区域并存，各自使用自己的账号、模型列表与积分。
 - **Our Free Model。** 向导里的 **Our Free Model** 类型使用内置的 [dsh-our-free-model](https://github.com/Ebony-Vinyl/dsh-our-free-model) 包。Young Router 的进程桥直接引用该包的协议与本地网关；无需账号或填写密钥。模型列表由多个上游渠道提供，选择器按上游目录自己标注的渠道分组。输出上限、地区受限模型、刷新间隔和可用性探测等设置位于 **Runtime**。
 - **Codex 与 Claude 一键接入。** Codex 设置会写入本地端点与密钥且不碰你的其他配置，并提供模型目录、Fast 层级、压缩方式、推理强度兼容和用量归一化；Claude 设置提供**使用本机 API**，以及模型、权限和沙箱选项。
 - **默认保护隐私。** 提示词正文、消息内容、授权头和 API 密钥不会进入请求日志。
@@ -121,7 +121,7 @@ MIT License. See [LICENSE](./LICENSE).
 2. 打开漾路由——本地服务自动启动，菜单栏 / 托盘图标显示服务状态。
 3. 打开**服务商管理…** 登录 OpenAI / Claude，或填入 URL 添加 New API / Sub2API 中转站，密钥和模型会自动加载。
    如果习惯直接用 API 密钥，可以在**供应商与模型…** 中添加，或导入现有的 Codex / Claude 配置。
-   WorkBuddy 用户：在向导的供应商类型中选择 WorkBuddy 或 WorkBuddy AI（基础 URL 自动填入服务官方地址），然后在供应商详情页的**服务商关联**里关联桌面 App 账号，再用**模型管理**挑选要导入的模型。
+   WorkBuddy 用户：在向导的供应商类型中选择 WorkBuddy 或 WorkBuddy Global（国内版网关与国际版网关，基础 URL 自动填入该网关的官方地址），然后在供应商详情页的**服务商关联**里关联桌面 App 账号，再用**模型管理**挑选要导入的模型。
    Our Free Model 用户：在向导中选择 **Our Free Model**（无需填写任何内容），点击完成即可，内置的包会随条目导入模型列表。若匿名渠道拒绝当前网络出口，该渠道的探测会在自己的行上说明，而不是归咎于密钥。
 4. 接入工具：
    - **Codex** → **Codex 设置…** → 选择一个 LiteLLM 部署
@@ -157,14 +157,14 @@ Windows（Developer PowerShell，需要 Windows App SDK 与 VS C++ 桌面工作�
 
 ## 配置
 
-可编辑配置：`~/.young-router/config.yaml`（脱敏示例：[`config.example.yaml`](./config.example.yaml)）。所有修改都会先校验再写入，需要重启的改动由服务自行重载；只有供应商向导、原始文件编辑器与分组管理会把修改暂存到各自的保存 / 关闭动作。超时、冷却、端口、识图 / 搜索 / 电脑操作等运行时项都在**运行时**中调整；每个部署的能力标志（`upstream_protocol_mode`、`upstream_url_surface`、`supports_responses_web_search`、`supports_responses_image_generation_tool`、`supports_responses_compaction`）在示例文件中有说明。
+可编辑配置：`~/.young-router/config.yaml`（脱敏示例：[`config.example.yaml`](./config.example.yaml)）。所有修改都会先校验再写入，需要重启的改动由服务自行重载；只有供应商向导、原始文件编辑器与分组管理会把修改暂存到各自的保存 / 关闭动作。超时、冷却、端口、识图 / 电脑操作等运行时项都在**运行时**中调整；每个部署的能力标志（`upstream_protocol_mode`、`upstream_url_surface`、`supports_responses_web_search`、`supports_responses_image_generation_tool`、`supports_responses_compaction`）在示例文件中有说明。
 
 <details>
 <summary>导入导出、同步、深链、开发</summary>
 
 - **导入导出：** 可从 Codex / Claude 设置、文件或 New API / CC Switch 链接导入供应商，按配置段导出 JSON；确认导入的配置段会立即写入。**备份与同步**中提供可选的 WebDAV 智能同步（推送 / 拉取 / 合并）。
 - **深链：** 直接打开指定页面——`open "young-router://open/<route>"`，可用 `home`、`providers-models`、`provider-wizard`、`codex-settings`、`claude-settings`、`runtime-settings`、`relay-accounts`、`data-management`、`logs?tab=…`（`requests`、`service`、`route-trace`、`recovery`、`online-usage`）。深链不能携带配置值，也不会触发配置写入。
-- **开发：** 贡献者指南见 [`AGENTS.md`](./AGENTS.md)；聚焦测试位于 `tests/`，共享 UI 在 `rn/` 下运行 `pnpm exec tsc --noEmit`。`scripts/version.py` 负责同步版本与 Cask；构建时会自动将 `LITELLM_VERSION` 推进到最新稳定版，并打包匹配的 pi-web-access 与 Node.js 22 运行时。
+- **开发：** 贡献者指南见 [`AGENTS.md`](./AGENTS.md)；聚焦测试位于 `tests/`，共享 UI 在 `rn/` 下运行 `pnpm exec tsc --noEmit`。`scripts/version.py` 负责同步版本与 Cask；构建时会自动将 `LITELLM_VERSION` 推进到最新稳定版，并打包匹配的 Node.js 22 运行时。
 
 </details>
 

@@ -31,7 +31,7 @@ HOOK_MODULE_NAMES = (
     "proxy.routing",
     "proxy.responses_tools",
     "proxy.responses_surfaces",
-    "proxy.responses_web_search_bridge",
+    "proxy.web_search_native",
     "proxy.responses_output",
     "proxy.image_inputs",
     "proxy.responses_request",
@@ -43,7 +43,6 @@ HOOK_MODULE_NAMES = (
     "adapters.dsh_vision_router",
     "proxy.streaming_recovery",
     "proxy.streaming",
-    "adapters.pi_web_access",
     "proxy.hook",
 )
 

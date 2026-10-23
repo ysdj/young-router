@@ -203,6 +203,9 @@ class HookResponsesChatBridgeTests(HookTestCase):
             )
         )
 
+        # Even when the selected Responses route is registered as not
+        # supporting Hosted search, the caller's declaration is what travels:
+        # no local search implementation is substituted for it.
         selected_responses_web_search_bridge = {
             **selected_responses,
             "model_info": {
@@ -210,16 +213,17 @@ class HookResponsesChatBridgeTests(HookTestCase):
                 "supports_responses_web_search": False,
             },
         }
-        external_bridge = hooks._with_responses_external_web_search_bridge(
-            selected_responses_web_search_bridge,
-            stale_outer_chat,
+        self.assertIsNone(
+            hooks._responses_chat_bridge_preemptive_kwargs(
+                selected_responses_web_search_bridge,
+                stale_outer_chat,
+                include_hosted_web_search_unsupported=True,
+                include_client_tool_unsupported=True,
+            )
         )
-
-        self.assertIsNotNone(external_bridge)
-        assert external_bridge is not None
-        self.assertNotIn("use_chat_completions_api", external_bridge)
-        self.assertTrue(
-            external_bridge["litellm_metadata"][hooks._WEB_SEARCH_EXTERNAL_BRIDGE_KEY]
+        self.assertEqual(
+            selected_responses_web_search_bridge["tools"],
+            [{"type": "function", "name": "exec_command", "parameters": {"type": "object"}}, {"type": "web_search"}],
         )
 
     async def test_function_tool_bridge_bad_response_status_stays_on_responses(self) -> None:
@@ -1332,7 +1336,7 @@ class HookResponsesChatBridgeTests(HookTestCase):
         self.assertEqual(stats["bridged_custom_tools"], 1)
         self.assertEqual(stats["bridged_tool_search_tools"], 1)
         self.assertEqual(stats["bridged_namespace_tools"], 1)
-        self.assertEqual(stats["bridged_web_search_tools"], 0)
+        self.assertEqual(stats["dropped_web_search_tools"], 0)
         self.assertEqual(
             stats["kept_tool_names"],
             ["shell", "spawn_agent", "tool_search", "valid_func", "valid_responses"],
@@ -1663,13 +1667,23 @@ class HookResponsesChatBridgeTests(HookTestCase):
         self.assertEqual(reasoning["summary"][0]["text"], "raw thought")
         self.assertEqual(chunks[-1]["response"]["output_text"], "hello")
 
-    async def test_chat_bridge_hides_deepseek_reasoning_for_auto_summary(
+    async def test_chat_bridge_streams_deepseek_reasoning_for_auto_summary(
         self,
     ) -> None:
+        """A summary request gets the thinking live, before the answer.
+
+        pi asks with ``reasoning: {effort, summary: "auto"}`` and renders a
+        thinking block from the ``reasoning_summary_text.delta`` frames of the
+        item whose ``output_index`` precedes the message's.  Emitting the
+        reasoning only as a finished item after the message left that block
+        empty for the whole turn.
+        """
+
         hooks, proxy_server = load_hook_module()
 
         async def chat_stream():
-            yield {"choices": [{"delta": {"reasoning": "raw thought"}}]}
+            yield {"choices": [{"delta": {"reasoning": "raw"}}]}
+            yield {"choices": [{"delta": {"reasoning": " thought"}}]}
             yield {"choices": [{"delta": {"content": "hello"}}]}
 
         class FakeRouter:
@@ -1698,14 +1712,132 @@ class HookResponsesChatBridgeTests(HookTestCase):
         chunks = [jsonable_stream_chunk(chunk) async for chunk in response]
 
         self.assertEqual(
+            [chunk["type"] for chunk in chunks],
             [
-                item
-                for item in chunks[-1]["response"]["output"]
-                if item.get("type") == "reasoning"
+                "response.created",
+                "response.output_item.added",
+                "response.reasoning_summary_part.added",
+                "response.reasoning_summary_text.delta",
+                "response.reasoning_summary_text.delta",
+                "response.reasoning_summary_text.done",
+                "response.reasoning_summary_part.done",
+                "response.output_item.done",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.completed",
+            ],
+        )
+        reasoning_item = chunks[1]
+        self.assertEqual(reasoning_item["output_index"], 0)
+        self.assertEqual(reasoning_item["item"]["type"], "reasoning")
+        self.assertEqual(
+            [chunk["delta"] for chunk in chunks[3:5]],
+            ["raw", " thought"],
+        )
+        self.assertTrue(
+            all(chunk["output_index"] == 0 for chunk in chunks[1:8])
+        )
+        self.assertEqual(chunks[8]["output_index"], 1)
+        self.assertEqual(chunks[8]["item"]["type"], "message")
+        self.assertEqual(
+            chunks[7]["item"]["summary"],
+            [{"type": "summary_text", "text": "raw thought"}],
+        )
+
+        completed = chunks[-1]["response"]
+        self.assertEqual(completed["output_text"], "hello")
+        self.assertEqual(
+            [item["type"] for item in completed["output"]],
+            ["reasoning", "message"],
+        )
+        self.assertEqual(
+            completed["output"][0]["summary"],
+            [{"type": "summary_text", "text": "raw thought"}],
+        )
+
+    async def test_chat_bridge_hides_reasoning_no_client_asked_for(
+        self,
+    ) -> None:
+        """A request with no reasoning summary gets no reasoning frames."""
+
+        hooks, proxy_server = load_hook_module()
+
+        async def chat_stream():
+            yield {"choices": [{"delta": {"reasoning": "raw thought"}}]}
+            yield {"choices": [{"delta": {"content": "hello"}}]}
+
+        class FakeRouter:
+            async def acompletion(self, **_payload):
+                return chat_stream()
+
+        proxy_server.llm_router = FakeRouter()
+        request_kwargs = {
+            "original_generic_function": lambda **_kwargs: None,
+        }
+        hooks._with_generic_deployment_failover_wrapper(request_kwargs)
+
+        response = await request_kwargs["original_generic_function"](
+            call_type="aresponses",
+            model="deepseek-v4.1-flash",
+            input="Say hello.",
+            stream=True,
+            model_info={
+                "id": "experimental_provider-deepseek",
+                "model_group": "deepseek-v4.1-flash",
+                "upstream_url_surface": "openai/chat",
+                "supported_upstream_url_surfaces": ["openai/chat"],
+            },
+        )
+        chunks = [jsonable_stream_chunk(chunk) async for chunk in response]
+
+        self.assertEqual(
+            [
+                chunk["type"]
+                for chunk in chunks
+                if chunk["type"].startswith("response.reasoning")
             ],
             [],
         )
+        self.assertEqual(chunks[1]["output_index"], 0)
+        self.assertEqual(chunks[1]["item"]["type"], "message")
+        self.assertEqual(
+            [item["type"] for item in chunks[-1]["response"]["output"]],
+            ["message"],
+        )
         self.assertEqual(chunks[-1]["response"]["output_text"], "hello")
+
+    def test_chat_bridge_stream_payload_sends_the_reasoning_level_as_chat(self) -> None:
+        """The text bridge hands its Chat upstream the level, not the object.
+
+        An OpenAI-chat gateway reads ``reasoning_effort`` and ignores a
+        Responses ``reasoning`` object whole, so forwarding that object left
+        every route served by the bridge answering without thinking.
+        """
+
+        hooks, _ = load_hook_module()
+
+        payload = hooks._chat_bridge_stream_payload(
+            {
+                "model": "default-chat",
+                "input": "Summarize this thread.",
+                "stream": True,
+                "reasoning": {"effort": "high", "summary": "auto"},
+                "model_info": {
+                    "id": "chat-only",
+                    "upstream_url_surface": "openai/chat",
+                    "supported_upstream_url_surfaces": ["openai/chat"],
+                },
+            }
+        )
+
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        self.assertEqual(payload.get("reasoning_effort"), "high")
+        self.assertNotIn("reasoning", payload)
 
     async def test_chat_only_bridge_preserves_codex_additional_tools_and_tool_call(self) -> None:
         hooks, _ = load_hook_module()
@@ -1942,7 +2074,7 @@ class HookResponsesChatBridgeTests(HookTestCase):
             )
         )
 
-    def test_explicit_anthropic_surface_bridges_hosted_search_to_pi_functions(self) -> None:
+    def test_explicit_anthropic_surface_drops_hosted_search_declaration(self) -> None:
         hooks, _ = load_hook_module()
         request_kwargs = {
             "call_type": "aresponses",
@@ -1968,10 +2100,16 @@ class HookResponsesChatBridgeTests(HookTestCase):
         self.assertIsNotNone(bridge_kwargs)
         assert bridge_kwargs is not None
         self.assertTrue(bridge_kwargs["use_chat_completions_api"])
-        self.assertEqual(
-            [(tool.get("type"), tool.get("name")) for tool in bridge_kwargs["tools"]],
-            [("function", "web_search"), ("function", "fetch_content")],
-        )
+        # An Anthropic/Chat surface has no Hosted web_search. The declaration
+        # is dropped, exactly once, and no local search functions take its
+        # place: the proxy does not run searches itself.
+        self.assertEqual(bridge_kwargs.get("tools"), None)
+        self.assertNotIn("web_search_options", bridge_kwargs)
+        stats = bridge_kwargs["litellm_metadata"][
+            "responses_chat_bridge_tool_sanitized"
+        ]
+        self.assertEqual(stats["dropped_web_search_tools"], 1)
+        self.assertIn("web_search", stats["dropped_types"])
         self.assertEqual(
             bridge_kwargs["litellm_metadata"]["responses_chat_bridge_preemptive_reason"],
             "responses_endpoint_unsupported",
@@ -2281,10 +2419,14 @@ class HookResponsesChatBridgeTests(HookTestCase):
         self.assertEqual(len(calls), 2)
         metadata = calls[1]["litellm_metadata"]
         self.assertTrue(metadata[hooks._RESPONSES_CHAT_BRIDGE_METADATA_KEY])
-        self.assertTrue(metadata[hooks._WEB_SEARCH_EXTERNAL_BRIDGE_KEY])
+        # Chat Completions has no Hosted declaration, so the bridge drops it
+        # instead of inventing a local search that the proxy would run.
+        stats = metadata["responses_chat_bridge_tool_sanitized"]
+        self.assertEqual(stats["dropped_web_search_tools"], 1)
+        self.assertIn("web_search", stats["dropped_types"])
         self.assertEqual(
             [tool["name"] for tool in calls[1]["tools"]],
-            ["web_search", "fetch_content", "tool_search", "spawn_agent"],
+            ["tool_search", "spawn_agent"],
         )
         self.assertNotIn("web_search_options", calls[1])
         self.assertFalse(hasattr(error, "responses_endpoint_unsupported"))

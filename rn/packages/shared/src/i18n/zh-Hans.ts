@@ -668,7 +668,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "providers.type.claude": "Claude",
   "providers.type.apiKey": "API 密钥",
   "providers.type.workbuddy": "WorkBuddy",
-  "providers.type.workbuddyAI": "WorkBuddy AI",
+  "providers.type.workbuddyGlobal": "WorkBuddy Global",
   "providers.type.ourFreeModel": "Our Free Model · OpenCode 通道",
   "providers.type.ourFreeModelKilo": "Our Free Model · Kilo 通道",
   "providers.type.ourFreeModelEAC": "Our Free Model · EAC 协付通道",

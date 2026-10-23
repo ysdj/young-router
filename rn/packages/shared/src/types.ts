@@ -224,7 +224,7 @@ export type ProviderAuthKind =
   | "openai_login"
   | "claude_login"
   | "workbuddy_login"
-  | "workbuddy_ai_login"
+  | "workbuddy_global_login"
   | "our_free_model_login";
 
 export type ProviderAuthStatus = "signed_out" | "authorizing" | "signed_in" | "expired" | "error" | "unsupported";

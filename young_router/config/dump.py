@@ -7,6 +7,7 @@ import pathlib
 import re
 import secrets
 import tempfile
+from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urlparse
 
@@ -700,6 +701,132 @@ def _replace_top_level_sections(text: str, blocks: dict[str, str]) -> str:
     if missing:
         updated = updated.rstrip() + "\n\n" + "\n\n".join(missing) + "\n"
     return updated
+
+
+#: ``router_settings`` tables that name model groups by the name a client
+#: sends.  A public model is not a record of its own: renaming or deleting one
+#: rewrites ``model_list`` and ``public_model_groups``, and every table here has
+#: to move with it.  The Router reads these at startup and resolves them per
+#: request, so a name left behind is not a stale comment -- it is a hop the
+#: Router still takes.  A group that no longer exists has no deployments, so the
+#: hop fails with ``There are no healthy deployments`` and LiteLLM answers the
+#: client a 500 that hides the original upstream failure behind
+#: ``Fallback to <gone> also failed``.
+GROUP_NAME_TABLES = (
+    "fallbacks",
+    "context_window_fallbacks",
+    "content_policy_fallbacks",
+    "model_group_alias",
+)
+
+#: The key of the Router's catch-all fallback chain.  It names no group, so it is
+#: never restated against the served names and never dropped for missing them.
+GENERIC_FALLBACK_GROUP = "*"
+
+
+def _restated_group_name(name: object, renames: dict[str, str], served: set[str]) -> str:
+    """The served name a stored group reference means now, or ``""`` for none."""
+
+    text = str(name).strip() if isinstance(name, str) or isinstance(name, (int, float)) else ""
+    if not text:
+        return ""
+    if text == GENERIC_FALLBACK_GROUP:
+        # ``"*"`` is not a group name: it is the key of the Router's catch-all
+        # fallback chain, read for every request whose own group has none.
+        return text
+    return text if (text := renames.get(text, text)) in served else ""
+
+
+def _restated_fallback_list(targets: object, renames: dict[str, str], served: set[str]) -> list[str]:
+    """One fallback target list, in order, with gone targets removed."""
+
+    values = targets if isinstance(targets, list) else ([] if targets is None else [targets])
+    restated: list[str] = []
+    for target in values:
+        name = _restated_group_name(target, renames, served)
+        if name and name not in restated:
+            restated.append(name)
+    return restated
+
+
+def _group_references_restated(
+    settings: object,
+    *,
+    renames: dict[str, str],
+    served: set[str],
+) -> tuple[dict[str, Any], list[str]]:
+    """Restate every group reference in one ``router_settings`` map.
+
+    ``renames`` reads an old public name as the one that replaced it, and
+    ``served`` is the set of names the configuration now serves.  A reference to
+    a name that is in neither is dropped, and named in the second return value:
+    the Router would never look such a group up, so keeping it only makes the
+    group's own failover list read as one hop longer than it is.
+
+    Returns the rewritten map (a plain dict, so a caller can dump it) and the
+    dropped names in document order.  The map is the input object itself when no
+    reference moved, so a caller can compare identity to know whether it has
+    anything to write.
+    """
+
+    if not isinstance(settings, Mapping):
+        return {}, []
+    rewritten = dict(settings)
+    dropped: list[str] = []
+    changed = False
+    for table in GROUP_NAME_TABLES:
+        if table not in rewritten:
+            continue
+        stored = rewritten[table]
+        if table == "model_group_alias":
+            restated_alias: dict[str, Any] = {}
+            for alias, target in stored.items() if isinstance(stored, Mapping) else ():
+                inner = target.get("model") if isinstance(target, Mapping) else target
+                name = _restated_group_name(inner, renames, served)
+                if not name:
+                    # An alias whose target no longer exists is a name the Router
+                    # still accepts and then cannot place: the request fails as an
+                    # unknown model over a table nothing serves.
+                    if isinstance(inner, str) and inner.strip():
+                        dropped.append(inner.strip())
+                    continue
+                next_alias = renames.get(str(alias).strip(), str(alias).strip())
+                restated_alias[next_alias] = {**target, "model": name} if isinstance(target, Mapping) else name
+            if restated_alias != stored:
+                rewritten[table] = restated_alias
+                changed = True
+            continue
+        if not isinstance(stored, list):
+            continue
+        restated_list: list[Any] = []
+        for entry in stored:
+            if not isinstance(entry, Mapping):
+                restated_list.append(entry)
+                continue
+            restated_entry: dict[str, Any] = {}
+            for source, targets in entry.items():
+                restated_targets = _restated_fallback_list(targets, renames, served)
+                name = _restated_group_name(source, renames, served)
+                if not name:
+                    if isinstance(source, str) and source.strip():
+                        dropped.append(source.strip())
+                    continue
+                if not restated_targets:
+                    # A from-group with every target gone names no hop at all.
+                    for target in targets if isinstance(targets, list) else (targets,):
+                        if isinstance(target, str) and target.strip():
+                            dropped.append(target.strip())
+                    continue
+                for target in targets if isinstance(targets, list) else ():
+                    if not _restated_group_name(target, renames, served) and isinstance(target, str) and target.strip():
+                        dropped.append(target.strip())
+                restated_entry[name] = restated_targets
+            if restated_entry:
+                restated_list.append(restated_entry)
+        if restated_list != stored:
+            rewritten[table] = restated_list
+            changed = True
+    return (rewritten if changed else settings), dropped
 
 
 def _unique_model_groups(active_entries: list[dict[str, Any]], existing_groups: list[Any] | None = None) -> list[str]:

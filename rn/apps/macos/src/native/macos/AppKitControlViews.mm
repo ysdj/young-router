@@ -4797,8 +4797,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitBusySpinnerCls(void)
        ([field isEqualToString:@"deployment_token"] || [field isEqualToString:@"desktop_gateway_api_key"]) &&
        target.length == 0) ||
       ([domain isEqualToString:@"runtime"] && [field isEqualToString:@"setting"] &&
-       ([target isEqualToString:@"YOUNG_ROUTER_PI_WEB_ACCESS_CONFIG_JSON"] ||
-        [target isEqualToString:@"YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON"])));
+       [target isEqualToString:@"YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON"]));
   if ((identityChanged || activeControlChanged || visibleChanged || resetReadable) && readablePlainText) {
     [self loadPlainTextSecretForGeneration:_generation];
   }
@@ -5128,8 +5127,7 @@ doCommandBySelector:(SEL)commandSelector
         ([_secretField isEqualToString:@"deployment_token"] || [_secretField isEqualToString:@"desktop_gateway_api_key"]));
   }
   return [_domain isEqualToString:@"runtime"] && [_secretField isEqualToString:@"setting"] &&
-      ([_target isEqualToString:@"YOUNG_ROUTER_PI_WEB_ACCESS_CONFIG_JSON"] ||
-       [_target isEqualToString:@"YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON"]);
+      [_target isEqualToString:@"YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON"];
 }
 
 - (NSView *)accessibilityElement

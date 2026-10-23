@@ -6,7 +6,7 @@ from . import responses_request as _responses_request_module
 from . import request_context as _request_context_module
 from . import responses_execution as _responses_execution_module
 from . import responses_tools as _responses_tools_module
-from . import responses_web_search_bridge as _responses_web_search_bridge_module
+from . import web_search_native as _web_search_native_module
 from . import routing as _routing_module
 from . import tools as _tools_module
 from . import trace as _trace_module
@@ -37,8 +37,6 @@ from .base import (
     _UPSTREAM_URL_SURFACE_KEY,
     _UPSTREAM_URL_SURFACE_OPENAI_CHAT,
     _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES,
-    _WEB_SEARCH_EXTERNAL_BRIDGE_KEY,
-    _WEB_SEARCH_EXTERNAL_BRIDGE_STREAM_KEY,
     copy,
     inspect,
     litellm,
@@ -60,8 +58,6 @@ def _sync_bridge_extra_body_tools(request_kwargs: dict, tools: list[dict]) -> No
 def _with_responses_chat_bridge_compatible_tools(
     retry_kwargs: dict,
     retry_metadata: dict,
-    *,
-    bridge_provider_native_web_search: bool = False,
 ) -> None:
     if _routing_module._protocol_fallback_relax_tool_choice(retry_kwargs):
         retry_metadata[_PROTOCOL_FALLBACK_RELAX_TOOL_CHOICE_KEY] = True
@@ -77,19 +73,9 @@ def _with_responses_chat_bridge_compatible_tools(
         tools = []
     if additional_tools:
         tools = [*tools, *additional_tools]
-    bridge_web_search = (
-        "web_search_options" in retry_kwargs
-        or any(
-            isinstance(tool, dict)
-            and tool.get("type") in {"web_search", "web_search_preview"}
-            for tool in tools
-        )
-    )
     sanitized_tools, web_search_options, stats = _responses_tools_module._responses_chat_bridge_sanitize_tools(
         tools,
         input_value=retry_kwargs.get("input"),
-        bridge_web_search=bridge_web_search,
-        bridge_provider_native_web_search=bridge_provider_native_web_search,
     )
     if stats.get("changed"):
         retry_metadata["responses_chat_bridge_tool_sanitized"] = stats
@@ -102,13 +88,8 @@ def _with_responses_chat_bridge_compatible_tools(
             ),
             "tool_count": len(additional_tools),
         }
-    if stats.get("bridged_web_search_tools"):
-        retry_metadata[_WEB_SEARCH_EXTERNAL_BRIDGE_KEY] = True
-        retry_kwargs.pop("web_search_options", None)
-        if retry_kwargs.get("stream") is True:
-            retry_metadata[_WEB_SEARCH_EXTERNAL_BRIDGE_STREAM_KEY] = True
     _responses_tools_module._append_responses_chat_bridge_instruction(retry_kwargs, stats)
-    if web_search_options is not None and not stats.get("bridged_web_search_tools"):
+    if web_search_options is not None:
         retry_kwargs["web_search_options"] = web_search_options
     if sanitized_tools:
         retry_kwargs["tools"] = sanitized_tools
@@ -156,19 +137,10 @@ def _with_responses_function_tool_bridge_compatible_tools(
         tools = []
     if additional_tools:
         tools = [*tools, *additional_tools]
-    plan = _responses_tools_module._responses_hosted_tool_plan(
-        bridge_kwargs,
-        outer_request_kwargs,
-    )
-    bridge_web_search = _responses_hosted_web_search_needs_external_bridge(
-        bridge_kwargs,
-        outer_request_kwargs,
-        plan=plan,
-    )
     sanitized_tools, web_search_options, stats = _responses_tools_module._responses_chat_bridge_sanitize_tools(
         tools,
         input_value=bridge_kwargs.get("input"),
-        bridge_web_search=bridge_web_search,
+        keep_hosted_web_search=True,
     )
     if stats.get("changed"):
         bridge_metadata["responses_function_tool_bridge_tool_sanitized"] = stats
@@ -181,11 +153,8 @@ def _with_responses_function_tool_bridge_compatible_tools(
             ),
             "tool_count": len(additional_tools),
         }
-    if stats.get("bridged_web_search_tools"):
-        bridge_metadata[_WEB_SEARCH_EXTERNAL_BRIDGE_KEY] = True
-        bridge_kwargs.pop("web_search_options", None)
     _responses_tools_module._append_responses_chat_bridge_instruction(bridge_kwargs, stats)
-    if web_search_options is not None and not stats.get("bridged_web_search_tools"):
+    if web_search_options is not None:
         bridge_kwargs["web_search_options"] = web_search_options
     if sanitized_tools:
         bridge_kwargs["tools"] = sanitized_tools
@@ -214,10 +183,11 @@ def _with_responses_function_tool_bridge_compatible_tools(
                     "responses_function_tool_bridge_relaxed_forced_tool_choice"
                 ] = True
             elif not (
-                not bridge_web_search
-                and isinstance(tool_choice, dict)
+                isinstance(tool_choice, dict)
                 and tool_choice.get("type") in {"web_search", "web_search_preview"}
             ):
+                # A Hosted choice belongs to the upstream that owns the Hosted
+                # declaration; it is never rewritten into a client function.
                 bridge_kwargs["tool_choice"] = (
                     _responses_tools_module._responses_function_tool_bridge_sanitize_tool_choice(
                         tool_choice,
@@ -543,48 +513,6 @@ def _request_should_try_unknown_native_responses_web_search(
         ) and _request_uses_responses_endpoint(request):
             return True
     return False
-
-
-def _request_should_bridge_responses_web_search(
-    request_kwargs: Optional[dict],
-    outer_request_kwargs: Optional[dict] = None,
-    plan: Optional[HostedToolPlan] = None,
-) -> bool:
-    plan = plan or _responses_tools_module._responses_hosted_tool_plan(
-        request_kwargs,
-        outer_request_kwargs,
-    )
-    cached_unsupported = any(
-        _routing_module._web_search_tool_unsupported_cached(request)
-        is not None
-        for request in (request_kwargs, outer_request_kwargs)
-    )
-    if not plan.hosted_web_search:
-        # Provider-native declarations (for example OpenRouter's
-        # openrouter:web_search) remain pass-through while capability is
-        # unknown. Once the route has explicitly rejected that declaration,
-        # the same local function bridge is safe to use preemptively until
-        # the probe memory expires.
-        native_support_decision = (
-            _request_native_responses_web_search_support_decision_for_requests(
-                request_kwargs,
-                outer_request_kwargs,
-            )
-        )
-        return cached_unsupported or native_support_decision is False
-    if _request_supports_native_responses_web_search(
-        request_kwargs,
-        outer_request_kwargs,
-    ):
-        return False
-    if _request_should_try_unknown_native_responses_web_search(
-        request_kwargs,
-        outer_request_kwargs,
-    ):
-        return False
-    return True
-
-
 def _request_should_try_native_responses_client_tools(
     request_kwargs: Optional[dict],
     outer_request_kwargs: Optional[dict] = None,
@@ -667,20 +595,6 @@ def _request_supports_responses_function_tools(
     if _request_uses_responses_endpoint(outer_request_kwargs):
         return True
     return False
-
-
-def _responses_hosted_web_search_needs_external_bridge(
-    request_kwargs: Optional[dict],
-    outer_request_kwargs: Optional[dict] = None,
-    plan: Optional[HostedToolPlan] = None,
-) -> bool:
-    return _request_should_bridge_responses_web_search(
-        request_kwargs,
-        outer_request_kwargs,
-        plan=plan,
-    )
-
-
 def _request_has_preemptive_responses_chat_bridge(request_kwargs: Optional[dict]) -> bool:
     for key in ("litellm_metadata", "metadata"):
         metadata = _request_context_module._request_metadata_dict(request_kwargs, key)
@@ -849,127 +763,6 @@ def _with_responses_native_client_tool_passthrough(
     ] = passthrough_metadata
     modified_kwargs["litellm_metadata"] = updated_metadata
     return modified_kwargs
-
-
-def _responses_external_web_search_bridge_kwargs(
-    request_kwargs: Optional[dict],
-    outer_request_kwargs: Optional[dict] = None,
-    *,
-    plan: Optional[HostedToolPlan] = None,
-) -> Optional[dict]:
-    if not isinstance(request_kwargs, dict):
-        return None
-    if not _responses_request_module._request_is_responses_api(request_kwargs):
-        return None
-    if _tools_module._request_suppresses_external_web_search_post_call(request_kwargs):
-        return None
-    outer_for_tool_plan = (
-        None
-        if _tools_module._request_is_external_web_search_synthesis(request_kwargs)
-        else outer_request_kwargs
-    )
-    if _current_route_responses_endpoint_unsupported(
-        request_kwargs,
-        outer_for_tool_plan,
-    ):
-        return None
-    plan = plan or _responses_tools_module._responses_hosted_tool_plan(request_kwargs, outer_for_tool_plan)
-    cached_unsupported = any(
-        _routing_module._web_search_tool_unsupported_cached(request)
-        is not None
-        for request in (request_kwargs, outer_for_tool_plan)
-    )
-    native_support_decision = (
-        _request_native_responses_web_search_support_decision_for_requests(
-            request_kwargs,
-            outer_for_tool_plan,
-        )
-    )
-    if (
-        not plan.hosted_web_search
-        and not cached_unsupported
-        and native_support_decision is not False
-    ):
-        return None
-    if plan.hosted_computer:
-        return None
-    if not _request_supports_responses_function_tools(
-        request_kwargs,
-        outer_for_tool_plan,
-    ):
-        # The fallback is an ordinary function-tool declaration. If the route
-        # explicitly rejects function tools, do not advertise a capability it
-        # cannot receive; leave the hosted request on the unsupported path.
-        return None
-
-    bridged_tools, stats = _responses_tools_module._responses_external_web_search_bridge_tools(
-        request_kwargs.get("tools")
-    )
-    if bridged_tools is None:
-        return None
-
-    bridge_kwargs = request_kwargs.copy()
-    bridge_kwargs["tools"] = bridged_tools
-    bridge_kwargs.pop("web_search_options", None)
-    if "tool_choice" in bridge_kwargs:
-        bridge_kwargs["tool_choice"] = _responses_tools_module._responses_external_web_search_bridge_tool_choice(
-            bridge_kwargs.get("tool_choice")
-        )
-
-    litellm_metadata = _request_context_module._request_metadata_dict(bridge_kwargs, "litellm_metadata") or {}
-    bridge_metadata = litellm_metadata.copy()
-    bridge_metadata[_WEB_SEARCH_EXTERNAL_BRIDGE_KEY] = True
-    bridge_metadata["external_web_search_native_bridge"] = True
-    bridge_metadata["responses_external_web_search_tool_sanitized"] = stats
-    _responses_execution_module._remember_responses_chat_bridge_model_group(
-        bridge_metadata,
-        request_kwargs,
-        outer_request_kwargs,
-    )
-    bridge_kwargs["litellm_metadata"] = bridge_metadata
-    return bridge_kwargs
-
-
-def _with_responses_external_web_search_bridge(
-    request_kwargs: Optional[dict],
-    outer_request_kwargs: Optional[dict] = None,
-) -> Optional[dict]:
-    if not isinstance(request_kwargs, dict):
-        return None
-    outer_for_tool_plan = (
-        None
-        if _tools_module._request_is_external_web_search_synthesis(request_kwargs)
-        else outer_request_kwargs
-    )
-    plan = _responses_tools_module._responses_hosted_tool_plan(request_kwargs, outer_for_tool_plan)
-    if not _responses_hosted_web_search_needs_external_bridge(
-        request_kwargs,
-        outer_for_tool_plan,
-        plan=plan,
-    ):
-        return None
-    # If the route has not declared support for opaque client tools, keep a
-    # Hosted-search request containing a namespace/custom tool intact for the
-    # native attempt.  Once that route explicitly rejects the Responses shape,
-    # the error path can use the single Chat bridge to preserve both tool
-    # families.  Ordinary function tools remain eligible for the direct
-    # pi-web-access fallback.
-    client_tool_support = _request_responses_client_tool_support(
-        request_kwargs,
-        outer_for_tool_plan,
-    )
-    if (
-        client_tool_support is None
-        and plan.client_namespaces
-    ):
-        return None
-    return _responses_external_web_search_bridge_kwargs(
-        request_kwargs,
-        outer_request_kwargs,
-        plan=plan,
-    )
-
-
 def _native_responses_web_search_unsupported_error(
     exception: Exception,
     request_kwargs: Optional[dict] = None,
@@ -985,7 +778,7 @@ def _with_responses_external_web_search_bridge_after_native_error(
     request_kwargs: Optional[dict],
     outer_request_kwargs: Optional[dict] = None,
 ) -> Optional[dict]:
-    if _responses_web_search_bridge_module._request_has_provider_native_web_search_event(
+    if _web_search_native_module._request_has_provider_native_web_search_event(
         request_kwargs
     ):
         return None
@@ -999,8 +792,6 @@ def _with_responses_external_web_search_bridge_after_native_error(
         request_kwargs,
         outer_request_kwargs,
     )
-    if _tools_module._request_should_intercept_external_web_search(request_kwargs):
-        return None
     # A bare Responses 404 means the selected gateway has no Responses
     # endpoint at all; it is not evidence that only Hosted web search is
     # unavailable. Use the one Chat bridge so client namespaces and the
@@ -1042,10 +833,9 @@ def _with_responses_external_web_search_bridge_after_native_error(
                 allow_selected_marker=True,
             )
         else:
-            bridge_kwargs = _responses_external_web_search_bridge_kwargs(
-                request_kwargs,
-                outer_request_kwargs,
-            )
+            # No Chat-surface fallback applies: the Hosted declaration stays
+            # Hosted and the upstream rejection reaches the client unchanged.
+            bridge_kwargs = None
     if bridge_kwargs is None:
         return None
     bridge_metadata = _request_context_module._request_metadata_dict(
@@ -1056,56 +846,6 @@ def _with_responses_external_web_search_bridge_after_native_error(
     updated_metadata["external_web_search_native_error_fallback"] = True
     bridge_kwargs["litellm_metadata"] = updated_metadata
     return bridge_kwargs
-
-
-def _responses_external_web_search_bridge_possible(
-    request_kwargs: Optional[dict],
-    outer_request_kwargs: Optional[dict] = None,
-    *,
-    plan: Optional[HostedToolPlan] = None,
-) -> bool:
-    if not isinstance(request_kwargs, dict):
-        return False
-    if not _responses_request_module._request_is_responses_api(request_kwargs):
-        return False
-    if _tools_module._request_suppresses_external_web_search_post_call(request_kwargs):
-        return False
-    outer_for_tool_plan = (
-        None
-        if _tools_module._request_is_external_web_search_synthesis(request_kwargs)
-        else outer_request_kwargs
-    )
-    if _current_route_responses_endpoint_unsupported(
-        request_kwargs,
-        outer_for_tool_plan,
-    ):
-        return False
-    plan = plan or _responses_tools_module._responses_hosted_tool_plan(request_kwargs, outer_for_tool_plan)
-    if plan.hosted_computer:
-        return False
-    cached_unsupported = any(
-        _routing_module._web_search_tool_unsupported_cached(request)
-        is not None
-        for request in (request_kwargs, outer_for_tool_plan)
-    )
-    native_support_decision = (
-        _request_native_responses_web_search_support_decision_for_requests(
-            request_kwargs,
-            outer_for_tool_plan,
-        )
-    )
-    if (
-        not plan.hosted_web_search
-        and not cached_unsupported
-        and native_support_decision is not False
-    ):
-        return False
-    bridged_tools, _stats = _responses_tools_module._responses_external_web_search_bridge_tools(
-        request_kwargs.get("tools")
-    )
-    return bridged_tools is not None
-
-
 def _responses_chat_bridge_preemptive_reason(
     request_kwargs: Optional[dict],
     outer_request_kwargs: Optional[dict] = None,
@@ -1121,17 +861,13 @@ def _responses_chat_bridge_preemptive_reason(
         return None
     if _responses_request_module._request_is_codex_compaction(request_kwargs):
         return None
-    outer_for_tool_reason = (
-        None
-        if _tools_module._request_is_external_web_search_synthesis(request_kwargs)
-        else outer_request_kwargs
-    )
+    outer_for_tool_reason = outer_request_kwargs
     plan = plan or _responses_tools_module._responses_hosted_tool_plan(
         request_kwargs, outer_for_tool_reason
     )
     # A provider-native declaration is already valid on its own. Do not
     # mistake an OpenRouter Chat surface for a Hosted-search incompatibility
-    # and replace it with pi-web-access while capability is unknown. If the
+    # and replace it with the local search bridge while capability is unknown. If the
     # route has explicitly rejected that declaration, the error-path caller
     # opts into the local pair below.
     has_provider_native_search = any(
@@ -1209,11 +945,7 @@ def _responses_chat_bridge_preemptive_kwargs(
     if _responses_request_module._request_already_attempted_responses_chat_bridge(request_kwargs):
         return None
 
-    outer_for_tool_plan = (
-        None
-        if _tools_module._request_is_external_web_search_synthesis(request_kwargs)
-        else outer_request_kwargs
-    )
+    outer_for_tool_plan = outer_request_kwargs
     plan = _responses_tools_module._responses_hosted_tool_plan(request_kwargs, outer_for_tool_plan)
     reasoning = request_kwargs.get("reasoning")
     requested_xhigh = (
@@ -1260,9 +992,6 @@ def _responses_chat_bridge_preemptive_kwargs(
     _with_responses_chat_bridge_compatible_tools(
         bridge_kwargs,
         bridge_metadata,
-        bridge_provider_native_web_search=(
-            reason == "provider_native_web_search_unsupported"
-        ),
     )
     bridge_input, input_stats = _responses_tools_module._responses_chat_bridge_input(
         bridge_kwargs.get("input"),
@@ -1305,11 +1034,7 @@ def _responses_function_tool_bridge_preemptive_reason(
         return None
     if _responses_request_module._request_is_codex_compaction(request_kwargs):
         return None
-    outer_for_tool_reason = (
-        None
-        if _tools_module._request_is_external_web_search_synthesis(request_kwargs)
-        else outer_request_kwargs
-    )
+    outer_for_tool_reason = outer_request_kwargs
     if _current_route_responses_endpoint_unsupported(
         request_kwargs,
         outer_for_tool_reason,
@@ -1342,11 +1067,7 @@ def _responses_function_tool_bridge_preemptive_kwargs(
         return None
     if _responses_request_module._request_is_codex_compaction(request_kwargs):
         return None
-    outer_for_tool_plan = (
-        None
-        if _tools_module._request_is_external_web_search_synthesis(request_kwargs)
-        else outer_request_kwargs
-    )
+    outer_for_tool_plan = outer_request_kwargs
     # Check the selected route before honoring an inherited preemptive marker.
     # LiteLLM may reuse the original Responses kwargs for a fallback callback;
     # that marker must not force a Responses function bridge onto a Chat route.
@@ -1661,7 +1382,6 @@ def _with_preemptive_responses_chat_bridge(request_kwargs: dict) -> Optional[dic
         tool_types=_trace_module._trace_tool_types(bridge_kwargs.get("tools")),
         tool_names=_trace_module._trace_tool_names(bridge_kwargs.get("tools")),
         has_image_input=_image_inputs_module._request_has_image_input(request_kwargs),
-        external_web_search_bridge=bridge_metadata.get(_WEB_SEARCH_EXTERNAL_BRIDGE_KEY),
         reason=bridge_metadata.get(
             "responses_chat_bridge_preemptive_reason"
         ),
@@ -1794,12 +1514,6 @@ async def _ensure_responses_chat_bridge_non_empty_response(
                 retry_response,
                 retry_kwargs,
             )
-            if bridge_metadata.get(_WEB_SEARCH_EXTERNAL_BRIDGE_KEY) is True:
-                retry_response = await _responses_web_search_bridge_module._resolve_web_search_function_calls(
-                    retry_response,
-                    retry_kwargs,
-                    original_function,
-                )
         except Exception as exc:
             _trace_module._route_trace(
                 "responses_chat_bridge_empty_retry_error",

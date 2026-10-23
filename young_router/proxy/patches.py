@@ -11,7 +11,7 @@ from . import responses_request as _responses_request_module
 from . import request_context as _request_context_module
 from . import responses_execution as _responses_execution_module
 from . import responses_output as _responses_output_module
-from . import responses_web_search_bridge as _responses_web_search_bridge_module
+from . import web_search_native as _web_search_native_module
 from . import reasoning as _reasoning_module
 from . import routing as _routing_module
 from . import streaming as _streaming_module
@@ -51,6 +51,11 @@ from .base import (
 _ANTHROPIC_UNVERSIONED_ENDPOINT_PATCH_ATTR = (
     "_young_router_anthropic_unversioned_endpoint_patch"
 )
+# LiteLLM treats these top-level request keys as caller-supplied credentials and
+# pins them on whatever deployment it selects next
+# (``get_dynamic_litellm_params``); a fallback hop may only present the next
+# deployment's own params.
+_REQUEST_SCOPED_CREDENTIAL_KEYS = frozenset({"api_key"})
 _LATIN1_RESPONSE_HEADERS_PATCH_ATTR = (
     "_young_router_latin1_response_headers_patch"
 )
@@ -1044,6 +1049,62 @@ def _install_selected_deployment_marker_patch() -> None:
     Router.make_call = patched_make_call
 
 
+def _next_deployment_kwargs(kwargs: dict) -> dict:
+    """Hand the next deployment its own credentials, not the failed route's.
+
+    LiteLLM reads a top-level ``api_key`` as a caller-supplied credential and
+    pins it on every deployment it selects next (``get_dynamic_litellm_params``).
+    The kwargs that reach a fallback still carry the *failed* deployment's
+    request-scoped value, so the next hop authenticated with the previous
+    route's key: observed as the local worker's token being presented to three
+    unrelated stations, each answering HTTP 401 while its own configured key
+    was valid, and the turn ending on "upstream auth or balance".  ``api_base``
+    stays, because it is the surface adaptation this router applies per
+    deployment rather than a credential.
+    """
+
+    return {
+        key: value
+        for key, value in kwargs.items()
+        if key not in _REQUEST_SCOPED_CREDENTIAL_KEYS
+    }
+
+
+def _stream_for_a_streaming_client(response: Any, request_kwargs: dict) -> Any:
+    """Never hand LiteLLM a buffered Responses object for a streaming request.
+
+    Litellm's stream pipeline wraps whatever the route call returns and calls
+    ``__aiter__`` on it; a bridge answer that stayed buffered (observed: a
+    web-search round ending on the client's own tool call) crashed that wrapper
+    with ``'dict' object has no attribute '__aiter__'``.  The client saw a
+    broken stream and re-sent the identical turn, so the thread looked stuck.
+    The payload leaves as ordinary Responses SSE instead.
+    """
+
+    if request_kwargs.get("stream") is not True:
+        return response
+    if _responses_output_module._response_is_async_iterable(response):
+        return response
+    if not isinstance(response, dict):
+        return response
+    if "output" not in response and "output_text" not in response:
+        return response
+    # Trace the conversion: without it the only evidence a buffered answer was
+    # repaired is the absence of the crash it used to cause.
+    _trace_module._route_trace(
+        "responses_buffered_answer_streamed_for_client",
+        request_id=_routing_module._trace_request_id(request_kwargs),
+        session=_routing_module._trace_session_context(request_kwargs),
+        model_group=_responses_execution_module._request_model_group(request_kwargs),
+        response_type=type(response).__name__,
+        output_items=len(response.get("output") or []),
+    )
+    return _streaming_module._non_streaming_response_as_stream(
+        response,
+        request_kwargs,
+    )
+
+
 def _install_order_peer_failover_patch() -> None:
     try:
         from litellm.router import Router
@@ -1095,7 +1156,7 @@ def _install_order_peer_failover_patch() -> None:
                 peer_kwargs = {
                     "litellm_router": self,
                     "original_exception": e,
-                    **browser_retry_kwargs,
+                    **_next_deployment_kwargs(browser_retry_kwargs),
                 }
                 peer_kwargs.setdefault("max_fallbacks", getattr(self, "max_fallbacks", 0))
                 peer_kwargs.setdefault("fallback_depth", 0)
@@ -1132,7 +1193,7 @@ def _install_order_peer_failover_patch() -> None:
                 peer_kwargs = {
                     "litellm_router": self,
                     "original_exception": e,
-                    **kwargs,
+                    **_next_deployment_kwargs(kwargs),
                 }
                 peer_kwargs.setdefault("max_fallbacks", getattr(self, "max_fallbacks", 0))
                 peer_kwargs.setdefault("fallback_depth", 0)
@@ -1183,24 +1244,6 @@ def _install_order_peer_failover_patch() -> None:
                 decision_kwargs,
                 self,
             ):
-                if _routing_module._should_block_external_web_search_original_recovery(
-                    decision_kwargs
-                ):
-                    _trace_module._route_trace(
-                        "external_web_search_original_recovery_blocked",
-                        request_id=_routing_module._trace_request_id(kwargs),
-                        session=_routing_module._trace_session_context(kwargs),
-                        model_group=_responses_execution_module._request_model_group(kwargs)
-                        or model_group,
-                        target_order=kwargs.get("_target_order"),
-                        excluded_deployment_ids=kwargs.get("_excluded_deployment_ids"),
-                        exception=_routing_module._trace_exception(e),
-                    )
-                    failed_stream_kwargs = decision_kwargs.copy()
-                    return _routing_module._failed_responses_stream_response(
-                        failed_stream_kwargs,
-                        e,
-                    )
                 _trace_module._route_trace(
                     "route_recovery_stream_returned",
                     request_id=_routing_module._trace_request_id(kwargs),
@@ -1329,6 +1372,7 @@ def _install_generic_deployment_failover_patch() -> None:
                     # request. Treating the async iterable as a successful
                     # answer sends its refusal again as a new prompt.
                     return response
+                response = _stream_for_a_streaming_client(response, kwargs)
                 marker = _routing_module._selected_deployment_marker_from_response(
                     response
                 )
@@ -1486,6 +1530,8 @@ def _install_generic_deployment_failover_patch() -> None:
                         decision_kwargs,
                     )
                 if order_fallback_entry is not None:
+                    for _credential_key in _REQUEST_SCOPED_CREDENTIAL_KEYS:
+                        kwargs.pop(_credential_key, None)
                     kwargs.update(
                         {
                             key: value
@@ -1514,19 +1560,6 @@ def _install_generic_deployment_failover_patch() -> None:
                     not external_web_search_internal
                     and _routing_module._should_return_route_recovery_stream(exc, decision_kwargs, self)
                 ):
-                    if _routing_module._should_block_external_web_search_original_recovery(decision_kwargs):
-                        _trace_module._route_trace(
-                            "external_web_search_original_recovery_blocked",
-                            request_id=_routing_module._trace_request_id(kwargs),
-                            session=_routing_module._trace_session_context(kwargs),
-                            model_group=model,
-                            target_order=target_order,
-                            excluded_deployment_ids=kwargs.get("_excluded_deployment_ids"),
-                            exception=_routing_module._trace_exception(exc),
-                        )
-                        failed_stream_kwargs = _responses_execution_module._request_kwargs_with_model_group(model, kwargs)
-                        failed_stream_kwargs["original_generic_function"] = wrapped_original_function
-                        return _routing_module._failed_responses_stream_response(failed_stream_kwargs, exc)
                     _trace_module._route_trace(
                         "route_recovery_stream_returned",
                         request_id=_routing_module._trace_request_id(kwargs),
@@ -1856,7 +1889,7 @@ def _install_responses_completion_stream_patch() -> None:
                 self,
                 litellm_model_response,
             )
-            response = _responses_web_search_bridge_module._response_item_get(response_completed_event, "response")
+            response = _web_search_native_module._response_item_get(response_completed_event, "response")
             if response is not None:
                 _responses_output_module._strip_empty_message_items_when_structured_output_present(response)
             _normalize_response_completed_event_usage(response_completed_event)

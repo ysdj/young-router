@@ -1012,9 +1012,9 @@ class HookStreamingTimeoutTests(HookTestCase):
             "model": "balanced-chat",
             "input": [{"role": "user", "content": "Say visible."}],
             "stream": True,
-            # The summary frames below are delivered because this client asked
-            # for raw reasoning; a request without it hides them, because a
-            # provider's thinking is not the turn's answer.
+            # The summary frames below are delivered because this client named
+            # a summary to see; only an absent or off-valued one means the
+            # client wants no reasoning frames at all.
             "reasoning": {"effort": "high", "summary": "raw"},
             "model_info": {"id": "chatroute", "order": 1},
         }
@@ -1117,6 +1117,95 @@ class HookStreamingTimeoutTests(HookTestCase):
                     },
                 },
             ],
+        )
+
+    async def test_streaming_reasoning_summary_reaches_a_client_that_asked_for_auto(
+        self,
+    ) -> None:
+        """``summary: auto`` is a request to see thinking, not a private one.
+
+        pi asks exactly this way (``effort`` plus ``summary: auto``) and renders
+        a live thinking block from these frames.  Delivering them only for
+        ``raw`` dropped every thinking block such a client had asked for, while
+        the provider's unedited ``reasoning_text`` stays hidden either way.
+        """
+
+        hooks, proxy_server = load_hook_module()
+
+        class FakeRouter:
+            async def aresponses(self, **_payload):
+                raise AssertionError("an active stream must not invoke fallback")
+
+        proxy_server.llm_router = FakeRouter()
+        hook = hooks.YoungRouterHook()
+
+        async def original_stream():
+            yield {
+                "type": "response.reasoning_summary_part.added",
+                "item_id": "rs_auto",
+                "output_index": 0,
+                "summary_index": 0,
+                "part": {"type": "summary_text", "text": ""},
+            }
+            yield {
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": "rs_auto",
+                "output_index": 0,
+                "summary_index": 0,
+                "delta": "Checking the arithmetic",
+            }
+            yield {
+                "type": "response.reasoning_text.delta",
+                "item_id": "rs_auto",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "private chain of thought",
+            }
+            yield {"type": "response.output_text.delta", "delta": "391"}
+            yield {"type": "response.completed", "response": {"id": "resp-auto"}}
+
+        request_data = {
+            "model": "balanced-chat",
+            "input": [{"role": "user", "content": "What is 17*23?"}],
+            "stream": True,
+            "reasoning": {"effort": "max", "summary": "auto"},
+            "model_info": {"id": "chatroute", "order": 1},
+        }
+
+        chunks = [
+            chunk
+            async for chunk in hook.async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=original_stream(),
+                request_data=request_data,
+            )
+        ]
+
+        self.assertEqual(
+            [chunk["type"] for chunk in chunks],
+            [
+                "response.reasoning_summary_part.added",
+                "response.reasoning_summary_text.delta",
+                "response.output_text.delta",
+                "response.completed",
+            ],
+        )
+        self.assertEqual(chunks[1]["delta"], "Checking the arithmetic")
+
+        # The same frames go nowhere for a request that named no summary.
+        silent_request = dict(request_data)
+        silent_request.pop("reasoning")
+        silent_chunks = [
+            chunk
+            async for chunk in hook.async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=original_stream(),
+                request_data=silent_request,
+            )
+        ]
+        self.assertEqual(
+            [chunk["type"] for chunk in silent_chunks],
+            ["response.output_text.delta", "response.completed"],
         )
 
     async def test_streaming_error_chunk_before_content_replays_via_router(self) -> None:

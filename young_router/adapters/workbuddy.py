@@ -1,22 +1,25 @@
-"""Python adapter for the bundled ``dsh-workbuddy-connect`` worker.
+"""Python adapter for the bundled ``dsh-connect-workbuddy`` worker.
 
-WorkBuddy (CN) and WorkBuddy AI (international) are not reimplemented here.
-The upstream project (https://github.com/corrinehu/dsh-workbuddy-connect, npm
-``dsh-workbuddy-connect``) owns the desktop app credential format, the token
-refresh, both model catalogs, and the loopback shim that speaks the upstream's
-Chat Completions wire format; ``scripts/update_workbuddy_connect.py`` stages
-the published package on every artifact build.  This module owns only what the
-gateway needs around it:
+The CN gateway and the international one are not reimplemented here.  The
+upstream project (https://github.com/dingminhua/dsh-connect-workbuddy, npm
+``dsh-connect-workbuddy``) owns the desktop app credential format and its
+at-rest envelope, the token refresh, both model catalogs, and the loopback shim
+that speaks the upstream's Chat Completions wire format;
+``scripts/update_connect_workbuddy.py`` stages the published package on every
+artifact build.  This module owns only what the gateway needs around it:
 
 * one long-lived Node worker per Core process, started on a loopback port with
   an inbound bearer this process generates, supervised for as long as this
   Core runs, and
 * the two environment references the managed LiteLLM child resolves
-  (``YOUNG_ROUTER_WORKBUDDY_BASE`` / ``..._AI_BASE`` and the matching keys) so
-  no port or token ever reaches ``config.yaml``.
+  (``YOUNG_ROUTER_WORKBUDDY_BASE`` / ``..._GLOBAL_BASE`` and the matching keys)
+  so no port or token ever reaches ``config.yaml``.
 
-A signed-out desktop app is a normal state, not an error: the worker reports
-it and the provider stays disabled until the user signs in.
+The two providers are two REGIONS of one upstream product, not two variants of
+one build: the CN gateway bills in its own credit and the international one
+keeps its own, each with its own sign-in.  A signed-out desktop app is a normal
+state, not an error: the worker reports it and that provider stays disabled
+until the user signs in.
 """
 
 from __future__ import annotations
@@ -42,19 +45,19 @@ from ..browser_identity import browser_request_headers
 from ..core.persistence import PersistenceError, atomic_write_json, read_json
 
 WORKBUDDY_PROVIDER = "workbuddy"
-WORKBUDDY_AI_PROVIDER = "workbuddy-ai"
-WORKBUDDY_PROVIDERS = (WORKBUDDY_PROVIDER, WORKBUDDY_AI_PROVIDER)
+WORKBUDDY_GLOBAL_PROVIDER = "workbuddy-global"
+WORKBUDDY_PROVIDERS = (WORKBUDDY_PROVIDER, WORKBUDDY_GLOBAL_PROVIDER)
 
 WORKBUDDY_AUTH_KIND = "workbuddy_login"
-WORKBUDDY_AI_AUTH_KIND = "workbuddy_ai_login"
-WORKBUDDY_AUTH_KINDS = (WORKBUDDY_AUTH_KIND, WORKBUDDY_AI_AUTH_KIND)
+WORKBUDDY_GLOBAL_AUTH_KIND = "workbuddy_global_login"
+WORKBUDDY_AUTH_KINDS = (WORKBUDDY_AUTH_KIND, WORKBUDDY_GLOBAL_AUTH_KIND)
 AUTH_KIND_TO_PROVIDER = {
     WORKBUDDY_AUTH_KIND: WORKBUDDY_PROVIDER,
-    WORKBUDDY_AI_AUTH_KIND: WORKBUDDY_AI_PROVIDER,
+    WORKBUDDY_GLOBAL_AUTH_KIND: WORKBUDDY_GLOBAL_PROVIDER,
 }
 PROVIDER_TO_AUTH_KIND = {value: key for key, value in AUTH_KIND_TO_PROVIDER.items()}
 # The desktop catalog states what each model bills at, so a route on either
-# variant can follow that rate the way a relay group's multiplier is followed.
+# region can follow that rate the way a relay group's multiplier is followed.
 # The same catalog also states each model's context window, so a route on this
 # account has an upstream-published window the pane reports read-only.
 CATALOG_AUTH_KINDS = frozenset(WORKBUDDY_AUTH_KINDS)
@@ -64,18 +67,18 @@ RATE_AUTH_KIND_TO_PROVIDER = CATALOG_AUTH_KIND_TO_PROVIDER
 
 WORKBUDDY_DISPLAY_NAMES = {
     WORKBUDDY_PROVIDER: "WorkBuddy",
-    WORKBUDDY_AI_PROVIDER: "WorkBuddy AI",
+    WORKBUDDY_GLOBAL_PROVIDER: "WorkBuddy Global",
 }
-# Variable names the managed proxy resolves for each variant.  They are
+# Variable names the managed proxy resolves for each region.  They are
 # process-local names, never credentials: the token itself lives only in this
 # Core process and in the worker's command line.
 API_BASE_ENV = {
     WORKBUDDY_PROVIDER: "YOUNG_ROUTER_WORKBUDDY_BASE",
-    WORKBUDDY_AI_PROVIDER: "YOUNG_ROUTER_WORKBUDDY_AI_BASE",
+    WORKBUDDY_GLOBAL_PROVIDER: "YOUNG_ROUTER_WORKBUDDY_GLOBAL_BASE",
 }
 API_KEY_ENV = {
     WORKBUDDY_PROVIDER: "YOUNG_ROUTER_WORKBUDDY_KEY",
-    WORKBUDDY_AI_PROVIDER: "YOUNG_ROUTER_WORKBUDDY_AI_KEY",
+    WORKBUDDY_GLOBAL_PROVIDER: "YOUNG_ROUTER_WORKBUDDY_GLOBAL_KEY",
 }
 # Provider key slot name shown in the provider editor.  The slot exists only
 # because LiteLLM requires a non-empty key for an OpenAI-compatible route; its
@@ -163,7 +166,7 @@ def staged_root() -> Path:
     configured = os.environ.get(_WORKBUDDY_DIR_ENV, "").strip()
     if configured:
         return Path(configured).expanduser()
-    return Path(__file__).with_name("workbuddy-connect")
+    return Path(__file__).with_name("connect-workbuddy")
 
 
 def worker_path() -> Path:
@@ -251,7 +254,7 @@ class WorkBuddyRuntime:
         self._token = ""
         self._environment: dict[str, str] = {}
         self._status_cache: tuple[float, dict[str, Any]] | None = None
-        # One catalog per variant, stamped like the status cache above: a model
+        # One catalog per region, stamped like the status cache above: a model
         # pane reads this once per model switch, and the worker's own read is a
         # full credential resolve plus an upstream fetch.
         self._models_cache: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -620,7 +623,7 @@ class WorkBuddyRuntime:
         self._status_cache = (now, result)
         if refresh:
             # A refreshing status read also re-reads both catalogs upstream (the
-            # worker refreshes every variant before it answers), so an answer
+            # worker refreshes every region before it answers), so an answer
             # remembered from before this call describes a catalog the worker
             # has already replaced.  That is what makes the account's own 刷新
             # button refresh the 倍率 column beside it.
@@ -628,13 +631,13 @@ class WorkBuddyRuntime:
         return result
 
     def models(self, provider: str, *, refresh: bool = False) -> dict[str, Any]:
-        """Return one variant's catalog, with the worker's own provenance.
+        """Return one region's catalog, with the worker's own provenance.
 
         The catalog answers the 倍率 column of every route on this account, so
         it is read far more often than it changes.  A fresh remembered answer
         is returned as-is; an explicit ``refresh`` (the pane's 刷新 button, the
         account import) always reaches upstream, and so does any read whose
-        remembered answer is stale or was a failure — a signed-out variant must
+        remembered answer is stale or was a failure — a signed-out region must
         not stay signed-out in the cache once the user signs in.
         """
 
@@ -711,7 +714,7 @@ class WorkBuddyRuntime:
         _publish(self._environment)
 
     def open_desktop_app(self, provider: str) -> dict[str, Any]:
-        """Open the desktop app that owns this variant's sign-in."""
+        """Open the desktop app that owns this region's sign-in."""
 
         provider_id = validated_provider(provider)
         document = self._request(f"/control/app?provider={provider_id}", timeout=10.0)

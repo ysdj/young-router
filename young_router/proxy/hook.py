@@ -9,7 +9,7 @@ from . import request_context as _request_context_module
 from . import codex_fast_tier as _codex_fast_tier_module
 from . import responses_execution as _responses_execution_module
 from . import responses_surfaces as _responses_surfaces_module
-from . import responses_web_search_bridge as _responses_web_search_bridge_module
+from . import web_search_native as _web_search_native_module
 from . import reasoning as _reasoning_module
 from . import routing as _routing_module
 from . import state as _state_module
@@ -168,6 +168,7 @@ class YoungRouterHook(CustomLogger):
             _codex_fast_tier_module._with_codex_fast_default_service_tier,
             _reasoning_module._with_model_reasoning_mapping,
             _reasoning_module._with_model_reasoning_parameter_support,
+            _responses_request_module._with_dsh_messages_plaintext_content_restored,
             _responses_request_module._with_plaintext_agent_message_content_restored,
             _responses_request_module._with_codex_function_call_arguments_repaired,
             _responses_request_module._with_neutral_attachment_paths,
@@ -179,7 +180,6 @@ class YoungRouterHook(CustomLogger):
             _responses_request_module._with_internal_litellm_metadata,
             _responses_request_module._with_mcp_auto_approval,
             _responses_request_module._with_codex_openrouter_native_web_search_tool,
-            _responses_request_module._with_codex_external_web_search_bridge_tool,
             *_codex_contract_module.CODEX_CONTRACT_REQUEST_STEPS,
             _responses_request_module._with_empty_tool_controls_removed,
             _responses_request_module._with_codex_compaction_controls,
@@ -348,10 +348,10 @@ class YoungRouterHook(CustomLogger):
         if request_data.get("stream") is not True:
             _routing_module._record_deployment_success_for_cooldown(request_data)
         response = _image_inputs_module._sanitize_response_echoed_request_images_for_delivery(response, request_data)
-        _responses_web_search_bridge_module._mark_provider_native_web_search_event(
+        _web_search_native_module._mark_provider_native_web_search_event(
             request_data, response
         )
-        response = _responses_web_search_bridge_module._sanitize_response_stream_payload(
+        response = _web_search_native_module._sanitize_response_stream_payload(
             response,
             request_data,
         )
@@ -359,29 +359,6 @@ class YoungRouterHook(CustomLogger):
             response,
             request_data,
         )
-        if (
-            not _tools_module._request_suppresses_external_web_search_post_call(request_data)
-            and _tools_module._request_should_consume_web_search_function_call(request_data)
-            and _responses_web_search_bridge_module._has_web_search_actions_for_request(response, request_data)
-        ):
-            original_function = _responses_execution_module._responses_bridge_original_function(request_data)
-            _trace_module._route_trace(
-                "external_web_search_bridge_post_call_start",
-                request_id=_routing_module._trace_request_id(request_data),
-                session=_routing_module._trace_session_context(request_data),
-                model_group=_responses_execution_module._request_model_group(request_data),
-                deployment_id=_routing_module._deployment_id_from_request(request_data),
-                route_key=_routing_module._deployment_route_key_from_request(request_data),
-                has_original_function=original_function is not None,
-                request=_trace_module._trace_request_summary(request_data, call_type=call_type),
-                response=_trace_module._trace_response_summary(response, request_data),
-                actions=_responses_web_search_bridge_module._web_search_actions_for_request(response, request_data),
-            )
-            return await _responses_web_search_bridge_module._resolve_web_search_function_calls(
-                response,
-                request_data,
-                original_function,
-            )
         if (
             not _tools_module._request_has_image_generation_tool(request_data)
             or not _image_generation_module._response_should_trigger_image_generation_fallback(response)
@@ -517,14 +494,14 @@ class YoungRouterHook(CustomLogger):
 
         response = _image_inputs_module._sanitize_response_echoed_request_images_for_delivery(response, request_data)
         if not _responses_output_module._response_is_async_iterable(response):
-            _responses_web_search_bridge_module._mark_provider_native_web_search_event(
+            _web_search_native_module._mark_provider_native_web_search_event(
                 request_data, response
             )
         if (
             _tools_module._request_has_web_search_tool(request_data)
             and _responses_output_module._response_is_async_iterable(response)
         ):
-            response = _responses_web_search_bridge_module._adapt_provider_hidden_web_search_stream(
+            response = _web_search_native_module._adapt_provider_hidden_web_search_stream(
                 response,
                 request_data,
             )
@@ -560,10 +537,10 @@ class YoungRouterHook(CustomLogger):
 
         try:
             async for chunk in _streaming_module._stream_with_idle_timeout(response, request_data):
-                _responses_web_search_bridge_module._mark_provider_native_web_search_event(
+                _web_search_native_module._mark_provider_native_web_search_event(
                     request_data, chunk
                 )
-                sanitized_chunk = _responses_web_search_bridge_module._sanitize_web_search_stream_chunk(
+                sanitized_chunk = _web_search_native_module._sanitize_web_search_stream_chunk(
                     chunk,
                     request_data,
                 )

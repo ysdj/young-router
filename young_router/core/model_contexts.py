@@ -43,6 +43,9 @@ MODEL_CONTEXT_SOURCES = (
 )
 _PI_SOURCE = MODEL_CONTEXT_SOURCES[0]
 _CODEX_SOURCE = MODEL_CONTEXT_SOURCES[1]
+SEARCH_TOOL_CAPABILITY_NATIVE = "native"
+SEARCH_TOOL_CAPABILITY_BRIDGE = "bridge"
+SEARCH_TOOL_CAPABILITY_UNSUPPORTED = "unsupported"
 _SOURCE_PRIORITIES = {
     _PI_SOURCE: 40,
     _CODEX_SOURCE: 30,
@@ -903,47 +906,44 @@ class ModelContextRegistry:
         # never mutate the cached deployment mappings.
         return [dict(deployment) for deployment in deployments]
 
-    def search_tool_capability_for(self, public_name: str) -> bool | None:
-        """Resolve the route's hosted web-search capability for the catalog.
-
-        Mirrors the proxy's request-time rule in
-        ``responses_request._request_is_codex_gpt_responses_route``: an
-        explicit false capability on any deployment wins; an official OpenAI
-        origin or provider keeps native search; a GPT-family public model
-        defaults to native search when the capability is unknown.  Returns
-        None when no route configuration is readable, leaving the inherited
-        native profile untouched.
-        """
+    def search_tool_capability_for(self, public_name: str) -> str | None:
+        """Resolve how this public model can search the web."""
 
         deployments = self._load_route_deployments(public_name)
         if not deployments:
             return None
-        explicit_false = False
-        identified = False
+        native_search_possible = False
+        function_bridge_possible = False
         for deployment in deployments:
             params = deployment.get("litellm_params")
             if not isinstance(params, Mapping):
                 continue
             info = deployment.get("model_info")
-            if isinstance(info, Mapping):
-                for key in ("supports_responses_web_search", "supports_web_search"):
-                    if info.get(key) is False:
-                        explicit_false = True
+            info = info if isinstance(info, Mapping) else {}
+            explicit_native_false = any(
+                info.get(key) is False
+                for key in ("supports_responses_web_search", "supports_web_search")
+            )
             provider = params.get("custom_llm_provider")
-            if isinstance(provider, str) and provider.strip().casefold() in {
-                "openai",
-                "chatgpt",
-            }:
-                identified = True
-            if _api_base_host(params.get("api_base")) == "api.openai.com":
-                identified = True
-        if explicit_false:
-            return False
-        if identified:
-            return True
-        if gpt_family_model_name(public_name):
-            return True
-        return False
+            identified_native_route = (
+                isinstance(provider, str)
+                and provider.strip().casefold() in {"openai", "chatgpt"}
+            ) or _api_base_host(params.get("api_base")) == "api.openai.com"
+            if (
+                not explicit_native_false
+                and (
+                    identified_native_route
+                    or gpt_family_model_name(public_name)
+                )
+            ):
+                native_search_possible = True
+            if info.get("supports_responses_function_tools") is not False:
+                function_bridge_possible = True
+        if native_search_possible:
+            return SEARCH_TOOL_CAPABILITY_NATIVE
+        if function_bridge_possible:
+            return SEARCH_TOOL_CAPABILITY_BRIDGE
+        return SEARCH_TOOL_CAPABILITY_UNSUPPORTED
 
     def _load_route_model_ids(self, public_name: str) -> list[str]:
         if self.runtime_config_path is None:
@@ -1199,6 +1199,9 @@ __all__ = [
     "PREVIOUS_MODEL_CONTEXT_CACHE_FILE_NAMES",
     "ModelContextRegistry",
     "ReasoningCapability",
+    "SEARCH_TOOL_CAPABILITY_BRIDGE",
+    "SEARCH_TOOL_CAPABILITY_NATIVE",
+    "SEARCH_TOOL_CAPABILITY_UNSUPPORTED",
     "UNKNOWN_MODEL_CONTEXT_WINDOW",
     "default_context_cache_path",
     "gpt_family_model_name",

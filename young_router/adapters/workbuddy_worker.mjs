@@ -1,39 +1,43 @@
 #!/usr/bin/env node
 /**
- * Node worker that drives the third-party ``dsh-workbuddy-connect`` package.
+ * Node worker that drives the third-party ``dsh-connect-workbuddy`` package.
  *
- * The upstream project (https://github.com/corrinehu/dsh-workbuddy-connect,
- * npm ``dsh-workbuddy-connect``) already owns the WorkBuddy product knowledge:
- * the desktop app credential file and its at-rest envelope, the token refresh,
- * the model catalog for both the CN and the international endpoint, and the
- * loopback shim that speaks OpenAI Chat Completions to the real upstream. This
- * worker therefore adds no protocol of its own -- it starts one shim per
- * variant from the published library, exposes that library's answer on a
- * Core-owned loopback port, and adapts only the two things LiteLLM needs and
- * the plugin never produced (its caller always streams):
+ * The upstream project (https://github.com/dingminhua/dsh-connect-workbuddy,
+ * npm ``dsh-connect-workbuddy``) owns the WorkBuddy product knowledge: the
+ * desktop app credential file and its at-rest envelope, the token refresh, the
+ * model catalog for both the CN and the international gateway, and the loopback
+ * shim that speaks OpenAI Chat Completions to the real upstream.  This worker
+ * therefore adds no protocol of its own -- it starts one shim per REGION from
+ * the published library, exposes that library's answer on a Core-owned loopback
+ * port, and adapts only the two things LiteLLM needs and the plugin never
+ * produced (its caller always streams):
  *
  *   * a bearer-guarded control surface the Python Core reads (account status,
  *     live model catalog) and
  *   * a non-streaming chat answer, aggregated from the upstream SSE stream.
  *
- * The bundle is staged from npm by ``scripts/update_workbuddy_connect.py`` on
+ * A region is the library's own unit of separation: the CN gateway and the
+ * international one keep separate credentials, separate catalogs and separate
+ * credit, and its ``WORKBUDDY_PROVIDERS`` names the route id each registers.
+ *
+ * The bundle is staged from npm by ``scripts/update_connect_workbuddy.py`` on
  * every artifact build, so this file must not embed product knowledge that the
- * library publishes: no endpoint, header, model list, or credential shape.
+ * library publishes: no endpoint, header, model list, app path, or credential
+ * shape.
  *
  * Protocol (all routes require ``Authorization: Bearer <--token>``):
- *   GET  /control/status                          account state per variant
- *   GET  /control/models?provider=<id>[&refresh=1] rich catalog per variant
+ *   GET  /control/status                          account state per region
+ *   GET  /control/models?provider=<id>[&refresh=1] rich catalog per region
  *   GET  /control/app?provider=<id>            the desktop app that owns the sign-in
  *   POST /control/shutdown                        stop the listener
- *   GET  /<variant-id>/v1/models                  OpenAI model list
- *   POST /<variant-id>/v1/chat/completions        OpenAI chat completions
+ *   GET  /<provider-id>/v1/models                 OpenAI model list
+ *   POST /<provider-id>/v1/chat/completions       OpenAI chat completions
  *
  * @module young_router/workbuddy_worker
  */
 
 import { createServer } from 'node:http'
 import { existsSync, mkdirSync } from 'node:fs'
-import { readdir } from 'node:fs/promises'
 import { pathToFileURL } from 'node:url'
 import { basename, dirname, join, resolve } from 'node:path'
 import { Readable } from 'node:stream'
@@ -65,105 +69,99 @@ function usage() {
 }
 
 /**
- * The library's own factory for one variant's desktop-key helper.
+ * The at-rest key provider this build resolves on its own.
  *
- * A 5.6-era desktop app seals its token fields, so a credential can only be
- * read through that product's own Electron binary.  The store resolves it
- * through this factory, which the package builds internally and never
- * re-exports from its entry point: `atRestKeyProviderFor` lives in the shared
- * internal chunk beside `index.js`.  Building the store without it (the store's
- * own default) leaves `discovery` at `none`, and every encrypted credential
- * then reads as signed-out with `electron-binary-unavailable` however well the
- * user is signed in.
+ * `dsh-connect-workbuddy` reads the sealed desktop credential through the key
+ * the installed app hands out, and it locates that app itself: the region's
+ * Electron bundle is probed by `workbuddyAppExecutableCandidates`, confirmed
+ * by `isWorkbuddyBundle`, and only then run as plain Node to ask its native
+ * binding for the payload.  Nothing here has to inject a key provider, so a
+ * build that cannot find the app reports `WORKBUDDY_ENCRYPTED_CREDENTIAL`
+ * rather than reading as signed out — see `describeCredential`.
  *
- * So the factory is looked up by name in those sibling chunks.  A release that
- * renames or relocates it yields `undefined`, which the caller reports as a
- * diagnosis instead of guessing a binary path here -- resolving which app is
- * installed stays the library's product knowledge, never this file's.
- *
- * @param entry Absolute path of the library entry point the worker loaded.
- * @param library The already-imported entry point, checked first.
- * @returns The factory, or `undefined` when this build does not publish one.
+ * The variable is listed here only so this worker can pass one through when
+ * the host resolves a non-standard install location.
  */
-async function loadAtRestKeyProviderFactory(entry, library) {
-  // A release that starts publishing the factory from its entry point is
-  // answered first; the sibling scan below exists only for the builds that do
-  // not, so promoting it upstream costs nothing here.
-  for (const value of Object.values(library ?? {})) {
-    if (typeof value === 'function' && value.name === 'atRestKeyProviderFor') return value
-  }
-  const directory = resolve(dirname(entry))
-  let names
-  try {
-    names = await readdir(directory)
-  } catch {
-    return undefined
-  }
-  for (const name of names.sort()) {
-    if (!name.endsWith('.js') || name === basename(entry) || name === 'client.js') continue
-    let module
-    try {
-      module = await import(pathToFileURL(join(directory, name)).href)
-    } catch {
-      // A chunk the worker cannot import is not the one holding the factory;
-      // the entry point or the package itself reports a real load failure.
-      continue
-    }
-    for (const value of Object.values(module)) {
-      if (typeof value === 'function' && value.name === 'atRestKeyProviderFor') return value
-    }
-  }
-  return undefined
-}
+const APP_EXECUTABLE_ENV = 'WORKBUDDY_APP_EXECUTABLE'
 
 /**
- * The installed desktop app that owns one variant's sign-in, when this
- * machine provably has it.
+ * The desktop app that owns one region's sign-in, when it is installed.
  *
- * The library's own `installedAppVersion` reads the international App alone:
- * its signature takes no variant, so asking it about the CN product answered
- * with the *international* bundle.  The host opens whatever bundle it is given
- * (the Core runs `open <bundle>`), so that defect sent a WorkBuddy account's
- * 去登录 to the WorkBuddy AI app -- one product opened for the other's account.
+ * The host needs this only to open the right app for a signed-out card.  The
+ * product paths are the library's: `workbuddyAppExecutableCandidates` publishes
+ * every bundle the desktop build may be installed as, in its own documented
+ * probe order, and `WORKBUDDY_REGIONS` names the two regions — the CN product
+ * first, the international one second.  Reading the two lists together is what
+ * keeps one region's card from opening the other region's app, which is the
+ * defect that shipped when a single-argument lookup answered for both.
  *
- * The variant descriptor publishes each product's own macOS Electron path, and
- * `X.app/Contents/MacOS/Electron` puts the bundle three levels up. A bundle is
- * reported only once its `Info.plist` is actually there, so an app that lives
- * elsewhere yields nothing here and the host falls back to opening the app by
- * the name the descriptor states.  Windows and Linux state no verified layout,
- * matching the library's own discipline: the path is never guessed.
+ * `WORKBUDDY_APP_EXECUTABLE` pins one binary when the app lives somewhere the
+ * probe does not look.  The library reads the same variable when it goes after
+ * the app's at-rest key, so a pinned install is the one it opens too.
  *
- * @returns `{bundle, version}`; `version` only when the plist states one.
+ * @returns `{executable, bundle}`; `bundle` only on macOS, where the value is
+ *   `X.app/Contents/MacOS/<product>` and the bundle sits three levels up.
  */
-async function installedDesktopApp(library, variant) {
-  const electronPath = variant.electron?.macOS?.defaultPath
-  if (typeof electronPath !== 'string' || electronPath === '' || process.platform !== 'darwin') return undefined
-  // `X.app/Contents/MacOS/Electron` -- the bundle is three levels above the
-  // binary the descriptor names.
-  const bundle = dirname(dirname(dirname(electronPath)))
-  const plist = join(bundle, 'Contents', 'Info.plist')
+/**
+ * The installed app's own name, read from the path that was found.
+ *
+ * macOS names an app by its bundle (`WorkBuddy AI.app` -> `WorkBuddy AI`); the
+ * other platforms name it by the directory the executable sits in
+ * (`...\\WorkBuddy\\WorkBuddy.exe` -> `WorkBuddy`).
+ */
+function desktopAppName(installed) {
+  if (installed === undefined) return undefined
+  if (installed.bundle !== undefined) {
+    const name = basename(installed.bundle)
+    return name.endsWith('.app') ? name.slice(0, -4) : name
+  }
+  const executable = installed.executable
+  if (typeof executable !== 'string' || executable === '') return undefined
+  const directory = basename(dirname(executable))
+  return directory === '' || directory === '.' ? undefined : directory
+}
+
+function installedDesktopApp(library, region) {
+  // The library publishes the desktop bundles in a documented probe order and
+  // names the two regions in the same order, so the pairing is read from those
+  // two lists rather than from an app name written here.  A pinned
+  // WORKBUDDY_APP_EXECUTABLE leads the list, which is why the CN slot is taken
+  // from it when it is set: the user pointed at one product, and that product
+  // is the domestic build the variable documents.
+  const pinned = (process.env[APP_EXECUTABLE_ENV] ?? '').trim()
+  const candidates = library.workbuddyAppExecutableCandidates()
+  const index = library.WORKBUDDY_REGIONS.indexOf(region)
+  const executable = pinned !== '' ? pinned : candidates[index]
+  if (typeof executable !== 'string' || executable === '') return undefined
   try {
-    if (!existsSync(plist)) return undefined
+    if (!existsSync(executable)) return undefined
   } catch {
     return undefined
   }
-  // The version rides along when the plist states one; the bundle alone still
-  // names the app, so an unparseable version is not a reason to withhold it.
-  const version = await library.readBundleVersion(plist).catch(() => undefined)
-  return version === undefined ? { bundle } : { bundle, version }
+  if (process.platform !== 'darwin') return { executable }
+  // `X.app/Contents/MacOS/<product>` puts the bundle three levels up; it is
+  // reported only once its Info.plist is really there, so a path that is not a
+  // bundle yields no bundle rather than a guessed one.
+  const bundle = dirname(dirname(dirname(executable)))
+  try {
+    if (!existsSync(join(bundle, 'Contents', 'Info.plist'))) return { executable }
+  } catch {
+    return { executable }
+  }
+  return { executable, bundle }
 }
 
 /** Load the staged third-party library (or a developer-supplied entry). */
 async function loadLibrary(entry) {
   const configured = process.env.YOUNG_ROUTER_WORKBUDDY_ENTRY ?? ''
-  const candidate = entry || configured || join(dirname(pathToFileURL(import.meta.url).pathname), 'workbuddy-connect', 'index.js')
+  const candidate = entry || configured || join(dirname(pathToFileURL(import.meta.url).pathname), 'connect-workbuddy', 'index.js')
   const resolved = resolve(candidate)
   try {
     return { library: await import(pathToFileURL(resolved).href), entry: resolved }
   } catch (error) {
     // A development checkout may have the package on its own module path.
     if (process.env.YOUNG_ROUTER_WORKBUDDY_ENTRY || entry) throw error
-    return { library: await import('dsh-workbuddy-connect'), entry: 'dsh-workbuddy-connect' }
+    return { library: await import('dsh-connect-workbuddy'), entry: 'dsh-connect-workbuddy' }
   }
 }
 
@@ -286,31 +284,41 @@ async function aggregateStream(response, model) {
   }
 }
 
-/** One WorkBuddy variant: the library's store, catalog, and shim. */
-class VariantRuntime {
-  constructor(id, variant, library, root, keyProvider) {
-    this.id = id
-    this.variant = variant
+/**
+ * One WorkBuddy region: the library's store, catalog, and shim.
+ *
+ * A region is the library's own unit — `WORKBUDDY_REGIONS` names the two
+ * upstreams and `WORKBUDDY_PROVIDERS` maps each to the route id it registers.
+ * The CN and the international gateway keep separate credentials, separate
+ * catalogs and separate credit, so each gets its own store, catalog and shim
+ * exactly as the library intends; nothing here merges them.
+ */
+class RegionRuntime {
+  constructor(region, library, root) {
+    this.id = library.WORKBUDDY_PROVIDERS[region]
+    this.region = region
     this.library = library
     this.client = new library.WorkBuddyUpstreamClient()
+    // The store scopes itself to `region`: only credentials whose login domain
+    // maps to it are discovered, selected or refreshed, so the two regions'
+    // accounts never see each other.  It resolves the at-rest key through the
+    // installed desktop app on its own -- there is no key provider to inject.
     this.store = new library.WorkBuddyCredentialStore({
-      variant,
+      region,
       refresh: credential => this.client.refreshToken(credential),
-      ownPath: join(root, `${id}.auth.json`),
-      // Without the library's own factory the store defaults to `discovery:
-      // 'none'` and refuses every encrypted credential, so the variant reads
-      // as signed out while the desktop app is signed in.
-      ...(keyProvider === undefined ? {} : { keyProvider: keyProvider(variant) }),
+      ownPath: join(root, `${this.id}.auth.json`),
     })
-    this.catalog = new library.WorkBuddyCatalog(
-      variant.region === 'global' ? library.FALLBACK_WORKBUDDY_AI_MODELS : library.FALLBACK_WORKBUDDY_MODELS,
-    )
-    this.catalogStore = new library.WorkBuddyCatalogStore(join(root, `${id}.catalog.json`))
+    // Seeded from this region's own fallback: a region must never serve the
+    // other's roster before its first upstream read.
+    this.catalog = new library.WorkBuddyCatalog(region)
     this.shim = library.createWorkBuddyShim({
       store: this.store,
       client: this.client,
       catalog: this.catalog,
-      logger: { warn: (...args) => console.error('[warn]', this.id, ...args), error: (...args) => console.error('[error]', this.id, ...args) },
+      logger: {
+        warn: (...args) => console.error('[warn]', this.id, ...args),
+        error: (...args) => console.error('[error]', this.id, ...args),
+      },
     })
     this.source = 'builtin'
     this.fetchedAtMs = 0
@@ -318,18 +326,26 @@ class VariantRuntime {
     this.credits = null
   }
 
+  /**
+   * One region's account state.
+   *
+   * A credential that exists but cannot be decrypted is not a signed-out
+   * account: the library distinguishes them so the UI can say "point the
+   * plugin at the app" instead of "sign in again", which cannot help.  The
+   * reason travels verbatim to the caller that renders it.
+   */
   async status() {
     let status
     try {
       status = await this.store.status()
     } catch (error) {
-      status = { state: 'signed-out', reason: String(error) }
+      status = { state: 'signed-out', reason: String(error?.message ?? error) }
     }
     return {
       ...status,
       provider: this.id,
-      displayName: this.variant.displayName,
-      appName: this.variant.appName,
+      region: this.region,
+      displayName: this.library.WORKBUDDY_PROVIDER_DISPLAY_NAMES[this.region],
       catalogSource: this.source,
       catalogFetchedAtMs: this.fetchedAtMs || undefined,
       catalogError: this.catalogError || undefined,
@@ -338,31 +354,19 @@ class VariantRuntime {
     }
   }
 
-  /** Resolve the credential, then refresh the variant's catalog. */
+  /** Resolve this region's credential, then refresh its catalog. */
   async refresh({ withCredits = true } = {}) {
     const credential = await this.store.resolve()
-    this.catalog.setVisible(true)
+    this.catalog.setRegionUsable(true)
     try {
       const models = await this.client.fetchModels(credential)
       this.catalog.set(models)
       this.source = 'live'
       this.fetchedAtMs = Date.now()
       this.catalogError = ''
-      this.catalogStore.set(accountOf(credential), {
-        source: 'live',
-        fetchedAtMs: this.fetchedAtMs,
-        models: [...models],
-      })
     } catch (error) {
-      const saved = this.catalogStore.get(accountOf(credential))
-      if (saved && Array.isArray(saved.models) && saved.models.length > 0) {
-        this.catalog.set(saved.models)
-        this.source = 'saved'
-        this.fetchedAtMs = saved.fetchedAtMs ?? 0
-      } else {
-        this.source = 'builtin'
-        this.fetchedAtMs = 0
-      }
+      this.source = 'builtin'
+      this.fetchedAtMs = 0
       this.catalogError = String(error?.message ?? error)
     }
     if (withCredits) {
@@ -381,7 +385,9 @@ class VariantRuntime {
       await this.refresh({ withCredits: false })
       return { state: 'ready' }
     } catch (error) {
-      this.catalog.setVisible(false)
+      // "This region has no sign-in" is a state the catalog states on its own,
+      // so it is recorded rather than guessed from a blanked list.
+      this.catalog.setRegionUsable(false)
       this.source = 'none'
       this.catalogError = String(error?.message ?? error)
       return { state: 'signed-out', reason: this.catalogError }
@@ -389,11 +395,11 @@ class VariantRuntime {
   }
 
   /** Forward one OpenAI request to the library's shim. */
-  async forward(req, res, url, variantPath) {
+  async forward(req, res, url, providerPath) {
     const chunks = []
     for await (const chunk of req) chunks.push(chunk)
     const body = Buffer.concat(chunks)
-    const target = `${this.shim.baseUrl()}${url.pathname.slice(variantPath.length) || '/'}${url.search}`
+    const target = `${this.shim.baseUrl()}${url.pathname.slice(providerPath.length) || '/'}${url.search}`
     const upstream = await fetch(target, {
       method: req.method,
       headers: { 'content-type': 'application/json', authorization: `Bearer ${this.shim.token()}` },
@@ -458,10 +464,6 @@ class VariantRuntime {
   }
 }
 
-function accountOf(credential) {
-  return `${credential.uid ?? ''}:${credential.enterpriseId ?? ''}`
-}
-
 function streamRequested(body) {
   try {
     const parsed = JSON.parse(body.toString('utf8') || '{}')
@@ -486,19 +488,16 @@ async function main() {
   mkdirSync(root, { recursive: true, mode: 0o700 })
 
   const { library, entry } = await loadLibrary(options.entry)
-  // Read before the runtimes below build their stores: it is what lets a
-  // sealed desktop credential be opened at all.
-  const keyProviderFactory = await loadAtRestKeyProviderFactory(entry, library)
-  if (keyProviderFactory === undefined) {
-    process.stderr.write(
-      '[warn] workbuddy: this dsh-workbuddy-connect build publishes no at-rest key provider; '
-      + 'an encrypted desktop credential will read as signed out\n',
-    )
+  // A pinned binary is how a non-standard install is reported to the library,
+  // which reads the same variable when it goes looking for the app's key.
+  const pinnedApp = process.env[APP_EXECUTABLE_ENV] ?? ''
+  if (pinnedApp !== '' && !existsSync(pinnedApp)) {
+    process.stderr.write(`[warn] workbuddy: ${APP_EXECUTABLE_ENV} names no file: ${pinnedApp}\n`)
   }
   const runtimes = new Map()
-  for (const variant of library.WORKBUDDY_VARIANTS) {
-    const runtime = new VariantRuntime(variant.id, variant, library, root, keyProviderFactory)
-    runtimes.set(variant.id, runtime)
+  for (const region of library.WORKBUDDY_REGIONS) {
+    const runtime = new RegionRuntime(region, library, root)
+    runtimes.set(runtime.id, runtime)
   }
   for (const runtime of runtimes.values()) await runtime.shim.ready
 
@@ -532,7 +531,7 @@ async function main() {
           try {
             await runtime.refresh({ withCredits: true })
           } catch {
-            // A signed-out variant is reported by status() below.
+            // A signed-out region is reported by status() below.
           }
         }
         status[id] = await runtime.status()
@@ -581,33 +580,36 @@ async function main() {
       return
     }
     if (req.method === 'GET' && url.pathname === '/control/app') {
-      // The account signs in through the desktop app, so the host needs to
-      // know which app that is: this product's own bundle, from the descriptor
-      // the library publishes, and its name either way.  The descriptor is the
-      // one source of product identity -- this file embeds no product
-      // knowledge, so a third product would be a data change upstream.
+      // A signed-out card offers to open the app that owns the sign-in, so the
+      // host needs to know which one that is.  The library both names the
+      // product and finds its installed binary; this file carries neither.
       const id = url.searchParams.get('provider') ?? ''
-      const variant = library.WORKBUDDY_VARIANTS.find(candidate => candidate.id === id)
-      if (!variant) {
+      const runtime = runtimes.get(id)
+      if (runtime === undefined) {
         json(res, 404, { error: { message: `unknown provider: ${id}`, type: 'not_found' } })
         return
       }
-      let bundle
-      let version
+      let installed
       try {
-        const installed = await installedDesktopApp(library, variant)
-        bundle = installed?.bundle
-        version = installed?.version
+        installed = installedDesktopApp(library, runtime.region)
       } catch {
-        // An older library build does not report an app path; the name below
-        // still lets the host ask the platform to open the app.
-        bundle = undefined
+        // No probe answer: the region's display name below still lets the host
+        // offer the button rather than not offering it at all.
+        installed = undefined
       }
+      // The name reported is the app that will actually open, not the region's
+      // label.  The host falls back to `open -a <name>` when it has no bundle,
+      // and that call only succeeds against the app's real name -- reporting
+      // "WorkBuddy Global" would open nothing, because the installed app is
+      // named "WorkBuddy AI".  Derived from the path the library found, so this
+      // file still embeds no product knowledge; the region label stays in
+      // `/control/status` where it names the provider, not an application.
+      const appName = desktopAppName(installed)
+        ?? library.WORKBUDDY_PROVIDER_DISPLAY_NAMES[runtime.region]
       json(res, 200, {
         provider: id,
-        appName: variant.appName,
-        ...(bundle === undefined ? {} : { bundle }),
-        ...(version === undefined ? {} : { version }),
+        appName,
+        ...(installed?.bundle === undefined ? {} : { bundle: installed.bundle }),
       })
       return
     }
@@ -638,7 +640,7 @@ async function main() {
     })
   })
   for (const runtime of runtimes.values()) {
-    // A signed-out variant must not answer with a stale roster, and a warm
+    // A signed-out region must not answer with a stale roster, and a warm
     // fetch keeps `/v1/models` honest as soon as the gateway asks for it.
     void runtime.warm().catch(error => console.error('[warm]', runtime.id, String(error?.message ?? error)))
   }

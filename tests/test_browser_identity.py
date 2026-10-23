@@ -15,12 +15,9 @@ drive the data-plane hook and the relay client.
 
 from __future__ import annotations
 
-import asyncio
-import importlib.util
 import json
 from pathlib import Path
 import re
-import tempfile
 import unittest
 
 from young_router import browser_identity
@@ -146,7 +143,6 @@ class BrowserIdentityLiteralTests(unittest.TestCase):
         self.assertEqual("1", headers["X-Trace"])
         self.assertEqual(browser_identity.BROWSER_ACCEPT_LANGUAGE, headers["Accept-Language"])
         self.assertTrue(browser_identity.is_self_identifying_user_agent("Young Router/1 CFNetwork/3860.600.21"))
-        self.assertTrue(browser_identity.is_self_identifying_user_agent("pi-web-access"))
         self.assertFalse(browser_identity.is_self_identifying_user_agent("codex-local/1.2.3"))
         self.assertFalse(browser_identity.is_self_identifying_user_agent(browser_identity.browser_user_agent()))
         self.assertEqual(
@@ -282,46 +278,6 @@ class DataPlaneUserAgentTests(unittest.TestCase):
             "            _responses_request_module._with_owned_user_agent_header,\n",
             hook_source,
         )
-
-
-class PiWebAccessStagingTests(unittest.TestCase):
-    @staticmethod
-    def _staging_module():
-        spec = importlib.util.spec_from_file_location(
-            "update_pi_web_access", ROOT / "scripts" / "update_pi_web_access.py"
-        )
-        module = importlib.util.module_from_spec(spec)
-        assert spec.loader is not None
-        spec.loader.exec_module(module)
-        return module
-
-    def test_staged_package_loses_its_self_naming_user_agents(self) -> None:
-        module = self._staging_module()
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "dist").mkdir()
-            (root / "dist" / "index.js").write_text(
-                'const REST_HEADERS = { "User-Agent": "pi-web-access" };\n'
-                'const USER_AGENT = "Mozilla/5.0 (compatible; pi-web-access/1.0; +https://example.test)";\n'
-                'headers: { "user-agent": "pi-web-access" },\n'
-                'other: { "User-Agent": "codex-local/1.2.3" },\n',
-                encoding="utf-8",
-            )
-            rewritten = module._normalize_staged_user_agents(root)
-            self.assertEqual(3, rewritten)
-            staged = (root / "dist" / "index.js").read_text(encoding="utf-8")
-            self.assertNotIn("pi-web-access\"", staged)
-            self.assertNotIn("pi-web-access/1.0", staged)
-            self.assertEqual(3, staged.count(module._browser_user_agent()))
-            self.assertIn('"User-Agent": "codex-local/1.2.3"', staged)
-
-    def test_staging_fails_when_upstream_drops_the_literals(self) -> None:
-        module = self._staging_module()
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "index.js").write_text('const UA = "Mozilla/5.0";\n', encoding="utf-8")
-            with self.assertRaisesRegex(module.UpdateError, "self-naming User-Agent literals"):
-                module._normalize_staged_user_agents(root)
 
 
 if __name__ == "__main__":

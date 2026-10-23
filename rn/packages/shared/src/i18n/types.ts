@@ -641,7 +641,7 @@ export type TranslationKey =
   | "providers.serviceLinks"
   | "providers.serviceKeyHint"
   | "providers.type.workbuddy"
-  | "providers.type.workbuddyAI"
+  | "providers.type.workbuddyGlobal"
   | "providers.type.ourFreeModel"
   | "providers.type.ourFreeModelKilo"
   | "providers.type.ourFreeModelEAC"

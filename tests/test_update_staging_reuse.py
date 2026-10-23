@@ -31,13 +31,13 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 update_common = importlib.import_module("update_common")
-pi_web_access = importlib.import_module("update_pi_web_access")
-workbuddy_connect = importlib.import_module("update_workbuddy_connect")
+node_runtime = importlib.import_module("update_node_runtime")
+workbuddy_connect = importlib.import_module("update_connect_workbuddy")
 our_free_model = importlib.import_module("update_our_free_model")
 dsh_vision_router = importlib.import_module("update_dsh_vision_router")
 
 
-PACKAGE = "dsh-workbuddy-connect"
+PACKAGE = "dsh-connect-workbuddy"
 VERSION = "1.2.3"
 INTEGRITY = "sha512-abc123"
 
@@ -249,6 +249,151 @@ class NpmPeerSpecTransportTests(unittest.TestCase):
         self.assertEqual(manifest["dependencies"]["@deepseek-ai/cordis"], "^4.0.2")
 
 
+class DeprecatedReleaseTests(unittest.TestCase):
+    """A withdrawn release is a failed build, never a packaged one.
+
+    ``dsh-workbuddy-connect`` was withdrawn this way: npm kept serving the
+    tarball and ``npm install`` still exited 0, so a build that only checked
+    the exit status packaged a frozen package and reported success.  The
+    registry's ``deprecated`` notice is the only place that withdrawal is
+    visible, so the resolution step must refuse it.
+    """
+
+    def _metadata(self, **overrides):
+        payload = {
+            "dist-tags": {"latest": "0.7.9"},
+            "versions": {
+                "0.7.9": {
+                    "name": PACKAGE,
+                    "version": "0.7.9",
+                    "dist": {"tarball": "https://registry.invalid/pkg.tgz"},
+                }
+            },
+        }
+        version = payload["versions"]["0.7.9"]
+        version.update(overrides)
+        return payload
+
+    def _resolve(self, payload):
+        with mock.patch.object(
+            update_common, "request_json", lambda *a, **k: payload
+        ):
+            return update_common.package_metadata(
+                "https://registry.invalid/pkg",
+                package_name=PACKAGE,
+                timeout=5,
+                user_agent="test",
+            )
+
+    def test_a_deprecated_latest_is_refused(self) -> None:
+        payload = self._metadata(
+            deprecated="因个人精力有限，本项目已停止维护，不再提供更新和支持。"
+        )
+        with self.assertRaises(update_common.UpdateError) as raised:
+            self._resolve(payload)
+        # The notice travels into the failure, so the build says why it stopped
+        # instead of only that it did.
+        self.assertIn("deprecated", str(raised.exception))
+        self.assertIn("停止维护", str(raised.exception))
+
+    def test_an_undeprecated_latest_still_resolves(self) -> None:
+        version, tarball, _ = self._resolve(self._metadata())
+        self.assertEqual(version, "0.7.9")
+        self.assertEqual(tarball, "https://registry.invalid/pkg.tgz")
+
+    def test_an_empty_or_false_notice_is_not_a_withdrawal(self) -> None:
+        # npm writes ``""`` on some republishes and ``false`` when a notice is
+        # lifted; neither may fail the build.
+        for value in ("", False, None):
+            with self.subTest(value=value):
+                version, _, _ = self._resolve(self._metadata(deprecated=value))
+                self.assertEqual(version, "0.7.9")
+
+    def test_the_workbuddy_stager_resolves_through_this_guard(self) -> None:
+        # The guard only protects a build if every stager uses it: this one
+        # resolves through ``package_metadata`` rather than reading the
+        # registry itself.
+        source = (SCRIPTS / "update_connect_workbuddy.py").read_text(encoding="utf-8")
+        self.assertIn("package_metadata(", source)
+        self.assertIn("PACKAGE_NAME = \"dsh-connect-workbuddy\"", source)
+
+
+class ScopedPeerMergeTests(unittest.TestCase):
+    """A nested dependency must never erase its scope-mates.
+
+    npm nests a dependency under the package when the flat tree carries
+    another version of it.  ``flatten_npm_package`` copies the package first,
+    so the merge that follows meets an ``@scope`` directory that already
+    exists -- and skipping the whole of it because one name was nested dropped
+    every sibling peer.  ``cosmokit`` vanished with ``schemastery`` that way and
+    the staged tree could not be imported at all.
+    """
+
+    def setUp(self) -> None:
+        self.directory = Path(tempfile.mkdtemp(prefix="young-router-scope-test-"))
+        self.addCleanup(lambda: shutil.rmtree(self.directory, ignore_errors=True))
+        self.npm_root = self.directory / "npm"
+        self.package_root = self.npm_root / "node_modules" / PACKAGE
+        (self.package_root / "lib").mkdir(parents=True)
+        (self.package_root / "lib/index.js").write_text("export const x = 1\n", encoding="utf-8")
+        (self.package_root / "package.json").write_text(
+            json.dumps({"name": PACKAGE, "version": VERSION}), encoding="utf-8"
+        )
+
+    def _peer(self, relative: str, body: str = "export const y = 1\n") -> Path:
+        path = self.npm_root / "node_modules" / relative
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "index.js").write_text(body, encoding="utf-8")
+        return path
+
+    def _nested(self, relative: str, body: str) -> None:
+        path = self.package_root / "node_modules" / relative
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "index.js").write_text(body, encoding="utf-8")
+
+    def test_a_scoped_peer_survives_a_nested_sibling(self) -> None:
+        # The store's own nested copy wins for the name it carries...
+        self._nested("@scope/versioned", "nested\n")
+        # ...and every other peer in the same scope is still merged in.
+        self._peer("@scope/versioned", "flat\n")
+        self._peer("@scope/sibling", "sibling\n")
+        self._peer("@scope/deep", "deep\n")
+
+        destination = self.directory / "out"
+        update_common.flatten_npm_package(
+            self.npm_root,
+            destination,
+            package_name=PACKAGE,
+            required_files=("package.json", "lib/index.js"),
+            required_peer_dirs=("@scope/sibling",),
+        )
+
+        staged = destination / "node_modules"
+        # The nested copy is the one the package resolved against.
+        self.assertEqual((staged / "@scope/versioned/index.js").read_text(encoding="utf-8"), "nested\n")
+        # The siblings are present: this is the assertion that fails when the
+        # merge skips the whole scope.
+        self.assertTrue((staged / "@scope/sibling/index.js").is_file())
+        self.assertTrue((staged / "@scope/deep/index.js").is_file())
+
+    def test_an_unscoped_nested_copy_still_wins(self) -> None:
+        self._nested("plain", "nested\n")
+        self._peer("plain", "flat\n")
+
+        destination = self.directory / "out"
+        update_common.flatten_npm_package(
+            self.npm_root,
+            destination,
+            package_name=PACKAGE,
+            required_files=("package.json", "lib/index.js"),
+        )
+
+        self.assertEqual(
+            (destination / "node_modules/plain/index.js").read_text(encoding="utf-8"),
+            "nested\n",
+        )
+
+
 class StagedEntrySpecifierTests(unittest.TestCase):
     """A staged ESM entry is imported by URL, not by filesystem path.
 
@@ -311,71 +456,7 @@ class StagedEntrySpecifierTests(unittest.TestCase):
         self.assertNotRegex(argument, r"^[A-Za-z]:[\\/]", argument)
 
 
-class PiWebAccessReuseTests(unittest.TestCase):
-    """The pi-web-access staging also imposes the shared browser identity."""
-
-    def setUp(self) -> None:
-        self.directory = Path(tempfile.mkdtemp(prefix="young-router-pi-reuse-test-"))
-        self.addCleanup(lambda: __import__("shutil").rmtree(self.directory, ignore_errors=True))
-        self.user_agent = pi_web_access._browser_user_agent()
-
-    def write_source(self, name: str, text: str) -> None:
-        (self.directory / name).write_text(text, encoding="utf-8")
-
-    def stage_rewritten(self) -> None:
-        (self.directory / "index.ts").write_text("export const x = 1\n", encoding="utf-8")
-        (self.directory / "package.json").write_text(
-            json.dumps({"name": "pi-web-access", "version": "0.1.0"}), encoding="utf-8"
-        )
-        self.write_source(
-            "a-request.ts",
-            json.dumps({"headers": {"user-agent": self.user_agent}}),
-        )
-        self.write_source(
-            "z-request.ts",
-            json.dumps({"headers": {"user-agent": self.user_agent}}),
-        )
-
-    def test_a_tree_with_the_shared_identity_is_reusable(self) -> None:
-        self.stage_rewritten()
-        self.assertTrue(pi_web_access._carries_the_shared_user_agent(self.directory))
-
-    def test_a_self_naming_literal_in_any_single_file_blocks_reuse(self) -> None:
-        # The scan must cover every file: an earlier version of this check
-        # returned as soon as it saw one rewritten file, so a later file that
-        # still named the package would have been waved through and shipped a
-        # self-identifying client.
-        self.stage_rewritten()
-        self.write_source(
-            "z-request.ts",
-            json.dumps({"headers": {"user-agent": "pi-web-access/9.9.9"}}),
-        )
-        self.assertFalse(pi_web_access._carries_the_shared_user_agent(self.directory))
-
-    def test_a_tree_without_the_shared_identity_is_not_reusable(self) -> None:
-        # A tree that names nobody is still not proof that this build's
-        # identity was written into it, so it is staged again rather than
-        # assumed.
-        (self.directory / "index.ts").write_text("export const x = 1\n", encoding="utf-8")
-        self.write_source("a-request.ts", json.dumps({"headers": {"accept": "*/*"}}))
-        self.assertFalse(pi_web_access._carries_the_shared_user_agent(self.directory))
-
-    def test_the_rewrite_is_what_reuse_relies_on(self) -> None:
-        # Tie the gate to the rewrite itself: whatever the rewrite produces must
-        # satisfy the check a reused tree has to pass.  Three literals because
-        # the rewrite treats fewer than three as an upstream layout change.
-        for index in range(3):
-            self.write_source(
-                f"request{index}.ts",
-                json.dumps({"headers": {"user-agent": f"pi-web-access/1.{index}"}}),
-            )
-        self.assertFalse(pi_web_access._carries_the_shared_user_agent(self.directory))
-        rewritten = pi_web_access._normalize_staged_user_agents(self.directory)
-        self.assertGreaterEqual(rewritten, 3)
-        self.assertTrue(pi_web_access._carries_the_shared_user_agent(self.directory))
-
-
-class PiWebAccessNodeStagingTests(unittest.TestCase):
+class NodeRuntimeStagingTests(unittest.TestCase):
     """The Node runtime is copied from the installed bundle without rewriting it.
 
     Every artifact build hands ``--node-source`` the Node executable the
@@ -397,7 +478,7 @@ class PiWebAccessNodeStagingTests(unittest.TestCase):
         self.source.chmod(0o755)
 
     def install(self) -> None:
-        pi_web_access._install_node(
+        node_runtime._install_node(
             self.output,
             source=str(self.source),
             index_url="https://node.invalid/index.json",

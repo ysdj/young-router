@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Shared npm-registry staging helpers for the third-party update scripts.
 
-``update_pi_web_access.py``, ``update_workbuddy_connect.py``, and
-``update_dsh_vision_router.py`` resolve an npm ``latest`` dist-tag, download the
+``update_connect_workbuddy.py`` and ``update_dsh_vision_router.py`` resolve an npm ``latest`` dist-tag, download the
 tarball, install it without touching a lockfile, and flatten the installed
 package into a Core directory.  The mechanics live here once; each script keeps
 only what is particular to its package (its peer rules and any staged rewrite).
@@ -165,6 +164,17 @@ def package_metadata(
     version_payload = versions.get(latest) if isinstance(versions, dict) else None
     if not isinstance(version_payload, dict):
         raise UpdateError(f"npm registry metadata is missing {package_name} {latest}")
+    # A deprecated release is not a usable integration surface.  npm keeps
+    # serving the tarball and npm install still exits 0, so this is the only
+    # place the withdrawal is visible: without it a build silently packages a
+    # frozen package forever.  ``dsh-workbuddy-connect`` was withdrawn exactly
+    # this way, and every one of its 32 versions carried the notice.
+    deprecated = version_payload.get("deprecated")
+    if deprecated not in (None, False, ""):
+        notice = str(deprecated).strip()
+        raise UpdateError(
+            f"npm marks {package_name} {latest} deprecated: {notice}"
+        )
     dist = version_payload.get("dist")
     tarball = dist.get("tarball") if isinstance(dist, dict) else None
     if not isinstance(tarball, str) or not tarball.startswith(("http://", "https://")):
@@ -507,6 +517,27 @@ def copy_tree(source: Path, destination: Path, *, package_name: str) -> None:
     shutil.copytree(source, destination, symlinks=True)
 
 
+def _merge_directory(source: Path, destination: Path) -> None:
+    """Copy the entries of ``source`` into ``destination``, keeping what is there.
+
+    Used for a scope directory (``@scope``), where the staged tree and the flat
+    peer closure both contribute packages and neither may erase the other.
+    A name present in both keeps the destination's copy: the package's own
+    nested dependency is the one it resolved against.
+    """
+
+    for child in source.iterdir():
+        target = destination / child.name
+        if target.exists() or target.is_symlink():
+            continue
+        if child.is_symlink():
+            target.symlink_to(os.readlink(child))
+        elif child.is_dir():
+            shutil.copytree(child, target, symlinks=True)
+        else:
+            shutil.copy2(child, target)
+
+
 def flatten_npm_package(
     npm_root: Path,
     destination: Path,
@@ -546,7 +577,20 @@ def flatten_npm_package(
         if child.name in {package_name, ".bin"}:
             continue
         target = dependency_payload / child.name
-        if target.exists() or target.is_symlink():
+        # A nested copy the package shipped itself wins: it is the one its own
+        # code resolved against.  That makes the skip a PER-PACKAGE decision,
+        # never a per-directory one -- `@scope` is a directory too, so skipping
+        # the whole of it because the package nested one `@scope/name` dropped
+        # every sibling peer in the same scope (cosmokit vanished with
+        # schemastery, and the staged tree then failed to import at all).
+        if target.is_dir() and not child.name.startswith("@") and not target.is_symlink():
+            continue
+        if target.is_symlink():
+            continue
+        if target.is_dir():
+            _merge_directory(child, target)
+            continue
+        if target.exists():
             continue
         if child.is_symlink():
             target.symlink_to(os.readlink(child))

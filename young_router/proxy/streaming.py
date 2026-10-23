@@ -12,13 +12,12 @@ from . import request_context as _request_context_module
 from . import responses_execution as _responses_execution_module
 from . import responses_output as _responses_output_module
 from . import responses_tools as _responses_tools_module
-from . import responses_web_search_bridge as _responses_web_search_bridge_module
+from . import web_search_native as _web_search_native_module
 from . import routing as _routing_module
 from . import state as _state_module
 from . import stream_continuation as _stream_continuation_module
 from . import tools as _tools_module
 from . import trace as _trace_module
-
 
 from .base import (
     Any,
@@ -43,7 +42,6 @@ from .base import (
     _STREAM_IDLE_TIMEOUT_METADATA_KEY,
     _STREAM_START_TIMEOUT_METADATA_KEY,
     _VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY,
-    _WEB_SEARCH_EXTERNAL_BRIDGE_KEY,
     _UPSTREAM_URL_SURFACE_ANTHROPIC,
     _normalize_response_completed_event_usage,
     asyncio,
@@ -56,12 +54,10 @@ from .base import (
     timezone,
 )
 
-
 _ROUTE_RECOVERY_FORCED_TARGET_ORDER_KEY = "_route_recovery_forced_target_order"
 _CODEX_USAGE_REQUEST_OVERHEAD_BYTES = 32_768
 _CODEX_USAGE_TOKENS_PER_BYTE = 1
 _USAGE_BOUND_UNSERIALIZABLE = object()
-
 
 def _route_recovery_state_key(request_data: Optional[dict]) -> str:
     request_id = _routing_module._trace_request_id(request_data)
@@ -73,7 +69,6 @@ def _route_recovery_state_key(request_data: Optional[dict]) -> str:
     if session_id:
         return f"session:{session_id}:model:{model_group}"
     return f"process:{os.getpid()}:model:{model_group}"
-
 
 def _route_recovery_state_record(
     request_data: Optional[dict],
@@ -122,7 +117,6 @@ def _route_recovery_state_record(
         record["diagnostic"] = _routing_module._recovery_diagnostic(exception)
     return record
 
-
 def _route_recovery_state_upsert(
     request_data: Optional[dict],
     exception: Optional[Exception],
@@ -151,11 +145,9 @@ def _route_recovery_state_upsert(
     _state_module._upsert_route_recovery_state(record)
     return str(record.get("key") or "")
 
-
 def _route_recovery_state_remove(key: str) -> None:
     if key:
         _state_module._remove_route_recovery_state(key)
-
 
 def _jsonable(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
@@ -179,7 +171,6 @@ def _jsonable(value: Any) -> Any:
         except Exception:
             return None
     return None
-
 
 def _usage_bound_jsonable(value: Any, *, depth: int = 0) -> Any:
     if depth > 32:
@@ -217,7 +208,6 @@ def _usage_bound_jsonable(value: Any, *, depth: int = 0) -> Any:
         return _usage_bound_jsonable(dumped, depth=depth + 1)
     return _USAGE_BOUND_UNSERIALIZABLE
 
-
 def _explicit_route_model_group(request_data: Optional[dict]) -> Optional[str]:
     route_key = _request_context_module._request_model_info(request_data).get(
         "route_key"
@@ -229,7 +219,6 @@ def _explicit_route_model_group(request_data: Optional[dict]) -> Optional[str]:
         if separator and key.strip().lower() == "model" and value.strip():
             return value.strip()
     return None
-
 
 def _codex_request_input_token_upper_bound(
     request_data: Optional[dict],
@@ -293,7 +282,6 @@ def _codex_request_input_token_upper_bound(
         payload_bytes + _CODEX_USAGE_REQUEST_OVERHEAD_BYTES
     ) * _CODEX_USAGE_TOKENS_PER_BYTE
 
-
 def _normalize_sse_response_completed_block(
     block: str,
     delimiter: str,
@@ -343,7 +331,6 @@ def _normalize_sse_response_completed_block(
             continue
         next_lines.append(line)
     return line_separator.join(next_lines) + delimiter
-
 
 def _normalize_sse_response_completed_text(
     text: str,
@@ -397,7 +384,6 @@ def _normalize_sse_response_completed_text(
         index = position + len(delimiter)
     return "".join(output)
 
-
 def _normalize_sse_response_completed_chunk(
     chunk: str | bytes,
     *,
@@ -423,14 +409,12 @@ def _normalize_sse_response_completed_chunk(
         request_data=request_data,
     )
 
-
 def _function_call_arguments_valid(value: Any) -> bool:
     normalized, valid = _responses_request_module._codex_normalized_function_arguments(
         value,
         empty_is_object=True,
     )
     return bool(valid and isinstance(normalized, str))
-
 
 def _payload_invalid_function_call_reason(payload: Any) -> Optional[str]:
     """Where a Responses event still carries function-call arguments nothing can read.
@@ -471,7 +455,6 @@ def _payload_invalid_function_call_reason(payload: Any) -> Optional[str]:
                     return "function call arguments are not a valid JSON object"
     return None
 
-
 def _responses_stream_chunk_for_delivery(
     chunk: Any,
     request_data: Optional[dict] = None,
@@ -506,7 +489,7 @@ def _responses_stream_chunk_for_delivery(
         )
         if (
             _stream_chunk_type(chunk).startswith("response.reasoning_summary_")
-            and not _responses_web_search_bridge_module._public_reasoning_is_allowed(
+            and not _web_search_native_module._public_reasoning_is_allowed(
                 request_data
             )
         ):
@@ -566,14 +549,13 @@ def _responses_stream_chunk_for_delivery(
             _stream_chunk_type(json_chunk).startswith(
                 "response.reasoning_summary_"
             )
-            and not _responses_web_search_bridge_module._public_reasoning_is_allowed(
+            and not _web_search_native_module._public_reasoning_is_allowed(
                 request_data
             )
         ):
             return None
         return _json_stream_event(json_chunk)
     return chunk
-
 
 def _normalize_response_function_call_added_arguments(payload: Any) -> None:
     if not isinstance(payload, dict) or payload.get("type") != "response.output_item.added":
@@ -586,7 +568,6 @@ def _normalize_response_function_call_added_arguments(payload: Any) -> None:
     normalized_item = item.copy()
     normalized_item["arguments"] = ""
     payload["item"] = normalized_item
-
 
 def _normalized_item_arguments(value: Any) -> Optional[str]:
     """One function call's arguments as a parseable object, or ``None``.
@@ -608,7 +589,6 @@ def _normalized_item_arguments(value: Any) -> Optional[str]:
     if closed is None:
         return None
     return json.dumps(closed, ensure_ascii=False, separators=(",", ":"))
-
 
 def _normalize_response_function_call_arguments(payload: Any) -> None:
     """Normalize function-call arguments before a Responses event is delivered."""
@@ -656,7 +636,6 @@ def _normalize_response_function_call_arguments(payload: Any) -> None:
         normalized_response["output"] = normalized_output
         payload["response"] = normalized_response
 
-
 def _stream_chunk_error_payload(chunk: Any) -> Any:
     sse_payload = _sse_stream_chunk_payload(chunk)
     if sse_payload is not None:
@@ -693,7 +672,6 @@ def _stream_chunk_error_payload(chunk: Any) -> Any:
         if isinstance(dumped, dict):
             return _stream_chunk_error_payload(dumped)
     return None
-
 
 def _stream_chunk_error_exception(chunk: Any) -> Optional[Exception]:
     error = _stream_chunk_error_payload(chunk)
@@ -776,7 +754,6 @@ def _stream_chunk_error_exception(chunk: Any) -> Optional[Exception]:
         pass
     return exception
 
-
 def _stream_chunk_priority_error_exception(
     chunk: Any,
     request_data: Optional[dict] = None,
@@ -793,7 +770,6 @@ def _stream_chunk_priority_error_exception(
         else None
     )
 
-
 def _is_structured_codex_compaction_failure_chunk(chunk: Any) -> bool:
     """Recognize the terminal failure event produced for a prior compaction attempt."""
     dumped = _stream_chunk_dump(chunk)
@@ -806,7 +782,6 @@ def _is_structured_codex_compaction_failure_chunk(chunk: Any) -> bool:
         "upstream_compaction_failure",
         "upstream_compaction_unsupported",
     }
-
 
 def _stream_chunk_dump(chunk: Any) -> dict[str, Any]:
     if isinstance(chunk, dict):
@@ -821,7 +796,6 @@ def _stream_chunk_dump(chunk: Any) -> dict[str, Any]:
             return {}
         return dumped if isinstance(dumped, dict) else {}
     return {}
-
 
 def _sse_stream_chunk_payload(chunk: Any) -> Optional[dict[str, Any]]:
     """Decode a structured wire chunk for local classification, never delivery."""
@@ -863,12 +837,10 @@ def _sse_stream_chunk_payload(chunk: Any) -> Optional[dict[str, Any]]:
         payload["type"] = event_type
     return payload
 
-
 def _stream_chunk_type(chunk: Any) -> str:
     dumped = _stream_chunk_dump(chunk)
     chunk_type = dumped.get("type")
     return chunk_type if isinstance(chunk_type, str) else ""
-
 
 def _stream_chunk_response_status(chunk: Any) -> str:
     dumped = _stream_chunk_dump(chunk)
@@ -880,13 +852,11 @@ def _stream_chunk_response_status(chunk: Any) -> str:
     status = dumped.get("status")
     return status if isinstance(status, str) else ""
 
-
 def _responses_stream_chunk_is_completed(chunk: Any) -> bool:
     return _stream_chunk_type(chunk) in _RESPONSES_STREAM_COMPLETED_TYPES or (
         _stream_chunk_type(chunk) == "response"
         and _stream_chunk_response_status(chunk).lower() == "completed"
     )
-
 
 def _responses_completed_chunk_has_usable_output(
     chunk: Any,
@@ -909,7 +879,6 @@ def _responses_completed_chunk_has_usable_output(
         )
     return _stream_chunk_has_visible_output(dumped)
 
-
 def _responses_completed_chunk_is_empty(
     chunk: Any,
     request_data: Optional[dict] = None,
@@ -918,12 +887,10 @@ def _responses_completed_chunk_is_empty(
         chunk
     ) and not _responses_completed_chunk_has_usable_output(chunk, request_data)
 
-
 def _responses_stream_chunk_is_incomplete_terminal(chunk: Any) -> bool:
     return _stream_chunk_type(chunk) in _RESPONSES_STREAM_INCOMPLETE_TYPES or (
         _stream_chunk_response_status(chunk).lower() in _RESPONSES_STREAM_INCOMPLETE_STATUSES
     )
-
 
 def _is_young_router_terminal_failure_event(chunk: Any) -> bool:
     if bool(getattr(chunk, "_young_router_terminal_failure", False)):
@@ -938,6 +905,7 @@ def _is_young_router_terminal_failure_event(chunk: Any) -> bool:
     return error.get("code") in {
         "image_generation_tool_unavailable",
         "router_restarting",
+        "upstream_account_restricted",
         "upstream_auth_or_balance",
         "upstream_compaction_failure",
         "upstream_compaction_unsupported",
@@ -945,8 +913,8 @@ def _is_young_router_terminal_failure_event(chunk: Any) -> bool:
         "upstream_relay_capacity",
         "upstream_request_body_too_large",
         "upstream_route_failure",
+        "upstream_tool_history_rejected",
     }
-
 
 _OUTPUT_TOKEN_LIMIT_INCOMPLETE_REASONS = {
     "length",
@@ -954,7 +922,6 @@ _OUTPUT_TOKEN_LIMIT_INCOMPLETE_REASONS = {
     "max_output_tokens",
     "max_tokens",
 }
-
 
 def _output_limit_incomplete_reason_from_text(value: str) -> Optional[str]:
     lowered = value.strip().lower()
@@ -964,7 +931,6 @@ def _output_limit_incomplete_reason_from_text(value: str) -> Optional[str]:
         if reason in lowered:
             return reason
     return None
-
 
 def _responses_incomplete_terminal_reason(chunk: Any) -> str:
     event = _jsonable(chunk)
@@ -1003,7 +969,6 @@ def _responses_incomplete_terminal_reason(chunk: Any) -> str:
             return reason or candidate.strip().lower()
     return ""
 
-
 def _complete_incomplete_response_statuses(value: Any) -> None:
     if isinstance(value, dict):
         if value.get("status") == "incomplete":
@@ -1013,7 +978,6 @@ def _complete_incomplete_response_statuses(value: Any) -> None:
     elif isinstance(value, list):
         for nested in value:
             _complete_incomplete_response_statuses(nested)
-
 
 def _responses_output_limit_incomplete_as_completed_chunk(
     chunk: Any,
@@ -1049,7 +1013,6 @@ def _responses_output_limit_incomplete_as_completed_chunk(
     )
     return _json_stream_event(completed_event)
 
-
 def _responses_output_limit_terminal_state_as_completed_chunk(
     chunk: Any,
     completion_state: Any,
@@ -1072,9 +1035,7 @@ def _responses_output_limit_terminal_state_as_completed_chunk(
     )
     return _json_stream_event(completed_event)
 
-
 _STREAM_OUTPUT_TOOL_ITEM_TYPES = {"function_call", "tool_search_call", "web_search_call"}
-
 
 def _stream_output_item_is_tool_call(item_type: Any) -> bool:
     if not isinstance(item_type, str) or not item_type:
@@ -1085,30 +1046,26 @@ def _stream_output_item_is_tool_call(item_type: Any) -> bool:
         return True
     return item_type.endswith("_call") or "tool_call" in item_type
 
-
 def _stream_output_item_key(item: Any) -> Optional[str]:
-    item_id = _responses_web_search_bridge_module._response_item_get(item, "id")
+    item_id = _web_search_native_module._response_item_get(item, "id")
     if not isinstance(item_id, str) or not item_id:
-        item_id = _responses_web_search_bridge_module._response_item_get(item, "call_id")
+        item_id = _web_search_native_module._response_item_get(item, "call_id")
     return item_id if isinstance(item_id, str) and item_id else None
-
 
 def _stream_output_item_identity_keys(item: Any) -> list[str]:
     keys: list[str] = []
-    item_type = _responses_web_search_bridge_module._response_item_get(item, "type")
+    item_type = _web_search_native_module._response_item_get(item, "type")
     for key_name in ("id", "call_id"):
         if key_name == "call_id" and not _stream_output_item_is_tool_call(item_type):
             continue
-        value = _responses_web_search_bridge_module._response_item_get(item, key_name)
+        value = _web_search_native_module._response_item_get(item, key_name)
         if isinstance(value, str) and value and value not in keys:
             keys.append(value)
     return keys
 
-
 def _mark_stream_output_item_identity_seen(item: Any, seen_item_ids: set[str]) -> None:
     for item_id in _stream_output_item_identity_keys(item):
         seen_item_ids.add(item_id)
-
 
 def _pending_tool_item_key_for_item(
     pending_tool_items: dict[str, tuple[int, dict[str, Any]]],
@@ -1117,17 +1074,16 @@ def _pending_tool_item_key_for_item(
     for item_id in _stream_output_item_identity_keys(item):
         if item_id in pending_tool_items:
             return item_id
-    item_call_id = _responses_web_search_bridge_module._response_item_get(item, "call_id")
+    item_call_id = _web_search_native_module._response_item_get(item, "call_id")
     if isinstance(item_call_id, str) and item_call_id:
         for pending_key, (_index, pending_item) in pending_tool_items.items():
-            pending_call_id = _responses_web_search_bridge_module._response_item_get(
+            pending_call_id = _web_search_native_module._response_item_get(
                 pending_item,
                 "call_id",
             )
             if pending_call_id == item_call_id:
                 return pending_key
     return None
-
 
 def _pop_pending_tool_item_for_item(
     pending_tool_items: dict[str, tuple[int, dict[str, Any]]],
@@ -1137,7 +1093,6 @@ def _pop_pending_tool_item_for_item(
     if pending_key is None:
         return None
     return pending_tool_items.pop(pending_key, None)
-
 
 def _remember_stream_output_item_ids(
     chunk: Any,
@@ -1151,12 +1106,12 @@ def _remember_stream_output_item_ids(
         return
     item = dumped.get("item")
     item_id = _stream_output_item_key(item)
-    item_type = _responses_web_search_bridge_module._response_item_get(item, "type")
+    item_type = _web_search_native_module._response_item_get(item, "type")
     if item_type == "web_search_call":
         json_item = _jsonable(item)
         if not isinstance(json_item, dict):
             return
-        sanitized_item = _responses_web_search_bridge_module._sanitize_web_search_call_item(json_item)
+        sanitized_item = _web_search_native_module._sanitize_web_search_call_item(json_item)
         if sanitized_item is None:
             return
         item = sanitized_item
@@ -1188,7 +1143,6 @@ def _remember_stream_output_item_ids(
         if isinstance(json_item, dict):
             completed_output_items[output_index] = json_item
 
-
 def _remember_completed_response_output_items(
     chunk: Any,
     completed_output_items: dict[int, dict[str, Any]],
@@ -1199,12 +1153,12 @@ def _remember_completed_response_output_items(
         json_item = _jsonable(item)
         if not isinstance(json_item, dict):
             continue
-        item_type = _responses_web_search_bridge_module._response_item_get(
+        item_type = _web_search_native_module._response_item_get(
             json_item,
             "type",
         )
         if item_type == "web_search_call":
-            sanitized_item = _responses_web_search_bridge_module._sanitize_web_search_call_item(
+            sanitized_item = _web_search_native_module._sanitize_web_search_call_item(
                 json_item,
             )
             if sanitized_item is None:
@@ -1218,7 +1172,6 @@ def _remember_completed_response_output_items(
             if pending_tool_items is not None:
                 _pop_pending_tool_item_for_item(pending_tool_items, json_item)
 
-
 def _completed_response_output_items(chunk: Any) -> list[tuple[int, Any]]:
     if not _responses_stream_chunk_is_completed(chunk):
         return []
@@ -1231,15 +1184,12 @@ def _completed_response_output_items(chunk: Any) -> list[tuple[int, Any]]:
         return []
     return list(enumerate(output))
 
-
 def _json_stream_event(event: dict[str, Any]) -> _JSONStreamEvent:
     return _JSONStreamEvent(event)
-
 
 def _sse_comment_event(text: str) -> str:
     safe = str(text).replace("\r", " ").replace("\n", " ")
     return f": {safe}\n\n"
-
 
 def _synthesized_missing_completed_tool_events(
     chunk: Any,
@@ -1250,7 +1200,7 @@ def _synthesized_missing_completed_tool_events(
     model = dumped.get("model")
     events: list[_JSONStreamEvent] = []
     for output_index, item in _completed_response_output_items(chunk):
-        item_type = _responses_web_search_bridge_module._response_item_get(item, "type")
+        item_type = _web_search_native_module._response_item_get(item, "type")
         if not _stream_output_item_is_tool_call(item_type):
             continue
         if any(identity_key in seen_item_ids for identity_key in _stream_output_item_identity_keys(item)):
@@ -1260,7 +1210,7 @@ def _synthesized_missing_completed_tool_events(
         if not isinstance(done_item, dict):
             continue
         if done_item.get("type") == "web_search_call":
-            sanitized_item = _responses_web_search_bridge_module._sanitize_web_search_call_item(done_item)
+            sanitized_item = _web_search_native_module._sanitize_web_search_call_item(done_item)
             if sanitized_item is None:
                 continue
             done_item = sanitized_item
@@ -1300,7 +1250,6 @@ def _synthesized_missing_completed_tool_events(
         _mark_stream_output_item_identity_seen(done_item, seen_item_ids)
     return events
 
-
 def _synthesized_pending_tool_completion_events(
     pending_tool_items: dict[str, tuple[int, dict[str, Any]]],
     completed_output_items: dict[int, dict[str, Any]],
@@ -1318,7 +1267,7 @@ def _synthesized_pending_tool_completion_events(
         done_item = copy.deepcopy(item)
         done_item["status"] = "completed"
         if done_item.get("type") == "web_search_call":
-            sanitized_item = _responses_web_search_bridge_module._sanitize_web_search_call_item(done_item)
+            sanitized_item = _web_search_native_module._sanitize_web_search_call_item(done_item)
             if sanitized_item is None:
                 continue
             done_item = sanitized_item
@@ -1339,7 +1288,7 @@ def _synthesized_pending_tool_completion_events(
     response["output"] = [
         item for _, item in sorted(completed_output_items.items(), key=lambda entry: entry[0])
     ]
-    response = _responses_web_search_bridge_module._sanitize_response_web_search_call_items(response)
+    response = _web_search_native_module._sanitize_response_web_search_call_items(response)
     completed_event: dict[str, Any] = {
         "type": "response.completed",
         "response": response,
@@ -1349,7 +1298,6 @@ def _synthesized_pending_tool_completion_events(
     events.append(_json_stream_event(completed_event))
     pending_tool_items.clear()
     return events
-
 
 def _synthesized_completed_response_event(
     completed_output_items: dict[int, dict[str, Any]],
@@ -1387,7 +1335,7 @@ def _synthesized_completed_response_event(
         response["output_text"] = text
     response["status"] = "completed"
     _image_generation_module._normalize_image_generation_result_status(response)
-    response = _responses_web_search_bridge_module._sanitize_response_web_search_call_items(response)
+    response = _web_search_native_module._sanitize_response_web_search_call_items(response)
     completed_event: dict[str, Any] = {
         "type": "response.completed",
         "response": response,
@@ -1395,7 +1343,6 @@ def _synthesized_completed_response_event(
     if model:
         completed_event["model"] = model
     return _json_stream_event(completed_event)
-
 
 def _stream_chunk_text_fragment(chunk: Any) -> tuple[str, bool]:
     dumped = _stream_chunk_dump(chunk)
@@ -1407,7 +1354,6 @@ def _stream_chunk_text_fragment(chunk: Any) -> tuple[str, bool]:
         text = dumped.get("text")
         return (text, True) if isinstance(text, str) else ("", True)
     return "", False
-
 
 def _local_shutdown_completed_response_event(
     request_data: dict,
@@ -1455,7 +1401,6 @@ def _local_shutdown_completed_response_event(
         output_items=len(output) if isinstance(output, list) else 0,
     )
     return _json_stream_event(completed_event)
-
 
 def _synthesized_failed_response_event(
     request_data: dict,
@@ -1545,6 +1490,35 @@ def _synthesized_failed_response_event(
         )
         error_type = "server_error"
         error_code = "upstream_relay_capacity"
+    elif _routing_module._is_upstream_account_restricted_error(exception):
+        # The route answered, and its answer is that the account paying for it
+        # is restricted.  Resending the same bytes cannot change that, so the
+        # stop names the account and the wire type says it is the configuration
+        # that must change: ``server_error`` here is what made the client
+        # reconnect five times over a request no route would accept.
+        model_group = (
+            _responses_execution_module._request_model_group(request_data)
+            or request_data.get("model")
+            or "the requested model"
+        )
+        message = _routing_module._upstream_account_restricted_message(model_group)
+        error_type = "invalid_request_error"
+        error_code = "upstream_account_restricted"
+    elif _routing_module._is_upstream_tool_history_rejected_error(exception):
+        # The route refused this replay because a tool call and its output no
+        # longer pair.  The client can only fix that by starting a new task, so
+        # the stop says so and uses a wire type that never invites the same
+        # history to be sent again.
+        model_group = (
+            _responses_execution_module._request_model_group(request_data)
+            or request_data.get("model")
+            or "the requested model"
+        )
+        message = _routing_module._upstream_tool_history_rejected_message(
+            model_group
+        )
+        error_type = "invalid_request_error"
+        error_code = "upstream_tool_history_rejected"
     elif _routing_module._is_upstream_deployment_failover_error(exception):
         message = _routing_module._sanitized_upstream_route_failure_message(
             model,
@@ -1630,7 +1604,6 @@ def _synthesized_failed_response_event(
         pass
     return terminal_event
 
-
 def _synthesized_native_stream_error_chunk(
     request_data: dict,
     exception: Exception,
@@ -1661,6 +1634,8 @@ def _synthesized_native_stream_error_chunk(
             "upstream_prompt_rejected",
             "image_generation_tool_unavailable",
             "upstream_request_body_too_large",
+            "upstream_account_restricted",
+            "upstream_tool_history_rejected",
         }
         else "server_error"
     )
@@ -1684,7 +1659,6 @@ def _synthesized_native_stream_error_chunk(
         }
     }
 
-
 def _native_stream_error_code(exception: Exception) -> str:
     if _routing_module._is_local_shutdown_exception(exception):
         return "router_restarting"
@@ -1698,6 +1672,10 @@ def _native_stream_error_code(exception: Exception) -> str:
         return "image_generation_tool_unavailable"
     if _routing_module._is_upstream_relay_capacity_error(exception):
         return "upstream_relay_capacity"
+    if _routing_module._is_upstream_account_restricted_error(exception):
+        return "upstream_account_restricted"
+    if _routing_module._is_upstream_tool_history_rejected_error(exception):
+        return "upstream_tool_history_rejected"
     if _routing_module._is_upstream_deployment_failover_error(exception):
         return "upstream_auth_or_balance"
     # The router's own timeout predicate answers for both reasons, so the
@@ -1709,7 +1687,6 @@ def _native_stream_error_code(exception: Exception) -> str:
     if getattr(exception, "stream_incomplete", False):
         return "upstream_stream_incomplete"
     return "upstream_route_failure"
-
 
 def _native_stream_error_message(
     model: Optional[str],
@@ -1747,6 +1724,25 @@ def _native_stream_error_message(
             f"{model_group}'s context window. Compact or start a new task so "
             "the history sent upstream is smaller."
         )
+    if _routing_module._is_upstream_account_restricted_error(exception):
+        # Same trap as the context refusal: the refusal belongs to the account
+        # behind the route, so a resent turn meets the identical answer. It is
+        # stated as the configuration change it needs instead of a retry tip.
+        model_group = (
+            _responses_execution_module._request_model_group(request_data)
+            or request_data.get("model")
+            or "the requested model"
+        )
+        return _routing_module._upstream_account_restricted_message(model_group)
+    if _routing_module._is_upstream_tool_history_rejected_error(exception):
+        # The replay cannot be repaired on the client's side by sending it
+        # again: the interrupted tool call stays in the history forever.
+        model_group = (
+            _responses_execution_module._request_model_group(request_data)
+            or request_data.get("model")
+            or "the requested model"
+        )
+        return _routing_module._upstream_tool_history_rejected_message(model_group)
     if getattr(exception, "stream_incomplete", False):
         return (
             "The upstream model route ended the stream before it reported the "
@@ -1758,14 +1754,6 @@ def _native_stream_error_message(
         exception,
         request_data,
     )
-
-
-def _external_web_search_missing_answer_failed_event(
-    request_data: dict,
-    exception: Exception,
-) -> _JSONStreamEvent:
-    return _synthesized_failed_response_event(request_data, exception)
-
 
 def _responses_incomplete_stream_exception(
     reason: str,
@@ -1820,7 +1808,6 @@ def _responses_incomplete_stream_exception(
             pass
     return exception
 
-
 def _responses_incomplete_terminal_summary(chunk: Any) -> dict[str, Any]:
     dumped = _stream_chunk_dump(chunk)
     response = dumped.get("response") if isinstance(dumped, dict) else None
@@ -1865,12 +1852,10 @@ def _responses_incomplete_terminal_summary(chunk: Any) -> dict[str, Any]:
         ),
     }
 
-
 def _is_responses_incomplete_stream_error(exception: Exception) -> bool:
     if getattr(exception, "stream_incomplete", False):
         return True
     return "responses stream incomplete" in _routing_module._exception_text(exception)
-
 
 def _response_has_tool_call_activity(response: Any) -> bool:
     def walk(value: Any) -> bool:
@@ -1896,7 +1881,6 @@ def _response_has_tool_call_activity(response: Any) -> bool:
 
     return walk(response)
 
-
 def _stream_chunk_has_visible_text_output(chunk: Any) -> bool:
     text = _responses_output_module._response_text(chunk)
     # A relay that finishes a turn early can emit a whitespace-only output
@@ -1910,7 +1894,6 @@ def _stream_chunk_has_visible_text_output(chunk: Any) -> bool:
         return True
     return any("output_text" in item_type for item_type in types)
 
-
 def _stream_chunk_has_visible_output(chunk: Any) -> bool:
     dumped = _stream_chunk_dump(chunk)
     visible_chunk = dumped if dumped else chunk
@@ -1920,27 +1903,22 @@ def _stream_chunk_has_visible_output(chunk: Any) -> bool:
         or _response_has_tool_call_activity(visible_chunk)
     )
 
-
 def _response_item_is_web_search_call(item: Any) -> bool:
     json_item = _jsonable(item)
     if not isinstance(json_item, dict):
         return False
-    if json_item.get("type") == "web_search_call":
-        return True
-    return _responses_web_search_bridge_module._is_web_search_function_call_item(json_item)
-
+    return json_item.get("type") == "web_search_call"
 
 def _response_item_is_codex_compaction(item: Any) -> bool:
     """Recognize both canonical and server-reference compaction item names."""
     json_item = _jsonable(item)
     if not isinstance(json_item, dict):
         return False
-    item_type = _responses_web_search_bridge_module._response_item_get(
+    item_type = _web_search_native_module._response_item_get(
         json_item,
         "type",
     )
     return item_type in {"compaction", "compaction_summary"}
-
 
 def _response_item_has_encrypted_codex_compaction(item: Any) -> bool:
     if not _response_item_is_codex_compaction(item):
@@ -1948,12 +1926,11 @@ def _response_item_has_encrypted_codex_compaction(item: Any) -> bool:
     json_item = _jsonable(item)
     if not isinstance(json_item, dict):
         return False
-    encrypted_content = _responses_web_search_bridge_module._response_item_get(
+    encrypted_content = _web_search_native_module._response_item_get(
         json_item,
         "encrypted_content",
     )
     return isinstance(encrypted_content, str) and bool(encrypted_content)
-
 
 def _codex_compaction_output_is_valid(output: Any) -> bool:
     """Return whether output has exactly one encrypted item Codex can resume from."""
@@ -1966,16 +1943,14 @@ def _codex_compaction_output_is_valid(output: Any) -> bool:
         compaction_items[0]
     )
 
-
 def _response_item_has_assistant_text(item: Any) -> bool:
     json_item = _jsonable(item)
     if not isinstance(json_item, dict):
         return False
-    item_type = _responses_web_search_bridge_module._response_item_get(json_item, "type")
+    item_type = _web_search_native_module._response_item_get(json_item, "type")
     if item_type == "reasoning" or _stream_output_item_is_tool_call(item_type):
         return False
     return bool(_responses_output_module._response_text(json_item).strip())
-
 
 def _responses_completed_chunk_is_web_search_only(chunk: Any) -> bool:
     if not _responses_stream_chunk_is_completed(chunk):
@@ -1988,7 +1963,6 @@ def _responses_completed_chunk_is_web_search_only(chunk: Any) -> bool:
     if not isinstance(output, list) or not output:
         return False
     return all(_response_item_is_web_search_call(item) for item in output)
-
 
 def _responses_completed_chunk_has_route_recovery_output(
     chunk: Any,
@@ -2017,7 +1991,6 @@ def _responses_completed_chunk_has_route_recovery_output(
         if all(_response_item_is_web_search_call(item) for item in output):
             return False
     return _responses_completed_chunk_has_usable_output(chunk, request_data)
-
 
 def _stream_chunk_has_deliverable_route_recovery_output(
     chunk: Any,
@@ -2049,27 +2022,6 @@ def _stream_chunk_has_deliverable_route_recovery_output(
     if _responses_stream_chunk_is_incomplete_terminal(dumped):
         return True
     return False
-
-
-def _stream_chunk_is_assistant_text_without_tool_activity(chunk: Any) -> bool:
-    dumped = _stream_chunk_dump(chunk)
-    chunk_type = _stream_chunk_type(dumped)
-    if chunk_type in {
-        "response.output_text.delta",
-        "response.output_text.done",
-        "response.content_part.added",
-        "response.content_part.done",
-    }:
-        return bool(_stream_chunk_has_visible_text_output(dumped))
-    if chunk_type in {"response.output_item.added", "response.output_item.done"}:
-        item = dumped.get("item")
-        item_type = _responses_web_search_bridge_module._response_item_get(item, "type")
-        if _stream_output_item_is_tool_call(item_type):
-            return False
-        return bool(_responses_output_module._response_text(item).strip())
-    return False
-
-
 def _stream_start_timeout_exception(
     request_data: dict,
     *,
@@ -2166,7 +2118,6 @@ def _stream_idle_timeout_exception(
     )
     return exception
 
-
 def _stream_route_recovery_wait_timeout_exception(
     request_data: dict,
     *,
@@ -2190,7 +2141,6 @@ def _stream_route_recovery_wait_timeout_exception(
         saw_chunk=False,
         buffered_chunks=0,
     )
-
 
 def _route_recovery_terminal_chunk_exception(
     chunk: Any,
@@ -2231,7 +2181,6 @@ def _route_recovery_terminal_chunk_exception(
     )
     return exception
 
-
 def _resolved_stream_timeout_seconds(
     request_data: dict,
     key: str,
@@ -2257,7 +2206,6 @@ def _resolved_stream_timeout_seconds(
             if explicit is not None:
                 return explicit
     return default_resolver(request_data)
-
 
 async def _stream_with_idle_timeout(
     response: Any,
@@ -2349,7 +2297,6 @@ async def _stream_with_idle_timeout(
             )
         yield chunk
 
-
 def _should_emit_codex_responses_initial_sse_keepalive(
     request_data: Optional[dict],
 ) -> bool:
@@ -2363,7 +2310,6 @@ def _should_emit_codex_responses_initial_sse_keepalive(
         )
     )
 
-
 def _codex_responses_initial_sse_keepalive() -> _JSONStreamEvent:
     # Responses clients parse every ``data:`` payload as JSON.  A bare SSE
     # comment yielded by the hook would be re-framed by the proxy as a data
@@ -2376,7 +2322,6 @@ def _codex_responses_initial_sse_keepalive() -> _JSONStreamEvent:
         }
     )
 
-
 def _is_codex_responses_initial_sse_keepalive(chunk: Any) -> bool:
     if isinstance(chunk, dict) and chunk.get("type") == "response.metadata":
         metadata = chunk.get("metadata")
@@ -2386,7 +2331,6 @@ def _is_codex_responses_initial_sse_keepalive(chunk: Any) -> bool:
     if isinstance(chunk, str):
         return chunk.startswith(": young_router initial_wait ")
     return False
-
 
 async def _cancel_pending_read(task: Optional[asyncio.Task[Any]]) -> None:
     """Cancel and settle one in-flight upstream read without letting it raise."""
@@ -2401,7 +2345,6 @@ async def _cancel_pending_read(task: Optional[asyncio.Task[Any]]) -> None:
         pass
     except Exception:
         pass
-
 
 async def _yield_codex_responses_initial_keepalive_stream(
     response: Any,
@@ -2528,7 +2471,6 @@ async def _yield_codex_responses_initial_keepalive_stream(
     finally:
         await cancel_pending_read()
 
-
 def _stream_chunk_reasoning_only_text(chunk: Any) -> str:
     """Return the thinking an arriving non-Responses frame carries, if any.
 
@@ -2558,7 +2500,7 @@ def _stream_chunk_reasoning_only_text(chunk: Any) -> str:
     if not isinstance(choices, (list, tuple)):
         return ""
     for choice in choices:
-        delta = _responses_web_search_bridge_module._response_item_get(
+        delta = _web_search_native_module._response_item_get(
             choice, "delta"
         )
         if not isinstance(delta, dict):
@@ -2569,7 +2511,7 @@ def _stream_chunk_reasoning_only_text(chunk: Any) -> str:
             "thinking_blocks",
             "reasoning_items",
         ):
-            value = _responses_web_search_bridge_module._response_item_get(
+            value = _web_search_native_module._response_item_get(
                 delta, field
             )
             if isinstance(value, str):
@@ -2578,7 +2520,6 @@ def _stream_chunk_reasoning_only_text(chunk: Any) -> str:
             elif value not in (None, "", [], {}):
                 return "reasoning"
     return ""
-
 
 def _stream_chunk_has_meaningful_delta(chunk: Any) -> bool:
     dumped = _stream_chunk_dump(chunk)
@@ -2592,7 +2533,6 @@ def _stream_chunk_has_meaningful_delta(chunk: Any) -> bool:
     if _stream_chunk_reasoning_only_text(chunk).strip():
         return True
     return _stream_chunk_has_visible_output(chunk)
-
 
 async def _stream_with_selected_deployment_box(
     response: Any,
@@ -2611,10 +2551,8 @@ async def _stream_with_selected_deployment_box(
             _CURRENT_SELECTED_DEPLOYMENT_BOX.reset(selected_deployment_box_token)
         yield chunk
 
-
 def _request_is_responses_stream(request_data: Optional[dict]) -> bool:
     return _responses_request_module._request_is_responses_api(request_data) or "input" in (request_data or {})
-
 
 def _request_supports_streaming_error_fallback(request_data: Optional[dict]) -> bool:
     """Whether this is a streaming request with a route-replay payload.
@@ -2628,7 +2566,6 @@ def _request_supports_streaming_error_fallback(request_data: Optional[dict]) -> 
         return False
     return request_data.get("input") is not None or request_data.get("messages") is not None
 
-
 def _request_is_anthropic_messages_stream(request_data: Optional[dict]) -> bool:
     if not _request_supports_streaming_error_fallback(request_data):
         return False
@@ -2639,14 +2576,12 @@ def _request_is_anthropic_messages_stream(request_data: Optional[dict]) -> bool:
         == _UPSTREAM_URL_SURFACE_ANTHROPIC
     )
 
-
 def _request_uses_native_event_stream(request_data: Optional[dict]) -> bool:
     """Return true when recovery must preserve a non-Responses SSE wire form."""
 
     return _request_supports_streaming_error_fallback(
         request_data
     ) and not _request_is_responses_stream(request_data)
-
 
 def _streaming_error_fallback_method_name(request_data: Optional[dict]) -> Optional[str]:
     request_data = request_data or {}
@@ -2658,7 +2593,6 @@ def _streaming_error_fallback_method_name(request_data: Optional[dict]) -> Optio
         return "acompletion"
     return None
 
-
 def _model_route_slug(model: Any) -> Optional[str]:
     if not isinstance(model, str):
         return None
@@ -2668,7 +2602,6 @@ def _model_route_slug(model: Any) -> Optional[str]:
     if "/" in text:
         text = text.rsplit("/", 1)[-1].strip()
     return text or None
-
 
 def _should_prefer_selected_route_model(
     payload_model: Any,
@@ -2683,7 +2616,6 @@ def _should_prefer_selected_route_model(
     payload_slug = _model_route_slug(payload_model)
     selected_slug = _model_route_slug(selected_route_model)
     return bool(payload_slug and selected_slug and selected_slug != payload_slug)
-
 
 def _build_streaming_error_fallback_payload(
     request_data: dict,
@@ -2900,7 +2832,6 @@ def _build_streaming_error_fallback_payload(
         payload = header_payload
     return payload
 
-
 def _apply_streaming_error_fallback_constraints(
     payload: dict,
     router: Any,
@@ -2999,7 +2930,6 @@ def _apply_streaming_error_fallback_constraints(
         preserve_cumulative_exclusions(
             {"_excluded_deployment_ids": sorted(excluded_ids)}
         )
-
 
 async def _streaming_error_fallback_response(
     request_data: dict,
@@ -3187,7 +3117,6 @@ async def _streaming_error_fallback_response(
     finally:
         _CURRENT_SELECTED_DEPLOYMENT_BOX.reset(selected_deployment_box_token)
 
-
 def _request_with_selected_deployment(
     request_data: dict,
     *,
@@ -3209,7 +3138,6 @@ def _request_with_selected_deployment(
     ):
         return success_request
     return {}
-
 
 async def _stream_streaming_error_fallback_round(
     request_data: dict,
@@ -3361,11 +3289,9 @@ async def _stream_streaming_error_fallback_round(
             )
         raise fallback_exception
 
-
 _ROUTE_RECOVERY_SSE_KEEPALIVE_SECONDS = 15.0
 _ROUTE_RECOVERY_SSE_KEEPALIVE_MIN_DELAY_SECONDS = 1.0
 _CODEX_RESPONSES_INITIAL_SSE_GRACE_SECONDS = 5.0
-
 
 def _build_forced_image_generation_payload(request_data: dict, *, stream: bool) -> Optional[dict]:
     allowed_keys = (
@@ -3426,7 +3352,6 @@ def _build_forced_image_generation_payload(request_data: dict, *, stream: bool) 
             payload["_target_order"] = selected_order
     return payload
 
-
 async def _call_forced_image_generation_payload(payload: dict) -> Any:
     from litellm.proxy.proxy_server import llm_router
 
@@ -3434,7 +3359,6 @@ async def _call_forced_image_generation_payload(payload: dict) -> Any:
         raise RuntimeError("LiteLLM router is unavailable for image_generation fallback")
 
     return await llm_router.aresponses(**payload)
-
 
 async def _stream_forced_image_generation_payload(payload: dict) -> AsyncIterator[Any]:
     fallback_response = await _call_forced_image_generation_payload(payload)
@@ -3477,7 +3401,6 @@ async def _stream_forced_image_generation_payload(payload: dict) -> AsyncIterato
         for chunk in buffer:
             yield chunk
 
-
 async def _yield_original_stream(
     buffer: List[Any],
     response: Any,
@@ -3503,11 +3426,9 @@ async def _yield_original_stream(
     ):
         yield chunk
 
-
 async def _empty_async_iterator() -> AsyncIterator[Any]:
     if False:
         yield None
-
 
 def _responses_non_streaming_response_has_usable_output(
     response: Any,
@@ -3526,7 +3447,6 @@ def _responses_non_streaming_response_has_usable_output(
     ):
         return True
     return False
-
 
 def _completed_response_payload(response: Any, request_data: Optional[dict]) -> dict[str, Any]:
     payload = _jsonable(response)
@@ -3567,9 +3487,8 @@ def _completed_response_payload(response: Any, request_data: Optional[dict]) -> 
         ),
     )
     payload["status"] = "completed"
-    payload = _responses_web_search_bridge_module._sanitize_response_stream_payload(payload)
+    payload = _web_search_native_module._sanitize_response_stream_payload(payload)
     return payload
-
 
 def _stream_function_arguments_key(dumped: dict[str, Any]) -> Optional[str]:
     for key in ("item_id", "call_id", "id"):
@@ -3577,7 +3496,6 @@ def _stream_function_arguments_key(dumped: dict[str, Any]) -> Optional[str]:
         if isinstance(value, str) and value:
             return value
     return None
-
 
 def _apply_stream_function_arguments(
     item: dict[str, Any],
@@ -3601,9 +3519,7 @@ def _apply_stream_function_arguments(
     next_item["arguments"] = normalized
     return next_item
 
-
 _STREAM_SYNTHETIC_TEXT_MAX_CHARS = 8192
-
 
 class _ResponsesStreamCompletionState:
     def __init__(self, request_data: Optional[dict] = None) -> None:
@@ -3683,10 +3599,7 @@ class _ResponsesStreamCompletionState:
                 json_item = merged_item
 
         item_id = _stream_output_item_key(json_item)
-        if item_id and (
-            json_item.get("type") == "function_call"
-            or _responses_web_search_bridge_module._is_web_search_function_call_item(json_item)
-        ):
+        if item_id and json_item.get("type") == "function_call":
             argument_parts = self.argument_parts_by_item_id.get(item_id)
             existing_args = json_item.get("arguments")
             if existing_args is None:
@@ -3723,7 +3636,7 @@ class _ResponsesStreamCompletionState:
                 self.arguments_by_item_id,
             )
             self.pending_by_index.pop(index, None)
-        elif json_item.get("type") == "function_call" or _responses_web_search_bridge_module._is_web_search_function_call_item(json_item):
+        elif json_item.get("type") == "function_call":
             if json_item.get("type") == "function_call":
                 json_item.setdefault("arguments", "")
             self.pending_by_index[index] = json_item
@@ -3928,7 +3841,6 @@ class _ResponsesStreamCompletionState:
 
         return chunk
 
-
 def _codex_compaction_done_item_completed_compat(
     completion_state: _ResponsesStreamCompletionState,
     request_data: dict,
@@ -3983,7 +3895,7 @@ def _codex_compaction_done_item_completed_compat(
         reason=reason,
         buffered_events=completion_state.event_count,
         completed_output_types=[
-            _responses_web_search_bridge_module._response_item_get(item, "type")
+            _web_search_native_module._response_item_get(item, "type")
             for _index, item in sorted(completed_output_items.items())
         ],
         exception=(
@@ -3993,7 +3905,6 @@ def _codex_compaction_done_item_completed_compat(
         ),
     )
     return completed_event
-
 
 def _responses_stream_events_to_completed_payload(
     events: list[Any],
@@ -4006,7 +3917,6 @@ def _responses_stream_events_to_completed_payload(
     for chunk in events:
         state.remember(chunk)
     return state.completed_payload(request_data)
-
 
 async def _collect_responses_stream_completed_payload(
     buffer: list[Any],
@@ -4028,7 +3938,7 @@ async def _collect_responses_stream_completed_payload(
         saw_visible_output=saw_visible_output,
         initial_chunk_count=completion_state.event_count or len(buffer),
     ):
-        sanitized_chunk = _responses_web_search_bridge_module._sanitize_web_search_stream_chunk(
+        sanitized_chunk = _web_search_native_module._sanitize_web_search_stream_chunk(
             chunk,
             request_data,
         )
@@ -4038,7 +3948,6 @@ async def _collect_responses_stream_completed_payload(
         if _responses_stream_chunk_is_completed(sanitized_chunk):
             break
     return completion_state.completed_payload(request_data)
-
 
 async def _close_async_iterator_safely(iterator: Any) -> None:
     aclose = getattr(iterator, "aclose", None)
@@ -4050,7 +3959,6 @@ async def _close_async_iterator_safely(iterator: Any) -> None:
             await result
     except Exception:
         return
-
 
 async def _non_streaming_response_as_stream(
     response: Any,
@@ -4067,11 +3975,10 @@ async def _non_streaming_response_as_stream(
                 request_data=request_data,
             )
         payload = _completed_response_payload(response, request_data)
-        async for chunk in _responses_web_search_bridge_module._external_web_search_bridge_stream(payload):
+        async for chunk in _web_search_native_module._external_web_search_bridge_stream(payload):
             yield chunk
         return
     yield response
-
 
 async def _yield_validated_structured_codex_compaction_stream(
     buffer: List[Any],
@@ -4083,16 +3990,16 @@ async def _yield_validated_structured_codex_compaction_stream(
     """Buffer a remote compaction until its required encrypted result is final."""
     events: List[Any] = []
     completion_state = _ResponsesStreamCompletionState(request_data)
-    raw_tool_call_text_filter = _responses_web_search_bridge_module._RawToolCallTextFilter()
+    raw_tool_call_text_filter = _web_search_native_module._RawToolCallTextFilter()
 
     def remember(chunk: Any) -> Optional[str]:
-        sanitized_chunk = _responses_web_search_bridge_module._sanitize_web_search_stream_chunk(
+        sanitized_chunk = _web_search_native_module._sanitize_web_search_stream_chunk(
             chunk,
             request_data,
         )
         if sanitized_chunk is None:
             return None
-        sanitized_chunk = _responses_web_search_bridge_module._sanitize_raw_tool_call_text_stream_chunk(
+        sanitized_chunk = _web_search_native_module._sanitize_raw_tool_call_text_stream_chunk(
             sanitized_chunk,
             raw_tool_call_text_filter,
             request_data,
@@ -4188,7 +4095,6 @@ async def _yield_validated_structured_codex_compaction_stream(
         buffer=events,
         request_data=request_data,
     )
-
 
 async def _yield_native_stream_with_output_limit_continuation(
     buffer: List[Any],
@@ -4370,7 +4276,6 @@ async def _yield_native_stream_with_output_limit_continuation(
             yield fallback_chunk
         return
 
-
 async def _yield_guarded_original_stream(
     buffer: List[Any],
     response: Any,
@@ -4410,7 +4315,6 @@ async def _yield_guarded_original_stream(
     seen_output_item_ids: set[str] = set()
     pending_tool_items: dict[str, tuple[int, dict[str, Any]]] = {}
     completed_output_items: dict[int, dict[str, Any]] = {}
-    internal_bridge_item_ids: set[str] = set()
     client_open_tool_output_indexes: set[int] = set()
     # A Responses stream reports its outcome through a terminal ``completed``
     # event rather than through LiteLLM's stream-completion callback, so this
@@ -4427,14 +4331,6 @@ async def _yield_guarded_original_stream(
 
     completion_state = _ResponsesStreamCompletionState(request_data)
     saw_image_generation_activity = False
-    saw_web_search_call_activity = False
-    saw_visible_assistant_output_after_web_search = False
-    # The bridge consumes the upstream web_search function_call before it is
-    # delivered to the client.  Keep that protocol fact after takeover so a
-    # failed hidden continuation can still enter the recovery path even when
-    # the consumed call is no longer present in completed_output_items.
-    bridge_search_intercepted = False
-    seen_web_search_activity_keys: set[str] = set()
     namespace_by_name = _responses_output_module._responses_namespace_tool_map(
         request_data.get("input"),
         request_data,
@@ -4446,7 +4342,7 @@ async def _yield_guarded_original_stream(
     custom_tool_item_ids: set[str] = set()
     completed_custom_tool_input_item_ids: set[str] = set()
     custom_tool_input_delta_tracker = _responses_output_module._CustomToolInputDeltaTracker()
-    raw_tool_call_text_filter = _responses_web_search_bridge_module._RawToolCallTextFilter()
+    raw_tool_call_text_filter = _web_search_native_module._RawToolCallTextFilter()
 
     def normalize_tool_bridge_chunk(chunk: Any) -> Any:
         return _responses_output_module._normalize_response_stream_tool_bridge_chunk(
@@ -4458,105 +4354,11 @@ async def _yield_guarded_original_stream(
         )
 
     def sanitize_visible_text_chunk(chunk: Any) -> Optional[Any]:
-        return _responses_web_search_bridge_module._sanitize_raw_tool_call_text_stream_chunk(
+        return _web_search_native_module._sanitize_raw_tool_call_text_stream_chunk(
             chunk,
             raw_tool_call_text_filter,
             request_data,
         )
-
-    def should_consume_bridge_calls() -> bool:
-        return _tools_module._request_should_consume_web_search_function_call(request_data)
-
-    def internal_bridge_item_from_chunk(chunk: Any) -> Optional[dict[str, Any]]:
-        dumped = _stream_chunk_dump(chunk)
-        if _stream_chunk_type(dumped) not in {
-            "response.output_item.added",
-            "response.output_item.done",
-        }:
-            return None
-        item = _jsonable(dumped.get("item"))
-        if isinstance(item, dict) and _responses_web_search_bridge_module._is_web_search_function_call_item(item):
-            return item
-        return None
-
-    def remember_internal_bridge_item_id(chunk: Any) -> None:
-        item = internal_bridge_item_from_chunk(chunk)
-        if item is None:
-            return
-        item_id = _stream_output_item_key(item)
-        if isinstance(item_id, str) and item_id:
-            internal_bridge_item_ids.add(item_id)
-
-    def should_suppress_internal_bridge_chunk(chunk: Any) -> bool:
-        if not should_consume_bridge_calls():
-            return False
-        if internal_bridge_item_from_chunk(chunk) is not None:
-            return True
-        dumped = _stream_chunk_dump(chunk)
-        if _stream_chunk_type(dumped) not in {
-            "response.function_call_arguments.delta",
-            "response.function_call_arguments.done",
-        }:
-            return False
-        item_id = _stream_function_arguments_key(dumped)
-        return isinstance(item_id, str) and item_id in internal_bridge_item_ids
-
-    def bridge_payload_from_state(*, require_finished_arguments: bool) -> Optional[dict[str, Any]]:
-        if not should_consume_bridge_calls():
-            return None
-        if require_finished_arguments and not (
-            internal_bridge_item_ids & completion_state.finished_argument_item_ids
-        ):
-            return None
-        payload = completion_state.completed_payload(request_data)
-        if _responses_web_search_bridge_module._has_web_search_actions_for_request(payload, request_data):
-            return payload
-        return None
-
-    def has_client_visible_unclosed_tool_call() -> bool:
-        """Whether a tool call already shown to the client is still open.
-
-        A Responses client holds a tool call open from its
-        ``response.output_item.added`` until the matching
-        ``response.output_item.done``.  Handing the stream to the bridge
-        restarts the output indexes at 0 and closes only the items the bridge
-        itself creates, so abandoning an open call leaves the client holding a
-        tool call it can never finish.  The model emits parallel calls routinely
-        (an ``Agent`` beside the ``web_search``), and the search call's own
-        ``arguments.done`` is the trigger, so its sibling is already visible --
-        and still streaming -- by then.  The takeover waits for the upstream to
-        close it instead of truncating a call the client asked for.
-        """
-        return bool(client_open_tool_output_indexes)
-
-    def unclosed_client_visible_tool_completion_events() -> list[_JSONStreamEvent]:
-        """Close a client-visible tool call the bridge is about to abandon.
-
-        Reached only when the upstream ended without closing a call the client
-        already saw.  The closing event states the arguments the upstream
-        actually streamed, so the client never runs a tool call with arguments
-        the model never wrote.
-        """
-        events: list[_JSONStreamEvent] = []
-        for item_id, (output_index, item) in sorted(
-            pending_tool_items.items(), key=lambda entry: entry[1][0]
-        ):
-            if item_id in internal_bridge_item_ids:
-                continue
-            done_item = _apply_stream_function_arguments(
-                copy.deepcopy(item),
-                completion_state.arguments_by_item_id,
-            )
-            done_item["status"] = "completed"
-            done_event: dict[str, Any] = {
-                "type": "response.output_item.done",
-                "output_index": output_index,
-                "item": done_item,
-            }
-            if completion_state.model:
-                done_event["model"] = completion_state.model
-            events.append(_json_stream_event(done_event))
-        return events
 
     def remember_client_tool_call_exposure(chunk: Any) -> None:
         """Track which tool calls the client was actually told about.
@@ -4575,7 +4377,7 @@ async def _yield_guarded_original_stream(
             return
         item = dumped.get("item")
         if not _stream_output_item_is_tool_call(
-            _responses_web_search_bridge_module._response_item_get(item, "type")
+            _web_search_native_module._response_item_get(item, "type")
         ):
             return
         output_index = dumped.get("output_index")
@@ -4625,50 +4427,12 @@ async def _yield_guarded_original_stream(
             return None
         return name
 
-    def bridge_payload_for_chunk(chunk: Any) -> Optional[dict[str, Any]]:
-        if not should_consume_bridge_calls():
-            return None
-        if has_client_visible_unclosed_tool_call():
-            return None
-        if _responses_web_search_bridge_module._has_web_search_actions_for_request(chunk, request_data):
-            return completion_state.completed_payload(request_data)
-        dumped = _stream_chunk_dump(chunk)
-        if _stream_chunk_type(dumped) in {
-            "response.function_call_arguments.done",
-            "response.output_item.done",
-        }:
-            return bridge_payload_from_state(require_finished_arguments=True)
-        return None
-
-    async def yield_resolved_bridge_stream(
-        trigger_chunk: Any,
-        payload: dict[str, Any],
-    ) -> AsyncIterator[Any]:
-        actions = _responses_web_search_bridge_module._web_search_actions_for_request(payload, request_data)
-        _trace_module._request_route_trace(
-            "external_web_search_bridge_guarded_stream_function_call_intercept", request_data, include_route_identity=True,
-            activity="upstream_model",
-            request=_trace_module._trace_request_summary(request_data),
-            response=_trace_module._trace_response_summary(payload, request_data),
-            actions=actions,
-            stream_event_count=completion_state.event_count,
-        )
-        original_function = _responses_execution_module._responses_bridge_original_function(request_data)
-        async for resolved_chunk in _responses_web_search_bridge_module._resolve_web_search_function_calls_stream_rounds(
-            payload,
-            request_data,
-            original_function,
-        ):
-            yield resolved_chunk
-
     def remember(chunk: Any) -> None:
-        nonlocal saw_image_generation_activity, saw_web_search_call_activity
-        nonlocal saw_visible_assistant_output_after_web_search
+        nonlocal saw_image_generation_activity
         event_tail.append(chunk)
         if len(event_tail) > _STREAM_ERROR_FALLBACK_START_BUFFER_CHUNKS:
             del event_tail[0]
         completion_state.remember(chunk)
-        remember_internal_bridge_item_id(chunk)
         saw_image_generation_activity = (
             saw_image_generation_activity
             or _image_generation_module._response_has_image_generation_activity(chunk)
@@ -4693,26 +4457,12 @@ async def _yield_guarded_original_stream(
                 chunk,
                 completed_output_items,
             )
-        web_search_activity_keys = stream_chunk_web_search_activity_keys(chunk)
-        chunk_has_web_search = bool(web_search_activity_keys) or stream_chunk_has_web_search_call_activity(chunk)
-        if web_search_activity_keys:
-            new_web_search_keys = web_search_activity_keys - seen_web_search_activity_keys
-            seen_web_search_activity_keys.update(web_search_activity_keys)
-        else:
-            new_web_search_keys = set()
-        if new_web_search_keys or (chunk_has_web_search and not web_search_activity_keys):
-            _routing_module._mark_external_web_search_started_for_request(request_data)
-            saw_web_search_call_activity = True
-            saw_visible_assistant_output_after_web_search = False
-        if saw_web_search_call_activity and stream_chunk_has_visible_assistant_text_output(chunk):
-            saw_visible_assistant_output_after_web_search = True
-
     def synthesized_text() -> str:
         return completion_state.synthesized_text()
 
     def completed_output_is_tool_call_only() -> bool:
         return bool(completed_output_items) and all(
-            _stream_output_item_is_tool_call(_responses_web_search_bridge_module._response_item_get(item, "type"))
+            _stream_output_item_is_tool_call(_web_search_native_module._response_item_get(item, "type"))
             for item in completed_output_items.values()
         )
 
@@ -4722,95 +4472,6 @@ async def _yield_guarded_original_stream(
             for item in completed_output_items.values()
         )
 
-    def output_item_is_web_search_only_tool(item: Any) -> bool:
-        json_item = _jsonable(item)
-        if not isinstance(json_item, dict):
-            return False
-        if json_item.get("type") == "web_search_call":
-            return True
-        return _responses_web_search_bridge_module._is_web_search_function_call_item(json_item)
-
-    def output_item_has_visible_assistant_text(item: Any) -> bool:
-        return _response_item_has_assistant_text(item)
-
-    def web_search_activity_key_from_item(item: Any, output_index: Any = None) -> Optional[str]:
-        json_item = _jsonable(item)
-        if not isinstance(json_item, dict) or not output_item_is_web_search_only_tool(json_item):
-            return None
-        item_id = _stream_output_item_key(json_item)
-        if isinstance(item_id, str) and item_id:
-            return f"id:{item_id}"
-        action = web_search_call_action_from_item(json_item)
-        if action is not None:
-            return "action:" + _responses_web_search_bridge_module._external_web_search_action_key(action)
-        if isinstance(output_index, int):
-            return f"output_index:{output_index}"
-        return None
-
-    def stream_chunk_web_search_activity_keys(chunk: Any) -> set[str]:
-        dumped = _stream_chunk_dump(chunk)
-        chunk_type = _stream_chunk_type(dumped)
-        keys: set[str] = set()
-        if chunk_type in {"response.output_item.added", "response.output_item.done"}:
-            key = web_search_activity_key_from_item(dumped.get("item"), dumped.get("output_index"))
-            if key:
-                keys.add(key)
-            return keys
-        if chunk_type == "response.web_search_call.completed":
-            item_id = dumped.get("item_id") or dumped.get("id") or dumped.get("call_id")
-            if isinstance(item_id, str) and item_id:
-                keys.add(f"id:{item_id}")
-                return keys
-            action = dumped.get("action")
-            if isinstance(action, dict):
-                action_type = _responses_web_search_bridge_module._external_web_search_action_name(action.get("type"))
-                keyed_action: Optional[dict[str, str]] = None
-                if action_type == "search":
-                    query = action.get("query")
-                    if isinstance(query, str) and query.strip():
-                        keyed_action = {"type": "search", "query": query.strip()}
-                elif action_type == "openPage":
-                    url = action.get("url")
-                    if isinstance(url, str) and url.strip():
-                        keyed_action = {"type": "openPage", "url": url.strip()}
-                elif action_type == "findInPage":
-                    url = action.get("url")
-                    pattern = action.get("pattern") or action.get("text") or action.get("needle")
-                    if isinstance(url, str) and url.strip() and isinstance(pattern, str) and pattern.strip():
-                        keyed_action = {"type": "findInPage", "url": url.strip(), "pattern": pattern.strip()}
-                if keyed_action is not None:
-                    keys.add("action:" + _responses_web_search_bridge_module._external_web_search_action_key(keyed_action))
-                    return keys
-            output_index = dumped.get("output_index")
-            if isinstance(output_index, int):
-                keys.add(f"output_index:{output_index}")
-            return keys
-        if _responses_stream_chunk_is_completed(dumped):
-            response = dumped.get("response")
-            output = response.get("output") if isinstance(response, dict) else None
-            if isinstance(output, list):
-                for output_index, item in enumerate(output):
-                    key = web_search_activity_key_from_item(item, output_index)
-                    if key:
-                        keys.add(key)
-            return keys
-        return keys
-
-    def stream_chunk_has_web_search_call_activity(chunk: Any) -> bool:
-        dumped = _stream_chunk_dump(chunk)
-        chunk_type = _stream_chunk_type(dumped)
-        if chunk_type in {"response.output_item.added", "response.output_item.done"}:
-            return output_item_is_web_search_only_tool(dumped.get("item"))
-        if chunk_type == "response.web_search_call.completed":
-            return True
-        if _responses_stream_chunk_is_completed(dumped):
-            response = dumped.get("response")
-            output = response.get("output") if isinstance(response, dict) else None
-            return isinstance(output, list) and any(
-                output_item_is_web_search_only_tool(item) for item in output
-            )
-        return False
-
     def stream_chunk_has_visible_assistant_text_output(chunk: Any) -> bool:
         dumped = _stream_chunk_dump(chunk)
         chunk_type = _stream_chunk_type(dumped)
@@ -4818,497 +4479,8 @@ async def _yield_guarded_original_stream(
         if text_fragment.strip():
             return True
         if chunk_type in {"response.output_item.added", "response.output_item.done"}:
-            return output_item_has_visible_assistant_text(dumped.get("item"))
-        if _responses_stream_chunk_is_completed(dumped):
-            response = dumped.get("response")
-            return _responses_web_search_bridge_module._external_web_search_has_completed_assistant_message(
-                response,
-            )
+            return _response_item_has_assistant_text(dumped.get("item"))
         return False
-
-    def completed_output_is_web_search_call_only() -> bool:
-        if completed_output_has_visible_assistant_text() or synthesized_text().strip():
-            return False
-        items = [item for item in completed_output_items.values() if isinstance(item, dict)]
-        items.extend(
-            item
-            for _index, item in pending_tool_items.values()
-            if isinstance(item, dict)
-        )
-        return bool(items) and all(output_item_is_web_search_only_tool(item) for item in items)
-
-    def completed_output_has_web_search_call() -> bool:
-        items = [item for item in completed_output_items.values() if isinstance(item, dict)]
-        items.extend(
-            item
-            for _index, item in pending_tool_items.values()
-            if isinstance(item, dict)
-        )
-        return any(output_item_is_web_search_only_tool(item) for item in items)
-
-    def missing_answer_after_web_search() -> bool:
-        return (
-            saw_web_search_call_activity
-            and not saw_visible_assistant_output_after_web_search
-            and not completed_output_has_visible_assistant_text()
-            and (
-                completed_output_is_web_search_call_only()
-                or (bridge_search_intercepted and not synthesized_text().strip())
-            )
-        )
-
-    def external_web_search_recovery_allowed(exception: Optional[Exception]) -> bool:
-        if _responses_web_search_bridge_module._external_web_search_is_recovery_payload(
-            request_data,
-        ):
-            return True
-        metadata = _request_context_module._request_metadata_dict(
-            request_data,
-            "litellm_metadata",
-        ) or {}
-        if metadata.get(_WEB_SEARCH_EXTERNAL_BRIDGE_KEY) is True:
-            return True
-        if _responses_web_search_bridge_module._external_web_search_has_recovery_context(
-            request_data,
-            exception,
-        ):
-            return True
-        if exception is None:
-            return False
-        return _routing_module._is_native_responses_web_search_unsupported_error(
-            exception,
-            request_data,
-        )
-
-    def web_search_missing_answer_failed_event(
-        reason: str,
-        exception: Optional[Exception] = None,
-    ) -> _JSONStreamEvent:
-        if exception is not None:
-            _routing_module._mark_exception_for_deployment_failover(
-                exception,
-                request_data,
-            )
-        return failed_terminal_event(reason, exception)
-
-    def current_completed_output() -> list[dict[str, Any]]:
-        return [
-            copy.deepcopy(item)
-            for _index, item in sorted(completed_output_items.items(), key=lambda entry: entry[0])
-            if isinstance(item, dict)
-        ]
-
-    def web_search_call_action_from_item(item: dict[str, Any]) -> Optional[dict[str, str]]:
-        if item.get("type") != "web_search_call":
-            return None
-        raw_action = item.get("action")
-        raw_action = raw_action if isinstance(raw_action, dict) else {}
-        bridge_action = raw_action.get("bridge_action")
-        lookup_action = bridge_action if isinstance(bridge_action, dict) else raw_action
-        clean_item = _responses_web_search_bridge_module._sanitize_web_search_call_item(item)
-        if not isinstance(clean_item, dict):
-            return None
-        clean_action = clean_item.get("action")
-        if not isinstance(clean_action, dict):
-            return None
-        action_type = _responses_web_search_bridge_module._external_web_search_action_name(
-            lookup_action.get("type") or clean_action.get("type")
-        )
-        if action_type == "openPage":
-            url = lookup_action.get("url") or clean_action.get("url")
-            if isinstance(url, str) and url.strip():
-                return {"type": "openPage", "url": url.strip()}
-            return None
-        if action_type == "findInPage":
-            url = lookup_action.get("url") or clean_action.get("url")
-            pattern = (
-                lookup_action.get("pattern")
-                or lookup_action.get("text")
-                or lookup_action.get("needle")
-                or clean_action.get("pattern")
-                or clean_action.get("text")
-                or clean_action.get("needle")
-            )
-            if (
-                isinstance(url, str)
-                and url.strip()
-                and isinstance(pattern, str)
-                and pattern.strip()
-            ):
-                return {
-                    "type": "findInPage",
-                    "url": url.strip(),
-                    "pattern": pattern.strip(),
-                }
-            return None
-        query = lookup_action.get("query") or clean_action.get("query") or clean_item.get("query")
-        if isinstance(query, str) and query.strip():
-            return {"type": "search", "query": query.strip()}
-        return None
-
-    def web_search_call_actions_from_output() -> list[dict[str, str]]:
-        actions: list[dict[str, str]] = []
-        seen: set[str] = set()
-        for item in current_completed_output():
-            action = web_search_call_action_from_item(item)
-            if action is None:
-                continue
-            key = _responses_web_search_bridge_module._external_web_search_action_key(action)
-            if key in seen:
-                continue
-            seen.add(key)
-            actions.append(action)
-        return actions
-
-    async def hidden_web_search_evidence_for_recovery() -> tuple[
-        str,
-        list[str],
-        list[dict[str, str]],
-        list[str],
-    ]:
-        actions = web_search_call_actions_from_output()
-        if not actions:
-            return "", [], [], []
-        try:
-            run_search_action = _responses_web_search_bridge_module._external_web_search_run_action
-            page_cache: dict[str, str] = {}
-            page_fetch_tasks: dict[str, asyncio.Task[str]] = {}
-            action_results = [
-                await run_search_action(action, page_cache, page_fetch_tasks)
-                for action in actions
-            ]
-        except Exception as exc:
-            _trace_module._request_route_trace(
-                "responses_web_search_call_recovery_evidence_error", request_data,
-                actions=actions,
-                exception=_routing_module._trace_exception(exc),
-            )
-            return (
-                "",
-                _responses_web_search_bridge_module._external_web_search_action_labels(actions),
-                actions,
-                [],
-            )
-        sections = [section for section, _urls, _action in action_results]
-        completed_actions = [action for _section, _urls, action in action_results]
-        source_urls: list[str] = []
-        for _section, urls, _action in action_results:
-            for url in urls:
-                if url not in source_urls:
-                    source_urls.append(url)
-        message = "\n\n".join(section for section in sections if section.strip())
-        labels = _responses_web_search_bridge_module._external_web_search_action_labels(completed_actions or actions)
-        _trace_module._request_route_trace(
-            "responses_web_search_call_recovery_evidence_collected", request_data,
-            actions=labels,
-            evidence_chars=len(message or ""),
-        )
-        return message, labels, completed_actions or actions, source_urls
-
-    def visible_message_items_from_payload(payload: Any) -> list[dict[str, Any]]:
-        json_payload = _jsonable(payload)
-        output = json_payload.get("output") if isinstance(json_payload, dict) else None
-        if not isinstance(output, list):
-            return []
-        messages: list[dict[str, Any]] = []
-        for item in output:
-            if not isinstance(item, dict) or item.get("type") != "message":
-                continue
-            if _responses_output_module._response_text(item).strip():
-                messages.append(item)
-        return messages
-
-    def message_stream_events(item: dict[str, Any], index: int) -> list[_JSONStreamEvent]:
-        return [
-            _JSONStreamEvent(event)
-            for event in _responses_web_search_bridge_module._message_item_stream_events(
-                item, index
-            )
-        ]
-
-    def search_tool_missing_answer_exception(
-        reason: str,
-        exception: Optional[Exception] = None,
-    ) -> Exception:
-        recovery_request = (
-            _responses_web_search_bridge_module._external_web_search_recovery_request_from_exception(
-                exception,
-            )
-            if exception is not None
-            else None
-        )
-        if exception is not None and _external_web_search_recovery_poll_error(exception):
-            _routing_module._mark_exception_for_deployment_failover(exception, request_data)
-            return exception
-        recovery_exception = RuntimeError(
-            f"Responses web_search stream ended without a visible assistant answer: {reason}"
-        )
-        if isinstance(recovery_request, dict):
-            _responses_web_search_bridge_module._external_web_search_set_recovery_request(
-                recovery_exception,
-                recovery_request,
-            )
-        try:
-            recovery_exception.status_code = 503  # type: ignore[attr-defined]
-        except Exception:
-            pass
-        try:
-            recovery_exception.body = {  # type: ignore[attr-defined]
-                "reason": "responses_web_search_missing_final_answer",
-                "stream_reason": reason,
-            }
-        except Exception:
-            pass
-        _routing_module._mark_exception_for_deployment_failover(recovery_exception, request_data)
-        return recovery_exception
-
-    async def yield_recovered_search_tool_answer(
-        reason: str,
-        exception: Optional[Exception] = None,
-    ) -> AsyncIterator[Any]:
-        if exception is not None and _routing_module._is_local_shutdown_exception(
-            exception
-        ):
-            return
-        if _responses_web_search_bridge_module._request_has_provider_native_web_search_event(
-            request_data
-        ):
-            yield web_search_missing_answer_failed_event(reason, exception)
-            return
-        if not external_web_search_recovery_allowed(exception):
-            yield web_search_missing_answer_failed_event(reason, exception)
-            return
-        recovery_exception = search_tool_missing_answer_exception(reason, exception)
-        bridge_payload = bridge_payload_from_state(require_finished_arguments=False)
-        if bridge_payload is not None:
-            try:
-                async for resolved_chunk in yield_resolved_bridge_stream(
-                    bridge_payload,
-                    bridge_payload,
-                ):
-                    yield resolved_chunk
-                return
-            except Exception as bridge_exc:
-                recovery_exception = search_tool_missing_answer_exception(
-                    "bridge resolution after web_search-only stream failed",
-                    bridge_exc,
-                )
-
-        evidence_task = asyncio.create_task(hidden_web_search_evidence_for_recovery())
-        try:
-            while True:
-                # A task that has already finished must be consumed instead of
-                # re-awaited.  ``wait_for`` cancels the shielded inner future on
-                # timeout, but a task that raised ``asyncio.TimeoutError`` itself
-                # (the shape every bridged sub-call and socket read uses) makes
-                # the very same exception surface as the wait's own timeout: the
-                # guard below is what tells a real silence apart from a finished
-                # read.  Without it this loop re-awaits a settled task with no
-                # suspension point and spins at full core until the client
-                # disappears -- idle energy the battery panel then reports as
-                # this app's.  Resolve the done case through ``.result()`` so the
-                # attempt fails with the error it actually raised.
-                if evidence_task.done():
-                    (
-                        search_results,
-                        completed_labels,
-                        completed_actions_for_recovery,
-                        source_urls_for_recovery,
-                    ) = evidence_task.result()
-                    break
-                try:
-                    (
-                        search_results,
-                        completed_labels,
-                        completed_actions_for_recovery,
-                        source_urls_for_recovery,
-                    ) = await asyncio.wait_for(
-                        asyncio.shield(evidence_task),
-                        timeout=_ROUTE_RECOVERY_SSE_KEEPALIVE_SECONDS,
-                    )
-                    break
-                except asyncio.TimeoutError:
-                    if evidence_task.done():
-                        # The evidence read may settle exactly at the keepalive
-                        # boundary; consume its outcome on the next pass rather
-                        # than emitting a tick for a finished task.
-                        continue
-                    yield _route_recovery_sse_keepalive(
-                        0,
-                        request_data=request_data,
-                        phase="web_search_evidence",
-                    )
-        finally:
-            if not evidence_task.done():
-                evidence_task.cancel()
-        recovered_payload: Optional[dict[str, Any]] = None
-        if (
-            _routing_module._recovery_max_seconds_for_request(request_data) > 0
-            and (
-                _external_web_search_recovery_poll_error(recovery_exception)
-                or search_results.strip()
-            )
-        ):
-            events: list[Any] = []
-            try:
-                if search_results.strip():
-                    existing_recovery_request = (
-                        _responses_web_search_bridge_module._external_web_search_recovery_request_from_exception(
-                            recovery_exception
-                        )
-                        or _responses_web_search_bridge_module._external_web_search_pending_recovery_request(
-                            request_data
-                        )
-                    )
-                    if (
-                        _responses_web_search_bridge_module._external_web_search_recovery_payload_phase(
-                            existing_recovery_request
-                        )
-                        == "continuation"
-                    ):
-                        recovery_request = (
-                            _responses_web_search_bridge_module._external_web_search_recovery_kwargs(
-                                request_data,
-                                search_results=search_results,
-                                exception=recovery_exception,
-                            )
-                        )
-                    else:
-                        continuation_request = (
-                            _responses_web_search_bridge_module._external_web_search_prepare_continuation_recovery_request(
-                                request_kwargs=request_data,
-                                search_results=search_results,
-                                queries=completed_labels,
-                                completed_actions=completed_actions_for_recovery,
-                                round_number=1,
-                            )
-                        )
-                        _responses_web_search_bridge_module._external_web_search_set_recovery_request(
-                            recovery_exception,
-                            continuation_request,
-                        )
-                        recovery_request = continuation_request
-                else:
-                    recovery_request = (
-                        _responses_web_search_bridge_module._external_web_search_safe_request_base(
-                            request_data
-                        )
-                    )
-                    recovery_request["stream"] = True
-                async for recovery_chunk in _stream_route_recovery_poll(
-                    recovery_request,
-                    recovery_exception,
-                ):
-                    if _is_route_recovery_sse_keepalive(recovery_chunk):
-                        yield recovery_chunk
-                        continue
-                    events.append(recovery_chunk)
-            except Exception as recovery_exc:
-                _trace_module._request_route_trace(
-                    "responses_web_search_call_route_recovery_error", request_data,
-                    request=_trace_module._trace_request_summary(request_data),
-                    recovery_request=(
-                        _trace_module._trace_request_summary(recovery_request)
-                        if "recovery_request" in locals()
-                        else None
-                    ),
-                    original_exception=_routing_module._trace_exception(
-                        recovery_exception
-                    ),
-                    exception=_routing_module._trace_exception(recovery_exc),
-                )
-                recovery_exception = search_tool_missing_answer_exception(
-                    "route recovery after web_search-only stream failed",
-                    recovery_exc,
-                )
-            if events:
-                try:
-                    recovered_payload = _responses_stream_events_to_completed_payload(
-                        events,
-                        recovery_request,
-                    )
-                except Exception:
-                    recovered_payload = None
-        if not isinstance(recovered_payload, dict):
-            yield _synthesized_failed_response_event(request_data, recovery_exception)
-            return
-
-        recovered_output = recovered_payload.get("output")
-        recovered_non_search_items = [
-            item
-            for item in recovered_output
-            if isinstance(item, dict)
-            and item.get("type") != "web_search_call"
-            and not _responses_web_search_bridge_module._is_web_search_function_call_item(item)
-        ] if isinstance(recovered_output, list) else []
-        recovered_has_only_search_calls = not recovered_non_search_items
-        if recovered_has_only_search_calls:
-            original_function = _responses_execution_module._responses_bridge_original_function(
-                request_data
-            )
-            if original_function is not None:
-                try:
-                    continuation_request = (
-                        _responses_web_search_bridge_module._external_web_search_prepare_continuation_recovery_request(
-                            request_kwargs=request_data,
-                            search_results=search_results,
-                            queries=completed_labels,
-                            completed_actions=completed_actions_for_recovery,
-                            round_number=1,
-                            response=recovered_payload,
-                            round_evidence=search_results,
-                        )
-                    )
-                    continued = await _responses_web_search_bridge_module._external_web_search_call_original(
-                        original_function,
-                        continuation_request,
-                        request_kwargs=request_data,
-                        phase="continuation",
-                    )
-                    continued_payload = _jsonable(continued)
-                    if isinstance(continued_payload, dict):
-                        continued_output = continued_payload.get("output")
-                        continued_non_search_items = [
-                            item
-                            for item in continued_output
-                            if isinstance(item, dict)
-                            and item.get("type") != "web_search_call"
-                            and not _responses_web_search_bridge_module._is_web_search_function_call_item(item)
-                        ] if isinstance(continued_output, list) else []
-                        if not continued_non_search_items:
-                            raise RuntimeError(
-                                "route recovery continuation returned another web_search-only response"
-                            )
-                        recovered_payload = continued_payload
-                    else:
-                        raise RuntimeError("route recovery continuation returned no response")
-                except Exception as continuation_exc:
-                    recovery_exception = search_tool_missing_answer_exception(
-                        "route recovery continuation after duplicate web_search call failed",
-                        continuation_exc,
-                    )
-                    yield _synthesized_failed_response_event(
-                        request_data,
-                        recovery_exception,
-                    )
-                    return
-
-        final_output = current_completed_output()
-        for item in recovered_payload.get("output", []):
-            if not isinstance(item, dict):
-                continue
-            if item.get("type") == "web_search_call" or _responses_web_search_bridge_module._is_web_search_function_call_item(item):
-                continue
-            item = _responses_web_search_bridge_module._final_answer_message_item(item)
-            final_output.append(item)
-            if item.get("type") == "message":
-                index = len(final_output) - 1
-                for event in message_stream_events(item, index):
-                    yield event
-        recovered_payload = copy.deepcopy(recovered_payload)
-        recovered_payload["status"] = "completed"
-        recovered_payload["output"] = final_output
-        yield _JSONStreamEvent({"type": "response.completed", "response": recovered_payload})
 
     def terminal_completed_output_items(
         *,
@@ -5327,13 +4499,6 @@ async def _yield_guarded_original_stream(
         if synthesized_text().strip():
             return {}
         return None
-
-    def prune_internal_bridge_items() -> None:
-        for item_id in list(internal_bridge_item_ids):
-            pending_tool_items.pop(item_id, None)
-        for output_index, item in list(completed_output_items.items()):
-            if _responses_web_search_bridge_module._is_web_search_function_call_item(item):
-                completed_output_items.pop(output_index, None)
 
     def completed_terminal_event(
         reason: str,
@@ -5437,10 +4602,10 @@ async def _yield_guarded_original_stream(
         return _synthesized_failed_response_event(request_data, failure)
 
     for chunk in buffer:
-        _responses_web_search_bridge_module._mark_provider_native_web_search_event(
+        _web_search_native_module._mark_provider_native_web_search_event(
             request_data, chunk
         )
-        sanitized_chunk = _responses_web_search_bridge_module._sanitize_web_search_stream_chunk(
+        sanitized_chunk = _web_search_native_module._sanitize_web_search_stream_chunk(
             chunk,
             request_data,
         )
@@ -5454,15 +4619,6 @@ async def _yield_guarded_original_stream(
             continue
         remember(chunk)
         visible_output_seen = visible_output_seen or _stream_chunk_has_visible_output(chunk)
-        bridge_payload = bridge_payload_for_chunk(chunk)
-        if bridge_payload is not None:
-            bridge_search_intercepted = True
-            for closed_chunk in unclosed_client_visible_tool_completion_events():
-                remember(closed_chunk)
-                yield closed_chunk
-            async for resolved_chunk in yield_resolved_bridge_stream(chunk, bridge_payload):
-                yield resolved_chunk
-            return
         completed_compat_chunk = _responses_output_limit_incomplete_as_completed_chunk(
             chunk,
             request_data,
@@ -5487,15 +4643,6 @@ async def _yield_guarded_original_stream(
                 remember(synthetic_chunk)
                 remember_client_tool_call_exposure(synthetic_chunk)
                 yield synthetic_chunk
-            if missing_answer_after_web_search():
-                async for recovered_chunk in yield_recovered_search_tool_answer(
-                    "completed response event after web_search without final answer",
-                ):
-                    yield recovered_chunk
-                return
-            if should_suppress_internal_bridge_chunk(chunk):
-                await _close_async_iterator_safely(response)
-                return
             yield deliver_client_chunk(chunk)
             await _close_async_iterator_safely(response)
             return
@@ -5503,12 +4650,6 @@ async def _yield_guarded_original_stream(
             if _is_young_router_terminal_failure_event(chunk):
                 yield deliver_client_chunk(chunk)
                 await _close_async_iterator_safely(response)
-                return
-            if missing_answer_after_web_search():
-                async for recovered_chunk in yield_recovered_search_tool_answer(
-                    "terminal response event after web_search-only output",
-                ):
-                    yield recovered_chunk
                 return
             terminal_events = completed_custom_tool_terminal_events()
             for synthetic_chunk in terminal_events:
@@ -5553,8 +4694,6 @@ async def _yield_guarded_original_stream(
                 buffer=event_tail,
                 request_data=request_data,
             )
-        if should_suppress_internal_bridge_chunk(chunk):
-            continue
         undeclared_name = undeclared_tool_call_name(chunk)
         if undeclared_name is not None:
             _trace_module._request_route_trace(
@@ -5589,10 +4728,10 @@ async def _yield_guarded_original_stream(
             saw_visible_output=visible_output_seen,
             initial_chunk_count=len(buffer),
         ):
-            _responses_web_search_bridge_module._mark_provider_native_web_search_event(
+            _web_search_native_module._mark_provider_native_web_search_event(
                 request_data, chunk
             )
-            sanitized_chunk = _responses_web_search_bridge_module._sanitize_web_search_stream_chunk(
+            sanitized_chunk = _web_search_native_module._sanitize_web_search_stream_chunk(
                 chunk,
                 request_data,
             )
@@ -5621,13 +4760,6 @@ async def _yield_guarded_original_stream(
                         remember(completed)
                         yield completed
                         return
-                if missing_answer_after_web_search():
-                    async for recovered_chunk in yield_recovered_search_tool_answer(
-                        "stream error after web_search-only output",
-                        chunk_exception,
-                    ):
-                        yield recovered_chunk
-                    return
                 terminal_events = completed_custom_tool_terminal_events()
                 for synthetic_chunk in terminal_events:
                     remember(synthetic_chunk)
@@ -5640,15 +4772,6 @@ async def _yield_guarded_original_stream(
                 raise chunk_exception
             remember(chunk)
             visible_output_seen = visible_output_seen or _stream_chunk_has_visible_output(chunk)
-            bridge_payload = bridge_payload_for_chunk(chunk)
-            if bridge_payload is not None:
-                bridge_search_intercepted = True
-                for closed_chunk in unclosed_client_visible_tool_completion_events():
-                    remember(closed_chunk)
-                    yield closed_chunk
-                async for resolved_chunk in yield_resolved_bridge_stream(chunk, bridge_payload):
-                    yield resolved_chunk
-                return
             completed_compat_chunk = _responses_output_limit_incomplete_as_completed_chunk(
                 chunk,
                 request_data,
@@ -5668,15 +4791,6 @@ async def _yield_guarded_original_stream(
                 ):
                     remember(synthetic_chunk)
                     yield synthetic_chunk
-                if missing_answer_after_web_search():
-                    async for recovered_chunk in yield_recovered_search_tool_answer(
-                        "completed response event after web_search without final answer",
-                    ):
-                        yield recovered_chunk
-                    return
-                if should_suppress_internal_bridge_chunk(chunk):
-                    await _close_async_iterator_safely(response)
-                    return
                 yield deliver_client_chunk(chunk)
                 await _close_async_iterator_safely(response)
                 return
@@ -5684,12 +4798,6 @@ async def _yield_guarded_original_stream(
                 if _is_young_router_terminal_failure_event(chunk):
                     yield deliver_client_chunk(chunk)
                     await _close_async_iterator_safely(response)
-                    return
-                if missing_answer_after_web_search():
-                    async for recovered_chunk in yield_recovered_search_tool_answer(
-                        "terminal response event after web_search-only output",
-                    ):
-                        yield recovered_chunk
                     return
                 terminal_events = completed_custom_tool_terminal_events()
                 for synthetic_chunk in terminal_events:
@@ -5734,8 +4842,6 @@ async def _yield_guarded_original_stream(
                     buffer=event_tail,
                     request_data=request_data,
                 )
-            if should_suppress_internal_bridge_chunk(chunk):
-                continue
             yield deliver_client_chunk(chunk)
     except (Exception, asyncio.CancelledError) as exc:
         if isinstance(exc, asyncio.CancelledError) and not _routing_module._is_local_shutdown_exception(exc):
@@ -5770,13 +4876,6 @@ async def _yield_guarded_original_stream(
                 remember(completed)
                 yield completed
                 return
-        if missing_answer_after_web_search():
-            async for recovered_chunk in yield_recovered_search_tool_answer(
-                "stream error after web_search-only output",
-                exc,
-            ):
-                yield recovered_chunk
-            return
         terminal_events = completed_custom_tool_terminal_events()
         for synthetic_chunk in terminal_events:
             remember(synthetic_chunk)
@@ -5798,22 +4897,6 @@ async def _yield_guarded_original_stream(
         return
 
     if not saw_responses_completed:
-        bridge_payload = bridge_payload_from_state(require_finished_arguments=True)
-        if bridge_payload is not None:
-            bridge_search_intercepted = True
-            for closed_chunk in unclosed_client_visible_tool_completion_events():
-                remember(closed_chunk)
-                yield closed_chunk
-            async for resolved_chunk in yield_resolved_bridge_stream(
-                bridge_payload,
-                bridge_payload,
-            ):
-                yield resolved_chunk
-            return
-
-    prune_internal_bridge_items()
-
-    if not saw_responses_completed:
         terminal_events = completed_custom_tool_terminal_events()
         for synthetic_chunk in terminal_events:
             remember(synthetic_chunk)
@@ -5822,12 +4905,6 @@ async def _yield_guarded_original_stream(
             return
 
     if not saw_responses_completed and pending_tool_items:
-        if missing_answer_after_web_search():
-            async for recovered_chunk in yield_recovered_search_tool_answer(
-                "stream ended before response.completed",
-            ):
-                yield recovered_chunk
-            return
         for synthetic_chunk in _synthesized_pending_tool_completion_events(
             pending_tool_items,
             completed_output_items,
@@ -5840,12 +4917,6 @@ async def _yield_guarded_original_stream(
         return
 
     if not saw_responses_completed:
-        if missing_answer_after_web_search():
-            async for recovered_chunk in yield_recovered_search_tool_answer(
-                "stream ended before response.completed",
-            ):
-                yield recovered_chunk
-            return
         if visible_output_seen:
             incomplete_exception = _responses_incomplete_stream_exception(
                 "stream ended before response.completed",
@@ -5949,74 +5020,6 @@ async def _yield_streaming_error_fallback_or_raise(
     route_recovery_poll_payload = litellm_metadata.get(_ROUTE_RECOVERY_POLL_METADATA_KEY) is True
     if is_responses_stream and _routing_module._is_context_size_error(exception):
         raise exception
-    native_web_search_unsupported = (
-        is_responses_stream
-        and _routing_module._is_native_responses_web_search_unsupported_error(
-            exception,
-            request_data,
-        )
-        and not _responses_web_search_bridge_module._request_has_provider_native_web_search_event(
-            request_data
-        )
-    )
-    if (
-        _routing_module._should_block_external_web_search_original_recovery(
-            request_data
-        )
-        and not native_web_search_unsupported
-    ):
-        _trace_module._request_route_trace(
-            "external_web_search_original_stream_fallback_blocked", request_data,
-            request=_trace_module._trace_request_summary(request_data),
-            exception=_routing_module._trace_exception(exception),
-        )
-        yield _external_web_search_missing_answer_failed_event(request_data, exception)
-        return
-    if native_web_search_unsupported:
-        from . import responses_surfaces as _responses_surfaces_module
-
-        external_web_search_bridge_kwargs = (
-            _responses_surfaces_module._with_responses_external_web_search_bridge_after_native_error(
-                exception,
-                request_data,
-            )
-        )
-        original_function = _responses_execution_module._responses_bridge_original_function(
-            request_data,
-        )
-        if external_web_search_bridge_kwargs is not None and original_function is not None:
-            try:
-                bridge_response = await _responses_execution_module._execute_responses_native_web_search_bridge_call(
-                    original_function,
-                    external_web_search_bridge_kwargs,
-                    original_request_kwargs=request_data,
-                    outer_request_kwargs=request_data,
-                )
-            except Exception as bridge_exception:
-                exception = bridge_exception
-            else:
-                async for chunk in _yield_start_buffered_stream_with_error_fallback(
-                    bridge_response,
-                    external_web_search_bridge_kwargs,
-                ):
-                    yield chunk
-                return
-        if (
-            _routing_module._should_block_external_web_search_original_recovery(
-                request_data
-            )
-            and not native_web_search_unsupported
-        ):
-            _trace_module._request_route_trace(
-                "external_web_search_original_stream_fallback_blocked", request_data,
-                request=_trace_module._trace_request_summary(request_data),
-                exception=_routing_module._trace_exception(exception),
-            )
-            yield _external_web_search_missing_answer_failed_event(
-                request_data,
-                exception,
-            )
-            return
     fallback_start_buffer: List[Any] = []
     fallback_started_delivery = False
     fallback_delivered_terminal_or_visible = False
@@ -6028,21 +5031,6 @@ async def _yield_streaming_error_fallback_or_raise(
             payload = recovery_request.copy()
             payload["_route_recovery_ignore_local_constraints"] = True
             return payload
-
-        if _responses_web_search_bridge_module._external_web_search_has_recovery_context(
-            request_data,
-            exception,
-        ):
-            recovery_request = _responses_web_search_bridge_module._external_web_search_recovery_kwargs(
-                request_data,
-                exception=exception,
-            )
-            async for chunk in _stream_route_recovery_poll(
-                with_full_route_pool(recovery_request),
-                exception,
-            ):
-                yield chunk
-            return
 
         async for chunk in _stream_route_recovery_poll(
             with_full_route_pool(request_data),
@@ -6074,7 +5062,7 @@ async def _yield_streaming_error_fallback_or_raise(
         # that the group has no eligible deployment; then the shared cooldown
         # check can keep the original stream alive without an upstream probe.
         and _routing_module._is_no_deployments_available_error(exception)
-        and _external_web_search_recovery_poll_error(exception)
+        and _routing_module._is_route_recovery_poll_error(exception)
         and _route_recovery_poll_cooldown_wait(
             request_data,
             ignore_constraints=True,
@@ -6126,7 +5114,7 @@ async def _yield_streaming_error_fallback_or_raise(
                 supports_streaming_fallback
                 and not fallback_delivered_terminal_or_visible
                 and _routing_module._recovery_max_seconds_for_request(request_data) > 0
-                and _external_web_search_recovery_poll_error(exc)
+                and _routing_module._is_route_recovery_poll_error(exc)
             ):
                 _trace_module._request_route_trace(
                     "stream_fallback_route_recovery_poll", request_data,
@@ -6177,7 +5165,7 @@ async def _yield_streaming_error_fallback_or_raise(
         and _routing_module._recovery_max_seconds_for_request(request_data) > 0
         and (
             network_recovery
-            or _external_web_search_recovery_poll_error(final_exception)
+            or _routing_module._is_route_recovery_poll_error(final_exception)
         )
     ):
         yielded_recovery = False
@@ -6200,7 +5188,7 @@ async def _yield_streaming_error_fallback_or_raise(
         and (
             recovery_exception is None
             or _routing_module._is_network_recovery_exception(recovery_exception)
-            or _external_web_search_recovery_poll_error(final_exception)
+            or _routing_module._is_route_recovery_poll_error(final_exception)
         )
     ):
         # Never turn an offline upstream into the CancelledError escape hatch
@@ -6240,7 +5228,6 @@ async def _yield_streaming_error_fallback_or_raise(
         )
     raise exception
 
-
 async def _yield_start_buffered_stream_with_error_fallback(
     response: Any,
     request_data: dict,
@@ -6266,42 +5253,6 @@ async def _yield_start_buffered_stream_with_error_fallback(
     ):
         failed_exception = getattr(response, "exception", None)
         failed_request = getattr(response, "request_data", None)
-        if (
-            isinstance(failed_exception, Exception)
-            and isinstance(failed_request, dict)
-            and _routing_module._is_native_responses_web_search_unsupported_error(
-                failed_exception,
-                failed_request,
-            )
-            and not _responses_web_search_bridge_module._request_has_provider_native_web_search_event(
-                failed_request
-            )
-        ):
-            from . import responses_surfaces as _responses_surfaces_module
-
-            bridge_kwargs = (
-                _responses_surfaces_module._with_responses_external_web_search_bridge_after_native_error(
-                    failed_exception,
-                    failed_request,
-                    failed_request,
-                )
-            )
-            original_function = _responses_execution_module._responses_bridge_original_function(
-                failed_request
-            )
-            if bridge_kwargs is not None and original_function is not None:
-                bridge_response = await _responses_execution_module._execute_responses_native_web_search_bridge_call(
-                    original_function,
-                    bridge_kwargs,
-                    original_request_kwargs=failed_request,
-                    outer_request_kwargs=failed_request,
-                )
-                async for chunk in _yield_start_buffered_stream_with_error_fallback(
-                    bridge_response,
-                    bridge_kwargs,
-                ):
-                    yield chunk
-                return
         async for chunk in response:
             yield chunk
         return
@@ -6337,14 +5288,10 @@ async def _yield_start_buffered_stream_with_error_fallback(
     is_responses_stream = _request_is_responses_stream(request_data)
     saw_responses_completed = False
     saw_visible_output = False
-    should_delay_web_search_preamble = (
-        is_responses_stream
-        and _tools_module._request_should_consume_web_search_function_call(request_data)
-    )
     stream_exhausted = True
     stream_started_at = time.monotonic()
     completion_state = _ResponsesStreamCompletionState(request_data)
-    raw_tool_call_text_filter = _responses_web_search_bridge_module._RawToolCallTextFilter()
+    raw_tool_call_text_filter = _web_search_native_module._RawToolCallTextFilter()
 
     try:
         stream = _stream_with_idle_timeout(
@@ -6359,16 +5306,16 @@ async def _yield_start_buffered_stream_with_error_fallback(
                 stream_started_at=stream_started_at,
             )
         async for chunk in stream:
-            _responses_web_search_bridge_module._mark_provider_native_web_search_event(
+            _web_search_native_module._mark_provider_native_web_search_event(
                 request_data, chunk
             )
-            sanitized_chunk = _responses_web_search_bridge_module._sanitize_web_search_stream_chunk(
+            sanitized_chunk = _web_search_native_module._sanitize_web_search_stream_chunk(
                 chunk,
                 request_data,
             )
             if sanitized_chunk is None:
                 continue
-            sanitized_chunk = _responses_web_search_bridge_module._sanitize_raw_tool_call_text_stream_chunk(
+            sanitized_chunk = _web_search_native_module._sanitize_raw_tool_call_text_stream_chunk(
                 sanitized_chunk,
                 raw_tool_call_text_filter,
                 request_data,
@@ -6414,32 +5361,6 @@ async def _yield_start_buffered_stream_with_error_fallback(
             buffer.append(chunk)
             if is_responses_stream:
                 completion_state.remember(chunk)
-            if (
-                is_responses_stream
-                and _tools_module._request_should_consume_web_search_function_call(request_data)
-                and _responses_web_search_bridge_module._has_web_search_actions_for_request(
-                    completion_state.completed_payload(request_data),
-                    request_data,
-                )
-            ):
-                payload = completion_state.completed_payload(request_data)
-                _trace_module._request_route_trace(
-                    "external_web_search_bridge_stream_function_call_intercept", request_data, include_route_identity=True,
-            activity="upstream_model",
-                    request=_trace_module._trace_request_summary(request_data),
-                    response=_trace_module._trace_response_summary(payload, request_data),
-                    actions=_responses_web_search_bridge_module._web_search_actions_for_request(payload, request_data),
-                    buffered_chunks=len(buffer),
-                )
-                await _close_async_iterator_safely(response)
-                original_function = _responses_execution_module._responses_bridge_original_function(request_data)
-                async for resolved_chunk in _responses_web_search_bridge_module._resolve_web_search_function_calls_stream_rounds(
-                    payload,
-                    request_data,
-                    original_function,
-                ):
-                    yield resolved_chunk
-                return
             saw_visible_output = saw_visible_output or (
                 _stream_chunk_has_visible_output(chunk)
             )
@@ -6502,19 +5423,11 @@ async def _yield_start_buffered_stream_with_error_fallback(
                     ):
                         yield fallback_chunk
                     return
-            chunk_is_delayed_web_search_preamble = (
-                should_delay_web_search_preamble
-                and _stream_chunk_is_assistant_text_without_tool_activity(chunk)
-            )
             if (
-                (
-                    saw_visible_output
-                    and not chunk_is_delayed_web_search_preamble
-                )
+                saw_visible_output
                 or saw_responses_completed
                 or (
                     len(buffer) >= _STREAM_ERROR_FALLBACK_START_BUFFER_CHUNKS
-                    and not should_delay_web_search_preamble
                     and not is_responses_stream
                 )
             ):
@@ -6608,7 +5521,6 @@ async def _yield_start_buffered_stream_with_error_fallback(
     ):
         yield chunk
 
-
 # The recovery conversation moved to young_router.proxy.streaming_recovery; the
 # names stay importable here so every caller keeps its one entry point.
 from .streaming_recovery import (  # noqa: E402
@@ -6616,10 +5528,6 @@ from .streaming_recovery import (  # noqa: E402
     _chat_completions_stream_chunk_is_terminal,
     _configured_deployment_ids,
     _configured_deployment_orders,
-    _external_web_search_exception_has_recovery_request,
-    _external_web_search_recovery_payload_for_blocked_original,
-    _external_web_search_recovery_poll_error,
-    _is_external_web_search_synthesis_recovery_payload,
     _is_route_recovery_sse_keepalive,
     _is_stream_keepalive_chunk,
     _native_stream_chunk_is_terminal,

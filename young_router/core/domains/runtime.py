@@ -120,7 +120,6 @@ class RuntimeSettingsDomain:
     name = "runtime"
     _SECRET_KEYS = frozenset({
         "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON",
-        "YOUNG_ROUTER_PI_WEB_ACCESS_CONFIG_JSON",
     })
 
     def __init__(self, settings_path: Path | str | None = None):
@@ -439,10 +438,7 @@ class RuntimeSettingsDomain:
     def trusted_secret_value(self, field: str, target: str | None = None) -> str:
         """Return the one runtime JSON document authorized for native editing."""
 
-        if field != "setting" or target not in {
-            "YOUNG_ROUTER_PI_WEB_ACCESS_CONFIG_JSON",
-            "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON",
-        }:
+        if field != "setting" or target != "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON":
             raise DomainError("The requested secret field is unavailable")
         if target not in self.specs or not self._is_secret_setting(target):
             raise DomainError("The requested secret field is unavailable")

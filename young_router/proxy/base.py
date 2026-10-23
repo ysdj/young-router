@@ -837,18 +837,8 @@ _RESPONSES_NATIVE_CLIENT_TOOL_PASSTHROUGH_METADATA_KEY = (
     "responses_native_client_tool_passthrough"
 )
 _TOOL_SEARCH_BRIDGE_FUNCTION_NAME = "tool_search"
-# Names registered by the bundled pi-web-access extension. Hosted
-# web_search is a different Responses tool type; the proxy never exposes
-# both representations in the same upstream request.
-_PI_WEB_ACCESS_TOOL_NAMES = frozenset({"web_search", "fetch_content"})
 _RESPONSES_BRIDGE_NAMESPACE_KEY = "x-young-router-responses-namespace"
 _RESPONSES_BRIDGE_CUSTOM_TOOL_KEY = "x-young-router-responses-custom-tool"
-_WEB_SEARCH_EXTERNAL_BRIDGE_KEY = "external_web_search_bridge"
-_WEB_SEARCH_EXTERNAL_BRIDGE_STREAM_KEY = "external_web_search_bridge_stream"
-_WEB_SEARCH_EXTERNAL_STARTED_METADATA_KEY = "external_web_search_started"
-_WEB_SEARCH_EXTERNAL_SUPPRESS_POST_CALL_KEY = (
-    "external_web_search_suppress_post_call"
-)
 _HOSTED_WEB_SEARCH_UNSUPPORTED_BRIDGE_KEY = (
     "hosted_web_search_unsupported_bridge"
 )
@@ -868,21 +858,7 @@ _ROUTE_TRACE_PREVIEW_DEFAULT_CHARS = 2000
 _ROUTE_TRACE_PREVIEW_MAX_CHARS = 2000
 _ROUTE_TRACE_LIST_SCAN_ITEMS = 40
 _RECENT_REQUESTS_LOG_ENV = "LITELLM_RECENT_REQUESTS_LOG"
-_EXTERNAL_WEB_SEARCH_MAX_RESULTS_ENV = "YOUNG_ROUTER_WEB_SEARCH_MAX_RESULTS"
-_EXTERNAL_WEB_SEARCH_READ_CHARS_ENV = "YOUNG_ROUTER_WEB_SEARCH_READ_CHARS"
-_EXTERNAL_WEB_FETCH_TIMEOUT_ENV = "YOUNG_ROUTER_WEB_FETCH_TIMEOUT_SECONDS"
-_EXTERNAL_WEB_SEARCH_MAX_ROUNDS_ENV = "YOUNG_ROUTER_WEB_SEARCH_MAX_ROUNDS"
-_EXTERNAL_WEB_SEARCH_MAX_QUERIES_ENV = "YOUNG_ROUTER_WEB_SEARCH_MAX_QUERIES"
-_EXTERNAL_WEB_SEARCH_MAX_OPEN_PAGES_ENV = "YOUNG_ROUTER_WEB_SEARCH_MAX_OPEN_PAGES"
-_EXTERNAL_WEB_SEARCH_MAX_FIND_IN_PAGE_ENV = "YOUNG_ROUTER_WEB_SEARCH_MAX_FIND_IN_PAGE"
 _DSH_VISION_ROUTER_CONFIG_ENV = "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON"
-_EXTERNAL_WEB_SEARCH_MAX_RESULTS_DEFAULT = 5
-_EXTERNAL_WEB_SEARCH_READ_CHARS_DEFAULT = 1400
-_EXTERNAL_WEB_FETCH_TIMEOUT_DEFAULT = 12.0
-_EXTERNAL_WEB_SEARCH_MAX_ROUNDS_DEFAULT = 8
-_EXTERNAL_WEB_SEARCH_MAX_QUERIES_DEFAULT = 16
-_EXTERNAL_WEB_SEARCH_MAX_OPEN_PAGES_DEFAULT = 8
-_EXTERNAL_WEB_SEARCH_MAX_FIND_IN_PAGE_DEFAULT = 12
 _INTERNAL_CONTEXT_PREFIXES = (
     "another language model started to solve this problem",
     "<codex_internal_context",
@@ -943,10 +919,6 @@ _SESSION_DEPLOYMENT_AFFINITY_LOCK = threading.Lock()
 _SESSION_DEPLOYMENT_AFFINITY: dict[str, dict[str, Any]] = {}
 _PROTOCOL_FALLBACK_LOCK = threading.Lock()
 _PROTOCOL_FALLBACKS: dict[str, dict[str, Any]] = {}
-_EXTERNAL_WEB_SEARCH_STARTED_REQUESTS_LOCK = threading.Lock()
-_EXTERNAL_WEB_SEARCH_STARTED_REQUESTS: dict[str, float] = {}
-_EXTERNAL_WEB_SEARCH_STARTED_REQUESTS_MAX = 512
-_EXTERNAL_WEB_SEARCH_STARTED_REQUESTS_TTL_SECONDS = 3600.0
 
 
 def _exception_text(exception: Exception) -> str:
@@ -1181,6 +1153,48 @@ _UPSTREAM_RELAY_CAPACITY_MARKERS = (
     "all accounts exhausted",
     "no available accounts",
 )
+# An upstream that answers "this account is restricted" is refusing the
+# account that pays for the route, not the bytes in the request.  Observed as a
+# plain HTTP 400 (`账号存在异常行为，已被限制使用`, "abnormal account behavior, use
+# restricted") relayed by a local worker: read as the request's own verdict it
+# was terminal, so no route was cooled, every retry selected the same dead
+# account first, and a turn ended on the unclassified-stop sentence while a
+# sibling route was answering the same request.  The wording, not the status, is
+# the evidence that a replay would be refused the same way.
+_UPSTREAM_ACCOUNT_RESTRICTED_ERROR_MARKERS = (
+    "账号存在异常行为",
+    "账户存在异常行为",
+    "账号已被限制",
+    "账号被限制使用",
+    "账户已被限制",
+    "account has been restricted",
+    "account is restricted",
+    "account has been suspended",
+    "account is suspended",
+    "account has been banned",
+    "account is banned",
+    "account is disabled",
+)
+# A route that validates the replayed tool history more strictly than its peers
+# refuses a conversation that was cut between a tool call and its output with
+# `工具记录不完整，请新建任务` ("tool records incomplete, create a new task").
+# Observed after a turn was interrupted mid-tool: the router ended the whole
+# turn on that route with the unclassified-stop sentence, so the client retried
+# the same history against the same route.  The refusal belongs to that route's
+# tolerance of the replay -- a peer may accept it -- and the one action that
+# changes it is starting a new task.
+_UPSTREAM_TOOL_HISTORY_REJECTION_MARKERS = (
+    "工具记录不完整",
+    "工具调用记录不完整",
+    "工具记录缺失",
+    "tool records are incomplete",
+    "tool call history is incomplete",
+    "incomplete tool call history",
+    # Tken states the same verdict in English; the words are what makes the
+    # cause recognisable, the status (400) alone reads as the request's fault.
+    "tool calls and tool results do not match",
+    "tool_calls and tool_results do not match",
+)
 _UPSTREAM_TEMPORARY_ERROR_CLASS_NAMES = {
     "APIConnectionError",
     "APIError",
@@ -1231,7 +1245,7 @@ _RESPONSES_STREAM_INCOMPLETE_TYPES = {
 _RESPONSES_STREAM_INCOMPLETE_STATUSES = {"failed", "incomplete", "cancelled"}
 # OpenAI's Hosted Responses tools use the first two wire types. OpenRouter's
 # server-side web-search tool is provider-native but still participates in the
-# same hosted-tool planning/fallback decisions; it is not a pi-web-access
+# same hosted-tool planning/fallback decisions; it is not a web-search-bridge
 # function declaration.
 _PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES = {
     "openrouter:web_search",

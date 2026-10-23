@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import json
 
-from ..adapters import pi_web_access as _pi_web_access_module
-from . import responses_web_search_bridge as _responses_web_search_bridge_module
 from . import request_context as _request_context_module
 from . import routing as _routing_module
 from . import tools as _tools_module
@@ -367,59 +365,6 @@ def _responses_bridge_provider_native_web_search_tool(tool: Any) -> Optional[dic
     if tool.get("type") not in _PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES:
         return None
     return copy.deepcopy(tool)
-
-
-def _pi_web_access_tool_definitions() -> list[dict[str, Any]]:
-    """Return the shared client and proxy declaration for pi-web-access."""
-    return _pi_web_access_module._pi_web_access_tool_definitions()
-
-
-def _responses_external_web_search_bridge_tools(
-    tools: Any,
-) -> tuple[Optional[list[dict]], dict[str, Any]]:
-    if not isinstance(tools, list):
-        return None, {"changed": False}
-
-    bridged_tools: list[dict] = []
-    bridged_web_search_tools = 0
-    has_direct_search_tool = _tools_module._tools_include_pi_web_access_tool(tools)
-    for tool in tools:
-        if not isinstance(tool, dict):
-            continue
-        if tool.get("type") in ({"web_search", "web_search_preview"} | _PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES):
-            # Replace only hosted/provider-native declarations.  A plain
-            # function named ``web_search`` is already the pi-web-access
-            # contract and must keep its arguments and call identity.
-            bridged_web_search_tools += 1
-            if not has_direct_search_tool:
-                bridged_tools.extend(_pi_web_access_tool_definitions())
-                has_direct_search_tool = True
-            continue
-        bridged_tools.append(copy.deepcopy(tool))
-
-    changed = bridged_web_search_tools > 0 and bridged_tools != tools
-    stats = {
-        "changed": changed,
-        "original_count": len(tools),
-        "kept_count": len(bridged_tools),
-        "bridged_web_search_tools": bridged_web_search_tools,
-        "kept_tool_types": _trace_module._trace_tool_types(bridged_tools),
-        "kept_tool_names": _trace_module._trace_tool_names(bridged_tools),
-    }
-    return bridged_tools if changed else None, stats
-
-
-def _responses_external_web_search_bridge_tool_choice(tool_choice: Any) -> Any:
-    if not isinstance(tool_choice, dict):
-        return tool_choice
-    if tool_choice.get("type") not in ({"web_search", "web_search_preview"} | _PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES):
-        return tool_choice
-    # A hosted tool choice cannot be represented after the fallback becomes an
-    # ordinary pi-web-access function. Keep the model's normal choice policy;
-    # do not force a particular local function call.
-    return "auto"
-
-
 def _responses_input_tool_search_output_tool_names(value: Any) -> list[str]:
     names: list[str] = []
 
@@ -1105,8 +1050,7 @@ def _responses_chat_bridge_sanitize_tools(
     tools: Any,
     *,
     input_value: Any = None,
-    bridge_web_search: bool = True,
-    bridge_provider_native_web_search: bool = False,
+    keep_hosted_web_search: bool = False,
 ) -> tuple[Optional[list[dict]], Optional[dict], dict[str, Any]]:
     if not isinstance(tools, list):
         return None, None, {"changed": False}
@@ -1125,7 +1069,7 @@ def _responses_chat_bridge_sanitize_tools(
     bridged_namespace_tools = 0
     bridged_custom_tools = 0
     bridged_tool_search_output_tools = 0
-    bridged_web_search_tools = 0
+    dropped_web_search_tools = 0
     for tool in tools:
         tool_type = tool.get("type") if isinstance(tool, dict) else None
         converted = _responses_bridge_function_tool(tool)
@@ -1161,44 +1105,26 @@ def _responses_chat_bridge_sanitize_tools(
             tool
         )
         if provider_native_web_search is not None:
-            if bridge_provider_native_web_search:
-                added_local_web_tools = False
-                for direct_tool in _pi_web_access_tool_definitions():
-                    converted_direct_tool = _responses_bridge_function_tool(direct_tool)
-                    if converted_direct_tool is not None and _append_unique_chat_tool(
-                        sanitized,
-                        converted_direct_tool,
-                        seen_tool_names,
-                    ):
-                        added_local_web_tools = True
-                if added_local_web_tools:
-                    bridged_web_search_tools += 1
-                continue
             # Provider-native server tools do not have a Chat function name.
             # Route them by their declared type and keep the complete
-            # declaration intact; neither a Hosted declaration nor a client
-            # function bridge may silently replace it with pi-web-access.
+            # declaration intact; a Hosted declaration or a client function
+            # bridge must never silently replace one.
             if provider_native_web_search not in sanitized:
                 sanitized.append(provider_native_web_search)
             continue
-        converted_web_search_options = _responses_bridge_web_search_options(tool)
-        if converted_web_search_options is not None:
-            if not bridge_web_search:
+        if _responses_bridge_web_search_options(tool) is not None:
+            if keep_hosted_web_search:
+                # The request stays on the Responses surface, so the Hosted
+                # declaration is the caller's own tool: forward it untouched
+                # and let the upstream accept or refuse it in its own words.
                 sanitized.append(copy.deepcopy(tool))
                 continue
-            added_local_web_tools = False
-            for direct_tool in _pi_web_access_tool_definitions():
-                converted_direct_tool = _responses_bridge_function_tool(direct_tool)
-                if converted_direct_tool is not None and _append_unique_chat_tool(
-                    sanitized,
-                    converted_direct_tool,
-                    seen_tool_names,
-                ):
-                    added_local_web_tools = True
-            if added_local_web_tools:
-                # Count the hosted declaration being replaced, not each local
-                # function that represents it.
-                bridged_web_search_tools += 1
+            # Chat Completions has no hosted web_search tool. The declaration
+            # cannot be forwarded, so it is dropped rather than replaced: the
+            # proxy no longer executes searches on the model's behalf.
+            dropped_web_search_tools += 1
+            if tool_type not in dropped_types:
+                dropped_types.append(str(tool_type))
             continue
         if tool_type == "function":
             invalid_function_tools += 1
@@ -1221,7 +1147,7 @@ def _responses_chat_bridge_sanitize_tools(
     changed = (
         sanitized != tools
         or any(_responses_chat_bridge_tool_schema_has_empty_enum(tool) for tool in tools)
-        or bridged_web_search_tools > 0
+        or dropped_web_search_tools > 0
         or suppressed_tool_search_tools > 0
         or bridged_tool_search_output_tools > 0
     )
@@ -1236,7 +1162,7 @@ def _responses_chat_bridge_sanitize_tools(
         "bridged_namespace_tools": bridged_namespace_tools,
         "bridged_custom_tools": bridged_custom_tools,
         "bridged_tool_search_output_tools": bridged_tool_search_output_tools,
-        "bridged_web_search_tools": bridged_web_search_tools,
+        "dropped_web_search_tools": dropped_web_search_tools,
         "tool_search_output_tool_names": tool_search_output_tool_names[:40],
         "kept_tool_names": _trace_module._trace_tool_names(sanitized),
     }
@@ -1271,10 +1197,40 @@ def _append_responses_chat_bridge_instruction(
         retry_kwargs["instructions"] = note
 
 
+def _request_input_text(request_kwargs: Optional[dict]) -> str:
+    """Flatten the request's input/messages down to the text the model saw."""
+    request_kwargs = request_kwargs or {}
+    parts: list[str] = []
+
+    def append_text(value: Any, depth: int = 0) -> None:
+        if value is None or depth > 8 or len(parts) >= 80:
+            return
+        if isinstance(value, str):
+            if value.strip():
+                parts.append(value.strip())
+            return
+        if isinstance(value, list):
+            for item in value:
+                append_text(item, depth + 1)
+            return
+        if isinstance(value, dict):
+            value_type = value.get("type")
+            if isinstance(value_type, str) and value_type in {"input_text", "output_text"}:
+                append_text(value.get("text"), depth + 1)
+                return
+            for key in ("content", "text", "input", "message"):
+                if key in value:
+                    append_text(value.get(key), depth + 1)
+
+    append_text(request_kwargs.get("input"))
+    append_text(request_kwargs.get("messages"))
+    return "\n".join(parts[-20:]).strip()
+
+
 def _request_current_time_context(
     request_kwargs: Optional[dict],
 ) -> Optional[dict[str, str]]:
-    text = _responses_web_search_bridge_module._external_web_search_request_text(request_kwargs)
+    text = _request_input_text(request_kwargs)
     if not text:
         return None
 
@@ -1396,7 +1352,7 @@ def _responses_function_tool_bridge_sanitize_tool_choice(
 
     if tool_choice_type in {"web_search", "web_search_preview"}:
         # A hosted choice has no faithful representation after a fallback to
-        # local pi-web-access functions. Preserve normal model discretion.
+        # local search-bridge functions. Preserve normal model discretion.
         return "auto"
 
     if tool_choice_type in _PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES:

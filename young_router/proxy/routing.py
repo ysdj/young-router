@@ -74,10 +74,6 @@ from .base import (
     _QUOTA_RESET_COOLDOWN_HORIZON_DEFAULT_SECONDS,
     _QUOTA_RESET_COOLDOWN_HORIZON_SECONDS_ENV,
     _UPSTREAM_QUOTA_RESET_MARKERS,
-    _EXTERNAL_WEB_SEARCH_STARTED_REQUESTS,
-    _EXTERNAL_WEB_SEARCH_STARTED_REQUESTS_LOCK,
-    _EXTERNAL_WEB_SEARCH_STARTED_REQUESTS_MAX,
-    _EXTERNAL_WEB_SEARCH_STARTED_REQUESTS_TTL_SECONDS,
     _LITELLM_MODEL_GROUP_FALLBACK_EXHAUSTED_MARKERS,
     _RESPONSES_IMAGE_INPUT_SUPPORT_KEY,
     _UPSTREAM_PROTOCOL_MODE_FALLBACK,
@@ -143,9 +139,11 @@ from .base import (
     _SUPPORTS_WEB_SEARCH_KEY,
     _SURFACE_TARGET_DEPLOYMENT_ID_KEY,
     _TerminalFailedResponsesStreamResponse,
+    _UPSTREAM_ACCOUNT_RESTRICTED_ERROR_MARKERS,
     _UPSTREAM_BALANCE_ERROR_MARKERS,
     _UPSTREAM_HTML_BAD_REQUEST_MARKERS,
     _UPSTREAM_RELAY_CAPACITY_MARKERS,
+    _UPSTREAM_TOOL_HISTORY_REJECTION_MARKERS,
     _UPSTREAM_TEMPORARY_ERROR_CLASS_NAMES,
     _UPSTREAM_TEMPORARY_ERROR_MARKERS,
     _UPSTREAM_URL_SURFACE_ANTHROPIC,
@@ -155,7 +153,6 @@ from .base import (
     _UPSTREAM_URL_SURFACE_CHAT_BRIDGE_VALUES,
     _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES,
     _VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY,
-    _WEB_SEARCH_EXTERNAL_STARTED_METADATA_KEY,
     _XHIGH_REASONING_EFFORT,
     _exception_text,
     _is_local_shutdown_exception,
@@ -943,6 +940,23 @@ def _recovery_policy_for_exception(exception: Exception) -> str:
             _RECOVERY_POLICY_ERROR,
         )
 
+    # Read after the refusals above: a policy refusal keeps its own verdict even
+    # when its wording mentions the account.  One route's own account being
+    # restricted is a different fact -- no replay can change that answer, and a
+    # sibling route can still serve the same bytes.  Leaving it to the request
+    # error below kept the dead route first in every request and ended the turn
+    # on it, so it is parked instead and the request advances to the sibling.
+    if _is_upstream_account_restricted_error(exception):
+        return _recovery_policy_setting(
+            _RECOVERY_POLICY_REQUEST_ERROR_ENV,
+            _RECOVERY_POLICY_COOLDOWN,
+        )
+    if _is_upstream_tool_history_rejected_error(exception):
+        # The route refused *this replay* because its tool calls and outputs no
+        # longer pair up.  Another candidate may accept the same history, and
+        # the route itself is not broken, so this attempt moves on instead of
+        # ending the turn (the same reading as a refused thinking replay).
+        return _RECOVERY_POLICY_RECOVERY
     if _is_thinking_replay_contract_error(exception):
         # The route that refused is not broken -- it refuses a history that
         # dropped its own out-of-band thinking, and another route can answer
@@ -1010,88 +1024,6 @@ def _recovery_max_seconds() -> float:
         _RECOVERY_MAX_DEFAULT_SECONDS,
         minimum=0.0,
     )
-
-
-def _external_web_search_started_request_key(request_kwargs: Optional[dict]) -> Optional[str]:
-    request_id = _trace_request_id(request_kwargs)
-    if isinstance(request_id, str) and request_id.strip():
-        return request_id.strip()
-    return None
-
-
-def _prune_external_web_search_started_requests(now: Optional[float] = None) -> None:
-    current_time = time.monotonic() if now is None else now
-    expired = [
-        key
-        for key, started_at in _EXTERNAL_WEB_SEARCH_STARTED_REQUESTS.items()
-        if current_time - started_at > _EXTERNAL_WEB_SEARCH_STARTED_REQUESTS_TTL_SECONDS
-    ]
-    for key in expired:
-        _EXTERNAL_WEB_SEARCH_STARTED_REQUESTS.pop(key, None)
-    overflow = len(_EXTERNAL_WEB_SEARCH_STARTED_REQUESTS) - _EXTERNAL_WEB_SEARCH_STARTED_REQUESTS_MAX
-    if overflow <= 0:
-        return
-    oldest_keys = sorted(
-        _EXTERNAL_WEB_SEARCH_STARTED_REQUESTS,
-        key=lambda key: _EXTERNAL_WEB_SEARCH_STARTED_REQUESTS.get(key, 0.0),
-    )[:overflow]
-    for key in oldest_keys:
-        _EXTERNAL_WEB_SEARCH_STARTED_REQUESTS.pop(key, None)
-
-
-def _mark_external_web_search_started_for_request(request_kwargs: Optional[dict]) -> None:
-    if isinstance(request_kwargs, dict):
-        metadata = _request_context_module._request_metadata_dict(request_kwargs, "litellm_metadata") or {}
-        if metadata.get(_WEB_SEARCH_EXTERNAL_STARTED_METADATA_KEY) is not True:
-            updated_metadata = metadata.copy()
-            updated_metadata[_WEB_SEARCH_EXTERNAL_STARTED_METADATA_KEY] = True
-            request_kwargs["litellm_metadata"] = updated_metadata
-    key = _external_web_search_started_request_key(request_kwargs)
-    if key is None:
-        return
-    now = time.monotonic()
-    with _EXTERNAL_WEB_SEARCH_STARTED_REQUESTS_LOCK:
-        _prune_external_web_search_started_requests(now)
-        _EXTERNAL_WEB_SEARCH_STARTED_REQUESTS[key] = now
-
-
-def _request_has_started_external_web_search(request_kwargs: Optional[dict]) -> bool:
-    if isinstance(request_kwargs, dict):
-        for metadata_key in ("litellm_metadata", "metadata"):
-            metadata = _request_context_module._request_metadata_dict(request_kwargs, metadata_key) or {}
-            if metadata.get(_WEB_SEARCH_EXTERNAL_STARTED_METADATA_KEY) is True:
-                return True
-    key = _external_web_search_started_request_key(request_kwargs)
-    if key is None:
-        return False
-    now = time.monotonic()
-    with _EXTERNAL_WEB_SEARCH_STARTED_REQUESTS_LOCK:
-        _prune_external_web_search_started_requests(now)
-        return key in _EXTERNAL_WEB_SEARCH_STARTED_REQUESTS
-
-
-def _should_block_external_web_search_original_recovery(request_kwargs: Optional[dict]) -> bool:
-    if not _request_has_started_external_web_search(request_kwargs):
-        return False
-    for metadata_key in ("litellm_metadata", "metadata"):
-        metadata = _request_context_module._request_metadata_dict(request_kwargs, metadata_key) or {}
-        search_results = metadata.get("external_web_search_search_results")
-        has_search_results = isinstance(search_results, str) and bool(search_results.strip())
-        has_completed_actions = bool(metadata.get("external_web_search_completed_actions"))
-        if metadata.get("external_web_search_synthesis") is True:
-            return False
-        if metadata.get("external_web_search_continuation") is True:
-            return False
-        if has_search_results or has_completed_actions:
-            return False
-    input_text = str((request_kwargs or {}).get("input") or "")
-    if "Retrieved evidence" in input_text or "Retrieved evidence observed so far" in input_text:
-        return False
-    if not _tools_module._request_has_web_search_tool(request_kwargs):
-        return False
-    return _streaming_module._request_is_responses_stream(request_kwargs)
-
-
 def _recovery_max_seconds_for_request(request_data: Optional[dict]) -> float:
     override = _request_metadata_positive_float(
         request_data,
@@ -4778,6 +4710,10 @@ def _trace_exception(exception: Exception) -> dict[str, Any]:
         reason = "model-not-configured"
     elif _is_terminal_prompt_or_policy_error(exception):
         reason = "terminal-prompt-or-policy"
+    elif _is_upstream_account_restricted_error(exception):
+        reason = "upstream-account-restricted"
+    elif _is_upstream_tool_history_rejected_error(exception):
+        reason = "upstream-tool-history-rejected"
     elif _is_image_generation_tool_runtime_fallback_error(exception):
         reason = "image-generation-tool-runtime-fallback"
     elif _is_upstream_deployment_failover_error(exception):
@@ -4854,6 +4790,25 @@ def _recovery_diagnostic(exception: Exception) -> dict[str, Any]:
             "title": "Upstream account pool unavailable",
             "detail": (
                 "The upstream has no available accounts or channels for this route."
+            ),
+        }
+    elif _is_upstream_account_restricted_error(exception):
+        result = {
+            "kind": "account_restricted",
+            "title": "Upstream account restricted",
+            "detail": (
+                "The upstream refused the account behind this route, so the "
+                "route is parked and another route answers."
+            ),
+        }
+    elif _is_upstream_tool_history_rejected_error(exception):
+        result = {
+            "kind": "tool_history_rejected",
+            "title": "Replayed tool records incomplete",
+            "detail": (
+                "The upstream refused this replay because a tool call has no "
+                "matching output. Start a new task so the history sent upstream "
+                "is smaller than the upstream limit."
             ),
         }
     elif status_code in (401, 403) or any(
@@ -6314,6 +6269,13 @@ def _is_priority_deployment_failover_error(exception: Exception) -> bool:
         return True
     if getattr(exception, "stream_incomplete", False):
         return True
+    if _is_upstream_account_restricted_error(exception):
+        # This attempt cannot be answered by the route that refused its own
+        # account; another candidate deployment still can.
+        return True
+    if _is_upstream_tool_history_rejected_error(exception):
+        # This route refuses the replayed tool history; a peer may accept it.
+        return True
     if _is_upstream_deployment_failover_error(exception):
         return True
     if _is_upstream_gateway_bad_request_error(exception):
@@ -6905,6 +6867,70 @@ def _is_upstream_relay_capacity_error(exception: Exception) -> bool:
     return _upstream_relay_capacity_message(exception) is not None
 
 
+def _is_upstream_account_restricted_error(exception: Exception) -> bool:
+    """Whether the route refused the account that pays for it, not the request.
+
+    The station reports this as an ordinary HTTP 400, so the status alone reads
+    as the request's own verdict.  The invariant is that this refusal belongs to
+    the route: a different request is refused identically, and a sibling
+    deployment can still answer, so the route is cooled down and the turn
+    advances instead of ending.
+    """
+
+    return any(
+        marker in _exception_text(exception)
+        for marker in _UPSTREAM_ACCOUNT_RESTRICTED_ERROR_MARKERS
+    )
+
+
+def _is_upstream_tool_history_rejected_error(exception: Exception) -> bool:
+    """Whether the route refused this replay because its tool records do not pair.
+
+    A turn that was cut between a tool call and its output leaves a history a
+    strict route will not accept.  That verdict is about the replay reaching
+    *this* route, not about the model or the account: another candidate may
+    accept the same history, so the turn advances.  When every candidate
+    refuses it, the one honest action left is starting a new task.
+    """
+
+    text = _exception_text(exception)
+    return any(
+        marker in text for marker in _UPSTREAM_TOOL_HISTORY_REJECTION_MARKERS
+    )
+
+
+def _upstream_account_restricted_message(model_group: str) -> str:
+    """The one sentence for a route whose own account the upstream restricted.
+
+    Shared by the Responses terminal event, the native chunk, and the raised
+    final failure so the cause reads the same on every surface.  It names the
+    account and never suggests resending: the same bytes meet the same answer,
+    and the account is what has to change.
+    """
+
+    return (
+        "The upstream refused the account behind this route as restricted, "
+        f"and no other candidate route answered {model_group} this turn. Sign "
+        "the account in again or choose another model route."
+    )
+
+
+def _upstream_tool_history_rejected_message(model_group: str) -> str:
+    """The one sentence for a history the upstream could not pair back up.
+
+    Shared by the Responses terminal event, the native chunk, and the raised
+    final failure.  It names the cause and the action that actually changes the
+    outcome -- a new task -- instead of inviting another identical replay.
+    """
+
+    return (
+        "The upstream rejected this conversation's tool records as "
+        f"incomplete for {model_group}, and no other candidate route accepted "
+        "it. Start a new task so the history sent upstream begins after the "
+        "interrupted tool call."
+    )
+
+
 def _sanitized_upstream_route_failure_message(
     model: Optional[str],
     exception: Exception,
@@ -6927,6 +6953,14 @@ def _sanitized_upstream_route_failure_message(
             "The router was restarting while this turn was streaming, so the "
             "response was cut short. Send the message again."
         )
+    if _is_upstream_account_restricted_error(exception):
+        # Not the "temporary / retry later" sentence below: the refusal belongs
+        # to the account behind the route, and a replay is refused identically.
+        return _upstream_account_restricted_message(model_group)
+    if _is_upstream_tool_history_rejected_error(exception):
+        # Same rule: only a new task changes this verdict, so a retry tip would
+        # send the client back with the identical history.
+        return _upstream_tool_history_rejected_message(model_group)
     status_code = _exception_status_code(exception)
     relay_message = _upstream_relay_capacity_message(exception)
     if _is_upstream_relay_capacity_error(exception):

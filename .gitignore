@@ -26,8 +26,10 @@ Young Router.app/
 young.router.proxy.runtime.plist
 *audit*.png
 output/
-# Staged build output (scripts/update_veridrop.py); never committed.
+# Staged build output (scripts/update_veridrop.py and
+# scripts/update_connect_workbuddy.py); never committed.
 young_router/adapters/veridrop/
+young_router/adapters/connect-workbuddy/
 # Persistent third-party staging cache for scripts/build-and-install-macos.sh.
 # A build reuses a staged release only when its own upstream lookup resolves
 # that exact release; deleting this directory is always safe.

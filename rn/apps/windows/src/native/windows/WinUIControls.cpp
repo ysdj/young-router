@@ -2035,8 +2035,7 @@ struct SecureTextInputComponentView final
           (props.field == "deployment_token" || props.field == "desktop_gateway_api_key");
     }
     return props.domain == "runtime" && props.field == "setting" &&
-        (props.target == "YOUNG_ROUTER_PI_WEB_ACCESS_CONFIG_JSON" ||
-         props.target == "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON");
+        props.target == "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON";
   }
 
   bool IsPlainTextAutoCommitField() const noexcept {

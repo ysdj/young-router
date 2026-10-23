@@ -383,7 +383,7 @@ class ProvidersModelsDomain:
         # for the debounced Apply validator to distinguish that case from a
         # newly added key, which still needs the secure editor.
         self._model_edit_existing_key_ids: set[str] = set()
-        # What the last live WorkBuddy read observed, per variant.  A snapshot
+        # What the last live WorkBuddy read observed, per region.  A snapshot
         # projects this instead of calling the worker: see
         # `_workbuddy_projection_status`.
         self._workbuddy_observed: dict[str, dict[str, Any]] = {}
@@ -442,7 +442,7 @@ class ProvidersModelsDomain:
         return self.our_free_model
 
     def _workbuddy_remember(self, document: Mapping[str, Any]) -> None:
-        """Record what one live WorkBuddy read reported, per variant."""
+        """Record what one live WorkBuddy read reported, per region."""
 
         providers = document.get("providers")
         if not isinstance(providers, Mapping):
@@ -4129,8 +4129,8 @@ class ProvidersModelsDomain:
         workbuddy_module.WORKBUDDY_AUTH_KIND: {
             "name": workbuddy_module.WORKBUDDY_DISPLAY_NAMES[workbuddy_module.WORKBUDDY_PROVIDER],
         },
-        workbuddy_module.WORKBUDDY_AI_AUTH_KIND: {
-            "name": workbuddy_module.WORKBUDDY_DISPLAY_NAMES[workbuddy_module.WORKBUDDY_AI_PROVIDER],
+        workbuddy_module.WORKBUDDY_GLOBAL_AUTH_KIND: {
+            "name": workbuddy_module.WORKBUDDY_DISPLAY_NAMES[workbuddy_module.WORKBUDDY_GLOBAL_PROVIDER],
         },
         # Our Free Model carries no default model: the staged adapter's own
         # catalog is the roster, so a newly added lane imports exactly what the

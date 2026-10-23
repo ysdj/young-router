@@ -454,8 +454,7 @@ std::optional<std::string> CoreIPCBridge::ReadPlainTextSecret(
   return ReadSecret(
       capability->token,
       domain == "runtime" && field == "setting" && target &&
-          (*target == "YOUNG_ROUTER_PI_WEB_ACCESS_CONFIG_JSON" ||
-           *target == "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON"));
+          *target == "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON");
 }
 
 std::optional<CoreIPCBridge::RelayLoginResult> CoreIPCBridge::AcceptRelayLogin(

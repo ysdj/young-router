@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 from . import image_generation as _image_generation_module
-from . import deepseek_reasoning as _deepseek_reasoning_module
 from . import responses_output as _responses_output_module
 from . import image_inputs as _image_inputs_module
 from . import responses_request as _responses_request_module
 from . import request_context as _request_context_module
 from . import responses_surfaces as _responses_surfaces_module
 from . import responses_tools as _responses_tools_module
-from . import responses_web_search_bridge as _responses_web_search_bridge_module
+from . import web_search_native as _web_search_native_module
 from . import routing as _routing_module
 from . import streaming as _streaming_module
 from . import tools as _tools_module
@@ -20,7 +19,6 @@ from .base import (
     Optional,
     _GENERIC_HELPER_PATCH_ATTR,
     _HOSTED_COMPUTER_UNSUPPORTED_MESSAGE,
-    _HOSTED_WEB_SEARCH_UNSUPPORTED_BRIDGE_KEY,
     _PROTOCOL_FALLBACK_CACHE_HIT_KEY,
     _PROTOCOL_FALLBACK_CLIENT_SURFACE_KEY,
     _PROTOCOL_FALLBACK_FROM_SURFACE_KEY,
@@ -31,8 +29,6 @@ from .base import (
     _UPSTREAM_URL_SURFACE_ANTHROPIC,
     _RESPONSES_CHAT_BRIDGE_ORIGINAL_MODEL_GROUP_KEY,
     _RESPONSES_FUNCTION_TOOL_BRIDGE_FALLBACK_REASON_KEY,
-    _WEB_SEARCH_EXTERNAL_BRIDGE_KEY,
-    _WEB_SEARCH_EXTERNAL_BRIDGE_STREAM_KEY,
     _VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY,
     asyncio,
     inspect,
@@ -61,19 +57,44 @@ def _chat_stream_delta_text(chunk: Any) -> str:
     return content if isinstance(content, str) else ""
 
 
-def _chat_stream_delta_reasoning(
-    chunk: Any,
-    *,
-    include_raw: bool,
-) -> str:
-    if not include_raw:
-        return ""
+def _chat_stream_delta_reasoning(chunk: Any) -> str:
+    """The thinking one Chat delta carries, whichever field names it."""
+
     choice = _chat_stream_first_choice(chunk)
     delta = _chat_stream_object_get(choice, "delta")
     reasoning = _chat_stream_object_get(delta, "reasoning_content")
     if not isinstance(reasoning, str):
         reasoning = _chat_stream_object_get(delta, "reasoning")
     return reasoning if isinstance(reasoning, str) else ""
+
+
+def _chat_message_reasoning(response: Any) -> str:
+    """The same thinking, from a Chat answer that did not stream."""
+
+    choice = _chat_stream_first_choice(response)
+    message = _chat_stream_object_get(choice, "message")
+    reasoning = _chat_stream_object_get(message, "reasoning_content")
+    if not isinstance(reasoning, str):
+        reasoning = _chat_stream_object_get(message, "reasoning")
+    return reasoning if isinstance(reasoning, str) else ""
+
+
+def _chat_bridge_reasoning_effort(bridge_kwargs: dict) -> Optional[str]:
+    """The client's reasoning level as the Chat field an upstream reads.
+
+    A Responses request states its level inside ``reasoning`` (a Chat surface
+    reads ``reasoning_effort``), and an OpenAI-chat gateway ignores the object
+    whole: forwarding it verbatim left every route served by the text bridge
+    answering without thinking at all.  Only the level travels — the summary
+    the object also carries is a visibility request this bridge answers
+    itself.
+    """
+
+    reasoning = bridge_kwargs.get("reasoning")
+    effort = reasoning.get("effort") if isinstance(reasoning, dict) else reasoning
+    if not isinstance(effort, str) or not effort.strip():
+        return None
+    return effort.strip()
 
 
 def _chat_completion_message_text(response: Any) -> str:
@@ -168,11 +189,9 @@ def _chat_bridge_stream_payload(
 ) -> Optional[dict[str, Any]]:
     if bridge_kwargs.get("stream") is not True:
         return None
-    if not _responses_web_search_bridge_module._external_web_search_chat_only_route(
+    if not _web_search_native_module._external_web_search_chat_only_route(
         bridge_kwargs,
     ):
-        return None
-    if _tools_module._request_should_intercept_external_web_search(bridge_kwargs):
         return None
     tools = bridge_kwargs.get("tools")
     if isinstance(tools, list) and tools:
@@ -193,7 +212,7 @@ def _chat_bridge_stream_payload(
 
     payload: dict[str, Any] = {
         "model": model_group,
-        "messages": _responses_web_search_bridge_module._external_web_search_chat_tool_messages(
+        "messages": _web_search_native_module._external_web_search_chat_tool_messages(
             bridge_kwargs,
         ),
         "stream": True,
@@ -214,7 +233,6 @@ def _chat_bridge_stream_payload(
     for key in (
         "temperature",
         "top_p",
-        "reasoning",
         "user",
         "service_tier",
         "seed",
@@ -234,6 +252,9 @@ def _chat_bridge_stream_payload(
         value = bridge_kwargs.get(key)
         if value is not None:
             payload[key] = value
+    reasoning_effort = _chat_bridge_reasoning_effort(bridge_kwargs)
+    if reasoning_effort is not None:
+        payload["reasoning_effort"] = reasoning_effort
     return payload
 
 
@@ -241,6 +262,16 @@ async def _responses_chat_bridge_text_stream_from_chat_stream(
     chat_stream: Any,
     bridge_kwargs: dict,
 ) -> Any:
+    """Relay a Chat stream as a Responses stream, thinking included.
+
+    A thinking route streams ``reasoning_content`` before its answer, and a
+    Responses client renders that as one reasoning item's summary part.  The
+    item is opened on the first reasoning frame and closed before the answer's
+    own message item, so the two arrive in the order their ``output_index``
+    states; buffering the thinking into one item emitted after the message left
+    a client's live thinking block empty for the whole turn, and put its item
+    after the answer it preceded.
+    """
     response_id = f"resp_chat_bridge_{time.time_ns()}"
     reasoning_id = f"rs_chat_bridge_{time.time_ns()}"
     message_id = f"msg_chat_bridge_{time.time_ns()}"
@@ -250,12 +281,88 @@ async def _responses_chat_bridge_text_stream_from_chat_stream(
         or _request_model_group(bridge_kwargs)
         or "unknown"
     )
+    deliver_reasoning = (
+        _web_search_native_module._public_reasoning_is_allowed(
+            bridge_kwargs
+        )
+    )
     text_parts: list[str] = []
     reasoning_parts: list[str] = []
-    include_deepseek_raw = _deepseek_reasoning_module.raw_reasoning_requested(
-        bridge_kwargs
-    )
     usage = None
+    reasoning_open = False
+    message_index: Optional[int] = None
+
+    def reasoning_added_events() -> list[dict[str, Any]]:
+        return [
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "id": reasoning_id,
+                    "type": "reasoning",
+                    "status": "in_progress",
+                    "summary": [],
+                },
+            },
+            {
+                "type": "response.reasoning_summary_part.added",
+                "item_id": reasoning_id,
+                "output_index": 0,
+                "summary_index": 0,
+                "part": {"type": "summary_text", "text": ""},
+            },
+        ]
+
+    def reasoning_done_events() -> list[dict[str, Any]]:
+        reasoning = "".join(reasoning_parts)
+        return [
+            {
+                "type": "response.reasoning_summary_text.done",
+                "item_id": reasoning_id,
+                "output_index": 0,
+                "summary_index": 0,
+                "text": reasoning,
+            },
+            {
+                "type": "response.reasoning_summary_part.done",
+                "item_id": reasoning_id,
+                "output_index": 0,
+                "summary_index": 0,
+                "part": {"type": "summary_text", "text": reasoning},
+            },
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "id": reasoning_id,
+                    "type": "reasoning",
+                    "status": "completed",
+                    "summary": [{"type": "summary_text", "text": reasoning}],
+                },
+            },
+        ]
+
+    def message_added_events(index: int) -> list[dict[str, Any]]:
+        return [
+            {
+                "type": "response.output_item.added",
+                "output_index": index,
+                "item": {
+                    "id": message_id,
+                    "type": "message",
+                    "status": "in_progress",
+                    "role": "assistant",
+                    "content": [],
+                },
+            },
+            {
+                "type": "response.content_part.added",
+                "item_id": message_id,
+                "output_index": index,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": "", "annotations": []},
+            },
+        ]
 
     yield {
         "type": "response.created",
@@ -268,64 +375,57 @@ async def _responses_chat_bridge_text_stream_from_chat_stream(
             "output": [],
         },
     }
-    yield {
-        "type": "response.output_item.added",
-        "output_index": 0,
-        "item": {
-            "id": message_id,
-            "type": "message",
-            "status": "in_progress",
-            "role": "assistant",
-            "content": [],
-        },
-    }
-    yield {
-        "type": "response.content_part.added",
-        "item_id": message_id,
-        "output_index": 0,
-        "content_index": 0,
-        "part": {"type": "output_text", "text": "", "annotations": []},
-    }
 
     async for chunk in chat_stream:
         chunk_usage = _chat_stream_usage(chunk)
         if chunk_usage is not None:
             usage = chunk_usage
-        reasoning_delta = _chat_stream_delta_reasoning(
-            chunk,
-            include_raw=include_deepseek_raw,
-        )
-        if reasoning_delta:
-            reasoning_parts.append(reasoning_delta)
+        reasoning_delta = _chat_stream_delta_reasoning(chunk)
         delta = _chat_stream_delta_text(chunk)
+        # Reasoning frames only ever precede the answer, and the item order the
+        # client reads is fixed once the message opens: a route that resumed
+        # thinking after its first answer frame has no place to put it.
+        if reasoning_delta and deliver_reasoning and message_index is None:
+            if not reasoning_open:
+                reasoning_open = True
+                for event in reasoning_added_events():
+                    yield event
+            reasoning_parts.append(reasoning_delta)
+            yield {
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": reasoning_id,
+                "output_index": 0,
+                "summary_index": 0,
+                "delta": reasoning_delta,
+            }
         if not delta:
             continue
+        if message_index is None:
+            if reasoning_open:
+                for event in reasoning_done_events():
+                    yield event
+                reasoning_open = False
+            message_index = 1 if reasoning_parts else 0
+            for event in message_added_events(message_index):
+                yield event
         text_parts.append(delta)
         yield {
             "type": "response.output_text.delta",
             "item_id": message_id,
-            "output_index": 0,
+            "output_index": message_index,
             "content_index": 0,
             "delta": delta,
         }
 
+    if reasoning_open:
+        for event in reasoning_done_events():
+            yield event
+        reasoning_open = False
+    if message_index is None:
+        message_index = 1 if reasoning_parts else 0
+        for event in message_added_events(message_index):
+            yield event
     text = "".join(text_parts)
-    reasoning = "".join(reasoning_parts)
-    if reasoning:
-        reasoning_item = {
-            "id": reasoning_id,
-            "type": "reasoning",
-            "status": "completed",
-            "role": "assistant",
-            "summary": [{"type": "summary_text", "text": reasoning}],
-        }
-        yield {
-            "type": "response.output_item.done",
-            "output_index": 1,
-            "item": reasoning_item,
-        }
-    else:
-        reasoning_item = None
     message = {
         "id": message_id,
         "type": "message",
@@ -342,22 +442,34 @@ async def _responses_chat_bridge_text_stream_from_chat_stream(
     yield {
         "type": "response.output_text.done",
         "item_id": message_id,
-        "output_index": 0,
+        "output_index": message_index,
         "content_index": 0,
         "text": text,
     }
     yield {
         "type": "response.content_part.done",
         "item_id": message_id,
-        "output_index": 0,
+        "output_index": message_index,
         "content_index": 0,
         "part": {"type": "output_text", "text": text, "annotations": []},
     }
     yield {
         "type": "response.output_item.done",
-        "output_index": 0,
+        "output_index": message_index,
         "item": message,
     }
+    output: list[dict[str, Any]] = []
+    if reasoning_parts:
+        reasoning = "".join(reasoning_parts)
+        output.append(
+            {
+                "id": reasoning_id,
+                "type": "reasoning",
+                "status": "completed",
+                "summary": [{"type": "summary_text", "text": reasoning}],
+            }
+        )
+    output.append(message)
     completed = {
         "type": "response.completed",
         "response": {
@@ -367,7 +479,7 @@ async def _responses_chat_bridge_text_stream_from_chat_stream(
             "status": "completed",
             "model": model,
             "output_text": text,
-            "output": [item for item in (reasoning_item, message) if item is not None],
+            "output": output,
         },
     }
     if usage is not None:
@@ -555,7 +667,8 @@ async def _responses_chat_bridge_direct_stream_response(
         return responses_chat_bridge_stream(bridge_kwargs, chat_response)
 
     text = _chat_completion_message_text(chat_response)
-    if not text:
+    reasoning = _chat_message_reasoning(chat_response)
+    if not text and not reasoning:
         return None
 
     return responses_chat_bridge_stream(
@@ -566,10 +679,14 @@ async def _responses_chat_bridge_direct_stream_response(
 
 async def _single_chat_completion_chunk_stream(response: Any) -> Any:
     text = _chat_completion_message_text(response)
+    delta: dict[str, Any] = {"content": text}
+    reasoning = _chat_message_reasoning(response)
+    if reasoning:
+        delta["reasoning_content"] = reasoning
     yield {
         "choices": [
             {
-                "delta": {"content": text},
+                "delta": delta,
             }
         ],
         "usage": _chat_stream_usage(response),
@@ -632,14 +749,6 @@ async def _execute_responses_chat_bridge_call(
         bridge_kwargs,
         "litellm_metadata",
     ) or {}
-    if bridge_metadata.get(_WEB_SEARCH_EXTERNAL_BRIDGE_KEY) is True:
-        bridge_kwargs = _responses_web_search_bridge_module._external_web_search_safe_request_base(
-            bridge_kwargs
-        )
-        bridge_metadata = _request_context_module._request_metadata_dict(
-            bridge_kwargs,
-            "litellm_metadata",
-        ) or {}
     trace_request = original_request_kwargs or bridge_kwargs
     trace_request_summary = _trace_module._trace_request_summary(trace_request)
     bridge_request_summary = _trace_module._trace_request_summary(bridge_kwargs)
@@ -656,17 +765,8 @@ async def _execute_responses_chat_bridge_call(
         "retry_tool_types": _trace_module._trace_tool_types(bridge_kwargs.get("tools")),
         "retry_tool_names": _trace_module._trace_tool_names(bridge_kwargs.get("tools")),
         "retry_has_web_search_options": "web_search_options" in bridge_kwargs,
-        "hosted_web_search_unsupported_bridge": bridge_metadata.get(
-            _HOSTED_WEB_SEARCH_UNSUPPORTED_BRIDGE_KEY
-        ),
         "responses_chat_bridge_tool_sanitized": bridge_metadata.get(
             "responses_chat_bridge_tool_sanitized"
-        ),
-        "external_web_search_bridge": bridge_metadata.get(
-            _WEB_SEARCH_EXTERNAL_BRIDGE_KEY
-        ),
-        "external_web_search_bridge_stream": bridge_metadata.get(
-            _WEB_SEARCH_EXTERNAL_BRIDGE_STREAM_KEY
         ),
         "preemptive_reason": bridge_metadata.get(
             "responses_chat_bridge_preemptive_reason"
@@ -676,128 +776,25 @@ async def _execute_responses_chat_bridge_call(
         trace_payload["exception"] = _routing_module._trace_exception(original_exception)
     _trace_module._route_trace(start_event, **trace_payload)
 
-    unsupported_message = _responses_web_search_bridge_module._hosted_tool_unsupported_message(bridge_metadata)
-    if unsupported_message is not None:
-        response = _responses_web_search_bridge_module._hosted_tool_unsupported_response(
-            bridge_kwargs,
-            unsupported_message,
-        )
-        if bridge_kwargs.get("stream") is True:
-            return _responses_web_search_bridge_module._hosted_tool_unsupported_stream(response)
-        return response
-
     async def execute_once(active_bridge_kwargs: dict) -> Any:
         active_bridge_metadata = _request_context_module._request_metadata_dict(
             active_bridge_kwargs,
             "litellm_metadata",
         ) or {}
-        external_bridge_stream = (
-            active_bridge_metadata.get(_WEB_SEARCH_EXTERNAL_BRIDGE_KEY) is True
-            and active_bridge_metadata.get(_WEB_SEARCH_EXTERNAL_BRIDGE_STREAM_KEY)
-            is True
+        # A Chat-only route is served directly from the Chat stream: the
+        # Responses call has no endpoint to reach on that deployment.
+        direct_stream_response = await _responses_chat_bridge_direct_stream_response(
+            active_bridge_kwargs,
         )
-        if not external_bridge_stream:
-            direct_stream_response = await _responses_chat_bridge_direct_stream_response(
-                active_bridge_kwargs,
-            )
-            if direct_stream_response is not None:
-                return direct_stream_response
-        upstream_kwargs = (
-            _tools_module._with_external_web_search_post_call_suppressed(active_bridge_kwargs)
-            if active_bridge_metadata.get(_WEB_SEARCH_EXTERNAL_BRIDGE_KEY) is True
-            else active_bridge_kwargs
-        )
-        if external_bridge_stream:
-            # The internal search/planner round is deliberately buffered. A
-            # few Chat/Anthropic compatibility endpoints return a Responses-
-            # shaped iterator without response.completed; passing that
-            # iterator through the outer stream makes the request appear
-            # hung forever. The final buffered result is still emitted as
-            # normal Responses SSE by the outer layer.
-            upstream_kwargs = upstream_kwargs.copy()
-            upstream_kwargs["stream"] = False
-            upstream_kwargs.pop("stream_options", None)
-            response = original_function(**upstream_kwargs)
-            if inspect.isawaitable(response):
-                response = await response
-        else:
-            response = None
-            if active_bridge_metadata.get(_WEB_SEARCH_EXTERNAL_BRIDGE_KEY) is True:
-                response = await _responses_web_search_bridge_module._external_web_search_chat_tool_response(
-                    upstream_kwargs,
-                    active_bridge_kwargs,
-                    phase="initial",
-                )
-            if response is None:
-                response = original_function(**upstream_kwargs)
-                if inspect.isawaitable(response):
-                    response = await response
+        if direct_stream_response is not None:
+            return direct_stream_response
+        response = original_function(**active_bridge_kwargs)
+        if inspect.isawaitable(response):
+            response = await response
         response = _image_inputs_module._sanitize_response_echoed_request_images_for_delivery(
             response,
             active_bridge_kwargs,
         )
-        should_intercept_external_web_search = _tools_module._request_should_intercept_external_web_search(
-            active_bridge_kwargs,
-        )
-        if external_bridge_stream:
-            if _responses_output_module._response_is_async_iterable(response):
-                # Some test doubles and Chat adapters ignore ``stream=False``
-                # and still return a Chat iterator. Adapt that iterator into a
-                # terminating Responses stream instead of handing the raw Chat
-                # chunks to the caller.
-                return responses_chat_bridge_stream(
-                    active_bridge_kwargs, response
-                )
-            # The search rounds above are buffered, but this request is still a
-            # streaming request: the client and LiteLLM's own stream hooks only
-            # accept an async iterator here. Returning the buffered Responses
-            # object made LiteLLM fail with "'ResponsesAPIResponse' object has
-            # no attribute '__aiter__'" and answer the turn with a 500, so the
-            # finalized payload is emitted as ordinary Responses SSE.
-            resolved_response = response
-            if should_intercept_external_web_search:
-                resolved_response = (
-                    await _responses_web_search_bridge_module._resolve_web_search_function_calls(
-                        response,
-                        active_bridge_kwargs,
-                        original_function,
-                    )
-                )
-            response_payload = _streaming_module._jsonable(resolved_response)
-            if not isinstance(response_payload, dict):
-                response_payload = _responses_web_search_bridge_module._hosted_tool_unsupported_response(
-                    active_bridge_kwargs,
-                    _responses_output_module._response_text(resolved_response),
-                )
-            return _responses_web_search_bridge_module._external_web_search_bridge_stream(
-                response_payload
-            )
-        if (
-            should_intercept_external_web_search
-            and active_bridge_metadata.get(_WEB_SEARCH_EXTERNAL_BRIDGE_STREAM_KEY) is True
-        ):
-            if active_bridge_metadata.get(_WEB_SEARCH_EXTERNAL_BRIDGE_KEY) is True:
-                return _responses_web_search_bridge_module._resolve_web_search_function_calls_stream_rounds(
-                    response,
-                    active_bridge_kwargs,
-                    original_function,
-                )
-            response_payload = _streaming_module._jsonable(response)
-            if not isinstance(response_payload, dict):
-                response_payload = _responses_web_search_bridge_module._hosted_tool_unsupported_response(
-                    active_bridge_kwargs,
-                    _responses_output_module._response_text(response),
-                )
-            return _responses_web_search_bridge_module._external_web_search_bridge_stream(response_payload)
-        if (
-            should_intercept_external_web_search
-            and active_bridge_metadata.get(_WEB_SEARCH_EXTERNAL_BRIDGE_KEY) is True
-        ):
-            response = await _responses_web_search_bridge_module._resolve_web_search_function_calls(
-                response,
-                active_bridge_kwargs,
-                original_function,
-            )
         response = await _responses_surfaces_module._ensure_responses_chat_bridge_non_empty_response(
             response,
             active_bridge_kwargs,
@@ -884,79 +881,9 @@ async def _postprocess_generic_bridge_response(
     request_kwargs: dict,
     original_function: Any,
 ) -> Any:
-    response = _image_inputs_module._sanitize_response_echoed_request_images_for_delivery(
+    return _image_inputs_module._sanitize_response_echoed_request_images_for_delivery(
         response,
         request_kwargs,
-    )
-    if not _tools_module._request_should_intercept_external_web_search(request_kwargs):
-        return response
-
-    bridge_metadata = _request_context_module._request_metadata_dict(
-        request_kwargs,
-        "litellm_metadata",
-    ) or {}
-    if request_kwargs.get("stream") is True:
-        if _tools_module._request_has_pi_web_access_tool(request_kwargs):
-            async def direct_pi_web_access_stream() -> Any:
-                actions = _responses_web_search_bridge_module._web_search_actions_for_request(
-                    response,
-                    request_kwargs,
-                )
-                if actions:
-                    async for chunk in _responses_web_search_bridge_module._resolve_web_search_function_calls_stream_rounds(
-                        response,
-                        request_kwargs,
-                        original_function,
-                    ):
-                        yield chunk
-                    return
-                payload = _streaming_module._jsonable(response)
-                if not isinstance(payload, dict):
-                    payload = _responses_web_search_bridge_module._hosted_tool_unsupported_response(
-                        request_kwargs,
-                        _responses_output_module._response_text(response),
-                    )
-                async for chunk in _responses_web_search_bridge_module._external_web_search_bridge_stream(
-                    payload
-                ):
-                    yield chunk
-
-            if not _responses_output_module._response_is_async_iterable(response):
-                return direct_pi_web_access_stream()
-        if _responses_output_module._response_is_async_iterable(response):
-            # A preemptive function-tool bridge is executed before LiteLLM's
-            # normal streaming hook. That hook still receives the original
-            # request (which only contains Codex additional_tools), so it
-            # cannot see the native pi-web-access declarations that were
-            # added to request_kwargs here. Run the same guarded stream
-            # adapter at this boundary; otherwise a native web_search
-            # function_call is returned to Codex as an unexecuted tool call.
-            if _tools_module._request_should_intercept_external_web_search(
-                request_kwargs
-            ):
-                return _streaming_module._yield_start_buffered_stream_with_error_fallback(
-                    response,
-                    request_kwargs,
-                )
-            return response
-        if bridge_metadata.get(_WEB_SEARCH_EXTERNAL_BRIDGE_KEY) is True:
-            return _responses_web_search_bridge_module._resolve_web_search_function_calls_stream_rounds(
-                response,
-                request_kwargs,
-                original_function,
-            )
-        response_payload = _streaming_module._jsonable(response)
-        if not isinstance(response_payload, dict):
-            response_payload = _responses_web_search_bridge_module._hosted_tool_unsupported_response(
-                request_kwargs,
-                _responses_output_module._response_text(response),
-            )
-        return _responses_web_search_bridge_module._external_web_search_bridge_stream(response_payload)
-
-    return await _responses_web_search_bridge_module._resolve_web_search_function_calls(
-        response,
-        request_kwargs,
-        original_function,
     )
 
 
@@ -1278,11 +1205,7 @@ async def _execute_bridged_upstream_attempt(
 ) -> Any:
     """Run one bridged upstream attempt and post-process the answer."""
 
-    response = original_function(
-        **_tools_module._upstream_request_kwargs_for_web_search_bridge(
-            active_bridge_kwargs
-        )
-    )
+    response = original_function(**active_bridge_kwargs)
     response = await _responses_request_module._await_streaming_fallback_candidate_response(
         response,
         active_bridge_kwargs,
@@ -1295,122 +1218,6 @@ async def _execute_bridged_upstream_attempt(
     )
 
 
-async def _execute_responses_external_web_search_bridge_call(
-    original_function: Any,
-    bridge_kwargs: dict,
-    *,
-    original_request_kwargs: Optional[dict] = None,
-    outer_request_kwargs: Optional[dict] = None,
-) -> Any:
-    bridge_kwargs = _responses_web_search_bridge_module._external_web_search_safe_request_base(
-        bridge_kwargs
-    )
-    bridge_metadata = _request_context_module._request_metadata_dict(
-        bridge_kwargs,
-        "litellm_metadata",
-    ) or {}
-    trace_request = original_request_kwargs or bridge_kwargs
-    trace_request_summary = _trace_module._trace_request_summary(trace_request)
-    bridge_request_summary = _trace_module._trace_request_summary(bridge_kwargs)
-    _trace_module._request_route_trace(
-        "responses_external_web_search_bridge_start", outer_request_kwargs, trace_request=trace_request, include_route_identity=True,
-        request=trace_request_summary,
-        retry_request=bridge_request_summary,
-        retry_tool_types=_trace_module._trace_tool_types(bridge_kwargs.get("tools")),
-        retry_tool_names=_trace_module._trace_tool_names(bridge_kwargs.get("tools")),
-        retry_has_web_search_options="web_search_options" in bridge_kwargs,
-        external_web_search_bridge=bridge_metadata.get(_WEB_SEARCH_EXTERNAL_BRIDGE_KEY),
-        responses_external_web_search_tool_sanitized=bridge_metadata.get(
-            "responses_external_web_search_tool_sanitized"
-        ),
-    )
-    async def execute_once(active_bridge_kwargs: dict) -> Any:
-        return await _execute_bridged_upstream_attempt(
-            original_function,
-            active_bridge_kwargs,
-            outer_request_kwargs,
-        )
-
-    error_request_summary = bridge_request_summary
-    try:
-        return await execute_once(bridge_kwargs)
-    except Exception as exc:
-        original_exc = exc
-        active_retry_kwargs = bridge_kwargs
-        xhigh_retry_kwargs = _responses_request_module._xhigh_reasoning_compat_retry_kwargs(exc, bridge_kwargs)
-        if xhigh_retry_kwargs is not None:
-            try:
-                return await execute_once(xhigh_retry_kwargs)
-            except Exception as retry_exc:
-                active_retry_kwargs = xhigh_retry_kwargs
-                error_request_summary = _trace_module._trace_request_summary(xhigh_retry_kwargs)
-                _trace_module._request_route_trace(
-                    "xhigh_reasoning_compat_retry_error", outer_request_kwargs, trace_request=trace_request, include_route_identity=True,
-                    request=trace_request_summary,
-                    retry_request=error_request_summary,
-                    original_exception=_routing_module._trace_exception(exc),
-                    exception=_routing_module._trace_exception(retry_exc),
-                )
-                exc = retry_exc
-        if _routing_module._is_deployment_compatible_bad_request_error(exc):
-            _trace_module._request_route_trace(
-                "responses_external_web_search_bridge_transient_retry_start", outer_request_kwargs, trace_request=trace_request, include_route_identity=True,
-                request=trace_request_summary,
-                retry_request=error_request_summary,
-                exception=_routing_module._trace_exception(exc),
-            )
-            try:
-                return await execute_once(active_retry_kwargs)
-            except Exception as retry_exc:
-                _trace_module._request_route_trace(
-                    "responses_external_web_search_bridge_transient_retry_error", outer_request_kwargs, trace_request=trace_request, include_route_identity=True,
-                    request=trace_request_summary,
-                    retry_request=error_request_summary,
-                    original_exception=_routing_module._trace_exception(exc),
-                    exception=_routing_module._trace_exception(retry_exc),
-                )
-                exc = retry_exc
-        _trace_module._request_route_trace(
-            "responses_external_web_search_bridge_error", outer_request_kwargs, trace_request=trace_request, include_route_identity=True,
-            request=trace_request_summary,
-            retry_request=error_request_summary,
-            exception=_routing_module._trace_exception(exc),
-        )
-        if exc is original_exc:
-            raise
-        raise exc
-
-
-async def _execute_responses_native_web_search_bridge_call(
-    original_function: Any,
-    bridge_kwargs: dict,
-    *,
-    original_request_kwargs: Optional[dict] = None,
-    outer_request_kwargs: Optional[dict] = None,
-) -> Any:
-    """Execute the post-rejection web-search bridge on the right surface.
-
-    Hosted Responses failures on Chat-surface deployments are converted to
-    ordinary function tools by the Chat bridge.  Responses-surface failures
-    use the dedicated external bridge.
-    """
-    if bridge_kwargs.get("use_chat_completions_api") is True:
-        return await _execute_responses_chat_bridge_call(
-            original_function,
-            bridge_kwargs,
-            original_request_kwargs=original_request_kwargs,
-            outer_request_kwargs=outer_request_kwargs,
-            start_event="responses_chat_bridge_native_web_search_fallback_start",
-            error_event="responses_chat_bridge_native_web_search_fallback_error",
-        )
-    return await _execute_responses_external_web_search_bridge_call(
-        original_function,
-        bridge_kwargs,
-        original_request_kwargs=original_request_kwargs,
-        outer_request_kwargs=outer_request_kwargs,
-    )
-
-
 async def _execute_responses_function_tool_bridge_call(
     original_function: Any,
     bridge_kwargs: dict,
@@ -1418,14 +1225,6 @@ async def _execute_responses_function_tool_bridge_call(
     original_request_kwargs: Optional[dict] = None,
     outer_request_kwargs: Optional[dict] = None,
 ) -> Any:
-    bridge_metadata = _request_context_module._request_metadata_dict(
-        bridge_kwargs,
-        "litellm_metadata",
-    ) or {}
-    if bridge_metadata.get(_WEB_SEARCH_EXTERNAL_BRIDGE_KEY) is True:
-        bridge_kwargs = _responses_web_search_bridge_module._external_web_search_safe_request_base(
-            bridge_kwargs
-        )
     bridge_metadata = _request_context_module._request_metadata_dict(
         bridge_kwargs,
         "litellm_metadata",
@@ -1508,17 +1307,19 @@ async def _execute_responses_function_tool_bridge_call(
                     exception=_routing_module._trace_exception(retry_exc),
                 )
                 exc = retry_exc
-        external_web_search_bridge_kwargs = _responses_surfaces_module._with_responses_external_web_search_bridge_after_native_error(
+        native_error_bridge_kwargs = _responses_surfaces_module._with_responses_external_web_search_bridge_after_native_error(
             exc,
             bridge_kwargs,
             outer_request_kwargs,
         )
-        if external_web_search_bridge_kwargs is not None:
-            return await _execute_responses_native_web_search_bridge_call(
+        if native_error_bridge_kwargs is not None:
+            return await _execute_responses_chat_bridge_call(
                 original_function,
-                external_web_search_bridge_kwargs,
+                native_error_bridge_kwargs,
                 original_request_kwargs=original_request_kwargs or bridge_kwargs,
                 outer_request_kwargs=outer_request_kwargs,
+                start_event="responses_chat_bridge_native_web_search_fallback_start",
+                error_event="responses_chat_bridge_native_web_search_fallback_error",
             )
         _trace_module._request_route_trace(
             "responses_function_tool_bridge_error", outer_request_kwargs, trace_request=trace_request, include_route_identity=True,
@@ -1563,12 +1364,12 @@ def _hosted_computer_unsupported_retry_response(
         outer_request_kwargs,
     ):
         return None
-    response = _responses_web_search_bridge_module._hosted_tool_unsupported_response(
+    response = _web_search_native_module._hosted_tool_unsupported_response(
         request_kwargs,
         _HOSTED_COMPUTER_UNSUPPORTED_MESSAGE,
     )
     if request_kwargs.get("stream") is True:
-        return _responses_web_search_bridge_module._hosted_tool_unsupported_stream(response)
+        return _web_search_native_module._hosted_tool_unsupported_stream(response)
     return response
 
 
@@ -1597,12 +1398,12 @@ def _hosted_computer_unavailable_preemptive_response(
         outer_request_kwargs,
     ):
         return None
-    response = _responses_web_search_bridge_module._hosted_tool_unsupported_response(
+    response = _web_search_native_module._hosted_tool_unsupported_response(
         request_kwargs,
         _HOSTED_COMPUTER_UNSUPPORTED_MESSAGE,
     )
     if request_kwargs.get("stream") is True:
-        return _responses_web_search_bridge_module._hosted_tool_unsupported_stream(
+        return _web_search_native_module._hosted_tool_unsupported_stream(
             response
         )
     return response
@@ -1624,7 +1425,6 @@ def _wrap_generic_function_for_deployment_failover(
         _routing_module._apply_current_selected_deployment_to_request(kwargs)
         for update_request in (
             _responses_request_module._with_codex_openrouter_native_web_search_tool,
-            _responses_request_module._with_codex_external_web_search_bridge_tool,
             *_responses_request_module._CODEX_REQUEST_INSTRUCTION_STEPS,
         ):
             updated_kwargs = update_request(kwargs)
@@ -1741,37 +1541,6 @@ def _wrap_generic_function_for_deployment_failover(
                     original_exception=exc,
                     start_event="responses_function_tool_bridge_chat_retry_start",
                     error_event="responses_function_tool_bridge_chat_retry_error",
-                )
-        external_web_search_bridge_kwargs = _responses_surfaces_module._with_responses_external_web_search_bridge(
-            kwargs,
-            outer_request_kwargs,
-        )
-        if external_web_search_bridge_kwargs is not None:
-            try:
-                return await _execute_responses_native_web_search_bridge_call(
-                    surface_adapted_original_function,
-                    external_web_search_bridge_kwargs,
-                    original_request_kwargs=kwargs,
-                    outer_request_kwargs=outer_request_kwargs,
-                )
-            except Exception as exc:
-                if _routing_module._request_current_upstream_surface(kwargs):
-                    raise
-                bridge_kwargs = _responses_surfaces_module._responses_chat_bridge_retry_kwargs(
-                    exc,
-                    kwargs,
-                    outer_request_kwargs,
-                )
-                if bridge_kwargs is None:
-                    raise
-                return await _execute_responses_chat_bridge_call(
-                    surface_adapted_original_function,
-                    bridge_kwargs,
-                    original_request_kwargs=kwargs,
-                    outer_request_kwargs=outer_request_kwargs,
-                    original_exception=exc,
-                    start_event="responses_external_web_search_bridge_retry_start",
-                    error_event="responses_external_web_search_bridge_retry_error",
                 )
         hosted_computer_unavailable = _hosted_computer_unavailable_preemptive_response(
             kwargs,
@@ -1906,24 +1675,6 @@ def _wrap_generic_function_for_deployment_failover(
                 return response
             if _routing_module._is_context_size_error(original_exception):
                 raise original_exception
-            # A Chat-surface route may reject the Responses Hosted
-            # ``web_search`` declaration with a schema-validation 400.
-            # Handle that explicit capability mismatch before generic
-            # surface-failover classification; otherwise the router cools
-            # down a healthy route and never gets to the ordinary function
-            # tool bridge.
-            external_web_search_bridge_kwargs = _responses_surfaces_module._with_responses_external_web_search_bridge_after_native_error(
-                exc,
-                kwargs,
-                outer_request_kwargs,
-            )
-            if external_web_search_bridge_kwargs is not None:
-                return await _execute_responses_native_web_search_bridge_call(
-                    surface_adapted_original_function,
-                    external_web_search_bridge_kwargs,
-                    original_request_kwargs=kwargs,
-                    outer_request_kwargs=outer_request_kwargs,
-                )
             if _routing_module._protocol_fallback_attempt_active(decision_kwargs):
                 _routing_module._mark_exception_for_deployment_failover(
                     exc,
@@ -2016,18 +1767,6 @@ def _wrap_generic_function_for_deployment_failover(
                         exception=_routing_module._trace_exception(retry_exc),
                     )
                     exc = retry_exc
-            external_web_search_bridge_kwargs = _responses_surfaces_module._with_responses_external_web_search_bridge_after_native_error(
-                exc,
-                kwargs,
-                outer_request_kwargs,
-            )
-            if external_web_search_bridge_kwargs is not None:
-                return await _execute_responses_native_web_search_bridge_call(
-                    surface_adapted_original_function,
-                    external_web_search_bridge_kwargs,
-                    original_request_kwargs=kwargs,
-                    outer_request_kwargs=outer_request_kwargs,
-                )
             bridge_kwargs = None
             if not _routing_module._request_current_upstream_surface(kwargs):
                 bridge_kwargs = _responses_surfaces_module._responses_chat_bridge_retry_kwargs(

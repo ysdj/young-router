@@ -662,7 +662,7 @@ export const en: Record<TranslationKey, string> = {
   "providers.type.claude": "Claude",
   "providers.type.apiKey": "API key",
   "providers.type.workbuddy": "WorkBuddy",
-  "providers.type.workbuddyAI": "WorkBuddy AI",
+  "providers.type.workbuddyGlobal": "WorkBuddy Global",
   "providers.type.ourFreeModel": "Our Free Model · OpenCode channel",
   "providers.type.ourFreeModelKilo": "Our Free Model · Kilo channel",
   "providers.type.ourFreeModelEAC": "Our Free Model · EAC channel",

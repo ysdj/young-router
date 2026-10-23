@@ -7,6 +7,7 @@ from typing import Any
 from .schema import (
     CONFIG_YAML,
     DEFAULT_API_KEY_NAME,
+    current_managed_reference,
     DISABLED_MODELS_KEY,
     MENU_API_KEY_NAME_KEY,
     MENU_KEY_BINDING_KEY,
@@ -75,7 +76,7 @@ def _provider_to_editor(name: str, value: Any) -> dict[str, Any]:
     return {
         "name": name,
         "enabled": _bool_value(provider.get("enabled"), True),
-        "api_base": _string_value(provider.get("api_base")),
+        "api_base": current_managed_reference(_string_value(provider.get("api_base"))),
         "api_key": api_key,
         "api_keys": api_keys,
         "models": [],
@@ -124,7 +125,7 @@ def _provider_api_keys_from_raw(provider_name: str, provider: dict[str, Any]) ->
     for index, item in enumerate(_as_list(provider.get("api_keys")), start=1):
         item_dict = _as_dict(item)
         key_name = _string_value(item_dict.get("name")).strip() or f"key-{index}"
-        key_value = _string_value(item_dict.get("value"))
+        key_value = current_managed_reference(_string_value(item_dict.get("value")))
         if not key_value or key_name in seen_names:
             continue
         slot = slots_by_name.get(key_name, {})
@@ -226,8 +227,8 @@ def _model_to_editor(
     # provider at all and the load silently drops it: the provider would come
     # back with its key slot and none of its models.
     provider = _string_value(model_info.get("provider")).strip()
-    api_base = _string_value(params.get("api_base"))
-    api_key = _string_value(params.get("api_key"))
+    api_base = current_managed_reference(_string_value(params.get("api_base")))
+    api_key = current_managed_reference(_string_value(params.get("api_key")))
     api_key_name = _string_value(model_info.get(MENU_API_KEY_NAME_KEY)).strip()
     provider_key_id = _provider_key_id(model_info.get(MENU_PROVIDER_KEY_ID_KEY))
     if provider_key_id:

@@ -3847,6 +3847,139 @@ class HookRoutingTests(HookTestCase):
         self.assertNotIn("upstream relay channel unavailable", plain_message)
         self.assertNotIn("[upstream relay reported:", plain_message)
 
+    def test_a_route_refusing_the_replayed_tool_history_keeps_looking(self) -> None:
+        """A strict route's history check is about this replay, not the model.
+
+        Observed on the local worker after a turn was cut between a tool call
+        and its output: it answered HTTP 400
+        `workbuddy upstream client (http 400): 工具记录不完整，请新建任务`
+        ("tool records incomplete, create a new task").  Read as the request's
+        own verdict it ended the turn on that route with the unclassified-stop
+        sentence, so the client re-sent the identical history and met it again.
+        A peer may accept the same replay, so the attempt advances; only a
+        refusal that reaches no accepted route names the cause and the new task.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        self.set_env(hooks._RECOVERY_POLICY_REQUEST_ERROR_ENV, None)
+
+        class BadRequestError(Exception):
+            pass
+
+        rejected = BadRequestError(
+            "litellm.BadRequestError: OpenAIException - workbuddy upstream "
+            "client (http 400): 工具记录不完整，请新建任务 {'message': "
+            "'workbuddy upstream client (http 400): 工具记录不完整，请新建任务', "
+            "'type': 'client', 'code': 'client'}"
+        )
+        rejected.status_code = 400
+
+        self.assertTrue(hooks._is_upstream_tool_history_rejected_error(rejected))
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(rejected),
+            "recovery",
+        )
+        self.assertTrue(hooks._is_priority_deployment_failover_error(rejected))
+        self.assertEqual(
+            hooks._trace_exception(rejected)["reason"],
+            "upstream-tool-history-rejected",
+        )
+        self.assertEqual(
+            hooks._recovery_diagnostic(rejected)["kind"],
+            "tool_history_rejected",
+        )
+        sanitized = hooks._sanitized_upstream_route_failure_message(
+            "balanced-chat",
+            rejected,
+            {"model": "balanced-chat"},
+        )
+        self.assertIn("tool records", sanitized)
+        self.assertIn("new task", sanitized)
+        self.assertNotIn("retry later", sanitized.lower())
+
+        # The same verdict in a station's English wording is the same cause,
+        # not an anonymous request error.
+        english = BadRequestError(
+            "litellm.BadRequestError: OpenAIException - tool calls and tool "
+            "results do not match, please start a new conversation and retry "
+            "(request id: 202610221208000799135708268d9d6hqsg9zze)"
+        )
+        english.status_code = 400
+        self.assertTrue(hooks._is_upstream_tool_history_rejected_error(english))
+        self.assertEqual(hooks._recovery_policy_for_exception(english), "recovery")
+
+        # A refusal that does not name the history keeps the ordinary verdict.
+        plain = BadRequestError("litellm.BadRequestError: some unrelated 400")
+        plain.status_code = 400
+        self.assertFalse(hooks._is_upstream_tool_history_rejected_error(plain))
+        self.assertEqual(hooks._recovery_policy_for_exception(plain), "error")
+
+    def test_a_route_refusing_its_own_account_advances_instead_of_ending_the_turn(
+        self,
+    ) -> None:
+        """An account refusal is the route's verdict, not the request's.
+
+        Observed on a local worker whose upstream answered HTTP 400
+        ``workbuddy upstream client: 账号存在异常行为，已被限制使用`` ("abnormal account
+        behavior, use restricted").  Classified as a request error it was
+        terminal: the dead route was never cooled, every client retry selected
+        it first again, and the turn ended on the unclassified-stop sentence
+        while a sibling route of the same group answered the same bytes.  The
+        refusal is one route's account, so the turn advances and the route is
+        parked; only a replay that reaches no other route names the account.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        self.set_env(hooks._RECOVERY_POLICY_REQUEST_ERROR_ENV, None)
+
+        class BadRequestError(Exception):
+            pass
+
+        restricted = BadRequestError(
+            "litellm.BadRequestError: OpenAIException - workbuddy upstream "
+            "client: 账号存在异常行为，已被限制使用 litellm.BadRequestError: "
+            "OpenAIException - workbuddy upstream client: 账号存在异常行为，已被限制使用 "
+            "{'message': 'workbuddy upstream client: 账号存在异常行为，已被限制使用', "
+            "'type': 'client', 'code': 'client'}"
+        )
+        restricted.status_code = 400
+
+        self.assertTrue(hooks._is_upstream_account_restricted_error(restricted))
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(restricted),
+            "recovery_cooldown",
+        )
+        self.assertTrue(
+            hooks._is_priority_deployment_failover_error(restricted)
+        )
+        self.assertEqual(
+            hooks._trace_exception(restricted)["reason"],
+            "upstream-account-restricted",
+        )
+        self.assertEqual(
+            hooks._recovery_diagnostic(restricted)["kind"],
+            "account_restricted",
+        )
+        # The final failure for a chat client keeps the same cause and never
+        # turns the refusal into a retry tip.
+        sanitized = hooks._sanitized_upstream_route_failure_message(
+            "balanced-chat",
+            restricted,
+            {"model": "balanced-chat"},
+        )
+        self.assertIn("restricted", sanitized)
+        self.assertIn("balanced-chat", sanitized)
+        self.assertNotIn("retry later", sanitized.lower())
+        self.assertNotIn("temporary", sanitized.lower())
+
+        # An ordinary 400 stays the request's own verdict: it neither parks the
+        # route nor moves the turn to a peer.
+        invalid = BadRequestError("litellm.BadRequestError: some unrelated 400")
+        invalid.status_code = 400
+        self.assertFalse(hooks._is_upstream_account_restricted_error(invalid))
+        self.assertEqual(hooks._recovery_policy_for_exception(invalid), "error")
+        self.assertFalse(hooks._is_priority_deployment_failover_error(invalid))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -10,18 +10,15 @@ from .base import (
     Any,
     List,
     Optional,
+    os,
     _BROWSER_COMPUTER_CLIENT_FUNCTION_NAMES,
     _BROWSER_COMPUTER_CLIENT_NAMESPACE_NAMES,
     _HOSTED_COMPUTER_TOOL_TYPES,
     _RESPONSES_CHAT_BRIDGE_METADATA_KEY,
     _RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY,
-    _PI_WEB_ACCESS_TOOL_NAMES,
     _PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES,
     _WEB_SEARCH_NATIVE_EVENT_SEEN_METADATA_KEY,
-    _WEB_SEARCH_EXTERNAL_BRIDGE_KEY,
-    _WEB_SEARCH_EXTERNAL_SUPPRESS_POST_CALL_KEY,
 )
-
 
 
 def _content_text(content: Any) -> str:
@@ -64,186 +61,9 @@ def _tools_include_web_search(tools: Any) -> bool:
     )
 
 
-def _tools_include_pi_web_access_tool(tools: Any) -> bool:
-    """Return whether direct bundled pi-web-access tools are declared.
-
-    These are ordinary function declarations, so ``has_web_search_tool`` is
-    intentionally false for them.  The two flags must not be merged: the
-    hosted-tool flag describes a provider-native ``web_search`` item, while
-    this flag tells streaming/post-call code that the local worker must execute
-    a ``web_search`` or ``fetch_content`` function call.
-    """
-    if not isinstance(tools, list):
-        return False
-    for tool in tools:
-        if not isinstance(tool, dict):
-            continue
-        # Hosted web search uses type=web_search (or web_search_preview).
-        # Only an ordinary function declaration is the pi-web-access
-        # contract, even when a caller attaches a similarly named name field
-        # to a hosted object.
-        if tool.get("type") != "function":
-            continue
-        name = tool.get("name")
-        function = tool.get("function")
-        if isinstance(function, dict):
-            name = function.get("name") or name
-        if isinstance(name, str) and name in _PI_WEB_ACCESS_TOOL_NAMES:
-            return True
-    return False
-
-
 def _request_has_web_search_tool(request_kwargs: Optional[dict]) -> bool:
-    # Do not use this hosted-tool predicate to detect the pi-web-access bridge;
-    # a real third-party Codex request can contain search-named functions while
-    # still having no provider-native web-search item.
     request_kwargs = request_kwargs or {}
     return _tools_include_web_search(request_kwargs.get("tools"))
-
-
-def _request_has_pi_web_access_tool(request_kwargs: Optional[dict]) -> bool:
-    request_kwargs = request_kwargs or {}
-    return _tools_include_pi_web_access_tool(request_kwargs.get("tools"))
-
-
-def _request_is_external_web_search_synthesis(request_kwargs: Optional[dict]) -> bool:
-    for key in ("litellm_metadata", "metadata"):
-        metadata = _request_context_module._request_metadata_dict(request_kwargs, key) or {}
-        if metadata.get("external_web_search_synthesis") is True:
-            return True
-    return False
-
-
-def _request_suppresses_external_web_search_post_call(
-    request_kwargs: Optional[dict],
-) -> bool:
-    for key in ("litellm_metadata", "metadata"):
-        metadata = _request_context_module._request_metadata_dict(request_kwargs, key) or {}
-        if metadata.get(_WEB_SEARCH_EXTERNAL_SUPPRESS_POST_CALL_KEY) is True:
-            return True
-    return False
-
-
-def _with_external_web_search_post_call_suppressed(
-    request_kwargs: dict[str, Any],
-) -> dict[str, Any]:
-    suppressed_kwargs = request_kwargs.copy()
-    for key in ("litellm_metadata", "metadata"):
-        metadata = _request_context_module._request_metadata_dict(request_kwargs, key) or {}
-        suppressed_metadata = metadata.copy()
-        suppressed_metadata[_WEB_SEARCH_EXTERNAL_SUPPRESS_POST_CALL_KEY] = True
-        suppressed_kwargs[key] = suppressed_metadata
-    return suppressed_kwargs
-
-
-def _upstream_request_kwargs_for_web_search_bridge(
-    request_kwargs: dict[str, Any],
-) -> dict[str, Any]:
-    """Keep native pi-web-access calls visible to the stream bridge.
-
-    Hosted compatibility metadata is suppressed while an internal upstream
-    response is collected so the normal post-call hook does not execute the
-    same action twice. Native pi-web-access functions are different: they are
-    the public tool contract for Codex turns, and the streaming hook must see
-    their function call in order to execute the bundled worker and continue the
-    response.
-    """
-    if _request_has_pi_web_access_tool(request_kwargs):
-        return request_kwargs
-    return _with_external_web_search_post_call_suppressed(request_kwargs)
-
-
-def _request_should_intercept_external_web_search(request_kwargs: Optional[dict]) -> bool:
-    if not (
-        _request_has_pi_web_access_tool(request_kwargs)
-    ):
-        return False
-    if not isinstance(request_kwargs, dict):
-        return False
-    metadata = _request_context_module._request_metadata_dict(request_kwargs, "litellm_metadata") or {}
-    return bool(
-        metadata.get(_WEB_SEARCH_EXTERNAL_BRIDGE_KEY) is True
-        or metadata.get(_RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY) is True
-        or metadata.get(_RESPONSES_CHAT_BRIDGE_METADATA_KEY) is True
-        or request_kwargs.get("use_chat_completions_api") is True
-    )
-
-
-_EXTERNAL_WEB_SEARCH_CONTINUATION_METADATA_KEY = "external_web_search_continuation"
-# litellm's streaming post-call hook only receives a reduced request context
-# (input / tools / litellm_params): litellm_metadata is dropped there.  Hidden
-# bridge continuation turns are therefore also recognised by their distinctive
-# input header, which the bridge builds from this constant.
-_EXTERNAL_WEB_SEARCH_CONTINUATION_INPUT_MARKER = "Retrieved evidence observed so far:"
-
-
-def _request_is_external_web_search_continuation(
-    request_kwargs: Optional[dict],
-) -> bool:
-    if not isinstance(request_kwargs, dict):
-        return False
-    metadata = _request_context_module._request_metadata_dict(
-        request_kwargs, "litellm_metadata"
-    ) or {}
-    if metadata.get(_EXTERNAL_WEB_SEARCH_CONTINUATION_METADATA_KEY) is True:
-        return True
-    litellm_params = request_kwargs.get("litellm_params")
-    if isinstance(litellm_params, dict):
-        for key in ("litellm_metadata", "metadata"):
-            nested = litellm_params.get(key)
-            if (
-                isinstance(nested, dict)
-                and nested.get(_EXTERNAL_WEB_SEARCH_CONTINUATION_METADATA_KEY) is True
-            ):
-                return True
-    input_value = request_kwargs.get("input")
-    return (
-        isinstance(input_value, str)
-        and _EXTERNAL_WEB_SEARCH_CONTINUATION_INPUT_MARKER in input_value
-    )
-
-
-def _request_should_consume_web_search_function_call(
-    request_kwargs: Optional[dict],
-) -> bool:
-    if _request_is_external_web_search_continuation(request_kwargs):
-        # Hidden bridge continuation turns are consumed by the bridge's own
-        # round loop, which emits a client-visible web_search_call item for
-        # every executed action -- searches AND page opens.  Re-intercepting
-        # them here would swallow page-open actions invisibly (Codex would
-        # only ever show query chips) and reset the round accounting by
-        # nesting fresh resolves.
-        return False
-    if _request_should_intercept_external_web_search(request_kwargs):
-        return True
-    if not isinstance(request_kwargs, dict):
-        return False
-    if _request_suppresses_external_web_search_post_call(request_kwargs):
-        return False
-    if _request_is_external_web_search_synthesis(request_kwargs):
-        return False
-    metadata = _request_context_module._request_metadata_dict(
-        request_kwargs, "litellm_metadata"
-    ) or {}
-    if (
-        metadata.get(_WEB_SEARCH_NATIVE_EVENT_SEEN_METADATA_KEY) is True
-        and not _request_has_pi_web_access_tool(request_kwargs)
-    ):
-        return False
-    # A provider-native search event belongs to the upstream runtime. It is
-    # already being delivered as a hosted search lifecycle and must never be
-    # reinterpreted as a pi-web-access function call. Keep explicit pi tools
-    # eligible because a request may legitimately contain both tool families;
-    # only an actual pi function call can then be consumed.
-    if not (
-        _request_has_pi_web_access_tool(request_kwargs)
-        or _request_has_web_search_tool(request_kwargs)
-    ):
-        return False
-    return (
-        _responses_request_module._request_is_responses_api(request_kwargs)
-        or _responses_surfaces_module._request_uses_responses_endpoint(request_kwargs)
-    )
 
 
 def _tools_include_browser_computer_client_tool(tools: Any) -> bool:

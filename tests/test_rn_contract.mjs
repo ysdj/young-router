@@ -29,7 +29,7 @@ try {
     + '  | "openai_login"\n'
     + '  | "claude_login"\n'
     + '  | "workbuddy_login"\n'
-    + '  | "workbuddy_ai_login"\n'
+    + '  | "workbuddy_global_login"\n'
     + '  | "our_free_model_login";'));
   assert.ok(original.includes("auth_status?: ProviderAuthStatus;"));
 

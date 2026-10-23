@@ -632,12 +632,14 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn("set -euo pipefail", script)
         # A guarded expansion is what an array that can be empty must use.
         self.assertIn('if [[ ${#NODE_SOURCE_ARGS[@]} -gt 0 ]]; then', script)
-        self.assertIn('PI_WEB_ACCESS_NODE_ARGS+=("${NODE_SOURCE_ARGS[@]}")', script)
+        self.assertIn('NODE_RUNTIME_ARGS+=("${NODE_SOURCE_ARGS[@]}")', script)
         # The unguarded form must not appear for that array.
         self.assertNotIn('"${NODE_SOURCE_ARGS[@]}" &', script)
         # An empty array has to be initialized, and an exit must stop every
         # staged update rather than leave a child writing a cache that the
         # next installer begins to modify.
+        # Five: the four staged releases plus the Node runtime that ships beside
+        # them, which is its own stager because it is not a release.
         self.assertEqual(5, script.count('STAGING_PIDS+=("$!")'))
         self.assertIn('STAGING_PIDS[@]+"${STAGING_PIDS[@]}"', script)
         self.assertIn('INSTALL_LOCK_PID=$!', script)
@@ -659,13 +661,13 @@ class ReactNativeReleaseTests(unittest.TestCase):
 
         # Every staged integration resolves into the cache, and none of them
         # still points at the throwaway per-build tree.
-        for artifact in ("pi-web-access", "workbuddy-connect", "veridrop", "dsh-vision-router"):
+        for artifact in ("connect-workbuddy", "veridrop", "dsh-vision-router"):
             self.assertIn(f'"$STAGING_CACHE/{artifact}"', macos)
             self.assertIn(f'Join-Path $StagingCache "{artifact}"', windows)
-        self.assertNotIn('WORKBUDDY_CONNECT_WORK="$RUNTIME_WORK/', macos)
+        self.assertNotIn('CONNECT_WORKBUDDY_WORK="$RUNTIME_WORK/', macos)
         self.assertNotIn('VERIDROP_WORK="$RUNTIME_WORK/', macos)
         self.assertNotIn('DSH_VISION_ROUTER_WORK="$RUNTIME_WORK/', macos)
-        self.assertNotIn('PI_WEB_ACCESS_PACKAGE_WORK="$RUNTIME_WORK/', macos)
+        self.assertNotIn('NODE_RUNTIME_WORK="$STAGING_CACHE/', macos)
         self.assertNotIn('Join-Path ([System.IO.Path]::GetTempPath()) ("young-router-veridrop-" + [guid]', windows)
 
         # The cache is build output, never committed.
@@ -676,8 +678,8 @@ class ReactNativeReleaseTests(unittest.TestCase):
         # lookup), not by the build scripts trusting a directory that happens
         # to exist.  Both scripts still invoke every updater on every build.
         for updater in (
-            "update_pi_web_access.py",
-            "update_workbuddy_connect.py",
+            "update_node_runtime.py",
+            "update_connect_workbuddy.py",
             "update_veridrop.py",
             "update_dsh_vision_router.py",
         ):
@@ -825,30 +827,36 @@ class ReactNativeReleaseTests(unittest.TestCase):
         install = install[:install.index("\n\n")] if "\n\n" in install else install
         self.assertIn("--target", install)
 
-    def test_the_build_proves_the_staged_workbuddy_key_factory_is_still_reachable(self) -> None:
-        # A WorkBuddy variant's store can only open a 5.6-era sealed desktop
-        # credential through the library's per-variant at-rest key factory, and
-        # that factory is the one name upstream builds internally without
-        # exporting from its entry point.  The worker resolves it by name from
-        # the sibling chunks, so the build must prove that name is still
-        # reachable: without this check a release that moved it would ship, and
-        # every signed-in account would read as 未登录 with
-        # `electron-binary-unavailable` -- the exact failure this guard exists
-        # to catch.
+    def test_the_build_proves_the_staged_workbuddy_surface_is_still_published(self) -> None:
+        # WorkBuddy ships the desktop credential format and both model
+        # catalogs, so a release that renamed one of its published exports
+        # would break the provider at request time instead of at build time.
+        # The smoke test names exactly what the worker imports.
         script = (ROOT / "scripts" / "build-and-install-macos.sh").read_text(encoding="utf-8")
-        self.assertIn("atRestKeyProviderFor", script)
-        self.assertIn("no longer resolvable from the staged package", script)
-        # The published surface stays checked in the same smoke test.
-        self.assertIn("WorkBuddyCredentialStore", script)
-        # The build's resolution must mirror the worker's, or the check would
-        # pass while the worker itself failed to find the factory.
         worker = (ROOT / "young_router" / "adapters" / "workbuddy_worker.mjs").read_text(
             encoding="utf-8"
         )
-        self.assertIn("atRestKeyProviderFor", worker)
-        for name in ("WorkBuddyCredentialStore", "WorkBuddyUpstreamClient", "WorkBuddyCatalog"):
+        for name in (
+            "WorkBuddyCredentialStore",
+            "WorkBuddyUpstreamClient",
+            "WorkBuddyCatalog",
+            "createWorkBuddyShim",
+        ):
             self.assertIn(name, script)
             self.assertIn(name, worker)
+        # The regions are what the worker iterates, so the build proves the
+        # list still names two of them and that each has a provider id and a
+        # display name: a release that dropped one would serve one gateway
+        # while reporting success.
+        self.assertIn("WORKBUDDY_REGIONS", script)
+        self.assertIn("WORKBUDDY_PROVIDERS", script)
+        self.assertIn("WORKBUDDY_PROVIDER_DISPLAY_NAMES", script)
+        self.assertIn("library.WORKBUDDY_REGIONS", worker)
+        # The desktop app probe is how a signed-out card finds the app that
+        # owns its sign-in; the worker must not carry those paths itself.
+        self.assertIn("workbuddyAppExecutableCandidates", script)
+        self.assertIn("workbuddyAppExecutableCandidates", worker)
+        self.assertNotIn("/Applications/WorkBuddy", worker)
 
     def test_windows_build_checks_085_codegen_before_msbuild(self) -> None:
         package = (ROOT / "rn/package.json").read_text(encoding="utf-8")

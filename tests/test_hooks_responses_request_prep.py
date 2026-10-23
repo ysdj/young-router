@@ -7,6 +7,32 @@ from hook_test_utils import *
 
 
 class HookResponsesRequestPrepTests(HookTestCase):
+    def test_dsh_messages_plaintext_placeholder_is_restored(self) -> None:
+        hooks, _ = load_hook_module()
+        request = {
+            "call_type": "anthropic_messages",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "encrypted_content",
+                            "encrypted_content": "Perform a web search for the query: OpenAI",
+                        }
+                    ],
+                }
+            ],
+        }
+
+        modified = hooks._with_dsh_messages_plaintext_content_restored(request)
+
+        self.assertIsNotNone(modified)
+        self.assertEqual(
+            modified["messages"][0]["content"],
+            [{"type": "text", "text": "Perform a web search for the query: OpenAI"}],
+        )
+        self.assertEqual(request["messages"][0]["content"][0]["type"], "encrypted_content")
+
     def setUp(self) -> None:
         super().setUp()
         # Replay-image reference copies stay inside a per-test directory so a
@@ -158,101 +184,6 @@ class HookResponsesRequestPrepTests(HookTestCase):
         self.assertEqual(error["code"], contract.UNDECLARED_TOOL_CODE)
         self.assertEqual(error["tool_name"], "web__run")
 
-    def test_codex_external_web_search_bridge_is_advertised(self) -> None:
-        hooks, _ = load_hook_module()
-        contract = hooks._codex_contract_module
-        original = self._codex_collaboration_request()
-        original["model_info"] = {
-            "supports_responses_web_search": False,
-        }
-
-        modified = hooks._with_codex_external_web_search_bridge_tool(original)
-
-        self.assertIsNotNone(modified)
-        assert modified is not None
-        bridge_tools = [
-            tool
-            for tool in modified["tools"]
-            if isinstance(tool, dict)
-            and tool.get("name") in {"web_search", "fetch_content"}
-        ]
-        self.assertEqual(
-            {tool["name"] for tool in bridge_tools},
-            {"web_search", "fetch_content"},
-        )
-        self.assertIn("query", next(tool for tool in bridge_tools if tool["name"] == "web_search")["parameters"]["properties"])
-        self.assertNotIn("private_web_search_bridge", {tool["name"] for tool in bridge_tools})
-        self.assertEqual(original["instructions"], modified["instructions"])
-        self.assertIsNone(
-            hooks._with_codex_external_web_search_bridge_tool(modified)
-        )
-
-    def test_codex_responses_unknown_search_capability_bridges_local_search(self) -> None:
-        hooks, _ = load_hook_module()
-        contract = hooks._codex_contract_module
-        original = self._codex_collaboration_request()
-        original["model_info"] = {
-            "upstream_url_surface": "openai/responses",
-        }
-
-        # A generic openai/responses surface is shared by many third-party
-        # gateways, so unknown capability metadata on a non-GPT public model
-        # must not keep Codex's native GPT search route: the local
-        # pi-web-access bridge takes over.
-        bridged = hooks._with_codex_external_web_search_bridge_tool(original)
-        self.assertIsNotNone(bridged)
-        bridged_tools = [
-            tool.get("name")
-            for tool in (bridged or {}).get("tools", [])
-            if isinstance(tool, dict)
-        ]
-        self.assertIn("web_search", bridged_tools)
-        self.assertIn("fetch_content", bridged_tools)
-        self.assertEqual(original["tools"], [])
-
-    async def test_pre_call_bridges_codex_search_for_third_party_chat(self) -> None:
-        hooks, _ = load_hook_module()
-        original = self._codex_collaboration_request()
-        original.pop("client_metadata")
-        original["input"][0]["tools"].append(
-            {
-                "type": "namespace",
-                "name": "functions",
-                "tools": [{"type": "function", "name": "exec_command"}],
-            }
-        )
-        original["tools"] = [
-            {
-                "type": "function",
-                "name": "web_search",
-                "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
-            },
-            {
-                "type": "function",
-                "name": "fetch_content",
-                "parameters": {"type": "object", "properties": {"url": {"type": "string"}}},
-            },
-        ]
-        original["model_info"] = {
-            "provider": "third-party",
-            "upstream_url_surface": "openai/chat",
-        }
-
-        modified = await hooks.YoungRouterHook().async_pre_call_deployment_hook(
-            original,
-            call_type="aresponses",
-        )
-
-        self.assertIsNotNone(modified)
-        assert modified is not None
-        self.assertEqual(
-            [tool["name"] for tool in modified["tools"]],
-            ["web_search", "fetch_content"],
-        )
-        web_search = next(tool for tool in modified["tools"] if tool["name"] == "web_search")
-        self.assertIn("queries", web_search["parameters"]["properties"])
-        self.assertTrue(hooks._tools_module._request_has_pi_web_access_tool(modified))
-
     def test_generic_additional_tools_do_not_identify_codex(self) -> None:
         hooks, _ = load_hook_module()
         request = {
@@ -273,129 +204,6 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
         self.assertFalse(hooks._responses_request_module._request_has_codex_client_evidence(request))
 
-    def test_codex_non_gpt_route_bridges_explicit_search_capability(self) -> None:
-        hooks, _ = load_hook_module()
-        contract = hooks._codex_contract_module
-        original = self._codex_collaboration_request()
-        original["model_info"] = {
-            "provider": "third-party",
-            "upstream_url_surface": "openai/responses",
-            "supports_responses_web_search": True,
-        }
-
-        modified = hooks._with_codex_external_web_search_bridge_tool(original)
-
-        self.assertIsNotNone(modified)
-        assert modified is not None
-        self.assertEqual(
-            {tool["name"] for tool in modified["tools"] if "name" in tool},
-            {"web_search", "fetch_content"},
-        )
-
-    def test_codex_gpt_responses_route_keeps_native_search(self) -> None:
-        hooks, _ = load_hook_module()
-        contract = hooks._codex_contract_module
-        original = self._codex_collaboration_request()
-        original["api_base"] = "https://api.openai.com/v1"
-        original["model_info"] = {
-            "provider": "third-party",
-            "upstream_url_surface": "openai/responses",
-        }
-
-        self.assertIsNone(
-            hooks._with_codex_external_web_search_bridge_tool(original)
-        )
-        self.assertEqual(original["tools"], [])
-
-    def test_codex_gpt_family_model_with_unknown_capability_keeps_native_search(self) -> None:
-        hooks, _ = load_hook_module()
-        contract = hooks._codex_contract_module
-        original = self._codex_collaboration_request()
-        original["model"] = "gpt-5-test"
-        original["model_info"] = {
-            "provider": "third-party",
-            "upstream_url_surface": "openai/responses",
-        }
-
-        self.assertIsNone(
-            hooks._with_codex_external_web_search_bridge_tool(original)
-        )
-        self.assertEqual(original["tools"], [])
-        self.assertTrue(
-            hooks._request_is_codex_gpt_responses_route(original)
-        )
-
-    def test_codex_gpt_family_model_with_explicit_unsupported_capability_uses_local_bridge(self) -> None:
-        hooks, _ = load_hook_module()
-        contract = hooks._codex_contract_module
-        original = self._codex_collaboration_request()
-        original["model"] = "gpt-5-test"
-        original["model_info"] = {
-            "provider": "third-party",
-            "upstream_url_surface": "openai/responses",
-            "supports_responses_web_search": False,
-        }
-
-        modified = hooks._with_codex_external_web_search_bridge_tool(original)
-
-        self.assertIsNotNone(modified)
-        assert modified is not None
-        self.assertEqual(
-            [tool.get("name") for tool in modified["tools"] if isinstance(tool, dict)],
-            ["web_search", "fetch_content"],
-        )
-
-    def test_codex_gpt_family_model_cached_rejection_uses_local_bridge(self) -> None:
-        hooks, _ = load_hook_module()
-        contract = hooks._codex_contract_module
-        original = self._codex_collaboration_request()
-        original["model"] = "gpt-5-test"
-        original["model_info"] = {
-            "id": "gpt-cached-search",
-            "provider": "third-party",
-            "route_key": "third-party / model / key=default",
-            "upstream_url_surface": "openai/responses",
-        }
-        probe = original.copy()
-        probe["tools"] = [{"type": "web_search"}]
-
-        class UnsupportedSearch(Exception):
-            status_code = 400
-
-        hooks._record_web_search_tool_unsupported(
-            UnsupportedSearch(
-                "invalid_request_error: web_search is not supported"
-            ),
-            probe,
-        )
-
-        fallback = hooks._with_codex_external_web_search_bridge_tool(original)
-        self.assertIsNotNone(fallback)
-        assert fallback is not None
-        self.assertEqual(
-            [tool.get("name") for tool in fallback["tools"]],
-            ["web_search", "fetch_content"],
-        )
-
-    def test_codex_gpt_family_model_on_chat_surface_uses_local_bridge(self) -> None:
-        hooks, _ = load_hook_module()
-        contract = hooks._codex_contract_module
-        original = self._codex_collaboration_request()
-        original["model"] = "gpt-5-test"
-        original["model_info"] = {
-            "provider": "third-party",
-            "upstream_url_surface": "openai/chat",
-        }
-
-        modified = hooks._with_codex_external_web_search_bridge_tool(original)
-
-        self.assertIsNotNone(modified)
-        assert modified is not None
-        self.assertEqual(
-            [tool.get("name") for tool in modified["tools"] if isinstance(tool, dict)],
-            ["web_search", "fetch_content"],
-        )
-
     def test_codex_gpt_image_family_is_not_a_gpt_responses_route(self) -> None:
         hooks, _ = load_hook_module()
         contract = hooks._codex_contract_module
@@ -406,135 +214,9 @@ class HookResponsesRequestPrepTests(HookTestCase):
             "upstream_url_surface": "openai/responses",
         }
 
-        modified = hooks._with_codex_external_web_search_bridge_tool(original)
-
-        self.assertIsNotNone(modified)
-        assert modified is not None
-        self.assertFalse(
-            hooks._request_is_codex_gpt_responses_route(original)
-        )
-        self.assertEqual(
-            [tool.get("name") for tool in modified["tools"] if isinstance(tool, dict)],
-            ["web_search", "fetch_content"],
-        )
-
-    def test_codex_provider_switch_does_not_use_stale_custom_provider(self) -> None:
-        hooks, _ = load_hook_module()
-        contract = hooks._codex_contract_module
-        original = self._codex_collaboration_request()
-        original["custom_llm_provider"] = "openai"
-        original["model_info"] = {
-            "provider": "third-party",
-            "upstream_url_surface": "openai/responses",
-        }
-
-        modified = hooks._with_codex_external_web_search_bridge_tool(original)
-
-        self.assertIsNotNone(modified)
-        assert modified is not None
-        self.assertEqual(
-            {tool["name"] for tool in modified["tools"] if "name" in tool},
-            {"web_search", "fetch_content"},
-        )
-
-    def test_codex_plain_non_gpt_turn_receives_local_search_tools(self) -> None:
-        hooks, _ = load_hook_module()
-        contract = hooks._codex_contract_module
-        original = self._codex_collaboration_request()
-        original["input"] = [{"role": "user", "content": "Search the web."}]
-        original["tools"] = []
-        original["model_info"] = {
-            "provider": "third-party",
-            "upstream_url_surface": "openai/responses",
-        }
-
-        modified = hooks._with_codex_external_web_search_bridge_tool(original)
-
-        self.assertIsNotNone(modified)
-        assert modified is not None
-        self.assertEqual(
-            [tool["name"] for tool in modified["tools"]],
-            ["web_search", "fetch_content"],
-        )
-
-    def test_codex_responses_native_search_capability_keeps_native_route(self) -> None:
-        hooks, _ = load_hook_module()
-        contract = hooks._codex_contract_module
-        original = self._codex_collaboration_request()
-        original["model_info"] = {
-            "provider": "openai",
-            "upstream_url_surface": "openai/responses",
-            "supports_responses_web_search": True,
-        }
-
-        self.assertIsNone(
-            hooks._with_codex_external_web_search_bridge_tool(original)
-        )
-        self.assertEqual(original["tools"], [])
-
-    def test_codex_external_web_search_bridge_is_not_advertised_on_function_unsupported_route(self) -> None:
-        hooks, _ = load_hook_module()
-        contract = hooks._codex_contract_module
-        original = self._codex_collaboration_request()
-        original["model_info"] = {
-            "supports_responses_function_tools": False,
-        }
-
-        self.assertIsNone(
-            hooks._with_codex_external_web_search_bridge_tool(original)
-        )
-
-    def test_codex_provider_native_search_does_not_add_pi_bridge_tools(self) -> None:
-        hooks, _ = load_hook_module()
-        contract = hooks._codex_contract_module
-        original = self._codex_collaboration_request()
-        original["tools"] = [{"type": "openrouter:web_search"}]
-        original["model_info"] = {
-            "provider": "openrouter",
-            "upstream_url_surface": "openai/responses",
-        }
-
-        modified = hooks._with_codex_external_web_search_bridge_tool(original)
-
-        self.assertIsNone(modified)
-        self.assertEqual(original["tools"], [{"type": "openrouter:web_search"}])
-
-    def test_codex_openrouter_search_capable_route_does_not_add_pi_bridge_tools(self) -> None:
-        hooks, _ = load_hook_module()
-        contract = hooks._codex_contract_module
-        original = self._codex_collaboration_request()
-        original["model_info"] = {
-            "provider": "openrouter",
-            "upstream_url_surface": "openai/responses",
-        }
-
-        self.assertIsNone(
-            hooks._with_codex_external_web_search_bridge_tool(original)
-        )
-
-    def test_codex_openrouter_route_injects_native_search_before_local_bridge(self) -> None:
-        hooks, _ = load_hook_module()
-        contract = hooks._codex_contract_module
-        original = self._codex_collaboration_request()
-        original["model_info"] = {
-            "provider": "openrouter",
-            "upstream_url_surface": "openai/responses",
-            "supports_responses_function_tools": True,
-        }
-
-        modified = hooks._with_codex_openrouter_native_web_search_tool(original)
-
-        self.assertIsNotNone(modified)
-        assert modified is not None
-        self.assertEqual(modified["tools"], [{"type": "openrouter:web_search"}])
-        self.assertEqual(original["tools"], [])
-        self.assertTrue(
-            modified["litellm_metadata"][
-                hooks._CODEX_OPENROUTER_NATIVE_WEB_SEARCH_METADATA_KEY
-            ]
-        )
-        self.assertIsNone(hooks._with_codex_external_web_search_bridge_tool(modified))
-        self.assertIsNone(hooks._with_codex_openrouter_native_web_search_tool(modified))
+        # A GPT image model is not a GPT Responses chat route, so the Codex
+        # tool registry is never applied to it.
+        self.assertFalse(hooks._request_is_codex_gpt_responses_route(original))
 
     def test_codex_openrouter_hosted_search_is_converted_to_native_declaration(self) -> None:
         hooks, _ = load_hook_module()
@@ -648,94 +330,6 @@ class HookResponsesRequestPrepTests(HookTestCase):
         assert modified is not None
         self.assertEqual(modified["tools"], [{"type": "openrouter:web_search"}])
 
-    def test_codex_openrouter_cached_rejection_uses_local_bridge_without_native_tool(self) -> None:
-        hooks, _ = load_hook_module()
-        contract = hooks._codex_contract_module
-        original = self._codex_collaboration_request()
-        original["model_info"] = {
-            "id": "openrouter-cached-search",
-            "provider": "openrouter",
-            "route_key": "openrouter / model / key=default",
-            "upstream_url_surface": "openai/responses",
-            "supports_responses_function_tools": True,
-        }
-        probe = original.copy()
-        probe["tools"] = [{"type": "openrouter:web_search"}]
-
-        class UnsupportedSearch(Exception):
-            status_code = 400
-
-        hooks._record_web_search_tool_unsupported(
-            UnsupportedSearch(
-                "invalid_request_error: openrouter:web_search is not supported"
-            ),
-            probe,
-        )
-
-        self.assertIsNone(
-            hooks._with_codex_openrouter_native_web_search_tool(original)
-        )
-        fallback = hooks._with_codex_external_web_search_bridge_tool(original)
-        self.assertIsNotNone(fallback)
-        assert fallback is not None
-        self.assertEqual(
-            [tool.get("name") for tool in fallback["tools"]],
-            ["web_search", "fetch_content"],
-        )
-
-    def test_codex_openrouter_chat_surface_cached_rejection_uses_local_bridge(self) -> None:
-        hooks, _ = load_hook_module()
-        contract = hooks._codex_contract_module
-        original = self._codex_collaboration_request()
-        original["model_info"] = {
-            "id": "openrouter-cached-search-chat",
-            "provider": "openrouter",
-            "route_key": "openrouter / chat-model / key=default",
-            "upstream_url_surface": "openai/chat",
-        }
-        probe = original.copy()
-        probe["tools"] = [{"type": "openrouter:web_search"}]
-
-        class UnsupportedSearch(Exception):
-            status_code = 400
-
-        hooks._record_web_search_tool_unsupported(
-            UnsupportedSearch(
-                "invalid_request_error: openrouter:web_search is not supported"
-            ),
-            probe,
-        )
-
-        self.assertIsNone(
-            hooks._with_codex_openrouter_native_web_search_tool(original)
-        )
-        fallback = hooks._with_codex_external_web_search_bridge_tool(original)
-        self.assertIsNotNone(fallback)
-        assert fallback is not None
-        self.assertEqual(
-            [tool.get("name") for tool in fallback["tools"]],
-            ["web_search", "fetch_content"],
-        )
-
-    def test_codex_openrouter_explicit_search_unsupported_keeps_pi_fallback(self) -> None:
-        hooks, _ = load_hook_module()
-        contract = hooks._codex_contract_module
-        original = self._codex_collaboration_request()
-        original["model_info"] = {
-            "provider": "openrouter",
-            "upstream_url_surface": "openai/responses",
-            "supports_responses_web_search": False,
-        }
-
-        modified = hooks._with_codex_external_web_search_bridge_tool(original)
-
-        self.assertIsNotNone(modified)
-        assert modified is not None
-        self.assertEqual(
-            {tool.get("name") for tool in modified["tools"] if isinstance(tool, dict)},
-            {"web_search", "fetch_content"},
-        )
-
     def test_codex_declared_set_covers_a_function_namespace(self) -> None:
         hooks, _ = load_hook_module()
         contract = hooks._codex_contract_module
@@ -785,7 +379,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
             self.assertNotIn(marker, instructions)
         self.assertEqual(
             {tool.get("name") for tool in modified["tools"] if isinstance(tool, dict)},
-            {"collaboration", "web_search", "fetch_content"},
+            {"collaboration"},
         )
 
     def test_codex_descendant_barrier_holds_the_turn_with_tool_choice(self) -> None:
@@ -1147,6 +741,36 @@ class HookResponsesRequestPrepTests(HookTestCase):
         self.assertEqual(declared, {"exec", "wait", "list_agents"})
         self.assertFalse(contract.is_undeclared_tool_call(request, "exec"))
         self.assertTrue(contract.is_undeclared_tool_call(request, "web__run"))
+
+    def test_codex_declared_set_covers_loaded_browser_tools(self) -> None:
+        hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
+        request = self._codex_collaboration_request()
+        request["input"].insert(
+            1,
+            {
+                "type": "tool_search_output",
+                "tools": [
+                    {
+                        "type": "namespace",
+                        "name": "mcp__pi_control_chrome",
+                        "tools": [
+                            {"type": "function", "name": "browser_targets"},
+                            {"type": "function", "name": "browser_snapshot"},
+                        ],
+                    }
+                ],
+            },
+        )
+
+        declared = contract.declared_tool_names(request)
+
+        self.assertIn("browser_targets", declared)
+        self.assertIn("browser_snapshot", declared)
+        self.assertFalse(
+            contract.is_undeclared_tool_call(request, "browser_snapshot")
+        )
+        self.assertTrue(contract.is_undeclared_tool_call(request, "browser_missing"))
 
     def test_codex_root_clean_snapshot_allows_tool_free_completion(self) -> None:
         hooks, _ = load_hook_module()
@@ -1601,7 +1225,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
         self.assertEqual(modified["input"][-1], original["input"][-1])
         self.assertEqual(
             [tool["name"] for tool in modified["tools"]],
-            ["web_search", "fetch_content", "exec", "wait", "request_user_input"],
+            ["exec", "wait", "request_user_input"],
         )
         self.assertNotIn("additional_tools", json.dumps(modified["input"]))
 
@@ -3267,7 +2891,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
         assert modified is not None
         self.assertEqual(
             [tool["name"] for tool in modified["tools"]],
-            ["web_search", "fetch_content", "exec", "wait", "request_user_input"],
+            ["exec", "wait", "request_user_input"],
         )
         self.assertNotIn("additional_tools", json.dumps(modified["input"]))
         self.assertEqual(modified["input"][-1], original["input"][-1])

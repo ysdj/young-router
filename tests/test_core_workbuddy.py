@@ -8,6 +8,7 @@ the answer.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import shutil
@@ -115,14 +116,14 @@ class StubRuntime:
         return {
             workbuddy.API_BASE_ENV[workbuddy.WORKBUDDY_PROVIDER]: "http://127.0.0.1:1/workbuddy/v1",
             workbuddy.API_KEY_ENV[workbuddy.WORKBUDDY_PROVIDER]: "local-token",
-            workbuddy.API_BASE_ENV[workbuddy.WORKBUDDY_AI_PROVIDER]: "http://127.0.0.1:1/workbuddy-ai/v1",
-            workbuddy.API_KEY_ENV[workbuddy.WORKBUDDY_AI_PROVIDER]: "local-token",
+            workbuddy.API_BASE_ENV[workbuddy.WORKBUDDY_GLOBAL_PROVIDER]: "http://127.0.0.1:1/workbuddy-global/v1",
+            workbuddy.API_KEY_ENV[workbuddy.WORKBUDDY_GLOBAL_PROVIDER]: "local-token",
         }
 
     def open_desktop_app(self, provider: str) -> dict[str, object]:
         self.calls.append(("open_desktop_app", provider))
         return {
-            "app_name": "WorkBuddy" if provider == "workbuddy" else "WorkBuddy AI",
+            "app_name": "WorkBuddy" if provider == "workbuddy" else "WorkBuddy Global",
             "app_path": "/Applications/WorkBuddy.app",
             "opened": True,
         }
@@ -199,7 +200,7 @@ class WorkBuddyProviderTests(unittest.TestCase):
         directory, domain, _config = self._domain(runtime)
         with directory:
             provider = domain.dispatch(
-                "service_provider.add", {"kind": "workbuddy_ai_login"}
+                "service_provider.add", {"kind": "workbuddy_global_login"}
             )["providers"][0]
             self.assertEqual(
                 1_000_000,
@@ -224,7 +225,7 @@ class WorkBuddyProviderTests(unittest.TestCase):
         directory, domain, _config = self._domain(runtime)
         with directory:
             provider = domain.dispatch(
-                "service_provider.add", {"kind": "workbuddy_ai_login"}
+                "service_provider.add", {"kind": "workbuddy_global_login"}
             )["providers"][0]
             self.assertEqual(
                 192_000,
@@ -444,10 +445,10 @@ class WorkBuddyProviderTests(unittest.TestCase):
             self.assertEqual([entry["id"] for entry in models["models"]], ["glm-5.3", "hy3"])
 
             ai = domain.dispatch(
-                "workbuddy_models", {"provider": "workbuddy-ai"}
+                "workbuddy_models", {"provider": "workbuddy-global"}
             )["operation_summary"]
-            self.assertEqual(ai["provider"], "workbuddy-ai")
-            self.assertIn(("models", "workbuddy-ai"), runtime.calls)
+            self.assertEqual(ai["provider"], "workbuddy-global")
+            self.assertIn(("models", "workbuddy-global"), runtime.calls)
 
     def test_workbuddy_models_reject_an_unknown_provider(self) -> None:
         directory, domain, _config = self._domain()
@@ -461,15 +462,15 @@ class WorkBuddyProviderTests(unittest.TestCase):
             domain.dispatch(
                 "service_provider.add",
                 {
-                    "kind": "workbuddy_ai_login",
-                    "name": "WorkBuddy AI",
+                    "kind": "workbuddy_global_login",
+                    "name": "WorkBuddy Global",
                     "models": [{"name": "hy3", "upstream_model": "hy3", "enabled": True, "order": 1}],
                 },
             )
             provider = domain.snapshot()["providers"][0]
-            self.assertEqual(provider["auth_kind"], "workbuddy_ai_login")
+            self.assertEqual(provider["auth_kind"], "workbuddy_global_login")
             self.assertEqual([model["model_name"] for model in provider["models"]], ["hy3"])
-            self.assertEqual(provider["api_base"], workbuddy.api_base_reference("workbuddy-ai"))
+            self.assertEqual(provider["api_base"], workbuddy.api_base_reference("workbuddy-global"))
 
     def test_models_added_later_inherit_the_account_route(self) -> None:
         directory, domain, _config = self._domain()
@@ -536,7 +537,7 @@ class WorkBuddyProviderTests(unittest.TestCase):
             with self.assertRaisesRegex(DomainError, "type is fixed"):
                 domain.dispatch(
                     "service_provider.patch",
-                    {"provider_id": provider_id, "provider": {"auth_kind": "workbuddy_ai_login"}},
+                    {"provider_id": provider_id, "provider": {"auth_kind": "workbuddy_global_login"}},
                 )
             provider = domain.snapshot()["providers"][0]
             self.assertEqual(provider["auth_kind"], "workbuddy_login")
@@ -794,7 +795,7 @@ class WorkBuddyServiceEnvironmentTests(unittest.TestCase):
         environment = controller._workbuddy_environment(autostart=True)
         self.assertEqual(environment["YOUNG_ROUTER_WORKBUDDY_BASE"], "http://127.0.0.1:1/workbuddy/v1")
         self.assertEqual(environment["YOUNG_ROUTER_WORKBUDDY_KEY"], "local-token")
-        self.assertEqual(environment["YOUNG_ROUTER_WORKBUDDY_AI_BASE"], "http://127.0.0.1:1/workbuddy-ai/v1")
+        self.assertEqual(environment["YOUNG_ROUTER_WORKBUDDY_GLOBAL_BASE"], "http://127.0.0.1:1/workbuddy-global/v1")
 
     def test_a_missing_worker_never_blocks_the_proxy_environment(self) -> None:
         from young_router.core.operations import CoreServiceController
@@ -838,178 +839,209 @@ class WorkBuddyDesktopCredentialTests(unittest.TestCase):
     # and only the internal sibling chunk carries the key factory -- exactly the
     # arrangement that made the worker's own wiring invisible.
     _ENTRY = """\
+export { WorkBuddyCredentialStore } from './chunk.js'
 export class WorkBuddyUpstreamClient {
-  async refreshToken() { return {} }
+  async refreshToken() { return { accessToken: 'a', refreshToken: 'r', expiresAtMs: Date.now() + 3600000 } }
+  async fetchModels() { return [] }
+  async fetchCredits() { return null }
 }
 export class WorkBuddyCatalog {
-  constructor() { this.models = [] }
+  constructor(region) { this.region = region; this.models = [] }
   current() { return this.models }
-  setVisible() {}
+  setRegionUsable() {}
   set(models) { this.models = models }
-}
-export class WorkBuddyCatalogStore {
-  get() { return undefined }
-  set() {}
 }
 export function createWorkBuddyShim() {
   return { ready: Promise.resolve(), baseUrl: () => 'http://127.0.0.1:1', token: () => 'shim', close: () => {} }
 }
-export const WORKBUDDY_VARIANTS = [
-  { id: 'workbuddy', displayName: 'WorkBuddy', appName: 'WorkBuddy', region: 'cn',
-    electron: { macOS: { defaultPath: '/Applications/WorkBuddy.app/Contents/MacOS/Electron' } } },
-  { id: 'workbuddy-ai', displayName: 'WorkBuddy AI', appName: 'WorkBuddy AI', region: 'global',
-    electron: { macOS: { defaultPath: '/Applications/WorkBuddy AI.app/Contents/MacOS/Electron' } } },
-]
-export function readBundleVersion() { return '9.9.9' }
-export { WorkBuddyCredentialStore } from './chunk.js'
+export const WORKBUDDY_REGIONS = ['cn', 'global']
+export const WORKBUDDY_PROVIDERS = { cn: 'workbuddy', global: 'workbuddy-global' }
+export const WORKBUDDY_PROVIDER_DISPLAY_NAMES = { cn: 'WorkBuddy', global: 'WorkBuddy Global' }
+// The real probe order: the domestic bundle first, the international one
+// second.  The root is the test's own so the pairing is asserted without
+// depending on what this machine happens to have installed.
+export function workbuddyAppExecutableCandidates() {
+  const root = process.env.STUB_APP_ROOT || '/Applications'
+  return [`${root}/WorkBuddy.app/Contents/MacOS/Electron`, `${root}/WorkBuddy AI.app/Contents/MacOS/Electron`]
+}
+export function findWorkbuddyAppExecutable() { return workbuddyAppExecutableCandidates()[0] }
 """
 
     _CHUNK = """\
 export class WorkBuddyCredentialStore {
   constructor(options) {
-    this.variant = options.variant
-    this.keyProvider = options.keyProvider
+    this.region = options.region
+    this.ownPath = options.ownPath
   }
-  // What the store was built with is the whole question: a store without the
-  // library's key provider cannot open a sealed document, and says so.
+  // What the store was built with is the whole question: a store is scoped to
+  // one region, and the region is what decides which gateway it reads.
   async status() {
-    if (this.keyProvider === undefined) return { state: 'signed-out', reasonCode: 'electron-binary-unavailable' }
-    return { state: 'signed-in', reasonCode: 'wired', helper: this.keyProvider.helperPath() }
+    return { state: 'signed-in', region: this.region, ownPath: this.ownPath }
   }
   async resolve() { throw new Error('the stub serves no credential') }
 }
 """
 
-    # The factory this build publishes, in the shape the worker resolves: a
-    # named function export on the internal chunk beside ``index.js``.
-    _FACTORY = """\
-export function atRestKeyProviderFor(variant) {
-  return { helperPath: () => `/apps/${variant.id}` }
-}
-"""
-
-    def _library(self, root: Path, *, expose_factory: bool) -> Path:
-        """The stub library; ``expose_factory`` publishes the key factory."""
+    def _library(self, root: Path) -> Path:
+        """The stub library in the shape the worker imports."""
 
         library_root = root / "library"
         library_root.mkdir(parents=True)
-        chunk = self._CHUNK + (self._FACTORY if expose_factory else "")
         (library_root / "index.js").write_text(self._ENTRY, encoding="utf-8")
-        (library_root / "chunk.js").write_text(chunk, encoding="utf-8")
+        (library_root / "chunk.js").write_text(self._CHUNK, encoding="utf-8")
         return library_root
 
-    def _status(self, library_root: Path, root: Path) -> dict:
-        """Start the real worker against one stub library and read its status."""
+    def _fake_apps(self, root: Path) -> Path:
+        """Two stand-in desktop bundles, so the pairing is checked hermetically."""
 
-        import json
+        apps = root / "apps"
+        for name in ("WorkBuddy.app", "WorkBuddy AI.app"):
+            bundle = apps / name
+            (bundle / "Contents" / "MacOS").mkdir(parents=True)
+            (bundle / "Contents" / "MacOS" / "Electron").write_text("", encoding="utf-8")
+            (bundle / "Contents" / "Info.plist").write_text("<plist/>", encoding="utf-8")
+        return apps
+
+    def _start(self, root: Path) -> str:
+        """Start the real worker against the stub library; return its base URL.
+
+        Cleanups are registered ``kill`` before ``wait`` so that FIFO order kills
+        the worker and only then reaps it: the other order waits on a live
+        process and hangs the suite.  Neither assertion below may build its
+        message from ``stderr.read()`` -- that blocks until the worker exits,
+        which a serving worker never does.
+        """
+
         import subprocess
-        import urllib.request
 
         worker = ROOT / "young_router" / "adapters" / "workbuddy_worker.mjs"
-        token = "stub-token"
+        environment = dict(os.environ)
+        environment["STUB_APP_ROOT"] = str(root / "apps")
         process = subprocess.Popen(
             [
                 self.node,
                 str(worker),
                 "--port", "0",
-                "--token", token,
-                "--root", str(root),
-                "--entry", str(library_root / "index.js"),
+                "--token", self.token,
+                "--root", str(root / "worker"),
+                "--entry", str(self._library(root) / "index.js"),
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            env=environment,
         )
-        # ``kill`` is registered after ``wait`` on purpose: cleanups run
+        # ``kill`` is registered AFTER ``wait`` on purpose: cleanups run
         # last-in-first-out, so this kills the worker and only then reaps it.
-        # The other order waits on a live process and hangs the suite.  The
-        # pipes are closed first, because a killed worker never closes them.
+        # The other order blocks on a live process and hangs the suite.
         self.addCleanup(process.wait)
         self.addCleanup(process.kill)
         self.addCleanup(process.stdout.close)
         self.addCleanup(process.stderr.close)
         line = process.stdout.readline()
         if not line:
-            # Read stderr only now, and never inside the assertion's own
-            # message: a worker that is still serving holds this pipe open, so
-            # an eager read would wait forever on the very failure it describes.
+            # Only now, because the worker has already exited: its stderr is at
+            # EOF, so this read returns instead of waiting for a live process.
             self.fail(f"the worker never announced itself: {process.stderr.read()}")
         ready = json.loads(line)
         self.assertIs(ready.get("ready"), True)
+        return f"http://127.0.0.1:{int(ready['port'])}"
+
+    def _get(self, base: str, path: str) -> dict:
+        import urllib.request
+
         request = urllib.request.Request(
-            f"http://127.0.0.1:{int(ready['port'])}/control/status",
-            headers={"Authorization": f"Bearer {token}"},
+            f"{base}{path}", headers={"Authorization": f"Bearer {self.token}"}
         )
         with urllib.request.urlopen(request, timeout=30) as response:
             return json.loads(response.read().decode("utf-8"))
 
-    def test_the_store_is_wired_with_the_librarys_own_key_provider(self) -> None:
-        """Both products get their own key provider, from the library."""
+    token = "stub-token"
+
+    def test_each_region_gets_its_own_store(self) -> None:
+        """One region, one store: the CN gateway never reads the global one."""
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            document = self._status(self._library(root, expose_factory=True), root / "worker")
+            self._fake_apps(root)
+            document = self._get(self._start(root), "/control/status")
 
         providers = document["providers"]
-        for provider_id in ("workbuddy", "workbuddy-ai"):
+        self.assertEqual(sorted(providers), ["workbuddy", "workbuddy-global"])
+        for provider_id, region in (("workbuddy", "cn"), ("workbuddy-global", "global")):
             entry = providers[provider_id]
-            self.assertEqual(
-                entry["state"],
-                "signed-in",
-                f"{provider_id} was not given the library's key provider: {entry}",
-            )
-            self.assertEqual(entry["reasonCode"], "wired")
-            # Each variant resolved its *own* helper, not the other product's.
-            self.assertEqual(entry["helper"], f"/apps/{provider_id}")
+            self.assertEqual(entry["state"], "signed-in", entry)
+            self.assertEqual(entry["region"], region)
+            self.assertEqual(entry["provider"], provider_id)
+            # The store keeps its own copy under a per-region name, so a
+            # refresh for one gateway can never overwrite the other's.
+            self.assertIn(f"/{provider_id}.auth.json", entry["ownPath"])
 
-    def test_a_library_without_the_factory_is_reported_rather_than_guessed(self) -> None:
-        """A build that drops the factory degrades to a diagnosis.
+    def test_the_worker_iterates_the_librarys_regions(self) -> None:
+        """The region list is the library's, not a pair written here."""
 
-        The worker must not guess an Electron path of its own: resolving which
-        app is installed is the library's product knowledge, and 未登录 with its
-        reason is the honest answer when that name is absent -- the same answer
-        the library's own default gives.
+        worker = (ROOT / "young_router" / "adapters" / "workbuddy_worker.mjs").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("library.WORKBUDDY_REGIONS", worker)
+        self.assertIn("library.WORKBUDDY_PROVIDERS", worker)
+        # The pre-region surface is gone; naming it would mean a stale build.
+        for stale in ("WORKBUDDY_VARIANTS", "WORKBUDDY_AI_PROVIDER", "workbuddy-ai"):
+            self.assertNotIn(stale, worker)
+
+    def test_the_worker_embeds_no_product_path(self) -> None:
+        """Resolving which app is installed stays upstream's knowledge."""
+
+        worker = (ROOT / "young_router" / "adapters" / "workbuddy_worker.mjs").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("workbuddyAppExecutableCandidates", worker)
+        self.assertNotIn("/Applications/WorkBuddy", worker)
+        # The one product name this file may carry is the env var the library
+        # itself reads, and only so the host can pass a pinned install through.
+        self.assertIn("WORKBUDDY_APP_EXECUTABLE", worker)
+
+    def test_each_region_reports_its_own_desktop_app(self) -> None:
+        """One region's 去登录 must not open the other region's app.
+
+        The bundles come from the library's own probe order, which lists the
+        domestic product first and the international one second -- the same
+        order ``WORKBUDDY_REGIONS`` names.
         """
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            document = self._status(self._library(root, expose_factory=False), root / "worker")
+            apps = self._fake_apps(root)
+            base = self._start(root)
+            answers = {
+                provider_id: self._get(base, f"/control/app?provider={provider_id}")
+                for provider_id in ("workbuddy", "workbuddy-global")
+            }
 
-        self.assertIs(document["ready"], True)
-        for provider_id in ("workbuddy", "workbuddy-ai"):
-            self.assertEqual(
-                document["providers"][provider_id]["reasonCode"],
-                "electron-binary-unavailable",
-            )
-
-    def test_the_worker_names_the_factory_and_embeds_no_product_path(self) -> None:
-        """The seam is the library's published name, not a path copied here."""
-
-        worker = (ROOT / "young_router" / "adapters" / "workbuddy_worker.mjs").read_text(
-            encoding="utf-8"
+        # Two answers, not one repeated: the CN region gets the domestic
+        # bundle and the global one the international bundle.
+        self.assertEqual(answers["workbuddy"]["bundle"], str(apps / "WorkBuddy.app"))
+        self.assertEqual(
+            answers["workbuddy-global"]["bundle"], str(apps / "WorkBuddy AI.app")
         )
-        self.assertIn("atRestKeyProviderFor", worker)
-        self.assertIn("keyProvider", worker)
-        # Resolving which app is installed stays upstream's knowledge.
-        self.assertNotIn("/Applications/WorkBuddy", worker)
-        self.assertNotIn("WORKBUDDY_AI_ELECTRON_BIN", worker)
+        # The name is the app that opens, not the region's label: the host
+        # falls back to `open -a <name>` without a bundle, and "WorkBuddy
+        # Global" is not an installed app name.
+        self.assertEqual(answers["workbuddy"]["appName"], "WorkBuddy")
+        self.assertEqual(answers["workbuddy-global"]["appName"], "WorkBuddy AI")
 
-    def test_each_product_reports_its_own_desktop_app(self) -> None:
-        """One product's 去登录 must not open the other product's app.
+    def test_an_unknown_provider_is_refused(self) -> None:
+        """A pre-region id is a 404, never a guess at the nearest region."""
 
-        The library's ``installedAppVersion`` reads the international App alone
-        -- it takes no variant -- so the host was handed the WorkBuddy AI bundle
-        for a WorkBuddy account, and the Core's ``open <bundle>`` then launched
-        the wrong product for that account's sign-in.
-        """
+        import urllib.error
 
-        worker = (ROOT / "young_router" / "adapters" / "workbuddy_worker.mjs").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn("installedDesktopApp", worker)
-        self.assertNotIn("library.installedAppVersion(", worker)
-        # The bundle comes from the descriptor each product publishes.
-        self.assertIn("variant.electron?.macOS?.defaultPath", worker)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._fake_apps(root)
+            base = self._start(root)
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                self._get(base, "/control/app?provider=workbuddy-ai")
+            self.assertEqual(raised.exception.code, 404)
 
 
 class WorkBuddyModuleTests(unittest.TestCase):
@@ -1159,7 +1191,7 @@ class WorkBuddyModuleTests(unittest.TestCase):
             workbuddy.api_base_reference("workbuddy"), "os.environ/YOUNG_ROUTER_WORKBUDDY_BASE"
         )
         self.assertEqual(
-            workbuddy.api_key_reference("workbuddy-ai"), "os.environ/YOUNG_ROUTER_WORKBUDDY_AI_KEY"
+            workbuddy.api_key_reference("workbuddy-global"), "os.environ/YOUNG_ROUTER_WORKBUDDY_GLOBAL_KEY"
         )
         with self.assertRaises(ValueError):
             workbuddy.api_base_reference("codebuddy")
@@ -1169,10 +1201,10 @@ class WorkBuddyModuleTests(unittest.TestCase):
             workbuddy.AUTH_KIND_TO_PROVIDER["workbuddy_login"], "workbuddy"
         )
         self.assertEqual(
-            workbuddy.AUTH_KIND_TO_PROVIDER["workbuddy_ai_login"], "workbuddy-ai"
+            workbuddy.AUTH_KIND_TO_PROVIDER["workbuddy_global_login"], "workbuddy-global"
         )
         self.assertEqual(
-            workbuddy.PROVIDER_TO_AUTH_KIND["workbuddy-ai"], "workbuddy_ai_login"
+            workbuddy.PROVIDER_TO_AUTH_KIND["workbuddy-global"], "workbuddy_global_login"
         )
 
     def test_status_without_a_staged_package_reports_unavailable(self) -> None:
@@ -1309,7 +1341,7 @@ def serve():
 
 
 threading.Thread(target=serve, daemon=True).start()
-print(json.dumps({"ready": True, "port": bound, "providers": ["workbuddy", "workbuddy-ai"]}), flush=True)
+print(json.dumps({"ready": True, "port": bound, "providers": ["workbuddy", "workbuddy-global"]}), flush=True)
 signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
 time.sleep(lifetime)
 '''

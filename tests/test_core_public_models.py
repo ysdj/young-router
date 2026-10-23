@@ -500,6 +500,187 @@ class PublicModelDomainTests(unittest.TestCase):
         # keeps showing the registry default rather than a custom claim.
         self.assertIsNone(self.model("00000003")["max_input_tokens"])
 
+    def _saved(self) -> dict:
+        import yaml
+
+        return yaml.safe_load(self.path.read_text(encoding="utf-8"))
+
+    def _with_router_settings(self, block: str) -> None:
+        self.path.write_text(
+            textwrap.dedent(PUBLIC_MODEL_CONFIG).lstrip() + textwrap.dedent(block),
+            encoding="utf-8",
+        )
+        self.domain = ProvidersModelsDomain(self.path)
+
+    def test_a_rename_restates_the_group_every_router_table_names(self) -> None:
+        """Renaming a public model moves the fallback graph with it.
+
+        A public model is the client-facing group name, and `router_settings`
+        names groups in its own tables.  LiteLLM resolves those per request, so a
+        rename that left them alone pointed every fallback hop at a group with no
+        deployments: the Router took the hop, found nothing, and the client got a
+        500 reading `Fallback to <gone> also failed` over the real upstream error.
+        """
+
+        self._with_router_settings(
+            """
+            router_settings:
+              fallbacks:
+                - kimi-k3:
+                    - gpt-5.6-sol
+              context_window_fallbacks:
+                - kimi-k3:
+                    - gpt-5.6-sol
+              model_group_alias:
+                fast-sol: gpt-5.6-sol
+            """
+        )
+
+        self.domain.dispatch(
+            "public.model_patch",
+            {"public_model": "gpt-5.6-sol", "changes": {"name": "sol-next"}},
+        )
+        self.domain.apply()
+        saved = self._saved()
+
+        self.assertEqual(
+            [{"kimi-k3": ["sol-next"]}], saved["router_settings"]["fallbacks"]
+        )
+        self.assertEqual(
+            [{"kimi-k3": ["sol-next"]}],
+            saved["router_settings"]["context_window_fallbacks"],
+        )
+        self.assertEqual(
+            {"fast-sol": "sol-next"}, saved["router_settings"]["model_group_alias"]
+        )
+        # Every table it names is a name the document actually serves.
+        served = set(saved["litellm_settings"]["public_model_groups"])
+        for entry in saved["router_settings"]["fallbacks"]:
+            for source, targets in entry.items():
+                self.assertIn(source, served)
+                for target in targets:
+                    self.assertIn(target, served)
+
+    def test_a_delete_drops_the_hop_that_named_only_it(self) -> None:
+        """A removed group's fallback hop goes with it, and the save says so."""
+
+        self._with_router_settings(
+            """
+            router_settings:
+              fallbacks:
+                - kimi-k3:
+                    - gpt-5.6-sol
+                    - kimi-k3
+              model_group_alias:
+                fast-sol: gpt-5.6-sol
+            """
+        )
+
+        self.domain.dispatch("public.model_delete", {"public_model": "gpt-5.6-sol"})
+        self.domain.apply()
+        saved = self._saved()
+
+        # Only the removed name is dropped; the surviving sibling keeps its hop.
+        self.assertEqual([{"kimi-k3": ["kimi-k3"]}], saved["router_settings"]["fallbacks"])
+        self.assertEqual({}, saved["router_settings"]["model_group_alias"])
+
+    def test_a_hop_the_document_never_served_is_reported_not_kept(self) -> None:
+        """A reference to a name no route serves is dropped and named.
+
+        It cannot be resolved by any request, so keeping it only made a group's
+        failover list read one hop longer than it is -- and the Router spent that
+        hop on a group with no deployments.
+        """
+
+        self._with_router_settings(
+            """
+            router_settings:
+              fallbacks:
+                - kimi-k3:
+                    - retired-model
+                    - gpt-5.6-sol
+            """
+        )
+
+        from young_router.config import api as config_api, load as config_load
+
+        document = config_api.config_document_from_path(self.path)
+        result = config_api.save_config(
+            config_load.load_config(self.path)["providers"], self.path, None, document,
+        )
+        saved = self._saved()
+        self.assertEqual([{"kimi-k3": ["gpt-5.6-sol"]}], saved["router_settings"]["fallbacks"])
+        self.assertEqual(["retired-model"], result["dropped_group_references"])
+
+    def test_an_edit_that_keeps_every_name_never_rewrites_the_tables(self) -> None:
+        """Only a rename moves the fallback graph; a limit edit leaves it alone.
+
+        The deployment ids are what identify a rename.  An edit that keeps the
+        names therefore restates nothing, which is what keeps a hand-written
+        table out of the path of every unrelated save.
+        """
+
+        self._with_router_settings(
+            """
+            router_settings:
+              fallbacks:
+                - kimi-k3:
+                    - gpt-5.6-sol
+              model_group_alias:
+                fast-sol: gpt-5.6-sol
+            """
+        )
+
+        self.domain.dispatch(
+            "public.model_patch",
+            {"public_model": "gpt-5.6-sol", "changes": {"max_input_tokens": 372000}},
+        )
+        self.domain.apply()
+        saved = self._saved()
+        self.assertEqual([{"kimi-k3": ["gpt-5.6-sol"]}], saved["router_settings"]["fallbacks"])
+        self.assertEqual(
+            {"fast-sol": "gpt-5.6-sol"}, saved["router_settings"]["model_group_alias"]
+        )
+
+    def test_a_document_without_router_settings_gains_none(self) -> None:
+        """The save never invents a section the file did not have."""
+
+        self.domain.dispatch(
+            "public.model_patch",
+            {"public_model": "gpt-5.6-sol", "changes": {"name": "sol-next"}},
+        )
+        self.domain.apply()
+        self.assertNotIn("router_settings", self._saved())
+
+    def test_the_catch_all_fallback_chain_survives_a_rename(self) -> None:
+        """``"*"`` is the Router's catch-all key, not a group name.
+
+        It is read for every request whose own group declares no fallbacks, so
+        measuring it against the served group names would delete the one chain
+        that answers for all of them.  Its *targets* are group names, so they move
+        with a rename like every other fallback list.
+        """
+
+        self._with_router_settings(
+            """
+            router_settings:
+              fallbacks:
+                - "*":
+                    - gpt-5.6-sol
+                    - kimi-k3
+            """
+        )
+
+        self.domain.dispatch(
+            "public.model_patch",
+            {"public_model": "gpt-5.6-sol", "changes": {"name": "sol-next"}},
+        )
+        self.domain.apply()
+        saved = self._saved()
+        self.assertEqual(
+            [{"*": ["sol-next", "kimi-k3"]}], saved["router_settings"]["fallbacks"]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

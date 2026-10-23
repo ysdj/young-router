@@ -79,7 +79,6 @@ _RUNTIME_SETTINGS_PROCESS_AUTHORITATIVE_KEYS = frozenset(
         "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON",
     }
 )
-_PI_WEB_ACCESS_CONFIG_KEY = "YOUNG_ROUTER_PI_WEB_ACCESS_CONFIG_JSON"
 
 
 @dataclass(frozen=True)
@@ -179,6 +178,86 @@ def _router_settings_with_retry_counts(document: object) -> object | None:
         "retry_policy": retry_policy,
     }
     return staged
+
+
+def _retired_references_rewritten(document: object) -> object | None:
+    """Restate every retired ``os.environ/`` reference as the name that exists.
+
+    The staging step copies the source document verbatim, so a document written
+    before the WorkBuddy rename hands the proxy a reference this build no longer
+    publishes.  The child then resolves that base to nothing and every route on
+    the provider answers into an empty address -- while the pane, which reads
+    through the loader, shows the provider as fine.  Rewriting here is what keeps
+    what the pane shows and what the proxy dials the same name.
+
+    The source file is left alone: this adapts the staged copy, exactly as the
+    retry-count move beside it does.  The next save from the pane writes the
+    current spelling into the document itself.
+
+    Returns the staged document when a reference needed restating, and ``None``
+    when the source configuration can be staged as it is.
+    """
+
+    from ..config.schema import current_managed_reference
+
+    if not isinstance(document, Mapping):
+        return None
+    changed = False
+
+    def restate(value: object) -> object:
+        nonlocal changed
+        if not isinstance(value, str):
+            return value
+        current = current_managed_reference(value)
+        if current != value:
+            changed = True
+        return current
+
+    staged = dict(document)
+    providers = document.get("providers")
+    if isinstance(providers, Mapping):
+        restated_providers: dict[Any, Any] = {}
+        for name, provider in providers.items():
+            if not isinstance(provider, Mapping):
+                restated_providers[name] = provider
+                continue
+            block = dict(provider)
+            if "api_base" in block:
+                block["api_base"] = restate(block["api_base"])
+            keys = block.get("api_keys")
+            if isinstance(keys, list):
+                restated_keys = []
+                for item in keys:
+                    if isinstance(item, Mapping) and "value" in item:
+                        entry = dict(item)
+                        entry["value"] = restate(entry["value"])
+                        restated_keys.append(entry)
+                    else:
+                        restated_keys.append(item)
+                block["api_keys"] = restated_keys
+            restated_providers[name] = block
+        if changed:
+            staged["providers"] = restated_providers
+    models = document.get("model_list")
+    if isinstance(models, list):
+        restated_models = []
+        for item in models:
+            if not isinstance(item, Mapping):
+                restated_models.append(item)
+                continue
+            entry = dict(item)
+            params = entry.get("litellm_params")
+            if isinstance(params, Mapping):
+                updated = dict(params)
+                for field in ("api_base", "api_key"):
+                    if field in updated:
+                        updated[field] = restate(updated[field])
+                if updated != params:
+                    entry["litellm_params"] = updated
+            restated_models.append(entry)
+        if changed:
+            staged["model_list"] = restated_models
+    return staged if changed else None
 
 
 def _safe_object(value: object, *, limit: int = 64) -> dict[str, Any]:
@@ -640,10 +719,6 @@ class CoreServiceController:
             "YOUNG_ROUTER_VISION_BRIDGE_LOCAL_FORMAT",
         ):
             env.pop(key, None)
-        # pi-web-access configuration is also file-owned. Do not forward raw
-        # JSON settings from a host environment into every proxy worker.
-        env.pop(_PI_WEB_ACCESS_CONFIG_KEY, None)
-        env.pop("YOUNG_ROUTER_WEB_SEARCH_CONFIG_JSON", None)
         # dsh-vision-router settings are file-owned as well.  A stale host
         # environment value must not activate or reconfigure the fallback
         # when Runtime Settings has no persisted value for this key.
@@ -660,17 +735,6 @@ class CoreServiceController:
         ):
             env.pop(key, None)
         configured = self._configured_runtime_values(strict=strict)
-        pi_web_access_config = configured.pop(_PI_WEB_ACCESS_CONFIG_KEY, "{}")
-        try:
-            pi_web_access_payload = json.loads(pi_web_access_config)
-        except (TypeError, ValueError):
-            if strict:
-                raise RuntimeError("Runtime settings are invalid") from None
-            pi_web_access_payload = {}
-        if not isinstance(pi_web_access_payload, dict):
-            if strict:
-                raise RuntimeError("Runtime settings are invalid")
-            pi_web_access_payload = {}
         dsh_quick_values: dict[str, str] = {}
         for key in (*_DSH_VISION_ROUTER_QUICK_KEYS, *_DSH_VISION_ROUTER_LOCAL_QUICK_KEYS):
             raw = configured.pop(key, None)
@@ -711,14 +775,7 @@ class CoreServiceController:
                 separators=(",", ":"),
                 allow_nan=False,
             )
-        if strict:
-            try:
-                web_search_config = self.paths.root / "web-search.json"
-                atomic_write_json(web_search_config, pi_web_access_payload)
-            except PersistenceError:
-                raise RuntimeError("Runtime settings are invalid") from None
         env["PI_CODING_AGENT_DIR"] = str(self.paths.root)
-        env["YOUNG_ROUTER_WEB_SEARCH_CONFIG_DIR"] = str(self.paths.root)
         # The native preview port is a host-owned isolation boundary. A
         # persisted user setting must not redirect an isolated preview back
         # onto production's 4000 listener.
@@ -748,12 +805,6 @@ class CoreServiceController:
         # the proxy process together with the bundled package root.
         core_root = Path(__file__).resolve().parents[2]
         python_path = [str(core_root)]
-        bundled_node = core_root / "runtime" / "bin" / ("node.exe" if os.name == "nt" else "node")
-        bundled_pi_entry = core_root / "young_router" / "adapters" / "pi-web-access" / "index.ts"
-        if bundled_node.is_file():
-            env["YOUNG_ROUTER_PI_WEB_ACCESS_NODE"] = str(bundled_node)
-        if bundled_pi_entry.is_file():
-            env["YOUNG_ROUTER_PI_WEB_ACCESS_ENTRY"] = str(bundled_pi_entry)
         inherited_python_path = env.get("PYTHONPATH", "")
         if inherited_python_path:
             python_path.extend(
@@ -764,9 +815,6 @@ class CoreServiceController:
         env["YOUNG_ROUTER_PROXY_PROCESS"] = "1"
         env["YOUNG_ROUTER_TIMESTAMP_OUTPUT"] = "1"
         env["YOUNG_ROUTER_SERVICE_LOG"] = str(self.paths.root / "server.log")
-        env["LITELLM_WORKER_STARTUP_HOOKS"] = (
-            "young_router.proxy.search_endpoint:register"
-        )
         # The packaged LiteLLM already ships its model catalog.  Never make
         # each of the sixteen macOS worker starts wait on a best-effort
         # GitHub refresh before serving the local proxy.
@@ -940,6 +988,9 @@ class CoreServiceController:
         try:
             document = _load_yaml(source)
             staged = _router_settings_with_retry_counts(document)
+            retired = _retired_references_rewritten(staged if staged is not None else document)
+            if retired is not None:
+                staged = retired
             if staged is None:
                 atomic_write_bytes(self.paths.runtime_config, source.read_bytes())
             else:

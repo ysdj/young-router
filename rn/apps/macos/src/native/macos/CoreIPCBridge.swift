@@ -490,8 +490,7 @@ import Foundation
         try readSecret(
             createSecretReadCapability(domain: domain, field: field, target: target).token,
             allowMultiline: domain == "runtime" && field == "setting" &&
-                (target == "YOUNG_ROUTER_PI_WEB_ACCESS_CONFIG_JSON" ||
-                 target == "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON")
+                target == "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON"
         )
     }
 

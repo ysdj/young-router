@@ -1,12 +1,12 @@
 """Guard the proxy package against the two shapes a bad merge produces.
 
 Both checks here come from one real outage: a refactor moved the pi-web-access
-tool declarations into ``adapters/pi_web_access.py`` and rewrote the proxy-side
+tool declarations into ``adapters/web_search.py`` and rewrote the proxy-side
 wrapper, but the edit left the body of ``_responses_external_web_search_bridge_tools``
 below the new ``return`` (so it was dead) and dropped the module import the
 wrapper now calls.  Nothing failed at import time, so every request that carried
 a hosted ``web_search`` declaration reached the fallback helper, raised
-``NameError: name '_pi_web_access_module' is not defined``, and the client
+``NameError: name '_web_search_module' is not defined``, and the client
 reported ``upstream_route_failure`` — "the upstream model route failed before a
 final assistant response was available" — against routes that were healthy.
 

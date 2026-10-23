@@ -1047,10 +1047,6 @@ class CoreOperationsTests(unittest.TestCase):
             self.assertEqual("true", environment["LITELLM_LOCAL_MODEL_COST_MAP"])
             self.assertEqual(str(controller.paths.recovery), environment["YOUNG_ROUTER_ROUTE_RECOVERY_STATE_FILE"])
             self.assertEqual(str(controller.paths.cooldowns), environment["YOUNG_ROUTER_DEPLOYMENT_COOLDOWN_FILE"])
-            self.assertEqual(
-                "young_router.proxy.search_endpoint:register",
-                environment["LITELLM_WORKER_STARTUP_HOOKS"],
-            )
             self.assertEqual(str(core_root), environment["LITELLM_TEMPLATE_ROOT"])
             self.assertEqual(str(core_root), environment["PYTHONPATH"].split(os.pathsep)[0])
             self.assertTrue((core_root / "sitecustomize.py").is_file())
@@ -1065,6 +1061,60 @@ class CoreOperationsTests(unittest.TestCase):
             )
 
             self.assertEqual("44001", controller._runtime_env()["LITELLM_PORT"])
+
+    def test_staged_runtime_config_restates_a_retired_reference(self) -> None:
+        # Staging copies the source document verbatim, so a document written
+        # before the WorkBuddy rename hands the proxy an ``os.environ/`` name
+        # this build no longer publishes.  The child then resolves that base to
+        # nothing and the provider's routes answer into an empty address, while
+        # the pane -- which reads through the loader -- shows the provider as
+        # fine.  The staged copy must carry the name that exists, and the source
+        # file must be left for the next save to restate.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            controller = CoreServiceController(root)
+            runtime = root / ".litellm-runtime"
+            runtime.mkdir(parents=True)
+            source = textwrap.dedent(
+                """
+                providers:
+                  wbi:
+                    api_base: "os.environ/YOUNG_ROUTER_WORKBUDDY_AI_BASE"
+                    api_keys:
+                      - name: workbuddy-local
+                        value: "os.environ/YOUNG_ROUTER_WORKBUDDY_AI_KEY"
+                    x-young-router-provider-auth: {kind: workbuddy_ai_login, credential_ref: provider-auth-b}
+                model_list:
+                  - model_name: wbi-model
+                    litellm_params:
+                      model: openai/workbuddy-local
+                      api_base: "os.environ/YOUNG_ROUTER_WORKBUDDY_AI_BASE"
+                      api_key: "os.environ/YOUNG_ROUTER_WORKBUDDY_AI_KEY"
+                    model_info: {provider: wbi, auth_kind: workbuddy_ai_login, model_enabled: true}
+                """
+            ).lstrip()
+            (runtime / "config.yaml").write_text(source, encoding="utf-8")
+
+            controller._stage_runtime_config()
+
+            staged = yaml.safe_load(
+                (runtime / "config.yaml").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                "os.environ/YOUNG_ROUTER_WORKBUDDY_GLOBAL_BASE",
+                staged["providers"]["wbi"]["api_base"],
+            )
+            self.assertEqual(
+                "os.environ/YOUNG_ROUTER_WORKBUDDY_GLOBAL_KEY",
+                staged["providers"]["wbi"]["api_keys"][0]["value"],
+            )
+            params = staged["model_list"][0]["litellm_params"]
+            self.assertEqual(
+                "os.environ/YOUNG_ROUTER_WORKBUDDY_GLOBAL_BASE", params["api_base"]
+            )
+            self.assertEqual(
+                "os.environ/YOUNG_ROUTER_WORKBUDDY_GLOBAL_KEY", params["api_key"]
+            )
 
     def test_staged_runtime_config_moves_retry_counts_into_the_policy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

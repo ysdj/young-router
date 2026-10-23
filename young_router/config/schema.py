@@ -123,7 +123,7 @@ PROVIDER_AUTH_KINDS = {
     "openai_login",
     "claude_login",
     "workbuddy_login",
-    "workbuddy_ai_login",
+    "workbuddy_global_login",
     "our_free_model_login",
 }
 
@@ -136,7 +136,37 @@ PROVIDER_AUTH_KINDS = {
 #: own configuration and the affected provider simply vanished from the list.
 #: Accepting the old spelling and answering with the current one keeps such a
 #: document loadable; the panes show the new name, and the next save stores it.
-RETIRED_PROVIDER_AUTH_KINDS = {"opencode2dsh_login": "our_free_model_login"}
+RETIRED_PROVIDER_AUTH_KINDS = {
+    "opencode2dsh_login": "our_free_model_login",
+    # The WorkBuddy rename named the two gateways by region.  ``ai`` meant the
+    # international one -- its ``workbuddy.ai`` address and its own credit --
+    # so it becomes the global kind.  Mapping it to the desktop kind instead
+    # filed a global account under the domestic gateway, and the pane then read
+    # the domestic account's credit for it: one product's number shown as the
+    # other's.  Without any entry at all the document fails the strict
+    # whitelist, so the Core stages nothing and the proxy never starts.
+    "workbuddy_ai_login": "workbuddy_global_login",
+}
+
+#: ``os.environ/`` references this build no longer publishes, mapped to the one
+#: that replaced them.
+#:
+#: Same rule as the retired auth kinds above, and for the same reason: the
+#: reference is how a provider names the address a bundled worker publishes, so
+#: a stored document that still spells the old name points at nothing at all --
+#: the route stages with no base URL.  Rewriting it on read keeps that provider
+#: on the worker it always meant, and the next save stores a name that exists.
+RETIRED_MANAGED_REFERENCES = {
+    "os.environ/YOUNG_ROUTER_WORKBUDDY_AI_BASE": "os.environ/YOUNG_ROUTER_WORKBUDDY_GLOBAL_BASE",
+    "os.environ/YOUNG_ROUTER_WORKBUDDY_AI_KEY": "os.environ/YOUNG_ROUTER_WORKBUDDY_GLOBAL_KEY",
+}
+
+
+def current_managed_reference(value: Any) -> str:
+    """The name a stored ``os.environ/`` reference carries in this build."""
+
+    text = str(value or "").strip()
+    return RETIRED_MANAGED_REFERENCES.get(text, text)
 MODEL_CATALOG_MODES = {"independent", "relay_linked"}
 MODEL_ORDER_MODES = {"manual", "relay_multiplier"}
 RANDOM_DEPLOYMENT_ID_RE = re.compile(r"^[0-9a-f]{8}$")

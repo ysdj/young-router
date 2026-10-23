@@ -3577,35 +3577,38 @@ class RuntimeSettingsDomainTests(unittest.TestCase):
             domain.apply()
             self.assertNotIn("YOUNG_ROUTER_VISION_BRIDGE_API_KEY", path.read_text(encoding="utf-8"))
 
-    def test_pi_web_access_json_default_is_not_reported_as_configured(self) -> None:
+    def test_retired_search_settings_never_load_from_a_persisted_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            domain = RuntimeSettingsDomain(Path(directory) / "runtime-settings.env")
-            key = "YOUNG_ROUTER_PI_WEB_ACCESS_CONFIG_JSON"
-            field = next(item for item in domain.snapshot()["settings"] if item["key"] == key)
+            path = Path(directory) / "runtime-settings.env"
+            path.write_text(
+                "YOUNG_ROUTER_WEB_SEARCH_CONFIG_JSON=replace-me-secret\n"
+                "YOUNG_ROUTER_WEB_SEARCH_MAX_ROUNDS=4\n",
+                encoding="utf-8",
+            )
+            domain = RuntimeSettingsDomain(path)
+            keys = {item["key"] for item in domain.snapshot()["settings"]}
+            self.assertNotIn("YOUNG_ROUTER_WEB_SEARCH_CONFIG_JSON", keys)
+            self.assertNotIn("YOUNG_ROUTER_WEB_SEARCH_MAX_ROUNDS", keys)
+            with self.assertRaisesRegex(DomainError, "unavailable"):
+                domain.secret_present("setting", "YOUNG_ROUTER_WEB_SEARCH_CONFIG_JSON")
+            self.assertFalse(domain.secret_present("setting", "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON"))
+            domain.apply()
+            self.assertNotIn("YOUNG_ROUTER_WEB_SEARCH_CONFIG_JSON", path.read_text(encoding="utf-8"))
 
-            self.assertFalse(field["configured"])
-            self.assertFalse(domain.secret_present("setting", key))
-
-            domain.stage_secret("setting", key, '{"provider":"duckduckgo"}')
-            configured = next(item for item in domain.snapshot()["settings"] if item["key"] == key)
-            self.assertTrue(configured["configured"])
-            self.assertTrue(domain.secret_present("setting", key))
-            self.assertEqual("configured", configured["value"])
-
-    def test_pi_web_access_json_multiline_value_uses_only_the_native_read_lease(self) -> None:
+    def test_vision_config_json_multiline_value_uses_only_the_native_read_lease(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             domain = RuntimeSettingsDomain(Path(directory) / "runtime-settings.env")
             core = CoreStore(domains=[domain])
-            key = "YOUNG_ROUTER_PI_WEB_ACCESS_CONFIG_JSON"
-            value = '{\n  "provider": "duckduckgo"\n}'
+            key = "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON"
+            value = '{\n  "backend": "auto"\n}'
 
             result = core.stage_secret("runtime", "setting", key, value, revision=core.revision)
             self.assertTrue(result["present"])
-            self.assertEqual('{"provider":"duckduckgo"}', core.trusted_secret_value("runtime", "setting", key, revision=core.revision))
+            self.assertEqual('{"backend":"auto"}', core.trusted_secret_value("runtime", "setting", key, revision=core.revision))
             self.assertNotIn(value, json.dumps(core.snapshot()))
 
             with self.assertRaisesRegex(CoreError, "unavailable"):
-                core.trusted_secret_descriptor("runtime", "setting", "YOUNG_ROUTER_VISION_BRIDGE_API_KEY")
+                core.trusted_secret_descriptor("runtime", "setting", "YOUNG_ROUTER_WEB_SEARCH_CONFIG_JSON")
 
 
 class WebDAVSettingsDomainTests(unittest.TestCase):
@@ -3721,6 +3724,66 @@ class RetiredAuthKindLoadsTests(unittest.TestCase):
                 "our_free_model_login",
                 saved["providers"]["ofm"]["x-young-router-provider-auth"]["kind"],
             )
+
+    def test_the_workbuddy_split_maps_the_retired_sign_in_to_the_global_one(self) -> None:
+        # The rename named the two gateways by region.  The retired spelling was
+        # the INTERNATIONAL sign-in -- its ``workbuddy.ai`` address and its own
+        # credit -- so it becomes the global kind.  Mapping it to the desktop
+        # kind filed that account under the domestic gateway and the pane read
+        # the domestic account's credit for it, which is the defect this pins.
+        #
+        # The document still has to load at all: refusing it stages nothing, so
+        # the Core reports an invalid provider configuration and never starts
+        # the proxy.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(
+                textwrap.dedent(
+                    """
+                    providers:
+                      wbi:
+                        api_base: "os.environ/YOUNG_ROUTER_WORKBUDDY_AI_BASE"
+                        api_keys:
+                          - name: workbuddy-local
+                            value: "os.environ/YOUNG_ROUTER_WORKBUDDY_AI_KEY"
+                        x-young-router-provider-auth: {kind: workbuddy_ai_login, credential_ref: provider-auth-b}
+                    model_list:
+                      - model_name: workbuddy-model
+                        litellm_params:
+                          model: openai/workbuddy-local
+                          api_base: "os.environ/YOUNG_ROUTER_WORKBUDDY_AI_BASE"
+                          api_key: "os.environ/YOUNG_ROUTER_WORKBUDDY_AI_KEY"
+                        model_info: {provider: wbi, auth_kind: workbuddy_ai_login, model_enabled: true}
+                    """
+                ).lstrip(),
+                encoding="utf-8",
+            )
+            domain = ProvidersModelsDomain(path)
+            provider = domain.snapshot()["providers"][0]
+            self.assertEqual("workbuddy_global_login", provider["auth_kind"])
+            # The retired ``os.environ/`` names are rewritten on read: a
+            # reference this build no longer publishes stages a route with no
+            # base URL, so the provider would answer nothing at all.
+            self.assertEqual(
+                "os.environ/YOUNG_ROUTER_WORKBUDDY_GLOBAL_BASE", provider["api_base"]
+            )
+            # The document loads, which is the whole point: a strict rejection
+            # here is a Core that cannot stage its own configuration.
+            domain.apply()
+            saved = yaml.safe_load(path.read_text(encoding="utf-8"))
+            block = saved["providers"]["wbi"]
+            self.assertEqual(
+                "workbuddy_global_login",
+                block["x-young-router-provider-auth"]["kind"],
+            )
+            self.assertEqual(
+                "os.environ/YOUNG_ROUTER_WORKBUDDY_GLOBAL_BASE", block["api_base"]
+            )
+            self.assertEqual(
+                "os.environ/YOUNG_ROUTER_WORKBUDDY_GLOBAL_KEY",
+                block["api_keys"][0]["value"],
+            )
+
 
     def test_an_unknown_auth_kind_is_still_refused(self) -> None:
         from young_router.config.schema import _provider_auth

@@ -117,7 +117,7 @@ type WebDavSyncAction = "sync" | "push" | "pull";
  */
 type ResultMessage = string | null | ((value: unknown) => string | null);
 
-const PROVIDER_AUTH_OPTIONS = ["api_key", "openai_login", "claude_login", "workbuddy_login", "workbuddy_ai_login", "our_free_model_login"] as const satisfies readonly ProviderAuthKind[];
+const PROVIDER_AUTH_OPTIONS = ["api_key", "openai_login", "claude_login", "workbuddy_login", "workbuddy_global_login", "our_free_model_login"] as const satisfies readonly ProviderAuthKind[];
 
 
 function providerAuthKind(provider: UnknownRecord | undefined): ProviderAuthKind {
@@ -132,14 +132,14 @@ function providerAuthStatus(provider: UnknownRecord | undefined): ProviderAuthSt
 }
 
 /** The merged workspace shows every provider kind; this drives row labels. */
-type ProviderKind = "relay" | "openai" | "claude" | "workbuddy" | "workbuddyAI" | "ourFreeModel" | "apiKey";
+type ProviderKind = "relay" | "openai" | "claude" | "workbuddy" | "workbuddyGlobal" | "ourFreeModel" | "apiKey";
 
 function providerKind(provider: UnknownRecord | undefined): ProviderKind {
   const auth = providerAuthKind(provider);
   if (auth === "openai_login") return "openai";
   if (auth === "claude_login") return "claude";
   if (auth === "workbuddy_login") return "workbuddy";
-  if (auth === "workbuddy_ai_login") return "workbuddyAI";
+  if (auth === "workbuddy_global_login") return "workbuddyGlobal";
   if (auth === "our_free_model_login") return "ourFreeModel";
   return stringValue(provider?.provider_type, "custom") === "relay" ? "relay" : "apiKey";
 }
@@ -149,12 +149,13 @@ function providerKind(provider: UnknownRecord | undefined): ProviderKind {
  *
  * `openai` is OpenAI's own subscription service, named OpenAI everywhere it is
  * shown (Core registers the login kind as `openai_login`, and the provider the
- * wizard mints carries that name); `workbuddy`/`workbuddyAI` are the two
- * WorkBuddy desktop products. A service decides two things everywhere below:
+ * wizard mints carries that name); `workbuddy`/`workbuddyGlobal` are the two
+ * WorkBuddy gateways, the domestic build and the international one. A service
+ * decides two things everywhere below:
  * which address a provider carries, and whether its association section reads
  * as a service link rather than a relay station link.
  */
-type ServiceID = "openai" | "claude" | "workbuddy" | "workbuddyAI" | "ourFreeModel";
+type ServiceID = "openai" | "claude" | "workbuddy" | "workbuddyGlobal" | "ourFreeModel";
 
 /**
  * The key slot every Our Free Model entry carries.
@@ -179,7 +180,7 @@ const OUR_FREE_MODEL_KEY_NAME = "our-free-model-local";
  */
 const MANAGED_SLOT_AUTH_KINDS = new Set<ProviderAuthKind>([
   "workbuddy_login",
-  "workbuddy_ai_login",
+  "workbuddy_global_login",
   "our_free_model_login",
 ]);
 
@@ -269,7 +270,7 @@ const SERVICE_BASE_URLS: Record<ServiceID, string> = {
   openai: "https://api.openai.com/v1",
   claude: "https://api.anthropic.com",
   workbuddy: "https://copilot.tencent.com",
-  workbuddyAI: "https://www.workbuddy.ai",
+  workbuddyGlobal: "https://www.workbuddy.ai",
   // Our Free Model is served by a Core-owned worker on this machine, and
   // its port is assigned at launch, so it has no fixed address to print here.
   // The entry carries Core's own `os.environ/` reference instead, which is the
@@ -290,7 +291,7 @@ function serviceFromURL(value: string): ServiceID | undefined {
   })();
   if (!host) return undefined;
   const matches = (suffix: string): boolean => host === suffix || host.endsWith(`.${suffix}`);
-  if (matches("workbuddy.ai")) return "workbuddyAI";
+  if (matches("workbuddy.ai")) return "workbuddyGlobal";
   if (matches("codebuddy.ai") || matches("codebuddy.cn") || matches("copilot.tencent.com")) return "workbuddy";
   if (matches("opencode.ai")) return "ourFreeModel";
   if (matches("api.openai.com") || matches("openai.com") || matches("chatgpt.com")) return "openai";
@@ -301,7 +302,7 @@ function serviceFromURL(value: string): ServiceID | undefined {
 /** The service behind one provider entry: its kind first, then its address. */
 function providerService(provider: UnknownRecord | undefined): ServiceID | undefined {
   const kind = providerKind(provider ?? {});
-  if (kind === "openai" || kind === "claude" || kind === "workbuddy" || kind === "workbuddyAI" || kind === "ourFreeModel") return kind;
+  if (kind === "openai" || kind === "claude" || kind === "workbuddy" || kind === "workbuddyGlobal" || kind === "ourFreeModel") return kind;
   return serviceFromURL(stringValue(provider?.endpoint, stringValue(provider?.api_base)));
 }
 
@@ -333,12 +334,12 @@ function hasFreshServiceRates(service: ServiceID | undefined): boolean {
  * when this service publishes no catalog of its own.
  *
  * The action and the id it is addressed with belong together: the worker's
- * document names its own variants (`workbuddy`, `workbuddy-ai`), which are not
+ * document names its own regions (`workbuddy`, `workbuddy-global`), which are not
  * the auth kinds the configuration stores.
  */
 function serviceCatalogRead(service: ServiceID, channel?: string): { action: string; providerId: string } | undefined {
   if (service === "workbuddy") return { action: "workbuddy_models", providerId: "workbuddy" };
-  if (service === "workbuddyAI") return { action: "workbuddy_models", providerId: "workbuddy-ai" };
+  if (service === "workbuddyGlobal") return { action: "workbuddy_models", providerId: "workbuddy-global" };
   // One worker serves every channel, so the id decides which slice of the
   // roster comes back.  Defaulting to the lane's own id would list the
   // anonymous channel's rows for a Kilo entry.
@@ -430,15 +431,15 @@ function serviceCatalogRates(models: UnknownRecord[]): Record<string, string> {
 }
 
 /** Which WorkBuddy product a provider kind borrows its sign-in from. */
-function workbuddyProviderIDFor(kind: ProviderKind): "workbuddy" | "workbuddy-ai" | undefined {
+function workbuddyProviderIDFor(kind: ProviderKind): "workbuddy" | "workbuddy-global" | undefined {
   if (kind === "workbuddy") return "workbuddy";
-  if (kind === "workbuddyAI") return "workbuddy-ai";
+  if (kind === "workbuddyGlobal") return "workbuddy-global";
   return undefined;
 }
 
 /** The desktop app a WorkBuddy account signs in through. */
 function workbuddyAppName(kind: ProviderKind, translate: Translate): string {
-  return translate(kind === "workbuddyAI" ? "providers.type.workbuddyAI" : "providers.type.workbuddy");
+  return translate(kind === "workbuddyGlobal" ? "providers.type.workbuddyGlobal" : "providers.type.workbuddy");
 }
 
 function officialStatusLabel(status: ProviderAuthStatus, translate: Translate): string {  return status === "signed_in" ? translate("providers.authStatusSignedIn")
@@ -458,12 +459,21 @@ function officialStatusLabel(status: ProviderAuthStatus, translate: Translate): 
  * for the credit document carries no ``credits`` field at all, and the empty
  * string it produces here means exactly that — see
  * {@link workbuddyAccountFacts} for how the block reports it.
+ *
+ * Upstream sums its packages to a float (``7621.440001540001``), and printing
+ * that whole tail says more precision than the balance has.  The block states
+ * whole credits, which is the unit the account is read in.  A balance between
+ * nothing and one credit still has to read as something: rounding it to ``0``
+ * would state an empty account, so it keeps one decimal instead.
  */
 function workbuddyCreditsText(account: UnknownRecord | undefined, translate: Translate): string {
   const credits = asRecord(account?.credits);
   if (credits.unlimited === true) return translate("providers.wizard.workbuddyUnlimited");
   const total = credits.total;
-  return typeof total === "number" && Number.isFinite(total) ? String(total) : "";
+  if (typeof total !== "number" || !Number.isFinite(total)) return "";
+  const whole = Math.round(total);
+  if (whole === 0 && total > 0) return total.toFixed(1);
+  return String(whole);
 }
 
 /**
@@ -553,8 +563,8 @@ function providerKindLabel(kind: ProviderKind, translate: Translate): string {
         ? translate("providers.type.claude")
         : kind === "workbuddy"
           ? translate("providers.type.workbuddy")
-          : kind === "workbuddyAI"
-            ? translate("providers.type.workbuddyAI")
+          : kind === "workbuddyGlobal"
+            ? translate("providers.type.workbuddyGlobal")
             : kind === "ourFreeModel"
               ? translate("providers.type.ourFreeModel")
               : translate("providers.type.apiKey");
@@ -564,7 +574,7 @@ function providerKindLabel(kind: ProviderKind, translate: Translate): string {
  * name, address, and key all belong to the service surface rather than to the
  * provider editor. */
 function isLoginProviderKind(kind: ProviderKind): boolean {
-  return kind === "openai" || kind === "claude" || kind === "workbuddy" || kind === "workbuddyAI" || kind === "ourFreeModel";
+  return kind === "openai" || kind === "claude" || kind === "workbuddy" || kind === "workbuddyGlobal" || kind === "ourFreeModel";
 }
 
 const DATA_PACKAGE_SECTIONS: ReadonlyArray<{ domain: ConfigDomain; labelKey: string }> = [
@@ -3217,7 +3227,7 @@ function providerWizardKeyTarget(token: string, keyName: string): string {
   return `${WIZARD_PENDING_KEY_PREFIX}${token}\u001f${keyName}`;
 }
 
-type ServiceProviderKind = "openai_login" | "claude_login" | "workbuddy_login" | "workbuddy_ai_login" | "our_free_model_login";
+type ServiceProviderKind = "openai_login" | "claude_login" | "workbuddy_login" | "workbuddy_global_login" | "our_free_model_login";
 
 /**
  * Every provider the snapshot carries, whatever its kind.
@@ -3248,9 +3258,9 @@ function serviceProviderKindLabel(kind: ServiceProviderKind, translate: Translat
  * The persisted login kind behind each service type the pane offers.
  *
  * The pane's own vocabulary for a service provider is its short type
- * (`openai`, `claude`, `workbuddy`, `workbuddyAI`), while Core persists and
+ * (`openai`, `claude`, `workbuddy`, `workbuddyGlobal`), while Core persists and
  * validates the login kind (`openai_login`, `claude_login`,
- * `workbuddy_login`, `workbuddy_ai_login`).  Anything that retargets a
+ * `workbuddy_login`, `workbuddy_global_login`).  Anything that retargets a
  * provider through `service_provider.patch` has to translate between the two:
  * the short name is not in Core's `_SERVICE_PROVIDER_KINDS`, so a dispatch
  * that sent it would be refused as an unavailable login type.
@@ -3259,7 +3269,7 @@ function nextServiceProviderName(providers: UnknownRecord[], kind: ServiceProvid
   const base = kind === "openai_login" ? "OpenAI"
     : kind === "claude_login" ? "Claude"
       : kind === "workbuddy_login" ? "WorkBuddy"
-        : kind === "workbuddy_ai_login" ? "WorkBuddy AI"
+        : kind === "workbuddy_global_login" ? "WorkBuddy Global"
           // A lane channel states its own name: the name is what Core reads to
           // know which channel an entry is, so three entries cannot share one.
           : laneChannelName || "Our Free Model · OpenCode";
@@ -3272,7 +3282,7 @@ function nextServiceProviderName(providers: UnknownRecord[], kind: ServiceProvid
 
 function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayStations, busy, translate, dispatchWithOutcome, onSecretState, onStatus, onClose, onKeyToken, relay, addOfficialAccount, status }: { snapshot?: CoreSnapshot; native: NativeLeafAdapter; providers: UnknownRecord[]; relaySources: RelaySourceOption[]; relayStations: RelayStationOption[]; busy: boolean; translate: Translate; dispatchWithOutcome: (type: string, payload?: UnknownRecord, domain?: ConfigDomain, keepControlsEnabled?: boolean) => Promise<CoreSnapshot | undefined>; onSecretState: (state: SecretState) => void; onStatus: (status?: string) => void; onClose: () => void; onKeyToken: (token: string) => void; relay: RelayWorkspaceBridge; addOfficialAccount: (kind: ServiceProviderKind, name?: string) => Promise<string>; /** The window's own result: a child window keeps no strip, so its footer states it. */ status?: string }): React.JSX.Element {
   type WizardStep = "provider" | "keys" | "model";
-  type WizardType = "api" | "openai" | "claude" | "workbuddy" | "workbuddyAI" | "ourFreeModel" | "ourFreeModelKilo" | "ourFreeModelEAC";
+  type WizardType = "api" | "openai" | "claude" | "workbuddy" | "workbuddyGlobal" | "ourFreeModel" | "ourFreeModelKilo" | "ourFreeModelEAC";
   const [step, setStep] = useState<WizardStep>("provider");
   // The step the last advance left, so one press cannot advance twice.
   const stepRef = useRef<WizardStep | undefined>("provider");
@@ -3365,7 +3375,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   };
 
   const isOfficialLoginType = providerType === "openai" || providerType === "claude";
-  const isWorkBuddyType = providerType === "workbuddy" || providerType === "workbuddyAI";
+  const isWorkBuddyType = providerType === "workbuddy" || providerType === "workbuddyGlobal";
   // Our Free Model has no sign-in and no user secret at all: its provider is
   // created straight from the provider step, so it shares neither the key
   // step's fields nor the official services' web login.
@@ -3380,8 +3390,8 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   /** The provider this entry creates; the wizard names it. */
   const ourFreeModelProviderID = ourFreeModelProviderIDFor(providerType);
   const isLoginType = isOfficialLoginType || isWorkBuddyType || isOurFreeModelType;
-  const workbuddyProvider = providerType === "workbuddyAI" ? "workbuddy-ai" : "workbuddy";
-  const workbuddyAuthKind: ServiceProviderKind = providerType === "workbuddyAI" ? "workbuddy_ai_login" : "workbuddy_login";
+  const workbuddyProvider = providerType === "workbuddyGlobal" ? "workbuddy-global" : "workbuddy";
+  const workbuddyAuthKind: ServiceProviderKind = providerType === "workbuddyGlobal" ? "workbuddy_global_login" : "workbuddy_login";
   const selectedProvider = providers.find((entry) => editorIdentifier(entry) === providerSelection);
   const providerID = selectedProvider ? editorIdentifier(selectedProvider) : "";
   const selectedProviderName = selectedProvider
@@ -3494,7 +3504,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     { type: "openai", label: translate("providers.type.openai") },
     { type: "claude", label: translate("providers.type.claude") },
     { type: "workbuddy", label: translate("providers.type.workbuddy") },
-    { type: "workbuddyAI", label: translate("providers.type.workbuddyAI") },
+    { type: "workbuddyGlobal", label: translate("providers.type.workbuddyGlobal") },
     // One entry per upstream channel, because each channel is a provider of its
     // own: a channel decides the wire its rows answer on and the window they
     // accept, and a provider is the only unit this app states those on. Adding
@@ -3694,7 +3704,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     // is: three entries cannot all be called "Our Free Model".
     const channelName = OUR_FREE_MODEL_CHANNEL[value]?.name;
     setProviderName(value === "workbuddy" ? nextServiceProviderName(providers, "workbuddy_login")
-      : value === "workbuddyAI" ? nextServiceProviderName(providers, "workbuddy_ai_login")
+      : value === "workbuddyGlobal" ? nextServiceProviderName(providers, "workbuddy_global_login")
         : channelName ? nextServiceProviderName(providers, "our_free_model_login", channelName)
           : value === "openai" ? nextServiceProviderName(providers, "openai_login")
             : value === "claude" ? nextServiceProviderName(providers, "claude_login")
@@ -3712,7 +3722,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     // no longer this draft's to change.
     if (step !== "provider" || providerMode !== "new" || providerType === "api") return;
     const kind: ServiceProviderKind = providerType === "workbuddy" ? "workbuddy_login"
-      : providerType === "workbuddyAI" ? "workbuddy_ai_login"
+      : providerType === "workbuddyGlobal" ? "workbuddy_global_login"
         : providerType === "ourFreeModel" ? "our_free_model_login"
           : providerType === "claude" ? "claude_login"
             : "openai_login";
@@ -4573,7 +4583,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         </View> : <>
         {step === "provider" ? <View style={styles.providerWizardFormSection}>
           <NativeFormRow label={translate("providers.wizard.providerType")}>
-            <NativePicker labels={servicePickerLabels} selectedValue={selectedServiceLabel} disabled={wizardBusy} onChange={({ nativeEvent }) => { const kinds: WizardType[] = ["api", "openai", "claude", "workbuddy", "workbuddyAI", "ourFreeModel", "ourFreeModelKilo", "ourFreeModelEAC"]; chooseProviderType(kinds[nativeEvent.index] ?? "api"); }} style={styles.providerWizardPicker} />
+            <NativePicker labels={servicePickerLabels} selectedValue={selectedServiceLabel} disabled={wizardBusy} onChange={({ nativeEvent }) => { const kinds: WizardType[] = ["api", "openai", "claude", "workbuddy", "workbuddyGlobal", "ourFreeModel", "ourFreeModelKilo", "ourFreeModelEAC"]; chooseProviderType(kinds[nativeEvent.index] ?? "api"); }} style={styles.providerWizardPicker} />
           </NativeFormRow>
           {providerMode === "new" && isOfficialLoginType ? <NativeFormRow label={translate("providers.wizard.authPath")}>
             <NativePicker labels={[translate("providers.wizard.pathWebLogin"), translate("providers.wizard.pathCustomKey")]} selectedValue={keyPath === "login" ? translate("providers.wizard.pathWebLogin") : translate("providers.wizard.pathCustomKey")} disabled={wizardBusy} onChange={({ nativeEvent }) => { chooseOfficialAuthPath(nativeEvent.index === 1 ? "manual" : "login"); }} style={styles.providerWizardPicker} />
@@ -4970,7 +4980,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   // WorkBuddy's sign-in belongs to the desktop app, and the free lane imports
   // its roster on create.  Listing a synthesized "key" for them only put a
   // picker with one meaningless name beside 获取模型.
-  const providerHoldsNoKey = providerKindSelected === "workbuddy" || providerKindSelected === "workbuddyAI"
+  const providerHoldsNoKey = providerKindSelected === "workbuddy" || providerKindSelected === "workbuddyGlobal"
     || providerKindSelected === "ourFreeModel";
   const fetchKeyChoices = useMemo(() => {
     if (!provider || providerKindSelected === "openai" || providerKindSelected === "claude" || providerHoldsNoKey) return [];
@@ -7248,7 +7258,7 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
   const kind = providerKind(provider);
   const service = providerService(provider);
   const isOfficialAccount = kind === "openai" || kind === "claude";
-  const isWorkBuddyAccount = kind === "workbuddy" || kind === "workbuddyAI";
+  const isWorkBuddyAccount = kind === "workbuddy" || kind === "workbuddyGlobal";
   // The one predicate, not a second spelling of it: a login service owns its
   // key, so no key editor may be drawn for it.  Re-deriving this locally from
   // the two kinds this pane also branches on left the Our Free Model lane

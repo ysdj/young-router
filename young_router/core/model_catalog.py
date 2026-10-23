@@ -8,6 +8,10 @@ from pathlib import Path
 from typing import Any
 
 from .model_contexts import ModelContextRegistry
+from .model_contexts import (
+    SEARCH_TOOL_CAPABILITY_BRIDGE,
+    SEARCH_TOOL_CAPABILITY_UNSUPPORTED,
+)
 from .native_codex_catalog import load_native_catalog
 from .persistence import PersistenceError, atomic_write_json, read_json
 
@@ -315,21 +319,22 @@ def _apply_search_tool_capability(
     registry: ModelContextRegistry,
     name: str,
 ) -> None:
-    """Keep the catalog's search-tool advertisement aligned with the route.
-
-    The inherited native profile advertises hosted search for the profile it
-    was copied from.  The route may not deliver that tool: an explicit false
-    capability or an unidentified non-GPT route must not advertise it.  When
-    the route configuration is unreadable the native profile is left
-    untouched.
-    """
+    """Keep the catalog aligned with the search tool Young Router can serve."""
 
     capability = registry.search_tool_capability_for(name)
     if capability is None:
         return
-    model["supports_search_tool"] = bool(capability)
-    if not capability:
+    if capability == SEARCH_TOOL_CAPABILITY_UNSUPPORTED:
+        model["supports_search_tool"] = False
         model.pop("web_search_tool_type", None)
+        return
+    model["supports_search_tool"] = True
+    if capability == SEARCH_TOOL_CAPABILITY_BRIDGE:
+        # The proxy supplies a text-search function through the local search bridge when
+        # a route cannot execute Codex's hosted search itself. Keep the native
+        # profile's value: the Responses Lite client recognizes the built-in
+        # web-search tool only when this optional field is present.
+        model["web_search_tool_type"] = "text_and_image"
 
 
 def _catalog_model(

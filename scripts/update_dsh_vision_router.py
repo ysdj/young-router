@@ -8,8 +8,8 @@ this application used to keep a hand-written Python mirror of.
 
 Upstream is a Node module and the vision fallback runs inside the Python
 LiteLLM process, so the package is not importable there.  It is therefore
-staged into the Core bundle the same way ``pi-web-access``, Veridrop, and
-``dsh-workbuddy-connect`` are, and ``young_router/adapters/dsh_vision_worker.mjs``
+staged into the Core bundle the same way Veridrop and
+``dsh-connect-workbuddy`` are, and ``young_router/adapters/dsh_vision_worker.mjs``
 calls it through the bundled Node.js runtime.  This script resolves the npm
 ``latest`` dist-tag, installs the package plus the peer closure it needs, writes
 the one stub its closure requires, and flattens the result into Core.  No

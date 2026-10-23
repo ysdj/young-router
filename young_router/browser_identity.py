@@ -42,7 +42,6 @@ _SELF_IDENTITY_MARKERS = (
     "young-router",
     "youngrouter",
     "young_router",
-    "pi-web-access",
 )
 
 

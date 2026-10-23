@@ -16,7 +16,6 @@ from __future__ import annotations
 from . import responses_request as _responses_request_module
 from . import request_context as _request_context_module
 from . import responses_execution as _responses_execution_module
-from . import responses_web_search_bridge as _responses_web_search_bridge_module
 from . import routing as _routing_module
 from . import state as _state_module
 from . import trace as _trace_module
@@ -890,10 +889,6 @@ def _route_recovery_poll_keep_going(exception: Exception) -> bool:
     # identical bytes for the rest of the recovery window.
     if _routing_module._is_request_body_size_rejection_error(exception):
         return False
-    if _streaming_module._external_web_search_exception_has_recovery_request(exception):
-        # This attempt carries its own recovery request, and that request is
-        # still a stream, so the next attempt is not a replay of these bytes.
-        return True
     # A first-event timeout with nothing buffered means the route was sent the
     # request and answered with zero bytes.  That is a route that cannot serve
     # this request at all, not a transient pause: every later attempt replays
@@ -905,52 +900,6 @@ def _route_recovery_poll_keep_going(exception: Exception) -> bool:
     if _routing_module._is_local_stream_start_timeout_error(exception):
         return False
     return _routing_module._is_route_recovery_poll_error(exception)
-
-def _external_web_search_exception_has_recovery_request(
-    exception: Exception,
-) -> bool:
-    return (
-        _responses_web_search_bridge_module._external_web_search_recovery_request_from_exception(
-            exception,
-        )
-        is not None
-    )
-
-def _external_web_search_recovery_poll_error(exception: Exception) -> bool:
-    return bool(
-        _routing_module._is_route_recovery_poll_error(exception)
-        or _streaming_module._external_web_search_exception_has_recovery_request(exception)
-    )
-
-def _external_web_search_recovery_payload_for_blocked_original(
-    request_data: dict,
-    exception: Exception,
-) -> Optional[dict[str, Any]]:
-    if not _routing_module._should_block_external_web_search_original_recovery(request_data):
-        return None
-    recovery_request = (
-        _responses_web_search_bridge_module._external_web_search_recovery_request_from_exception(
-            exception,
-        )
-    )
-    if recovery_request is None:
-        return None
-    recovery_request["stream"] = True
-    if not _responses_web_search_bridge_module._external_web_search_is_recovery_payload(
-        recovery_request,
-    ):
-        return None
-    return recovery_request
-
-def _is_external_web_search_synthesis_recovery_payload(
-    request_data: Optional[dict],
-) -> bool:
-    metadata = _request_context_module._request_metadata_dict(
-        request_data,
-        "litellm_metadata",
-    ) or {}
-    return metadata.get("external_web_search_synthesis") is True
-
 def _route_recovery_sse_keepalive(
     attempt: int,
     *,
@@ -1138,26 +1087,6 @@ async def _stream_route_recovery_poll(
     exception: Exception,
 ) -> AsyncIterator[Any]:
     uses_native_event_stream = _streaming_module._request_uses_native_event_stream(request_data)
-    recovery_request = _streaming_module._external_web_search_recovery_payload_for_blocked_original(
-        request_data,
-        exception,
-    )
-    if recovery_request is not None:
-        _trace_module._request_route_trace(
-            "external_web_search_original_route_recovery_resumed_with_payload", request_data,
-            request=_trace_module._trace_request_summary(request_data),
-            retry_request=_trace_module._trace_request_summary(recovery_request),
-            exception=_routing_module._trace_exception(exception),
-        )
-        request_data = recovery_request
-    elif _routing_module._should_block_external_web_search_original_recovery(request_data):
-        _trace_module._request_route_trace(
-            "external_web_search_original_route_recovery_blocked", request_data,
-            request=_trace_module._trace_request_summary(request_data),
-            exception=_routing_module._trace_exception(exception),
-        )
-        yield _streaming_module._external_web_search_missing_answer_failed_event(request_data, exception)
-        return
     max_poll_seconds = _routing_module._recovery_max_seconds_for_request(request_data)
     if max_poll_seconds <= 0:
         return
@@ -1170,7 +1099,7 @@ async def _stream_route_recovery_poll(
             exception=_routing_module._trace_exception(exception),
         )
         return
-    if not _streaming_module._external_web_search_recovery_poll_error(exception):
+    if not _routing_module._is_route_recovery_poll_error(exception):
         return
     started_at_monotonic = time.monotonic()
     poll_interval_seconds = _routing_module._recovery_interval_seconds()
@@ -1279,25 +1208,6 @@ async def _stream_route_recovery_poll(
                 ):
                     yield keepalive
                 continue
-            recovery_request = _streaming_module._external_web_search_recovery_payload_for_blocked_original(
-                request_data,
-                last_exception,
-            )
-            if recovery_request is not None:
-                _trace_module._request_route_trace(
-                    "external_web_search_original_route_recovery_resumed_with_payload", request_data,
-                    request=_trace_module._trace_request_summary(request_data),
-                    retry_request=_trace_module._trace_request_summary(recovery_request),
-                    exception=_routing_module._trace_exception(last_exception),
-                )
-                request_data = recovery_request
-            elif _routing_module._should_block_external_web_search_original_recovery(request_data):
-                _trace_module._request_route_trace(
-                    "external_web_search_original_route_recovery_blocked", request_data,
-                    request=_trace_module._trace_request_summary(request_data),
-                    exception=_routing_module._trace_exception(last_exception),
-                )
-                break
             if waited_for_all_cooldown:
                 # Only this path deliberately reopens the full route pool.
                 # Normal recovery must retain its ordered fallback constraints.

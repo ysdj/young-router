@@ -21,65 +21,6 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
             failed,
         )
 
-    def test_external_search_response_marks_final_answer_phase(self) -> None:
-        hooks, _ = load_hook_module()
-        response = hooks._external_web_search_message_response(
-            {"model": "synthetic-search-model"},
-            "Sunny.",
-        )
-        self.assertEqual(response["output"][0]["phase"], "final_answer")
-
-        enriched = hooks._with_external_web_search_call_action_items(
-            {
-                "output": [
-                    {
-                        "id": "msg_final",
-                        "type": "message",
-                        "status": "completed",
-                        "role": "assistant",
-                        "content": [],
-                    }
-                ]
-            },
-            [{"type": "search", "query": "Suzhou weather"}],
-        )
-        self.assertEqual(enriched["output"][-1]["phase"], "final_answer")
-
-        already_enriched = hooks._with_external_web_search_call_action_items(
-            {
-                "output": [
-                    {
-                        "id": "ws_existing",
-                        "type": "web_search_call",
-                        "status": "completed",
-                        "action": {"type": "search", "query": "Suzhou weather"},
-                    },
-                    {
-                        "id": "msg_existing_final",
-                        "type": "message",
-                        "status": "completed",
-                        "role": "assistant",
-                        "content": [],
-                    },
-                ]
-            },
-            [{"type": "search", "query": "Suzhou weather"}],
-        )
-        self.assertEqual(already_enriched["output"][-1]["phase"], "final_answer")
-
-        message_events = hooks._external_web_search_message_stream_events(
-            {
-                "id": "msg_stream_final",
-                "type": "message",
-                "status": "completed",
-                "role": "assistant",
-                "content": [],
-            },
-            1,
-        )
-        self.assertEqual(message_events[0]["item"]["phase"], "final_answer")
-        self.assertEqual(message_events[-1]["item"]["phase"], "final_answer")
-
     def test_provider_citation_suffix_is_removed_from_source_url(self) -> None:
         hooks, _ = load_hook_module()
         self.assertEqual(
@@ -193,6 +134,41 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
         )
         self.assertEqual(sanitized["output"][0]["action"]["query"], "Web search")
         self.assertNotIn(request["input"], json.dumps(sanitized))
+
+    def test_a_named_reasoning_summary_is_what_asks_for_thinking(self) -> None:
+        """Every summary a client can name is a request to see the thinking.
+
+        pi sends ``summary: "auto"`` with ``effort`` and renders the frames a
+        ``raw``-only reading dropped; ``none`` and an absent summary are the
+        requests that mean no reasoning at all.  ``model_reasoning_summary`` is
+        the same request under the Codex-shaped spelling.
+        """
+
+        hooks, _ = load_hook_module()
+
+        for summary in ("auto", "concise", "detailed", "raw"):
+            with self.subTest(summary=summary):
+                self.assertTrue(
+                    hooks._public_reasoning_is_allowed(
+                        {"reasoning": {"effort": "max", "summary": summary}}
+                    )
+                )
+        self.assertTrue(
+            hooks._public_reasoning_is_allowed(
+                {"model_reasoning_summary": "concise"}
+            )
+        )
+        for reasoning in (
+            None,
+            {},
+            {"effort": "max"},
+            {"effort": "max", "summary": None},
+            {"effort": "max", "summary": "none"},
+            {"effort": "max", "summary": "off"},
+        ):
+            with self.subTest(reasoning=reasoning):
+                request = {} if reasoning is None else {"reasoning": reasoning}
+                self.assertFalse(hooks._public_reasoning_is_allowed(request))
 
     def test_regular_reasoning_and_missing_tool_are_not_hidden_search(self) -> None:
         hooks, _ = load_hook_module()
@@ -521,15 +497,8 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
         self.assertEqual(chunks[message_start_index]["output_index"], 9)
         self.assertEqual(chunks[message_start_index]["item"]["phase"], "final_answer")
 
-    async def test_hidden_provider_search_with_answer_never_runs_local_bridge(self) -> None:
+    async def test_hidden_provider_search_with_answer_emits_one_search_call(self) -> None:
         hooks, _ = load_hook_module()
-        original_run_action = hooks._external_web_search_run_action
-
-        async def forbidden_local_search(*_args, **_kwargs):
-            raise AssertionError("native provider search must not run the local bridge")
-
-        hooks._external_web_search_run_action = forbidden_local_search
-        self.addCleanup(setattr, hooks, "_external_web_search_run_action", original_run_action)
 
         async def upstream():
             yield {
@@ -713,131 +682,6 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
             "https://www.python.org/downloads/",
         )
 
-    async def test_chat_only_external_web_search_uses_chat_completion_for_planning(self) -> None:
-        hooks, proxy_server = load_hook_module()
-        original_calls = []
-        chat_calls = []
-
-        class FakeRouter:
-            async def acompletion(self, **kwargs):
-                chat_calls.append(kwargs)
-                if len(chat_calls) == 1:
-                    return {
-                        "id": "chat_tool",
-                        "object": "chat.completion",
-                        "model": "legacy-chat",
-                        "choices": [
-                            {
-                                "finish_reason": "tool_calls",
-                                "message": {
-                                    "role": "assistant",
-                                    "content": "",
-                                    "tool_calls": [
-                                        {
-                                            "id": "call_search",
-                                            "type": "function",
-                                            "function": {
-                                                "name": "web_search",
-                                                "arguments": json.dumps(
-                                                    {
-                                                        "query": (
-                                                            "latest stable Python release python.org"
-                                                        )
-                                                    }
-                                                ),
-                                            },
-                                        }
-                                    ],
-                                },
-                            }
-                        ],
-                    }
-                return {
-                    "id": "chat_final",
-                    "object": "chat.completion",
-                    "model": "legacy-chat",
-                    "choices": [
-                        {
-                            "finish_reason": "stop",
-                            "message": {
-                                "role": "assistant",
-                                "content": (
-                                    "Python 3.14.2 https://www.python.org/downloads/"
-                                ),
-                            },
-                        }
-                    ],
-                }
-
-        proxy_server.llm_router = FakeRouter()
-
-        original_run_action = hooks._external_web_search_run_action
-
-        async def fake_run_action(action, _page_cache, _page_fetch_tasks):
-            return (
-                "Web search results for query: latest stable Python release python.org\n"
-                "Title: Download Python\n"
-                "URL: https://www.python.org/downloads/\n"
-                "Snippet: Download the latest stable Python release.",
-                ["https://www.python.org/downloads/"],
-                action,
-            )
-
-        hooks._external_web_search_run_action = fake_run_action
-        self.addCleanup(setattr, hooks, "_external_web_search_run_action", original_run_action)
-
-        async def original_generic_function(**kwargs):
-            original_calls.append(kwargs)
-            raise AssertionError("chat-only web_search planning should use acompletion")
-
-        request_kwargs = {"original_generic_function": original_generic_function}
-        hooks._with_generic_deployment_failover_wrapper(request_kwargs)
-
-        response = await request_kwargs["original_generic_function"](
-            call_type="aresponses",
-            model="legacy-chat",
-            input="Use web_search for the latest stable Python release.",
-            stream=False,
-            tools=[{"type": "web_search"}],
-            tool_choice="auto",
-            use_chat_completions_api=True,
-            _young_router_upstream_url_surface="openai/chat",
-            model_info={
-                "id": "chatroute",
-                "provider": "provider_chat",
-                "route_key": "provider_chat / openai/vendor-chat / key=default / order=1",
-                "upstream_url_surface": "openai/chat",
-                "supported_upstream_url_surfaces": ["openai/chat"],
-            },
-        )
-
-        self.assertEqual(original_calls, [])
-        self.assertEqual(len(chat_calls), 2)
-        self.assertNotIn("input", chat_calls[0])
-        self.assertNotIn("use_chat_completions_api", chat_calls[0])
-        self.assertEqual(chat_calls[0]["stream"], False)
-        for chat_call in chat_calls:
-            self.assertTrue(
-                chat_call["litellm_metadata"][
-                    hooks._WEB_SEARCH_EXTERNAL_SUPPRESS_POST_CALL_KEY
-                ]
-            )
-            self.assertTrue(
-                chat_call["metadata"][
-                    hooks._WEB_SEARCH_EXTERNAL_SUPPRESS_POST_CALL_KEY
-                ]
-            )
-        self.assertEqual(
-            chat_calls[0]["tools"][0]["function"]["name"],
-            "web_search",
-        )
-        self.assertEqual(chat_calls[1]["stream"], False)
-        self.assertEqual(
-            response["output_text"],
-            "Python 3.14.2 https://www.python.org/downloads/",
-        )
-        self.assertEqual(response["output"][0]["type"], "web_search_call")
-
     async def test_generic_response_wrapper_keeps_unknown_web_search_native_with_client_tool_bridge(self) -> None:
         hooks, _ = load_hook_module()
         calls = []
@@ -924,14 +768,13 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
         self.assertTrue(
             metadata[hooks._RESPONSES_FUNCTION_TOOL_BRIDGE_PREEMPTIVE_METADATA_KEY]
         )
-        self.assertNotIn(hooks._WEB_SEARCH_EXTERNAL_BRIDGE_KEY, metadata)
         self.assertEqual(
             metadata[hooks._RESPONSES_CHAT_BRIDGE_ORIGINAL_MODEL_GROUP_KEY],
             "balanced-chat",
         )
         self.assertNotIn(hooks._RESPONSES_CHAT_BRIDGE_METADATA_KEY, metadata)
         stats = metadata["responses_function_tool_bridge_tool_sanitized"]
-        self.assertEqual(stats["bridged_web_search_tools"], 0)
+        self.assertEqual(stats["dropped_web_search_tools"], 0)
         self.assertEqual(stats["bridged_custom_tools"], 1)
         self.assertEqual(stats["bridged_tool_search_tools"], 1)
         self.assertEqual(stats["bridged_namespace_tools"], 1)
@@ -1003,9 +846,8 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
             ["web_search", "function"],
         )
         metadata = calls[0]["litellm_metadata"]
-        self.assertNotIn(hooks._WEB_SEARCH_EXTERNAL_BRIDGE_KEY, metadata)
         stats = metadata["responses_function_tool_bridge_tool_sanitized"]
-        self.assertEqual(stats["bridged_web_search_tools"], 0)
+        self.assertEqual(stats["dropped_web_search_tools"], 0)
 
     async def test_generic_response_wrapper_tries_pure_web_search_natively_when_support_unknown(self) -> None:
         hooks, _ = load_hook_module()
@@ -1062,7 +904,6 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
             ["web_search"],
         )
         metadata = calls[0].get("litellm_metadata", {})
-        self.assertNotIn(hooks._WEB_SEARCH_EXTERNAL_BRIDGE_KEY, metadata)
         self.assertNotIn(
             hooks._RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY,
             metadata,
@@ -1096,14 +937,8 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
             error = UnsupportedSearch(
                 "invalid_request_error: unsupported web_search tool"
             )
-            bridge = hooks._with_responses_external_web_search_bridge_after_native_error(
-                error,
-                request,
-            )
-            self.assertIsNotNone(bridge)
-            self.assertEqual(
-                [tool.get("name") for tool in bridge["tools"]],
-                ["web_search", "fetch_content"],
+            self.assertTrue(
+                hooks._record_web_search_tool_unsupported(error, request)
             )
             self.assertEqual(len(hooks._WEB_SEARCH_TOOL_UNSUPPORTED), 1)
             state = next(iter(hooks._WEB_SEARCH_TOOL_UNSUPPORTED.values()))
@@ -1116,23 +951,15 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
             payload = json.loads(state_path.read_text(encoding="utf-8"))
             self.assertIn("web_search_tool_unsupported", payload)
 
+            # The probe memory still answers the capability question: a route
+            # that refused the declaration is not asked again until expiry.
             hooks._WEB_SEARCH_TOOL_UNSUPPORTED.clear()
             cached_request = request.copy()
             cached_request["model_info"] = request["model_info"].copy()
-            self.assertEqual(
+            self.assertFalse(
                 hooks._request_native_responses_web_search_support_decision(
                     cached_request
-                ),
-                False,
-            )
-            cached_bridge = hooks._with_responses_external_web_search_bridge(
-                cached_request
-            )
-            self.assertIsNotNone(cached_bridge)
-            self.assertTrue(
-                cached_request["litellm_metadata"][
-                    hooks._WEB_SEARCH_TOOL_UNSUPPORTED_CACHE_HIT_KEY
-                ]
+                )
             )
 
             # Exercise expiry against the in-memory copy without reloading the
@@ -1147,121 +974,6 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
                     expired_request
                 )
             )
-            self.assertIsNone(
-                hooks._with_responses_external_web_search_bridge(expired_request)
-            )
-
-    def test_openrouter_native_web_search_rejection_uses_cached_local_bridge(self) -> None:
-        hooks, _ = load_hook_module()
-        self.set_env(hooks._WEB_SEARCH_TOOL_UNSUPPORTED_TTL_SECONDS_ENV, "600")
-        request = {
-            "call_type": "aresponses",
-            "model": "openrouter/grok",
-            "input": "Search the web.",
-            "tools": [{"type": "openrouter:web_search"}],
-            "model_info": {
-                "id": "openrouter-grok-deployment",
-                "provider": "openrouter",
-                "route_key": "openrouter / grok / key=default",
-                "upstream_url_surface": "openai/responses",
-                "supports_responses_function_tools": True,
-            },
-        }
-
-        class UnsupportedSearch(Exception):
-            status_code = 400
-
-        error = UnsupportedSearch(
-            "invalid_request_error: openrouter:web_search is not supported"
-        )
-        bridge = hooks._with_responses_external_web_search_bridge_after_native_error(
-            error,
-            request,
-        )
-        self.assertIsNotNone(bridge)
-        self.assertEqual(
-            [tool.get("name") for tool in bridge["tools"]],
-            ["web_search", "fetch_content"],
-        )
-        next_request = request.copy()
-        next_request["model_info"] = request["model_info"].copy()
-        cached_bridge = hooks._with_responses_external_web_search_bridge(next_request)
-        self.assertIsNotNone(cached_bridge)
-
-    def test_openrouter_provider_native_web_search_unknown_stays_native(self) -> None:
-        hooks, _ = load_hook_module()
-        request = {
-            "call_type": "aresponses",
-            "model": "openrouter/grok",
-            "input": "Search the web if needed.",
-            "tools": [{"type": "openrouter:web_search"}],
-            "model_info": {
-                "id": "openrouter-grok-unknown-search",
-                "provider": "openrouter",
-                "route_key": "openrouter / grok / key=default",
-                "upstream_url_surface": "openai/responses",
-                "supports_responses_function_tools": True,
-            },
-        }
-
-        self.assertFalse(hooks._request_should_bridge_responses_web_search(request))
-        self.assertIsNone(hooks._responses_external_web_search_bridge_kwargs(request))
-
-    def test_explicit_false_provider_native_web_search_uses_local_bridge(self) -> None:
-        hooks, _ = load_hook_module()
-        request = {
-            "call_type": "aresponses",
-            "model": "openrouter/grok",
-            "input": "Search the web.",
-            "tools": [{"type": "openrouter:web_search"}],
-            "model_info": {
-                "id": "openrouter-grok-explicit-no-search",
-                "provider": "openrouter",
-                "upstream_url_surface": "openai/responses",
-                "supports_web_search": False,
-                "supports_responses_function_tools": True,
-            },
-        }
-
-        bridge = hooks._responses_external_web_search_bridge_kwargs(request)
-
-        self.assertIsNotNone(bridge)
-        assert bridge is not None
-        self.assertEqual(
-            [tool.get("name") for tool in bridge["tools"]],
-            ["web_search", "fetch_content"],
-        )
-
-    def test_openrouter_native_web_search_chat_rejection_uses_local_bridge(self) -> None:
-        hooks, _ = load_hook_module()
-        request = {
-            "call_type": "aresponses",
-            "model": "openrouter/grok",
-            "input": "Search the web.",
-            "use_chat_completions_api": True,
-            "tools": [{"type": "openrouter:web_search"}],
-            "model_info": {
-                "id": "openrouter-grok-chat-rejection",
-                "provider": "openrouter",
-                "route_key": "openrouter / grok / key=default",
-                "upstream_url_surface": "openai/chat",
-            },
-        }
-
-        class UnsupportedSearch(Exception):
-            status_code = 400
-
-        bridge = hooks._with_responses_external_web_search_bridge_after_native_error(
-            UnsupportedSearch("invalid_request_error: openrouter:web_search is not supported"),
-            request,
-        )
-
-        self.assertIsNotNone(bridge)
-        assert bridge is not None
-        self.assertEqual(
-            [tool.get("name") for tool in bridge["tools"]],
-            ["web_search", "fetch_content"],
-        )
 
     def test_web_search_transient_failure_does_not_create_probe_memory(self) -> None:
         hooks, _ = load_hook_module()
@@ -1397,9 +1109,8 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
             ["web_search"],
         )
         metadata = calls[0].get("litellm_metadata", {})
-        self.assertNotIn(hooks._WEB_SEARCH_EXTERNAL_BRIDGE_KEY, metadata)
 
-    async def test_generic_response_wrapper_prefers_external_bridge_for_explicit_false_web_search(self) -> None:
+    async def test_generic_response_wrapper_forwards_hosted_search_despite_deduced_unsupported(self) -> None:
         hooks, _ = load_hook_module()
         calls = []
 
@@ -1446,30 +1157,74 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
             },
         )
 
-        self.assertTrue(hooks._response_is_async_iterable(response))
-        chunks = [jsonable_stream_chunk(chunk) async for chunk in response]
-        self.assertEqual(chunks[-1]["type"], "response.completed")
-        self.assertEqual(chunks[-1]["response"]["output_text"], "No search needed.")
+        self.assertEqual(response["output_text"], "No search needed.")
         self.assertEqual(len(calls), 1)
         self.assertNotIn("use_chat_completions_api", calls[0])
-        self.assertIn(
-            calls[0]["tool_choice"],
-            ("auto",),
-        )
+        # The proxy no longer executes searches, so the caller's Hosted
+        # declaration and its Hosted choice stay exactly as the caller wrote
+        # them; the upstream answers for its own capabilities.
         self.assertEqual(
-            [tool.get("name") for tool in calls[0]["tools"]],
-            ["web_search", "fetch_content"],
+            [tool.get("type") for tool in calls[0]["tools"]],
+            ["web_search"],
         )
-        metadata = calls[0]["litellm_metadata"]
-        self.assertTrue(metadata[hooks._WEB_SEARCH_EXTERNAL_BRIDGE_KEY])
+        self.assertEqual(calls[0]["tool_choice"], {"type": "web_search"})
+        self.assertNotIn("web_search_options", calls[0])
+        metadata = calls[0].get("litellm_metadata", {})
         self.assertNotIn(
             hooks._RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY,
             metadata,
         )
         self.assertNotIn(hooks._RESPONSES_CHAT_BRIDGE_METADATA_KEY, metadata)
-        stats = metadata["responses_external_web_search_tool_sanitized"]
-        self.assertEqual(stats["bridged_web_search_tools"], 1)
-        self.assertEqual(stats["kept_tool_names"], ["web_search", "fetch_content"])
+        self.assertNotIn("responses_external_web_search_tool_sanitized", metadata)
+
+    async def test_upstream_hosted_search_rejection_reaches_the_client_verbatim(self) -> None:
+        """A route that refuses Hosted search answers for itself.
+
+        The proxy does not run searches, so there is nothing to fall back to:
+        the upstream's own rejection is the response, not a locally produced
+        answer that pretends the turn succeeded.
+        """
+
+        hooks, _ = load_hook_module()
+        calls = []
+
+        class HostedSearchRejected(Exception):
+            status_code = 400
+
+        error = HostedSearchRejected(
+            "Invalid tools: web_search is not supported for this model"
+        )
+
+        async def original_generic_function(**kwargs):
+            calls.append(kwargs)
+            raise error
+
+        request_kwargs = {"original_generic_function": original_generic_function}
+        hooks._with_generic_deployment_failover_wrapper(request_kwargs)
+
+        with self.assertRaises(HostedSearchRejected) as raised:
+            await request_kwargs["original_generic_function"](
+                call_type="aresponses",
+                model="deepseek-v4.1-flash",
+                input="Search the news.",
+                stream=False,
+                tools=[{"type": "web_search"}],
+                model_info={
+                    "id": "relay-provider-generic-responses",
+                    "provider": "relay_provider",
+                    "route_key": "relay_provider / openai/vendor-chat / key=default",
+                    "upstream_url_surface": "openai/responses",
+                    "supports_responses_web_search": False,
+                },
+            )
+
+        self.assertIs(raised.exception, error)
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("web_search_options", calls[0])
+        self.assertEqual(
+            [tool.get("type") for tool in calls[0]["tools"]],
+            ["web_search"],
+        )
 
     async def test_plain_responses_404_is_not_deployment_failover_error(self) -> None:
         hooks, _ = load_hook_module()
@@ -1785,28 +1540,6 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
         self.assertEqual(calls[0]["tools"], [{"type": "openrouter:web_search"}])
         self.assertNotIn("external_web_search_bridge", calls[0].get("litellm_metadata", {}))
 
-    def test_openrouter_explicit_false_uses_local_fallback_contract(self) -> None:
-        hooks, _ = load_hook_module()
-        request = {
-            "call_type": "aresponses",
-            "model": "x-ai/grok-4",
-            "input": "Search.",
-            "tools": [{"type": "web_search"}],
-            "api_base": "https://openrouter.ai/api/v1",
-            "model_info": {
-                "provider": "openrouter",
-                "supports_responses_web_search": False,
-            },
-        }
-
-        bridge = hooks._responses_external_web_search_bridge_kwargs(request)
-        self.assertIsNotNone(bridge)
-        assert bridge is not None
-        self.assertEqual(
-            [tool.get("name") for tool in bridge["tools"]],
-            ["web_search", "fetch_content"],
-        )
-
     def test_response_text_joins_one_answers_delta_frames(self) -> None:
         """One answer cut into delta frames is one answer, not one token a line.
 
@@ -1847,124 +1580,3 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
         }
 
         self.assertEqual(hooks._response_text(response), "")
-
-    async def test_web_search_route_recovery_keeps_a_called_tool_instead_of_an_answer(self) -> None:
-        """A poll that carried the interrupted tool call must not become prose.
-
-        The continuation was rejected because the model asked for the client's
-        own tool.  The recovery poll then streamed that same call in per-character
-        argument frames, and reading those frames for text turned the arguments
-        into an assistant message: the client was handed its own command written
-        one character per line, with the tool call thrown away.
-        """
-
-        hooks, _ = load_hook_module()
-        web_search_bridge_module = importlib.import_module(
-            "young_router.proxy.responses_web_search_bridge"
-        )
-        streaming_module = importlib.import_module("young_router.proxy.streaming")
-        original_route_recovery_poll = streaming_module._stream_route_recovery_poll
-
-        arguments = json.dumps({"command": "cd /tmp && ls -la"})
-        polled_events = [
-            {
-                "type": "response.created",
-                "response": {"id": "resp_polled", "object": "response", "output": []},
-            },
-            {
-                "type": "response.output_item.added",
-                "output_index": 0,
-                "item": {
-                    "type": "function_call",
-                    "id": "fc_polled",
-                    "call_id": "call_polled",
-                    "name": "bash",
-                    "arguments": "",
-                },
-            },
-            *[
-                {
-                    "type": "response.function_call_arguments.delta",
-                    "item_id": "fc_polled",
-                    "output_index": 0,
-                    "delta": character,
-                }
-                for character in arguments
-            ],
-            {
-                "type": "response.output_item.done",
-                "output_index": 0,
-                "item": {
-                    "type": "function_call",
-                    "id": "fc_polled",
-                    "call_id": "call_polled",
-                    "name": "bash",
-                    "arguments": arguments,
-                    "status": "completed",
-                },
-            },
-            {
-                "type": "response.completed",
-                "response": {
-                    "id": "resp_polled",
-                    "object": "response",
-                    "status": "completed",
-                    "output": [
-                        {
-                            "type": "function_call",
-                            "id": "fc_polled",
-                            "call_id": "call_polled",
-                            "name": "bash",
-                            "arguments": arguments,
-                            "status": "completed",
-                        }
-                    ],
-                },
-            },
-        ]
-
-        async def fake_route_recovery_poll(request_data, exception):
-            for event in polled_events:
-                yield event
-
-        streaming_module._stream_route_recovery_poll = fake_route_recovery_poll
-        self.addCleanup(
-            setattr,
-            streaming_module,
-            "_stream_route_recovery_poll",
-            original_route_recovery_poll,
-        )
-
-        async def run_recovery():
-            failure = RuntimeError(
-                "external web_search continuation returned an invalid response: "
-                "mixed_client_and_server_tool_calls"
-            )
-            failure.status_code = 503
-            return await web_search_bridge_module._external_web_search_stream_route_recovery_or_fallback(
-                failure,
-                request_kwargs={
-                    "model": "openai/vendor-chat",
-                    "input": "Investigate.",
-                    "stream": True,
-                    "litellm_metadata": {
-                        "external_web_search_continuation": True,
-                    },
-                },
-                search_results="Retrieved evidence observed so far: sample",
-                queries=["sample"],
-            )
-
-        recovered = await run_recovery()
-
-        output = recovered["output"]
-        self.assertEqual(len(output), 1)
-        self.assertEqual(output[0].get("type"), "function_call")
-        self.assertEqual(output[0].get("name"), "bash")
-        # The bridge re-serializes the value it delivers; the call is what matters.
-        self.assertEqual(
-            json.loads(output[0].get("arguments")),
-            json.loads(arguments),
-        )
-        self.assertNotIn("resp_hosted_tool_unsupported", recovered["id"])
-        self.assertNotIn("\n", recovered.get("output_text") or "")

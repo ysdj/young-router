@@ -57,7 +57,7 @@ class ServiceProviderBoundaryTests(unittest.TestCase):
                 },
             )
             provider_id = snapshot["providers"][0]["id"]
-            for requested in ("claude_login", "workbuddy_login", "workbuddy_ai_login"):
+            for requested in ("claude_login", "workbuddy_login", "workbuddy_global_login"):
                 with self.assertRaisesRegex(DomainError, "type is fixed"):
                     domain.dispatch(
                         "provider.patch",

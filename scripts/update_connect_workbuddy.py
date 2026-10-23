@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
-"""Stage the latest ``dsh-workbuddy-connect`` package for an artifact build.
+"""Stage the latest ``dsh-connect-workbuddy`` package for an artifact build.
 
 WorkBuddy model access is not reimplemented in this repository: the upstream
-project (https://github.com/corrinehu/dsh-workbuddy-connect) owns the desktop
-app credential format, the token refresh, both model catalogs, and the
-loopback shim that speaks the upstream's Chat Completions wire format.  Its
-npm distribution is the integration surface, so every artifact build resolves
-the ``latest`` dist-tag, installs the package together with its declared peer
-dependencies, and flattens the result into the Core bundle.  No repository lock
-is written: a stale adaptation is never packaged.
+project (https://github.com/dingminhua/dsh-connect-workbuddy) owns the desktop
+app credential format and its at-rest envelope, the token refresh, both model
+catalogs, and the loopback shim that speaks the upstream's Chat Completions
+wire format.  Its npm distribution is the integration surface, so every
+artifact build resolves the ``latest`` dist-tag, installs the package together
+with its declared peer dependencies, and flattens the result into the Core
+bundle.  No repository lock is written: a stale adaptation is never packaged.
+
+A deprecated release is a failed build.  The previous upstream was withdrawn
+this way: npm kept serving its last version while marking every version
+deprecated, so a build that only checked the exit status kept packaging a
+frozen package and reporting success.
 
 ``*_URL`` environment variables and the matching command-line options exist for
 offline/unit-test fixtures.
@@ -43,15 +48,15 @@ from update_common import (
 )
 
 
-PACKAGE_NAME = "dsh-workbuddy-connect"
+PACKAGE_NAME = "dsh-connect-workbuddy"
 PACKAGE_REGISTRY_URL = os.environ.get(
-    "WORKBUDDY_CONNECT_NPM_REGISTRY_URL",
+    "CONNECT_WORKBUDDY_NPM_REGISTRY_URL",
     f"https://registry.npmjs.org/{PACKAGE_NAME}",
 )
 DEFAULT_TIMEOUT_SECONDS = 180
 # Build-tool metadata lookup identity: this script runs on a maintainer's
 # machine, not in the shipped app.
-USER_AGENT = "Young-Router/workbuddy-connect-build"
+USER_AGENT = "Young-Router/connect-workbuddy-build"
 # Entry points and peer packages the worker imports.  A staged package that is
 # missing one of these cannot drive the library at runtime, so the build fails
 # here instead of shipping a Core that reports WorkBuddy as unavailable.
@@ -139,8 +144,8 @@ def update(output: Path, *, registry_url: str, version: str | None = None) -> st
         required_peer_dirs=REQUIRED_PEER_DIRECTORIES,
     ):
         return latest
-    npm = _find_executable("WORKBUDDY_CONNECT_NPM_BIN")
-    with tempfile.TemporaryDirectory(prefix="young-router-workbuddy-connect-") as directory:
+    npm = _find_executable("CONNECT_WORKBUDDY_NPM_BIN")
+    with tempfile.TemporaryDirectory(prefix="young-router-connect-workbuddy-") as directory:
         work = Path(directory)
         package_tarball = work / f"{PACKAGE_NAME}.tgz"
         package_tarball.write_bytes(_request_bytes(tarball_url))
@@ -159,7 +164,7 @@ def update(output: Path, *, registry_url: str, version: str | None = None) -> st
 
 def parse_arguments(arguments: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", required=True, help="Core/young_router/adapters/workbuddy-connect destination")
+    parser.add_argument("--output", required=True, help="Core/young_router/adapters/connect-workbuddy destination")
     parser.add_argument("--registry-url", default=PACKAGE_REGISTRY_URL)
     parser.add_argument("--version", help="Stage this exact version instead of the latest dist-tag")
     return parser.parse_args(arguments)

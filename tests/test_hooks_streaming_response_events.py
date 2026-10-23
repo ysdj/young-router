@@ -1845,3 +1845,116 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
 
         self.assertEqual("invalid_request_error", chunk["error"]["type"])
         self.assertEqual("upstream_context_too_large", chunk["error"]["code"])
+
+    def test_an_incomplete_tool_history_stop_names_the_new_task(self) -> None:
+        """The stop a cut tool record produces must name the only fix.
+
+        The upstream refuses the replay because a tool call lost its output.
+        Sending the same history again meets the same refusal, so both wire
+        formats state the cause and ask for a new task instead of a retry.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
+
+        class BadRequestError(Exception):
+            pass
+
+        exception = BadRequestError(
+            "litellm.BadRequestError: OpenAIException - workbuddy upstream "
+            "client (http 400): 工具记录不完整，请新建任务 {'message': "
+            "'workbuddy upstream client (http 400): 工具记录不完整，请新建任务'}"
+        )
+        exception.status_code = 400
+        request_data = {
+            "model": "deepseek-v4.1-flash",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+        }
+
+        event = streaming_module._synthesized_failed_response_event(
+            request_data,
+            exception,
+        )
+        payload = event if isinstance(event, dict) else json.loads(event.data or "{}")
+        error = payload["response"]["error"]
+
+        self.assertEqual("invalid_request_error", error["type"])
+        self.assertEqual("upstream_tool_history_rejected", error["code"])
+        self.assertIn("tool records", error["message"])
+        self.assertIn("new task", error["message"])
+        self.assertNotIn("could not classify", error["message"])
+        lowered = error["message"].lower()
+        for retry_tip in ("send it again", "send the message again", "retry", "try again"):
+            self.assertNotIn(retry_tip, lowered)
+        self.assertTrue(
+            streaming_module._is_young_router_terminal_failure_event(event)
+        )
+
+        chunk = streaming_module._synthesized_native_stream_error_chunk(
+            {"model": "deepseek-v4.1-flash", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+            exception,
+        )
+        self.assertEqual("invalid_request_error", chunk["error"]["type"])
+        self.assertEqual("upstream_tool_history_rejected", chunk["error"]["code"])
+
+    def test_a_restricted_account_stop_names_the_account_instead_of_retrying(self) -> None:
+        """A route refused for its own account may not read as a transport hiccup.
+
+        The station reports the refusal as HTTP 400
+        (`账号存在异常行为，已被限制使用`), so the terminal branch used to fall
+        through to the unclassified-stop sentence with ``server_error``.  Codex
+        answered that by reconnecting five times over the same dead route.  The
+        account is the thing that must change, so both wire formats say so.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
+
+        class BadRequestError(Exception):
+            pass
+
+        exception = BadRequestError(
+            "litellm.BadRequestError: OpenAIException - workbuddy upstream "
+            "client: 账号存在异常行为，已被限制使用 {'message': 'workbuddy upstream "
+            "client: 账号存在异常行为，已被限制使用', 'type': 'client', 'code': 'client'}"
+        )
+        exception.status_code = 400
+        request_data = {
+            "model": "deepseek-v4.1-flash",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+        }
+
+        event = streaming_module._synthesized_failed_response_event(
+            request_data,
+            exception,
+        )
+        payload = event if isinstance(event, dict) else json.loads(event.data or "{}")
+        error = payload["response"]["error"]
+
+        self.assertEqual("invalid_request_error", error["type"])
+        self.assertEqual("upstream_account_restricted", error["code"])
+        self.assertIn("account", error["message"].lower())
+        self.assertNotIn("could not classify the stop", error["message"])
+        lowered = error["message"].lower()
+        for retry_tip in ("send it again", "send the message again", "retry", "try again"):
+            self.assertNotIn(retry_tip, lowered)
+        self.assertTrue(getattr(event, "_young_router_terminal_failure", False))
+        self.assertTrue(
+            streaming_module._is_young_router_terminal_failure_event(event)
+        )
+
+        chunk = streaming_module._synthesized_native_stream_error_chunk(
+            {
+                "model": "deepseek-v4.1-flash",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
+            exception,
+        )
+        self.assertEqual("invalid_request_error", chunk["error"]["type"])
+        self.assertEqual("upstream_account_restricted", chunk["error"]["code"])
+        self.assertIn("account", chunk["error"]["message"].lower())
+        self.assertIn("deepseek-v4.1-flash", chunk["error"]["message"])
+        self.assertNotIn("retry", chunk["error"]["message"].lower())

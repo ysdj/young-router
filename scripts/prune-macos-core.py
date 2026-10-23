@@ -84,7 +84,7 @@ def deduplicate_node_assets(adapters: Path) -> tuple[int, int]:
     """
 
     candidates: list[Path] = []
-    for package in ("pi-web-access", "workbuddy-connect", "dsh-vision-router"):
+    for package in ("connect-workbuddy", "dsh-vision-router"):
         dependency_root = adapters / package / "node_modules"
         if dependency_root.is_dir():
             candidates.extend(
@@ -122,19 +122,11 @@ def deduplicate_node_assets(adapters: Path) -> tuple[int, int]:
 
 def prune_core(core: Path) -> None:
     adapters = core / "young_router" / "adapters"
-    for package in ("pi-web-access", "workbuddy-connect", "dsh-vision-router"):
+    for package in ("connect-workbuddy", "dsh-vision-router"):
         prune_tree(adapters / package, node=True)
 
-    # The worker loads pi-web-access' TypeScript entry directly. Its generated
-    # MCP CLI bundle is a separate npm executable, and the Pi SDK's optional
-    # codemode/image helpers are not reached by this worker.
-    shutil.rmtree(adapters / "pi-web-access" / "dist", ignore_errors=True)
-    for package in ("esbuild", "quickjs-wasi", "temml", "@silvia-odwyer/photon-node"):
-        shutil.rmtree(adapters / "pi-web-access" / "node_modules" / package, ignore_errors=True)
-    shutil.rmtree(adapters / "pi-web-access" / "node_modules" / "@esbuild", ignore_errors=True)
     for node_modules in (
-        adapters / "pi-web-access" / "node_modules",
-        adapters / "workbuddy-connect" / "node_modules",
+        adapters / "connect-workbuddy" / "node_modules",
         adapters / "dsh-vision-router" / "node_modules",
     ):
         # Package-manager bookkeeping is useful only while staging; Node's
@@ -142,10 +134,6 @@ def prune_core(core: Path) -> None:
         for name in (".modules.yaml", ".package-map.json", ".pnpm-workspace-state-v1.json"):
             (node_modules / name).unlink(missing_ok=True)
 
-    # These two assets demonstrate the extension on its npm page; the worker
-    # loads index.ts and its resources, never the promotional image or video.
-    for name in ("banner.png", "pi-web-fetch-demo.mp4"):
-        (adapters / "pi-web-access" / name).unlink(missing_ok=True)
     linked_files, saved_bytes = deduplicate_node_assets(adapters)
     if linked_files:
         print(

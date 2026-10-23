@@ -1,5 +1,5 @@
 """Adapters and worker scripts for the third-party integrations this app
-bundles (pi-web-access, Veridrop, WorkBuddy, Our Free Model, dsh-vision-router).
+bundles (Veridrop, WorkBuddy, Our Free Model, dsh-vision-router).
 
 A staged worker that serves a model endpoint publishes the base URL it is
 reachable at as an ``os.environ/`` *reference*, never as a literal URL: the
@@ -102,8 +102,8 @@ def managed_base_urls() -> tuple[str, ...]:
 def rate_provider_id(auth_kind: str) -> str:
     """The catalog id one rate-publishing account kind is read through.
 
-    The worker's own document addresses its variants by id (``workbuddy``,
-    ``workbuddy-ai``), which is not the same string as the auth kind the
+    The worker's own document addresses its regions by id (``workbuddy``,
+    ``workbuddy-global``), which is not the same string as the auth kind the
     configuration stores.  The adapter that owns that protocol states the
     mapping, so a caller asks for it instead of naming the product.
     """

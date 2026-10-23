@@ -7,7 +7,6 @@ from . import responses_request as _responses_request_module
 from . import request_context as _request_context_module
 from . import responses_execution as _responses_execution_module
 from . import responses_surfaces as _responses_surfaces_module
-from . import responses_web_search_bridge as _responses_web_search_bridge_module
 from . import routing as _routing_module
 from . import streaming as _streaming_module
 from . import tools as _tools_module
@@ -49,10 +48,6 @@ from .base import (
     _UPSTREAM_URL_SURFACE_KEY,
     _UPSTREAM_URL_SURFACE_OPENAI_CHAT,
     _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES,
-    _WEB_SEARCH_EXTERNAL_BRIDGE_KEY,
-    _WEB_SEARCH_EXTERNAL_BRIDGE_STREAM_KEY,
-    _WEB_SEARCH_EXTERNAL_STARTED_METADATA_KEY,
-    _WEB_SEARCH_EXTERNAL_SUPPRESS_POST_CALL_KEY,
     _XHIGH_REASONING_COMPAT_RETRY_METADATA_KEY,
     datetime,
     json,
@@ -774,9 +769,6 @@ def _trace_tools_summary(request_kwargs: Optional[dict]) -> dict[str, Any]:
         "has_web_search_tool": _tools_module._request_has_web_search_tool(
             effective_request
         ),
-        "has_pi_web_access_tool": _tools_module._request_has_pi_web_access_tool(
-            effective_request
-        ),
         "has_image_generation_tool": _tools_module._request_has_image_generation_tool(
             effective_request
         ),
@@ -797,10 +789,6 @@ def _trace_metadata_flags(request_kwargs: Optional[dict]) -> dict[str, Any]:
         _STREAM_ERROR_FALLBACK_METADATA_KEY,
         _STREAM_IDLE_TIMEOUT_METADATA_KEY,
         _STREAM_START_TIMEOUT_METADATA_KEY,
-        _WEB_SEARCH_EXTERNAL_BRIDGE_KEY,
-        _WEB_SEARCH_EXTERNAL_BRIDGE_STREAM_KEY,
-        _WEB_SEARCH_EXTERNAL_STARTED_METADATA_KEY,
-        _WEB_SEARCH_EXTERNAL_SUPPRESS_POST_CALL_KEY,
         _XHIGH_REASONING_COMPAT_RETRY_METADATA_KEY,
         "codex_descendant_cleanup",
         "codex_compaction_optimized",
@@ -1080,9 +1068,6 @@ def _trace_tool_call_summary(
             add({"type": "function_call", **item["function_call"]})
 
     visit(payload)
-    if request_kwargs is not None:
-        for call in _responses_web_search_bridge_module._web_search_function_calls(response):
-            add(call)
 
     types: list[str] = []
     names: list[str] = []
@@ -1106,14 +1091,9 @@ def _trace_response_summary(
     response: Any,
     request_kwargs: Optional[dict] = None,
 ) -> dict[str, Any]:
-    summary = {
+    return {
         "tool_calls": _trace_tool_call_summary(response, request_kwargs),
     }
-    if request_kwargs is not None:
-        actions = _responses_web_search_bridge_module._web_search_actions_for_request(response, request_kwargs)
-        if actions:
-            summary["web_search_actions"] = actions
-    return summary
 
 
 _UNSET = object()

@@ -405,6 +405,262 @@ class HookRouteRecoveryTests(HookTestCase):
         self.assertTrue(hooks._is_route_recovery_stream_response(response))
         self.assertFalse(hooks._is_failed_responses_stream_response(response))
 
+    async def test_generic_helper_advances_past_a_route_refusing_its_own_account(
+        self,
+    ) -> None:
+        """The turn moves to a healthy peer instead of ending on the refusal.
+
+        Reproduces the observed shape: the deployment selected first answers
+        HTTP 400 `账号存在异常行为，已被限制使用` ("abnormal account behavior,
+        use restricted").  Classified as the request's own verdict, that answer
+        ended the turn while a sibling deployment of the same group answered
+        the same bytes, and every client retry selected the dead route first
+        again.  As a route-level refusal it excludes that deployment and
+        advances to the peer in the same request.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        self.set_env(hooks._SAME_DEPLOYMENT_RETRIES_ENV, "0")
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "60")
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        self.set_env(
+            hooks._DEPLOYMENT_COOLDOWN_FILE_ENV,
+            str(Path(temp_dir.name) / "deployment-cooldowns.json"),
+        )
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+
+        deployments = [
+            {
+                "litellm_params": {"order": 0},
+                "model_info": {
+                    "id": "restricted-primary",
+                    "route_key": "model=logical-chat / provider=primary / upstream=openai/primary-chat / order=0",
+                },
+            },
+            {
+                "litellm_params": {"order": 1},
+                "model_info": {
+                    "id": "healthy-peer",
+                    "route_key": "model=logical-chat / provider=peer / upstream=openai/peer-chat / order=1",
+                },
+            },
+        ]
+
+        router_module = types.ModuleType("litellm.router")
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return deployments if model_name == "logical-chat" else []
+
+            async def _ageneric_api_call_with_fallbacks_helper(
+                self,
+                model,
+                original_generic_function,
+                **kwargs,
+            ):
+                return await original_generic_function(**kwargs)
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_generic_deployment_failover_patch()
+
+        class AccountRestrictedError(Exception):
+            status_code = 400
+
+        calls = []
+
+        async def healthy_peer_stream():
+            yield {"type": "response.output_text.delta", "delta": "healthy peer"}
+            yield {"type": "response.completed", "response": {"id": "resp-healthy-peer"}}
+
+        async def original_generic_function(**kwargs):
+            calls.append(
+                {
+                    "target_order": kwargs.get("_target_order"),
+                    "excluded": kwargs.get("_excluded_deployment_ids"),
+                    "api_key": kwargs.get("api_key"),
+                    "api_base": kwargs.get("api_base"),
+                }
+            )
+            if kwargs.get("_target_order") == 1:
+                return healthy_peer_stream()
+            raise AccountRestrictedError(
+                "litellm.BadRequestError: OpenAIException - workbuddy upstream "
+                "client: 账号存在异常行为，已被限制使用 {'message': 'workbuddy "
+                "upstream client: 账号存在异常行为，已被限制使用', 'type': "
+                "'client', 'code': 'client'}"
+            )
+
+        response = await Router()._ageneric_api_call_with_fallbacks_helper(
+            "logical-chat",
+            original_generic_function,
+            input=[{"role": "user", "content": "Continue."}],
+            stream=True,
+            # The failed deployment's request-scoped credential, the way LiteLLM
+            # leaves it on the kwargs a fallback receives.
+            api_key="local-worker-token",
+            model_info={
+                "id": "restricted-primary",
+                "order": 0,
+                "route_key": "model=logical-chat / provider=primary / upstream=openai/primary-chat / order=0",
+            },
+        )
+
+        self.assertFalse(hooks._is_failed_responses_stream_response(response))
+        self.assertEqual(len(calls), 2)
+        self.assertIsNone(calls[0]["target_order"])
+        self.assertEqual(calls[1]["target_order"], 1)
+        self.assertEqual(calls[1]["excluded"], ["restricted-primary"])
+        # The peer authenticates with its own configured key: the failed route's
+        # request-scoped api_key must not travel to it.  Observed live as three
+        # unrelated stations answering 401 to the local worker's token while
+        # their own keys were valid.
+        self.assertEqual(calls[0]["api_key"], "local-worker-token")
+        self.assertIsNone(calls[1]["api_key"])
+        chunks = [chunk async for chunk in response]
+        self.assertIn(
+            {"type": "response.output_text.delta", "delta": "healthy peer"},
+            chunks,
+        )
+        self.assertEqual(chunks[-1]["response"]["id"], "resp-healthy-peer")
+
+    def test_a_fallback_hop_drops_the_failed_route_credential(self) -> None:
+        """Only the next deployment's own params may authenticate it.
+
+        LiteLLM pins a top-level ``api_key`` on every deployment it selects
+        afterwards, so a fallback that still carries the failed route's value
+        authenticates the next station with the previous one's key.  Observed
+        live: the local worker's token reached three unrelated stations, each
+        answered 401, and the turn ended on "upstream auth or balance" while
+        every configured key was valid.  The surface api_base is not a
+        credential and stays with the handoff.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        carried = {
+            "api_key": "local-worker-token",
+            "api_base": "http://127.0.0.1:50041/workbuddy/v1",
+            "input": [{"role": "user", "content": "Continue."}],
+            "model": "logical-chat",
+        }
+
+        released = hooks._next_deployment_kwargs(carried)
+
+        self.assertNotIn("api_key", released)
+        self.assertEqual(released["api_base"], carried["api_base"])
+        self.assertEqual(released["input"], carried["input"])
+        self.assertEqual(released["model"], carried["model"])
+        # The caller's dict is not mutated; the failed attempt may still need it.
+        self.assertEqual(carried["api_key"], "local-worker-token")
+
+    async def test_generic_helper_advances_past_a_route_refusing_the_tool_history(
+        self,
+    ) -> None:
+        """A route's own history check must not end the turn for its peers.
+
+        The first deployment answers HTTP 400 `工具记录不完整，请新建任务`
+        ("tool records incomplete, create a new task") because the replayed
+        conversation was cut between a tool call and its output.  That verdict
+        belongs to this route's tolerance of the replay, so the request moves to
+        the peer instead of ending on the first refusal.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        self.set_env(hooks._SAME_DEPLOYMENT_RETRIES_ENV, "0")
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "60")
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        self.set_env(
+            hooks._DEPLOYMENT_COOLDOWN_FILE_ENV,
+            str(Path(temp_dir.name) / "deployment-cooldowns.json"),
+        )
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+
+        deployments = [
+            {
+                "litellm_params": {"order": 0},
+                "model_info": {
+                    "id": "strict-primary",
+                    "route_key": "model=logical-chat / provider=strict / upstream=openai/strict-chat / order=0",
+                },
+            },
+            {
+                "litellm_params": {"order": 1},
+                "model_info": {
+                    "id": "tolerant-peer",
+                    "route_key": "model=logical-chat / provider=peer / upstream=openai/peer-chat / order=1",
+                },
+            },
+        ]
+
+        router_module = types.ModuleType("litellm.router")
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return deployments if model_name == "logical-chat" else []
+
+            async def _ageneric_api_call_with_fallbacks_helper(
+                self,
+                model,
+                original_generic_function,
+                **kwargs,
+            ):
+                return await original_generic_function(**kwargs)
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_generic_deployment_failover_patch()
+
+        class StrictHistoryError(Exception):
+            status_code = 400
+
+        calls = []
+
+        async def tolerant_peer_stream():
+            yield {"type": "response.output_text.delta", "delta": "peer answered"}
+            yield {"type": "response.completed", "response": {"id": "resp-peer-history"}}
+
+        async def original_generic_function(**kwargs):
+            calls.append(kwargs.get("_target_order"))
+            if kwargs.get("_target_order") == 1:
+                return tolerant_peer_stream()
+            raise StrictHistoryError(
+                "litellm.BadRequestError: OpenAIException - workbuddy upstream "
+                "client (http 400): 工具记录不完整，请新建任务 {'message': "
+                "'workbuddy upstream client (http 400): 工具记录不完整，请新建任务'}"
+            )
+
+        response = await Router()._ageneric_api_call_with_fallbacks_helper(
+            "logical-chat",
+            original_generic_function,
+            input=[{"role": "user", "content": "Continue."}],
+            stream=True,
+            model_info={
+                "id": "strict-primary",
+                "order": 0,
+                "route_key": "model=logical-chat / provider=strict / upstream=openai/strict-chat / order=0",
+            },
+        )
+
+        self.assertFalse(hooks._is_failed_responses_stream_response(response))
+        self.assertEqual(calls, [None, 1])
+        chunks = [chunk async for chunk in response]
+        self.assertIn(
+            {"type": "response.output_text.delta", "delta": "peer answered"},
+            chunks,
+        )
+        self.assertEqual(chunks[-1]["response"]["id"], "resp-peer-history")
+        # The route is not parked: it refused this replay, it is not broken.
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(
+                StrictHistoryError("工具记录不完整，请新建任务")
+            ),
+            "recovery",
+        )
+
     def test_route_recovery_does_not_poll_on_context_size_error(self) -> None:
         hooks, _proxy_server = load_hook_module()
 
@@ -2099,182 +2355,6 @@ class HookRouteRecoveryTests(HookTestCase):
         self.assertLess(elapsed, 0.25)
         assert_upstream_route_failed_terminal(self, chunks)
 
-    async def test_route_recovery_does_not_replay_original_web_search_after_search_started(self) -> None:
-        hooks, proxy_server = load_hook_module()
-        calls = []
-        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "60")
-        self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
-
-        class GatewayTimeout(Exception):
-            status_code = 504
-
-        class FakeRouter:
-            def _get_all_deployments(self, model_name, team_id=None):
-                return []
-
-            async def aresponses(self, **payload):
-                calls.append(payload)
-                raise AssertionError("original web_search request must not be replayed")
-
-        proxy_server.llm_router = FakeRouter()
-        request_data = {
-            "model": "legacy-chat",
-            "input": "Use web_search for Sample City weather.",
-            "stream": True,
-            "tools": [{"type": "web_search"}],
-            "metadata": {"request_id": "web-search-started-no-replay"},
-            "model_info": {"id": "chatroute", "order": 1},
-        }
-        hooks._mark_external_web_search_started_for_request(request_data)
-        first_exception = GatewayTimeout("upstream timeout after web_search")
-
-        chunks = [
-            chunk
-            async for chunk in hooks._stream_route_recovery_poll(
-                request_data,
-                first_exception,
-            )
-        ]
-
-        self.assertEqual(calls, [])
-        assert_external_web_search_missing_answer_failed(self, chunks)
-
-    async def test_route_recovery_stops_replaying_original_web_search_after_attempt_starts_search(self) -> None:
-        hooks, _proxy_server = load_hook_module()
-        streaming_module = importlib.import_module("young_router.proxy.streaming")
-        original_attempt = streaming_module._stream_route_recovery_poll_attempt
-        attempts = []
-        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "1")
-        self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
-
-        class GatewayTimeout(Exception):
-            status_code = 504
-
-        async def fake_attempt(request_data, exception, *, attempt, deadline=None):
-            attempts.append(attempt)
-            if attempt == 1:
-                hooks._mark_external_web_search_started_for_request(request_data)
-                raise GatewayTimeout("synthesis timed out after search")
-            raise AssertionError("original web_search request must not be replayed")
-            yield None
-
-        streaming_module._stream_route_recovery_poll_attempt = fake_attempt
-        self.addCleanup(
-            setattr,
-            streaming_module,
-            "_stream_route_recovery_poll_attempt",
-            original_attempt,
-        )
-
-        request_data = {
-            "model": "legacy-chat",
-            "input": "Use web_search for Sample City weather.",
-            "stream": True,
-            "tools": [{"type": "web_search"}],
-            "metadata": {"request_id": "web-search-started-during-poll"},
-            "model_info": {"id": "chatroute", "order": 1},
-        }
-        first_exception = GatewayTimeout("upstream timeout before first chunk")
-
-        chunks = [
-            chunk
-            async for chunk in hooks._stream_route_recovery_poll(
-                request_data,
-                first_exception,
-            )
-        ]
-
-        self.assertEqual(attempts, [1])
-        assert_upstream_route_failed_terminal(self, chunks)
-
-    async def test_route_recovery_continues_with_web_search_recovery_payload_after_attempt_timeout(self) -> None:
-        hooks, _proxy_server = load_hook_module()
-        streaming_module = importlib.import_module("young_router.proxy.streaming")
-        original_attempt = streaming_module._stream_route_recovery_poll_attempt
-        attempts = []
-        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "1")
-        self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
-
-        class GatewayTimeout(Exception):
-            status_code = 504
-
-        recovery_request = {
-            "model": "legacy-chat",
-            "input": (
-                "Original user request. Any instruction to call or use web_search "
-                "has already been satisfied by the compatibility bridge:\n"
-                "Use web_search for sample subject transporters.\n\n"
-                "Retrieved evidence:\n"
-                "Web search results for query: sample subject factor A factor B\n"
-                "Title: Example Source\nURL: https://example.test/source-one"
-            ),
-            "stream": True,
-            "litellm_metadata": {
-                "external_web_search_synthesis": True,
-                "external_web_search_search_results": (
-                    "Web search results for query: sample subject factor A factor B\n"
-                    "Title: Example Source\nURL: https://example.test/source-one"
-                ),
-            },
-            "metadata": {"request_id": "web-search-synthesis-retry"},
-            "model_info": {"id": "chatroute", "order": 1},
-        }
-
-        async def fake_attempt(request_data, exception, *, attempt, deadline=None):
-            attempts.append(copy.deepcopy(request_data))
-            if attempt == 1:
-                hooks._mark_external_web_search_started_for_request(request_data)
-                exc = GatewayTimeout("synthesis timed out after search")
-                hooks._external_web_search_set_recovery_request(exc, recovery_request)
-                raise exc
-            self.assertTrue(
-                request_data["litellm_metadata"]["external_web_search_synthesis"]
-            )
-            self.assertNotIn("tools", request_data)
-            yield {"type": "response.output_text.delta", "delta": "recovered synthesis answer"}
-            yield {"type": "response.completed", "response": {"id": "resp-web-synthesis-recovered"}}
-
-        streaming_module._stream_route_recovery_poll_attempt = fake_attempt
-        self.addCleanup(
-            setattr,
-            streaming_module,
-            "_stream_route_recovery_poll_attempt",
-            original_attempt,
-        )
-
-        request_data = {
-            "model": "legacy-chat",
-            "input": "Use web_search for sample subject transporters.",
-            "stream": True,
-            "tools": [{"type": "web_search"}],
-            "metadata": {"request_id": "web-search-original-started"},
-            "model_info": {"id": "chatroute", "order": 1},
-        }
-        first_exception = GatewayTimeout("upstream timeout before first chunk")
-
-        chunks = [
-            chunk
-            async for chunk in hooks._stream_route_recovery_poll(
-                request_data,
-                first_exception,
-            )
-        ]
-
-        self.assertEqual(len(attempts), 2)
-        self.assertIn("tools", attempts[0])
-        self.assertTrue(
-            attempts[1]["litellm_metadata"]["external_web_search_synthesis"]
-        )
-        self.assertNotIn("tools", attempts[1])
-        self.assertIn(
-            {"type": "response.output_text.delta", "delta": "recovered synthesis answer"},
-            chunks,
-        )
-        self.assertIn(
-            {"type": "response.completed", "response": {"id": "resp-web-synthesis-recovered"}},
-            chunks,
-        )
-
     async def test_route_recovery_stream_response_uses_poll(self) -> None:
         hooks, proxy_server = load_hook_module()
         calls = []
@@ -3217,42 +3297,17 @@ class RouteRecoveryKeepaliveWaitTests(HookTestCase):
     Every recovery wait in this pipeline is written as
     ``while True: try: await wait_for(shield(task), timeout=T)
     except asyncio.TimeoutError: <keepalive>; continue``.  ``asyncio.TimeoutError``
-    is ``TimeoutError`` on the supported runtimes, and the bridged sub-calls and
-    socket reads raise exactly that class on their own per-io timeout.  A task
-    that has already failed that way therefore keeps raising the very exception
-    the loop reads as "still silent", so an unguarded loop re-awaits a settled
-    task without ever suspending and pins a core until the client goes away.
+    is ``TimeoutError`` on the supported runtimes, and the recovery reads raise
+    exactly that class on their own per-io timeout.  A task that has already
+    failed that way therefore keeps raising the very exception the loop reads as
+    "still silent", so an unguarded loop re-awaits a settled task without ever
+    suspending and pins a core until the client goes away.
 
     That is idle energy the battery panel attributes to this app, and it is
     invisible to every behavioural assertion: the stream still produces its
     keepalives, it just burns the machine to do it.  These tests pin the
     contract that keeps the wait loop from collapsing into a spin.
     """
-
-    def _source(self, hooks, name: str) -> str:
-        import inspect
-
-        owner = hooks._owners.get(name)
-        return inspect.getsource(getattr(owner, name))
-
-    def test_the_evidence_wait_consumes_a_settled_task(self) -> None:
-        hooks, _proxy_server = load_hook_module()
-        source = self._source(hooks, "_yield_guarded_original_stream")
-
-        self.assertIn("evidence_task = asyncio.create_task(", source)
-        self.assertIn("if evidence_task.done():", source)
-        self.assertIn("evidence_task.result()", source)
-
-        # The done-check has to sit inside the keepalive handler as well: a read
-        # that settles exactly at the boundary is otherwise read as silence and
-        # the next pass re-awaits it.
-        handler_start = source.index("except asyncio.TimeoutError:")
-        handler = source[handler_start : handler_start + 400]
-        self.assertIn(
-            "evidence_task.done()",
-            handler,
-            "the keepalive handler must not treat a finished evidence read as silence",
-        )
 
     async def test_a_settled_task_is_never_re_awaited_across_the_pipeline(self) -> None:
         """No recovery wait may loop on a task that is already done."""
@@ -3263,8 +3318,8 @@ class RouteRecoveryKeepaliveWaitTests(HookTestCase):
 
         offenders: list[str] = []
         for name in (
-            "_yield_guarded_original_stream",
-            "_yield_downstream_keepalive_stream",
+            "_stream_route_recovery_poll_attempt",
+            "_stream_native_route_recovery_poll_attempt",
         ):
             owner = hooks._owners.get(name)
             if owner is None:
@@ -3273,7 +3328,7 @@ class RouteRecoveryKeepaliveWaitTests(HookTestCase):
             for match in re.finditer(r"asyncio\.wait_for\(\s*asyncio\.shield\((\w+)\)", source):
                 task_name = match.group(1)
                 # The handler that follows this wait must test the same task.
-                window = source[match.end() : match.end() + 600]
+                window = source[match.end() : match.end() + 2000]
                 self.assertIn(
                     f"{task_name}.done()",
                     window,

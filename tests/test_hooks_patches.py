@@ -752,6 +752,68 @@ class HookPatchTests(HookTestCase):
         self.assertIs(response, failed)
         self.assertEqual(len(calls), 1)
 
+    async def test_a_buffered_responses_answer_leaves_as_a_stream(self) -> None:
+        """A streaming client may never receive a buffered Responses object.
+
+        Observed on a web-search turn whose round ended on the client's own tool
+        call: the bridge answered with the buffered Responses object, LiteLLM's
+        post-call wrapper called ``__aiter__`` on it and raised ``'dict' object
+        has no attribute '__aiter__'``.  The client saw a broken stream and
+        re-sent the identical turn, so the thread looked stuck.  The route call
+        must hand LiteLLM an async iterator whenever the client asked for one.
+        """
+
+        hooks, _ = load_hook_module()
+        router_module = types.ModuleType("litellm.router")
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return []
+
+            async def _ageneric_api_call_with_fallbacks_helper(
+                self,
+                model,
+                original_generic_function,
+                **kwargs,
+            ):
+                return await original_generic_function(**kwargs)
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_generic_deployment_failover_patch()
+
+        async def original_generic_function(**_kwargs):
+            return {
+                "id": "resp_buffered_answer",
+                "object": "response",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "function_call",
+                        "name": "shell",
+                        "call_id": "call_buffered",
+                        "arguments": '{"cmd":"ls"}',
+                    }
+                ],
+            }
+
+        response = await Router()._ageneric_api_call_with_fallbacks_helper(
+            "logical-chat",
+            original_generic_function,
+            call_type="aresponses",
+            input=[{"role": "user", "content": "hi"}],
+            stream=True,
+        )
+
+        self.assertTrue(
+            hooks._response_is_async_iterable(response),
+            "a streaming request may only leave as an async iterator",
+        )
+        chunks = [chunk async for chunk in response]
+        dumped = json.dumps(chunks, default=str)
+        self.assertIn("call_buffered", dumped)
+        self.assertIn("response.completed", dumped)
+
     async def test_generic_helper_retries_invalid_parameter_combination_on_configured_protocol(self) -> None:
         hooks, _ = load_hook_module()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")

@@ -720,7 +720,7 @@ class ModelCatalogTests(unittest.TestCase):
         self.assertTrue(model["supports_search_tool"])
         self.assertEqual("text_and_image", model["web_search_tool_type"])
 
-    def test_non_gpt_route_drops_inherited_search_tool_advertisement(self) -> None:
+    def test_non_gpt_route_advertises_the_gateway_search_bridge(self) -> None:
         native_profile = {
             "slug": "gpt-5.6-sol",
             "base_instructions": "Native prompt",
@@ -744,10 +744,10 @@ class ModelCatalogTests(unittest.TestCase):
             ):
                 model = catalog_payload(["kimi-k3"], registry=registry)["models"][0]
 
-        self.assertFalse(model["supports_search_tool"])
-        self.assertNotIn("web_search_tool_type", model)
+        self.assertTrue(model["supports_search_tool"])
+        self.assertEqual("text_and_image", model["web_search_tool_type"])
 
-    def test_explicit_false_search_capability_wins_on_gpt_family_route(self) -> None:
+    def test_explicit_false_native_capability_keeps_the_gateway_search_bridge(self) -> None:
         native_profile = {
             "slug": "gpt-5.6-sol",
             "base_instructions": "Native prompt",
@@ -791,6 +791,38 @@ class ModelCatalogTests(unittest.TestCase):
                 return_value=[native_profile],
             ):
                 model = catalog_payload(["gpt-5-test"], registry=registry)["models"][0]
+
+        self.assertTrue(model["supports_search_tool"])
+        self.assertEqual("text_and_image", model["web_search_tool_type"])
+
+    def test_route_without_function_tools_does_not_advertise_search(self) -> None:
+        native_profile = {
+            "slug": "gpt-5.6-sol",
+            "base_instructions": "Native prompt",
+            "model_messages": {"instructions_template": "Native prompt"},
+            "supports_search_tool": True,
+            "web_search_tool_type": "text_and_image",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory) / "config.yaml"
+            runtime.write_text(
+                "model_list:\n"
+                "  - model_name: no-search\n"
+                "    litellm_params:\n"
+                "      model: anthropic/no-search\n"
+                "    model_info:\n"
+                "      supports_responses_function_tools: false\n",
+                encoding="utf-8",
+            )
+            registry = ModelContextRegistry(
+                runtime_config_path=runtime,
+                refresh_enabled=False,
+            )
+            with mock.patch(
+                "young_router.core.model_catalog.load_native_catalog",
+                return_value=[native_profile],
+            ):
+                model = catalog_payload(["no-search"], registry=registry)["models"][0]
 
         self.assertFalse(model["supports_search_tool"])
         self.assertNotIn("web_search_tool_type", model)

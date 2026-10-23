@@ -47,6 +47,81 @@ def _assert_unique_deployment_ids(entries: list[dict[str, Any]]) -> None:
         seen[deployment_id] = index
 
 
+def _router_settings_restated(
+    original_data: object,
+    *,
+    active_entries: list[dict[str, Any]],
+    served: list[str],
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Restate ``router_settings`` against the groups this document now serves.
+
+    A public model is a group name several routes share, so renaming one writes
+    the new ``model_name`` on every route and leaves ``router_settings`` naming the
+    old group.  LiteLLM reads those tables per request, so the leftover name is
+    not a stale comment: it is a hop whose group has no deployments, which fails
+    the turn and wraps the original upstream failure into a 500 that reports only
+    ``Fallback to <gone> also failed``.
+
+    The routes identify a renamed group on their own: a deployment id survives a
+    rename, so a group whose ids now carry a different name *is* that group under
+    its new name.  Ids are only matched one-to-one, because a group assembled by
+    hand from an existing route's ids is not a rename of it.
+
+    Returns the restated ``router_settings`` map -- or ``None`` when no group
+    reference moved, so a save that renames nothing leaves the section's own
+    spelling, anchors, and comments exactly as they were -- and the group names
+    whose reference was dropped because no route serves them any more.
+    """
+
+    from .dump import _group_references_restated
+
+    root = _as_dict(original_data)
+    settings = _as_dict(root.get("router_settings"))
+    if not settings:
+        return None, []
+    previous_by_id: dict[str, str] = {}
+    for entry in _as_list(root.get("model_list")):
+        item = _as_dict(entry)
+        deployment_id = _string_value(_as_dict(item.get("model_info")).get("id")).strip()
+        name = _string_value(item.get("model_name")).strip()
+        if deployment_id and name:
+            previous_by_id[deployment_id] = name
+    current_by_id: dict[str, str] = {}
+    for entry in active_entries:
+        item = _as_dict(entry)
+        deployment_id = _string_value(_as_dict(item.get("model_info")).get("id")).strip()
+        name = _string_value(item.get("model_name")).strip()
+        if deployment_id and name:
+            current_by_id[deployment_id] = name
+    # One old name is a rename only when every route it had still exists under
+    # one other name; a group that lost or gained a route was edited, not renamed.
+    previous_ids_by_name: dict[str, set[str]] = {}
+    for deployment_id, name in previous_by_id.items():
+        previous_ids_by_name.setdefault(name, set()).add(deployment_id)
+    current_ids_by_name: dict[str, set[str]] = {}
+    for deployment_id, name in current_by_id.items():
+        current_ids_by_name.setdefault(name, set()).add(deployment_id)
+    renames: dict[str, str] = {}
+    for old_name, ids in previous_ids_by_name.items():
+        if old_name in current_ids_by_name:
+            continue
+        candidates = [
+            new_name
+            for new_name, new_ids in current_ids_by_name.items()
+            if new_ids == ids and new_name not in previous_ids_by_name
+        ]
+        if len(candidates) == 1:
+            renames[old_name] = candidates[0]
+    restated, dropped = _group_references_restated(
+        settings,
+        renames=renames,
+        served={str(name).strip() for name in served if str(name).strip()},
+    )
+    # Leaving ``router_settings`` alone when no reference moved keeps a save that
+    # renames nothing from rewriting a section's anchors and comments.
+    return (restated if restated is not settings else None), dropped
+
+
 def save_config(
     providers: list[dict[str, Any]],
     path: pathlib.Path = CONFIG_YAML,
@@ -60,6 +135,7 @@ def save_config(
         _dump_providers_section,
         _dump_section,
         _entry_from_editor,
+        _group_references_restated,
         _replace_top_level_sections,
         _unique_model_groups,
         _write_atomic,
@@ -113,12 +189,34 @@ def save_config(
     existing_groups = _as_list(_as_dict(original_data.get("litellm_settings")).get("public_model_groups"))
     settings = dict(_as_dict(original_data.get("litellm_settings")))
     settings["public_model_groups"] = _unique_model_groups(active_entries, existing_groups)
+    # A public model is a group name, not a record of its own, so renaming one
+    # rewrites the routes and nothing else.  ``router_settings`` still names the
+    # old group in its fallback and alias tables, and LiteLLM resolves those per
+    # request: a deleted or renamed group is a hop with no deployments, which
+    # fails the turn with ``no healthy deployments`` and wraps the original
+    # upstream failure into a 500 that hides the cause.  Restate those tables
+    # against the groups this document now serves, reading an old name as the one
+    # that replaced it by the routes themselves -- the deployment ids are what
+    # survive a rename, so they identify a renamed group without the caller
+    # having to say what it renamed.
+    groups_renamed, groups_dropped = _router_settings_restated(
+        original_data,
+        active_entries=active_entries,
+        served=settings["public_model_groups"],
+    )
     next_text = _replace_top_level_sections(
         original,
         {
             "providers": _dump_providers_section(providers),
             "model_list": _dump_model_list_section("model_list", active_entries),
             "litellm_settings": _dump_section("litellm_settings", settings),
+            # A document with no ``router_settings`` gains none: the section is
+            # only restated where the file already has one.
+            **(
+                {"router_settings": _dump_section("router_settings", groups_renamed)}
+                if groups_renamed
+                else {}
+            ),
         },
     )
 
@@ -191,6 +289,10 @@ def save_config(
         "disabled_path": str(disabled_path) if disabled_entries else "",
         "disabled_backup": disabled_backup,
         "revision": _config_revision(path),
+        # Group names a removed route no longer serves, whose fallback or alias
+        # reference was dropped from ``router_settings``.  A hop that disappears
+        # says so here rather than only in the file it edited.
+        "dropped_group_references": sorted(set(groups_dropped)),
         "document": {
             CONFIG_DOCUMENT_CONFIG_KEY: next_text.rstrip() + "\n",
             CONFIG_DOCUMENT_DISABLED_KEY: next_disabled_text,

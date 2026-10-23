@@ -442,58 +442,57 @@ command -v pnpm >/dev/null 2>&1 || {
 # workspace themselves: scripts/package-release.sh calls it directly. Install
 # here so a caller only has to have the checkout, and let pnpm itself decide
 # when the store already satisfies the lockfile.
-# Four of the five staged integrations are re-checked against their upstreams on
-# every build, and that re-check is network wait rather than build work.  They
-# start here, before the workspace install and the release resolution below, and
-# always with the same arguments; pi-web-access follows once the build has
-# decided which runtime and Node it is staging against, so the gate that decides
-# those still runs first.  Nothing here is read until the Core is assembled.
-PI_WEB_ACCESS_UPDATE_COMMAND=()
-if [[ -n "${LITELLM_PI_WEB_ACCESS_PYTHON:-}" ]]; then
-  command -v "$LITELLM_PI_WEB_ACCESS_PYTHON" >/dev/null 2>&1 || {
-    echo "Configured LITELLM_PI_WEB_ACCESS_PYTHON was not found." >&2
+# The staged integrations are re-checked against their upstreams on every
+# build, and that re-check is network wait rather than build work.  They start
+# here, before the workspace install and the release resolution below, and
+# always with the same arguments; the Node runtime stages once the build has
+# decided which runtime it is staging against, so the gate that decides that
+# still runs first.  Nothing here is read until the Core is assembled.
+STAGE_PYTHON=()
+if [[ -n "${LITELLM_STAGE_PYTHON:-}" ]]; then
+  command -v "$LITELLM_STAGE_PYTHON" >/dev/null 2>&1 || {
+    echo "Configured LITELLM_STAGE_PYTHON was not found." >&2
     exit 1
   }
-  PI_WEB_ACCESS_UPDATE_COMMAND=("$LITELLM_PI_WEB_ACCESS_PYTHON")
+  STAGE_PYTHON=("$LITELLM_STAGE_PYTHON")
 elif [[ -n "$UV_BIN" && -x "$UV_BIN" ]]; then
-  PI_WEB_ACCESS_UPDATE_COMMAND=("$UV_BIN" run --no-project --python 3.12)
+  STAGE_PYTHON=("$UV_BIN" run --no-project --python 3.12)
 elif command -v python3 >/dev/null 2>&1 \
   && python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)'; then
-  PI_WEB_ACCESS_UPDATE_COMMAND=(python3)
+  STAGE_PYTHON=(python3)
 else
-  echo "Python 3.11+ (or uv) is required to stage pi-web-access for the macOS Core runtime." >&2
+  echo "Python 3.11+ (or uv) is required to stage the bundled integrations for the macOS Core runtime." >&2
   exit 1
 fi
-PI_WEB_ACCESS_PACKAGE_WORK="$STAGING_CACHE/pi-web-access"
-PI_WEB_ACCESS_NODE_WORK="$RUNTIME_WORK/node"
+NODE_RUNTIME_WORK="$RUNTIME_WORK/node"
 mkdir -p "$STAGING_CACHE"
-WORKBUDDY_CONNECT_WORK="$STAGING_CACHE/workbuddy-connect"
+CONNECT_WORKBUDDY_WORK="$STAGING_CACHE/connect-workbuddy"
 VERIDROP_WORK="$STAGING_CACHE/veridrop"
 OUR_FREE_MODEL_WORK="$STAGING_CACHE/our-free-model"
 DSH_VISION_ROUTER_WORK="$STAGING_CACHE/dsh-vision-router"
 # Each job is started in this shell, not inside a command substitution: a
 # substitution runs in a subshell, so a job it launches is not a child of the
 # shell that has to wait for it and its output would corrupt the captured pid.
-"${PI_WEB_ACCESS_UPDATE_COMMAND[@]}" "$PROJECT_ROOT/scripts/update_workbuddy_connect.py" \
-  --output "$WORKBUDDY_CONNECT_WORK" &
+"${STAGE_PYTHON[@]}" "$PROJECT_ROOT/scripts/update_connect_workbuddy.py" \
+  --output "$CONNECT_WORKBUDDY_WORK" &
 STAGING_PIDS+=("$!")
-"${PI_WEB_ACCESS_UPDATE_COMMAND[@]}" "$PROJECT_ROOT/scripts/update_veridrop.py" \
+"${STAGE_PYTHON[@]}" "$PROJECT_ROOT/scripts/update_veridrop.py" \
   --output "$VERIDROP_WORK" &
 STAGING_PIDS+=("$!")
-"${PI_WEB_ACCESS_UPDATE_COMMAND[@]}" "$PROJECT_ROOT/scripts/update_dsh_vision_router.py" \
+"${STAGE_PYTHON[@]}" "$PROJECT_ROOT/scripts/update_dsh_vision_router.py" \
   --output "$DSH_VISION_ROUTER_WORK" &
 STAGING_PIDS+=("$!")
 # Our Free Model is reached through the published third-party package, so it
 # joins the same re-check: every artifact build resolves the current release
 # instead of shipping whichever version was reviewed last.
-# No ``--node-source`` here: that argument is ``pi-web-access``'s, because that
-# integration ships a Node of its own.  The Our Free Model worker is a module
+# No ``--node-source`` here: that argument belongs to the Node runtime stager,
+# because that is what ships a Node of its own.  The Our Free Model worker is a module
 # the Core imports and runs with the runtime it already installs
 # (``Core/runtime/bin/node``), so handing this stager a Node to copy would only
 # add a second 90 MB runtime to the bundle.
 OUR_FREE_MODEL_STAGE_ARGS=("$PROJECT_ROOT/scripts/update_our_free_model.py"
   --output "$OUR_FREE_MODEL_WORK")
-"${PI_WEB_ACCESS_UPDATE_COMMAND[@]}" "${OUR_FREE_MODEL_STAGE_ARGS[@]}" &
+"${STAGE_PYTHON[@]}" "${OUR_FREE_MODEL_STAGE_ARGS[@]}" &
 STAGING_PIDS+=("$!")
 
 pnpm install --frozen-lockfile
@@ -533,13 +532,12 @@ fi
 # it keeps the mandatory upstream re-checks below unchanged — only the Node
 # binary avoids a second trip over the network.  A caller that supplied another
 # runtime, or a build with no installed app, still downloads it.
-#
 # This reads the installed bundle directly rather than following the Python
 # runtime above: the pinned LiteLLM release moves far more often than Node 22,
 # and a version bump would otherwise throw away a Node runtime that is the
-# same bytes.  `pi-web-access`'s own `--node-source` copies whatever executable
-# it is handed, so the version that satisfies the pinned release is checked
-# here, before the argument is built.
+# same bytes.  The stager's `--node-source` copies whatever executable it is
+# handed, so the version that satisfies the pinned release is checked here,
+# before the argument is built.
 NODE_SOURCE_ARGS=()
 NODE_SOURCE_PATH=""
 if [[ -n "$RUNTIME_SOURCE" && -x "$RUNTIME_SOURCE/bin/node" ]]; then
@@ -553,13 +551,12 @@ if [[ -n "$NODE_SOURCE_PATH" ]]; then
 fi
 # `set -u` treats an empty array expansion as unbound on the bash 3.2 that
 # macOS ships, so the argument is added only when it exists.
-PI_WEB_ACCESS_NODE_ARGS=("$PROJECT_ROOT/scripts/update_pi_web_access.py"
-  --output "$PI_WEB_ACCESS_PACKAGE_WORK"
-  --node-output "$PI_WEB_ACCESS_NODE_WORK")
+NODE_RUNTIME_ARGS=("$PROJECT_ROOT/scripts/update_node_runtime.py"
+  --output "$NODE_RUNTIME_WORK")
 if [[ ${#NODE_SOURCE_ARGS[@]} -gt 0 ]]; then
-  PI_WEB_ACCESS_NODE_ARGS+=("${NODE_SOURCE_ARGS[@]}")
+  NODE_RUNTIME_ARGS+=("${NODE_SOURCE_ARGS[@]}")
 fi
-"${PI_WEB_ACCESS_UPDATE_COMMAND[@]}" "${PI_WEB_ACCESS_NODE_ARGS[@]}" &
+"${STAGE_PYTHON[@]}" "${NODE_RUNTIME_ARGS[@]}" &
 STAGING_PIDS+=("$!")
 # The authenticity deep test runs the latest upstream Veridrop, so every
 # artifact build re-checks its default branch instead of packaging a stale
@@ -783,9 +780,8 @@ start_copy() {
   "$@" &
   COPY_PIDS+=("$!")
 }
-start_copy copy_tree "$PI_WEB_ACCESS_PACKAGE_WORK" "$CORE/young_router/adapters/pi-web-access"
 start_copy copy_tree "$VERIDROP_WORK" "$CORE/young_router/adapters/veridrop"
-start_copy copy_tree "$WORKBUDDY_CONNECT_WORK" "$CORE/young_router/adapters/workbuddy-connect"
+start_copy copy_tree "$CONNECT_WORKBUDDY_WORK" "$CORE/young_router/adapters/connect-workbuddy"
 start_copy copy_tree "$DSH_VISION_ROUTER_WORK" "$CORE/young_router/adapters/dsh-vision-router"
 start_copy copy_tree "$OUR_FREE_MODEL_WORK" "$CORE/young_router/adapters/our-free-model"
 
@@ -866,7 +862,7 @@ else
   # release it was not built from.
   start_copy copy_tree "$RUNTIME_CACHE_ENTRY" "$CORE/runtime"
 fi
-start_copy copy_tree "$PI_WEB_ACCESS_NODE_WORK" "$CORE/runtime/bin"
+start_copy copy_tree "$NODE_RUNTIME_WORK" "$CORE/runtime/bin"
 
 COPY_FAILED=0
 for copy_pid in "${COPY_PIDS[@]}"; do
@@ -979,10 +975,6 @@ fi
   echo "Bundled Core launcher is missing." >&2
   exit 5
 }
-[[ -f "$CORE/young_router/adapters/pi-web-access/index.ts" ]] || {
-  echo "The bundled pi-web-access package is missing." >&2
-  exit 5
-}
 [[ -f "$CORE/young_router/adapters/veridrop/src/relay_detector/cli.py" ]] || {
   echo "The bundled Veridrop scan program is missing." >&2
   exit 5
@@ -995,8 +987,8 @@ fi
   echo "The macOS build output does not contain young_router/adapters/workbuddy_stream.mjs." >&2
   exit 5
 }
-[[ -f "$CORE/young_router/adapters/workbuddy-connect/lib/index.js" ]] || {
-  echo "The bundled dsh-workbuddy-connect package is missing." >&2
+[[ -f "$CORE/young_router/adapters/connect-workbuddy/lib/index.js" ]] || {
+  echo "The bundled dsh-connect-workbuddy package is missing." >&2
   exit 5
 }
 [[ -f "$CORE/young_router/adapters/dsh-vision-router/lib/core-primitives.js" ]] || {
@@ -1025,14 +1017,6 @@ fi
 # this group's own output is what a failing build prints.
 WORKER_SMOKE_LOG="$RUNTIME_WORK/worker-smokes.log"
 (
-PI_WEB_ACCESS_SMOKE_CONFIG="$RUNTIME_WORK/pi-web-access-smoke-config"
-if ! printf '' | "$CORE/runtime/bin/node" \
-  "$CORE/young_router/adapters/pi_web_access_worker.mjs" \
-  --entry "$CORE/young_router/adapters/pi-web-access/index.ts" \
-  --config-dir "$PI_WEB_ACCESS_SMOKE_CONFIG"; then
-  echo "The bundled pi-web-access worker could not load its staged SDK." >&2
-  exit 5
-fi
 # The vision fallback is entered only after a model has already rejected the
 # image, so a chain that cannot be built would cost the answer rather than the
 # request. The bundle therefore asks the staged package for its chain once: a
@@ -1049,35 +1033,45 @@ fi
 # request time rather than at build time. The bundle proves the staged package
 # still offers the surface the worker imports.
 #
-# The at-rest key factory is checked here too, and it is the one name upstream
-# does *not* export from its entry point: a variant's store can only open a
-# sealed desktop credential through it, so a release that moves or renames it
-# would otherwise read every signed-in account as 未登录 with
-# `electron-binary-unavailable` -- exactly the failure this check exists to
-# catch. Resolution deliberately mirrors `loadAtRestKeyProviderFactory` in
-# `young_router/adapters/workbuddy_worker.mjs`: the entry point first, then the
-# internal chunks beside it. Keep the two in step.
+# The region names are checked beside those exports because they are what the
+# worker iterates: a release that renamed the list, or dropped one region from
+# it, would silently start serving one gateway and report success. The desktop
+# app probe is checked too, since a build whose probe disappeared could no
+# longer open the app that owns a signed-out account's sign-in.
 if ! "$CORE/runtime/bin/node" --input-type=module -e "
 const entry = process.argv[1]
-Promise.all([import(entry), import('node:fs/promises'), import('node:path'), import('node:url')]).then(async ([library, fs, path, url]) => {
-  const required = ['WorkBuddyCredentialStore', 'WorkBuddyUpstreamClient', 'WorkBuddyCatalog', 'createWorkBuddyShim', 'WORKBUDDY_VARIANTS']
+Promise.all([import(entry)]).then(async ([library]) => {
+  const required = [
+    'WorkBuddyCredentialStore',
+    'WorkBuddyUpstreamClient',
+    'WorkBuddyCatalog',
+    'createWorkBuddyShim',
+    'WORKBUDDY_REGIONS',
+    'WORKBUDDY_PROVIDERS',
+    'WORKBUDDY_PROVIDER_DISPLAY_NAMES',
+    'workbuddyAppExecutableCandidates',
+    'findWorkbuddyAppExecutable',
+  ]
   const missing = required.filter((name) => library[name] === undefined)
-  if (missing.length > 0) { process.stderr.write('missing: ' + missing.join(', ') + '\\n'); process.exit(1) }
-  const isFactory = (value) => typeof value === 'function' && value.name === 'atRestKeyProviderFor'
-  let factory
-  for (const value of Object.values(library)) { if (isFactory(value)) factory = value }
-  const directory = path.resolve(path.dirname(entry))
-  for (const name of (await fs.readdir(directory)).sort()) {
-    if (factory !== undefined) break
-    if (!name.endsWith('.js') || name === path.basename(entry) || name === 'client.js') continue
-    let module
-    try { module = await import(url.pathToFileURL(path.join(directory, name)).href) } catch { continue }
-    for (const value of Object.values(module)) { if (isFactory(value)) factory = value }
+  if (missing.length > 0) { process.stderr.write('missing: ' + missing.join(', ') + '\n'); process.exit(1) }
+  const regions = library.WORKBUDDY_REGIONS
+  if (!Array.isArray(regions) || regions.length !== 2) {
+    process.stderr.write('WORKBUDDY_REGIONS is not the two regions: ' + JSON.stringify(regions) + '\n')
+    process.exit(1)
   }
-  if (factory === undefined) { process.stderr.write('the at-rest key factory (atRestKeyProviderFor) is no longer resolvable from the staged package\\n'); process.exit(1) }
-}).catch((e) => { process.stderr.write(String((e && e.message) || e) + '\\n'); process.exit(1) })
-" "$CORE/young_router/adapters/workbuddy-connect/lib/index.js"; then
-  echo "The bundled dsh-workbuddy-connect package no longer exports the surface the worker uses." >&2
+  for (const region of regions) {
+    if (typeof library.WORKBUDDY_PROVIDERS[region] !== 'string') {
+      process.stderr.write('no provider id for region: ' + region + '\n')
+      process.exit(1)
+    }
+    if (typeof library.WORKBUDDY_PROVIDER_DISPLAY_NAMES[region] !== 'string') {
+      process.stderr.write('no display name for region: ' + region + '\n')
+      process.exit(1)
+    }
+  }
+}).catch((e) => { process.stderr.write(String((e && e.message) || e) + '\n'); process.exit(1) })
+" "$CORE/young_router/adapters/connect-workbuddy/lib/index.js"; then
+  echo "The bundled dsh-connect-workbuddy package no longer exports the surface the worker uses." >&2
   exit 5
 fi
 # The staged program is imported into the Core's own interpreter, so the bundle

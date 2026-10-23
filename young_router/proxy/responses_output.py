@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from . import responses_tools as _responses_tools_module
-from . import responses_web_search_bridge as _responses_web_search_bridge_module
+from . import web_search_native as _web_search_native_module
 from . import routing as _routing_module
 from . import streaming as _streaming_module
 
@@ -228,14 +228,14 @@ def _response_is_async_iterable(response: Any) -> bool:
 
 
 def _responses_tool_search_call_from_function_call(item: Any) -> Any:
-    if _responses_web_search_bridge_module._response_item_get(item, "type") != "function_call":
+    if _web_search_native_module._response_item_get(item, "type") != "function_call":
         return item
-    if _responses_web_search_bridge_module._response_item_get(item, "name") != _TOOL_SEARCH_BRIDGE_FUNCTION_NAME:
+    if _web_search_native_module._response_item_get(item, "name") != _TOOL_SEARCH_BRIDGE_FUNCTION_NAME:
         return item
 
-    call_id = _responses_web_search_bridge_module._response_item_get(item, "call_id") or _responses_web_search_bridge_module._response_item_get(item, "id") or ""
-    item_id = _responses_web_search_bridge_module._response_item_get(item, "id") or call_id
-    status = _responses_web_search_bridge_module._response_item_get(item, "status") or "completed"
+    call_id = _web_search_native_module._response_item_get(item, "call_id") or _web_search_native_module._response_item_get(item, "id") or ""
+    item_id = _web_search_native_module._response_item_get(item, "id") or call_id
+    status = _web_search_native_module._response_item_get(item, "status") or "completed"
     if status not in {"in_progress", "completed", "incomplete"}:
         status = "completed"
 
@@ -243,11 +243,11 @@ def _responses_tool_search_call_from_function_call(item: Any) -> Any:
         "id": str(item_id),
         "type": "tool_search_call",
         "call_id": str(call_id) if call_id is not None else None,
-        "arguments": _responses_web_search_bridge_module._parse_tool_search_arguments(_responses_web_search_bridge_module._response_item_get(item, "arguments")),
+        "arguments": _web_search_native_module._parse_tool_search_arguments(_web_search_native_module._response_item_get(item, "arguments")),
         "execution": "client",
         "status": status,
     }
-    created_by = _responses_web_search_bridge_module._response_item_get(item, "created_by")
+    created_by = _web_search_native_module._response_item_get(item, "created_by")
     if created_by is not None:
         payload["created_by"] = created_by
     return payload
@@ -358,7 +358,7 @@ def _responses_custom_tool_names(
     responses_api_request: Any = None,
 ) -> set[str]:
     names: set[str] = set()
-    request_tools = _responses_web_search_bridge_module._response_item_get(responses_api_request, "tools")
+    request_tools = _web_search_native_module._response_item_get(responses_api_request, "tools")
     names.update(_responses_custom_tool_names_from_tools(request_tools))
     names.update(
         _responses_custom_tool_names_from_tools(
@@ -378,7 +378,7 @@ def _responses_namespace_tool_map(
     responses_api_request: Any = None,
 ) -> dict[str, str]:
     namespace_by_name: dict[str, str] = {}
-    request_tools = _responses_web_search_bridge_module._response_item_get(responses_api_request, "tools")
+    request_tools = _web_search_native_module._response_item_get(responses_api_request, "tools")
     namespace_by_name.update(_responses_namespace_tool_map_from_tools(request_tools))
     namespace_by_name.update(
         _responses_namespace_tool_map_from_tools(
@@ -399,14 +399,14 @@ def _restore_response_function_call_namespace(
 ) -> Any:
     if not namespace_by_name:
         return item
-    if _responses_web_search_bridge_module._response_item_get(item, "type") not in {
+    if _web_search_native_module._response_item_get(item, "type") not in {
         "function_call",
         "custom_tool_call",
     }:
         return item
-    if _responses_web_search_bridge_module._response_item_get(item, "namespace") is not None:
+    if _web_search_native_module._response_item_get(item, "namespace") is not None:
         return item
-    name = _responses_web_search_bridge_module._response_item_get(item, "name")
+    name = _web_search_native_module._response_item_get(item, "name")
     namespace = namespace_by_name.get(name) if isinstance(name, str) else None
     if namespace:
         _response_item_set(item, "namespace", namespace)
@@ -421,9 +421,9 @@ def _restore_response_custom_tool_call(
 ) -> Any:
     if not custom_tool_names:
         return item
-    if _responses_web_search_bridge_module._response_item_get(item, "type") != "function_call":
+    if _web_search_native_module._response_item_get(item, "type") != "function_call":
         return item
-    name = _responses_web_search_bridge_module._response_item_get(item, "name")
+    name = _web_search_native_module._response_item_get(item, "name")
     if not isinstance(name, str) or name not in custom_tool_names:
         return item
 
@@ -572,7 +572,7 @@ class _CustomToolInputDeltaTracker:
 
 def _stream_function_arguments_event_item_id(event: Any) -> Optional[str]:
     for key in ("item_id", "call_id", "id"):
-        value = _responses_web_search_bridge_module._response_item_get(event, key)
+        value = _web_search_native_module._response_item_get(event, key)
         if isinstance(value, str) and value:
             return value
     return None
@@ -596,7 +596,7 @@ def _normalize_custom_tool_input_event(
     custom_tool_item_ids: set[str],
     input_delta_tracker: _CustomToolInputDeltaTracker,
 ) -> Optional[Any]:
-    event_type = _responses_web_search_bridge_module._response_item_get(event, "type")
+    event_type = _web_search_native_module._response_item_get(event, "type")
     if not isinstance(event_type, str) or event_type not in {
         "response.function_call_arguments.delta",
         "response.function_call_arguments.done",
@@ -610,10 +610,10 @@ def _normalize_custom_tool_input_event(
     converted = copy.deepcopy(event)
     if raw_item_id != item_id:
         for key in ("item_id", "id"):
-            if _responses_web_search_bridge_module._response_item_get(converted, key) == raw_item_id:
+            if _web_search_native_module._response_item_get(converted, key) == raw_item_id:
                 _response_event_set(converted, key, item_id)
     if event_type.endswith(".delta"):
-        delta = _responses_web_search_bridge_module._response_item_get(event, "delta")
+        delta = _web_search_native_module._response_item_get(event, "delta")
         if not isinstance(delta, str) or not item_id:
             return None
         input_delta = input_delta_tracker.append_arguments_delta(item_id, delta)
@@ -623,7 +623,7 @@ def _normalize_custom_tool_input_event(
         _response_event_set(converted, "delta", input_delta)
         return converted
 
-    arguments = _responses_web_search_bridge_module._response_item_get(event, "arguments")
+    arguments = _web_search_native_module._response_item_get(event, "arguments")
     if not isinstance(arguments, str) or not item_id:
         return None
     input_text = _custom_tool_input_from_chat_arguments(arguments)
@@ -647,7 +647,7 @@ def _normalize_response_tool_search_output(
     *,
     normalize_exec_input: bool = True,
 ) -> Any:
-    output = _responses_web_search_bridge_module._response_item_get(response, "output")
+    output = _web_search_native_module._response_item_get(response, "output")
     if not isinstance(output, list):
         return response
     for index, item in enumerate(output):
@@ -667,11 +667,11 @@ def _normalize_response_tool_search_output(
 def _responses_output_has_non_message_item(output: Any) -> bool:
     if not isinstance(output, list):
         return False
-    return any(_responses_web_search_bridge_module._response_item_get(item, "type") != "message" for item in output)
+    return any(_web_search_native_module._response_item_get(item, "type") != "message" for item in output)
 
 
 def _strip_empty_message_items_when_structured_output_present(response: Any) -> Any:
-    output = _responses_web_search_bridge_module._response_item_get(response, "output")
+    output = _web_search_native_module._response_item_get(response, "output")
     if not isinstance(output, list) or not _responses_output_has_non_message_item(output):
         return response
 
@@ -679,7 +679,7 @@ def _strip_empty_message_items_when_structured_output_present(response: Any) -> 
     changed = False
     for item in output:
         if (
-            _responses_web_search_bridge_module._response_item_get(item, "type") == "message"
+            _web_search_native_module._response_item_get(item, "type") == "message"
             and not _payload_has_visible_text(item)
         ):
             changed = True
@@ -708,9 +708,9 @@ def _streaming_completion_should_skip_empty_message_events(response: Any) -> boo
 
     message_payload = _streaming_module._jsonable(message)
     return bool(
-        _responses_web_search_bridge_module._response_item_get(message_payload, "tool_calls")
-        or _responses_web_search_bridge_module._response_item_get(message_payload, "function_call")
-        or _responses_web_search_bridge_module._response_item_get(message_payload, "reasoning_content")
+        _web_search_native_module._response_item_get(message_payload, "tool_calls")
+        or _web_search_native_module._response_item_get(message_payload, "function_call")
+        or _web_search_native_module._response_item_get(message_payload, "reasoning_content")
     )
 
 
@@ -722,10 +722,10 @@ def _chat_completion_chunk_has_output_payload(chunk: Any) -> bool:
     marker into an empty message item, which downstream clients render as a
     blank activity row before the actual tool call or answer arrives.
     """
-    choices = _responses_web_search_bridge_module._response_item_get(chunk, "choices")
+    choices = _web_search_native_module._response_item_get(chunk, "choices")
     if not isinstance(choices, (list, tuple)) or not choices:
         return False
-    delta = _responses_web_search_bridge_module._response_item_get(choices[0], "delta")
+    delta = _web_search_native_module._response_item_get(choices[0], "delta")
     if delta is None:
         return False
     for key in (
@@ -736,7 +736,7 @@ def _chat_completion_chunk_has_output_payload(chunk: Any) -> bool:
         "function_call",
         "annotations",
     ):
-        value = _responses_web_search_bridge_module._response_item_get(delta, key)
+        value = _web_search_native_module._response_item_get(delta, key)
         if isinstance(value, str):
             if value:
                 return True
@@ -752,7 +752,7 @@ def _normalize_tool_search_output_item_event(
     *,
     normalize_exec_input: bool = True,
 ) -> Any:
-    item = _responses_web_search_bridge_module._response_item_get(event, "item")
+    item = _web_search_native_module._response_item_get(event, "item")
     converted = _responses_tool_search_call_from_function_call(item)
     converted = _restore_response_custom_tool_call(
         converted,
@@ -799,10 +799,10 @@ def _normalize_response_stream_tool_bridge_chunk(
             custom_tool_names,
             normalize_exec_input=False,
         )
-        item = _responses_web_search_bridge_module._response_item_get(normalized, "item")
+        item = _web_search_native_module._response_item_get(normalized, "item")
         if (
             custom_tool_item_ids is not None
-            and _responses_web_search_bridge_module._response_item_get(item, "type") == "custom_tool_call"
+            and _web_search_native_module._response_item_get(item, "type") == "custom_tool_call"
         ):
             item_id = _streaming_module._stream_output_item_key(item)
             if isinstance(item_id, str) and item_id:
@@ -821,7 +821,7 @@ def _normalize_response_stream_tool_bridge_chunk(
             input_delta_tracker,
         )
 
-    response = _responses_web_search_bridge_module._response_item_get(chunk, "response")
+    response = _web_search_native_module._response_item_get(chunk, "response")
     if response is None:
         return chunk
     _normalize_response_tool_search_output(
@@ -872,9 +872,9 @@ def _append_missing_pending_tool_search_done_events(pending: list[Any]) -> None:
     added: dict[str, tuple[int, dict[str, Any]]] = {}
     done_ids: set[str] = set()
     for event in pending:
-        event_type = _responses_web_search_bridge_module._response_item_get(event, "type")
-        item = _responses_web_search_bridge_module._response_item_get(event, "item")
-        item_type = _responses_web_search_bridge_module._response_item_get(item, "type")
+        event_type = _web_search_native_module._response_item_get(event, "type")
+        item = _web_search_native_module._response_item_get(event, "item")
+        item_type = _web_search_native_module._response_item_get(item, "type")
         item_id = _streaming_module._stream_output_item_key(item)
         if not item_id or item_type != "tool_search_call":
             continue
@@ -883,7 +883,7 @@ def _append_missing_pending_tool_search_done_events(pending: list[Any]) -> None:
             continue
         if event_type != "response.output_item.added":
             continue
-        output_index = _responses_web_search_bridge_module._response_item_get(event, "output_index", len(added) + 1)
+        output_index = _web_search_native_module._response_item_get(event, "output_index", len(added) + 1)
         if not isinstance(output_index, int):
             output_index = len(added) + 1
         json_item = _streaming_module._jsonable(item)
@@ -989,7 +989,7 @@ def _strip_reasoning_wrapper(text: str) -> str:
     # The wrapper was never closed: everything after the opener is the thought
     # summary.  A trailing fragment of the closer is a truncated marker rather
     # than content, so it goes with the opener.
-    trailing = _responses_web_search_bridge_module._raw_tool_call_pending_prefix_len(
+    trailing = _web_search_native_module._raw_tool_call_pending_prefix_len(
         text,
         closer,
     )

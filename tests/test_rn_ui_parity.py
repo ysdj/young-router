@@ -4181,9 +4181,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
     def test_workbuddy_provider_types_borrow_the_desktop_app_sign_in(self) -> None:
         """WorkBuddy keeps its sign-in and its model catalog in its own app."""
         for marker in (
-            'type WizardType = "api" | "openai" | "claude" | "workbuddy" | "workbuddyAI" | "ourFreeModel" | "ourFreeModelKilo" | "ourFreeModelEAC";',
-            'const isWorkBuddyType = providerType === "workbuddy" || providerType === "workbuddyAI";',
-            'const workbuddyAuthKind: ServiceProviderKind = providerType === "workbuddyAI" ? "workbuddy_ai_login" : "workbuddy_login";',
+            'type WizardType = "api" | "openai" | "claude" | "workbuddy" | "workbuddyGlobal" | "ourFreeModel" | "ourFreeModelKilo" | "ourFreeModelEAC";',
+            'const isWorkBuddyType = providerType === "workbuddy" || providerType === "workbuddyGlobal";',
+            'const workbuddyAuthKind: ServiceProviderKind = providerType === "workbuddyGlobal" ? "workbuddy_global_login" : "workbuddy_login";',
             'dispatchWithOutcome("workbuddy_status", { refresh }, "providers_models", true);',
             # The wizard creates only the service entry, and 完成 is what
             # creates it; the account and its models are linked in the
@@ -4202,7 +4202,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # provider's own key slot and the key-driven 获取模型 path.
             'const refreshWorkBuddyAccount = async (): Promise<void> => {',
             'const isOfficialAccount = kind === "openai" || kind === "claude";',
-            'const isWorkBuddyAccount = kind === "workbuddy" || kind === "workbuddyAI";',
+            'const isWorkBuddyAccount = kind === "workbuddy" || kind === "workbuddyGlobal";',
             'const service = providerService(provider);',
             'translate("providers.wizard.providerType")',
             'translate("providers.wizard.baseUrl")',
@@ -4261,7 +4261,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # Both products and both service labels are named for the user.
         for text in (self.en, self.zh):
             self.assertIn('"providers.type.workbuddy": "WorkBuddy"', text)
-            self.assertIn('"providers.type.workbuddyAI": "WorkBuddy AI"', text)
+            self.assertIn('"providers.type.workbuddyGlobal": "WorkBuddy Global"', text)
             self.assertIn('"providers.wizard.workbuddyCredits":', text)
             self.assertIn('"providers.serviceLinks":', text)
         self.assertIn('"providers.wizard.workbuddySignInRequired": "Sign in to the WorkBuddy desktop app first."', self.en)
@@ -4459,7 +4459,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # and the credit helper never invents a zero for a missing record.
         self.assert_ui_not_has('{workbuddyCreditsText(workbuddyAccount, translate) ? <View style={styles.officialStatusRow}>')
         self.assert_ui_not_has('workbuddyCreditsRead')
-        self.assert_ui_has('return typeof total === "number" && Number.isFinite(total) ? String(total) : "";')
+        # A missing record states nothing, and a stated one reads in whole
+        # credits: upstream sums its packages to a float, and printing that
+        # tail claims a precision the balance does not have.
+        self.assert_ui_has('if (typeof total !== "number" || !Number.isFinite(total)) return "";')
+        self.assert_ui_has('const whole = Math.round(total);')
+        self.assert_ui_has('if (whole === 0 && total > 0) return total.toFixed(1);')
+        # Rounding a real balance to "0" would state an empty account.
+        self.assert_ui_has('return String(whole);')
         for text in (self.en, self.zh):
             self.assertIn('"providers.workbuddyCreditUnavailable":', text)
         translation_keys = (ROOT / "rn/packages/shared/src/i18n/types.ts").read_text(encoding="utf-8")
@@ -4542,7 +4549,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '  | "openai_login"\n'
             '  | "claude_login"\n'
             '  | "workbuddy_login"\n'
-            '  | "workbuddy_ai_login"\n'
+            '  | "workbuddy_global_login"\n'
             '  | "our_free_model_login";',
             types,
         )
@@ -5919,7 +5926,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("const isLogin = isLoginProviderKind(kind);", identity)
         # The predicate itself names every login service, the lane included.
         self.assert_ui_has(
-            'return kind === "openai" || kind === "claude" || kind === "workbuddy" || kind === "workbuddyAI" || kind === "ourFreeModel";'
+            'return kind === "openai" || kind === "claude" || kind === "workbuddy" || kind === "workbuddyGlobal" || kind === "ourFreeModel";'
         )
         # ...and the panel refuses Core's own slot itself, so the guarantee does
         # not rest on every caller naming the service correctly.
