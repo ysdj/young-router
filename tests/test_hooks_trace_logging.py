@@ -758,6 +758,51 @@ class HookTraceLoggingTests(HookTestCase):
             "model-not-configured",
         )
 
+    def test_local_gateway_key_rejection_is_not_an_upstream_failure(self) -> None:
+        """LiteLLM's own auth refusal never reaches a route.
+
+        A caller using a stale key reaches this proxy, not a provider: LiteLLM
+        looks the key up as a virtual key, needs the database for that, and
+        answers ``ProxyException(type="no_db_connection", code=400)``.  Read as
+        ``other`` it produced 路由前失败 | 上游异常 in the request log for an
+        upstream that was never contacted -- every ``/v1/models`` probe with an
+        old key became a row blaming the providers.  The type, not the
+        sentence, is what tells this apart from a provider's own database
+        error, which stays a route failure.
+        """
+
+        hooks, _ = load_hook_module()
+
+        class ProxyException(Exception):
+            def __init__(self, message: str, type: str, code: int) -> None:
+                super().__init__(message)
+                self.type = type
+                self.code = str(code)
+
+        rejection = ProxyException("No connected db.", "no_db_connection", 400)
+
+        self.assertTrue(hooks._is_local_gateway_auth_rejection_error(rejection))
+        self.assertEqual(
+            hooks._trace_exception(rejection)["reason"],
+            "local-gateway-auth-rejected",
+        )
+
+        record = hooks._request_log_record(
+            "failure",
+            {"call_type": "/v1/models", "exception": rejection},
+        )
+        self.assertEqual(record["routing_state"], "gateway_auth_rejected")
+        self.assertEqual(record["error"]["reason"], "local-gateway-auth-rejected")
+
+        # A provider that reports its own database problem is a route failure:
+        # the same sentence arrives with a provider-owned exception instead.
+        provider_failure = ProxyException(
+            "No connected db.", "internal_server_error", 500
+        )
+        self.assertFalse(
+            hooks._is_local_gateway_auth_rejection_error(provider_failure)
+        )
+
     def test_recent_request_timestamp_treats_naive_callback_time_as_local(self) -> None:
         hooks, _ = load_hook_module()
         callback_time = datetime(2026, 6, 9, 12, 0, 0)
@@ -1087,6 +1132,48 @@ class HookTraceLoggingTests(HookTestCase):
                 start,
                 end,
             )
+
+    def test_a_served_route_states_the_wire_it_answered_on(self) -> None:
+        """The success record must name the wire, not the backup protocol.
+
+        A ``fallback`` route that answers the client's own /v1/responses request
+        still declares ``openai/chat`` as its backup.  Reading that declaration
+        as the wire labelled live Responses traffic as a chat call and split the
+        served route from its own selection in the viewer.
+        """
+
+        hooks, _ = load_hook_module()
+        routing = sys.modules["young_router.proxy.routing"]
+        kwargs = {
+            "model": "public-chat",
+            "request_id": "req-wire-1",
+            "custom_llm_provider": "provider_alpha",
+            "litellm_params": {
+                "model": "openai/upstream-chat",
+                "api_base": "https://relay.example/v1",
+            },
+            "model_info": {
+                "id": "deployment-9",
+                "provider": "provider_alpha",
+                "api_key_name": "team",
+                "order": 2,
+                "upstream_url_surface": "openai/chat",
+                "upstream_protocol_mode": "fallback",
+            },
+            "_young_router_upstream_url_surface": "openai/responses",
+        }
+        with routing._TRACED_DEPLOYMENT_SUCCESSES_LOCK:
+            routing._TRACED_DEPLOYMENT_SUCCESSES.clear()
+        self.addCleanup(routing._TRACED_DEPLOYMENT_SUCCESSES.clear)
+
+        with self.assertLogs("young_router.route_trace", level="WARNING") as captured:
+            routing._record_deployment_success_for_cooldown(kwargs)
+
+        record = json.loads(captured.output[0].split("litellm_route_trace ", 1)[1])
+        self.assertEqual("deployment_success", record["event"])
+        self.assertEqual("openai/responses", record["deployment"]["surface"])
+        self.assertEqual("openai/chat", record["deployment"]["upstream_url_surface"])
+        self.assertEqual("fallback", record["deployment"]["upstream_protocol_mode"])
 
     def test_a_served_route_is_traced_once_per_request(self) -> None:
         """One success trace per request, naming the route that served it.

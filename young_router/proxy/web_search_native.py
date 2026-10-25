@@ -2453,3 +2453,21 @@ def _message_item_stream_events(item: dict[str, Any], index: int) -> list[dict[s
     )
     return events
 
+
+
+def _trace_bridge_reasoning(
+    request_kwargs: Optional[dict], *, saw: bool, delivered: bool, dropped: bool
+) -> None:
+    """Record whether a relayed Chat stream carried the thinking it received."""
+
+    try:
+        _trace_module._route_trace(
+            "chat_bridge_reasoning",
+            saw=saw,
+            delivered=delivered,
+            dropped=dropped,
+            requested=_requested_reasoning_summary(request_kwargs),
+            model_group=_request_context_module._request_model_group(request_kwargs),
+        )
+    except Exception:
+        pass

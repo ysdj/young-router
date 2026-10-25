@@ -1284,7 +1284,7 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
             config_schema.infer_upstream_fallback_surface("openai/kimi-k3"),
         )
         self.assertEqual(
-            "openai/responses",
+            "openai/chat",
             config_schema.infer_upstream_fallback_surface("openai/gpt-5"),
         )
         self.assertEqual(

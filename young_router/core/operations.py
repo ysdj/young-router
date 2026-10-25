@@ -60,6 +60,9 @@ MAX_OPERATION_OUTPUT_BYTES = 128 * 1024
 # out. A row is ~400 bytes, which keeps this under the view budget with room for
 # the metadata the view also carries.
 MAX_USAGE_ROWS = 6_000
+# How long one page read may take.  A page is what the pane waits for, so this
+# is the bound on the wait indicator rather than on the history.
+USAGE_PAGE_TIMEOUT_SECONDS = 90.0
 SERVICE_STATES = frozenset({"starting", "running", "unhealthy", "stopped", "unknown"})
 OWNER_RECORD_VERSION = 2
 # Local proxy port used when no valid preference is configured.
@@ -1513,8 +1516,46 @@ class ConfigurationPackageAdapter:
 class OnlineUsageReader:
     """Call the existing opt-in remote usage reader only on explicit refresh."""
 
-    def __init__(self, config_path: Path) -> None:
+    def __init__(self, config_path: Path, accounts: object | None = None) -> None:
         self.config_path = config_path
+        # The relay-account store owns the durable login material, so it is the
+        # one that keeps a refresh token the station rotated.  It is optional:
+        # a reader built without a store still reads usage, it just cannot make
+        # a rotated credential survive a restart.
+        self.accounts = accounts
+
+    def _install_rotated_refresh_sink(self) -> None:
+        from . import remote_usage_logs
+
+        store = self.accounts
+        keeper = getattr(store, "store_rotated_refresh_token", None)
+        if not callable(keeper):
+            return
+        remote_usage_logs.set_rotated_refresh_sink(keeper)
+
+    def _relogin(self, account_id: str) -> bool:
+        """Sign one relay account in again from its remembered password.
+
+        A dashboard login expires in hours, and the account usually has its
+        password remembered, so this is a renewal the app can do itself.  The
+        relay-account store owns the sign-in: it already enforces the station's
+        own session cap and its post-refusal wait, and it keeps the new session
+        it mints.  Returning False means the account could not be signed in —
+        which is the only case where the pane should say the login expired.
+        """
+
+        store = self.accounts
+        restore = getattr(store, "restore_saved_password", None)
+        if not callable(restore):
+            return False
+        try:
+            restored = restore(account_id)
+        except Exception:
+            # A refused password, a station at its session cap, or a station that
+            # could not be reached: the read that follows reports the usage it
+            # can actually see, and the login state is the relay panes' story.
+            return False
+        return bool(getattr(restored, "get", lambda *_: None)("login_status") == "signed_in")
 
     def sources(self) -> list[dict[str, str]]:
         """The relays this configuration can read, for the tab's own dropdown."""
@@ -1526,14 +1567,42 @@ class OnlineUsageReader:
         except Exception:
             return []
 
-    def refresh(self, source_id: str | None = None) -> tuple[list[dict[str, str]], str]:
+    def refresh(
+        self,
+        source_id: str | None = None,
+        *,
+        page: int = 1,
+        rows_per_page: int | None = None,
+    ) -> tuple[list[dict[str, str]], str, int, int]:
+        """Read one page of usage rows and the account's total row count.
+
+        The station owns the history: a busy relay reports tens of thousands of
+        rows, and reading them all before answering took 28 s on a real account,
+        far past the moment the pane stops waiting.  One page per read is what
+        keeps a page turn as fast as the station's own single request.
+        """
+
         from . import remote_usage_logs
 
+        self._install_rotated_refresh_sink()
         try:
-            records, reason = remote_usage_logs.collect(self.config_path, 5.0, source_id)
+            records, reason, total, page_rows = remote_usage_logs.collect(
+                self.config_path,
+                # One page from one relay is what this waits for, and a busy
+                # station answers a page in anywhere from one second to well
+                # over a minute.  The old five-second bound turned that variance
+                # into a table that never filled: the read was abandoned while
+                # the station was still working, and the pane reported the relay
+                # as unsupported.
+                USAGE_PAGE_TIMEOUT_SECONDS,
+                source_id,
+                self._relogin,
+                page=page,
+                rows_per_page=rows_per_page,
+            )
         except Exception:
-            return [], remote_usage_logs.USAGE_REASON_UNAVAILABLE
-        return records[-MAX_USAGE_ROWS:], reason
+            return [], remote_usage_logs.USAGE_REASON_UNAVAILABLE, 0, 0
+        return records, reason, total, page_rows
 
 
 __all__ = [

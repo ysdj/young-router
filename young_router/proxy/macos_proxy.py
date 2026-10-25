@@ -21,8 +21,10 @@ import urllib.request
 from ..lifecycle import proxy_drain_grace_seconds
 
 
-PROXY_APP = "litellm.proxy.proxy_server:app"
-PROXY_MODULE = "litellm.proxy.proxy_server"
+# The gateway module re-exports LiteLLM's own app after adding the provider-side
+# search route Codex calls, so the launcher still warms exactly one app.
+PROXY_APP = "young_router.proxy.gateway:app"
+PROXY_MODULE = "young_router.proxy.gateway"
 SYSTEM_PROXY_SNAPSHOT_ENV = "YOUNG_ROUTER_SYSTEM_PROXY_SNAPSHOT"
 
 

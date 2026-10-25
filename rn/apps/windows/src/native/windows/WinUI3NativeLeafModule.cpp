@@ -10,7 +10,12 @@
 #include <shobjidl_core.h>
 #include <winrt/Windows.Globalization.h>
 #include <winrt/Windows.ApplicationModel.DataTransfer.h>
-#include <ReactCoreInjection.h>
+
+namespace winrt::Microsoft::ReactNative::implementation {
+struct ReactCoreInjection {
+  static uint64_t GetTopLevelWindowId(IReactPropertyBag const& properties) noexcept;
+};
+} // namespace winrt::Microsoft::ReactNative::implementation
 
 namespace {
 std::wstring Utf8ToWide(std::string const& value) {
@@ -417,7 +422,7 @@ void WinUI3NativeLeafModule::ShowGroupedActionMenu(
       return;
     }
     NativeMenuGroup native_group;
-    native_group.title = winrt::hstring(*group_title).c_str();
+    native_group.title = Utf8ToWide(*group_title);
     native_group.items.reserve(items_array->size());
     for (auto const& item : *items_array) {
       auto item_text = item.TryGetString();
@@ -425,7 +430,7 @@ void WinUI3NativeLeafModule::ShowGroupedActionMenu(
         promise.Resolve(std::nullopt);
         return;
       }
-      native_group.items.push_back(winrt::hstring(*item_text).c_str());
+      native_group.items.push_back(Utf8ToWide(*item_text));
     }
     native_groups.push_back(std::move(native_group));
   }
@@ -447,7 +452,7 @@ void WinUI3NativeLeafModule::ShowGroupedActionMenu(
         winrt::Microsoft::ReactNative::JSValueObject result;
         result["group"] = static_cast<double>(selected->first);
         result["item"] = static_cast<double>(selected->second);
-        promise.Resolve(result);
+        promise.Resolve(std::optional<winrt::Microsoft::ReactNative::JSValueObject>(std::move(result)));
       });
     });
   } catch (...) {
@@ -924,7 +929,7 @@ void WinUI3NativeLeafModule::RelayLogin(
   auto station_origin = field("stationOrigin");
   auto const ui_language = language.value_or("system");
   if (options.size() > allowed.size() ||
-      std::any_of(options.begin(), options.end(), [&allowed](auto const& entry) { return allowed.find(entry.first) == allowed.end(); }) ||
+      std::any_of(options.begin(), options.end(), [](auto const& entry) { return allowed.find(entry.first) == allowed.end(); }) ||
       !account_id || !account_type || !label || !origin ||
       (options.find("language") != options.end() && !language) ||
       (pending_account && !pending_account.value()) ||

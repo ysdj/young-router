@@ -29,6 +29,7 @@
 #include <winrt/Microsoft.UI.Dispatching.h>
 #include <winrt/Microsoft.UI.Windowing.h>
 #include <winrt/Microsoft.UI.interop.h>
+#include <microsoft.ui.xaml.window.h>
 #include <winrt/Microsoft.Windows.AppLifecycle.h>
 #include <winrt/Windows.ApplicationModel.Activation.h>
 

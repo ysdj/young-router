@@ -459,6 +459,16 @@ def _responses_stream_chunk_for_delivery(
     chunk: Any,
     request_data: Optional[dict] = None,
 ) -> Any:
+    """Adapt one chunk to what this client must receive, or ``None`` to drop it.
+
+    ``None`` is an answer, not a payload: the caller skips that chunk.  Yielding
+    it instead reaches LiteLLM's serializer as neither a model, bytes, a string,
+    nor a dict, so the frame is written with the Python literal ``data: None`` --
+    a body every Responses client rejects as malformed JSON.  The request travels
+    with the chunk because the decisions here are the request's own: the
+    reasoning-visibility check reads ``request_data``, and without it a client
+    that asked for a summary had its thinking silently dropped.
+    """
     input_token_upper_bound = _codex_request_input_token_upper_bound(request_data)
     if isinstance(chunk, _JSONStreamEvent):
         _normalize_response_function_call_arguments(chunk)
@@ -902,18 +912,21 @@ def _is_young_router_terminal_failure_event(chunk: Any) -> bool:
     response = response if isinstance(response, dict) else {}
     error = response.get("error")
     error = error if isinstance(error, dict) else {}
+    # Only codes this router alone emits belong here.  ``context_length_exceeded``
+    # and ``invalid_prompt`` are the client's own vocabulary (see the Codes it
+    # maps in ``codex-api/src/sse/responses_error.rs``), so an upstream sending
+    # them must keep its ordinary meaning instead of being taken for a terminal
+    # this router already decided.  Our own events are recognised above by the
+    # attribute, which survives even when the code is a shared one.
     return error.get("code") in {
         "image_generation_tool_unavailable",
         "router_restarting",
         "upstream_account_restricted",
-        "upstream_auth_or_balance",
+        "insufficient_quota",
         "upstream_compaction_failure",
         "upstream_compaction_unsupported",
-        "upstream_context_too_large",
         "upstream_relay_capacity",
-        "upstream_request_body_too_large",
         "upstream_route_failure",
-        "upstream_tool_history_rejected",
     }
 
 _OUTPUT_TOKEN_LIMIT_INCOMPLETE_REASONS = {
@@ -1406,7 +1419,18 @@ def _synthesized_failed_response_event(
     request_data: dict,
     exception: Exception,
     completion_state: Any = None,
+    *,
+    after_visible_output: bool = False,
 ) -> _JSONStreamEvent:
+    """Build the terminal event for a turn that ended without an answer.
+
+    ``after_visible_output`` says the client already rendered part of this
+    answer, so neither the fallback nor the recovery poll can be used: replaying
+    the turn would duplicate what the reader has already seen.  Only the sentence
+    changes for that case -- a stop the router *did* classify must not be
+    described as one it could not, and a recovery policy here means "send it
+    again", which no other branch can say.
+    """
     if _routing_module._is_local_shutdown_exception(exception):
         # This worker truncated the stream because it is the one being replaced,
         # not because the upstream refused.  A synthetic ``response.failed`` is
@@ -1476,9 +1500,14 @@ def _synthesized_failed_response_event(
         # The failure every restart used to report as `upstream_route_failure`.
         # The route is healthy; this process closed the stream while it was
         # being replaced, so the turn just needs to be sent again.
+        # The replacement worker is already listening, so a resend is exactly
+        # the right answer -- and it has to be worded in a way the client's
+        # retry classifier recognises, or the turn dies on a restart the router
+        # recovered from a moment later.  "terminated" is on that list and is
+        # also the literal truth here.
         message = (
             "The router was restarting while this turn was streaming, so the "
-            "response was cut short. Send the message again."
+            "turn was terminated. Send the message again."
         )
         error_type = "server_error"
         error_code = "router_restarting"
@@ -1518,7 +1547,7 @@ def _synthesized_failed_response_event(
             model_group
         )
         error_type = "invalid_request_error"
-        error_code = "upstream_tool_history_rejected"
+        error_code = "invalid_prompt"
     elif _routing_module._is_upstream_deployment_failover_error(exception):
         message = _routing_module._sanitized_upstream_route_failure_message(
             model,
@@ -1526,7 +1555,7 @@ def _synthesized_failed_response_event(
             request_data,
         )
         error_type = "server_error"
-        error_code = "upstream_auth_or_balance"
+        error_code = "insufficient_quota"
     elif _routing_module._is_context_size_error(exception):
         # The conversation itself is what the upstream refused, not the route:
         # every candidate route would refuse the same bytes, so a generic
@@ -1545,7 +1574,65 @@ def _synthesized_failed_response_event(
             "or start a new task so the history sent upstream is smaller."
         )
         error_type = "invalid_request_error"
-        error_code = "upstream_context_too_large"
+        # Codex classifies a `response.failed` by exact `error.code` and treats
+        # every unrecognised one as retryable, so the codes on this wire are its
+        # vocabulary, not ours: an unrepresentable refusal here is a turn the
+        # client reconnects over.  The sentence still names our cause.
+        error_code = "context_length_exceeded"
+    elif _routing_module._is_route_cut_stream_error(exception):
+        # The upstream started this answer and then closed the body before its
+        # own framing finished.  The turn is over -- the bytes the client
+        # already read cannot be replayed -- but the cause is knowable and it
+        # belongs to the route, so the sentence names it instead of falling
+        # through to the unclassified-stop branch.  That branch used to be the
+        # answer here, which told the reader nothing while the same route was
+        # reselected for the next request.
+        model_group = (
+            _responses_execution_module._request_model_group(request_data)
+            or request_data.get("model")
+            or "the requested model"
+        )
+        message = (
+            f"{model_group} closed the response before finishing it, so the "
+            "stream ended without a terminal response event. The route has "
+            "been parked; send the message again and another route will answer."
+        )
+        error_type = "server_error"
+        error_code = "upstream_stream_truncated"
+    elif after_visible_output and _routing_module._is_local_stream_timeout_error(
+        exception
+    ):
+        # This worker's stall watchdog gave up on a route that had gone quiet.
+        # Scope is the active stream only: the recovery poll reaches this same
+        # builder when its whole window expires without a first event, and that
+        # verdict is deliberately terminal (the router already waited as long as
+        # it was willing to) rather than an invitation to wait again.
+        #
+        # The stop is transient and the route was not refused, so the event
+        # names the stall and its own code -- which also carries the word the
+        # client's retry classifier keys on, so a quiet upstream does not end
+        # the turn.  Falling through used to report it as unclassified, which
+        # was false: the trace recorded ``stream_idle_timeout``.
+        model_group = (
+            _responses_execution_module._request_model_group(request_data)
+            or request_data.get("model")
+            or "the requested model"
+        )
+        if _routing_module._is_local_stream_start_timeout_error(exception):
+            message = (
+                f"{model_group} produced no response in time, so the stream "
+                "ended without a terminal response event. Send the message "
+                "again and it will continue on a working route."
+            )
+            error_code = "upstream_stream_start_timeout"
+        else:
+            message = (
+                f"{model_group} stopped sending this response, so the stream "
+                "ended without a terminal response event. Send the message "
+                "again and it will continue on a working route."
+            )
+            error_code = "upstream_stream_idle_timeout"
+        error_type = "server_error"
     elif _routing_module._request_body_size_rejected(request_data):
         # Every candidate route refused these bytes.  The rejection is the
         # request's own size, not a route outage, so the client is told what to
@@ -1561,7 +1648,53 @@ def _synthesized_failed_response_event(
             "conversation sent upstream is smaller than the upstream limit."
         )
         error_type = "invalid_request_error"
-        error_code = "upstream_request_body_too_large"
+        error_code = "invalid_prompt"
+    elif (
+        after_visible_output
+        and _routing_module._is_route_recovery_poll_error(exception)
+        # This worker's own stall watchdog already names its cause and keeps its
+        # own terminal code; reporting its verdict as an upstream drop would
+        # invent a connection failure that never happened.
+        and not _routing_module._is_local_stream_timeout_error(exception)
+    ):
+        # Reachable only here: the stream already delivered part of this answer,
+        # so the recovery poll cannot run (a replay would duplicate output) and
+        # the route still has a retryable policy.  Falling through to the
+        # unclassified sentence below was a lie -- the trace already recorded
+        # ``upstream-network-connectivity`` -- and it gave the reader no way to
+        # know that resending is what works.
+        #
+        # The wording carries a client contract, not just a prose choice.  Pi
+        # classifies a failed turn with ``isRetryableAssistantError`` in
+        # ``@earendil-works/pi-ai/utils/retry.js``, which regex-matches the
+        # rendered ``<code>: <message>`` against a phrase list. A sentence that
+        # matches nothing ends the turn with no retry at all -- which is exactly
+        # what ``upstream_route_failure`` + "could not classify the stop" did to
+        # a live session. "stream ended without" is in that list and is also the
+        # literal truth here, so naming the truncation this way is what lets the
+        # client resend automatically instead of dropping the turn.
+        model_group = (
+            _responses_execution_module._request_model_group(request_data)
+            or request_data.get("model")
+            or "the requested model"
+        )
+        if _routing_module._is_network_recovery_exception(exception):
+            message = (
+                f"{model_group} closed this connection while the answer was "
+                "streaming, so the stream ended without a terminal response "
+                "event. Send the message again and it will continue on a "
+                "working route."
+            )
+            error_code = "upstream_connection_dropped"
+        else:
+            message = (
+                f"{model_group} stopped answering while this turn was "
+                "streaming, so the stream ended without a terminal response "
+                "event. Send the message again and it will continue on a "
+                "working route."
+            )
+            error_code = "upstream_stream_interrupted"
+        error_type = "server_error"
     else:
         # Nothing this router knows can explain the stop, so the sentence says
         # exactly that and no more.  The generic "the route failed before an
@@ -1630,12 +1763,11 @@ def _synthesized_native_stream_error_chunk(
         "invalid_request_error"
         if error_code
         in {
-            "upstream_context_too_large",
+            "context_length_exceeded",
+            "invalid_prompt",
             "upstream_prompt_rejected",
             "image_generation_tool_unavailable",
-            "upstream_request_body_too_large",
             "upstream_account_restricted",
-            "upstream_tool_history_rejected",
         }
         else "server_error"
     )
@@ -1663,7 +1795,8 @@ def _native_stream_error_code(exception: Exception) -> str:
     if _routing_module._is_local_shutdown_exception(exception):
         return "router_restarting"
     if _routing_module._is_context_size_error(exception):
-        return "upstream_context_too_large"
+        # Codex keys its retry decision on `error.code`; these are its names.
+        return "context_length_exceeded"
     if _routing_module._is_terminal_prompt_or_policy_error(exception):
         return "upstream_prompt_rejected"
     if _routing_module._is_image_generation_all_deployments_unsupported_error(
@@ -1675,9 +1808,9 @@ def _native_stream_error_code(exception: Exception) -> str:
     if _routing_module._is_upstream_account_restricted_error(exception):
         return "upstream_account_restricted"
     if _routing_module._is_upstream_tool_history_rejected_error(exception):
-        return "upstream_tool_history_rejected"
+        return "invalid_prompt"
     if _routing_module._is_upstream_deployment_failover_error(exception):
-        return "upstream_auth_or_balance"
+        return "insufficient_quota"
     # The router's own timeout predicate answers for both reasons, so the
     # narrower start timeout is read first.
     if _routing_module._is_local_stream_start_timeout_error(exception):
@@ -1686,6 +1819,8 @@ def _native_stream_error_code(exception: Exception) -> str:
         return "upstream_stream_idle_timeout"
     if getattr(exception, "stream_incomplete", False):
         return "upstream_stream_incomplete"
+    if _routing_module._is_route_cut_stream_error(exception):
+        return "upstream_stream_truncated"
     return "upstream_route_failure"
 
 def _native_stream_error_message(
@@ -1694,9 +1829,11 @@ def _native_stream_error_message(
     request_data: dict,
 ) -> str:
     if _routing_module._is_local_shutdown_exception(exception):
+        # Same contract as the Responses branch: the replacement is listening,
+        # so the sentence has to read as the transient restart it is.
         return (
             "The router was restarting while this turn was streaming, so the "
-            "response was cut short. Send the message again."
+            "turn was terminated. Send the message again."
         )
     if _routing_module._is_local_stream_start_timeout_error(exception):
         return (
@@ -1744,10 +1881,26 @@ def _native_stream_error_message(
         )
         return _routing_module._upstream_tool_history_rejected_message(model_group)
     if getattr(exception, "stream_incomplete", False):
+        # Keeps the phrase the chat-completions terminal test pins, and adds the
+        # one the client's retry classifier needs.  This stop is transient -- the
+        # peer simply stopped mid-answer -- so letting the sentence end the turn
+        # would throw away a request the next attempt can serve.
         return (
             "The upstream model route ended the stream before it reported the "
-            "response as finished. Send the message again or choose another "
-            "model route."
+            "response as finished, so the stream ended without a terminal "
+            "response event. Send the message again and it will continue on a "
+            "working route."
+        )
+    if _routing_module._is_route_cut_stream_error(exception):
+        model_group = (
+            _responses_execution_module._request_model_group(request_data)
+            or request_data.get("model")
+            or "the requested model"
+        )
+        return (
+            f"{model_group} closed the response before finishing it, so the "
+            "stream ended without a terminal response event. The route has "
+            "been parked; send the message again and another route will answer."
         )
     return _routing_module._sanitized_upstream_route_failure_message(
         model,
@@ -1902,6 +2055,40 @@ def _stream_chunk_has_visible_output(chunk: Any) -> bool:
         or _image_generation_module._response_has_image_generation_activity(visible_chunk)
         or _response_has_tool_call_activity(visible_chunk)
     )
+
+def _stream_chunk_is_public_reasoning_delta(chunk: Any) -> bool:
+    """Whether this frame is thinking the client can already read.
+
+    A reasoning summary delta is user-visible output even though it is not the
+    answer: the client renders it the moment it arrives.  It is kept apart from
+    ``_stream_chunk_has_visible_output`` because that predicate answers a
+    different question -- "has the answer begun" -- which decides whether a route
+    that produced nothing but a preamble may be replaced.
+    """
+
+    dumped = _stream_chunk_dump(chunk)
+    visible_chunk = dumped if dumped else chunk
+    if not _web_search_native_module._is_public_reasoning_summary_stream_event(
+        _stream_chunk_type(visible_chunk)
+    ):
+        return False
+    delta = visible_chunk.get("delta") if isinstance(visible_chunk, dict) else None
+    return isinstance(delta, str) and bool(delta.strip())
+
+
+def _stream_chunk_has_delivered_output(chunk: Any) -> bool:
+    """Whether the client has now been shown something it cannot un-see.
+
+    Once a frame has reached the reader, neither a replay nor a silent failover
+    can put the turn back the way it was, so the start buffer must stop holding
+    frames and a later failure belongs to this turn.  Thinking counts: holding it
+    until the first answer token is what made a whole reasoning block appear in
+    one burst after the model had finished thinking.
+    """
+
+    return _stream_chunk_has_visible_output(
+        chunk
+    ) or _stream_chunk_is_public_reasoning_delta(chunk)
 
 def _response_item_is_web_search_call(item: Any) -> bool:
     json_item = _jsonable(item)
@@ -4049,7 +4236,7 @@ async def _yield_validated_structured_codex_compaction_stream(
     for chunk in buffer:
         if remember(chunk) is not None:
             for event in events:
-                yield _responses_stream_chunk_for_delivery(event)
+                yield _responses_stream_chunk_for_delivery(event, request_data)
             await _close_async_iterator_safely(response)
             return
 
@@ -4062,7 +4249,7 @@ async def _yield_validated_structured_codex_compaction_stream(
         ):
             if remember(chunk) is not None:
                 for event in events:
-                    yield _responses_stream_chunk_for_delivery(event)
+                    yield _responses_stream_chunk_for_delivery(event, request_data)
                 await _close_async_iterator_safely(response)
                 return
     except Exception as exception:
@@ -4075,7 +4262,7 @@ async def _yield_validated_structured_codex_compaction_stream(
         if completed_compat is None:
             raise
         for event in events:
-            yield _responses_stream_chunk_for_delivery(event)
+            yield _responses_stream_chunk_for_delivery(event, request_data)
         yield completed_compat
         await _close_async_iterator_safely(response)
         return
@@ -4087,7 +4274,7 @@ async def _yield_validated_structured_codex_compaction_stream(
     )
     if completed_compat is not None:
         for event in events:
-            yield _responses_stream_chunk_for_delivery(event)
+            yield _responses_stream_chunk_for_delivery(event, request_data)
         yield completed_compat
         return
     raise _responses_incomplete_stream_exception(
@@ -4599,7 +4786,14 @@ async def _yield_guarded_original_stream(
             reason=reason,
             already_yielded_visible_output=True,
         )
-        return _synthesized_failed_response_event(request_data, failure)
+        # This terminal is only built once the stream has already delivered part
+        # of the answer, so the recovery poll is unavailable and the sentence
+        # must say what the reader can actually do.
+        return _synthesized_failed_response_event(
+            request_data,
+            failure,
+            after_visible_output=True,
+        )
 
     for chunk in buffer:
         _web_search_native_module._mark_provider_native_web_search_event(
@@ -4618,7 +4812,7 @@ async def _yield_guarded_original_stream(
         if chunk is None:
             continue
         remember(chunk)
-        visible_output_seen = visible_output_seen or _stream_chunk_has_visible_output(chunk)
+        visible_output_seen = visible_output_seen or _stream_chunk_has_delivered_output(chunk)
         completed_compat_chunk = _responses_output_limit_incomplete_as_completed_chunk(
             chunk,
             request_data,
@@ -4771,7 +4965,7 @@ async def _yield_guarded_original_stream(
                     return
                 raise chunk_exception
             remember(chunk)
-            visible_output_seen = visible_output_seen or _stream_chunk_has_visible_output(chunk)
+            visible_output_seen = visible_output_seen or _stream_chunk_has_delivered_output(chunk)
             completed_compat_chunk = _responses_output_limit_incomplete_as_completed_chunk(
                 chunk,
                 request_data,
@@ -5288,6 +5482,7 @@ async def _yield_start_buffered_stream_with_error_fallback(
     is_responses_stream = _request_is_responses_stream(request_data)
     saw_responses_completed = False
     saw_visible_output = False
+    saw_delivered_output = False
     stream_exhausted = True
     stream_started_at = time.monotonic()
     completion_state = _ResponsesStreamCompletionState(request_data)
@@ -5364,6 +5559,14 @@ async def _yield_start_buffered_stream_with_error_fallback(
             saw_visible_output = saw_visible_output or (
                 _stream_chunk_has_visible_output(chunk)
             )
+            # The start buffer exists so a route that fails before showing
+            # anything can be replaced without the reader noticing.  Thinking is
+            # shown, so it ends that window: holding it back until the first
+            # answer token made a whole reasoning block arrive at once, after the
+            # model had already finished thinking.
+            saw_delivered_output = saw_delivered_output or (
+                _stream_chunk_is_public_reasoning_delta(chunk)
+            )
             if is_responses_stream:
                 if _responses_stream_chunk_is_completed(chunk):
                     if _responses_completed_chunk_is_empty(chunk, request_data) and not saw_visible_output:
@@ -5391,7 +5594,10 @@ async def _yield_start_buffered_stream_with_error_fallback(
                     )
                     if completed_compat_chunk is not None:
                         for buffered_chunk in buffer[:-1]:
-                            yield _responses_stream_chunk_for_delivery(buffered_chunk)
+                            yield _responses_stream_chunk_for_delivery(
+                                buffered_chunk,
+                                request_data,
+                            )
                         yield completed_compat_chunk
                         await _close_async_iterator_safely(response)
                         return
@@ -5425,12 +5631,30 @@ async def _yield_start_buffered_stream_with_error_fallback(
                     return
             if (
                 saw_visible_output
+                or saw_delivered_output
                 or saw_responses_completed
                 or (
                     len(buffer) >= _STREAM_ERROR_FALLBACK_START_BUFFER_CHUNKS
                     and not is_responses_stream
                 )
             ):
+                # Which frame ends the start buffer decides whether a thinking
+                # block can stream at all, and "the reader saw nothing for the
+                # whole reasoning phase" is otherwise indistinguishable from a
+                # slow route in the trace.
+                _trace_module._request_route_trace(
+                    "responses_start_buffer_released", request_data,
+                    released_by=_stream_chunk_type(chunk),
+                    buffered_chunks=len(buffer),
+                    buffered_types=[
+                        chunk_type
+                        for chunk_type in dict.fromkeys(
+                            _stream_chunk_type(buffered) for buffered in buffer
+                        )
+                    ][:12],
+                    answer_started=saw_visible_output,
+                    thinking_seen=saw_delivered_output,
+                )
                 stream_exhausted = False
                 break
     except Exception as exc:
@@ -5442,7 +5666,10 @@ async def _yield_start_buffered_stream_with_error_fallback(
         )
         if completed_compat is not None:
             for buffered_chunk in buffer:
-                yield _responses_stream_chunk_for_delivery(buffered_chunk)
+                yield _responses_stream_chunk_for_delivery(
+                    buffered_chunk,
+                    request_data,
+                )
             yield completed_compat
             await _close_async_iterator_safely(response)
             return
@@ -5469,7 +5696,10 @@ async def _yield_start_buffered_stream_with_error_fallback(
         )
         if completed_compat is not None:
             for buffered_chunk in buffer:
-                yield _responses_stream_chunk_for_delivery(buffered_chunk)
+                yield _responses_stream_chunk_for_delivery(
+                    buffered_chunk,
+                    request_data,
+                )
             yield completed_compat
             return
         incomplete_exception = _responses_incomplete_stream_exception(
@@ -5512,7 +5742,7 @@ async def _yield_start_buffered_stream_with_error_fallback(
         request_data,
         saw_responses_completed=saw_responses_completed,
         stream_started_at=stream_started_at,
-        saw_visible_output=saw_visible_output,
+        saw_visible_output=saw_visible_output or saw_delivered_output,
         on_responses_completed=(
             lambda: _routing_module._record_deployment_success_for_cooldown(
                 request_data

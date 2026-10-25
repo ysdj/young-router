@@ -4641,3 +4641,88 @@ class HookResponsesToolOutputReplayWindowTests(HookTestCase):
         request = self._request(pairs=5, payload_chars=30_000)
 
         self.assertIsNone(hooks._with_elided_oversized_tool_outputs(request))
+
+
+class HookReplayedReasoningCountTests(HookTestCase):
+    """The pre-call estimate must read a replayed item as its upstream does."""
+
+    def test_an_unsigned_reasoning_item_counts_by_identity(self) -> None:
+        """Its summary text is billed as a message and sent by nobody.
+
+        Codex replays prior thinking as an opaque id: the client never sends the
+        summary words back, and the upstream that wrote them is the only party
+        that can read them.  Counting them as chat content made LiteLLM charge
+        1,004,863 tokens for a 400k prompt and refuse a turn the route could
+        serve.
+        """
+
+        hooks, _ = load_hook_module()
+        items = [
+            {
+                "type": "reasoning",
+                "id": "rs_1",
+                "summary": [{"type": "summary_text", "text": "x" * 40_000}],
+                "content": None,
+                "encrypted_content": None,
+            }
+        ]
+
+        counted = hooks._without_replayed_reasoning_summary_text(items)
+
+        self.assertEqual(counted[0]["id"], "rs_1")
+        self.assertNotIn("summary", counted[0])
+        # The request itself is untouched; only the value counted is stripped.
+        self.assertEqual(items[0]["summary"][0]["text"], "x" * 40_000)
+
+    def test_a_reasoning_item_with_visible_content_keeps_it(self) -> None:
+        """Only summary-only thinking is free; text a client can send is not."""
+
+        hooks, _ = load_hook_module()
+        item = {
+            "type": "reasoning",
+            "id": "rs_3",
+            "summary": [{"type": "summary_text", "text": "summary"}],
+            "content": [{"type": "reasoning_text", "text": "visible"}],
+        }
+
+        counted = hooks._without_replayed_reasoning_summary_text([item])
+
+        self.assertIs(counted[0], item)
+
+    def test_a_signed_reasoning_item_keeps_every_byte(self) -> None:
+        """A signed prefix is replayed verbatim, so the estimate may not hide it."""
+
+        hooks, _ = load_hook_module()
+        item = {
+            "type": "reasoning",
+            "id": "rs_2",
+            "summary": [{"type": "summary_text", "text": "kept"}],
+            "encrypted_content": "gAAAAAB-signed-prefix",
+        }
+
+        counted = hooks._without_replayed_reasoning_summary_text([item])
+
+        self.assertIs(counted[0], item)
+
+    def test_every_other_input_item_is_counted_unchanged(self) -> None:
+        hooks, _ = load_hook_module()
+        items = [
+            {"type": "message", "role": "user", "content": "hello"},
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "y" * 100,
+            },
+        ]
+
+        counted = hooks._without_replayed_reasoning_summary_text(items)
+
+        self.assertEqual(counted, items)
+        self.assertIs(counted[0], items[0])
+
+    def test_a_string_input_is_not_reinterpreted(self) -> None:
+        hooks, _ = load_hook_module()
+
+        self.assertEqual(
+            hooks._without_replayed_reasoning_summary_text("hello"), "hello"
+        )

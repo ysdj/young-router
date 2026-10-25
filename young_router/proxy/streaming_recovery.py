@@ -369,6 +369,25 @@ async def _stream_route_recovery_poll_attempt(
     completion_state = _streaming_module._ResponsesStreamCompletionState(request_data)
     started_delivery = False
     next_chunk_task = None
+
+    def delivered(chunk: Any) -> Optional[Any]:
+        """What this client receives for one upstream chunk, or ``None`` to drop it.
+
+        ``_responses_stream_chunk_for_delivery`` answers ``None`` for a frame
+        this client must not see.  Two traps live at this seam, both observed on
+        a live recovery: without the request the reasoning-visibility rule read
+        every attempt as "no summary asked for" and dropped the thinking of a
+        client that had asked, and yielding that ``None`` handed LiteLLM's
+        serializer a chunk it writes as the literal ``data: None`` -- a body
+        every Responses client rejects as malformed JSON, which ended the turn
+        exactly while this poll was trying to keep it alive.
+        """
+
+        return _streaming_module._responses_stream_chunk_for_delivery(
+            chunk,
+            request_data,
+        )
+
     configured_timeout_seconds = _routing_module._stream_start_timeout_seconds_for_request(request_data)
     request_timeout_seconds = configured_timeout_seconds
     if deadline is not None and attempt > 1:
@@ -423,9 +442,8 @@ async def _stream_route_recovery_poll_attempt(
                         )
                         if completed_compat is not None:
                             for buffered_chunk in buffered_chunks:
-                                yield _streaming_module._responses_stream_chunk_for_delivery(
-                                    buffered_chunk
-                                )
+                                if (delivered_chunk := delivered(buffered_chunk)) is not None:
+                                    yield delivered_chunk
                             yield completed_compat
                             return
                         raise _streaming_module._stream_route_recovery_wait_timeout_exception(
@@ -449,7 +467,8 @@ async def _stream_route_recovery_poll_attempt(
                 )
                 if completed_compat is not None:
                     for buffered_chunk in buffered_chunks:
-                        yield _streaming_module._responses_stream_chunk_for_delivery(buffered_chunk)
+                        if (delivered_chunk := delivered(buffered_chunk)) is not None:
+                            yield delivered_chunk
                     yield completed_compat
                 return
             except asyncio.TimeoutError:
@@ -469,9 +488,8 @@ async def _stream_route_recovery_poll_attempt(
                         )
                         if completed_compat is not None:
                             for buffered_chunk in buffered_chunks:
-                                yield _streaming_module._responses_stream_chunk_for_delivery(
-                                    buffered_chunk
-                                )
+                                if (delivered_chunk := delivered(buffered_chunk)) is not None:
+                                    yield delivered_chunk
                             yield completed_compat
                         return
                 elif not started_delivery:
@@ -489,9 +507,8 @@ async def _stream_route_recovery_poll_attempt(
                         )
                         if completed_compat is not None:
                             for buffered_chunk in buffered_chunks:
-                                yield _streaming_module._responses_stream_chunk_for_delivery(
-                                    buffered_chunk
-                                )
+                                if (delivered_chunk := delivered(buffered_chunk)) is not None:
+                                    yield delivered_chunk
                             yield completed_compat
                             return
                         raise _streaming_module._stream_route_recovery_wait_timeout_exception(
@@ -510,7 +527,8 @@ async def _stream_route_recovery_poll_attempt(
                     raise
 
             if started_delivery:
-                yield _streaming_module._responses_stream_chunk_for_delivery(chunk)
+                if (delivered_chunk := delivered(chunk)) is not None:
+                    yield delivered_chunk
                 if _streaming_module._responses_stream_chunk_is_completed(chunk):
                     return
                 continue
@@ -548,7 +566,8 @@ async def _stream_route_recovery_poll_attempt(
 
             started_delivery = True
             for buffered_chunk in buffered_chunks:
-                yield _streaming_module._responses_stream_chunk_for_delivery(buffered_chunk)
+                if (delivered_chunk := delivered(buffered_chunk)) is not None:
+                    yield delivered_chunk
             buffered_chunks.clear()
             if _streaming_module._responses_stream_chunk_is_completed(chunk):
                 return
@@ -561,7 +580,8 @@ async def _stream_route_recovery_poll_attempt(
         )
         if completed_compat is not None:
             for buffered_chunk in buffered_chunks:
-                yield _streaming_module._responses_stream_chunk_for_delivery(buffered_chunk)
+                if (delivered_chunk := delivered(buffered_chunk)) is not None:
+                    yield delivered_chunk
             yield completed_compat
             return
         raise
@@ -1355,7 +1375,14 @@ async def _stream_route_recovery_poll(
                     if uses_native_event_stream:
                         yield chunk
                     else:
-                        yield _streaming_module._responses_stream_chunk_for_delivery(chunk)
+                        delivered_chunk = (
+                            _streaming_module._responses_stream_chunk_for_delivery(
+                                chunk,
+                                request_data,
+                            )
+                        )
+                        if delivered_chunk is not None:
+                            yield delivered_chunk
                 if yielded:
                     _trace_module._request_route_trace(
                         "route_recovery_poll_success", request_data,

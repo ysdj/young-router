@@ -960,6 +960,7 @@ import Foundation
         if method == "probe" { return 900 }
         if method == "dispatch", webdavRemoteOperation(in: request) != nil { return 900 }
         if method == "dispatch", serviceLifecycleOperation(in: request) != nil { return 900 }
+        if method == "dispatch", onlineUsageReadOperation(in: request) != nil { return 900 }
         return 30
     }
 
@@ -973,6 +974,21 @@ import Foundation
               action["domain"] == nil else { return nil }
         let type = ((action["type"] as? String) ?? (action["action"] as? String) ?? "").lowercased()
         return ["service.start", "service.stop", "service.restart", "service.reload"].contains(type) ? type : nil
+    }
+
+    /// The usage read inside a dispatch request, when it has one.  It is a
+    /// network read against a third-party relay, and a busy station answers one
+    /// page in anywhere from one second to over a minute; the 30 s default
+    /// abandoned those reads, so the pane reported a relay it had just chosen
+    /// as if nothing had been selected.  One page is what this waits for, and
+    /// the pane shows its own wait beside the pill while it runs.
+    private static func onlineUsageReadOperation(in data: Data) -> String? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let params = object["params"] as? [String: Any],
+              let action = params["action"] as? [String: Any],
+              (action["domain"] as? String)?.lowercased() == "logs" else { return nil }
+        let type = ((action["type"] as? String) ?? (action["action"] as? String) ?? "").lowercased()
+        return ["logs.refresh_online_usage", "logs.refresh", "logs.reload"].contains(type) ? type : nil
     }
 
     /// The WebDAV operation inside a dispatch request, when it has one: these

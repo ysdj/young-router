@@ -68,6 +68,8 @@ def _node_target() -> tuple[str, str, str]:
     if system == "windows":
         if machine in {"amd64", "x86_64", "x64"}:
             return "win-x64-zip", "win-x64", "node.exe"
+        if machine in {"arm64", "aarch64"}:
+            return "win-arm64-zip", "win-arm64", "node.exe"
         raise UpdateError(f"Unsupported Windows Node architecture: {machine}")
     raise UpdateError("Node runtime packaging is supported only on macOS and Windows hosts")
 

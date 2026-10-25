@@ -5,11 +5,19 @@ The reader is deliberately opt-in by response shape: it tries a small set of
 documented, read-only endpoints against configured enabled credentials and
 emits a sanitized text feed.  It never guesses hosts, persists remote data, or
 prints a credential, URL, request body, IP address, or upstream response text.
+
+A relay dashboard's access token is short-lived (a couple of hours) and the
+station rotates it on every refresh.  Persisting a copy therefore guarantees a
+stale read: the browser keeps itself signed in, while the stored copy expires
+and the station starts refusing it.  The token this module uses therefore lives
+here, in memory, and is minted from the account's own refresh token on demand —
+the same trade the browser makes, minus the disk write.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import concurrent.futures
 import datetime as dt
 import hashlib
@@ -19,11 +27,13 @@ import os
 import pathlib
 import re
 import socket
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 from ..config.load import load_config
 from young_router.api_base import isolated_http_opener, service_root
@@ -64,6 +74,10 @@ USAGE_REASON_NO_CREDENTIAL = "no_credential"
 USAGE_REASON_UNSUPPORTED = "unsupported"
 USAGE_REASON_NO_ROWS = "no_rows"
 USAGE_REASON_UNAVAILABLE = "unavailable"
+# The station answered, and its answer was "your dashboard login is no longer
+# valid".  That is a fact the user can act on — sign in to the relay again —
+# and it is never the same as a station that installs no log feed.
+USAGE_REASON_LOGIN_EXPIRED = "login_expired"
 
 
 def _string(value: Any) -> str:
@@ -189,6 +203,11 @@ class UsageTarget:
     # session must never leave this module: it is not part of any record, label,
     # or IPC payload.
     session_headers: tuple[tuple[str, str], ...] = ()
+    # The login's refresh token, used to mint a current access token on demand.
+    # It is a credential like the headers above and stays inside this module:
+    # the token a read authorizes with lives in memory and is never read back
+    # from (or written to) the stored session.
+    refresh_token: str = ""
 
     def credentials(self) -> tuple[str, ...]:
         return (self.api_key, *self.fallback_keys) if self.api_key else self.fallback_keys
@@ -286,6 +305,9 @@ def active_usage_targets(path: pathlib.Path) -> list[UsageTarget]:
     order: list[tuple[str, str]] = []
     roots: dict[tuple[str, str], str] = {}
     labels: dict[tuple[str, str], str] = {}
+    # The provider name a station was configured under, so an account of that
+    # station is named the way every other surface names it.
+    provider_names: dict[str, str] = {}
     credentials: dict[tuple[str, str], list[str]] = {}
     # Every provider's routes are collected first, because whether one is a
     # *relay* is decided by the relay panes' own document, not by the provider
@@ -328,6 +350,7 @@ def active_usage_targets(path: pathlib.Path) -> list[UsageTarget]:
                 order.append(scope)
                 roots[scope] = api_base
                 labels[scope] = provider_name
+                provider_names[scope[0]] = provider_name
                 credentials[scope] = []
             if api_key and api_key not in credentials[scope]:
                 credentials[scope].append(api_key)
@@ -346,7 +369,16 @@ def active_usage_targets(path: pathlib.Path) -> list[UsageTarget]:
             continue
         order.append(scope)
         roots[scope] = origin
-        labels[scope] = _station_label(origin) or _string(account.get("label")) or origin
+        # The name the relay panes show is the provider name the user gave the
+        # station.  An account-only entry used the host instead, so the dropdown
+        # listed `relay.example.test · tester` beside `relay` for the same
+        # station — the same relay under two names, one of them a URL.
+        labels[scope] = (
+            provider_names.get(scope[0])
+            or _station_label(origin)
+            or _string(account.get("label"))
+            or origin
+        )
         credentials[scope] = []
 
     # Keep only relay stations.  A hand-pasted key on a vendor's own API
@@ -381,6 +413,9 @@ def active_usage_targets(path: pathlib.Path) -> list[UsageTarget]:
                 station_type=_string(account.get("type"))
                 or _string(stations.get(root, "")),
                 session_headers=tuple(_session_headers(account).items()),
+                refresh_token=_string((account.get("session") or {}).get("refresh_token"))
+                if isinstance(account.get("session"), dict)
+                else "",
             )
         )
         if len(targets) >= MAX_TARGETS:
@@ -530,20 +565,278 @@ _SUB2API_LEDGER_PATH = "/api/v1/usage"
 # One page of the ledger. The station caps its own page size, and asking for
 # more than it offers is answered with the cap instead of an error.
 _SUB2API_PAGE_SIZE = 200
-# How many ledger pages one refresh reads, and how many are fetched at once.
-# The account's history is unbounded (it routinely holds tens of thousands of
-# requests), and the pane pages through what a refresh loaded, so the read is
-# bounded by pages.  Pages are independent reads of one list, so they are
-# fetched in parallel: a sequential walk of the same pages took over a minute,
-# which is not a refresh the pane can wait on.  30 pages of 200 rows is one
-# refresh's ceiling: enough history for the pane's pages and its range filter,
-# and short enough that a slow station still finishes during the wait indicator.
-_SUB2API_MAX_PAGES = 30
-_SUB2API_PAGE_WORKERS = 8
+# The largest page the reader will ask a station for.  The pane asks for one
+# page at a time and the station caps its own size, so this only bounds a
+# request; it is never used to walk the history in a single read.
+_SUB2API_MAX_PAGE_SIZE = 1_000
 # A New API log page shorter than this is the account's whole history, not a
 # page of it, so the reader does not follow pagination that cannot exist.
 _NEWAPI_MIN_PAGE = 50
 _NEWAPI_MAX_PAGES = 100
+
+# The dashboard's own token exchange.  A Sub2API station mints a short-lived
+# access token and rotates the refresh token every time it is used; both facts
+# come from the station itself in that answer.
+_SUB2API_REFRESH_PATH = "/api/v1/auth/refresh"
+# How long before expiry a cached token is considered spent.  A token that
+# expires while a page of the ledger is in flight is refused mid-read, so the
+# margin covers the read it is about to authorize rather than the clock alone.
+_TOKEN_EXPIRY_MARGIN_SECONDS = 120
+
+
+@dataclass
+class _CachedToken:
+    """One account's live dashboard token, held only in this process.
+
+    The value never reaches disk, a record, a label, an IPC payload, or a log
+    line.  It exists to authorize reads for as long as the station honors it;
+    when it is spent the station is asked for another one.
+    """
+
+    access_token: str
+    expires_at: float
+
+    def usable(self, now: float) -> bool:
+        return bool(self.access_token) and now + _TOKEN_EXPIRY_MARGIN_SECONDS < self.expires_at
+
+
+# Keyed by the account's stable id, so two logins of one station never share a
+# token and a renamed label cannot resurrect a spent one.
+_TOKEN_CACHE: dict[str, _CachedToken] = {}
+_TOKEN_CACHE_LOCK = threading.Lock()
+# Refresh tokens the station has rotated during this process's life.  The
+# station invalidates the previous one, so the current value has to travel with
+# the read that produced it; it is kept in memory beside the token rather than
+# written back, because a persisted copy is exactly what went stale before.
+_REFRESH_CACHE: dict[str, str] = {}
+# Called with ``(account_id, refresh_token)`` when the station rotates a refresh
+# token.  A rotated token invalidates its predecessor, so a value kept only in
+# memory would be lost on the next restart and the account would need signing in
+# again.  This module stays free of the relay-account store, so the owner of that
+# store installs the sink and decides how a rotated credential is kept.
+_ROTATED_REFRESH_SINK: Any = None
+
+
+def set_rotated_refresh_sink(sink: Any) -> None:
+    """Let the relay-account store keep a rotated refresh token durable."""
+
+    global _ROTATED_REFRESH_SINK
+    _ROTATED_REFRESH_SINK = sink
+
+
+def _monotonic() -> float:
+    return time.monotonic()
+
+
+def _remember_session(
+    account_id: str,
+    access_token: str,
+    refresh_token: str,
+    expires_in: object,
+) -> None:
+    """Record the station's newest token pair for one account, in memory."""
+
+    if not account_id:
+        return
+    try:
+        seconds = float(expires_in) if expires_in is not None else 0.0
+    except (TypeError, ValueError):
+        seconds = 0.0
+    if not math.isfinite(seconds) or seconds <= 0:
+        seconds = 0.0
+    with _TOKEN_CACHE_LOCK:
+        _TOKEN_CACHE[account_id] = _CachedToken(
+            access_token=access_token,
+            expires_at=_monotonic() + seconds,
+        )
+        previous = _REFRESH_CACHE.get(account_id)
+        if refresh_token:
+            _REFRESH_CACHE[account_id] = refresh_token
+    # A rotated refresh token retires its predecessor, so the new value has to
+    # outlive this process: signing in again would otherwise be the only way
+    # back after a restart.  The access token itself is never stored.
+    if refresh_token and refresh_token != previous and _ROTATED_REFRESH_SINK is not None:
+        try:
+            _ROTATED_REFRESH_SINK(account_id, refresh_token)
+        except Exception:
+            # Keeping the credential is best effort: a store that cannot write
+            # must not fail the read that already succeeded.
+            pass
+
+
+def _refresh_session(
+    account_id: str,
+    origin: str,
+    refresh_token: str,
+    timeout: float,
+) -> str:
+    """Exchange a refresh token for a live access token.
+
+    Returns the new access token, or an empty string when the station will not
+    mint one.  A station that has rotated the refresh token also hands back the
+    successor; it is remembered in memory so the next refresh keeps working
+    without ever writing a credential to disk.
+    """
+
+    if not account_id or not refresh_token:
+        return ""
+    origin = origin.rstrip("/")
+    if not origin:
+        return ""
+    request = urllib.request.Request(
+        f"{origin}{_SUB2API_REFRESH_PATH}",
+        data=json.dumps({"refresh_token": refresh_token}).encode("utf-8"),
+        headers={
+            **browser_request_headers(),
+            "Content-Type": "application/json",
+            # The station's own dashboard sends this on every API call; without
+            # it the same request is refused as an API client.
+            "X-User-UI-Request": "1",
+        },
+        method="POST",
+    )
+    try:
+        with isolated_http_opener().open(request, timeout=timeout) as response:
+            status = int(getattr(response, "status", None) or response.getcode())
+            body = response.read(MAX_RESPONSE_BYTES + 1)
+    except (urllib.error.HTTPError, urllib.error.URLError, OSError, socket.timeout, TimeoutError):
+        return ""
+    if not 200 <= status < 300 or len(body) > MAX_RESPONSE_BYTES:
+        return ""
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return ""
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        return ""
+    access_token = _string(data.get("access_token"))
+    if not access_token:
+        return ""
+    _remember_session(
+        account_id,
+        access_token,
+        _string(data.get("refresh_token")),
+        data.get("expires_in"),
+    )
+    return access_token
+
+
+def _forget_token(account_id: str) -> None:
+    """Drop one account's cached access token so the next read mints a new one."""
+
+    if not account_id:
+        return
+    with _TOKEN_CACHE_LOCK:
+        _TOKEN_CACHE.pop(account_id, None)
+
+
+def _live_access_token(
+    target: "UsageTarget",
+    timeout: float,
+    *,
+    skip_stored: bool = False,
+) -> str:
+    """The account's current access token, minted only when it is really spent.
+
+    The order matters, because signing in is the expensive, side-effecting step
+    a station may cap:
+
+    1. a token minted during this process, while the station still honors it;
+    2. the token the login already stored, while its own `exp` says it is live —
+       a dashboard session routinely outlives the reader, so asking the station
+       to mint a replacement for a token that still works is pure cost;
+    3. only then an exchange through the refresh token.
+
+    A token is trusted from its `exp` claim when it has one, and is otherwise
+    offered to the station once: a refusal is answered by the caller, which is
+    cheaper than minting a session the account may not need.
+    """
+
+    account_id = target.account_id
+    with _TOKEN_CACHE_LOCK:
+        cached = _TOKEN_CACHE.get(account_id)
+        if cached is not None and cached.usable(_monotonic()):
+            return cached.access_token
+        refresh_token = _REFRESH_CACHE.get(account_id) or target.refresh_token
+    stored = "" if skip_stored else _stored_access_token(target)
+    if stored:
+        return stored
+    return _refresh_session(account_id, target.origin, refresh_token, timeout)
+
+
+def _stored_access_token(target: "UsageTarget") -> str:
+    """The login's own access token, when its expiry claim says it still works.
+
+    A station that mints 48-hour tokens was being asked for a fresh one on every
+    single read, which is a session per refresh for a credential that never
+    needed replacing.  The token's own `exp` settles it here without a request.
+    A token that carries no readable claim is returned as it stands so the
+    station can be the one to judge it.
+    """
+
+    header = next(
+        (value for key, value in target.session_headers if key.lower() == "authorization"),
+        "",
+    )
+    token = header[7:].strip() if header.lower().startswith("bearer ") else ""
+    if not token:
+        return ""
+    expiry = _jwt_expiry(token)
+    if expiry is None:
+        # No readable claim: let the station decide, rather than minting a
+        # replacement for a token it may well still accept.
+        return token
+    return token if time.time() + _TOKEN_EXPIRY_MARGIN_SECONDS < expiry else ""
+
+
+def _jwt_expiry(token: str) -> float | None:
+    """The `exp` claim of a JWT-shaped token, or None when it has none."""
+
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None
+    payload = parts[1]
+    try:
+        padded = payload + "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
+    except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(claims, dict):
+        return None
+    expiry = claims.get("exp")
+    if isinstance(expiry, bool) or not isinstance(expiry, (int, float)):
+        return None
+    return float(expiry)
+
+
+def _session_headers_for(
+    target: "UsageTarget",
+    timeout: float,
+    *,
+    skip_stored: bool = False,
+) -> dict[str, str]:
+    """Dashboard headers for one read, with a token the station currently honors.
+
+    The login's stored token is used while its own expiry claim says it is live;
+    a replacement is minted only once it is spent.  ``skip_stored`` is for the
+    retry that follows a refusal: that token has just been rejected, so the
+    station has to mint one.
+    """
+
+    headers = dict(target.session_headers)
+    authorization_key = next(
+        (key for key in headers if key.lower() == "authorization"),
+        "",
+    )
+    if not authorization_key:
+        # No bearer login to renew: a cookie session is sent as it stands.
+        return headers
+    token = _live_access_token(target, timeout, skip_stored=skip_stored)
+    if not token:
+        return {}
+    headers[authorization_key] = f"Bearer {token}"
+    return headers
 
 
 def _session_headers(account: dict[str, Any]) -> dict[str, str]:
@@ -586,7 +879,7 @@ def _fetch_json_with_headers(
     )
     try:
         with isolated_http_opener().open(request, timeout=timeout) as response:
-            status = int(getattr(response, "status", response.getcode()))
+            status = int(getattr(response, "status", None) or response.getcode())
             body = response.read(MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as exc:
         if exc.code in {401, 403}:
@@ -612,12 +905,65 @@ def _fetch_json_with_headers(
     return "ok", payload
 
 
+def _newapi_self_page(
+    target: "UsageTarget",
+    timeout: float,
+    page: int,
+    size: int,
+) -> tuple[list[dict[str, Any]] | None, bool, int, int]:
+    """Read one page of the account's own log feed, the way its dashboard does.
+
+    ``/log/self`` is the endpoint the dashboard itself calls: it answers the
+    *login's* history, so the pane and the station show the same rows.  The
+    per-key feed beside it is scoped to the traffic one key served, and this
+    account's six keys proved that is not the same history — their newest rows
+    were 32 hours apart, and the same request answered 42, 53, 447 and 1000 rows
+    depending on which key was sent.  Reading by key was therefore both slower
+    (one request per key, merged) and wrong (a partial history presented as the
+    account's).
+
+    The second value says the station refused the login, the third is the total
+    the station states, and the fourth is the page size it actually applied: a
+    feed that caps its own page answered 100 rows for a request of 300, and a
+    pager built on the request would promise pages it cannot produce.
+
+    ``p`` is one-based here: the feed answered page one for both ``p=0`` and
+    ``p=1``, and every page after that follows its own numbering.
+    """
+
+    control_root = _control_api_root(target.api_base)
+    if not control_root:
+        return None, False, 0, 0
+    query = urllib.parse.urlencode({"p": max(1, page), "page_size": max(1, size)})
+    result, payload = _fetch_json_with_headers(
+        f"{control_root}/log/self?{query}", target.headers(), timeout
+    )
+    if result != "ok" or payload is None:
+        return None, result == "refused", 0, 0
+    data = payload.get("data") if isinstance(payload, dict) else None
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return None, False, 0, 0
+    total = data.get("total") if isinstance(data, dict) else None
+    total_rows = (
+        total if isinstance(total, int) and not isinstance(total, bool) and total > 0 else 0
+    )
+    applied = data.get("page_size") if isinstance(data, dict) else None
+    applied_rows = (
+        applied if isinstance(applied, int) and not isinstance(applied, bool) and applied > 0 else 0
+    )
+    return [item for item in items if isinstance(item, dict)], False, total_rows, applied_rows
+
+
 def _sub2api_ledger_rows(
     headers: dict[str, str],
     origin: str,
     timeout: float,
-) -> list[dict[str, Any]] | None:
-    """Read the account's per-request usage ledger, newest page first.
+    *,
+    page: int = 1,
+    rows_per_page: int | None = None,
+) -> tuple[list[dict[str, Any]] | None, bool, int, int]:
+    """Read one page of the account's per-request usage ledger.
 
     The dashboard reports each request with its own model, token counts,
     duration, and timestamp, which is what the pane's columns and its time
@@ -627,72 +973,70 @@ def _sub2api_ledger_rows(
     rows as the account has models.  Reading the ledger is what makes both
     honest.
 
-    A failure on a later page keeps the pages already read: a long history is
-    the common case, and losing all of it to one slow page would answer
-    "nothing" for an account that had thousands of rows.
+    One page per read, positioned by ``page``.  The station's own pagination is
+    the only way to answer an account with tens of thousands of rows: walking
+    every page before answering anything took 28 s on a real account, far past
+    the moment the pane stops waiting, and the table sat empty behind a spinner
+    while the whole history was fetched.  The total the station reports is
+    returned beside the rows, so the pane can say how much history exists
+    without reading any of it.
+
+    The second value says the station *refused* the read, which is what an
+    expired dashboard login answers.  A refusal is not an empty ledger: the
+    account has to be signed in again, and the pane has to be able to say so.
+    The third value is the account's total row count as the station reports it,
+    and the fourth is the page size it actually applied.  A station that is asked
+    for an out-of-range page does not cap it — it silently answers its own
+    default (20 rows for a request of 2000) — so a pager built on the request
+    would promise pages the ledger never returns.
     """
 
     if not headers:
-        return None
+        return None, False, 0, 0
     origin = origin.rstrip("/")
     if not origin:
-        return None
+        return None, False, 0, 0
 
-    def read_page(page: int) -> tuple[list[dict[str, Any]] | None, int]:
-        query = urllib.parse.urlencode(
-            {"page": page, "page_size": _SUB2API_PAGE_SIZE}
-        )
-        result, payload = _fetch_json_with_headers(
-            f"{origin}{_SUB2API_LEDGER_PATH}?{query}", headers, timeout
-        )
-        if result != "ok" or payload is None:
-            return None, 0
-        data = payload.get("data")
-        items = data.get("items") if isinstance(data, dict) else None
-        if not isinstance(items, list):
-            return None, 0
-        pages = data.get("pages") if isinstance(data, dict) else None
-        total = (
-            pages
-            if isinstance(pages, int) and not isinstance(pages, bool) and pages > 0
-            else 0
-        )
-        return [item for item in items if isinstance(item, dict)], total
-
-    # The first page settles how many pages exist, and it is the one the pane
-    # draws first (the newest requests), so it is read before the fan-out.
-    first, total_pages = read_page(1)
-    if not first:
-        return None
-    rows: list[dict[str, Any]] = list(first)
-    if len(first) < _SUB2API_PAGE_SIZE:
-        return rows
-    wanted = total_pages or _SUB2API_MAX_PAGES
-    wanted = min(_SUB2API_MAX_PAGES, wanted)
-    rest = list(range(2, wanted + 1))
-    if not rest:
-        return rows
-    # Later pages are independent reads of one list, so a slow history is not
-    # paid for one page at a time.  A page that fails ends the walk: the rows
-    # already read are the newest ones, and answering with them is honest.
-    workers = min(_SUB2API_PAGE_WORKERS, len(rest))
-    pages: dict[int, list[dict[str, Any]]] = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(read_page, page): page for page in rest}
-        for future in concurrent.futures.as_completed(futures):
-            page = futures[future]
-            try:
-                page_rows, _total = future.result()
-            except Exception:
-                page_rows = None
-            if page_rows is None:
-                break
-            pages[page] = page_rows
-    for page in sorted(pages):
-        rows.extend(pages[page])
-        if len(pages[page]) < _SUB2API_PAGE_SIZE:
-            break
-    return rows or None
+    size = rows_per_page or _SUB2API_PAGE_SIZE
+    size = max(1, min(size, _SUB2API_MAX_PAGE_SIZE))
+    # The ledger's own query, as the station's dashboard sends it: the list is
+    # ordered server-side, and a request that omits the ordering is answered
+    # with an arbitrary window of the account's history rather than its newest
+    # page.  The dashboard has always sent these params, so they are the
+    # endpoint's contract, not a preference.
+    query = urllib.parse.urlencode(
+        {
+            "page": max(1, page),
+            "page_size": size,
+            "sort_by": "created_at",
+            "sort_order": "desc",
+        }
+    )
+    result, payload = _fetch_json_with_headers(
+        f"{origin}{_SUB2API_LEDGER_PATH}?{query}", headers, timeout
+    )
+    if result != "ok" or payload is None:
+        # A refusal (401/403) is the station rejecting this login, which is what
+        # an expired dashboard session answers.  Every other failure says
+        # nothing about the login.
+        return None, result == "refused", 0, 0
+    data = payload.get("data")
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return None, False, 0, 0
+    total = data.get("total") if isinstance(data, dict) else None
+    total_rows = (
+        total
+        if isinstance(total, int) and not isinstance(total, bool) and total > 0
+        else 0
+    )
+    echoed = data.get("page_size") if isinstance(data, dict) else None
+    applied_rows = (
+        echoed
+        if isinstance(echoed, int) and not isinstance(echoed, bool) and echoed > 0
+        else size
+    )
+    return [item for item in items if isinstance(item, dict)], False, total_rows, applied_rows
 
 
 def _fetch_json(
@@ -712,7 +1056,7 @@ def _fetch_json(
     )
     try:
         with isolated_http_opener().open(request, timeout=timeout) as response:
-            status = int(getattr(response, "status", response.getcode()))
+            status = int(getattr(response, "status", None) or response.getcode())
             body = response.read(MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as exc:
         # A refusal is not the same fact as a missing route: 401/403 says the
@@ -759,6 +1103,24 @@ def _items(payload: dict[str, Any]) -> list[dict[str, Any]] | None:
         elif isinstance(container, list):
             return [item for item in container if isinstance(item, dict)]
     return None
+
+
+def _named_text(value: Any, limit: int = 64) -> str:
+    """The name a station states for something, whether it is a string or an object.
+
+    A Sub2API ledger spells a grouping as a whole object (``{"id": 21, "name":
+    "混合分组", …}``), not as a string.  Reading only strings dropped that name
+    everywhere it was nested, so the pane had a 分组 column with nothing in it.
+    """
+
+    if isinstance(value, str):
+        return _safe_text(value, limit)
+    if isinstance(value, Mapping):
+        for key in ("name", "title", "label", "group_name", "model_name"):
+            text = _safe_text(value.get(key), limit)
+            if text:
+                return text
+    return ""
 
 
 def _safe_text(value: Any, limit: int = 120) -> str:
@@ -881,6 +1243,29 @@ def _summary_rows(payload: dict[str, Any]) -> list[dict[str, Any]] | None:
     return rows
 
 
+def _duration_milliseconds(row: Mapping[str, Any]) -> str:
+    """One request's duration in milliseconds, whichever spelling states it.
+
+    Two families answer here with different units: a Sub2API ledger records
+    `duration_ms` (already milliseconds), while a New API log records `use_time`
+    in seconds.  Reading them as one unit rendered every New API row as `0`s —
+    eight seconds became eight milliseconds — so the unit is decided by the key
+    that carried the value.
+    """
+
+    milliseconds = row.get("duration_ms")
+    if milliseconds is None:
+        milliseconds = row.get("latency_ms")
+    if milliseconds is not None:
+        return _safe_number(milliseconds)
+    seconds = row.get("use_time")
+    if seconds is None:
+        seconds = row.get("duration")
+    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
+        return _safe_number(seconds)
+    return _safe_number(round(float(seconds) * 1000))
+
+
 def _row_details(row: dict[str, Any]) -> dict[str, str]:
     """Project one usage row into the fields the log view renders.
 
@@ -895,11 +1280,21 @@ def _row_details(row: dict[str, Any]) -> dict[str, str]:
             row.get("model_name") or row.get("model") or row.get("requested_model"),
             96,
         ),
-        "status": _safe_text(row.get("status") or row.get("request_type"), 32),
+        # A Sub2API ledger states no per-request outcome at all: it records
+        # `request_type` (stream / sync), which is the shape of the call, not
+        # whether it succeeded.  Reading that as a status labelled every
+        # historical row as streaming, so the column reported the transport as
+        # if it were the result.  Only a real status field is a status.
+        "status": _safe_text(row.get("status"), 32),
         "channel": _safe_text(row.get("channel_name") or row.get("channel"), 64),
-        "group": _safe_text(row.get("group_name") or row.get("group"), 64),
-        "key_name": _safe_text(row.get("token_name") or row.get("key_name"), 64),
-        "duration": _safe_number(row.get("use_time") or row.get("duration")),
+        # The grouping decides which rate a request was billed at, so it is a
+        # fact about the row and not decoration: a station sends it as an object
+        # with its own name.
+        "group": _named_text(row.get("group") or row.get("group_name") or row.get("group_title"), 64),
+        "key_name": _named_text(
+            row.get("token_name") or row.get("key_name") or row.get("api_key"), 64
+        ),
+        "duration": _duration_milliseconds(row),
         "prompt_tokens": _safe_number(row.get("prompt_tokens") or row.get("input_tokens")),
         "completion_tokens": _safe_number(
             row.get("completion_tokens") or row.get("output_tokens")
@@ -964,7 +1359,10 @@ def fetch_target(
     target: UsageTarget,
     timeout: float,
     fallback_timestamp: str | None = None,
-) -> tuple[str, list[dict[str, Any]]]:
+    *,
+    page: int = 1,
+    rows_per_page: int | None = None,
+) -> tuple[str, list[dict[str, Any]], str, int, int]:
     """Read every one of the account's keys and merge what they report.
 
     The feed is scoped per key, so one key answers for the traffic it served
@@ -987,41 +1385,90 @@ def fetch_target(
     # per request.  Reading the compatible summary document instead answered one
     # always-current row per model, so the pane could never show more rows than
     # the account had models and no time filter could select anything.
+    #
+    # The ledger is therefore the account's only log feed: when the dashboard
+    # login it needs has expired, the summary document beside it is *not* a
+    # fallback.  Falling through to it answered one row per model stamped with
+    # the moment of the read, so a signed-out account showed "9 rows" over nine
+    # models and read as a complete, up-to-date history.  An empty answer here
+    # is the honest one: the pane states that the relay reported nothing rather
+    # than presenting a per-model total as per-request traffic.
     if target.station_type == "sub2api" and target.session_headers:
-        ledger = _sub2api_ledger_rows(target.headers(), target.origin, timeout)
-        if ledger:
-            return "sub2api", _deduplicated_records(
-                _records_from(ledger, target, "sub2api", fallback_timestamp)
+        # The read uses the token this login already holds while it is live, and
+        # only mints another one once that is spent.  A dashboard session
+        # routinely outlives the pane, and asking the station to replace a
+        # working token costs a session each time — which is exactly what a
+        # station with a concurrent-session cap makes expensive.
+        headers = _session_headers_for(target, timeout)
+        if not headers:
+            # Neither the stored token nor an exchange produced one, so this
+            # login really is spent.  The caller may be able to renew it; it is
+            # the one that knows whether a sign-in is allowed.
+            return "", [], USAGE_REASON_LOGIN_EXPIRED, 0, 0
+        ledger, refused, station_total, applied_rows = _sub2api_ledger_rows(
+            headers, target.origin, timeout, page=page, rows_per_page=rows_per_page
+        )
+        if refused:
+            # The station refused the token it was given.  One renewal is tried,
+            # and only one: a station that refuses two tokens in a row is not
+            # answering a rotation, and repeating the exchange would be the
+            # refresh loop this read exists to avoid.
+            _forget_token(target.account_id)
+            headers = _session_headers_for(target, timeout, skip_stored=True)
+            if not headers:
+                return "", [], USAGE_REASON_LOGIN_EXPIRED, 0, 0
+            ledger, refused, station_total, applied_rows = _sub2api_ledger_rows(
+                headers, target.origin, timeout, page=page, rows_per_page=rows_per_page
             )
-    for kind, endpoint, authorization_scheme in _endpoint_candidates(target.api_base):
-        credentials = target.credentials()
-        if not credentials:
-            continue
-        probe = (kind, endpoint, authorization_scheme)
-        # One key settles the shape.  A refusal settles it too: it proves the
-        # endpoint exists, and only tells us this particular key cannot read
-        # it, so the remaining keys are still worth spending on it.
-        first_result, _payload, first_rows = _fetch_key(credentials[0], probe, timeout, kind)
-        answered = first_result == "ok"
-        if not answered and first_result != "refused":
-            continue
-        records: list[dict[str, Any]] = []
-        if first_rows is not None:
-            records.extend(_records_from(first_rows, target, kind, fallback_timestamp))
-        rest = credentials[1:]
-        if rest:
-            # The remaining keys are independent reads against one station, so
-            # they run together instead of one after another.
-            workers = min(MAX_WORKERS, len(rest))
-            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = [executor.submit(_fetch_key, key, probe, timeout, kind) for key in rest]
-                for future in futures:
-                    result, _payload, rows = future.result()
-                    if result == "ok" and rows is not None:
-                        records.extend(_records_from(rows, target, kind, fallback_timestamp))
-        if answered or records:
-            return kind, _deduplicated_records(records)
-    return "", []
+        if ledger is not None:
+            # An empty list is the station stating that this login has served
+            # nothing: a real answer, and the pane says so.  `None` is a read
+            # that never came back, which is a different fact below.  The kind
+            # travels even with no rows, because it says the station was read.
+            return (
+                "sub2api",
+                _deduplicated_records(
+                    _records_from(ledger, target, "sub2api", fallback_timestamp)
+                ),
+                "",
+                station_total,
+                applied_rows,
+            )
+        # The dashboard login is the only thing that can read this station's
+        # ledger, so a refused read means the login no longer answers and the
+        # account has to be signed in again.  That is reported as its own
+        # reason: an expired login is something the user can fix, and it is not
+        # the same fact as a station that installs no log feed.
+        if refused:
+            return "", [], USAGE_REASON_LOGIN_EXPIRED, 0, 0
+        return "", [], "", 0, 0
+    # Every usage read goes through the account's own dashboard session: the
+    # per-key feed beside it answers only the traffic one key served, so a
+    # reader that walked the keys reported a partial history as the account's —
+    # one request per key, and pages of 42, 53, 447 and 1000 rows for the same
+    # question.  A relay with no dashboard login therefore has no readable
+    # history here, and saying so is more useful than drawing another list.
+    size = max(1, min(rows_per_page or _SUB2API_PAGE_SIZE, MAX_ROWS_PER_TARGET))
+    if target.station_type == "newapi" and target.session_headers:
+        rows, refused, station_total, applied_rows = _newapi_self_page(
+            target, timeout, page, size
+        )
+        if rows is not None:
+            return (
+                "newapi",
+                _deduplicated_records(
+                    _records_from(rows, target, "newapi", fallback_timestamp)
+                ),
+                "",
+                station_total,
+                applied_rows,
+            )
+        if refused:
+            return "", [], USAGE_REASON_LOGIN_EXPIRED, 0, 0
+        return "", [], "", 0, 0
+    if not target.session_headers:
+        return "", [], USAGE_REASON_NO_CREDENTIAL, 0, 0
+    return "", [], "", 0, 0
 
 
 def _fetch_key(
@@ -1137,14 +1584,23 @@ def _fetch_target_safely(
     target: UsageTarget,
     timeout: float,
     fallback_timestamp: str,
-) -> tuple[str, list[dict[str, Any]]]:
+    *,
+    page: int = 1,
+    rows_per_page: int | None = None,
+) -> tuple[str, list[dict[str, Any]], str, int, int]:
     try:
-        return fetch_target(target, timeout, fallback_timestamp)
+        return fetch_target(
+            target,
+            timeout,
+            fallback_timestamp,
+            page=page,
+            rows_per_page=rows_per_page,
+        )
     except Exception:
         # A malformed third-party response must not prevent other configured
         # relays from refreshing, and the underlying exception may include a
         # host or remote text that the native window must never display.
-        return "", []
+        return "", [], "", 0, 0
 
 
 def usage_sources(path: pathlib.Path) -> list[dict[str, str]]:
@@ -1170,40 +1626,155 @@ def collect(
     path: pathlib.Path,
     timeout: float,
     source_id: str | None = None,
-) -> tuple[list[dict[str, Any]], str]:
-    """Gather every configured relay's usage rows as structured records.
+    relogin: Any = None,
+    *,
+    page: int = 1,
+    rows_per_page: int | None = None,
+) -> tuple[list[dict[str, Any]], str, int, int]:
+    """Read one page of a relay's usage rows.
 
-    Returns the records and a status sentence for the view to show when there
-    is nothing to list.  The caller renders the rows; this never formats the
-    station's data into prose, because the pane owns how a row looks.
+    Returns the records, a status sentence for the view to show when there is
+    nothing to list, the account's total row count as the station reports it,
+    and the page size the feed actually applied.  The total is what lets the pane say "48 345 rows" without reading any
+    of them: fetching a whole history before drawing anything is what left the
+    tab spinning, since a real account with 48 000 rows took 28 s.
+
+    The caller renders the rows; this never formats the station's data into
+    prose, because the pane owns how a row looks.
+
+    ``relogin`` is called with an account id that the station has stopped
+    accepting.  A relay account commonly has its password remembered, and a
+    spent dashboard login is exactly the case that can renew itself: reporting
+    it as expired without asking is telling the user to do work the app can do.
+    The callback renews the stored login; this reader then reads again.  Only a
+    renewal that also fails ends as ``login_expired``, which is the one case the
+    user can still act on.
     """
 
     try:
         targets = active_usage_targets(path)
     except UsageConfigError:
-        return [], USAGE_REASON_CONFIG_UNREADABLE
+        return [], USAGE_REASON_CONFIG_UNREADABLE, 0, 0
     if source_id:
         # An unknown id is not an error the user can fix: the configuration may
         # have moved under a dropdown whose selection is one refresh old. Read
         # nothing rather than silently answering for a different relay.
         targets = [target for target in targets if target.source_id == source_id]
         if not targets:
-            return [], USAGE_REASON_UNKNOWN_SOURCE
+            return [], USAGE_REASON_UNKNOWN_SOURCE, 0, 0
     if not targets:
-        return [], USAGE_REASON_NO_CREDENTIAL
+        return [], USAGE_REASON_NO_CREDENTIAL, 0, 0
 
+    read = _read_targets(targets, timeout, page=page, rows_per_page=rows_per_page)
+    if read.expired_login and callable(relogin):
+        # The login is spent, and a remembered password can replace it.  The
+        # renewals run first and the read repeats, so a relay that signs itself
+        # back in never appears to the user as an expired login at all.
+        renewed = False
+        for target in targets:
+            if target.account_id and _renew_login(relogin, target.account_id):
+                renewed = True
+        if renewed:
+            # The station has new material, so the cached tokens for these
+            # accounts are spent by definition.
+            for target in targets:
+                _forget_token(target.account_id)
+            try:
+                targets = [
+                    t
+                    for t in active_usage_targets(path)
+                    if not source_id or t.source_id == source_id
+                ]
+            except UsageConfigError:
+                targets = []
+            read = _read_targets(targets, timeout, page=page, rows_per_page=rows_per_page)
+    if not read.readable:
+        # A relay whose dashboard login the station no longer accepts is not a
+        # relay that installs no feed: signing in again is the fix, so the pane
+        # says that instead of "unsupported".
+        reason = (
+            USAGE_REASON_LOGIN_EXPIRED if read.expired_login else USAGE_REASON_UNSUPPORTED
+        )
+        return [], reason, read.total, read.page_rows
+    if not read.records and read.answered_empty:
+        return [], USAGE_REASON_NO_ROWS, read.total, read.page_rows
+    return read.records, "", read.total, read.page_rows
+
+
+def _renew_login(relogin: Any, account_id: str) -> bool:
+    """Ask the store to sign one account in again, keeping every failure quiet.
+
+    A station that refuses the sign-in, caps its sessions, or cannot be reached
+    is not an error this reader reports: the read that follows states what the
+    relay's usage actually is, and the login itself is the relay panes' story.
+    """
+
+    try:
+        renewed = relogin(account_id)
+    except Exception:
+        return False
+    return bool(renewed)
+
+
+@dataclass
+class _TargetRead:
+    """One page read from every selected relay, folded into what the pane needs."""
+
+    records: list[dict[str, Any]]
+    readable: bool
+    answered_empty: bool
+    expired_login: bool
+    # The account's total row count as the station reports it, which is what
+    # the pager counts pages from without reading the rows.
+    total: int
+    # The page size the feed actually applied, which is what the pager counts
+    # from: a feed that caps its own page answered 100 rows for a request of 300.
+    page_rows: int
+
+
+def _read_targets(
+    targets: list[UsageTarget],
+    timeout: float,
+    *,
+    page: int = 1,
+    rows_per_page: int | None = None,
+) -> _TargetRead:
+    """Read one page from every target and fold the answers into one result."""
+
+    if not targets:
+        return _TargetRead([], False, False, False, 0, 0)
     observed_at = _utc_now_iso()
-    workers = min(MAX_WORKERS, len(targets))
+    workers = max(1, min(MAX_WORKERS, len(targets)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
         futures = [
-            executor.submit(_fetch_target_safely, target, timeout, observed_at) for target in targets
+            executor.submit(
+                _fetch_target_safely,
+                target,
+                timeout,
+                observed_at,
+                page=page,
+                rows_per_page=rows_per_page,
+            )
+            for target in targets
         ]
         results = [future.result() for future in futures]
 
     records: list[dict[str, Any]] = []
     readable = False
     answered_empty = False
-    for (source, rows) in results:
+    expired_login = False
+    total = 0
+    page_rows = 0
+    for source, rows, reason, station_total, applied_rows in results:
+        if applied_rows > 0:
+            page_rows = applied_rows
+        if reason == USAGE_REASON_LOGIN_EXPIRED:
+            expired_login = True
+        # One selected relay answers for one page, so its own total is the
+        # count the pager needs.  Several accounts of one station are several
+        # lists, and their totals add up.
+        if station_total > 0:
+            total += station_total
         if not source:
             continue
         readable = True
@@ -1213,11 +1784,7 @@ def collect(
             # that installs no feed, and the pane says which.
             answered_empty = True
         records.extend(rows)
-    if not readable:
-        return [], USAGE_REASON_UNSUPPORTED
-    if not records and answered_empty:
-        return [], USAGE_REASON_NO_ROWS
-    return records, ""
+    return _TargetRead(records, readable, answered_empty, expired_login, total, page_rows)
 
 
 def render(
@@ -1227,7 +1794,7 @@ def render(
 ) -> str:
     """The CLI's own plain-text presentation of the same records."""
 
-    records, status = collect(path, timeout, source_id)
+    records, status, _total, _page_rows = collect(path, timeout, source_id)
     if status:
         return status
     if not records:

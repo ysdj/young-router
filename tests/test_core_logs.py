@@ -61,22 +61,39 @@ class _ScopedUsageReader:
 
 
 class _PagedUsageReader:
-    """A relay whose five rows span two pages without a second remote read."""
+    """A relay that answers one page of a five-row history per request.
+
+    The station owns the history, so a page turn is a request for that page:
+    the reader reports its own total beside the rows it returns.
+    """
 
     def __init__(self) -> None:
         self.calls = 0
+        self.requests: list[tuple[int, int]] = []
 
-    def refresh(self, source_id: str | None = None) -> list[dict[str, str]]:
+    def refresh(
+        self,
+        source_id: str | None = None,
+        *,
+        page: int = 1,
+        rows_per_page: int | None = None,
+    ) -> tuple[list[dict[str, str]], str, int]:
         self.calls += 1
-        return [
+        size = rows_per_page or 3
+        self.requests.append((page, size))
+        # Newest first, the way a real ledger answers, so the page the reader
+        # returns is already in the order the pane draws it.
+        rows = [
             {
-                "timestamp": f"2026-01-01T00:00:0{index}Z",
+                "timestamp": f"2026-01-01T00:00:{10 + index:02d}Z",
                 "source": "newapi",
                 "source_label": "paged-relay",
                 "model": f"model-{index}",
             }
             for index in range(5)
         ]
+        start = (page - 1) * size
+        return rows[start:start + size], "", len(rows)
 
 
 class _StructuredUsageReader:
@@ -1386,6 +1403,170 @@ model_list:
             self.assertEqual("deployment-b", record["failed_route"]["deployment_id"])
             self.assertEqual("deployment-c", record["candidate_routes"][0]["deployment_id"])
 
+    def test_route_trace_reports_the_wire_that_was_sent_not_the_backup_protocol(self) -> None:
+        """A fallback-mode route declares its backup protocol, not the wire.
+
+        ``upstream_url_surface`` on a ``fallback`` route is the protocol it may
+        switch to, so a route that serves /v1/responses natively still declares
+        ``openai/chat``. Reading that declaration as the wire put "Chat" on a
+        live Responses stream, and a correction on a later record changed the
+        label, which split one route into two steps in the viewer.
+        """
+
+        route_key = (
+            "model=public-chat / provider=provider-a / upstream=openai/upstream-chat"
+            " / host=provider.example / key=team / order=0.1"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            records = [
+                {
+                    "timestamp": "2026-08-01T04:10:11Z",
+                    "event": "selected_deployment",
+                    "request_id": "req-1",
+                    "model_group": "public-chat",
+                    "deployment_id": "deployment-a",
+                    "order": 0.1,
+                    "route_key": route_key,
+                    "deployment": {
+                        "id": "deployment-a",
+                        "provider": "provider-a",
+                        "model": "openai/upstream-chat",
+                        "order": 0.1,
+                        "route_key": route_key,
+                        "upstream_url_surface": "openai/chat",
+                        "upstream_protocol_mode": "fallback",
+                        "surface": "openai/responses",
+                    },
+                },
+                {
+                    "timestamp": "2026-08-01T04:10:14Z",
+                    "event": "deployment_success",
+                    "request_id": "req-1",
+                    "model_group": "public-chat",
+                    "deployment_id": "deployment-a",
+                    "order": 0.1,
+                    "route_key": route_key,
+                    "deployment": {
+                        "id": "deployment-a",
+                        "provider": "provider-a",
+                        "model": "openai/upstream-chat",
+                        "order": 0.1,
+                        "route_key": route_key,
+                        "upstream_url_surface": "openai/chat",
+                        "upstream_protocol_mode": "fallback",
+                        "surface": "openai/responses",
+                    },
+                },
+            ]
+            (root / "server.log").write_text(
+                "".join(
+                    f"[{record['timestamp']}] litellm_route_trace {json.dumps(record)}\n"
+                    for record in records
+                ),
+                encoding="utf-8",
+            )
+
+            projected = LogsDomain(root).view("route-trace")["log"]["records"]
+
+            self.assertEqual(2, len(projected))
+            for record in projected:
+                # Both records name one identity: the wire and the policy are
+                # separate facts and neither may join the route's identity.
+                self.assertEqual("openai/responses", record["route"]["surface"])
+                self.assertEqual("fallback", record["route"]["protocol_mode"])
+                self.assertEqual(record["route"], projected[0]["route"])
+
+    def test_route_trace_never_reads_the_declared_surface_as_the_wire(self) -> None:
+        """Without an attempt-written ``surface`` the trace states no wire.
+
+        Guessing from ``upstream_url_surface`` is how a route that answered
+        Responses was reported as a chat call. An absent fact has to stay
+        absent instead of borrowing the declaration.
+        """
+
+        route_key = "model=public-chat / provider=provider-a / upstream=openai/upstream-chat"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = {
+                "timestamp": "2026-08-01T04:10:11Z",
+                "event": "selected_deployment",
+                "request_id": "req-1",
+                "model_group": "public-chat",
+                "deployment_id": "deployment-a",
+                "route_key": route_key,
+                "deployment": {
+                    "id": "deployment-a",
+                    "provider": "provider-a",
+                    "model": "openai/upstream-chat",
+                    "route_key": route_key,
+                    "upstream_url_surface": "openai/chat",
+                    "upstream_protocol_mode": "fallback",
+                },
+            }
+            (root / "server.log").write_text(
+                f"litellm_route_trace {json.dumps(payload)}\n",
+                encoding="utf-8",
+            )
+
+            route = LogsDomain(root).view("route-trace")["log"]["records"][0]["route"]
+
+            self.assertNotIn("surface", route)
+            self.assertEqual("fallback", route["protocol_mode"])
+
+    def test_a_reasoning_replay_repair_is_reported_as_a_local_step(self) -> None:
+        """The repair happens before an upstream judges the request.
+
+        It is named with its own detail so the row reads as a rewrite this
+        router made, not as a route event or an upstream failure.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = {
+                "timestamp": "2026-08-01T04:10:11Z",
+                "event": "responses_chat_bridge_reasoning_replay_repaired",
+                "request_id": "req-1",
+                "model_group": "public-chat",
+                "repaired_tool_call_count": 2,
+                "repaired_tool_call_ids": ["call_1", "call_2"],
+            }
+            (root / "server.log").write_text(
+                f"litellm_route_trace {json.dumps(payload)}\n",
+                encoding="utf-8",
+            )
+
+            record = LogsDomain(root).view("route-trace")["log"]["records"][0]
+
+            self.assertEqual("calls=2", record["detail"])
+
+    def test_a_function_tool_bridge_is_not_reported_as_an_upstream_error(self) -> None:
+        """Its ``reason`` says why client tools were rewritten, not what failed.
+
+        The event fell through to the generic ``reason=`` detail, where an
+        unmapped token rendered as 上游异常 — a local adaptation reported as an
+        upstream failure, before anything had been sent.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = {
+                "timestamp": "2026-08-01T04:10:11Z",
+                "event": "responses_function_tool_bridge_start",
+                "request_id": "req-1",
+                "model_group": "public-chat",
+                "preemptive_reason": "client_tools_need_responses_function_bridge",
+            }
+            (root / "server.log").write_text(
+                f"litellm_route_trace {json.dumps(payload)}\n",
+                encoding="utf-8",
+            )
+
+            record = LogsDomain(root).view("route-trace")["log"]["records"][0]
+
+            self.assertEqual("bridge=client_tools_need_responses_function_bridge", record["detail"])
+            self.assertNotIn("reason=", record["detail"])
+
     def test_route_trace_does_not_mark_a_failed_only_route_as_selected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2113,13 +2294,18 @@ model_list:
                 {"domain": "logs", "type": "logs.refresh_online_usage", "payload": {"tab": "online-usage", "source": "relay"}}
             )
             first = client.call("logs", {"tab": "online-usage"})["log"]
-            self.assertEqual((300, 1, 2), (first["line_count"], first["page"], first["page_count"]))
+            # This reader answers a whole list without a station total, so the
+            # rows it returned are the visible page and the total it states.
+            self.assertEqual((450, 1, 2), (first["line_count"], first["page"], first["page_count"]))
+            self.assertEqual(300, first["page_rows"])
 
             server.core.dispatch(
                 {"domain": "logs", "type": "logs.load_more", "payload": {"tab": "online-usage"}}
             )
             second = client.call("logs", {"tab": "online-usage"})["log"]
-            self.assertEqual((450, 2, 2, 0), (second["line_count"], second["page"], second["page_count"], second["remaining"]))
+            # A reader without paging answers the same list for page two, so the
+            # pager still names a page it can describe rather than crashing.
+            self.assertEqual(2, second["page"])
             self.assertEqual([], [key for key in first if key.startswith("_")])
 
     def test_default_core_can_start_when_the_optional_worker_is_not_configured(self) -> None:
@@ -2321,7 +2507,7 @@ model_list:
 
             self.assertEqual(["relay"], [source["label"] for source in sources])
 
-    def test_online_usage_pages_move_over_fetched_rows_in_both_directions(self) -> None:
+    def test_online_usage_pages_move_over_the_stations_history(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             reader = _PagedUsageReader()
             with mock.patch("young_router.core.domains.logs.ONLINE_USAGE_PAGE_ROWS", 3):
@@ -2330,43 +2516,131 @@ model_list:
                 tab = domain.view("online-usage")["log"]
                 self.assertEqual(5, tab["total"])
                 self.assertEqual((1, 2, 3), (tab["page"], tab["page_count"], tab["line_count"]))
-                self.assertEqual(["model-2", "model-3", "model-4"], [row["model"] for row in tab["records"]])
+                self.assertEqual(["model-0", "model-1", "model-2"], [row["model"] for row in tab["records"]])
 
                 domain.dispatch("logs.load_more", {"tab": "online-usage"})
                 tab = domain.view("online-usage")["log"]
-                self.assertEqual((2, 2, 5), (tab["page"], tab["page_count"], tab["line_count"]))
-                self.assertEqual("model-0", tab["records"][0]["model"])
+                self.assertEqual((2, 2, 2), (tab["page"], tab["page_count"], tab["line_count"]))
+                self.assertEqual(["model-3", "model-4"], [row["model"] for row in tab["records"]])
                 self.assertEqual(0, tab["remaining"])
+                # Two page turns read two different pages from the relay.
+                self.assertEqual([(1, 3), (2, 3)], reader.requests)
 
                 domain.dispatch("logs.previous_page", {"tab": "online-usage"})
                 tab = domain.view("online-usage")["log"]
                 self.assertEqual((1, 2, 3), (tab["page"], tab["page_count"], tab["line_count"]))
-                self.assertEqual("model-2", tab["records"][0]["model"])
+                self.assertEqual(["model-0", "model-1", "model-2"], [row["model"] for row in tab["records"]])
                 self.assertEqual(2, tab["remaining"])
 
-            self.assertEqual(1, reader.calls)
+            # Three page turns, three reads: every page came from the relay.
+            self.assertEqual(3, reader.calls)
 
-    def test_online_usage_first_page_carries_three_hundred_rows(self) -> None:
-        class _LargeUsageReader:
-            def refresh(self, source_id: str | None = None) -> list[dict[str, str]]:
-                return [
-                    {"timestamp": "2026-01-01T00:00:00Z", "source_label": source_id or "", "model": str(index)}
-                    for index in range(450)
-                ]
+    def test_a_failed_usage_read_keeps_the_page_already_shown(self) -> None:
+        """One dropped poll must not blank a table that was filled.
 
+        The pane shows what Core holds, so a read that failed and replaced its
+        rows with nothing made the table empty a while after it had loaded, with
+        no error and nothing to act on.
+        """
+
+        class _FlakyReader:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def refresh(
+                self,
+                source_id: str | None = None,
+                *,
+                page: int = 1,
+                rows_per_page: int | None = None,
+            ):
+                self.calls += 1
+                if self.calls == 1:
+                    return [{"timestamp": "2026-01-01T00:00:00Z", "model": "kept"}], "", 1, 300
+                raise RuntimeError("relay went away")
+
+        reader = _FlakyReader()
         with tempfile.TemporaryDirectory() as directory:
-            domain = LogsDomain(directory, online_usage_reader=_LargeUsageReader())
+            domain = LogsDomain(directory, online_usage_reader=reader)
+            domain.dispatch(
+                "logs.refresh_online_usage",
+                {"tab": "online-usage", "source": "one"},
+            )
+            self.assertEqual(1, domain.view("online-usage")["log"]["line_count"])
+
+            # The next read fails; the rows it did not replace stay on screen.
+            domain.dispatch(
+                "logs.refresh_online_usage",
+                {"tab": "online-usage", "source": "one"},
+            )
+            tab = domain.view("online-usage")["log"]
+            self.assertEqual(1, tab["line_count"])
+            self.assertEqual("kept", tab["records"][0]["model"])
+            self.assertIn("unavailable", tab["reason"].lower())
+
+    def test_online_usage_reads_one_page_from_the_relay(self) -> None:
+        """The relay owns the history, so a page turn is a page request.
+
+        Holding every row in memory and re-slicing it could only ever reach the
+        pages one refresh had already fetched: a real account with 48 000 rows
+        showed a few hundred and had no way past them.  The station reports the
+        total beside each page, so the pager can count pages without reading
+        them.
+        """
+
+        pages = {
+            1: [{"timestamp": "2026-01-01T00:00:00Z", "model": f"p1-{i}"} for i in range(300)],
+            2: [{"timestamp": "2026-01-01T00:00:01Z", "model": f"p2-{i}"} for i in range(300)],
+        }
+
+        class _StationPagedReader:
+            def __init__(self) -> None:
+                self.requests: list[tuple[int, int]] = []
+
+            def refresh(
+                self,
+                source_id: str | None = None,
+                *,
+                page: int = 1,
+                rows_per_page: int | None = None,
+            ) -> tuple[list[dict[str, str]], str, int]:
+                self.requests.append((page, rows_per_page or 0))
+                return pages.get(page, []), "", 600
+
+        reader = _StationPagedReader()
+        with tempfile.TemporaryDirectory() as directory:
+            domain = LogsDomain(directory, online_usage_reader=reader)
             domain.dispatch("logs.refresh_online_usage", {"tab": "online-usage", "source": "one"})
             tab = domain.view("online-usage")["log"]
 
-            self.assertGreaterEqual(tab["line_count"], 300)
-            self.assertEqual(tab["line_count"] + tab["remaining"], tab["total"])
-            self.assertEqual((450, 1, 2), (tab["total"], tab["page"], tab["page_count"]))
+            # One request, one page: the total is the station's, not a count.
+            self.assertEqual([(1, 300)], reader.requests)
+            self.assertEqual(300, tab["line_count"])
+            self.assertEqual((600, 1, 2), (tab["total"], tab["page"], tab["page_count"]))
+            self.assertEqual(300, tab["remaining"])
 
-            domain.dispatch("logs.load_more", {"tab": "online-usage"})
+            domain.dispatch("logs.next_page", {"tab": "online-usage"})
             next_page = domain.view("online-usage")["log"]
-            self.assertEqual(450, next_page["line_count"])
+            self.assertEqual([(1, 300), (2, 300)], reader.requests)
+            self.assertEqual("p2-0", next_page["records"][0]["model"])
             self.assertEqual((2, 2, 0), (next_page["page"], next_page["page_count"], next_page["remaining"]))
+
+            # Last page jumps straight to the end of the station's history.
+            domain.dispatch("logs.last_page", {"tab": "online-usage"})
+            self.assertEqual(2, domain.view("online-usage")["log"]["page"])
+
+            domain.dispatch("logs.first_page", {"tab": "online-usage"})
+            self.assertEqual(1, domain.view("online-usage")["log"]["page"])
+
+            # An explicit page is read as asked.
+            domain.dispatch("logs.goto_page", {"tab": "online-usage", "page": 2})
+            self.assertEqual(2, domain.view("online-usage")["log"]["page"])
+
+            # A different page size restarts at the first page of the new split.
+            domain.dispatch("logs.set_page_rows", {"tab": "online-usage", "rows_per_page": 50})
+            sized = domain.view("online-usage")["log"]
+            self.assertEqual((1, 50, 12), (sized["page"], sized["page_rows"], sized["page_count"]))
+            self.assertEqual(50, reader.requests[-1][1])
 
     def test_a_byte_trimmed_online_usage_page_does_not_hide_following_pages(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2501,6 +2775,8 @@ model_list:
                         "total_tokens": "120",
                     }],
                     "",
+                    1,
+                    300,
                 ),
             ) as collect:
                 domain.dispatch(
@@ -2508,7 +2784,9 @@ model_list:
                     {"tab": "online-usage", "source": "one"},
                 )
 
-            collect.assert_called_once_with(domain.config_path, 5.0, "one")
+            collect.assert_called_once_with(
+                domain.config_path, mock.ANY, "one", mock.ANY, page=1, rows_per_page=mock.ANY
+            )
             record = domain.view("online-usage")["log"]["records"][0]
             self.assertEqual("2026-07-18T10:00:00Z", record["timestamp"])
             self.assertEqual("relay", record["source_label"])

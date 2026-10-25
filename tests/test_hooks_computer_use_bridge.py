@@ -197,6 +197,7 @@ class HookComputerUseBridgeTests(HookTestCase):
             "id": "provider_alpha-generic-chat",
             "route_key": "provider_alpha / openai/vendor-chat / key=default",
             "upstream_url_surface": "openai/chat",
+            "supported_upstream_url_surfaces": ["openai/chat"],
         }
 
         # Chat-only route, no client-side computer use: the answer is explicit

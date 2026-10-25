@@ -516,12 +516,9 @@ def infer_upstream_fallback_surface(value: Any) -> str:
     tokens = [token for token in re.split(r"[^a-z0-9]+", model) if token]
     if any(token in {"claude", "anthropic"} for token in tokens):
         return "anthropic"
-    if any(
-        token in {"gpt", "openai", "o1", "o2", "o3", "o4", "codex"}
-        or token.startswith(("gpt", "o1", "o2", "o3", "o4"))
-        for token in tokens
-    ):
-        return "openai/responses"
+    # Everything else falls back to Chat Completions: it is the one wire every
+    # OpenAI-compatible relay answers, and a fallback is only consulted after the
+    # upstream refused the protocol the client used.
     return "openai/chat"
 
 

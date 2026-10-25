@@ -245,7 +245,9 @@ class CodexConfigTests(unittest.TestCase):
         self.assertEqual("https://stale-openai.example.test/v1", parsed["openai_base_url"])
         self.assertEqual(codex_config.LITELLM_CODEX_PROVIDER_NAME, parsed["model_providers"]["newapi"]["name"])
         self.assertEqual("http://127.0.0.1:4999/v1", parsed["model_providers"]["newapi"]["base_url"])
-        self.assertNotIn("supports_standalone_web_search", parsed["model_providers"]["newapi"])
+        # The LiteLLM route keeps Codex's standalone search, the only web
+        # tool the Responses Lite lane can expose.
+        self.assertIs(True, parsed["model_providers"]["newapi"]["supports_standalone_web_search"])
         self.assertEqual("https://fallback.example.test/v1", parsed["model_providers"]["newapi"]["base_url1"])
         self.assertEqual("sk-test-local", json.loads(auth_text)["OPENAI_API_KEY"])
 

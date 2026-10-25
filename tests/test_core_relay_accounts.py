@@ -4663,3 +4663,65 @@ class RelayReadPolicyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RelaySessionLeaseTests(unittest.TestCase):
+    """The dashboard link reads the session through the one-time native lease.
+
+    A dashboard window is a browser of its own, so the session that makes it a
+    dashboard rather than a second sign-in page has to come from Core.  These
+    pin the two facts the host depends on: the lease answers the fields the
+    console reads, and an account Core holds no login for answers nothing (so
+    the window opens at the station's own address instead of failing).
+    """
+
+    def test_the_session_lease_states_the_fields_a_console_keeps(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RelayAccountsDomain(Path(directory), http_client=_NoRelayHTTP())
+            domain.dispatch(
+                "account.add",
+                {"type": "sub2api", "label": "Relay", "origin": "https://relay.example.test"},
+            )
+            account_id = domain.snapshot()["accounts"][0]["id"]
+            domain.accept_login_result(
+                account_id,
+                username="person@example.test",
+                access_token="replace-access-token",
+                refresh_token="replace-refresh-token",
+                user_id="272",
+                remember_password=True,
+                preserve_resources=True,
+            )
+
+            payload = json.loads(domain.trusted_secret_value("session", account_id))
+
+            self.assertEqual(
+                {"username", "user_id", "access_token", "refresh_token", "expires_at"},
+                set(payload),
+            )
+            self.assertEqual("person@example.test", payload["username"])
+            self.assertEqual("272", payload["user_id"])
+            self.assertEqual("replace-access-token", payload["access_token"])
+            self.assertEqual("replace-refresh-token", payload["refresh_token"])
+            # A sub2api console refuses a token it cannot date, so the lease
+            # states a future expiry; the console's own refresh extends it.
+            self.assertGreater(int(payload["expires_at"]), 1_700_000_000_000)
+
+    def test_an_account_with_no_session_states_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RelayAccountsDomain(Path(directory), http_client=_NoRelayHTTP())
+            domain.dispatch(
+                "account.add",
+                {"type": "sub2api", "label": "Relay", "origin": "https://relay.example.test"},
+            )
+            account_id = domain.snapshot()["accounts"][0]["id"]
+
+            with self.assertRaises(Exception):
+                domain.trusted_secret_value("session", account_id)
+
+
+class _NoRelayHTTP:
+    """A station that is never contacted: this lease is local data only."""
+
+    def json(self, *arguments: object, **keywords: object) -> object:
+        raise AssertionError("the session lease must not read the station")

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import importlib
+from unittest import mock
+
 import copy
 
 from hook_test_utils import *
@@ -299,6 +302,46 @@ class HookRouteRecoveryTests(HookTestCase):
 
         self.assertTrue(hooks._is_route_recovery_poll_error(exc))
         self.assertTrue(hooks._should_return_route_recovery_stream(exc, request_data))
+
+    def test_a_logged_out_adapter_is_parked_instead_of_ending_the_turn(self) -> None:
+        """The adapter reports its own upstream 401 as an HTTP 400.
+
+        Read as the request's verdict that ends the turn; it is the route's
+        credential, so the route is parked and a sibling can answer.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+
+        class SessionRejectedError(Exception):
+            status_code = 400
+
+        exc = SessionRejectedError(
+            "litellm.BadRequestError: OpenAIException - workbuddy 上游失败："
+            '请求被上游拒绝（http 401）。<html><body><center><h1>401 Authorization '
+            "Required</h1></center></body></html>。"
+        )
+
+        self.assertTrue(hooks._is_upstream_session_rejected_error(exc))
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(exc),
+            hooks._RECOVERY_POLICY_COOLDOWN,
+        )
+
+    def test_a_parameter_refusal_stays_the_requests_own_verdict(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+
+        class ParameterError(Exception):
+            status_code = 400
+
+        exc = ParameterError(
+            "该请求被上游按参数拒绝：与网络、账号、额度都无关，换账号也不会改变结果"
+        )
+
+        self.assertFalse(hooks._is_upstream_session_rejected_error(exc))
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(exc),
+            hooks._RECOVERY_POLICY_ERROR,
+        )
 
     def test_route_recovery_polls_on_upstream_insufficient_user_quota(self) -> None:
         hooks, _proxy_server = load_hook_module()
@@ -1533,6 +1576,100 @@ class HookRouteRecoveryTests(HookTestCase):
         self.assertTrue(any(hooks._is_route_recovery_sse_keepalive(chunk) for chunk in chunks))
         self.assertIn({"type": "response.output_text.delta", "delta": "delayed recovery"}, chunks)
         self.assertEqual(chunks[-1], {"type": "response.completed", "response": {"id": "resp-delayed"}})
+
+    async def test_route_recovery_poll_delivers_requested_reasoning_without_a_dropped_frame(self) -> None:
+        """A recovered attempt keeps the thinking this client asked for, as JSON.
+
+        The attempt adapts its own chunks for delivery, and it used to do so
+        without the request.  The reasoning-visibility rule then read every
+        recovered attempt as "no summary asked for" and answered ``None`` for
+        the buffered thinking frames it flushed ahead of the answer.  That
+        ``None`` went out as the literal ``data: None`` -- the malformed frame pi
+        aborted a live turn on -- and a client that had asked for thinking lost
+        it on exactly the recovery that was saving the turn.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+
+        class ServiceUnavailable(Exception):
+            status_code = 503
+
+        async def fake_fallback_round(
+            _request_data,
+            exception,
+            *,
+            allow_repeated_attempt=False,
+            route_recovery_poll=False,
+        ):
+            yield {"type": "response.created", "response": {"id": "resp-recovered"}}
+            yield {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"id": "rs-1", "type": "reasoning", "summary": []},
+            }
+            yield {
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": "rs-1",
+                "output_index": 0,
+                "summary_index": 0,
+                "delta": "thinking it over",
+            }
+            yield {
+                "type": "response.output_text.delta",
+                "item_id": "msg-1",
+                "output_index": 1,
+                "content_index": 0,
+                "delta": "the recovered answer",
+            }
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-recovered",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "id": "msg-1",
+                            "type": "message",
+                            "status": "completed",
+                            "role": "assistant",
+                            "content": [
+                                {"type": "output_text", "text": "the recovered answer", "annotations": []}
+                            ],
+                        }
+                    ],
+                },
+            }
+
+        hooks._stream_streaming_error_fallback_round = fake_fallback_round
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "0.05")
+        self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "reasoning": {"effort": "high", "summary": "auto"},
+            "model_info": {"id": "order1-a", "order": 1},
+        }
+
+        chunks = [
+            chunk
+            async for chunk in hooks._stream_route_recovery_poll(
+                request_data,
+                ServiceUnavailable("upstream temporarily unavailable"),
+            )
+        ]
+
+        self.assertNotIn(
+            None,
+            chunks,
+            "a dropped chunk must never be forwarded: LiteLLM writes it as `data: None`",
+        )
+        delivered_types = [
+            chunk.get("type") for chunk in chunks if isinstance(chunk, dict)
+        ]
+        self.assertIn("response.reasoning_summary_text.delta", delivered_types)
+        self.assertIn("response.output_text.delta", delivered_types)
+        self.assertEqual("response.completed", delivered_types[-1])
 
     async def test_route_recovery_poll_keepalive_after_web_search_call_until_answer(self) -> None:
         hooks, _proxy_server = load_hook_module()
@@ -2861,7 +2998,7 @@ class HookRouteRecoveryTests(HookTestCase):
         )
         error = event["response"]["error"]
         self.assertEqual(error["type"], "invalid_request_error")
-        self.assertEqual(error["code"], "upstream_request_body_too_large")
+        self.assertEqual(error["code"], "invalid_prompt")
         self.assertNotIn("route failed", error["message"])
         self.assertIn("too large", error["message"])
 
@@ -3290,6 +3427,130 @@ class HookRouteRecoveryTests(HookTestCase):
         )
         self.assertEqual(hooks._trace_exception(exc)["reason"], "upstream-network-connectivity")
 
+    def test_a_body_the_upstream_cut_mid_stream_parks_the_route(self) -> None:
+        """A half-written body is the route's own fault, not an unclassified stop.
+
+        This is the exact exception text a real turn ended on: LiteLLM maps
+        ``aiohttp.ClientPayloadError`` onto ``httpx.ReadError``, so an upstream
+        that closes a response while it is still writing reaches this module as
+        a read error carrying the truncated-body sentence and no status code.
+        Every connectivity marker misses that text, so the failure used to land
+        in ``other`` with the ``error`` policy: the route was never cooled down,
+        the trace named no cause, and the next request selected the same
+        upstream that had just cut a turn mid-answer.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+
+        class ReadError(Exception):
+            pass
+
+        exc = ReadError(
+            "response payload is not completed: <transferencodingerror: 400, "
+            "message='not enough data to satisfy transfer length header.'>"
+        )
+        exc.failed_deployment_id = "c52c205f"
+        exc.failed_deployment_order = 0
+
+        self.assertTrue(hooks._is_upstream_truncated_stream_error(exc))
+        self.assertTrue(hooks._is_route_cut_stream_error(exc))
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(exc),
+            hooks._RECOVERY_POLICY_COOLDOWN,
+        )
+        self.assertEqual(
+            hooks._trace_exception(exc)["reason"], "upstream-truncated-stream"
+        )
+        self.assertEqual(
+            hooks._recovery_diagnostic(exc)["kind"], "truncated_stream"
+        )
+        # A route that cut a turn is parked on the first occurrence: the client
+        # already reconnected, so waiting for a second cut buys nothing.
+        self.assertTrue(hooks._should_count_deployment_failure_for_cooldown(exc))
+
+    def test_a_truncated_body_with_a_connectivity_cause_keeps_recovering(self) -> None:
+        """A cut body this machine caused by losing the link is not route evidence.
+
+        ``test_a_local_shutdown_is_not_upstream_evidence`` pins the local-teardown
+        case.  This pins the other half of the same ambiguity: the body is
+        truncated *and* the chain names a connectivity cause, which is an outage
+        to wait out rather than a route to quarantine.  The distinction is why
+        the truncated-body reading is asked second.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+
+        class MidStreamFallbackError(Exception):
+            status_code = 500
+
+        exc = MidStreamFallbackError(
+            "litellm.midstreamfallbackerror: litellm.apiconnectionerror: "
+            "response payload is not completed: <transferencodingerror: 400, "
+            "message='not enough data to satisfy transfer length header.'>"
+        )
+        exc.__cause__ = OSError("peer closed connection")
+
+        self.assertTrue(hooks._is_upstream_truncated_stream_error(exc))
+        self.assertFalse(hooks._is_route_cut_stream_error(exc))
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(exc),
+            hooks._RECOVERY_POLICY_RECOVERY,
+        )
+
+    def test_a_plain_disconnect_is_still_a_network_outage(self) -> None:
+        """The truncated-body reading never widens into every read error.
+
+        ``ReadError`` is also what an ordinary dropped connection produces, and
+        that is an outage to wait out rather than a route to quarantine.  Only a
+        body that stopped mid-framing is route evidence; the class name alone is
+        not.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+
+        class ReadError(Exception):
+            pass
+
+        exc = ReadError("connection closed.")
+
+        self.assertFalse(hooks._is_upstream_truncated_stream_error(exc))
+        self.assertFalse(hooks._is_route_cut_stream_error(exc))
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(exc),
+            hooks._RECOVERY_POLICY_RECOVERY,
+        )
+        self.assertEqual(
+            hooks._trace_exception(exc)["reason"], "upstream-network-connectivity"
+        )
+
+    def test_an_unrelated_earlier_error_does_not_make_a_stop_look_truncated(self) -> None:
+        """``__context__`` is whatever was in flight, never this failure's cause.
+
+        A stream-incomplete exception raised while an earlier transport error is
+        still being handled carries that error in ``__context__``.  Following it
+        would relabel a clean stream-incomplete stop as a truncated body and cool
+        the route down for the wrong reason.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+
+        class ReadError(Exception):
+            pass
+
+        inner = ReadError(
+            "response payload is not completed: <transferencodingerror: 400>"
+        )
+        exc = RuntimeError(
+            "Responses stream incomplete: stream ended before response.completed"
+        )
+        exc.stream_incomplete = True  # type: ignore[attr-defined]
+        exc.__context__ = inner
+
+        self.assertFalse(hooks._is_upstream_truncated_stream_error(exc))
+        self.assertEqual(
+            hooks._trace_exception(exc)["reason"], "upstream-stream-incomplete"
+        )
+
 
 class RouteRecoveryKeepaliveWaitTests(HookTestCase):
     """A finished wait must be consumed, never re-awaited.
@@ -3413,3 +3674,73 @@ class HookNativeRouteRecoveryExhaustionTests(HookTestCase):
         )
         self.assertIn("stopped sending", error_chunks[-1]["error"]["message"])
         self.assertTrue(poll_attempts)
+
+    def test_local_gateway_key_rejection_is_never_a_route_recovery_case(self) -> None:
+        """This proxy's own auth refusal must not look like an upstream outage.
+
+        A caller with a stale key reaches no route at all: LiteLLM looks that
+        key up as a virtual key, needs the database for the lookup, and answers
+        ``ProxyException(type="no_db_connection")``.  Classified by its HTTP
+        code alone it read as an unclassified upstream failure, so the request
+        log named an upstream that was never called and the recovery poll would
+        have kept the client waiting on a key only the caller can replace.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+
+        class ProxyException(Exception):
+            def __init__(self, message: str, type: str, code: int) -> None:
+                super().__init__(message)
+                self.type = type
+                self.code = str(code)
+
+        rejection = ProxyException("No connected db.", "no_db_connection", 400)
+
+        self.assertTrue(hooks._is_local_gateway_auth_rejection_error(rejection))
+        self.assertFalse(hooks._is_route_recovery_poll_error(rejection))
+        self.assertFalse(hooks._should_return_route_recovery_stream(rejection, {}))
+        self.assertFalse(hooks._should_count_deployment_failure_for_cooldown(rejection))
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(rejection),
+            hooks._RECOVERY_POLICY_ERROR,
+        )
+        self.assertEqual(
+            hooks._trace_exception(rejection)["reason"],
+            "local-gateway-auth-rejected",
+        )
+
+
+class DefaultFallbackProtocolTests(unittest.TestCase):
+    """The default fallback names the wire every relay answers.
+
+    A route that states nothing gets ``openai/chat``, or ``anthropic`` when the
+    upstream model is a Claude one.  The fallback is only consulted once the
+    upstream refuses the protocol the client used, so it must name the protocol
+    most likely to answer there.
+    """
+
+    def test_a_non_claude_model_defaults_to_chat(self) -> None:
+        from young_router.config import schema as config_schema
+
+        for model in (
+            "openai/deepseek-v4.1-flash",
+            "openai/kimi-k3",
+            "openai/glm-5.2",
+            "openai/gpt-5",
+            "gpt-5.1",
+        ):
+            with self.subTest(model=model):
+                self.assertEqual(
+                    "openai/chat",
+                    config_schema.infer_upstream_fallback_surface(model),
+                )
+
+    def test_a_claude_model_defaults_to_anthropic(self) -> None:
+        from young_router.config import schema as config_schema
+
+        for model in ("anthropic/claude-sonnet", "claude-opus-4", "openai/claude-3-5-sonnet"):
+            with self.subTest(model=model):
+                self.assertEqual(
+                    "anthropic",
+                    config_schema.infer_upstream_fallback_surface(model),
+                )

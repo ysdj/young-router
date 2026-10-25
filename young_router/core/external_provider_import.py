@@ -291,6 +291,34 @@ def _surface_from_values(*values: Any) -> str:
     return "openai/responses"
 
 
+def _declared_surface(*values: Any) -> str:
+    """Return the surface these fields actually declare, or "" for none.
+
+    ``_surface_from_values`` answers a normalized surface even when nothing was
+    stated, which cannot distinguish "declared Responses" from "said nothing".
+    Import defaults depend on that difference.
+    """
+
+    for value in values:
+        text = _text(value).lower()
+        if text in SUPPORTED_SURFACES:
+            return text
+        if text in {
+            "responses",
+            "response",
+            "openai_responses",
+            "chat",
+            "chat_completions",
+            "completions",
+            "openai_chat",
+            "anthropic",
+            "messages",
+            "anthropic_messages",
+        }:
+            return _surface_from_values(value)
+    return ""
+
+
 def _strip_adapter(value: str) -> str:
     for adapter in ("openai/", "anthropic/"):
         if value.startswith(adapter):
@@ -500,7 +528,7 @@ def _add_editor_model(
     source: dict[str, Any],
     *,
     default_model: str = "",
-    default_surface: str = "openai/responses",
+    default_surface: str = "",
     provider_enabled: bool | None = None,
 ) -> None:
     source_model = _first_text(source, MODEL_NAME_KEYS) or default_model
@@ -510,32 +538,14 @@ def _add_editor_model(
     ) or _strip_adapter(source_model)
     if not source_model:
         return
-    explicit_surface = _surface_from_values(
-        source.get("upstream_url_surface"),
-        source.get("wire_api"),
-        source.get("provider_type"),
-    )
-    has_explicit_surface = any(
-        _text(source.get(key)).lower() in SUPPORTED_SURFACES
-        or _text(source.get(key)).lower()
-        in {
-            "responses",
-            "response",
-            "openai_responses",
-            "chat",
-            "chat_completions",
-            "completions",
-            "openai_chat",
-            "anthropic",
-            "messages",
-            "anthropic_messages",
-        }
-        for key in ("upstream_url_surface", "wire_api", "provider_type")
-    )
     surface = (
-        explicit_surface
-        if has_explicit_surface
-        else infer_upstream_fallback_surface(source_model)
+        _declared_surface(
+            source.get("upstream_url_surface"),
+            source.get("wire_api"),
+            source.get("provider_type"),
+        )
+        or _declared_surface(default_surface)
+        or infer_upstream_fallback_surface(source_model)
     )
     if source_model.startswith("anthropic/"):
         surface = "anthropic"

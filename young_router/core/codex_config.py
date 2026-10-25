@@ -996,6 +996,10 @@ def structured_config(config: dict[str, Any], auth: dict[str, Any]) -> dict[str,
                 "requires_openai_auth": provider.get("requires_openai_auth")
                 if isinstance(provider.get("requires_openai_auth"), bool)
                 else False,
+                "supports_standalone_web_search": provider.get(
+                    "supports_standalone_web_search"
+                )
+                is True,
                 "auth_mode": _provider_auth_mode(provider),
                 # ``null`` distinguishes no command field from an explicitly
                 # configured empty string.  It lets a structured list update
@@ -1291,12 +1295,19 @@ def _apply_provider_patch(text: str, value: object) -> str:
             text = remove_table(text, path)
             continue
         existing = _provider_mapping(text, provider_id)
-        fields = ("name", "base_url", "wire_api", "env_key", "requires_openai_auth")
+        fields = (
+            "name",
+            "base_url",
+            "wire_api",
+            "env_key",
+            "requires_openai_auth",
+            "supports_standalone_web_search",
+        )
         for key in fields:
             if key not in item:
                 continue
             patch_value = item[key]
-            if key == "requires_openai_auth":
+            if key in {"requires_openai_auth", "supports_standalone_web_search"}:
                 text = _patch_optional_bool(text, path, key, patch_value)
             else:
                 text = _patch_optional_string(text, path, key, patch_value)
@@ -1752,14 +1763,27 @@ def apply_structured_patch(
             "openai_auth",
             {},
         )
-        # This provider is routed through Young Router. Remove the legacy
-        # opt-in so Codex emits hosted Responses search through the local
-        # gateway instead of calling an unsupported standalone endpoint.
-        result = remove_table_value(
+        # This provider is routed through Young Router, whose models inherit
+        # Codex's Responses Lite catalog metadata.  That lane never declares
+        # the hosted ``web_search`` tool -- its own contract admits only
+        # function, custom and client-executed tools -- so clearing this opt-in
+        # (which this patch used to do, to prefer hosted search) left every
+        # model without any web tool and the agent searching by curling search
+        # engines from the shell.  ``supports_standalone_web_search`` is the
+        # lane's substitute: it registers Codex's own ``web.run`` executor,
+        # which searches without asking the routed station to run a hosted
+        # tool.  Keep it on for every LiteLLM selection.
+        result = set_table_value(
             result,
             provider_path,
             "supports_standalone_web_search",
+            True,
         )
+        # The standalone executor inherits Codex's default mode, ``cached``,
+        # which registers it with external web access off -- a search tool that
+        # cannot reach the live web.  The mode is the only switch that decides
+        # this, so the route that opts into the tool also asks for live search.
+        result = set_top_level_value(result, "web_search", "live")
         # Older releases force-wrote features.token_budget = true on every
         # LiteLLM selection, which made Codex clear the context window
         # instead of summarizing it. Clean that legacy value up once per

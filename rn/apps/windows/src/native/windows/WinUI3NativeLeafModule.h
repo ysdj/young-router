@@ -6,8 +6,8 @@
 
 namespace YoungRouter {
 
+REACT_MODULE(WinUI3NativeLeafModule, L"LiteLLMNativeLeaf");
 struct WinUI3NativeLeafModule {
-  REACT_MODULE(WinUI3NativeLeafModule, L"LiteLLMNativeLeaf");
   REACT_INIT(Initialize);
   REACT_METHOD(OpenWindow, L"openWindow");
   REACT_METHOD(CloseWindow, L"closeWindow");
@@ -125,6 +125,7 @@ struct WinUI3NativeLeafModule {
   void ShowVersion() noexcept;
   void VersionInfo(winrt::Microsoft::ReactNative::ReactPromise<winrt::Microsoft::ReactNative::JSValueObject> const& promise) noexcept;
   void OpenExternalURL(std::wstring const& url) noexcept;
+  void RevealFile(std::wstring const& path) noexcept;
   void Quit() noexcept;
   void SetShortcuts(winrt::Microsoft::ReactNative::JSValueObject const& shortcuts) noexcept;
 

@@ -33,6 +33,7 @@ from .base import (
     _SUPPORTS_RESPONSES_WEB_SEARCH_KEY,
     _SUPPORTS_WEB_SEARCH_KEY,
     _UPSTREAM_URL_SURFACE_ANTHROPIC,
+    _UPSTREAM_PROTOCOL_MODE_KEY,
     _UPSTREAM_URL_SURFACE_CHAT_BRIDGE_VALUES,
     _UPSTREAM_URL_SURFACE_KEY,
     _UPSTREAM_URL_SURFACE_OPENAI_CHAT,
@@ -288,14 +289,46 @@ def _responses_chat_bridge_retry_reason(
 
 
 def _request_configured_responses_endpoint_unsupported(request_kwargs: Optional[dict]) -> bool:
+    """Whether this attempt must convert the Responses request to another protocol.
+
+    The protocol a route declares is not the protocol it is asked on.  Route
+    selection already answers that (``_request_surface_for_deployment``): a
+    ``fixed`` route uses its declared protocol, while an ``auto`` one uses the
+    protocol the *client* used and only falls back when the upstream refuses it.
+    So the surface to convert for is the attempt's own surface, and the declared
+    one is a fallback rather than a description of the wire.
+
+    Reading the declaration as the wire made every route that names a chat (or
+    Messages) fallback convert before the upstream was ever asked, which turned
+    a relay that does serve ``/v1/responses`` into a chat completion: the
+    reasoning summary then arrived aggregated instead of streaming.
+    """
+
     request_kwargs = request_kwargs or {}
+    attempt = _normalized_upstream_url_surface(
+        _routing_module._request_current_upstream_surface(request_kwargs)
+    )
+    if attempt:
+        # A /v1/responses request only converts away from Responses.
+        return attempt != _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES
     model_info = _request_context_module._request_model_info(request_kwargs)
-    mode = _routing_module._request_current_upstream_surface(request_kwargs)
-    if not mode:
-        mode = _normalized_upstream_url_surface(
-            model_info.get(_UPSTREAM_URL_SURFACE_KEY)
-        )
-    return mode in _UPSTREAM_URL_SURFACE_CHAT_BRIDGE_VALUES
+    declared = _normalized_upstream_url_surface(
+        model_info.get(_UPSTREAM_URL_SURFACE_KEY)
+    )
+    supported = model_info.get("supported_upstream_url_surfaces")
+    if isinstance(supported, list) and supported:
+        # A route that states which surfaces it serves answers this outright.
+        supported_surfaces = {
+            _normalized_upstream_url_surface(value) for value in supported
+        }
+        return _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES not in supported_surfaces
+    if _routing_module._protocol_fallback_attempt_active(request_kwargs):
+        return True
+    mode = str(model_info.get(_UPSTREAM_PROTOCOL_MODE_KEY) or "").strip().casefold()
+    if mode != "fixed":
+        # No attempt chosen yet under auto: ask on the client's protocol first.
+        return False
+    return declared not in ("", _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES)
 
 
 def _request_has_explicit_surface_metadata(request_kwargs: Optional[dict]) -> bool:

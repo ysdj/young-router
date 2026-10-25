@@ -803,7 +803,15 @@ class ReactNativeReleaseTests(unittest.TestCase):
         # silently, which is how the staging directory stopped being passed.
         msbuild_props = script[script.index("--msbuildprops"):].split("\n", 1)[0]
         self.assertNotIn(";", msbuild_props, "a semicolon list parses as no properties")
-        self.assertEqual(msbuild_props.count(","), 2, msbuild_props)
+        # The count is not pinned: the release build also pins the restore
+        # behaviour, and a low-resource ARM build appends two more compiler
+        # properties.  What the CLI requires is that every entry is one
+        # ``name=value`` pair, so that is what this reads.
+        argument = msbuild_props.split('--msbuildprops", "', 1)[1].rstrip('"')
+        properties = argument.split(",")
+        self.assertGreaterEqual(len(properties), 3, msbuild_props)
+        for entry in properties:
+            self.assertEqual(entry.count("="), 1, entry)
 
     def test_windows_build_installs_the_runtime_outside_uvs_management(self) -> None:
         # ``uv python install`` marks the interpreter it lays down as externally

@@ -140,12 +140,15 @@ from .base import (
     _SURFACE_TARGET_DEPLOYMENT_ID_KEY,
     _TerminalFailedResponsesStreamResponse,
     _UPSTREAM_ACCOUNT_RESTRICTED_ERROR_MARKERS,
+    _LOCAL_GATEWAY_AUTH_REJECTION_TYPES,
+    _UPSTREAM_SESSION_REJECTED_ERROR_MARKERS,
     _UPSTREAM_BALANCE_ERROR_MARKERS,
     _UPSTREAM_HTML_BAD_REQUEST_MARKERS,
     _UPSTREAM_RELAY_CAPACITY_MARKERS,
     _UPSTREAM_TOOL_HISTORY_REJECTION_MARKERS,
     _UPSTREAM_TEMPORARY_ERROR_CLASS_NAMES,
     _UPSTREAM_TEMPORARY_ERROR_MARKERS,
+    _is_upstream_truncated_stream_error,
     _UPSTREAM_URL_SURFACE_ANTHROPIC,
     _UPSTREAM_URL_SURFACE_DEPLOYMENT_ID_KEY,
     _UPSTREAM_URL_SURFACE_KEY,
@@ -874,6 +877,12 @@ def _recovery_policy_for_exception(exception: Exception) -> str:
     if preserved in _RECOVERY_POLICY_VALUES:
         return preserved
 
+    if _is_local_gateway_auth_rejection_error(exception):
+        # No route was involved at all: this proxy refused the caller's key.
+        # Cooling down or polling would blame a provider for an answer the
+        # provider never gave, and the key is what has to change.
+        return _RECOVERY_POLICY_ERROR
+
     if _is_local_stream_start_timeout_error(exception):
         return _recovery_policy_setting(
             _RECOVERY_POLICY_STREAM_START_TIMEOUT_ENV,
@@ -946,6 +955,15 @@ def _recovery_policy_for_exception(exception: Exception) -> str:
     # sibling route can still serve the same bytes.  Leaving it to the request
     # error below kept the dead route first in every request and ended the turn
     # on it, so it is parked instead and the request advances to the sibling.
+    if _is_upstream_session_rejected_error(exception):
+        # The route's own credential is what the upstream refused, even though
+        # the adapter reports it as a 400.  No replay changes that answer, and a
+        # sibling deployment can still serve the same bytes, so the route is
+        # parked and the turn advances.
+        return _recovery_policy_setting(
+            _RECOVERY_POLICY_REQUEST_ERROR_ENV,
+            _RECOVERY_POLICY_COOLDOWN,
+        )
     if _is_upstream_account_restricted_error(exception):
         return _recovery_policy_setting(
             _RECOVERY_POLICY_REQUEST_ERROR_ENV,
@@ -981,6 +999,19 @@ def _recovery_policy_for_exception(exception: Exception) -> str:
         return _recovery_policy_setting(
             _RECOVERY_POLICY_NETWORK_ENV,
             _RECOVERY_POLICY_RECOVERY,
+        )
+
+    if _is_route_cut_stream_error(exception):
+        # The route answered, started writing this stream, and then closed the
+        # body before its own framing was complete, with no connectivity cause
+        # anywhere in the chain.  The bytes the client already received cannot
+        # be replayed, so this attempt is over -- but the route is the thing that
+        # failed, and it will fail the same way on the next request.  A cooldown
+        # is what makes the next attempt pick a different deployment instead of
+        # the upstream that just cut a turn mid-answer.
+        return _recovery_policy_setting(
+            _RECOVERY_POLICY_SERVER_ENV,
+            _RECOVERY_POLICY_COOLDOWN,
         )
 
     if status_code == 429 or any(
@@ -3746,6 +3777,14 @@ def _request_log_record(
     request_exception = _request_log_exception(request_kwargs, response_obj)
     if route_key or deployment_id:
         routing_state = "selected"
+    elif request_exception is not None and _is_local_gateway_auth_rejection_error(
+        request_exception
+    ):
+        # This proxy refused the caller's key before choosing a route.  Left as
+        # ``unselected`` the row read 路由前失败/上游异常, which sent the reader to
+        # the providers for a failure none of them produced; the caller's key is
+        # the one thing that has to change.
+        routing_state = "gateway_auth_rejected"
     elif request_exception is not None and _is_no_deployments_available_error(
         request_exception
     ):
@@ -3998,7 +4037,7 @@ def _deployment_cooldown_keys_from_deployment_for_request(
         request_kwargs=request_kwargs,
     )
 
-def _trace_deployment(value: Any) -> dict[str, Any]:
+def _trace_deployment(value: Any, *, surface: str = "") -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
     model_info = value.get("model_info")
@@ -4013,6 +4052,7 @@ def _trace_deployment(value: Any) -> dict[str, Any]:
     model = litellm_params.get("model")
     provider = model_info.get("provider")
     api_key_name = model_info.get("api_key_name")
+    dispatched_surface = _normalized_request_surface(surface)
     return {
         "id": model_info.get("id"),
         "token": model_info.get("id"),
@@ -4037,10 +4077,25 @@ def _trace_deployment(value: Any) -> dict[str, Any]:
         "supports_responses_web_search": model_info.get(_SUPPORTS_RESPONSES_WEB_SEARCH_KEY),
         "supports_web_search": model_info.get(_SUPPORTS_WEB_SEARCH_KEY),
         "supports_vision": model_info.get("supports_vision"),
+        # The wire this attempt is actually dispatched on.  It is stated by the
+        # caller that adapted the request (selection or success), and is
+        # deliberately separate from ``upstream_url_surface``: that field is the
+        # route's configured backup protocol, and a ``fallback`` route that
+        # answers /v1/responses natively still declares ``openai/chat``.  Using
+        # the declaration as the wire told the trace a request had gone out as a
+        # chat call when the upstream had served Responses.
+        **({"surface": dispatched_surface} if dispatched_surface else {}),
     }
 
 
 def _trace_deployments(deployments: Any) -> list[dict[str, Any]]:
+    """Describe candidate routes; none of them has been dispatched yet.
+
+    No ``surface`` is stated here on purpose: this list is the pool the router
+    is choosing from, so claiming a wire for any entry would report a decision
+    that has not been made.
+    """
+
     if not isinstance(deployments, list):
         return []
     return [_trace_deployment(deployment) for deployment in deployments]
@@ -4700,6 +4755,12 @@ def _trace_exception(exception: Exception) -> dict[str, Any]:
     text = _exception_text(exception)
     if _is_local_shutdown_exception(exception):
         reason = "local-proxy-shutdown"
+    elif _is_local_gateway_auth_rejection_error(exception):
+        # This proxy answered, before any route existed: the caller's key was
+        # not the master key and there is no database to look a virtual key up
+        # in.  Reporting ``other`` sent the reader to inspect upstreams that
+        # were never contacted.
+        reason = "local-gateway-auth-rejected"
     elif _is_image_generation_all_deployments_unsupported_error(exception):
         reason = "image-generation-tool-all-deployments-unsupported"
     elif _is_codex_compaction_capability_unsupported_error(exception):
@@ -4738,6 +4799,11 @@ def _trace_exception(exception: Exception) -> dict[str, Any]:
         reason = "upstream-compatible-bad-request"
     elif getattr(exception, "stream_incomplete", False) and status_code is None:
         reason = "upstream-stream-incomplete"
+    elif _is_route_cut_stream_error(exception):
+        # Name the branch.  "other" is what this stop read as while it kept
+        # arriving as an unclassified terminal failure, and a trace that says
+        # only ``other`` is why the missing cooldown went unnoticed.
+        reason = "upstream-truncated-stream"
     elif _is_local_stream_timeout_error(exception):
         # The local stream watchdog assigns 504 itself; reporting it as an
         # upstream status fabricates a gateway response that never arrived.
@@ -4760,6 +4826,13 @@ def _trace_exception(exception: Exception) -> dict[str, Any]:
         "failed_deployment_id": _responses_execution_module._failed_deployment_id(exception),
         "failed_deployment_route_key": _responses_execution_module._failed_deployment_route_key(exception),
         "failed_deployment_order": _responses_execution_module._failed_deployment_order(exception),
+        # The wire the failed attempt was actually dispatched on.  Without it a
+        # refusal on a bridged chat call and a refusal of the native Responses
+        # wire read the same in the trace, which is the difference between "this
+        # route cannot serve Responses" and "this route broke after we adapted".
+        "failed_deployment_surface": _responses_execution_module._failed_deployment_surface(
+            exception
+        ),
         "recovery_policy": _recovery_policy_for_exception(exception),
     }
 
@@ -4837,6 +4910,18 @@ def _recovery_diagnostic(exception: Exception) -> dict[str, Any]:
             "detail": (
                 "The router was restarting while this turn was streaming, so the "
                 "response was cut short. Send the message again."
+            ),
+        }
+    elif _is_route_cut_stream_error(exception):
+        # The route answered and then closed the body mid-stream. Saying
+        # "network" here sends the user to inspect connectivity that is fine;
+        # saying "unknown" hides that this route is the thing to skip.
+        result = {
+            "kind": "truncated_stream",
+            "title": "Upstream cut the response short",
+            "detail": (
+                "The upstream closed this response before it finished writing "
+                "it, so the route is parked and another route answers."
             ),
         }
     elif _exception_indicates_network_connectivity_error(exception):
@@ -5283,13 +5368,40 @@ def _is_network_recovery_exception(exception: Exception) -> bool:
             return True
         if _exception_indicates_network_connectivity_error(candidate):
             return True
-        if "temporary network connectivity error" in _exception_text(candidate):
+        text = _exception_text(candidate)
+        if (
+            "upstream connection lost" in text
+            or "temporary network connectivity error" in text
+        ):
             return True
         for attr in ("__cause__", "__context__", "original_exception"):
             nested = getattr(candidate, attr, None)
             if isinstance(nested, Exception) and id(nested) not in seen:
                 pending.append(nested)
     return False
+
+
+def _is_route_cut_stream_error(exception: Exception) -> bool:
+    """Whether a half-written body is the *route's* failure, not an outage.
+
+    Every decision that acts on a truncated body asks this one question, so the
+    ordering is stated once instead of at each call site.  A body that stopped
+    mid-framing *and* carries a connectivity cause anywhere in its chain is an
+    outage this machine is on the wrong side of: the stream stays open through
+    the recovery poll and the route is not quarantined.  Only a body that
+    stopped mid-framing with no connectivity cause is the route's own fault --
+    it answered, cut the turn, and would cut the next one too.
+
+    ``_is_upstream_truncated_stream_error`` is the text-level reading and is
+    exported for the terminal-event branches; this is the routing decision.
+    """
+
+    if not _is_upstream_truncated_stream_error(exception):
+        return False
+    if _is_local_shutdown_exception(exception):
+        # This worker closed the body, not the upstream.
+        return False
+    return not _is_network_recovery_exception(exception)
 
 
 def _is_ssl_verification_error(exception: Exception) -> bool:
@@ -6269,6 +6381,15 @@ def _is_priority_deployment_failover_error(exception: Exception) -> bool:
         return True
     if getattr(exception, "stream_incomplete", False):
         return True
+    if _is_upstream_session_rejected_error(exception):
+        # The route's own credential is what the upstream refused, even though
+        # the adapter reports it as a 400.  No replay changes that answer, and a
+        # sibling deployment can still serve the same bytes, so the route is
+        # parked and the turn advances.
+        return _recovery_policy_setting(
+            _RECOVERY_POLICY_REQUEST_ERROR_ENV,
+            _RECOVERY_POLICY_COOLDOWN,
+        )
     if _is_upstream_account_restricted_error(exception):
         # This attempt cannot be answered by the route that refused its own
         # account; another candidate deployment still can.
@@ -6410,10 +6531,13 @@ def _record_deployment_failure_for_cooldown(
     # has already forced the client to reconnect. Unlike an ordinary
     # transient request error, another attempt through that route would
     # surface another user-visible stream failure, so quarantine it after the
-    # first occurrence regardless of the client protocol.
+    # first occurrence regardless of the client protocol.  A body the upstream
+    # closed mid-stream is the same evidence: the route cut a turn the reader
+    # was already consuming, and the next request must not select it again.
     threshold = (
         1
         if getattr(exception, "stream_incomplete", False)
+        or _is_route_cut_stream_error(exception)
         else _deployment_cooldown_failure_threshold()
     )
     cooldown_seconds = _deployment_cooldown_seconds()
@@ -6518,7 +6642,13 @@ def _trace_deployment_success(request_kwargs: Optional[dict]) -> None:
                     request_kwargs
                 ),
                 "litellm_params": _as_dict(request_kwargs.get("litellm_params")),
-            }
+            },
+            # A success must name the wire the answer came back on.  A
+            # ``fallback`` route often serves the client's own Responses wire
+            # while declaring a chat backup, so the declaration would mislabel
+            # the served route and split it from its own selection.
+            surface=_request_current_upstream_surface(request_kwargs)
+            or _request_adapted_surface(request_kwargs),
         ),
     )
 
@@ -6883,6 +7013,49 @@ def _is_upstream_account_restricted_error(exception: Exception) -> bool:
     )
 
 
+def _is_upstream_session_rejected_error(exception: Exception) -> bool:
+    """Whether the route's own credential was refused by its upstream.
+
+    A local adapter reports that as an HTTP 400 whose prose carries the
+    upstream's status, so the status alone would read as the request's verdict
+    and end the turn on a route that is simply logged out.
+    """
+
+    text = _exception_text(exception).lower()
+    return any(marker in text for marker in _UPSTREAM_SESSION_REJECTED_ERROR_MARKERS)
+
+
+def _is_local_gateway_auth_rejection_error(exception: Exception) -> bool:
+    """Whether *this* proxy rejected the caller before any route was chosen.
+
+    LiteLLM authenticates every request itself, and a key that is not the
+    configured master key is looked up as a virtual key.  Without a database
+    that lookup cannot answer, so the auth handler refuses the call with
+    ``ProxyException(type="no_db_connection", code=400)`` -- an answer this
+    installation produced, not one any upstream gave.
+
+    The distinction matters twice.  Read as an upstream error it named the
+    tray's route-trace sentence 上游异常 ("upstream error") for a client whose
+    own key was simply stale, which sent the reader to inspect providers that
+    had never been contacted.  Read as an upstream error it also made an
+    ordinary ``/v1/models`` probe with a wrong key look like a failed route.
+
+    Read from LiteLLM's own ``ProxyErrorTypes`` value: the sentence is shared
+    with a provider that reports a database problem, and that one *is* a route
+    failure.
+    """
+
+    for candidate in (exception, getattr(exception, "original_exception", None)):
+        if not isinstance(candidate, BaseException):
+            continue
+        value = getattr(candidate, "type", None)
+        if not isinstance(value, str):
+            continue
+        if value.rsplit(".", 1)[-1].strip().lower() in _LOCAL_GATEWAY_AUTH_REJECTION_TYPES:
+            return True
+    return False
+
+
 def _is_upstream_tool_history_rejected_error(exception: Exception) -> bool:
     """Whether the route refused this replay because its tool records do not pair.
 
@@ -6948,10 +7121,24 @@ def _sanitized_upstream_route_failure_message(
     if _is_local_shutdown_exception(exception):
         # This process closed the stream while it was being replaced.  Naming
         # the route, the network, or the provider would all be false, and the
-        # client can simply send the turn again.
+        # client can simply send the turn again -- which only happens if the
+        # sentence carries a phrase the client's retry classifier recognises;
+        # "terminated" is on that list.
         return (
             "The router was restarting while this turn was streaming, so the "
-            "response was cut short. Send the message again."
+            "turn was terminated. Send the message again."
+        )
+    if _is_upstream_session_rejected_error(exception):
+        # The route's own credential is what the upstream refused, even though
+        # the adapter reports it as a 400.  No replay changes that answer, and a
+        # sibling deployment can still serve the same bytes, so the route is
+        # parked and the turn advances.  This is a message function: returning
+        # the recovery-policy constant from here reached the client as the
+        # literal word "recovery_cooldown".
+        return (
+            "The upstream refused the credential behind this route, so it was "
+            f"parked and another route will answer for {model_group}. Send the "
+            "message again, or refresh that route's account if it stays parked."
         )
     if _is_upstream_account_restricted_error(exception):
         # Not the "temporary / retry later" sentence below: the refusal belongs
@@ -6972,7 +7159,10 @@ def _sanitized_upstream_route_failure_message(
     elif status_code == 408:
         reason = "upstream timeout"
     elif _exception_indicates_network_connectivity_error(exception):
-        reason = "temporary network connectivity error"
+        # "connection lost" is on the client's retry list, so a transport
+        # failure the router can only wait out still reaches a client that
+        # reconnects on its own instead of ending the turn.
+        reason = "upstream connection lost"
     elif _is_upstream_gateway_bad_request_error(exception):
         reason = "temporary upstream gateway bad request"
     elif _is_deployment_compatible_bad_request_error(exception):
@@ -7491,6 +7681,15 @@ def _is_thinking_replay_contract_error(exception: Exception) -> bool:
     other route had already refused for its own reason -- so the client showed
     a retry tip for a failure the user could not act on. Classified here, the
     group keeps looking for a route that can answer instead of ending the turn.
+
+    One cause of that missing field is ours, not the client's: the contract is
+    an *assistant message with tool calls must carry `reasoning_content`, even
+    empty*. The chat bridge used to drop a reasoning item whose payload was only
+    `encrypted_content`, which is exactly what Codex replays, so the bridged
+    message arrived without the field and a route that answers the same history
+    on Responses refused it here. ``patches._install_responses_chat_bridge_reasoning_replay_patch``
+    repairs that replay before dispatch; this classifier stays as the reading
+    for a refusal that still arrives from a provider the repair does not cover.
     """
 
     if _exception_status_code(exception) != 400:

@@ -76,6 +76,14 @@ type NativeModule = {
     origin: string;
     language: LanguagePreference;
   }) => Promise<void>;
+  /** Optional: a host with an authenticated station browser for the dashboard. */
+  openRelayDashboard?: (options: {
+    accountId: string;
+    type: "newapi" | "sub2api";
+    label: string;
+    origin: string;
+    language: LanguagePreference;
+  }) => Promise<void>;
   restoreRelaySession?: (options: {
     accountId: string;
     type: "newapi" | "sub2api";
@@ -174,6 +182,7 @@ const nativeBridge: NativeLeafBridge = {
   relayLogin: async (options) => leaf.relayLogin?.(options),
   cancelRelayLogin: () => leaf.cancelRelayLogin?.(),
   openRelayLogs: async (options) => { await leaf.openRelayLogs?.(options); },
+  openRelayDashboard: async (options) => { await leaf.openRelayDashboard?.(options); },
   restoreRelaySession: async (options) => leaf.restoreRelaySession?.(options),
   clearRelayPassword: async (accountId) => {
     if (!leaf.clearRelayPassword) throw new Error("The native relay credential store is unavailable.");

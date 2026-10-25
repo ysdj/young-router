@@ -1071,7 +1071,11 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("body.Measure(winrt::Windows::Foundation::Size{", windows_decision)
         self.assertIn("constexpr double kDialogMinWidth = 300;", windows_decision)
         self.assertIn("constexpr double kDialogMaxWidth = 420;", windows_decision)
-        self.assertIn("RunOwnedModalWindow(dialog, window_handle_, {dialog_width, dialog_height}, finished)", windows_decision)
+        # The measured size is rounded where the window API takes whole DIPs.
+        self.assertIn(
+            "{static_cast<int32_t>(std::lround(dialog_width)), static_cast<int32_t>(std::lround(dialog_height))}",
+            windows_decision,
+        )
         confirm = windows_leaf.split("bool WinUI3NativeLeaf::Confirm(", 1)[1].split(
             "void WinUI3NativeLeaf::DecideChoice(", 1
         )[0]
@@ -2131,6 +2135,64 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertNotIn('accountLabel.stringValue = "\\(type ==', mac_leaf)
         self.assertIn("account.Text(Utf8ToWide(state->options.origin));", windows_relay)
         self.assertNotIn("auto const account_type = state->options.account_type", windows_relay)
+
+    def test_the_account_row_opens_the_station_dashboard_in_the_authenticated_browser(self) -> None:
+        """The red-boxed account name is a link into the station's dashboard.
+
+        A dashboard session is the cookie this app's own browser store holds;
+        no default browser can be handed it (each keeps its own encrypted jar,
+        and a station binds the session to the identity that created it), so the
+        link opens the app's authenticated browser and only falls back to the
+        station's address where no host provides one.
+        """
+
+        types = (SHARED / "types.ts").read_text(encoding="utf-8")
+        bridge = (SHARED / "platform/nativeBridge.ts").read_text(encoding="utf-8")
+        platform = (SHARED / "platformEntry.ts").read_text(encoding="utf-8")
+        relay_ui = (SHARED / "ui/RelayAccountManager.tsx").read_text(encoding="utf-8")
+        mac_leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
+        mac_bridge = (MAC_NATIVE / "AppKitNativeLeafBridge.m").read_text(encoding="utf-8")
+        mac_module = (MAC_NATIVE / "AppKitNativeLeafModule.swift").read_text(encoding="utf-8")
+
+        self.assertIn("openRelayDashboard?(options:", types)
+        self.assertIn("openRelayDashboard?(options:", bridge)
+        self.assertIn("openRelayDashboard?: (options:", platform)
+        self.assertIn("openRelayDashboard: async (options) => { await leaf.openRelayDashboard?.(options); }", platform)
+        # The account name is the link, and it prefers the authenticated browser.
+        self.assertIn("const openDashboard = (): void => {", relay_ui)
+        self.assertIn("if (native.openRelayDashboard) {", relay_ui)
+        self.assertIn("if (native.openRelayDashboard) {", relay_ui)
+        self.assertIn("native.openExternalURL?.(account.origin);", relay_ui)
+        self.assertIn('translate("relay.openDashboard")', relay_ui)
+        self.assertIn("title={accountDisplayName(selected, translate)}", relay_ui)
+        # The macOS host renders that page in the browser that already holds the
+        # session, at the station's dashboard path.
+        self.assertIn("case dashboard", mac_leaf)
+        self.assertIn("func openRelayDashboard(", mac_leaf)
+        self.assertIn("mode: .dashboard", mac_leaf)
+        # The console's sidebar must fit before its content does: a dashboard
+        # opened at the sign-in form's 900 pt wrapped its own labels.
+        self.assertIn("let initialContentSize = mode == .dashboard", mac_leaf)
+        self.assertIn("NSSize(width: 1140, height: 780)", mac_leaf)
+        self.assertIn("NSSize(width: 1000, height: 620)", mac_leaf)
+        dashboard_url = mac_leaf.split("if mode == .dashboard {", 1)[1].split("private var localizedChinese", 1)[0]
+        # The console path, not the site root: a sub2api station renders its
+        # marketing home at ``/`` even for a live session.
+        self.assertIn('(resolvedType ?? type) == "newapi" ? "console" : "dashboard"', dashboard_url)
+        self.assertIn("RCT_EXTERN_METHOD(openRelayDashboard:(NSDictionary *)options", mac_bridge)
+        # A New API console sends `New-Api-User` on every read and takes its value
+        # from `localStorage.user.id` (its own `ar()` answers -1 without one), so
+        # a station that authenticates by cookie alone has to have that record
+        # written even though the lease carries no access token.  Writing only
+        # the token keys left tken signed out in a window whose cookie was valid.
+        self.assertIn("if (accessToken || userID || username) {", mac_leaf)
+        self.assertIn("if (userID) user.id = Number(userID);", mac_leaf)
+        self.assertIn("if (accessToken) user.token = accessToken;", mac_leaf)
+        # An export that is declared but not implemented is `undefined` in JS,
+        # where the optional chain silently does nothing: the two halves of the
+        # bridge are asserted together so a half-wired method cannot ship.
+        self.assertIn("@objc(openRelayDashboard:resolver:rejecter:)", mac_module)
+        self.assertIn("self.leaf.openRelayDashboard(", mac_module)
 
     def test_relay_session_restore_is_native_only_and_does_not_import_provider_models(self) -> None:
         types = (SHARED / "types.ts").read_text(encoding="utf-8")
@@ -3455,10 +3517,20 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # Logs are rendered with the native structured table. Text-editor
         # viewport behavior is still covered by the settings editors above;
         # the log surface must not regress to a giant raw text editor.
+        # A relay usage read is a network read against a third-party station: it
+        # can take a minute, and the 30 s default abandoned it, which the pane
+        # then showed as a relay it had just chosen reporting nothing.  Both
+        # hosts classify it with the other slow remote operations.
+        macos_bridge = (ROOT / "rn/apps/macos/src/native/macos/CoreIPCBridge.swift").read_text(encoding="utf-8")
+        self.assertIn('if method == "dispatch", onlineUsageReadOperation(in: request) != nil { return 900 }', macos_bridge)
+        self.assertIn('"logs.refresh_online_usage", "logs.refresh", "logs.reload"', macos_bridge)
+        windows_bridge = (ROOT / "rn/apps/windows/src/native/windows/CoreIPCBridge.cpp").read_text(encoding="utf-8")
+        self.assertIn("IsOnlineUsageReadOperation(request_json);", windows_bridge)
+        self.assertIn('type == "logs.refresh_online_usage" || type == "logs.refresh" || type == "logs.reload"', windows_bridge)
         self.assertNotIn('documentKey={`logs:${selected}`}', ui)
         self.assertIn("logColumns(", ui)
         self.assertIn("selected !== \"online-usage\" || rows.some((row) => Boolean(row.status)),", ui)
-        self.assertIn("selected === \"online-usage\" && rows.some((row) => Boolean(row.account)),", ui)
+        self.assertIn("selected === \"online-usage\" && hasDistinct(rows, (row) => row.account),", ui)
         self.assertIn("const nativeTableColumns = useMemo(", ui)
         self.assertIn("<NativeTable columns={nativeTableColumns}", ui)
         self.assertIn("REACT_FIELD(documentKey)", windows_codegen)

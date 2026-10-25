@@ -1063,9 +1063,14 @@ class ChannelProviderSplitTests(unittest.TestCase):
 
     A channel decides two things about a row that a provider row is the only
     thing in this app able to state: which surface it answers on, and which
-    window it accepts.  Sharing one provider across three channels forced every
+    window it accepts.  Sharing one provider across every channel forced every
     row onto one surface, and the rows that answered on the other were reported
     as "no such protocol" -- a protocol they never offered.
+
+    Only the two channels this bridge can fetch are providers.  The upstream's
+    co-paid channel opens from a sealed credential the worker never holds, so it
+    has no roster to import and no provider to add; a tag for it is refused
+    rather than offered as an entry that could only fail.
     """
 
     def _domain(self, runtime):
@@ -1111,10 +1116,13 @@ class ChannelProviderSplitTests(unittest.TestCase):
                 listed[our_free_model.OUR_FREE_MODEL_DISPLAY_NAMES[our_free_model.OUR_FREE_MODEL_KILO_PROVIDER]],
                 ["kilo-auto/free"],
             )
-            self.assertEqual(
-                listed[our_free_model.OUR_FREE_MODEL_DISPLAY_NAMES[our_free_model.OUR_FREE_MODEL_EAC_PROVIDER]],
-                ["eac-model"],
+            # The co-paid channel is not one of this lane's providers: the
+            # upstream will not list its rows without a sealed credential, so
+            # offering it would be an entry whose import always fails.
+            self.assertNotIn(
+                "our-free-model-eac", our_free_model.OUR_FREE_MODEL_PROVIDERS
             )
+            self.assertNotIn("eac", our_free_model.CHANNEL_TO_PROVIDER)
 
     def test_each_route_states_the_surface_and_window_its_channel_uses(self) -> None:
         directory, domain, _config = self._domain(ChannelRuntime())
@@ -1140,26 +1148,71 @@ class ChannelProviderSplitTests(unittest.TestCase):
 
             # Kilo's own row states a different number, and it is kept whole:
             # one channel's window is not another's.
-            model, _ = routes["eac-model"]
-            self.assertIsNone(model["max_input_tokens"])
+            self.assertIsNone(
+                routes["kilo-auto/free"][0]["max_input_tokens"]
+            )
             # The projection resolves from the saved document, so it is read
             # after Apply — the same order a pane sees it in.
             domain.apply()
             contexts = domain.snapshot()["model_contexts"]
             self.assertEqual(contexts["big-pickle"]["context_window"], 200_000)
             self.assertEqual(contexts["kilo-auto/free"]["context_window"], 131_072)
-            self.assertEqual(contexts["eac-model"]["context_window"], 1_048_576)
+
+    def test_the_co_paid_channel_is_refused_instead_of_offered_empty(self) -> None:
+        """An entry that could only fail its import is not an entry.
+
+        The upstream builds the co-paid roster only when its sealed credential
+        opens, and this bridge passes none, so ``eac`` is a channel whose every
+        read is empty.  Asking for it is refused as an unavailable channel --
+        not answered with "the catalog reported no models", which blamed an
+        upstream read for a channel this build never serves.
+        """
+
+        directory, domain, _config = self._domain(ChannelRuntime())
+        with directory:
+            with self.assertRaisesRegex(DomainError, "channel is unavailable"):
+                domain.dispatch(
+                    "service_provider.add",
+                    {
+                        "kind": "our_free_model_login",
+                        "name": "Our Free Model · EAC",
+                        "channel": "eac",
+                    },
+                )
+
+    def test_a_co_paid_row_is_not_filed_under_the_anonymous_lane(self) -> None:
+        """A channel no provider serves is dropped, not folded into another.
+
+        ``provider_for_channel`` answers the anonymous lane for a row whose
+        catalog states no channel.  A co-paid row also arrives with no provider
+        to file it under, and returning the lane for it would stage a route whose
+        every turn the upstream refuses -- the failure this removal prevents.
+        """
+
+        self.assertEqual(
+            "", our_free_model.provider_for_channel("eac")
+        )
+        self.assertEqual(
+            our_free_model.OUR_FREE_MODEL_PROVIDER,
+            our_free_model.provider_for_channel(""),
+        )
+        self.assertEqual(
+            our_free_model.OUR_FREE_MODEL_KILO_PROVIDER,
+            our_free_model.provider_for_channel("kilo"),
+        )
 
 
 class ChannelRuntime(StubRuntime):
-    """A lane that serves three channels, one row each."""
+    """A lane that serves two channels, one row each."""
 
     # The gateway states `context_window` on each row, and that is the only
     # place the number lives: a parallel map would be the same fact twice.
     ROWS = [
         {"id": "big-pickle", "name": "big-pickle", "context_window": 200_000},
         {"id": "kilo-auto/free", "name": "kilo-auto/free", "context_window": 131_072},
-        {"id": "eac-model", "name": "eac-model", "context_window": 1_048_576},
+        # A co-paid row as the upstream would state it if this bridge could
+        # ever fetch that roster.  It must not reach either provider.
+        {"id": "opencode/deepseek-v4.1-flash-free", "name": "EAC DeepSeek", "context_window": 1_048_576},
     ]
 
     def models(self, provider=our_free_model.OUR_FREE_MODEL_PROVIDER, *, refresh=False):  # noqa: D102
@@ -1168,8 +1221,16 @@ class ChannelRuntime(StubRuntime):
             "detail": "",
             "source": "adapter",
             "models": [dict(row) for row in self.ROWS],
-            "channels": {"big-pickle": "", "kilo-auto/free": "kilo", "eac-model": "eac"},
-            "wires": {"big-pickle": "chat", "kilo-auto/free": "chat", "eac-model": "chat"},
+            "channels": {
+                "big-pickle": "",
+                "kilo-auto/free": "kilo",
+                "opencode/deepseek-v4.1-flash-free": "eac",
+            },
+            "wires": {
+                "big-pickle": "chat",
+                "kilo-auto/free": "chat",
+                "opencode/deepseek-v4.1-flash-free": "chat",
+            },
             "status": self.provider_status(provider),
         }
 
@@ -1212,7 +1273,9 @@ class StatedWindowIsDisplayedTests(unittest.TestCase):
             contexts = domain.snapshot()["model_contexts"]
             self.assertEqual(contexts["big-pickle"]["context_window"], 200_000)
             self.assertEqual(contexts["kilo-auto/free"]["context_window"], 131_072)
-            self.assertEqual(contexts["eac-model"]["context_window"], 1_048_576)
+            # The co-paid row travels in the same answer, and no provider here
+            # serves it: importing it would stage a route nothing can call.
+            self.assertNotIn("opencode/deepseek-v4.1-flash-free", contexts)
 
     def test_a_user_declaration_wins_over_the_upstream(self) -> None:
         """The user knows the relay in front of the route; their number is kept.

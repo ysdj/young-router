@@ -157,7 +157,7 @@ class MacOSProxyLauncherTests(unittest.TestCase):
             {"source": "macos", "proxies": {}, "settings": {}},
             proxy_snapshot,
         )
-        set_preload.assert_called_once_with(["litellm.proxy.proxy_server"])
+        set_preload.assert_called_once_with([macos_proxy.PROXY_MODULE])
         get_context.assert_called_once_with("forkserver")
         prime.assert_called_once_with()
         # The preload starts before the launcher's own imports, and those
@@ -170,7 +170,7 @@ class MacOSProxyLauncherTests(unittest.TestCase):
         # earlier process left unfinished before the workers start serving.
         settle.assert_called_once_with()
         uvicorn.run.assert_called_once_with(
-            "litellm.proxy.proxy_server:app",
+            macos_proxy.PROXY_APP,
             host="127.0.0.1",
             port=4000,
             workers=16,

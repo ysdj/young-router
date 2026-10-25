@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from hook_test_utils import *
 
+import importlib
+
 
 class HookResponsesChatBridgeTests(HookTestCase):
     async def test_adapted_chat_stream_reports_restored_reasoning(self) -> None:
@@ -2503,3 +2505,132 @@ class HookResponsesChatBridgeTests(HookTestCase):
                 self.assertNotIn("lifted_delegation_tasks", stats)
                 self.assertFalse(stats.get("changed"))
                 self.assertEqual(len(bridged), 1)
+
+
+class DeclaredProtocolIsNotTheWireTests(unittest.TestCase):
+    """A route's declared protocol is its fallback, not the wire to convert to.
+
+    ``upstream_url_surface`` names the protocol to switch to when the upstream
+    refuses the client's one. Converting before the upstream was asked turned
+    relays that do serve ``/v1/responses`` into chat completions, and the
+    reasoning summary arrived aggregated instead of streaming.
+    """
+
+    def setUp(self) -> None:
+        self.hooks, _ = load_hook_module()
+
+    def _bridge_kwargs(self, surface: str, **extra):
+        request_kwargs = {
+            "call_type": "aresponses",
+            "model": "declared-surface-model",
+            "input": "Say hello.",
+            "stream": True,
+            "model_info": {
+                "id": "declared-surface",
+                "model_group": "declared-surface-model",
+                "upstream_url_surface": surface,
+                **extra,
+            },
+        }
+        return self.hooks._responses_chat_bridge_preemptive_kwargs(request_kwargs)
+
+    def test_a_declared_messages_fallback_does_not_convert_before_the_upstream_is_asked(self) -> None:
+        bridge = self._bridge_kwargs("anthropic", upstream_protocol_mode="fallback")
+
+        self.assertIsNone(bridge)
+
+    def test_a_declared_chat_fallback_does_not_convert_before_the_upstream_is_asked(self) -> None:
+        bridge = self._bridge_kwargs("openai/chat", upstream_protocol_mode="fallback")
+
+        self.assertIsNone(bridge)
+
+    def test_a_fixed_declaration_is_the_wire_and_converts_immediately(self) -> None:
+        bridge = self._bridge_kwargs("anthropic", upstream_protocol_mode="fixed")
+
+        self.assertIsNotNone(bridge)
+
+    def test_a_route_that_states_it_serves_responses_is_never_converted(self) -> None:
+        bridge = self._bridge_kwargs(
+            "openai/responses",
+            upstream_protocol_mode="fallback",
+            supported_upstream_url_surfaces=["openai/responses"],
+        )
+
+        self.assertIsNone(bridge)
+
+    def test_an_attempt_already_switched_to_messages_converts(self) -> None:
+        request_kwargs = {
+            "call_type": "aresponses",
+            "model": "declared-surface-model",
+            "input": "Say hello.",
+            "stream": True,
+            "_young_router_upstream_url_surface": "anthropic",
+            "model_info": {
+                "id": "declared-surface",
+                "model_group": "declared-surface-model",
+                "upstream_url_surface": "anthropic",
+                "upstream_protocol_mode": "fallback",
+            },
+        }
+
+        self.assertIsNotNone(
+            self.hooks._responses_chat_bridge_preemptive_kwargs(request_kwargs)
+        )
+
+    def test_an_attempt_on_responses_never_converts(self) -> None:
+        request_kwargs = {
+            "call_type": "aresponses",
+            "model": "declared-surface-model",
+            "input": "Say hello.",
+            "stream": True,
+            "_young_router_upstream_url_surface": "openai/responses",
+            "model_info": {
+                "id": "declared-surface",
+                "model_group": "declared-surface-model",
+                "upstream_url_surface": "openai/chat",
+                "upstream_protocol_mode": "fixed",
+            },
+        }
+
+        self.assertIsNone(
+            self.hooks._responses_chat_bridge_preemptive_kwargs(request_kwargs)
+        )
+
+
+class StreamedRequestsAreNotCompressedTests(unittest.TestCase):
+    """A compressed stream cannot be delivered incrementally.
+
+    A relay that gzips ``text/event-stream`` hands the whole body back when the
+    last block lands, so a summary produced over twenty seconds arrives as one
+    burst.  Streamed requests therefore negotiate plaintext.
+    """
+
+    def setUp(self) -> None:
+        self.module = importlib.import_module("young_router.proxy.responses_request")
+
+    def test_a_streamed_request_asks_for_plaintext(self) -> None:
+        modified = self.module._with_streaming_plaintext_headers(
+            {"stream": True, "extra_headers": {"x-test": "1"}}
+        )
+
+        assert modified is not None
+        headers = modified["extra_headers"]
+        self.assertEqual(headers["Accept-Encoding"], "identity")
+        self.assertEqual(headers["Accept"], "text/event-stream")
+        self.assertEqual(headers["x-test"], "1")
+
+    def test_a_compressed_negotiation_this_route_already_carried_is_replaced(self) -> None:
+        modified = self.module._with_streaming_plaintext_headers(
+            {"stream": True, "extra_headers": {"accept-encoding": "gzip, deflate"}}
+        )
+
+        assert modified is not None
+        self.assertEqual(
+            {key.lower(): value for key, value in modified["extra_headers"].items()},
+            {"accept-encoding": "identity", "accept": "text/event-stream"},
+        )
+
+    def test_a_buffered_request_keeps_compression(self) -> None:
+        self.assertIsNone(
+            self.module._with_streaming_plaintext_headers({"stream": False})
+        )

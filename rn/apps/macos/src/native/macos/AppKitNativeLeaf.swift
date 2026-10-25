@@ -1902,6 +1902,143 @@ private enum NativeRelayOriginPolicy {
         }
     }
 
+    /// Show the station's own dashboard for one signed-in account.
+    ///
+    /// This is deliberately a webview and not the user's default browser: a
+    /// dashboard read is authenticated by the session cookie this app's browser
+    /// holds, and that cookie cannot be handed to another browser — Safari and
+    /// Chrome each keep their own encrypted jar, and a cookie placed there would
+    /// also fail this station's binding because it was minted for this app's
+    /// browser identity.  The panel therefore rides the same browser, data
+    /// store, and user agent as the sign-in that created the session, which is
+    /// the only place the session is already installed.
+    func openRelayDashboard(
+        accountID: String,
+        type: String,
+        label: String,
+        origin: String,
+        language: String,
+        completion: @escaping () -> Void
+    ) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.openRelayDashboard(
+                    accountID: accountID,
+                    type: type,
+                    label: label,
+                    origin: origin,
+                    language: language,
+                    completion: completion
+                )
+            }
+            return
+        }
+        guard accountID.range(of: #"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$"#, options: .regularExpression) != nil,
+              ["newapi", "sub2api"].contains(type),
+              label.utf8.count <= 160,
+              origin.utf8.count <= 2_048,
+              let originURL = URL(string: origin),
+              NativeRelayOriginPolicy.allows(originURL),
+              originURL.host != nil,
+              originURL.user == nil,
+              originURL.password == nil,
+              originURL.query == nil,
+              originURL.fragment == nil,
+              ["system", "en", "zh-Hans"].contains(language),
+              activeRelayLoginController == nil else {
+            completion()
+            return
+        }
+        let canonicalOrigin = URLComponents(url: originURL, resolvingAgainstBaseURL: false).map { components -> URL in
+            var normalized = components
+            let path = normalized.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            normalized.path = path.isEmpty ? "" : "/" + path
+            return normalized.url ?? originURL
+        } ?? originURL
+        // A dashboard window is a browser of its own, and its data store is
+        // non-persistent: the session the user already signed in with is not in
+        // it.  Installing it is what makes this a *dashboard* rather than a
+        // second sign-in page — the one thing the account row promises.  The
+        // value arrives through the same one-time native lease a key or a
+        // password uses, so no session material travels in a snapshot or a React
+        // payload, and a station whose login this Core no longer holds simply
+        // opens at its own address.
+        //
+        // The lease is a synchronous Core call, so it stays off the main thread:
+        // the window appears as soon as the answer is in, and the pane the user
+        // is looking at never waits on loopback IPC.
+        DispatchQueue.global(qos: .userInitiated).async {
+            let session = Self.relaySessionForDashboard(
+                accountID: accountID,
+                type: type,
+                origin: canonicalOrigin.absoluteString
+            )
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.activeRelayLoginController == nil else {
+                    completion()
+                    return
+                }
+                if let session {
+                    NativeRelaySessionMemoryStore.writeSession(session, accountID: accountID)
+                }
+                let controller = NativeRelayLoginController(
+                    accountID: accountID,
+                    type: type,
+                    label: label,
+                    originURL: canonicalOrigin,
+                    language: language,
+                    username: nil,
+                    presentationParent: self.settingsWindow(),
+                    mode: .dashboard
+                )
+                self.activeRelayLoginController = controller
+                controller.start { [weak self] _ in
+                    self?.activeRelayLoginController = nil
+                    completion()
+                }
+            }
+        }
+    }
+
+    /// Read one account's dashboard session for the browser about to show it.
+    ///
+    /// Core holds the session (the live store after a sign-in, or the
+    /// remembered one after a restart) and hands it over only through the
+    /// one-time plaintext lease the native host already uses for keys and
+    /// passwords.  A malformed or absent answer is "no session", never an
+    /// error the account row has to explain: the window then opens at the
+    /// station's own address.
+    private static func relaySessionForDashboard(
+        accountID: String,
+        type: String,
+        origin: String
+    ) -> NativeRelaySession? {
+        guard let payload = try? CoreIPCBridge.shared.readPlainTextSecret(
+                  domain: "relay_accounts",
+                  field: "session",
+                  target: accountID
+              ),
+              let data = payload.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        let cookie = (object["cookie"] as? String) ?? ""
+        let accessToken = (object["access_token"] as? String) ?? ""
+        return NativeRelaySession(
+            // The store's own read guard matches the account type and origin, so
+            // both travel with the session: a session installed under another
+            // identity would be handed to the wrong site.
+            accountType: type,
+            origin: origin,
+            cookie: cookie,
+            accessToken: accessToken,
+            refreshToken: (object["refresh_token"] as? String) ?? "",
+            userID: (object["user_id"] as? String) ?? "",
+            tokenExpiresAt: (object["expires_at"] as? String) ?? "",
+            username: (object["username"] as? String) ?? ""
+        )
+    }
+
     func clearRelayCredentials(accountID: String) -> Bool {
         guard accountID.range(of: #"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$"#, options: .regularExpression) != nil else { return false }
         NativeRelaySessionMemoryStore.clear(accountID: accountID)
@@ -5676,6 +5813,15 @@ private final class NativeRelayLoginAttempt {
 private enum NativeRelayBrowserMode {
     case login
     case logs
+    /// The station's own dashboard, opened from the account row.
+    ///
+    /// It is a station page the app already holds the session for, so it rides
+    /// the same browser and the same data store as the sign-in and the usage
+    /// log: a session cookie belongs to this app's WebKit cookie jar and cannot
+    /// be handed to another browser, which is why this is a webview instead of
+    /// the default browser.  Like the usage log it owes the sign-in flow
+    /// nothing — no form watching, no automatic sign-in, no completion.
+    case dashboard
 }
 
 private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNavigationDelegate, WKScriptMessageHandler, URLSessionTaskDelegate {
@@ -6218,8 +6364,17 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         // later probe, dashboard read, and usage call — otherwise the session
         // it established is revoked on the first request this app makes.
         webView.customUserAgent = RelayBrowserIdentity.userAgent
+        // The sign-in form is one narrow column, so 900 pt is room to spare for
+        // it.  A station's *console* is not: its own sidebar is a fixed column
+        // of labels, and at 900 pt the page wraps 文档 and 模型广场 onto two
+        // lines — the dashboard opened in a window too small to show it.  The
+        // width is therefore the mode's own, and the console keeps the extra
+        // 240 pt that its sidebar needs.
+        let initialContentSize = mode == .dashboard
+            ? NSSize(width: 1140, height: 780)
+            : NSSize(width: 900, height: 700)
         panel = embeddedWindow == nil ? NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 900, height: 700),
+            contentRect: NSRect(x: 0, y: 0, width: initialContentSize.width, height: initialContentSize.height),
             styleMask: [.titled, .closable, .resizable],
             backing: .buffered,
             defer: false
@@ -6333,6 +6488,12 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         if mode == .logs {
             return relayURL(path: (resolvedType ?? type) == "newapi" ? "usage-logs" : "usage") ?? originURL
         }
+        if mode == .dashboard {
+            // The console path each family serves its own dashboard at.  The
+            // root is not a substitute: a sub2api station answers ``/`` with the
+            // marketing home, which renders signed-out even for a live session.
+            return relayURL(path: (resolvedType ?? type) == "newapi" ? "console" : "dashboard") ?? originURL
+        }
         // Both relay families expose the sign-in form at /login; landing
         // there skips the marketing home page and its separate 登录 link.
         return originURL.appendingPathComponent("login")
@@ -6422,7 +6583,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         let titleLabel = NSTextField(labelWithString: isEmbeddedPresentation
             ? text("1 Relay URL  ›  2 Sign in", "1 中转站 URL  ›  2 登录")
             : label)
-        let showsReloadAction = mode == .logs && !isEmbeddedPresentation
+        let showsReloadAction = mode != .login && !isEmbeddedPresentation
         // The React step owns the progress header and close action. The
         // embedded browser must not add a second native panel header.
         let showsEmbeddedClose = false
@@ -6436,7 +6597,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         titleLabel.lineBreakMode = .byTruncatingTail
         let host = originURL.host ?? ""
         // The host subtitle is redundant when the title already shows the URL.
-        let showsHostSubtitle = isEmbeddedPresentation || mode == .logs || host.isEmpty || !label.localizedCaseInsensitiveContains(host)
+        let showsHostSubtitle = isEmbeddedPresentation || mode != .login || host.isEmpty || !label.localizedCaseInsensitiveContains(host)
         accountLabel.stringValue = isEmbeddedPresentation
             ? text("Sign-in is detected automatically", "登录成功后自动检测")
             : (originURL.host ?? originURL.absoluteString)
@@ -6444,9 +6605,11 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         accountLabel.textColor = .secondaryLabelColor
         statusLabel.stringValue = isEmbeddedPresentation
             ? waitingForSignInStatus
-            : mode == .logs
-                ? text("Showing the relay site's usage logs.", "正在显示中转站用量日志。")
-                : text("Complete sign-in in the page; success is detected automatically.", "请在页面中完成登录，成功后将自动检测。")
+            : mode == .dashboard
+                ? text("Showing the relay site's dashboard.", "正在显示中转站仪表盘。")
+                : mode == .logs
+                    ? text("Showing the relay site's usage logs.", "正在显示中转站用量日志。")
+                    : text("Complete sign-in in the page; success is detected automatically.", "请在页面中完成登录，成功后将自动检测。")
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.lineBreakMode = .byTruncatingTail
         signInButton.isHidden = !showsReloadAction
@@ -6495,9 +6658,11 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         loadingOverlay.blendingMode = .withinWindow
         loadingOverlay.state = .active
         loadingOverlay.translatesAutoresizingMaskIntoConstraints = false
-        loadingLabel.stringValue = mode == .logs
-            ? text("Loading usage logs...", "正在加载用量日志...")
-            : text("Loading sign-in page...", "正在加载登录页面...")
+        loadingLabel.stringValue = mode == .dashboard
+            ? text("Loading the dashboard...", "正在加载仪表盘...")
+            : mode == .logs
+                ? text("Loading usage logs...", "正在加载用量日志...")
+                : text("Loading sign-in page...", "正在加载登录页面...")
         loadingLabel.textColor = .secondaryLabelColor
         loadingLabel.alignment = .center
         loadingLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -6510,10 +6675,16 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         header.translatesAutoresizingMaskIntoConstraints = false
         if let panel {
             configureImmediatePresentation(panel)
-            panel.title = mode == .logs
-                ? text("Relay Usage Logs", "中转站用量日志")
-                : text("Relay Account Sign In", "中转站账号登录")
-            panel.minSize = NSSize(width: 720, height: 560)
+            panel.title = mode == .dashboard
+                ? text("Relay Dashboard", "中转站仪表盘")
+                : mode == .logs
+                    ? text("Relay Usage Logs", "中转站用量日志")
+                    : text("Relay Account Sign In", "中转站账号登录")
+            // The console's own chrome has to fit before its content does; the
+            // sign-in form and the usage log need only their own column.
+            panel.minSize = mode == .dashboard
+                ? NSSize(width: 1000, height: 620)
+                : NSSize(width: 720, height: 560)
             panel.isReleasedWhenClosed = false
             panel.delegate = self
             panel.contentView = content
@@ -6668,21 +6839,45 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         (() => {
           const accessToken = \(jsonLiteral(session.accessToken));
           const refreshToken = \(jsonLiteral(session.refreshToken));
-          const username = \(jsonLiteral(presetUsername ?? ""));
+          const username = \(jsonLiteral(session.username.isEmpty ? (presetUsername ?? "") : session.username));
           const userID = \(jsonLiteral(session.userID));
-          if (accessToken) {
-            localStorage.setItem('auth_token', accessToken);
-            localStorage.setItem('access_token', accessToken);
+          const tokenExpiresAt = \(jsonLiteral(session.tokenExpiresAt));
+          // The account record is written even for a cookie-only session.  A
+          // New API console sends `New-Api-User` on every read, and its value is
+          // this record's `id` (`ar()` returns `-1` without one), so a station
+          // that authenticates by cookie alone stayed signed out in the window
+          // while its cookie was perfectly valid — the header, not the cookie,
+          // was what the station rejected.  The token fields are filled only when
+          // the lease actually carries a token.
+          if (accessToken || userID || username) {
+            if (accessToken) {
+              localStorage.setItem('auth_token', accessToken);
+              localStorage.setItem('access_token', accessToken);
+            }
             try {
               const current = JSON.parse(localStorage.getItem('user') || 'null');
               const user = current && typeof current === 'object' && !Array.isArray(current) ? current : {};
-              user.token = accessToken;
+              if (accessToken) user.token = accessToken;
               if (username && !user.username) user.username = username;
               // The record the page itself rewrites is kept coherent with the
               // stored session, so the next capture reads the same account id
               // the dashboard reads already send.
               if (userID) user.id = Number(userID);
               localStorage.setItem('user', JSON.stringify(user));
+              // A sub2api console reads its session from its *own* keys, not
+              // from the pair above: `auth_user` holds the account record and
+              // `token_expires_at` gates the client's refresh.  Writing only
+              // `auth_token` left that app's router on /login?redirect=/dashboard
+              // with a perfectly valid token in hand.
+              const authUser = JSON.parse(localStorage.getItem('auth_user') || 'null');
+              const record = authUser && typeof authUser === 'object' && !Array.isArray(authUser) ? authUser : {};
+              if (username && !record.username) record.username = username;
+              if (userID && !record.id) record.id = Number(userID);
+              if (Object.keys(record).length) localStorage.setItem('auth_user', JSON.stringify(record));
+              // The console drops a token it cannot date, so the lease states
+              // when this one stops being trusted; its own refresh extends it
+              // from the refresh token beside it, as after a sign-in.
+              if (tokenExpiresAt) localStorage.setItem('token_expires_at', tokenExpiresAt);
             } catch {}
           }
           if (refreshToken) localStorage.setItem('refresh_token', refreshToken);
@@ -6690,7 +6885,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         """
         webView.evaluateJavaScript(script) { [weak self] _, _ in
             guard let self, self.isBrowserFlowLive else { return }
-            if self.mode == .logs {
+            if self.mode != .login {
                 if !session.accessToken.isEmpty || !session.refreshToken.isEmpty {
                     // The protected usage route may redirect to login before
                     // local storage is restored. Navigate back to the intended
@@ -7739,7 +7934,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         schedulePageReadinessProbe()
         scheduleAgreementReveal()
         scheduleLoginWatch(delay: 1)
-        if mode == .logs {
+        if mode != .login {
             if !didRestoreSession {
                 restoreLocalStorageWhenReady()
             }
@@ -7830,7 +8025,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         withoutAnimations { loadingOverlay.isHidden = true }
         scheduleEmbeddedBrowserResize()
         scheduleAgreementReveal()
-        if mode == .logs {
+        if mode != .login {
             if !didRestoreSession {
                 restoreLocalStorageWhenReady()
             }
@@ -7965,9 +8160,11 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         agreementRevealAttempts = 0
         automaticCheckProbe?.cancel()
         automaticCheckProbe = nil
-        loadingLabel.stringValue = mode == .logs
-            ? text("Loading usage logs...", "正在加载用量日志...")
-            : text("Loading sign-in page...", "正在加载登录页面...")
+        loadingLabel.stringValue = mode == .dashboard
+            ? text("Loading the dashboard...", "正在加载仪表盘...")
+            : mode == .logs
+                ? text("Loading usage logs...", "正在加载用量日志...")
+                : text("Loading sign-in page...", "正在加载登录页面...")
         withoutAnimations { loadingOverlay.isHidden = false }
     }
 
@@ -7977,9 +8174,11 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         loginFormRevealProbe = nil
         automaticCheckProbe?.cancel()
         automaticCheckProbe = nil
-        loadingLabel.stringValue = mode == .logs
-            ? text("The usage log page could not be loaded.", "用量日志页面加载失败。")
-            : text("The sign-in page could not be loaded.", "登录页面加载失败。")
+        loadingLabel.stringValue = mode == .dashboard
+            ? text("The dashboard could not be loaded.", "仪表盘页面加载失败。")
+            : mode == .logs
+                ? text("The usage log page could not be loaded.", "用量日志页面加载失败。")
+                : text("The sign-in page could not be loaded.", "登录页面加载失败。")
         withoutAnimations { loadingOverlay.isHidden = false }
     }
 
@@ -8008,14 +8207,35 @@ private struct NativeRelaySession: Codable {
     /// session exactly like the cookie.  Decoded leniently: a session stored by
     /// an older build simply has none.
     let userID: String
+    /// When the console should stop trusting `accessToken`, in epoch
+    /// milliseconds.  A sub2api console refuses a token it cannot date, so the
+    /// lease that primes a dashboard window states one.  Empty for a session
+    /// this host captured itself, which keeps the page's own value.
+    let tokenExpiresAt: String
+    /// The station's own name for this account, written into the console's
+    /// account record so the window it primes shows the signed-in user instead
+    /// of a blank header.  Empty for a session this host captured itself, which
+    /// reads the page's own value.
+    let username: String
 
-    init(accountType: String, origin: String, cookie: String, accessToken: String, refreshToken: String, userID: String = "") {
+    init(
+        accountType: String,
+        origin: String,
+        cookie: String,
+        accessToken: String,
+        refreshToken: String,
+        userID: String = "",
+        tokenExpiresAt: String = "",
+        username: String = ""
+    ) {
         self.accountType = accountType
         self.origin = origin
         self.cookie = cookie
         self.accessToken = accessToken
         self.refreshToken = refreshToken
         self.userID = userID
+        self.tokenExpiresAt = tokenExpiresAt
+        self.username = username
     }
 
     init(from decoder: Decoder) throws {
@@ -8026,6 +8246,8 @@ private struct NativeRelaySession: Codable {
         accessToken = try container.decode(String.self, forKey: .accessToken)
         refreshToken = try container.decode(String.self, forKey: .refreshToken)
         userID = try container.decodeIfPresent(String.self, forKey: .userID) ?? ""
+        tokenExpiresAt = try container.decodeIfPresent(String.self, forKey: .tokenExpiresAt) ?? ""
+        username = try container.decodeIfPresent(String.self, forKey: .username) ?? ""
     }
 }
 

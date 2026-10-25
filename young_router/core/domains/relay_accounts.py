@@ -3383,6 +3383,50 @@ class RelayAccountsDomain:
             if not isinstance(password, str) or not password:
                 raise RelayAccountsError("The requested relay credential is unavailable")
             return password
+        if field == "session":
+            # The dashboard session, handed only to the host that owns the
+            # browser which installed it, through the same one-time lease as a
+            # key or a password.  Core already holds it (the live store after a
+            # sign-in, or the remembered session after a restart) and the
+            # ``relay/session`` route is what a later window needs it for: a
+            # dashboard opened from the account row is a *different* browser
+            # instance from the one that signed in, and a session cookie cannot
+            # be planted in the user's own browser at all.
+            #
+            # This is a read of local data about a login Core already holds; it
+            # mints nothing and contacts no station, so an aged-out observation
+            # cannot turn it into a sign-in attempt.
+            if target is None:
+                raise RelayAccountsError("The requested relay credential is unavailable")
+            account = self._accounts[self._index(target)]
+            live = self._session_secrets.get(target, {})
+            stored = account.get("session") if isinstance(account.get("session"), Mapping) else {}
+            payload: dict[str, str] = {}
+            for key in ("cookie", "access_token", "refresh_token"):
+                value = live.get(key) if isinstance(live.get(key), str) and live.get(key) else stored.get(key)
+                if isinstance(value, str) and value:
+                    payload[key] = value
+            if not payload.get("cookie") and not payload.get("access_token"):
+                raise RelayAccountsError("The requested relay credential is unavailable")
+            user_id = str(account.get("user_id") or "").strip()
+            # A sub2api console refuses a token it cannot date: the client reads
+            # ``token_expires_at`` and drops the session when it is absent or
+            # already past.  The station issues an access token with an hours-long
+            # life, so the lease states one from now; the client's own refresh
+            # (with the refresh token beside it) then extends it, exactly as it
+            # does after a sign-in.
+            expires_at = ""
+            if payload.get("access_token"):
+                expires_at = str(int((time.time() + 3600) * 1000))
+            return json.dumps(
+                {
+                    "username": str(account.get("username") or ""),
+                    "user_id": user_id,
+                    "expires_at": expires_at,
+                    **payload,
+                },
+                ensure_ascii=False,
+            )
         if field != "api_key" or target is None:
             raise RelayAccountsError("The requested relay credential is unavailable")
         account_id, resource_id = self._secret_target(target)
@@ -3568,6 +3612,39 @@ class RelayAccountsDomain:
         self._persist()
         self.revision += 1
         return _public_account(self._accounts[index])
+
+    def store_rotated_refresh_token(self, account_id: str, refresh_token: str) -> None:
+        """Keep a refresh token the station rotated during a usage read.
+
+        A Sub2API dashboard invalidates the refresh token it just honored, so
+        the successor is the only value that can mint the next token.  The
+        access token itself is never stored: it expires in hours and is minted
+        on demand, and a persisted copy is what went stale before.  The refresh
+        token is different — losing it means signing in again — so it is written
+        back with the session it belongs to.
+        """
+
+        value = _text(refresh_token, "Relay refresh token", limit=32768)
+        if not value:
+            return
+        try:
+            index = self._index(account_id)
+        except RelayAccountsError:
+            return
+        account = self._accounts[index]
+        session = account.get("session")
+        if not isinstance(session, dict):
+            session = {}
+        if session.get("refresh_token") == value:
+            return
+        session["refresh_token"] = value
+        account["session"] = session
+        secrets = self._session_secrets.get(account_id)
+        if isinstance(secrets, dict):
+            secrets["refresh_token"] = value
+        self._accounts[index] = _private_account(account)
+        self._persist()
+        self.revision += 1
 
     def settle_login_status(self, account_id: str, status: str) -> dict[str, Any]:
         """Record one host session observation, or hold one that is already proven.

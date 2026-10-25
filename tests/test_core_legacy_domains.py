@@ -750,7 +750,7 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             self.assertEqual("claude-sonnet-4-5", model["upstream_model"])
             self.assertEqual("anthropic/claude-sonnet-4-5", model["litellm_model"])
 
-    def test_new_non_claude_model_defaults_to_responses_surface(self) -> None:
+    def test_new_non_claude_model_defaults_to_chat_surface(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.yaml"
             path.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
@@ -772,7 +772,7 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             )
 
             model = domain.snapshot()["providers"][0]["models"][1]
-            self.assertEqual("openai/responses", model["upstream_url_surface"])
+            self.assertEqual("openai/chat", model["upstream_url_surface"])
             self.assertEqual("openai/gpt-5", model["litellm_model"])
 
     def test_upstream_model_is_displayed_without_prefix_and_saved_canonically(self) -> None:
@@ -2797,6 +2797,60 @@ class CodexSettingsDomainTests(unittest.TestCase):
                 ["future-runtime@openai-bundled", "future@openai-bundled"],
                 _ensure_plugins.call_args.args[2],
             )
+
+    def test_search_switch_writes_the_provider_standalone_opt_in(self) -> None:
+        """Codex only registers its own search executor from the provider row.
+
+        The Responses Lite lane these routes inherit never declares the hosted
+        ``web_search`` tool, so the switch has to reach the provider row and the
+        live search mode; a top-level flag alone would ship a tool that cannot
+        use the web.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            home = root / "codex"
+            home.mkdir()
+            (home / "config.toml").write_text(
+                textwrap.dedent(
+                    """
+                    model = "default-chat"
+                    model_provider = "newapi"
+
+                    [model_providers.newapi]
+                    name = "newapi"
+                    base_url = "http://127.0.0.1:4999/v1"
+                    wire_api = "responses"
+                    requires_openai_auth = true
+                    """
+                ).lstrip(),
+                encoding="utf-8",
+            )
+            (home / "auth.json").write_text("{}\n", encoding="utf-8")
+            domain = CodexSettingsDomain(runtime, codex_home=home)
+            self.assertFalse(domain.snapshot()["standalone_search"])
+
+            enabled = domain.dispatch("codex_search_set", {"enabled": True})
+            self.assertTrue(enabled["standalone_search"])
+            row = next(
+                item
+                for item in enabled["structured"]["providers"]
+                if item["id"] == "newapi"
+            )
+            self.assertIs(True, row["supports_standalone_web_search"])
+            self.assertEqual("live", enabled["structured"]["web_search"])
+
+            disabled = domain.dispatch("codex_search_set", {"enabled": False})
+            self.assertFalse(disabled["standalone_search"])
+            row = next(
+                item
+                for item in disabled["structured"]["providers"]
+                if item["id"] == "newapi"
+            )
+            self.assertIs(False, row["supports_standalone_web_search"])
+            self.assertIsNone(disabled["structured"]["web_search"])
 
     @mock.patch("young_router.core.domains.codex._ensure_browser_plugins", return_value=[])
     @mock.patch("young_router.core.domains.codex._installed_surface_plugins")

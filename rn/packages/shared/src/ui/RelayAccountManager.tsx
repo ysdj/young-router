@@ -557,9 +557,10 @@ export function DependencyPolicyDialog<T extends string>({ visible, title, messa
  *
  * ``session`` is a sign-in the user started (去登录, or the ＋ account flow);
  * ``checking`` is the session check the pane runs on mount.  Both are statements
- * about the login, so both own the login column's 登录中.  ``resources`` is the
- * key-list read, which says nothing about the login and so must not repaint the
- * login column.
+ * about the login, but they are not the same statement: a sign-in of the user's
+ * own is 登录中, while a check is only asking the station what a session already
+ * on hand is worth, so it reads 检测中.  ``resources`` is the key-list read,
+ * which says nothing about the login and so must not repaint the login column.
  */
 type AccountLoading = { session: boolean; checking: boolean; resources: boolean };
 
@@ -681,10 +682,16 @@ export function StationAccountsPanel({
     return "unknown";
   };
   // The status column and both account actions read this one state: 已登录,
-  // 登录中 while the login is still being settled — a sign-in this pane started
-  // (``session``) or the session check it runs on mount (``checking``) — and
-  // 未登录 for every other case (signed out, expired, and an account no answer
-  // has covered yet).
+  // 登录中 while a sign-in this pane started is still being settled
+  // (``session``), 检测中 while the mount check is asking the station what the
+  // session on hand is worth (``checking``), and 未登录 for every other case
+  // (signed out, expired, and an account no answer has covered yet).
+  //
+  // The two waits say different things.  A sign-in is the station minting a
+  // session, so it reads 登录中; a check spends that session on one probe and
+  // may answer 已登录 or 未登录 from it, so it reads 检测中 -- the word the row
+  // shows while the answer is still unknown, and never 登录中, which would
+  // claim a sign-in that nobody started.
   //
   // 未登录 is a conclusion, and only an answer may state it: the mount check is
   // a station round trip whose network timeout is long enough that a row painted
@@ -692,13 +699,13 @@ export function StationAccountsPanel({
   // second, pointless sign-in while the first session was still being verified.
   // A row the pane already knows is signed in keeps 已登录 through a check that
   // is about to agree with it, so re-entering the pane never flickers a verified
-  // account through 登录中; only the pane's own sign-in outranks that, because
+  // account through 检测中; only the pane's own sign-in outranks that, because
   // the facts beside the row must not read 已登录 before they belong to the
   // account that just signed in.
-  const relayLoginState = (account: RelayAccount): "signed_in" | "signing_in" | "signed_out" => {
+  const relayLoginState = (account: RelayAccount): "signed_in" | "checking_login" | "signing_in" | "signed_out" => {
     if (loading[account.id]?.session) return "signing_in";
     if (effectiveLoginStatus(account) === "signed_in") return "signed_in";
-    if (loading[account.id]?.checking) return "signing_in";
+    if (loading[account.id]?.checking) return "checking_login";
     return "signed_out";
   };
   // The session lane is set on the way in to a sign-in, never cleared in a
@@ -801,11 +808,12 @@ export function StationAccountsPanel({
   };
   const restoreSavedSession = async (account: RelayAccount): Promise<boolean> => {
     // The mount check reports in a lane of its own.  It is a statement about the
-    // login, so 登录中 is what the row says while it runs — never 未登录, which is
-    // the answer this check is still fetching — and it stays out of the session
-    // lane, because that lane is the pane's own sign-in: a window the host holds
-    // over this one until it closes, while this check is a wait 去登录 may
-    // interrupt instead of one the user has to sit out.
+    // login, so the row states a wait while it runs — 检测中, never 未登录, which
+    // is the answer this check is still fetching, and never 登录中, because this
+    // check signs nothing in — and it stays out of the session lane, because
+    // that lane is the pane's own sign-in: a window the host holds over this one
+    // until it closes, while this check is a wait 去登录 may interrupt instead
+    // of one the user has to sit out.
     updateLoading(account.id, "checking", true);
     const checkEpoch = signInCounts.current[account.id] ?? 0;
     try {
@@ -1008,6 +1016,36 @@ export function StationAccountsPanel({
     if (pendingAction === "login") return;
     const account = selected;
     await runPendingAction("login", () => loginAccount(account));
+  };
+  // The account row's name is the way into the station's own dashboard.
+  //
+  // A dashboard session is the cookie this app's browser installed, and no
+  // other browser can be handed it: Safari and Chrome keep separate encrypted
+  // jars, and the station binds its session to the identity that created it.
+  // The dashboard therefore opens in the app's own authenticated browser, which
+  // is the only surface that already has the session; a host without one falls
+  // back to the station's address, where the user can sign in themselves.
+  const openDashboard = (): void => {
+    if (!selected) return;
+    const account = selected;
+    // No pending lane: this surface's promise resolves when the dashboard
+    // window closes, and a spinner that lasted exactly that long would read as
+    // a stalled action and grey out the row's session controls meanwhile.
+    try {
+      if (native.openRelayDashboard) {
+        void native.openRelayDashboard({
+          accountId: account.id,
+          type: account.type,
+          label: account.label,
+          origin: account.origin,
+          language,
+        }).catch(() => { publish(translate("relay.operationFailed")); });
+        return;
+      }
+      native.openExternalURL?.(account.origin);
+    } catch {
+      publish(translate("relay.operationFailed"));
+    }
   };
   const removeSelected = async (): Promise<void> => {
     if (!removal) return;
@@ -1437,13 +1475,39 @@ export function StationAccountsPanel({
           onto a line of its own below the session controls. */}
       <View style={styles.fieldRow}>
         <Text style={styles.fieldLabel}>{translate("relay.accountField")}</Text>
-        <Text style={styles.accountNameValue}>{accountDisplayName(selected, translate)}</Text>
+        {/* The account name is the way into the station's own dashboard.  It
+            opens in this app's authenticated browser, not the default one: the
+            dashboard session is a cookie in this app's browser data store and
+            there is no supported way to hand it to Safari or Chrome (each keeps
+            its own encrypted jar, and the station would reject a cookie minted
+            for this app's browser identity anyway).  A host without that
+            browser falls back to the station's own address, where the user can
+            sign in themselves. */}
+        {/* The name is the action, so it is a link — and ``plainLink`` is the
+            link variant for a long value that owns its own room: it reserves the
+            address's own measured width (+2), draws no inline bezel, and carries
+            its underline at rest, which is what says "link" without the 20 pt of
+            bezel padding a navigation link reserves.  That padding is what
+            wrapped 分组 onto a second line.  ``titleWidth="flex"`` must not be
+            used here: flex skips the reservation entirely and leaves the width
+            to the container, and this row hands nothing down, so the address
+            collapsed to a sliver. */}
+        <NativeButton
+          title={accountDisplayName(selected, translate)}
+          toolTip={translate("relay.openDashboard")}
+          accessibilityLabel={translate("relay.openDashboard")}
+          compact
+          link
+          plainLink
+          titleWidth="tight"
+          onPress={openDashboard}
+        />
         {/* 去登录 is offered by a row that states 未登录, and only by one: a row
-            already reading 登录中 — the pane's own sign-in or the mount check
-            still fetching its answer — has no second sign-in to hand the user,
-            and a button beside that word reads as "your attempt did not
-            start".  A check that settles to 未登录 brings the button back; a
-            verified account never needed it. */}
+            already carrying a wait — 登录中 for the pane's own sign-in, 检测中
+            while the mount check fetches its answer — has no second sign-in to
+            hand the user, and a button beside that word reads as "your attempt
+            did not start".  A check that settles to 未登录 brings the button
+            back; a verified account never needed it. */}
         {selectedLoginState === "signed_out" ? <NativeButton title={translate("relay.goLogin")} compact busy={pendingAction === "login"} disabled={controlsBusy && pendingAction !== "login"} onPress={() => { void loginSelected(); }} /> : null}
         {selectedLoginState === "signed_in" ? <NativeButton title={translate("relay.refreshResources")} symbol="refresh" compact busy={pendingAction === "refresh"} disabled={controlsBusy && pendingAction !== "refresh"} onPress={() => { void refreshSelected(); }} /> : null}
         {selectedLoginState === "signed_in" ? <NativeButton title={translate("relay.groupManager")} titleWidth="tight" compact disabled={controlsBusy || !native.showGroupManager} onPress={() => { void openGroupManager(); }} /> : null}
@@ -1542,11 +1606,6 @@ const styles = StyleSheet.create({
   accountsEmpty: { minHeight: 40, alignItems: "center", justifyContent: "center", paddingHorizontal: 10, paddingVertical: 8, borderWidth: 1, borderColor: colors.separator, backgroundColor: colors.panel },
   accountsEmptyText: { color: colors.secondary, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15, textAlign: "center" },
   accountEditor: { minWidth: 0, gap: 5 },
-  // The value takes the width it needs and never ellipsizes: the account name
-  // is the row's fact, and a clipped address cannot be told from a different
-  // one.  The session controls give way instead — the row wraps below the name
-  // when both no longer fit — so nothing here sets minWidth or flexShrink.
-  accountNameValue: { minWidth: 0, color: colors.text, fontSize: UI_FONT_SIZE },
   // Compact and wrappable: 账号, its full value, and the session controls share
   // one row until they no longer fit, then 刷新 / 分组 flow to the next line
   // instead of overlapping the name.

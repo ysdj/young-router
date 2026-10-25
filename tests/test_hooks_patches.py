@@ -498,6 +498,45 @@ class HookPatchTests(HookTestCase):
             self.assertEqual(kwargs["custom_llm_provider"], provider)
             self.assertEqual(kwargs.get("use_chat_completions_api") is True, uses_chat)
 
+    def test_selected_deployment_records_the_wire_it_dispatched_on(self) -> None:
+        """The selection trace names the wire, not the route's backup protocol.
+
+        ``upstream_url_surface`` on a ``fallback`` route is the protocol it may
+        switch to; a route answering /v1/responses natively keeps declaring
+        ``openai/chat``.  Recording the declaration as the wire is what made the
+        trace claim a live Responses request had gone out as a chat call, and
+        made that step split from the route's own success record.
+        """
+
+        hooks, _ = load_hook_module()
+        router_module = types.ModuleType("litellm.router")
+
+        class Router:
+            def _update_kwargs_with_deployment(self, deployment, kwargs, function_name=None):
+                kwargs["litellm_params"] = dict(deployment["litellm_params"])
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_selected_deployment_marker_patch()
+        deployment = {
+            "litellm_params": {"model": "openai/vendor/model", "order": 1},
+            "model_info": {
+                "id": "fallback-route",
+                "upstream_url_surface": "openai/chat",
+                "upstream_protocol_mode": "fallback",
+            },
+        }
+        kwargs = {"model": "public-chat", "input": "hello", "stream": True}
+
+        with self.assertLogs("young_router.route_trace", level="WARNING") as captured:
+            Router()._update_kwargs_with_deployment(deployment, kwargs)
+
+        record = json.loads(captured.output[0].split("litellm_route_trace ", 1)[1])
+        self.assertEqual("selected_deployment", record["event"])
+        self.assertEqual("openai/responses", record["deployment"]["surface"])
+        self.assertEqual("openai/chat", record["deployment"]["upstream_url_surface"])
+        self.assertEqual("fallback", record["deployment"]["upstream_protocol_mode"])
+
     def test_selected_deployment_marker_forwards_upstream_keywords_it_does_not_read(self) -> None:
         """A keyword LiteLLM adds to deployment selection must reach it.
 
@@ -4125,6 +4164,236 @@ class HookPatchTests(HookTestCase):
         )
         self.assertEqual([f for f in socket.sent if '"response.metadata"' in f], [])
         self.assertEqual(len(socket.sent), 2)
+
+    def test_pre_call_token_count_reads_replayed_reasoning_as_the_upstream_does(
+        self,
+    ) -> None:
+        """A local estimate may not refuse a body the upstream accepts.
+
+        ``enable_pre_call_checks`` refuses the request before a route is tried
+        when its own count exceeds ``max_input_tokens``.  Its Responses path
+        prices a ``reasoning`` item's ``summary`` text as message content, and
+        that text is exactly what neither the client replays nor the upstream
+        receives: one measured thread was charged 1,004,863 tokens against a
+        1,000,000 window for a body whose own answer usage was 400,824.
+
+        The wrapper must change only the value counted: the request the route
+        receives keeps every item it arrived with.
+        """
+
+        hooks, _ = load_hook_module()
+        router_module = types.ModuleType("litellm.router")
+        seen: list[object] = []
+
+        class Router:
+            def _count_pre_call_check_tokens(self, messages, input, request_kwargs=None):
+                seen.append(input)
+                return 7
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_pre_call_token_count_patch()
+
+        request_input = [
+            {
+                "type": "reasoning",
+                "id": "rs_1",
+                "summary": [{"type": "summary_text", "text": "x" * 40_000}],
+                "encrypted_content": None,
+            },
+            {"type": "message", "role": "user", "content": "continue"},
+        ]
+        request = {"input": request_input}
+
+        count = Router()._count_pre_call_check_tokens(
+            messages=None,
+            input=request["input"],
+            request_kwargs=request,
+        )
+
+        self.assertEqual(count, 7)
+        counted = seen[0]
+        self.assertEqual(counted[0]["id"], "rs_1")
+        self.assertNotIn("summary", counted[0])
+        self.assertEqual(counted[1], request_input[1])
+        # The request the route will see is untouched.
+        self.assertIn("summary", request["input"][0])
+        self.assertEqual(
+            request["input"][0]["summary"][0]["text"], "x" * 40_000
+        )
+
+    def test_pre_call_token_count_leaves_a_chat_shaped_request_alone(self) -> None:
+        hooks, _ = load_hook_module()
+        router_module = types.ModuleType("litellm.router")
+        seen: list[object] = []
+
+        class Router:
+            def _count_pre_call_check_tokens(self, messages, input, request_kwargs=None):
+                seen.append((messages, input))
+                return 3
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_pre_call_token_count_patch()
+
+        messages = [{"role": "user", "content": "hello"}]
+        Router()._count_pre_call_check_tokens(
+            messages=messages,
+            input=None,
+            request_kwargs={},
+        )
+
+        self.assertEqual(seen, [(messages, None)])
+
+
+class ChatBridgeReasoningReplayTests(HookTestCase):
+    """A bridging replay must satisfy a thinking upstream's field contract.
+
+    A DeepSeek thinking upstream refuses the whole request with HTTP 400 ``the
+    `reasoning_content` in the thinking mode must be passed back to the API``
+    when an assistant message carrying ``tool_calls`` has no
+    ``reasoning_content`` field at all — the field being empty answers, being
+    absent does not.  On the Responses surface the client's own ``reasoning``
+    item supplies it; across the chat bridge LiteLLM drops that item when its
+    only payload is ``encrypted_content`` (the shape Codex sends), so the same
+    history was answered on one wire and refused on the other.
+    """
+
+    def test_a_tool_call_replay_gains_the_field_a_thinking_route_requires(self) -> None:
+        hooks, _ = load_hook_module()
+        hooks._install_responses_chat_bridge_reasoning_replay_patch()
+        from litellm.responses.litellm_completion_transformation.transformation import (
+            LiteLLMCompletionResponsesConfig,
+        )
+
+        request = {
+            "model": "deepseek-flash",
+            "input": [
+                {"role": "user", "content": "run echo hi"},
+                # Codex replays its thinking as an opaque blob with no text.
+                {"type": "reasoning", "id": "rs_1", "encrypted_content": "opaque", "summary": []},
+                {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "shell",
+                    "arguments": "{\"cmd\":\"echo hi\"}",
+                },
+                {"type": "function_call_output", "call_id": "call_1", "output": "hi"},
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "shell",
+                    "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}},
+                }
+            ],
+            "max_output_tokens": 64,
+        }
+
+        with self.assertLogs("young_router.route_trace", level="WARNING") as captured:
+            built = LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request(
+                model="deepseek-flash",
+                input=request["input"],
+                responses_api_request=request,
+                stream=False,
+                custom_llm_provider="openai",
+                kwargs={},
+            )
+
+        assistant = [m for m in built["messages"] if m.get("role") == "assistant"]
+        self.assertEqual(1, len(assistant))
+        self.assertTrue(assistant[0].get("tool_calls"))
+        # Empty is the whole repair: it invents no thinking, and it is what the
+        # upstream accepts.
+        self.assertEqual("", assistant[0].get("reasoning_content"))
+        # Nothing else about the replay moves.
+        self.assertIsNone(assistant[0].get("content"))
+
+        record = json.loads(captured.output[0].split("litellm_route_trace ", 1)[1])
+        self.assertEqual("responses_chat_bridge_reasoning_replay_repaired", record["event"])
+        self.assertEqual(["call_1"], record["repaired_tool_call_ids"])
+
+    def test_a_replay_that_already_carries_the_field_is_left_alone(self) -> None:
+        hooks, _ = load_hook_module()
+        hooks._install_responses_chat_bridge_reasoning_replay_patch()
+        from litellm.responses.litellm_completion_transformation.transformation import (
+            LiteLLMCompletionResponsesConfig,
+        )
+
+        request = {
+            "model": "deepseek-flash",
+            "input": [
+                {"role": "user", "content": "run echo hi"},
+                # Plaintext reasoning reaches the assistant message by itself.
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [{"type": "summary_text", "text": "I should run echo hi"}],
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "shell",
+                    "arguments": "{\"cmd\":\"echo hi\"}",
+                },
+                {"type": "function_call_output", "call_id": "call_1", "output": "hi"},
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "shell",
+                    "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}},
+                }
+            ],
+            "max_output_tokens": 64,
+        }
+
+        with self.assertNoLogs("young_router.route_trace", level="WARNING"):
+            built = LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request(
+                model="deepseek-flash",
+                input=request["input"],
+                responses_api_request=request,
+                stream=False,
+                custom_llm_provider="openai",
+                kwargs={},
+            )
+
+        assistant = [m for m in built["messages"] if m.get("role") == "assistant"]
+        self.assertEqual("I should run echo hi", assistant[0].get("reasoning_content"))
+
+    def test_a_plain_turn_gains_no_field(self) -> None:
+        """Only a tool-call message carries the contract; a text turn does not."""
+
+        hooks, _ = load_hook_module()
+        hooks._install_responses_chat_bridge_reasoning_replay_patch()
+        from litellm.responses.litellm_completion_transformation.transformation import (
+            LiteLLMCompletionResponsesConfig,
+        )
+
+        request = {
+            "model": "deepseek-flash",
+            "input": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+                {"role": "user", "content": "again"},
+            ],
+            "max_output_tokens": 64,
+        }
+
+        with self.assertNoLogs("young_router.route_trace", level="WARNING"):
+            built = LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request(
+                model="deepseek-flash",
+                input=request["input"],
+                responses_api_request=request,
+                stream=False,
+                custom_llm_provider="openai",
+                kwargs={},
+            )
+
+        for message in built["messages"]:
+            self.assertNotIn("reasoning_content", message)
 
 
 if __name__ == "__main__":

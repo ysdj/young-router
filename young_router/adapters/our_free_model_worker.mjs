@@ -152,10 +152,10 @@ function wireMembership(upstream, runtime) {
     const wires = {}
     for (const entry of catalog) {
       if (typeof entry?.id !== 'string' || entry.id === '') continue
-      // A row that states its own wire is taken at its word: the Kilo and EAC
-      // channels carry `wire` on every row, and the package routes by that
-      // field. Only a row that states none is answered from the id set the
-      // anonymous lane routes with.
+      // A row that states its own wire is taken at its word: the Kilo channel
+      // carries `wire` on every row, and the package routes by that field. Only
+      // a row that states none is answered from the id set the anonymous lane
+      // routes with.
       if (typeof entry.wire === 'string' && entry.wire !== '') wires[entry.id] = entry.wire
       else if (typeof upstream?.isResponsesModel === 'function') wires[entry.id] = upstream.isResponsesModel(entry.id) ? 'responses' : 'chat'
     }

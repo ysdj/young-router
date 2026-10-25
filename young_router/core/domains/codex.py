@@ -1057,6 +1057,27 @@ class CodexSettingsDomain:
                     candidates.append(str(item.get("base_url") or ""))
         return any(candidate.rstrip("/") == expected for candidate in candidates if candidate)
 
+    def standalone_search_enabled(self) -> bool:
+        """Whether the selected provider opts into Codex's own web search.
+
+        Provider-level opt-in is the only carrier that matters on this route:
+        the Responses Lite lane never declares the hosted ``web_search`` tool,
+        so ``supports_standalone_web_search`` is what makes Codex register its
+        ``web.run`` executor. A missing field is Codex's default (off), which
+        is why this reads the row instead of a top-level switch.
+        """
+
+        structured = self._draft.get("structured")
+        structured = structured if isinstance(structured, Mapping) else {}
+        provider_id = str(structured.get("model_provider") or "").strip()
+        providers = structured.get("providers")
+        if not provider_id or not isinstance(providers, list):
+            return False
+        for item in providers:
+            if isinstance(item, Mapping) and str(item.get("id") or "").strip() == provider_id:
+                return item.get("supports_standalone_web_search") is True
+        return False
+
     def _safe_snapshot(self, payload: Mapping[str, Any], revision: int) -> dict[str, Any]:
         errors = payload.get("validation_errors", [])
         warnings = payload.get("warnings", [])
@@ -1069,6 +1090,7 @@ class CodexSettingsDomain:
             "config_exists": bool(payload.get("config_exists")),
             "auth_file_exists": bool(payload.get("auth_exists")),
             "uses_local_api": self.uses_local_api(),
+            "standalone_search": self.standalone_search_enabled(),
             "structured": redact(payload.get("structured", {})),
             "models": redact(payload.get("models", [])),
             "validation_errors": redact(errors if isinstance(errors, list) else []),
@@ -1251,6 +1273,39 @@ class CodexSettingsDomain:
                 config_text,
                 auth_text,
                 patch,
+            )
+        elif name in {"codex_search_set", "codex_search"}:
+            # Codex's Responses Lite lane carries no hosted web_search tool, so
+            # the provider row's standalone opt-in is the whole switch: with it
+            # Codex registers ``web.run`` and the agent stops curling search
+            # engines from the shell.  Since the opt-in inherits Codex's default
+            # ``cached`` mode -- which registers the executor with live access
+            # off -- enabling it also asks for live search.
+            enabled_value = data.get("enabled")
+            if not isinstance(enabled_value, bool):
+                raise DomainError("The Codex search switch is invalid")
+            current = self._draft.get("structured")
+            current = current if isinstance(current, Mapping) else {}
+            provider_id = str(current.get("model_provider") or "").strip()
+            providers = current.get("providers")
+            if not provider_id or not isinstance(providers, list) or not any(
+                isinstance(item, Mapping)
+                and str(item.get("id") or "").strip() == provider_id
+                for item in providers
+            ):
+                raise DomainError("The selected Codex provider has no editable row")
+            self._draft = self._sync(
+                config_text,
+                auth_text,
+                {
+                    "web_search": "live" if enabled_value else None,
+                    "providers": [
+                        {
+                            "id": provider_id,
+                            "supports_standalone_web_search": True if enabled_value else None,
+                        }
+                    ],
+                },
             )
         elif name in {"reset", "cancel", "reload", "restore_defaults"}:
             self._draft = copy.deepcopy(self._raw)

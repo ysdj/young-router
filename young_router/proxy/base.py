@@ -821,6 +821,15 @@ _RESPONSES_COMPLETION_STREAM_COMPLETED_PATCH_ATTR = (
     "_responses_completion_stream_completed_patch"
 )
 _RESPONSES_TOOL_SEARCH_BRIDGE_PATCH_ATTR = "_responses_tool_search_bridge_patch"
+# The chat-bridge input pass that keeps a thinking upstream's replay contract.
+_RESPONSES_CHAT_BRIDGE_REASONING_PATCH_ATTR = (
+    "_responses_chat_bridge_reasoning_replay_patch"
+)
+# The metadata flag a bridged request carries once that pass rewrote it, so the
+# traces can say the replay was repaired rather than sent as the client wrote it.
+_RESPONSES_CHAT_BRIDGE_REASONING_REPLAY_KEY = (
+    "responses_chat_bridge_reasoning_replay_repaired"
+)
 _RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY = (
     "responses_function_tool_bridge_attempted"
 )
@@ -1161,6 +1170,44 @@ _UPSTREAM_RELAY_CAPACITY_MARKERS = (
 # account first, and a turn ended on the unclassified-stop sentence while a
 # sibling route was answering the same request.  The wording, not the status, is
 # the evidence that a replay would be refused the same way.
+# A local adapter wraps its own upstream refusal into an HTTP 400 that carries
+# the upstream's status in prose ("请求被上游拒绝（http 401）", an APISIX
+# "401 Authorization Required" page, or an OpenAI "invalid_api_key").  The
+# route's credential, not the request, is what the upstream rejected, so this
+# is parked like an account restriction and the turn advances to a sibling.
+# Read only the status words: a 400 about parameters must stay the request's
+# own verdict.
+_UPSTREAM_SESSION_REJECTED_ERROR_MARKERS = (
+    "http 401",
+    "http 403",
+    "401 authorization required",
+    "403 forbidden",
+    "invalid_api_key",
+    "invalid api key",
+)
+# Some callers reach this proxy with a key that is not the configured master
+# key, and LiteLLM answers that itself: the key is looked up as a virtual key,
+# needs the database, and the auth handler rejects the call with a 400 whose
+# type is ``no_db_connection``.  Nothing upstream was contacted, so this is not
+# an upstream error however the status reads -- the log line and the tray both
+# called it one until the type, not the status, named the branch.  Matched on
+# LiteLLM's own ``ProxyErrorTypes`` values, never on the sentence: the same
+# wording is also the answer a *provider* with a database problem gives, and
+# that one is a route failure.
+_LOCAL_GATEWAY_AUTH_REJECTION_TYPES = (
+    "no_db_connection",
+    "token_not_found_in_db",
+    "expired_key",
+    "auth_error",
+    "key_model_access_denied",
+    "team_model_access_denied",
+    "user_model_access_denied",
+    "org_model_access_denied",
+    "project_model_access_denied",
+    "agent_model_access_denied",
+)
+
+
 _UPSTREAM_ACCOUNT_RESTRICTED_ERROR_MARKERS = (
     "账号存在异常行为",
     "账户存在异常行为",
@@ -1204,6 +1251,62 @@ _UPSTREAM_TEMPORARY_ERROR_CLASS_NAMES = {
     "Timeout",
     "TimeoutError",
 }
+# A response body that ends mid-chunk is an upstream that closed the connection
+# while it was still writing, and the transport reports it as a *read* error --
+# never as a connectivity failure, because the connection was already
+# established.  LiteLLM's aiohttp transport maps ``aiohttp.ClientPayloadError``
+# onto ``httpx.ReadError`` (``litellm/llms/custom_httpx/aiohttp_transport.py``),
+# and the text it carries is the truncated-body sentence below.  None of the
+# connectivity markers match that text and no status code is attached, so
+# without this check the failure reached the terminal branch as an unclassified
+# stop: ``recovery_policy`` stayed ``error``, the route was never cooled down,
+# and the next request selected the same upstream that had just cut a turn.
+#
+# Only these markers are matched, never a read-error class on its own: a read
+# error whose text names no framing failure is an ordinary disconnect, which is
+# a network outage the caller should wait out, not a route to quarantine.
+_UPSTREAM_TRUNCATED_STREAM_MARKERS = (
+    "response payload is not completed",
+    "not enough data to satisfy transfer length",
+    "not enough data to satisfy content length",
+    "transferencodingerror",
+    "contentlengtherror",
+)
+
+
+def _is_upstream_truncated_stream_error(exception: Exception) -> bool:
+    """Whether the upstream closed a response body it had already started.
+
+    The route answered and started writing, then stopped mid-body.  That is a
+    route fault worth failing over from and cooling down, and it is not a
+    request the client can repair by sending different bytes.
+
+    Read before the connectivity check, because the two look alike in a trace
+    and mean opposite things.  ``__context__`` is deliberately not followed: it
+    holds whatever exception happened to be in flight when this one was raised,
+    so an unrelated earlier transport error would make every later failure read
+    as truncated.  Only the chain that actually caused this error counts.
+    """
+
+    pending = [exception]
+    seen: set[int] = set()
+    while pending:
+        candidate = pending.pop()
+        candidate_id = id(candidate)
+        if candidate_id in seen:
+            continue
+        seen.add(candidate_id)
+        text = _exception_text(candidate)
+        if text and any(marker in text for marker in _UPSTREAM_TRUNCATED_STREAM_MARKERS):
+            return True
+        for attr in ("__cause__", "original_exception"):
+            nested = getattr(candidate, attr, None)
+            if isinstance(nested, Exception) and id(nested) not in seen:
+                pending.append(nested)
+    return False
+
+
+
 _CHAT_TOOL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _HOSTED_COMPUTER_TOOL_TYPES = {"computer"}
 _BROWSER_COMPUTER_CLIENT_NAMESPACE_NAMES = {

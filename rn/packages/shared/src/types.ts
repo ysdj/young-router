@@ -409,6 +409,8 @@ export interface LogView extends LogSummary {
   page?: number;
   /** The number of pages available from rows already fetched. */
   page_count?: number;
+  /** How many rows one page of the online-usage view holds. */
+  page_rows?: number;
   /** Whether this answer carried every row the current page requested. */
   complete?: boolean;
 }
@@ -927,6 +929,21 @@ export interface NativeLeafAdapter {
     username?: string;
   }): Promise<{ revision: number; loginStatus: "signed_in" | "signed_out" | "expired"; username: string } | undefined>;
   openRelayLogs(options: {
+    accountId: string;
+    type: "newapi" | "sub2api";
+    label: string;
+    origin: string;
+    language: LanguagePreference;
+  }): Promise<void>;
+  /**
+   * Show a signed-in station's dashboard in the app's own authenticated
+   * browser.  The dashboard session is a cookie in this app's browser data
+   * store and cannot be handed to another browser, so the default browser is
+   * not a substitute: this surface is the one place the session already is.
+   * Optional because a host may have no such browser; a caller then falls back
+   * to opening the station's origin.
+   */
+  openRelayDashboard?(options: {
     accountId: string;
     type: "newapi" | "sub2api";
     label: string;

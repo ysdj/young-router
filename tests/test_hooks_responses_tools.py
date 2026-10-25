@@ -1266,6 +1266,7 @@ class HookResponsesToolBridgeTests(HookTestCase):
                 "id": "chat-route",
                 "provider": "atlas",
                 "upstream_url_surface": "openai/chat",
+                "supported_upstream_url_surfaces": ["openai/chat"],
             },
             "litellm_metadata": {
                 hooks._RESPONSES_FUNCTION_TOOL_BRIDGE_PREEMPTIVE_METADATA_KEY: True,

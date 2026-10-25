@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from hook_test_utils import *
 
+import re
+
 
 class HookStreamingResponseEventTests(HookTestCase):
     async def test_context_failed_terminal_propagates_without_replay(self) -> None:
@@ -186,6 +188,53 @@ class HookStreamingResponseEventTests(HookTestCase):
                 {"type": "response.output_text.delta", "delta": "hello"},
                 {"type": "response.completed", "response": {"id": "resp-original"}},
             ],
+        )
+
+    async def test_hook_streaming_boundary_never_forwards_a_dropped_chunk(self) -> None:
+        """Dropping a frame and sending "nothing" are different answers.
+
+        The delivery pipeline drops a frame this client must not see by
+        answering ``None``.  Forwarded as a chunk, that ``None`` is neither a
+        model, bytes, a string, nor a dict, so LiteLLM's serializer writes it as
+        the literal ``data: None``.  No Responses client parses that body: the
+        live symptom was a turn aborted with "Error reading response: malformed
+        server-sent event JSON" while the route was being recovered.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        hook = hooks.YoungRouterHook()
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "model_info": {"id": "order1-a", "order": 1},
+        }
+
+        async def pipeline_with_a_dropped_chunk(*_args, **_kwargs):
+            yield {"type": "response.created", "response": {"id": "resp-1"}}
+            yield None
+            yield {"type": "response.output_text.delta", "delta": "the answer"}
+            yield {"type": "response.completed", "response": {"id": "resp-1"}}
+
+        hook._post_call_streaming_iterator_pipeline = pipeline_with_a_dropped_chunk
+
+        chunks = [
+            chunk
+            async for chunk in hook.async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=None,
+                request_data=request_data,
+            )
+        ]
+
+        self.assertNotIn(
+            None,
+            chunks,
+            "a dropped chunk must never reach the wire: LiteLLM writes it as `data: None`",
+        )
+        self.assertEqual(
+            [chunk.get("type") for chunk in chunks if isinstance(chunk, dict)],
+            ["response.created", "response.output_text.delta", "response.completed"],
         )
 
     async def test_responses_stream_text_plan_completed_is_passed_through(self) -> None:
@@ -1777,7 +1826,9 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
         error = payload["response"]["error"]
 
         self.assertEqual("invalid_request_error", error["type"])
-        self.assertEqual("upstream_context_too_large", error["code"])
+        # Codex keys retryability on `error.code`, so a refusal no resend can
+        # fix has to carry the code it recognises as terminal.
+        self.assertEqual("context_length_exceeded", error["code"])
         self.assertIn("context window", error["message"])
         self.assertIn("deepseek-v4.1-flash", error["message"])
         # The sentence that turned a sized-down retry into an endless
@@ -1844,7 +1895,7 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
         )
 
         self.assertEqual("invalid_request_error", chunk["error"]["type"])
-        self.assertEqual("upstream_context_too_large", chunk["error"]["code"])
+        self.assertEqual("context_length_exceeded", chunk["error"]["code"])
 
     def test_an_incomplete_tool_history_stop_names_the_new_task(self) -> None:
         """The stop a cut tool record produces must name the only fix.
@@ -1880,7 +1931,7 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
         error = payload["response"]["error"]
 
         self.assertEqual("invalid_request_error", error["type"])
-        self.assertEqual("upstream_tool_history_rejected", error["code"])
+        self.assertEqual("invalid_prompt", error["code"])
         self.assertIn("tool records", error["message"])
         self.assertIn("new task", error["message"])
         self.assertNotIn("could not classify", error["message"])
@@ -1896,7 +1947,7 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
             exception,
         )
         self.assertEqual("invalid_request_error", chunk["error"]["type"])
-        self.assertEqual("upstream_tool_history_rejected", chunk["error"]["code"])
+        self.assertEqual("invalid_prompt", chunk["error"]["code"])
 
     def test_a_restricted_account_stop_names_the_account_instead_of_retrying(self) -> None:
         """A route refused for its own account may not read as a transport hiccup.
@@ -1958,3 +2009,488 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
         self.assertIn("account", chunk["error"]["message"].lower())
         self.assertIn("deepseek-v4.1-flash", chunk["error"]["message"])
         self.assertNotIn("retry", chunk["error"]["message"].lower())
+
+    def test_a_response_the_upstream_cut_short_names_its_cause(self) -> None:
+        """A stop this router can explain never reads as unclassifiable.
+
+        The upstream answered, streamed part of a turn, then closed the body
+        before its own framing finished.  Pi rendered that as
+        ``upstream_route_failure`` -- "the router could not classify the stop" --
+        while the same route was selected again for the next request.  Both wire
+        formats must name the cause, and neither may invite the client to resend
+        the identical bytes as if nothing had been learned.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
+
+        class ReadError(Exception):
+            pass
+
+        exception = ReadError(
+            "response payload is not completed: <transferencodingerror: 400, "
+            "message='not enough data to satisfy transfer length header.'>"
+        )
+        request_data = {
+            "model": "deepseek-v4.1-flash",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+        }
+
+        event = streaming_module._synthesized_failed_response_event(
+            request_data,
+            exception,
+        )
+        payload = event if isinstance(event, dict) else json.loads(event.data or "{}")
+        error = payload["response"]["error"]
+
+        self.assertEqual("server_error", error["type"])
+        self.assertEqual("upstream_stream_truncated", error["code"])
+        self.assertNotIn("could not classify", error["message"])
+        # Pi retries a failed turn only when the rendered `<code>: <message>`
+        # matches `isRetryableAssistantError`'s phrase list; a sentence that
+        # matches nothing ends the turn outright.  "ended without" is the phrase
+        # that list carries for a stream that stopped short, so it is part of
+        # this contract, not a style choice.
+        self.assertIn("ended without", error["message"])
+        self.assertIn("deepseek-v4.1-flash", error["message"])
+        self.assertTrue(getattr(event, "_young_router_terminal_failure", False))
+
+        chunk = streaming_module._synthesized_native_stream_error_chunk(
+            {
+                "model": "deepseek-v4.1-flash",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
+            exception,
+        )
+        self.assertEqual("upstream_stream_truncated", chunk["error"]["code"])
+        self.assertNotIn("could not classify", chunk["error"]["message"])
+
+    def test_a_refused_route_credential_reaches_the_client_as_a_sentence(self) -> None:
+        """A message function may never return a policy constant.
+
+        The login-refused branch of ``_sanitized_upstream_route_failure_message``
+        returned the recovery-policy constant it also uses to park the route, so
+        a chat client was shown the literal word ``recovery_cooldown`` instead of
+        a sentence.  The policy and the sentence are different answers and are
+        asserted together here so the two cannot collapse again.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+
+        class BadRequestError(Exception):
+            pass
+
+        exception = BadRequestError(
+            "litellm.BadRequestError: OpenAIException - workbuddy 上游失败："
+            "请求被上游拒绝（http 401）。<html> <head><title>401 Authorization "
+            "Required</title></head> </html>"
+        )
+        # The local adapter reports the upstream's 401 as its own 400.
+        exception.status_code = 400
+        request_data = {
+            "model": "deepseek-v4.1-flash",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+        }
+
+        message = hooks._sanitized_upstream_route_failure_message(
+            "deepseek-v4.1-flash",
+            exception,
+            request_data,
+        )
+
+        self.assertNotEqual(message, hooks._RECOVERY_POLICY_COOLDOWN)
+        self.assertNotIn("recovery_cooldown", message)
+        self.assertIn("credential", message)
+        self.assertIn("deepseek-v4.1-flash", message)
+        # The route is still parked: the sentence and the policy are independent.
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(exception),
+            hooks._RECOVERY_POLICY_COOLDOWN,
+        )
+
+    def test_a_dropped_connection_mid_answer_names_the_drop(self) -> None:
+        """A stop the router *did* classify may not claim it could not.
+
+        This is the exact failure a live turn ended on: ``connection closed.``
+        read as ``upstream-network-connectivity`` with the ``recovery`` policy.
+        Because part of the answer had already streamed, the fallback and the
+        recovery poll are both unavailable -- replaying would duplicate what the
+        client rendered -- so the terminal event fell through to the
+        unclassified branch and told the reader the router could not explain a
+        stop whose cause it had already recorded in the trace.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
+
+        class ReadError(Exception):
+            pass
+
+        exception = ReadError("connection closed.")
+        exception.failed_deployment_id = "d66ef277"
+        exception.failed_deployment_order = 0.15
+        request_data = {
+            "model": "deepseek-v4.1-flash",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+        }
+
+        # The classification this message must agree with.
+        self.assertEqual(
+            hooks._trace_exception(exception)["reason"],
+            "upstream-network-connectivity",
+        )
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(exception),
+            hooks._RECOVERY_POLICY_RECOVERY,
+        )
+
+        event = streaming_module._synthesized_failed_response_event(
+            request_data,
+            exception,
+            after_visible_output=True,
+        )
+        payload = event if isinstance(event, dict) else json.loads(event.data or "{}")
+        error = payload["response"]["error"]
+
+        self.assertEqual("server_error", error["type"])
+        self.assertEqual("upstream_connection_dropped", error["code"])
+        self.assertNotIn("could not classify", error["message"])
+        # See the truncation test above: this phrase is what makes Pi retry
+        # instead of ending the turn.
+        self.assertIn("ended without", error["message"])
+        self.assertIn("deepseek-v4.1-flash", error["message"])
+        self.assertIn("connection", error["message"].lower())
+
+    # Codex (rust-v0.163.0) does not read the sentence at all.  It maps
+    # `response.failed` by exact `error.code` in
+    # `codex-api/src/sse/responses_error.rs::parse_failed_response`, and then
+    # decides with `CodexErr::retry_delay` in `protocol/src/error.rs`: every
+    # code this set does not contain becomes `ApiError::Retryable`, which is
+    # retryable.  `server_is_overloaded` is retryable only together with a
+    # server `Retry-After`, which this router never sends, so it is terminal
+    # here for the same reason it would be in the client.
+    CODEX_TERMINAL_CODES = {
+        "context_length_exceeded",
+        "insufficient_quota",
+        "credit_balance_exhausted",
+        "organization_spend_limit_exceeded",
+        "project_spend_limit_exceeded",
+        "usage_not_included",
+        "cyber_policy",
+        "bio_policy",
+        "misalignment_policy_violation",
+        "invalid_prompt",
+        "flex_unavailable",
+        "server_is_overloaded",
+    }
+
+    @classmethod
+    def _codex_retries(cls, code: str) -> bool:
+        """Mirror of Codex's decision: recognise the code, else retry."""
+        return code not in cls.CODEX_TERMINAL_CODES
+
+    def test_the_client_retry_contract_holds_on_both_wire_formats(self) -> None:
+        """A failed turn is retried only if its sentence is one the client knows.
+
+        Pi decides with ``isRetryableAssistantError`` in
+        ``@earendil-works/pi-ai/utils/retry.js``: it regex-matches the rendered
+        ``<code>: <message>`` against a phrase list, and a stop matching nothing
+        ends the turn with no retry at all.  That is what a live session hit --
+        ``upstream_route_failure`` plus "could not classify the stop" read as
+        final, so every mid-answer interruption was a dead turn.
+
+        Both halves are asserted, because each is a different failure:
+
+        * a stop that cuts a turn after the route accepted it must carry a
+          phrase the client resends on, or the turn dies with no recovery;
+        * a stop the user has to fix, or one the router cannot explain, must
+          not carry one, or a refusal no resend can change gets looped.
+
+        Which wire format the client uses is the client's choice, so both are
+        covered: a phrase that only reaches one of them leaves the other ending
+        turns.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
+
+        class ReadError(Exception):
+            pass
+
+        class BadRequestError(Exception):
+            pass
+
+        # The slice of the client's phrase list this router deliberately words
+        # into its transient stops.  Mirrored here so the contract fails loudly
+        # if a sentence is reworded into something the client reads as final.
+        retry_phrases = re.compile(
+            r"ended without|connection lost|terminated|timed? out|timeout"
+            r"|server error|rate.?limit|too many requests|you can retry your request",
+            re.IGNORECASE,
+        )
+
+        def error(class_name, text, status=None, body=None):
+            exc = type(class_name, (Exception,), {})(text)
+            if status is not None:
+                exc.status_code = status
+            if body is not None:
+                exc.body = body
+            return exc
+
+        truncated = error(
+            "ReadError",
+            "response payload is not completed: <transferencodingerror: 400, "
+            "message='not enough data to satisfy transfer length header.'>",
+        )
+        incomplete = RuntimeError(
+            "Responses stream incomplete: stream ended before response.completed"
+        )
+        incomplete.stream_incomplete = True  # type: ignore[attr-defined]
+        restarting = ReadError("connection closed.")
+        hooks._mark_exception_as_local_shutdown(restarting)
+
+        transient = {
+            "dropped connection": (ReadError("connection closed."), {}),
+            "truncated body": (truncated, {}),
+            "stream ended short": (incomplete, {}),
+            "route reported 5xx": (
+                error("InternalServerError", "upstream blew up", 500),
+                {},
+            ),
+            "route rate limited": (
+                error("RateLimitError", "too many requests", 429),
+                {},
+            ),
+            "stall watchdog": (
+                error("Gateway", "stream idle timeout", 504, {"reason": "stream_idle_timeout"}),
+                {},
+            ),
+            "start watchdog": (
+                error("Gateway", "stream start timeout", 504, {"reason": "stream_start_timeout"}),
+                {},
+            ),
+        }
+
+        # Refusals no resend can fix, split by whether the client's own error
+        # vocabulary has a name for them.
+        user_must_act_mapped = {
+            "context too large": error(
+                "BadRequestError",
+                "context length exceeded: input is too long",
+                400,
+            ),
+            "tool history rejected": error(
+                "BadRequestError", "工具记录不完整，请新建任务", 400
+            ),
+        }
+        # No Codex error code means this.  Mapping one anyway would tell the user
+        # the wrong thing, so these stay unrecognised and the client's own retry
+        # budget bounds them; only Pi is asserted to end the turn here.
+        user_must_act_unmapped = {
+            "account restricted": error(
+                "BadRequestError", "账号存在异常行为，已被限制使用", 400
+            ),
+            "unexplainable stop": TypeError(
+                "patched_update_kwargs_with_deployment() got an unexpected "
+                "keyword argument 'splits_stream_timeout'"
+            ),
+        }
+
+        responses_request = {
+            "model": "deepseek-v4.1-flash",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/responses"},
+        }
+        chat_request = {
+            "model": "deepseek-v4.1-flash",
+            "messages": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/chat/completions"},
+        }
+
+        def rendered(exception, *, wire, after_visible_output):
+            if wire == "responses":
+                event = streaming_module._synthesized_failed_response_event(
+                    responses_request,
+                    exception,
+                    after_visible_output=after_visible_output,
+                )
+                payload = (
+                    event
+                    if isinstance(event, dict)
+                    else json.loads(event.data or "{}")
+                )
+                err = payload["response"]["error"]
+            else:
+                err = streaming_module._synthesized_native_stream_error_chunk(
+                    chat_request,
+                    exception,
+                )["error"]
+            return f"{err['code']}: {err['message']}"
+
+        def code_of(exception, *, wire):
+            return rendered(exception, wire=wire, after_visible_output=True).split(
+                ":", 1
+            )[0]
+
+        for name, (exception, _kwargs) in transient.items():
+            for wire in ("responses", "chat"):
+                with self.subTest(name=name, wire=wire):
+                    text = rendered(
+                        exception,
+                        wire=wire,
+                        after_visible_output=True,
+                    )
+                    # Pi: the sentence decides.
+                    self.assertTrue(
+                        retry_phrases.search(text),
+                        f"a transient stop would end the turn on {wire}: {text}",
+                    )
+                    # Codex: the code decides, and an unrecognised one retries.
+                    self.assertTrue(
+                        self._codex_retries(code_of(exception, wire=wire)),
+                        f"Codex would drop a transient stop on {wire}: {text}",
+                    )
+
+        for name, exception in user_must_act_mapped.items():
+            for wire in ("responses", "chat"):
+                with self.subTest(name=name, wire=wire):
+                    text = rendered(
+                        exception,
+                        wire=wire,
+                        after_visible_output=True,
+                    )
+                    self.assertIsNone(
+                        retry_phrases.search(text),
+                        f"{name} would be retried pointlessly by Pi on {wire}: {text}",
+                    )
+                    # Codex inverts the rule: anything it does not recognise is
+                    # retried, so a refusal no resend can fix has to carry a code
+                    # it maps to a terminal error.
+                    self.assertFalse(
+                        self._codex_retries(code_of(exception, wire=wire)),
+                        f"Codex would loop over {name} on {wire}: {text}",
+                    )
+
+        for name, exception in user_must_act_unmapped.items():
+            for wire in ("responses", "chat"):
+                with self.subTest(name=name, wire=wire):
+                    text = rendered(
+                        exception,
+                        wire=wire,
+                        after_visible_output=True,
+                    )
+                    self.assertIsNone(
+                        retry_phrases.search(text),
+                        f"{name} would be retried pointlessly by Pi on {wire}: {text}",
+                    )
+
+        # A restart is the other stop a client must resend through, and it is
+        # asserted through the message builders: the terminal path for a local
+        # teardown closes the turn as completed instead of failing it.
+        for text in (
+            streaming_module._native_stream_error_message(
+                "deepseek-v4.1-flash", restarting, chat_request
+            ),
+            hooks._sanitized_upstream_route_failure_message(
+                "deepseek-v4.1-flash", restarting, responses_request
+            ),
+        ):
+            self.assertTrue(
+                retry_phrases.search(text),
+                f"a restart would end the turn: {text}",
+            )
+
+    async def test_thinking_reaches_the_client_while_the_model_is_still_thinking(self) -> None:
+        """A reasoning frame may not wait for the first answer token.
+
+        The start buffer exists so a route that fails before showing anything can
+        be replaced without the reader noticing, and it used to end only on
+        *answer* output.  Every reasoning frame of a model that thinks before it
+        writes was therefore held until the first answer token arrived, so a live
+        session saw the whole thinking block appear in one burst after the model
+        had finished thinking, while the answer itself streamed normally.
+
+        Asserted at the buffer itself rather than through the hook: the delivery
+        wrapper above it drains an in-process generator eagerly, which would mask
+        the decision under test.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
+
+        delivered: list[str] = []
+        # Snapshot taken the instant the upstream is asked for its next frame:
+        # anything the client does not hold by then was still being buffered.
+        delivered_before_next_frame: list[list[str]] = []
+
+        async def upstream_stream():
+            frames = [
+                {"type": "response.created", "response": {"id": "resp-think"}},
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {
+                        "id": "rs_1",
+                        "type": "reasoning",
+                        "status": "in_progress",
+                        "summary": [],
+                    },
+                },
+                {
+                    "type": "response.reasoning_summary_part.added",
+                    "item_id": "rs_1",
+                    "output_index": 0,
+                    "summary_index": 0,
+                    "part": {"type": "summary_text", "text": ""},
+                },
+                {
+                    "type": "response.reasoning_summary_text.delta",
+                    "item_id": "rs_1",
+                    "output_index": 0,
+                    "summary_index": 0,
+                    "delta": "weighing the options",
+                },
+                {"type": "response.output_text.delta", "delta": "the answer"},
+                {
+                    "type": "response.completed",
+                    "response": {"id": "resp-think", "status": "completed", "output": []},
+                },
+            ]
+            for frame in frames:
+                yield frame
+                delivered_before_next_frame.append(list(delivered))
+
+        request_data = {
+            "model": "deepseek-v4.1-flash",
+            "input": [{"role": "user", "content": "Think first."}],
+            "stream": True,
+            "reasoning": {"effort": "medium", "summary": "auto"},
+            "proxy_server_request": {"path": "/v1/responses"},
+            "model_info": {"id": "order1-a", "order": 1},
+        }
+
+        async for chunk in streaming_module._yield_start_buffered_stream_with_error_fallback(
+            upstream_stream(),
+            request_data,
+        ):
+            delivered.append(str(jsonable_stream_chunk(chunk).get("type")))
+
+        # Index 3 is the snapshot taken after the reasoning delta was produced
+        # and before the answer frame was requested.
+        self.assertTrue(
+            len(delivered_before_next_frame) > 3,
+            "the upstream stream never advanced past thinking",
+        )
+        self.assertIn(
+            "response.reasoning_summary_text.delta",
+            delivered_before_next_frame[3],
+            "the reasoning frame was still held when the model moved on to the "
+            f"answer; delivered so far: {delivered_before_next_frame[3]}",
+        )
+        self.assertIn("response.reasoning_summary_text.delta", delivered)

@@ -76,6 +76,7 @@ const zh: Record<string, RuntimeCopy> = {
   YOUNG_ROUTER_PROTOCOL_FALLBACK_TTL_SECONDS: { label: "备用协议记忆", help: "某部署的备用协议成功后，在此时长内，同一种客户端协议直接复用该备用协议，不再重试原协议。设为 0 可关闭记忆。" },
   YOUNG_ROUTER_CODEX_COMPACTION_CAPABILITY_TTL_SECONDS: { label: "压缩能力记忆", help: "Responses 路由能否返回加密 Codex 压缩结果的记忆时长。新建任务默认使用 Codex 本地检查点摘要（漾路由保持中性 provider 名）；只有 model_info 显式声明 supports_responses_compaction opt-in 的模型才会公布精确的 OpenAI 名，其路由在转发签名历史前仍会用不带历史的小探测验证（官方 OpenAI 主机跳过探测）。明确不支持的 deployment 会让请求切换到其他候选；当所有候选都拒绝加密压缩时返回明确的协议错误。已在运行的任务保留任务创建时缓存的能力，无法在协议中途切换。设为 0 时每次压缩都重新探测。" },
   YOUNG_ROUTER_WEB_SEARCH_UNSUPPORTED_TTL_SECONDS: { label: "网页搜索不支持记忆", help: "某部署明确拒绝托管的 web_search 后，在此时长内不再附加该声明，改由 Chat 协议桥接完成这一轮，避免每次请求都重复同一拒绝。瞬时网络、配额和提供方搜索失败不会写入该记忆；设为 0 可关闭跨请求记忆。" },
+  YOUNG_ROUTER_ALPHA_SEARCH_UNSUPPORTED_TTL_SECONDS: { label: "独立搜索不支持记忆", help: "Codex 的 Responses Lite 通道不会下发托管 web_search，只调用 provider 的 /alpha/search。某条路由明确回答没有该端点后，在此时长内直接跳过它，避免每轮都重复同一次拒绝；超时、5xx 等瞬时失败不会写入该记忆。设为 0 则每次搜索都重新探测。" },
   YOUNG_ROUTER_REASONING_COMPAT_TTL_SECONDS: { label: "推理参数兼容记忆", help: "某部署携带客户端推理参数的兼容形态记忆时长。Gemini 系上游对别名模型拒绝 OpenAI 推理字段时，先改用原生 Google 思考配置重放，保留客户端请求的档位；其他路由则改用不带推理字段的重放，以上游默认思考方式运行。只有上游明确拒绝该模型的思考配置时才会写入该记忆；设为 0 可关闭跨请求记忆（每次请求重新重放一次）。" },
   YOUNG_ROUTER_DEPLOYMENT_COOLDOWN_ORDINARY_ENABLED: { label: "普通请求写入冷却", help: "普通请求失败时是否向共享部署冷却池累计失败。所有请求类型仍会读取已有冷却状态。" },
   YOUNG_ROUTER_DEPLOYMENT_COOLDOWN_COMPACTION_ENABLED: { label: "压缩请求写入冷却", help: "结构化 Codex 压缩失败时是否向共享部署冷却池累计失败。默认关闭，避免仅压缩时的上游失败让普通工作路由进入冷却。" },

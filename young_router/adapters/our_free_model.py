@@ -37,11 +37,17 @@ from ..node_runtime import node_command as node_runtime_command
 # One provider per upstream channel, because a channel is not a label on a row:
 # it decides which wire the row is reached over and which window it accepts, and
 # a provider is the only unit this app pins a transport to.  Keeping one provider
-# for three channels meant every route had to share one surface, and the rows
+# for every channel meant every route had to share one surface, and the rows
 # that answered on another were reported as "no such protocol".
+#
+# Two channels are served here: the anonymous free lane and Kilo.  The upstream
+# also carries a third, ``eac``, but that lane is unlocked from a sealed
+# credential this bridge never holds -- the package builds its roster only when
+# ``sealedCredential()`` answers, and the worker passes none -- so a provider for
+# it could list nothing and adding it was refused.  It is not addressed here
+# rather than offered as an empty entry.
 OUR_FREE_MODEL_PROVIDER = "our-free-model"
 OUR_FREE_MODEL_KILO_PROVIDER = "our-free-model-kilo"
-OUR_FREE_MODEL_EAC_PROVIDER = "our-free-model-eac"
 OUR_FREE_MODEL_AUTH_KIND = "our_free_model_login"
 
 #: Channel tag (as the upstream catalog states it) → the provider that serves it.
@@ -49,24 +55,29 @@ OUR_FREE_MODEL_AUTH_KIND = "our_free_model_login"
 CHANNEL_TO_PROVIDER = {
     "": OUR_FREE_MODEL_PROVIDER,
     "kilo": OUR_FREE_MODEL_KILO_PROVIDER,
-    "eac": OUR_FREE_MODEL_EAC_PROVIDER,
 }
 PROVIDER_TO_CHANNEL = {provider: channel for channel, provider in CHANNEL_TO_PROVIDER.items()}
 OUR_FREE_MODEL_PROVIDERS = tuple(CHANNEL_TO_PROVIDER.values())
 
-#: Per-channel names, because one gateway URL serves three providers and a
+#: Channels the upstream's catalog can tag that no provider here serves.  The
+#: co-paid lane is one: it opens only from a sealed credential this bridge never
+#: holds, so its rows can never be fetched, and importing them as the anonymous
+#: lane's would stage a route whose every turn is refused.  A tag in here is
+#: dropped from every roster rather than folded into another channel.
+UNSERVED_CHANNELS = frozenset({"eac"})
+
+#: Per-channel names, because one gateway URL serves both channels and a
 #: provider row addresses its own.  The lane's original name is kept for the
 #: anonymous channel so a document written before the split still resolves.
 _CHANNEL_ENV_SUFFIX = {
     OUR_FREE_MODEL_PROVIDER: "",
     OUR_FREE_MODEL_KILO_PROVIDER: "KILO_",
-    OUR_FREE_MODEL_EAC_PROVIDER: "EAC_",
 }
 API_BASE_ENV = {provider: f"YOUNG_ROUTER_OUR_FREE_MODEL_{suffix}BASE" for provider, suffix in _CHANNEL_ENV_SUFFIX.items()}
 API_KEY_ENV = {provider: f"YOUNG_ROUTER_OUR_FREE_MODEL_{suffix}KEY" for provider, suffix in _CHANNEL_ENV_SUFFIX.items()}
 
 #: Every provider row that belongs to this lane authenticates the same way: one
-#: login reaches all three channels, so the auth kind states "this is the lane",
+#: login reaches both channels, so the auth kind states "this is the lane",
 #: and the provider id states which of its channels the row is.
 AUTH_KIND_TO_PROVIDER = {OUR_FREE_MODEL_AUTH_KIND: OUR_FREE_MODEL_PROVIDER}
 PROVIDER_TO_AUTH_KIND = {provider: OUR_FREE_MODEL_AUTH_KIND for provider in OUR_FREE_MODEL_PROVIDERS}
@@ -78,14 +89,13 @@ OUR_FREE_MODEL_DISPLAY_NAME_BASE = "Our Free Model"
 OUR_FREE_MODEL_DISPLAY_NAME = "Our Free Model"
 #: One heading per channel, so the provider list itself states which channel
 #: a row is served from instead of leaving it to a tag inside the roster.
-# Every channel states which one it is, including the lane's own: three entries
-# named after the same product would be indistinguishable in the provider list,
-# and "Our Free Model" alone would read as the whole product rather than the one
+# Every channel states which one it is, including the lane's own: entries named
+# after the same product would be indistinguishable in the provider list, and
+# "Our Free Model" alone would read as the whole product rather than the one
 # anonymised channel inside it.
 OUR_FREE_MODEL_DISPLAY_NAMES = {
     OUR_FREE_MODEL_PROVIDER: f"{OUR_FREE_MODEL_DISPLAY_NAME_BASE} · OpenCode",
     OUR_FREE_MODEL_KILO_PROVIDER: f"{OUR_FREE_MODEL_DISPLAY_NAME_BASE} · Kilo",
-    OUR_FREE_MODEL_EAC_PROVIDER: f"{OUR_FREE_MODEL_DISPLAY_NAME_BASE} · EAC",
 }
 #: The staged upstream package, as its own manifest names it.
 UPSTREAM_PACKAGE_NAME = "dsh-our-free-model"
@@ -260,9 +270,16 @@ def validated_provider(value: object) -> str:
 
 
 def provider_for_channel(channel: object) -> str:
-    """The provider that serves one upstream channel; the lane when unnamed."""
+    """The provider that serves one upstream channel; the lane when unnamed.
 
-    return CHANNEL_TO_PROVIDER.get(str(channel or "").strip(), OUR_FREE_MODEL_PROVIDER)
+    An empty string answers for a channel no provider here serves: the caller
+    filters on a provider id, and no row is ever filed under one.
+    """
+
+    tag = str(channel or "").strip().casefold()
+    if tag in UNSERVED_CHANNELS:
+        return ""
+    return CHANNEL_TO_PROVIDER.get(tag, OUR_FREE_MODEL_PROVIDER)
 
 
 def provider_for_channel_tag(channel: object) -> str:
@@ -332,9 +349,9 @@ def _wire_membership(value: object) -> dict[str, str]:
 def _channel_membership(value: object) -> dict[str, str]:
     """The producer each row belongs to, as the upstream catalog states it.
 
-    The upstream serves three producers behind one gateway — the anonymous free
-    lane, the Kilo channel, and the co-paid lane — and its catalog entries carry
-    the producer in ``channel``.  The gateway's OpenAI-shaped ``/v1/models``
+    The upstream serves several producers behind one gateway — the anonymous
+    free lane and the Kilo channel on this bridge — and its catalog entries
+    carry the producer in ``channel``.  The gateway's OpenAI-shaped ``/v1/models``
     cannot express it (every row answers ``owned_by: 'our-free-model'``), and an
     id cannot be used to recover it: ``big-pickle`` and ``kilo-auto/free`` are
     both just ids.  This carries the upstream's own answer instead of deriving
@@ -587,7 +604,7 @@ class OurFreeModelRuntime:
         if not gateway_port:
             return {}
         base = f"http://127.0.0.1:{gateway_port}"
-        # Three provider rows, one gateway: the channels are routing inside the
+        # Two provider rows, one gateway: the channels are routing inside the
         # package, not separate hosts, so every row publishes the same address
         # and token under its own name.
         values: dict[str, str] = {}
@@ -792,12 +809,12 @@ __all__ = [
     "CHANNEL_TO_PROVIDER",
     "OUR_FREE_MODEL_DISPLAY_NAME",
     "OUR_FREE_MODEL_DISPLAY_NAMES",
-    "OUR_FREE_MODEL_EAC_PROVIDER",
     "OUR_FREE_MODEL_KILO_PROVIDER",
     "OUR_FREE_MODEL_PROVIDER",
     "OUR_FREE_MODEL_PROVIDERS",
     "PROVIDER_TO_AUTH_KIND",
     "PROVIDER_TO_CHANNEL",
+    "UNSERVED_CHANNELS",
     "provider_for_channel",
     "provider_for_channel_tag",
     "OurFreeModelRuntime",

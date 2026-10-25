@@ -3,6 +3,19 @@ $ErrorActionPreference = "Stop"
 $RnRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $ProjectRoot = (Resolve-Path (Join-Path $RnRoot "..")).Path
 $AppRoot = Join-Path $RnRoot "apps\windows"
+$WindowsArch = if ([string]::IsNullOrWhiteSpace($env:YOUNG_ROUTER_WINDOWS_ARCH)) {
+  "x64"
+} else {
+  $env:YOUNG_ROUTER_WINDOWS_ARCH.Trim().ToUpperInvariant()
+}
+if ($WindowsArch -notin @("X64", "ARM64")) {
+  throw "YOUNG_ROUTER_WINDOWS_ARCH must be x64 or ARM64."
+}
+$PythonTarget = if ($WindowsArch -eq "ARM64") {
+  "cpython-3.12-windows-arm64-none"
+} else {
+  "cpython-3.12-windows-x86_64-none"
+}
 if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP)) {
   $Core = Join-Path ([System.IO.Path]::GetTempPath()) ("young-router-rn-core-" + [guid]::NewGuid().ToString("N"))
 } else {
@@ -30,7 +43,14 @@ $DshVisionRouterWork = Join-Path $StagingCache "dsh-vision-router"
 function Copy-CoreSource {
   param([string]$Source, [string]$Destination)
   if (-not (Test-Path $Source)) { throw "Bundled Core source is incomplete." }
-  Copy-Item -LiteralPath $Source -Destination $Destination -Recurse -Force
+  if ((Get-Item -LiteralPath $Source).PSIsContainer) {
+    New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+    $CopyThreads = if ($env:YOUNG_ROUTER_LOW_RESOURCE_BUILD -notin @("0", "false", "no")) { 4 } else { 16 }
+    & robocopy $Source $Destination /E /MT:$CopyThreads /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+    if ($LASTEXITCODE -gt 7) { throw "Could not copy bundled Core source: $Source" }
+  } else {
+    Copy-Item -LiteralPath $Source -Destination $Destination -Force
+  }
 }
 
 try {
@@ -87,15 +107,20 @@ try {
   $RuntimeBin = Join-Path $Core "runtime\bin"
   $PythonInstalls = Join-Path $Core ".python-installs"
   New-Item -ItemType Directory -Path $RuntimeBin, $PythonInstalls | Out-Null
-  uv python install "cpython-3.12-windows-x86_64-none" --install-dir $PythonInstalls --no-bin
-  $PythonSource = Get-ChildItem -LiteralPath $PythonInstalls -Directory |
-    Where-Object { $_.Name -like "cpython-3.12*-windows-x86_64-none" } |
-    Select-Object -First 1
-  if ($null -eq $PythonSource -or -not (Test-Path (Join-Path $PythonSource.FullName "python.exe"))) {
-    throw "uv did not install the expected standalone Windows x64 Python 3.12 runtime."
+  $RuntimeSeed = $env:YOUNG_ROUTER_RUNTIME_SEED
+  if ($RuntimeSeed -and (Test-Path (Join-Path $RuntimeSeed "bin\python.exe"))) {
+    Copy-Item -Path (Join-Path $RuntimeSeed "bin\*") -Destination $RuntimeBin -Recurse -Force
+  } else {
+    uv python install $PythonTarget --install-dir $PythonInstalls --no-bin
+    $PythonSource = Get-ChildItem -LiteralPath $PythonInstalls -Directory |
+      Where-Object { $_.Name -like "cpython-3.12*-windows-*" } |
+      Select-Object -First 1
+    if ($null -eq $PythonSource -or -not (Test-Path (Join-Path $PythonSource.FullName "python.exe"))) {
+      throw "uv did not install the expected standalone Windows $WindowsArch Python 3.12 runtime."
+    }
+    Copy-Item -Path (Join-Path $PythonSource.FullName "*") -Destination $RuntimeBin -Recurse -Force
   }
-  Copy-Item -Path (Join-Path $PythonSource.FullName "*") -Destination $RuntimeBin -Recurse -Force
-  Remove-Item -LiteralPath $PythonInstalls -Recurse -Force
+  Remove-Item -LiteralPath $PythonInstalls -Recurse -Force -ErrorAction SilentlyContinue
 
   $LiteLLMVersion = (Get-Content -Raw (Join-Path $ProjectRoot "LITELLM_VERSION")).Trim()
   # ``uv`` marks the standalone interpreter it installs as externally managed
@@ -115,10 +140,24 @@ try {
   if ($LASTEXITCODE -ne 0 -or -not $RuntimeSitePackages) {
     throw "Could not resolve the bundled Windows runtime's site-packages path."
   }
-  uv pip install --python (Join-Path $RuntimeBin "python.exe") `
-    --target "$RuntimeSitePackages" `
-    "litellm[proxy]==$LiteLLMVersion" "fastapi==0.140.3" PyYAML Pillow
-  if ($LASTEXITCODE -ne 0) { throw "Could not install the bundled Windows runtime dependencies." }
+  if ($RuntimeSeed) {
+    $SeedCheck = & (Join-Path $RuntimeBin "python.exe") -c "from importlib.metadata import version; print(version('litellm'))"
+    if ($LASTEXITCODE -ne 0) {
+      throw "The prebuilt runtime seed does not carry LiteLLM metadata."
+    }
+    if ($SeedCheck.Trim() -ne $LiteLLMVersion) {
+      # Keep the large native/Python seed reusable while refreshing the small
+      # fast-moving LiteLLM layer when its release lock advances.
+      Write-Output "Updating LiteLLM in the prebuilt runtime seed: $($SeedCheck.Trim()) -> $LiteLLMVersion."
+      uv pip install --python (Join-Path $RuntimeBin "python.exe") --target "$RuntimeSitePackages" --upgrade "litellm[proxy]==$LiteLLMVersion" "fastapi==0.140.3" PyYAML Pillow
+      if ($LASTEXITCODE -ne 0) { throw "Could not update LiteLLM in the prebuilt runtime seed." }
+    }
+  } else {
+    uv pip install --python (Join-Path $RuntimeBin "python.exe") `
+      --target "$RuntimeSitePackages" `
+      "litellm[proxy]==$LiteLLMVersion" "fastapi==0.140.3" PyYAML Pillow
+    if ($LASTEXITCODE -ne 0) { throw "Could not install the bundled Windows runtime dependencies." }
+  }
   # The staged scan program is imported into the Core's own interpreter, so what
   # it imports and the bundled runtime does not already carry is added to that
   # runtime here - and only that: a dependency the runtime already has is never
@@ -132,6 +171,9 @@ try {
   if (Test-Path $GeneratedScripts) {
     Remove-Item -LiteralPath $GeneratedScripts -Recurse -Force
   }
+  $CorePruner = Join-Path $ProjectRoot "scripts\prune-windows-core.py"
+  & (Join-Path $RuntimeBin "python.exe") $CorePruner $Core
+  if ($LASTEXITCODE -ne 0) { throw "Could not prune the Windows Core runtime payload." }
 
   $LiteLLMCommand = @'
 @echo off
@@ -254,9 +296,18 @@ print('young-router-veridrop-import-ok')
   # CLI parses (``options.msbuildprops.split(',')``, then ``prop.split('=')``,
   # discarding anything that does not yield exactly two parts). A semicolon list
   # parses as zero properties and is dropped without a word.
-  pnpm --dir $AppRoot exec react-native run-windows --no-launch --no-deploy --no-packager --release --arch x64 `
-    --sln "windows\YoungRouter.sln" --proj "windows\YoungRouter\YoungRouter.vcxproj" `
-    --msbuildprops "YoungRouterCoreStagingDir=$CoreRoot,RunCodegenWindows=false,WindowsTargetPlatformVersion=$($InstalledSdk.Name)"
+  $RunWindowsArgs = @(
+    "--dir", $AppRoot, "exec", "react-native", "run-windows",
+    "--no-launch", "--no-deploy", "--no-packager", "--release", "--arch", $WindowsArch,
+    "--sln", "windows\YoungRouter.sln", "--proj", "windows\YoungRouter\YoungRouter.vcxproj",
+    "--msbuildprops", "YoungRouterCoreStagingDir=$CoreRoot,RunCodegenWindows=false,WindowsTargetPlatformVersion=$($InstalledSdk.Name),RestoreIgnoreFailedSources=true,RestoreForce=false"
+  )
+  $LowResourceBuild = $WindowsArch -eq "ARM64" -and $env:YOUNG_ROUTER_LOW_RESOURCE_BUILD -notin @("0", "false", "no")
+  if ($LowResourceBuild) {
+    $RunWindowsArgs += "--singleproc"
+    $RunWindowsArgs[$RunWindowsArgs.IndexOf("--msbuildprops") + 1] += ",MultiProcessorCompilation=false,MultiProcCL=false"
+  }
+  & pnpm @RunWindowsArgs
 
   $BundledPython = Get-ChildItem -LiteralPath (Join-Path $AppRoot "windows") -Recurse -File -Filter "python.exe" |
     Where-Object { $_.FullName -match '[\\/]Core[\\/]runtime[\\/]bin[\\/]python\.exe$' } |

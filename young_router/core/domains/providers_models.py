@@ -2650,8 +2650,8 @@ class ProvidersModelsDomain:
         One provider per channel is why this filters: the roster arrives whole,
         because one worker serves every channel, but a provider row only lists
         the rows its own channel serves.  Importing the whole roster into each
-        row would list every model three times and route each of them over a
-        wire two of the three rows do not have.
+        row would list every model once per provider and route each of them over
+        a wire the other rows do not have.
         """
 
         provider_id = provider_id or our_free_model_module.AUTH_KIND_TO_PROVIDER[auth_kind]
@@ -4245,7 +4245,7 @@ class ProvidersModelsDomain:
             # whole point of adding the account.
             raw_models = self._workbuddy_catalog_models(kind)
         if raw_models is None and kind in our_free_model_module.OUR_FREE_MODEL_AUTH_KINDS:
-            # The lane serves three channels behind one login, and each is a
+            # The lane serves two channels behind one login, and each is a
             # provider of its own.  Which one this add creates is the caller's,
             # stated as a channel tag: adding a provider adds exactly that
             # provider, so a user who wants only Kilo gets only Kilo.  The tag is
@@ -5580,15 +5580,93 @@ class ProvidersModelsDomain:
             raise DomainError("Relay binding material is unavailable")
         return dict(resolved)
 
-    def materialize_relay_bindings(self, relay: object) -> dict[str, Any]:
+    @classmethod
+    def _relay_binding_scope(cls, scope: object | None) -> set[tuple[str, ...]] | None:
+        """The binding-projection rows one Apply is allowed to refuse.
+
+        ``None`` means “everything”: a relay's own Apply judges every route it
+        materializes, because the station's answer is the edit.  A dependency
+        only Apply — the one a model edit rides — passes the rows it changed, so
+        a stale route on the same key keeps the state it already has instead of
+        refusing a different row's write.
+        """
+
+        if scope is None:
+            return None
+        if not isinstance(scope, Sequence) or isinstance(scope, (str, bytes, bytearray)):
+            return None
+        rows: set[tuple[str, ...]] = set()
+        for row in scope:
+            if not isinstance(row, Sequence) or isinstance(row, (str, bytes, bytearray)):
+                continue
+            rows.add(tuple(str(value) for value in row))
+        return rows
+
+    def _relay_binding_model_row(
+        self,
+        provider_name: str,
+        model: Mapping[str, Any],
+    ) -> tuple[str, ...]:
+        """One model's row of ``young_router.core.service._relay_binding_projection``.
+
+        The projection lives in Core because the baseline does, so the two
+        spellings have to agree: a route is changed when the tuple it forms from
+        its own draft fields is absent from the rows that Apply named.
+        """
+
+        return (
+            "model",
+            provider_name,
+            str(model.get("model_name", model.get("name", ""))),
+            str(model.get("provider_key_id", "")),
+            str(model.get("api_key_name", "")),
+            str(model.get("order_mode", "manual")).strip() or "manual",
+        )
+
+    def _relay_binding_in_scope(
+        self,
+        scope_rows: set[tuple[str, ...]] | None,
+        provider_name: str,
+        key_name: str,
+        model: Mapping[str, Any] | None = None,
+    ) -> bool:
+        """Whether this Apply may report an issue about one key or route."""
+
+        if scope_rows is None:
+            return True
+        if model is not None:
+            return self._relay_binding_model_row(provider_name, model) in scope_rows
+        # A key is in scope when its own binding moved, and also when any route
+        # this Apply changed hangs off it: a route's problem is about the key
+        # that serves it.
+        if ("key", provider_name, key_name) in {
+            row[:3] for row in scope_rows if row[0] == "key"
+        }:
+            return True
+        return any(
+            row[0] == "model" and row[1] == provider_name and row[4] == key_name
+            for row in scope_rows
+        )
+
+    def materialize_relay_bindings(self, relay: object, *, scope: object | None = None) -> dict[str, Any]:
         """Resolve private relay materials into the staged LiteLLM document.
 
         The input is intentionally Core-only and may contain API key values.
         This method never returns those values; it only updates the private
         provider draft and reports stable source/model identifiers.
+
+        ``scope`` names the ``_relay_binding_projection`` rows this Apply is
+        actually changing, and is passed by a dependency-only Apply (a model
+        edit).  A key the station answers about judges *every* route bound to
+        it, so one stale row — a group that dropped an upstream model — used to
+        refuse an edit about a different route on the same key: the pane said
+        the new row was not applied and marked nothing the user had touched.
+        With a scope, only the rows this edit changes can refuse the write;
+        every other route keeps exactly the state it already had.
         """
 
         payload = self._relay_materials(relay)
+        scope_rows = self._relay_binding_scope(scope)
         raw_resources = payload.get("resources", [])
         if not isinstance(raw_resources, Sequence) or isinstance(
             raw_resources, (str, bytes, bytearray)
@@ -5658,6 +5736,10 @@ class ProvidersModelsDomain:
                 models = []
                 provider["models"] = models
             provider_base: str | None = None
+            # The provider's own name, as the binding projection spells it: the
+            # scope rows an Apply hands in are built from that projection, so
+            # this is the identity a route is matched by.
+            provider_name = str(provider.get("name", "")).strip() or self._editor_id(provider)
             # One issue per provider, not one per key: a key the station no
             # longer lists is one row the pane marks, and a station that lost
             # several keys at once is one sentence about the account rather
@@ -5667,6 +5749,13 @@ class ProvidersModelsDomain:
                 source = key["source"]
                 if source.get("kind") != "relay":
                     continue
+                # Whether this Apply may report a problem about this key's own
+                # material.  A dependency-only Apply names the rows it changed;
+                # every other key keeps the state it already has, so an
+                # unrelated stale route cannot refuse this edit.
+                key_in_scope = self._relay_binding_in_scope(
+                    scope_rows, provider_name, key["name"]
+                )
                 resource_key = (
                     source["station_id"],
                     source["account_id"],
@@ -5690,6 +5779,12 @@ class ProvidersModelsDomain:
                     if not linked:
                         # Nothing routes through this slot, so nothing is
                         # refused: the stale row is the user's to delete.
+                        continue
+                    if not key_in_scope:
+                        # The station no longer lists this key, but no row this
+                        # Apply changes hangs off it: the stale route keeps its
+                        # mark from the read that found it, and this edit is
+                        # not refused for it.
                         continue
                     if not absence_reported:
                         issues.append(copy.deepcopy(absence))
@@ -5715,6 +5810,8 @@ class ProvidersModelsDomain:
                     # report.
                     stored_credential = key.get("value")
                     if not isinstance(stored_credential, str) or not stored_credential.strip():
+                        if not key_in_scope:
+                            continue
                         issue = {
                             "code": "resource_missing",
                             "provider_key_id": key["id"],
@@ -5744,48 +5841,52 @@ class ProvidersModelsDomain:
                         materialized_models += 1
                     continue
                 if resource.get("enabled") is not True:
-                    issues.append(
-                        {
-                            "code": "resource_disabled",
-                            "provider_key_id": key["id"],
-                            "source": copy.deepcopy(source),
-                        }
-                    )
-                    for model in linked_models:
-                        model["binding_health"] = {
-                            "status": "resource_disabled",
-                            "detail": "The linked relay API key is disabled",
-                        }
+                    if key_in_scope:
+                        issues.append(
+                            {
+                                "code": "resource_disabled",
+                                "provider_key_id": key["id"],
+                                "source": copy.deepcopy(source),
+                            }
+                        )
+                        for model in linked_models:
+                            model["binding_health"] = {
+                                "status": "resource_disabled",
+                                "detail": "The linked relay API key is disabled",
+                            }
                     continue
                 credential = resource.get("api_key")
                 if not isinstance(credential, str) or not credential.strip():
-                    issues.append(
-                        {
-                            "code": "credential_missing",
-                            "provider_key_id": key["id"],
-                            "source": copy.deepcopy(source),
-                        }
-                    )
+                    if key_in_scope:
+                        issues.append(
+                            {
+                                "code": "credential_missing",
+                                "provider_key_id": key["id"],
+                                "source": copy.deepcopy(source),
+                            }
+                        )
                     continue
                 api_base = resource.get("api_base")
                 if not isinstance(api_base, str) or not api_base.strip():
-                    issues.append(
-                        {
-                            "code": "api_base_missing",
-                            "provider_key_id": key["id"],
-                            "source": copy.deepcopy(source),
-                        }
-                    )
+                    if key_in_scope:
+                        issues.append(
+                            {
+                                "code": "api_base_missing",
+                                "provider_key_id": key["id"],
+                                "source": copy.deepcopy(source),
+                            }
+                        )
                     continue
                 api_base = api_base.strip()
                 if provider_base is not None and provider_base != api_base:
-                    issues.append(
-                        {
-                            "code": "provider_api_base_conflict",
-                            "provider_key_id": key["id"],
-                            "source": copy.deepcopy(source),
-                        }
-                    )
+                    if key_in_scope:
+                        issues.append(
+                            {
+                                "code": "provider_api_base_conflict",
+                                "provider_key_id": key["id"],
+                                "source": copy.deepcopy(source),
+                            }
+                        )
                     continue
                 provider_base = api_base
                 key["value"] = credential
@@ -5810,8 +5911,18 @@ class ProvidersModelsDomain:
                     model_id = str(model.get("deployment_id", "")).strip() or self._editor_id(
                         model, model=True
                     )
+                    # A route this Apply did not change is not this edit's to
+                    # judge: the station answers about the whole key, and one
+                    # row the group no longer serves used to refuse the row the
+                    # user was actually adding.  Its state stays exactly as the
+                    # read that last resolved it left it.
+                    model_in_scope = self._relay_binding_in_scope(
+                        scope_rows, provider_name, key["name"], model
+                    )
                     source_model_id = self._wire_model_name(model)
                     model["source_model_id"] = source_model_id
+                    if source_model_id not in catalog and not model_in_scope:
+                        continue
                     if source_model_id not in catalog:
                         # An absent model is evidence only where the station was
                         # actually consulted about this key.  A dependency-only
@@ -5857,18 +5968,19 @@ class ProvidersModelsDomain:
                     order_mode = str(model.get("order_mode", "manual")).strip() or "manual"
                     if order_mode == "relay_multiplier":
                         if multiplier is None:
-                            issues.append(
-                                {
-                                    "code": "multiplier_missing",
-                                    "provider_key_id": key["id"],
-                                    "model_id": model_id,
-                                    "source": copy.deepcopy(source),
+                            if model_in_scope:
+                                issues.append(
+                                    {
+                                        "code": "multiplier_missing",
+                                        "provider_key_id": key["id"],
+                                        "model_id": model_id,
+                                        "source": copy.deepcopy(source),
+                                    }
+                                )
+                                model["binding_health"] = {
+                                    "status": "multiplier_missing",
+                                    "detail": "The linked relay group has no usable multiplier",
                                 }
-                            )
-                            model["binding_health"] = {
-                                "status": "multiplier_missing",
-                                "detail": "The linked relay group has no usable multiplier",
-                            }
                             continue
                         model["effective_order"] = multiplier
                         model["order"] = multiplier
@@ -6634,8 +6746,32 @@ class ProvidersModelsDomain:
                 if isinstance(candidate, Mapping)
                 and str(candidate.get("deployment_id", "")).strip()
             }
+            # One route is one (public name, upstream, key) on its provider.  The
+            # picker a fetch opens lists the *catalog*, not the rows the provider
+            # already carries, so picking a model that is already there appended
+            # a second, identical deployment: two rows in the pane, two orders for
+            # one route, and the station's multiplier applied twice.  An
+            # identical entry is the row the user was looking at, not a new one,
+            # so it is skipped.  Two routes that differ in any of those three
+            # fields are still separate routes (the same upstream on two keys, or
+            # an alias for it).
+            def identity_of(candidate: Mapping[str, Any]) -> tuple[str, str, str]:
+                return (
+                    str(candidate.get("model_name", candidate.get("name", ""))).strip(),
+                    str(candidate.get("litellm_model", "")).strip(),
+                    str(candidate.get("provider_key_id", "")).strip(),
+                )
+
+            existing_identities = {
+                identity_of(item) for item in models if isinstance(item, Mapping)
+            }
             for value in values:
-                self._append_model_row(provider, models, self._new_model(provider, value, used_deployment_ids))
+                candidate = self._new_model(provider, value, used_deployment_ids)
+                identity = identity_of(candidate)
+                if identity in existing_identities:
+                    continue
+                existing_identities.add(identity)
+                self._append_model_row(provider, models, candidate)
             auth_kind = self._provider_auth_state(provider)["kind"]
             if auth_kind != "api_key":
                 # A model added to an account-backed provider inherits the

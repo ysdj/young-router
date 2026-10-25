@@ -118,6 +118,14 @@ export interface NativeLeafBridge {
     origin: string;
     language: LanguagePreference;
   }): Promise<void>;
+  /** Optional: the host's authenticated station browser, for the dashboard. */
+  openRelayDashboard?(options: {
+    accountId: string;
+    type: "newapi" | "sub2api";
+    label: string;
+    origin: string;
+    language: LanguagePreference;
+  }): Promise<void>;
   clearRelayPassword(accountId: string): Promise<void>;
   clearRelayCredentials(accountId: string): Promise<void>;
   setLaunchAtLogin(enabled: boolean): Promise<void>;
@@ -201,6 +209,9 @@ export function createNativeLeafBridgeAdapter(bridge: NativeLeafBridge): NativeL
     cancelRelayLogin: () => bridge.cancelRelayLogin?.(),
     restoreRelaySession: (options) => bridge.restoreRelaySession(options),
     openRelayLogs: (options) => bridge.openRelayLogs(options),
+    openRelayDashboard: bridge.openRelayDashboard
+      ? (options) => bridge.openRelayDashboard!(options)
+      : undefined,
     clearRelayPassword: (accountId) => bridge.clearRelayPassword(accountId),
     clearRelayCredentials: (accountId) => bridge.clearRelayCredentials(accountId),
     setLaunchAtLogin: (enabled) => bridge.setLaunchAtLogin(enabled),

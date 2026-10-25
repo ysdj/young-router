@@ -483,6 +483,159 @@ class RelayModelBindingTests(unittest.TestCase):
             )
             self.assertNotIn("replace-materialized-credential", json.dumps(domain.snapshot()))
 
+    def test_adding_a_model_that_is_already_on_the_key_adds_no_second_row(self) -> None:
+        """The add path must not duplicate a route that already exists.
+
+        A relay fetch lists the station's catalog, not the provider's own rows,
+        so the model the user is looking at is offered again.  Appending it made
+        a second, identical deployment for one route: two rows in the pane, two
+        orders for one model, and the group's multiplier counted twice.  An
+        identical (public name, upstream, key) entry is the row that is already
+        there; a route that differs in any of the three is still a new route.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            domain = ProvidersModelsDomain(Path(directory) / "config.yaml")
+            source = relay_source(models=["upstream-chat", "upstream-other"])
+            domain.stage_relay_import([source])
+            domain.materialize_relay_bindings(
+                {"resources": [{**source, "api_key": "replace-materialized-credential"}]}
+            )
+            provider = domain.snapshot()["providers"][0]
+            provider_id = provider["editor_id"]
+            key = next(item for item in provider["key_states"] if item["source"]["kind"] == "relay")
+
+            def row(name: str, key_id: str, key_name: str) -> dict[str, object]:
+                return {
+                    "name": name,
+                    "upstream_model": name,
+                    "enabled": True,
+                    "order": 0,
+                    "api_key_name": key_name,
+                    "provider_key_id": key_id,
+                }
+
+            first = domain.dispatch(
+                "model.add_many",
+                {
+                    "provider_id": provider_id,
+                    "models": [
+                        row("upstream-chat", key["id"], key["name"]),
+                        row("upstream-other", key["id"], key["name"]),
+                    ],
+                },
+            )
+            names = [model["name"] for model in first["providers"][0]["models"]]
+            self.assertEqual(["upstream-chat", "upstream-other"], sorted(names))
+
+            # Picking both again — and one of them twice in the same request —
+            # changes nothing: there is one row per route, not one per pick.
+            repeat = domain.dispatch(
+                "model.add_many",
+                {
+                    "provider_id": provider_id,
+                    "models": [
+                        row("upstream-chat", key["id"], key["name"]),
+                        row("upstream-other", key["id"], key["name"]),
+                        row("upstream-chat", key["id"], key["name"]),
+                    ],
+                },
+            )
+            self.assertEqual(names, [model["name"] for model in repeat["providers"][0]["models"]])
+
+            # A different key is a different route: the same upstream may be
+            # served twice on purpose, and that is not a duplicate.
+            added = domain.dispatch(
+                "model.add",
+                {
+                    "provider_id": provider_id,
+                    "model": row("upstream-chat", "", "second-key"),
+                },
+            )
+            self.assertEqual(3, len(added["providers"][0]["models"]))
+
+    def test_a_scope_keeps_a_stale_route_from_refusing_another_rows_write(self) -> None:
+        """Only the rows an Apply names may refuse it.
+
+        The station answers about a whole key, so materialization used to judge
+        every route on it.  One stale upstream then refused an edit about a
+        different route on the same key: adding a model answered
+        ``relay_binding_failed`` and the strip said the new row had not been
+        applied, while the row the user touched was perfectly fine.  A scope
+        names the projection rows that Apply changed; a route outside it keeps
+        exactly the state the last successful read gave it.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            domain = ProvidersModelsDomain(Path(directory) / "config.yaml")
+            source = relay_source(models=["upstream-chat", "upstream-new"])
+            domain.stage_relay_import([source])
+            domain.materialize_relay_bindings(
+                {"resources": [{**source, "api_key": "replace-materialized-credential"}]}
+            )
+            domain.apply()
+            provider = domain.snapshot()["providers"][0]
+            provider_id = provider["editor_id"]
+            key = next(item for item in provider["key_states"] if item["source"]["kind"] == "relay")
+            # A second route on the same key: the row this Apply is about.
+            domain.dispatch(
+                "model.add",
+                {
+                    "provider_id": provider_id,
+                    "model": {
+                        "name": "upstream-new",
+                        "upstream_model": "upstream-new",
+                        "enabled": True,
+                        "order": 0,
+                        "api_key_name": key["name"],
+                        "provider_key_id": key["id"],
+                    },
+                },
+            )
+            # The station now serves only the newly added upstream, and its
+            # answer is authoritative for this key.
+            served = {
+                "resources": [
+                    {
+                        **source,
+                        "api_key": "replace-materialized-credential",
+                        "models": ["upstream-new"],
+                        "source_models": ["upstream-new"],
+                        "catalog_authoritative": True,
+                    }
+                ]
+            }
+            scope = [
+                (
+                    "model",
+                    str(provider.get("name", "")),
+                    "upstream-new",
+                    key["id"],
+                    key["name"],
+                    "manual",
+                )
+            ]
+
+            scoped = domain.materialize_relay_bindings(served, scope=scope)
+            self.assertEqual([], scoped["issues"])
+            models = {
+                model["model_name"]: model
+                for model in domain.snapshot()["providers"][0]["models"]
+            }
+            # The untouched row was not re-judged, so it did not become a
+            # failure mark on a write that succeeded.
+            self.assertNotEqual(
+                "catalog_model_missing", models["upstream-chat"]["binding_health"]["status"]
+            )
+            self.assertEqual("linked", models["upstream-new"]["binding_health"]["status"])
+
+            # Without a scope the same material refuses the write: that is the
+            # relay's own Apply, where the station's answer is the edit.
+            unscoped = domain.materialize_relay_bindings(served)
+            self.assertEqual(
+                {"catalog_model_missing"}, {item["code"] for item in unscoped["issues"]}
+            )
+
     def test_an_absence_the_station_never_confirmed_still_resolves_from_the_document(self) -> None:
         """Only the station's own answer refuses a binding, never code alone.
 

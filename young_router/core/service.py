@@ -53,6 +53,10 @@ _SECRET_FIELDS: dict[tuple[str, str], bool] = {
     ("webdav", "password"): False,
     ("relay_accounts", "api_key"): True,
     ("relay_accounts", "password"): True,
+    # The dashboard session, keyed by the account id.  It is read only by the
+    # native host, through the one-time lease, so a window it opens itself can
+    # install the login the user already made.
+    ("relay_accounts", "session"): True,
 }
 
 # How long a plaintext read waits for the store lock before reading the live
@@ -67,6 +71,7 @@ _PLAINTEXT_SECRET_FIELDS = {
     ("claude", "desktop_gateway_api_key"),
     ("relay_accounts", "api_key"),
     ("relay_accounts", "password"),
+    ("relay_accounts", "session"),
     ("runtime", "setting"),
 }
 
@@ -397,6 +402,91 @@ def _relay_binding_projection(state: object) -> list[tuple[str, ...]]:
                     )
                 )
     return projection
+
+
+def _relay_dependency_sources(
+    provider_keys: object,
+    slot_credentials: object,
+    *,
+    dependency_baseline: object,
+    dependency_draft: object,
+) -> list[dict[str, Any]]:
+    """The relay sources one dependency-only Apply actually has to resolve.
+
+    ``provider_keys`` is ``dependency_summary()``'s own list: one row per linked
+    ProviderKey, each carrying its stable slot id and its relay source.  The
+    edit's own rows come from the binding projection, so an edited route is
+    always resolved, and a slot whose own binding changed (a newly imported key,
+    a key that moved to another resource) is resolved with it.
+
+    A slot that carries no persisted credential joins regardless of the edit:
+    the document is then not a substitute for a station read — there is no value
+    to fall back to — so resolving it is the only way its routes can be written.
+    Every other slot stays exactly as it is, which is what keeps one route's
+    stale upstream from refusing an edit about a different route.
+
+    Sources are deduplicated by their own identity: two provider keys may bind
+    the same station key, and one resolution answers both.  Reporting that pair
+    twice is what the materializer treats as a conflicting duplicate resource.
+    """
+
+    rows = (
+        [item for item in provider_keys if isinstance(item, Mapping)]
+        if isinstance(provider_keys, Sequence) and not isinstance(provider_keys, (str, bytes, bytearray))
+        else []
+    )
+    if not rows:
+        return []
+    before = set(_relay_binding_projection(dependency_baseline))
+    changed = [row for row in _relay_binding_projection(dependency_draft) if row not in before]
+    key_ids: set[str] = set()
+    key_names: set[tuple[str, str]] = set()
+    for row in changed:
+        if row[0] == "model":
+            if row[3]:
+                key_ids.add(row[3])
+            else:
+                # A route that states no slot is bound by its own key name, and
+                # that name is the weaker identity the projection also records.
+                key_names.add((row[1], row[4]))
+        else:
+            key_names.add((row[1], row[2]))
+    held: set[tuple[str, str]] = set()
+    if isinstance(slot_credentials, Mapping):
+        for raw_key, value in slot_credentials.items():
+            if not isinstance(value, str) or not value:
+                continue
+            try:
+                account_id, resource_id = raw_key
+            except (TypeError, ValueError):
+                continue
+            held.add((str(account_id), str(resource_id)))
+    resolved: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for item in rows:
+        source = item.get("source")
+        if not isinstance(source, Mapping):
+            continue
+        slot_id = str(item.get("provider_key_id", "")).strip()
+        name = (str(item.get("provider_id", "")), str(item.get("api_key_name", "")))
+        needed = slot_id in key_ids or name in key_names
+        if not needed:
+            # A slot with no credential cannot be resolved from the document, so
+            # the station has to answer for it even when this edit does not name
+            # it.
+            identity = (
+                str(source.get("account_id", "")).strip(),
+                str(source.get("resource_id", "")).strip(),
+            )
+            needed = identity not in held
+        if not needed:
+            continue
+        identity = (
+            str(source.get("station_id", "")),
+            str(source.get("account_id", "")),
+            str(source.get("resource_id", "")),
+        )
+        resolved.setdefault(identity, dict(source))
+    return list(resolved.values())
 
 
 def _as_mapping(value: object, label: str = "payload") -> dict[str, Any]:
@@ -1049,27 +1139,36 @@ class CoreStore:
             adapters.append(clients_factory())
         except Exception:
             adapters.append(RecoverableDomain("clients", clients_factory))
-        adapters.append(
-            LogsDomain(
-                resolved_runtime_root,
-                config_path=resolved_config_path,
-                runtime_settings_path=runtime_settings_path,
-            )
-        )
         language_factory: Callable[[], DomainAdapter] = lambda: LanguageSettingsDomain(language_path)
         try:
             adapters.append(language_factory())
         except Exception:
             adapters.append(RecoverableDomain("language", language_factory))
+        relay_accounts_domain: DomainAdapter
         try:
             relay_path = None
             if config_path is not None:
                 from ..webdav import core as webdav_core
 
                 relay_path = webdav_core.relay_accounts_path(Path(config_path).expanduser())
-            adapters.append(RelayAccountsDomain(runtime_root, storage_path=relay_path))
+            relay_accounts_domain = RelayAccountsDomain(runtime_root, storage_path=relay_path)
         except Exception:
-            adapters.append(UnavailableDomain("relay_accounts"))
+            relay_accounts_domain = UnavailableDomain("relay_accounts")
+        adapters.append(relay_accounts_domain)
+        # The log domain reads relay dashboards, and a dashboard token is minted
+        # from the login the relay-account domain holds.  Handing that store over
+        # lets a refresh token the station rotates during a usage read be kept,
+        # which is what the next read mints its token from: a token kept only in
+        # memory would be lost on the next restart, and the account would have to
+        # be signed in again.
+        adapters.append(
+            LogsDomain(
+                resolved_runtime_root,
+                config_path=resolved_config_path,
+                runtime_settings_path=runtime_settings_path,
+                relay_accounts=relay_accounts_domain,
+            )
+        )
         operations = (
             "start",
             "stop",
@@ -4081,6 +4180,10 @@ class CoreStore:
                     raise CoreError("relay_apply_unavailable", "Linked model synchronization is unavailable")
                 dependencies = dependency_summary()
                 provider_keys = dependencies.get("provider_keys", []) if isinstance(dependencies, Mapping) else []
+                # ``None`` means “judge every route”: only a relay's own Apply
+                # has the station's answer as its edit.  A dependency-only Apply
+                # names the rows it changed below.
+                binding_scope: object | None = None
                 sources = [
                     item.get("source")
                     for item in provider_keys
@@ -4106,6 +4209,40 @@ class CoreStore:
                     # on a fresh Core while the station is unreachable.
                     slot_reader = getattr(providers, "relay_slot_credentials", None)
                     slot_credentials = slot_reader() if callable(slot_reader) else None
+                    # One model edit names one key.  Resolving every linked key
+                    # in the document to write that one row made an unrelated
+                    # route's own problem (a stale upstream, a group that moved)
+                    # refuse this edit, and it paid a station round trip per key
+                    # when a newly bound slot still had to be read.  A
+                    # dependency-only Apply therefore resolves the keys its own
+                    # edit touches, plus any slot that carries no persisted
+                    # credential and so cannot be resolved without the station.
+                    # Every other linked route keeps its stored credential and
+                    # its applied row exactly as they are.
+                    if relay_dependency_only:
+                        sources = _relay_dependency_sources(
+                            provider_keys,
+                            slot_credentials,
+                            dependency_baseline=self._baselines.get("providers_models"),
+                            dependency_draft=self._adapter_draft_state("providers_models"),
+                        )
+                        # The rows this Apply may refuse: a dependency-only edit
+                        # judges the routes it changed, never a stale row the
+                        # station happens to answer about beside them.
+                        baseline_projection = set(
+                            _relay_binding_projection(self._baselines.get("providers_models"))
+                        )
+                        binding_scope = [
+                            row
+                            for row in _relay_binding_projection(
+                                self._adapter_draft_state("providers_models")
+                            )
+                            if row not in baseline_projection
+                        ]
+                    else:
+                        # A relay's own Apply is the read: every route it
+                        # materializes is judged against the station's answer.
+                        binding_scope = None
                     # A dependency-only Apply carries no relay work of its own:
                     # it needs each key the draft binds, and the document already
                     # persists every one of them.  Asking the station anyway spent
@@ -4124,7 +4261,7 @@ class CoreStore:
                         slot_credentials=slot_credentials,
                         local_only=relay_dependency_only,
                     )
-                    materialized = materialize(materials)
+                    materialized = materialize(materials, scope=binding_scope)
                     # Whatever this resolution said becomes the pane's own map
                     # of the linked rows: a successful one clears it, a failed
                     # one marks the key or route that refused the write.

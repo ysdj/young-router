@@ -3156,6 +3156,46 @@ def _frozen_tool_call_lane_ids(input_items: list) -> set[str]:
     return frozen
 
 
+def _without_replayed_reasoning_summary_text(input_items: list) -> list:
+    """Read a replayed ``reasoning`` item the way its upstream reads it.
+
+    LiteLLM's pre-call context check turns every Responses input item into chat
+    messages and counts them.  A ``reasoning`` item becomes a message whose
+    ``content`` is its ``summary`` text, so the check charges the whole chain of
+    thought the client replayed.  Neither side of a real request carries those
+    words: Codex replays reasoning as an opaque id, and the upstream that
+    produced them is the only party that can decode them.  On one measured
+    thread the summaries were 545k of the 1.14M tokens the check charged for a
+    body the same route had just answered at 400k -- 1,004,863 against a
+    1,000,000 window, i.e. a refusal decided entirely by this reading.
+
+    Only a summary-only item loses its text, and only for the count: the
+    request itself is untouched.  An item carrying ``encrypted_content`` keeps
+    everything (a signed prefix is re-sent byte-for-byte), and one carrying
+    ``content`` keeps it too, because that is reasoning text a client can
+    genuinely put on the wire.  The direction this can err in is the safe one --
+    a body this pass still refuses really is larger than the window, and a body
+    it accepts is then judged by the upstream's own accounting, which is what
+    the client's window was sized for.
+    """
+
+    counted: list = []
+    if not isinstance(input_items, list):
+        return input_items
+    for item in input_items:
+        if (
+            isinstance(item, dict)
+            and item.get("type") == "reasoning"
+            and item.get("content") in (None, "", [])
+            and not _value_has_encrypted_content(item)
+        ):
+            stripped = {key: value for key, value in item.items() if key != "summary"}
+            counted.append(stripped)
+            continue
+        counted.append(item)
+    return counted
+
+
 def _with_elided_oversized_tool_outputs(request_kwargs: dict) -> Optional[dict]:
     """Bound the replayed tool-call window in the mutable replay suffix.
 
@@ -4627,6 +4667,41 @@ def _xhigh_reasoning_compat_retry_kwargs(
         to_effort=target_effort,
     )
     return retry_kwargs
+
+
+def _with_streaming_plaintext_headers(request_kwargs: dict) -> Optional[dict]:
+    """Ask the upstream not to compress a streamed answer.
+
+    A relay that gzips ``text/event-stream`` defeats incremental delivery: the
+    whole body arrives decodable only when the last block lands, so a reasoning
+    summary produced over twenty seconds reaches the client as one burst after
+    the model stops thinking.  Compression buys nothing on a stream we forward
+    immediately, so streamed requests are negotiated as plaintext.
+    """
+
+    if request_kwargs.get("stream") is not True:
+        return None
+    existing_headers = request_kwargs.get("extra_headers")
+    merged_headers: Dict[str, str] = (
+        existing_headers.copy() if isinstance(existing_headers, dict) else {}
+    )
+    encoded = False
+    for header_name, value in (
+        ("Accept-Encoding", "identity"),
+        ("Accept", "text/event-stream"),
+    ):
+        existing_key = _header_key(merged_headers, header_name)
+        if existing_key is None:
+            merged_headers[header_name] = value
+            encoded = True
+        elif merged_headers[existing_key] != value:
+            merged_headers[existing_key] = value
+            encoded = True
+    if not encoded:
+        return None
+    modified_kwargs = request_kwargs.copy()
+    modified_kwargs["extra_headers"] = merged_headers
+    return modified_kwargs
 
 
 def _with_stream_request_timeout(request_kwargs: dict) -> Optional[dict]:

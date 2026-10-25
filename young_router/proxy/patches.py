@@ -35,6 +35,7 @@ from .base import (
     _RESPONSES_COMPLETION_STREAM_COMPLETED_PATCH_ATTR,
     _RESPONSES_COMPLETION_STREAM_DEFAULT_DONE_PATCH_ATTR,
     _RESPONSES_COMPLETION_STREAM_PATCH_ATTR,
+    _RESPONSES_CHAT_BRIDGE_REASONING_PATCH_ATTR,
     _RESPONSES_TOOL_SEARCH_BRIDGE_PATCH_ATTR,
     _ROUTING_CONSTRAINT_PATCH_ATTR,
     _RESTORED_REASONING_REPLAY_KEY,
@@ -881,7 +882,10 @@ def _install_selected_deployment_marker_patch() -> None:
                 session=_routing_module._trace_session_context(kwargs),
                 model_group=_responses_execution_module._request_model_group(kwargs),
                 function_name=function_name,
-                deployment=_routing_module._trace_deployment(deployment),
+                deployment=_routing_module._trace_deployment(
+                    deployment,
+                    surface=surface,
+                ),
                 request=_trace_module._trace_request_summary(
                     kwargs,
                     call_type=function_name,
@@ -1914,6 +1918,119 @@ def _install_responses_completion_stream_patch() -> None:
     _patch_completed_event_emitter("_emit_response_completed_event")
     _patch_completed_event_emitter("_emit_terminal_response_event")
 
+def _chat_bridge_reasoning_replay_repaired_messages(
+    litellm_completion_request: Any,
+) -> list[str]:
+    """Give a thinking upstream the replay contract LiteLLM left unsatisfied.
+
+    A DeepSeek thinking upstream refuses the whole request with HTTP 400 ``the
+    `reasoning_content` in the thinking mode must be passed back to the API``
+    whenever an assistant message that carries ``tool_calls`` has no
+    ``reasoning_content`` field at all.  The field being *empty* answers;
+    being absent does not.  Measured side by side on api.deepseek.com, one
+    history, one tool result: with the field the turn answers, without it the
+    same bytes are refused.
+
+    On the Responses surface the client's own replay satisfies that contract,
+    because the ``reasoning`` item is forwarded as-is.  Across the chat bridge
+    it cannot: ``transform_responses_api_input_to_messages`` turns a reasoning
+    item into the assistant's ``reasoning_content`` only when it finds plaintext
+    in ``content`` or ``summary``, and drops the item outright when the payload
+    is only ``encrypted_content`` -- which is exactly the shape a Codex client
+    sends.  So the bridged assistant message reaches the upstream with the
+    field missing and a route that answers this conversation natively refuses
+    it here.
+
+    The repair adds the field and nothing else: an *empty* ``reasoning_content``
+    states exactly as much as an opaque blob did to a provider that cannot
+    decode it.  No thinking is invented, no content is moved, and a turn that
+    already carries the field is left alone.  Only assistant messages with tool
+    calls are touched, because that is the shape the contract names.
+
+    Returns the tool-call ids it repaired, for the trace.
+    """
+
+    messages = (
+        litellm_completion_request.get("messages")
+        if isinstance(litellm_completion_request, dict)
+        else None
+    )
+    if not isinstance(messages, list):
+        return []
+    repaired: list[str] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") != "assistant":
+            continue
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list) or not tool_calls:
+            continue
+        if "reasoning_content" in message:
+            continue
+        message["reasoning_content"] = ""
+        for call in tool_calls:
+            if isinstance(call, dict):
+                call_id = call.get("id")
+                if isinstance(call_id, str) and call_id.strip():
+                    repaired.append(call_id.strip())
+    return repaired
+
+
+def _install_responses_chat_bridge_reasoning_replay_patch() -> None:
+    """Repair the bridged replay before a thinking upstream judges it."""
+
+    try:
+        from litellm.responses.litellm_completion_transformation.transformation import (
+            LiteLLMCompletionResponsesConfig,
+        )
+    except Exception:
+        return
+
+    original_transform = getattr(
+        LiteLLMCompletionResponsesConfig,
+        "transform_responses_api_request_to_chat_completion_request",
+        None,
+    )
+    if original_transform is None or getattr(
+        original_transform,
+        _RESPONSES_CHAT_BRIDGE_REASONING_PATCH_ATTR,
+        False,
+    ):
+        return
+
+    def patched_transform_responses_api_request_to_chat_completion_request(
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        litellm_completion_request = original_transform(*args, **kwargs)
+        repaired = _chat_bridge_reasoning_replay_repaired_messages(
+            litellm_completion_request
+        )
+        if repaired:
+            _trace_module._route_trace(
+                "responses_chat_bridge_reasoning_replay_repaired",
+                model_group=kwargs.get("model"),
+                repaired_tool_call_count=len(repaired),
+                repaired_tool_call_ids=repaired[:20],
+            )
+        return litellm_completion_request
+
+    setattr(
+        patched_transform_responses_api_request_to_chat_completion_request,
+        _RESPONSES_CHAT_BRIDGE_REASONING_PATCH_ATTR,
+        True,
+    )
+    setattr(
+        patched_transform_responses_api_request_to_chat_completion_request,
+        "_original_transform_responses_api_request_to_chat_completion_request",
+        original_transform,
+    )
+    LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request = staticmethod(
+        patched_transform_responses_api_request_to_chat_completion_request
+    )
+
+
 def _install_responses_tool_search_bridge_patch() -> None:
     try:
         from litellm.responses.litellm_completion_transformation.transformation import (
@@ -2048,6 +2165,68 @@ def _install_responses_tool_search_bridge_patch() -> None:
 _MODEL_LISTING_EFFORTS_PATCH_ATTR = (
     "_young_router_model_listing_efforts_patch"
 )
+_PRE_CALL_TOKEN_COUNT_PATCH_ATTR = "_young_router_pre_call_token_count_patch"
+
+
+def _install_pre_call_token_count_patch() -> None:
+    """Count a replayed Responses body the way its upstream reads it.
+
+    LiteLLM's ``enable_pre_call_checks`` refuses a request before any route is
+    contacted when the token count it computes exceeds the route's
+    ``max_input_tokens``.  On the Responses surface that count normalizes every
+    input item into a chat message, and a ``reasoning`` item is normalized to
+    one whose ``content`` is its ``summary`` text -- words the client never
+    sends (it replays an opaque id) and the upstream never receives.  A thread
+    whose real prompt was 400k tokens was charged 1,004,863 against a
+    1,000,000 window for exactly that text, so a conversation with obvious
+    headroom ended as ``context_length_exceeded`` before a route was tried.
+
+    The estimate is the whole decision here, so it is taken over the same items
+    the upstream will read: a summary-only reasoning item counts by identity, a
+    signed one keeps everything it carries (a signed prefix is re-sent
+    byte-for-byte, and pretending otherwise would undercount a real body), and
+    one that carries visible ``content`` keeps that too.  ``input`` is not
+    mutated; this wrapper only replaces the value it counts.
+    """
+
+    try:
+        from litellm.router import Router
+    except Exception:
+        return
+
+    original_count = getattr(Router, "_count_pre_call_check_tokens", None)
+    if original_count is None or getattr(
+        original_count, _PRE_CALL_TOKEN_COUNT_PATCH_ATTR, False
+    ):
+        return
+
+    def patched_count_pre_call_check_tokens(
+        self: Any,
+        messages: Optional[Any],
+        input: Optional[Any],
+        request_kwargs: Optional[Any] = None,
+    ) -> int:
+        # ``messages`` is already a chat shape: nothing here needs reading.
+        if messages is None and isinstance(input, list):
+            input = _responses_request_module._without_replayed_reasoning_summary_text(
+                input
+            )
+        return original_count(
+            self,
+            messages=messages,
+            input=input,
+            request_kwargs=request_kwargs,
+        )
+
+    setattr(
+        patched_count_pre_call_check_tokens, _PRE_CALL_TOKEN_COUNT_PATCH_ATTR, True
+    )
+    setattr(
+        patched_count_pre_call_check_tokens,
+        "_original_count_pre_call_check_tokens",
+        original_count,
+    )
+    Router._count_pre_call_check_tokens = patched_count_pre_call_check_tokens
 
 
 def _install_model_listing_efforts_patch() -> None:
@@ -2105,6 +2284,7 @@ def install_all() -> None:
     _install_latin1_response_headers_patch()
     _install_anthropic_unversioned_endpoint_patch()
     _install_model_listing_efforts_patch()
+    _install_pre_call_token_count_patch()
     _install_routing_constraint_patch()
     _install_selected_deployment_marker_patch()
     _install_order_peer_failover_patch()
@@ -2119,6 +2299,10 @@ def install_all() -> None:
     _install_managed_responses_websocket_keepalive_patch()
     _install_responses_completion_stream_patch()
     _install_responses_tool_search_bridge_patch()
+    # The bridged replay is repaired here, before a thinking upstream judges it:
+    # the client's reasoning item does not survive the Responses-to-Chat
+    # transformation when its payload is only ``encrypted_content``.
+    _install_responses_chat_bridge_reasoning_replay_patch()
     # The managed proxy's idle loops are not part of request handling, but every
     # worker and the supervisor run them, so they are installed with the rest.
     _proxy_idle_module.install_proxy_idle_patches()

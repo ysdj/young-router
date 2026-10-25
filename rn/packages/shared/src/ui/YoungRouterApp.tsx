@@ -231,7 +231,7 @@ function laneRouteOrder(routes: readonly string[]): string[] {
  *
  * The upstream's catalog tags every row with the channel that serves it, and
  * the tag is the whole point: an id does not identify its producer, so a flat
- * list of 28 ids read as one source when it was three.  The free lane's own
+ * list of 28 ids read as one source when it was two.  The free lane's own
  * models carry no channel tag — it *is* the lane the others are merged onto — so
  * they are filed under its own heading rather than absorbed into whichever named
  * producer happened to sort first.
@@ -241,7 +241,7 @@ function laneRouteOrder(routes: readonly string[]): string[] {
  * under a source it does not come from.
  */
 const LANE_CHANNEL_FREE = "";
-const LANE_CHANNEL_ORDER = [LANE_CHANNEL_FREE, "kilo", "eac"] as const;
+const LANE_CHANNEL_ORDER = [LANE_CHANNEL_FREE, "kilo"] as const;
 
 function laneChannelOrder(channels: readonly string[]): string[] {
   const known = LANE_CHANNEL_ORDER.filter((channel) => channels.includes(channel));
@@ -255,8 +255,6 @@ function laneChannelLabel(channel: string, translate: Translate): string {
       return translate("providers.laneChannel.free");
     case "kilo":
       return translate("providers.laneChannel.kilo");
-    case "eac":
-      return translate("providers.laneChannel.eac");
     default:
       // An upstream tag this build has no wording for is shown as it stated it,
       // so a new producer appears in the picker instead of hiding under another
@@ -354,12 +352,13 @@ function serviceCatalogRead(service: ServiceID, channel?: string): { action: str
  * tag, so a user who renames the entry keeps it on its own channel.  The names
  * must stay identical to `OUR_FREE_MODEL_DISPLAY_NAMES` in
  * `young_router/adapters/our_free_model.py`.  The anonymous channel's tag is the
- * empty string, which is a real answer rather than a missing one.
+ * empty string, which is a real answer rather than a missing one.  The upstream
+ * also carries a co-paid channel, but its roster opens only from a sealed
+ * credential this bridge never holds, so it is offered nowhere.
  */
 const OUR_FREE_MODEL_CHANNEL: Record<string, { providerId: string; tag: string; name: string }> = {
   ourFreeModel: { providerId: "our-free-model", tag: "", name: "Our Free Model · OpenCode" },
   ourFreeModelKilo: { providerId: "our-free-model-kilo", tag: "kilo", name: "Our Free Model · Kilo" },
-  ourFreeModelEAC: { providerId: "our-free-model-eac", tag: "eac", name: "Our Free Model · EAC" },
 };
 
 /** The provider id one wizard type creates; the lane when the type names none. */
@@ -650,6 +649,9 @@ const REQUEST_LOG_POLL_MS = 1_000;
 const RECOVERY_LOG_POLL_MS = 1_000;
 const ONLINE_USAGE_POLL_MS = 15_000;
 const ONLINE_USAGE_PAGE_ROWS = 300;
+// The page sizes the pager offers.  Each one is a single read from the relay, so
+// the choice decides how much one page turn costs, not how much is reachable.
+const ONLINE_USAGE_PAGE_SIZE_VALUES = [50, 100, 200, 300, 500, 1000];
 const ONLINE_USAGE_TIME_OPTIONS = ["all", "today", "7d", "30d", "custom"] as const;
 type OnlineUsageTimeOption = typeof ONLINE_USAGE_TIME_OPTIONS[number];
 type OnlineUsageRange = { since?: number; until?: number };
@@ -1070,6 +1072,66 @@ const RELAY_BINDING_ISSUE_KEYS: Record<string, TranslationKey> = {
 function relayBindingIssueText(issue: UnknownRecord, keyLabel: string, translate: Translate): string {
   const key = RELAY_BINDING_ISSUE_KEYS[stringValue(issue.code)] ?? "providers.bindingIssueGeneric";
   return translate(key, { key: keyLabel });
+}
+
+/**
+ * The status-strip sentence for a refused relay binding, naming the row.
+ *
+ * Core answers a refused linked write with ``relay_binding_failed`` and hands
+ * back the rows it refused in the snapshot (``binding_issues``).  The generic
+ * sentence for that code says the change did not apply and asks the user to
+ * check "the route's upstream model", which is unreadable when the pane holds
+ * dozens of routes: it named no key and no model, so the user could not tell
+ * which row the station had refused.  The strip therefore states the first
+ * issue's own cause — the same sentence the marked row carries — and names the
+ * route when the issue is about one.  One projection, no second copy of the
+ * failure.
+ */
+function relayBindingFailureStatus(reason: unknown, snapshot: unknown, translate: Translate): string | undefined {
+  if (stringValue(asRecord(reason).code) !== "relay_binding_failed") return undefined;
+  const rows = asRecords(domainState(snapshot as CoreSnapshot, "providers_models").binding_issues);
+  const issue = rows[0];
+  if (!issue) return undefined;
+  const keyLabel = relayBindingIssueKeyLabel(issue, snapshot);
+  // Only the catalog codes are about one route.  A key-level issue is expanded
+  // to every route on that key by ``_binding_issue_rows``, so the model id it
+  // carries does not mean "this model is the cause" — the key's own resource
+  // is.  Naming a route there would blame a row the station never judged.
+  const code = stringValue(issue.code);
+  const modelLabel = code === "catalog_model_missing" || code === "multiplier_missing"
+    ? relayBindingIssueModelLabel(issue, snapshot)
+    : "";
+  if (modelLabel) return translate("providers.bindingIssueCatalogModel", { key: keyLabel, model: modelLabel });
+  return relayBindingIssueText(issue, keyLabel, translate);
+}
+
+/** The provider key a binding issue names, by the name the pane shows it under. */
+function relayBindingIssueKeyLabel(issue: UnknownRecord, snapshot: unknown): string {
+  const keyID = stringValue(issue.provider_key_id);
+  const providerID = stringValue(issue.provider);
+  if (keyID) {
+    for (const provider of asRecords(domainState(snapshot as CoreSnapshot, "providers_models").providers)) {
+      if (providerID && editorIdentifier(provider) !== providerID) continue;
+      const key = providerKeyStates(provider).find((entry) => entry.id === keyID);
+      if (key) return key.name;
+    }
+  }
+  return stringValue(issue.resource_id) || stringValue(issue.account_id) || providerID;
+}
+
+/** The route a binding issue names, when it names one. */
+function relayBindingIssueModelLabel(issue: UnknownRecord, snapshot: unknown): string {
+  const modelID = stringValue(issue.model_id);
+  if (!modelID) return "";
+  const providerID = stringValue(issue.provider);
+  for (const provider of asRecords(domainState(snapshot as CoreSnapshot, "providers_models").providers)) {
+    if (providerID && editorIdentifier(provider) !== providerID) continue;
+    const model = asRecords(provider.models)
+      .map(modelRecord)
+      .find((entry) => stringValue(entry.editor_id, stringValue(entry.deployment_id, identifier(entry))).trim() === modelID);
+    if (model) return displayLabel(model.display_name, displayLabel(model.model_name ?? model.name, "")) || modelID;
+  }
+  return "";
 }
 
 function isApplyResult(value: unknown): value is IpcResults["apply"] {
@@ -2237,7 +2299,24 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
       return value as T;
     } catch (reason: unknown) {
       const validationStatus = await validationStatusAfterFailure(reason);
-      publishResult(validationStatus ?? errorMessage(reason, translate));
+      // A refused linked write names the row that refused it — the same
+      // sentence the marked key or route carries — instead of the generic
+      // "check this route's upstream model" over a list of dozens of routes.
+      // The issues were recorded by the Apply that just failed, so the snapshot
+      // has to be read again: the render before it still holds the last successful
+      // answer, and a second read only happens on this failure path.
+      let failureSnapshot = latestSnapshot.current;
+      if (stringValue(asRecord(reason).code) === "relay_binding_failed") {
+        try {
+          failureSnapshot = await ipc.snapshot();
+          latestSnapshot.current = failureSnapshot;
+          onSnapshot(failureSnapshot);
+        } catch {
+          // The strip falls back to the code's own sentence.
+        }
+      }
+      const bindingStatus = relayBindingFailureStatus(reason, failureSnapshot, translate);
+      publishResult(validationStatus ?? bindingStatus ?? errorMessage(reason, translate));
       return undefined;
     } finally {
       activeRuns.current -= 1;
@@ -3157,6 +3236,10 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
   // it points somewhere else, which provider and model that target is.
   const codexState = asRecord(domainState(snapshot, "codex"));
   const codexUsesLocalApi = booleanValue(codexState.uses_local_api);
+  // Codex's Responses Lite lane never carries the hosted web_search tool, so the
+  // provider row's standalone opt-in is the only thing that gives these routes a
+  // real search executor. The pane shows the row's own state, not a Codex default.
+  const codexStandaloneSearch = booleanValue(codexState.standalone_search);
   const codexStructured = asRecord(codexState.structured);
   const codexClientProvider = stringValue(codexStructured.model_provider).trim();
   const codexClientModel = stringValue(codexStructured.model).trim();
@@ -3170,6 +3253,10 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
   // One strip per window. Backup & sync reports per tab, so the strip shows the
   // active tab's own result; every other route reports its own work here.
   const routeStatus = result;
+  // A route may put controls in this strip instead of drawing a bar of its own:
+  // the usage pager belongs beside the status it changes, not in a second row
+  // above an empty strip.
+  const [statusBarControls, setStatusBarControls] = React.useState<React.ReactNode>(null);
 
   return <TranslationContext.Provider value={settingsRoute ? translate : undefined}><PendingFieldContext.Provider value={fieldRegistry}><View style={styles.windowSurface}>
     {!shell && route !== "providers-models" && route !== "logs" && route !== "provider-wizard" && route !== "data-management" ? <WindowTitle title={windowTitle} /> : null}
@@ -3177,8 +3264,8 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
     {route === "providers-models" ? <ProviderWorkspace snapshot={snapshot} ipc={ipc} onSnapshot={onSnapshot} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onStatus={setResult} onSecretState={onSecretState} applyProbedSurface={applyProbedSurface} onOpenWizard={() => { if (Platform.OS === "windows") onNavigate("provider-wizard"); native.window.open("provider-wizard"); }} relay={relayBridge} addOfficialAccount={addOfficialAccount} onActivateAndRestart={activateProviderAndRestart} /> : null}
     {route === "file-editor" ? <FileEditorWorkspace file={inlineEditorFile} fileId={fileIdRequest} nativeAction={nativeAction} ipc={ipc} native={native} translate={translate} busy={busy} onEditorConflict={resolveRawEditorConflict} reloadToken={settingsRawReloadToken} baselineToken={settingsRawBaselineToken} syncRevision={snapshot?.revision} onFlushPendingFields={flushPendingFields} onClose={closeRoute} /> : null}
     {route === "provider-wizard" ? <ProviderSetupWizard snapshot={snapshot} native={native} providers={providerWizardProviders} relaySources={providerWizardRelaySources} relayStations={providerWizardRelayStations} busy={busy} translate={translate} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onStatus={setResult} onClose={closeRoute} onKeyToken={registerProviderWizardKeyToken} relay={relayBridge} addOfficialAccount={addOfficialAccount} status={result} /> : null}
-    {settingsRoute ? <AssistantSettingsWorkspace busy={busy} native={native} codexModels={codexModelRows} codexModelCatalogEnabled={codexModelCatalogEnabled} codexFeatures={(domainState(snapshot, "codex").structured as UnknownRecord | undefined)?.features as UnknownRecord | undefined} clientProvider={codexClientProvider} clientModel={codexClientModel} localApiActive={codexUsesLocalApi} onToggleCodexModelCatalog={(enabled) => dispatch("codex.model_catalog.set", { enabled }, "codex")} onToggleCodexFeature={(feature, enabled) => dispatch("codex.feature.set", { feature, enabled }, "codex")} onUseLocalApi={(selection) => dispatch("use_local_api", selection, "codex")} onUseSavedModel={(selection) => dispatch("use_saved_model", selection, "codex")} translate={translate} ipc={ipc} filesToken={settingsRawBaselineToken} onOpenFile={openAssistantFile} /> : null}
-    {route === "logs" ? <LogsWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} translate={translate} dispatch={dispatch} onStatus={setResult} requestedTab={nativeAction?.id === "open-recovery" ? "recovery" : logTabRequest} requestedTabKey={nativeAction?.sequence ?? 0} /> : null}
+    {settingsRoute ? <AssistantSettingsWorkspace busy={busy} native={native} codexModels={codexModelRows} codexModelCatalogEnabled={codexModelCatalogEnabled} standaloneSearch={codexStandaloneSearch} onToggleStandaloneSearch={(enabled) => dispatch("codex.search.set", { enabled }, "codex")} codexFeatures={(domainState(snapshot, "codex").structured as UnknownRecord | undefined)?.features as UnknownRecord | undefined} clientProvider={codexClientProvider} clientModel={codexClientModel} localApiActive={codexUsesLocalApi} onToggleCodexModelCatalog={(enabled) => dispatch("codex.model_catalog.set", { enabled }, "codex")} onToggleCodexFeature={(feature, enabled) => dispatch("codex.feature.set", { feature, enabled }, "codex")} onUseLocalApi={(selection) => dispatch("use_local_api", selection, "codex")} onUseSavedModel={(selection) => dispatch("use_saved_model", selection, "codex")} translate={translate} ipc={ipc} filesToken={settingsRawBaselineToken} onOpenFile={openAssistantFile} /> : null}
+    {route === "logs" ? <LogsWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} translate={translate} dispatch={dispatch} onStatus={setResult} onStatusBar={setStatusBarControls} requestedTab={nativeAction?.id === "open-recovery" ? "recovery" : logTabRequest} requestedTabKey={nativeAction?.sequence ?? 0} /> : null}
     {route === "general-settings" ? <GeneralWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} dispatch={dispatch} dispatchServiceAction={enqueueServiceDispatch} translate={translate} onStatus={setResult} onSnapshot={onSnapshot} /> : null}
     {route === "runtime-settings" ? <RuntimeWorkspace snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} clearSecret={clearSecret} /> : null}
     {route === "data-management" ? <DataManagementWorkspace snapshot={snapshot} tab={dataManagementTab} onTabChange={setDataManagementTab} statuses={dataManagementStatuses} busy={busy} webDavOperationBusy={webDavOperationBusy} translate={translate} dispatch={dispatchDataManagement} onSecretState={onSecretState} onFlushPendingFields={flushPendingFields} onTabSwitchError={(tab, reason) => setDataManagementStatuses((current) => ({ ...current, [tab]: errorMessage(reason, translate) }))} onInspectImport={inspectImportDataManagement} onImport={importDataManagement} onConfirmImportReplace={confirmImportDraftReplacement} onExport={exportDataManagement} onProbeWebDav={probeWebDav} onSyncWebDav={syncWebDav} onCommitWebDavSettings={commitWebDavSettings} /> : null}
@@ -3188,7 +3275,7 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
         mid-action and the pane below it keeps a stable height.  A child window
         keeps no strip of its own: it states its result beside its own footer
         buttons instead. */}
-    {shell ? <View style={styles.routeStatusBar}><Text numberOfLines={2} style={styles.routeStatusText}>{routeStatus ?? translate("common.ready")}</Text></View> : null}
+    {shell ? <View style={styles.routeStatusBar}><Text numberOfLines={2} style={styles.routeStatusText}>{routeStatus ?? translate("common.ready")}</Text>{statusBarControls}</View> : null}
   </View></PendingFieldContext.Provider></TranslationContext.Provider>;
 }
 
@@ -3271,7 +3358,7 @@ function nextServiceProviderName(providers: UnknownRecord[], kind: ServiceProvid
       : kind === "workbuddy_login" ? "WorkBuddy"
         : kind === "workbuddy_global_login" ? "WorkBuddy Global"
           // A lane channel states its own name: the name is what Core reads to
-          // know which channel an entry is, so three entries cannot share one.
+          // know which channel an entry is, so two entries cannot share one.
           : laneChannelName || "Our Free Model · OpenCode";
   const names = new Set(providers.map((provider) => stringValue(provider.display_name, stringValue(provider.name)).trim().toLocaleLowerCase()).filter(Boolean));
   if (!names.has(base.toLocaleLowerCase())) return base;
@@ -3282,7 +3369,7 @@ function nextServiceProviderName(providers: UnknownRecord[], kind: ServiceProvid
 
 function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayStations, busy, translate, dispatchWithOutcome, onSecretState, onStatus, onClose, onKeyToken, relay, addOfficialAccount, status }: { snapshot?: CoreSnapshot; native: NativeLeafAdapter; providers: UnknownRecord[]; relaySources: RelaySourceOption[]; relayStations: RelayStationOption[]; busy: boolean; translate: Translate; dispatchWithOutcome: (type: string, payload?: UnknownRecord, domain?: ConfigDomain, keepControlsEnabled?: boolean) => Promise<CoreSnapshot | undefined>; onSecretState: (state: SecretState) => void; onStatus: (status?: string) => void; onClose: () => void; onKeyToken: (token: string) => void; relay: RelayWorkspaceBridge; addOfficialAccount: (kind: ServiceProviderKind, name?: string) => Promise<string>; /** The window's own result: a child window keeps no strip, so its footer states it. */ status?: string }): React.JSX.Element {
   type WizardStep = "provider" | "keys" | "model";
-  type WizardType = "api" | "openai" | "claude" | "workbuddy" | "workbuddyGlobal" | "ourFreeModel" | "ourFreeModelKilo" | "ourFreeModelEAC";
+  type WizardType = "api" | "openai" | "claude" | "workbuddy" | "workbuddyGlobal" | "ourFreeModel" | "ourFreeModelKilo";
   const [step, setStep] = useState<WizardStep>("provider");
   // The step the last advance left, so one press cannot advance twice.
   const stepRef = useRef<WizardStep | undefined>("provider");
@@ -3382,8 +3469,8 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   // Every lane channel is its own entry, so every one of them is "this type"
   // for the steps that differ from a key entry: no account, a minted key slot,
   // and a catalog read instead of a typed model list.
-  const isOurFreeModelType = providerType === "ourFreeModel" || providerType === "ourFreeModelKilo" || providerType === "ourFreeModelEAC";
-  /** The service this entry belongs to; all three channels are one service. */
+  const isOurFreeModelType = providerType === "ourFreeModel" || providerType === "ourFreeModelKilo";
+  /** The service this entry belongs to; both channels are one service. */
   const serviceType: ServiceID | undefined = providerType === "api"
     ? undefined
     : isOurFreeModelType ? "ourFreeModel" : providerType;
@@ -3508,11 +3595,10 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     // One entry per upstream channel, because each channel is a provider of its
     // own: a channel decides the wire its rows answer on and the window they
     // accept, and a provider is the only unit this app states those on. Adding
-    // one thing must not create three rows the user did not ask for, and a user
-    // who wants only Kilo must be able to add only Kilo.
+    // one thing must not create a row per channel the user did not ask for, and a
+    // user who wants only Kilo must be able to add only Kilo.
     { type: "ourFreeModel", label: translate("providers.type.ourFreeModel") },
     { type: "ourFreeModelKilo", label: translate("providers.type.ourFreeModelKilo") },
-    { type: "ourFreeModelEAC", label: translate("providers.type.ourFreeModelEAC") },
   ];
   const servicePickerLabels = servicePickerItems.map((item) => item.label);
   // A service provider always carries its own address; only the custom entry
@@ -3690,7 +3776,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     setProvidedKeySelection("");
     // A non-custom type carries the service's own address, so the URL field is
     // filled from the service table and every later step treats it as fixed.
-    // The lane's three channels are one service, so each answers with the same
+    // The lane's two channels are one service, so each answers with the same
     // (empty) address: one worker on this machine serves all of them.
     const chosenService: ServiceID | undefined = value === "api"
       ? undefined
@@ -3700,8 +3786,8 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     setProviderBaseURL(chosenService === undefined ? "" : SERVICE_BASE_URLS[chosenService]);
     // The entry is named after its own product, and a second entry for the
     // same account has to stay distinguishable.  A lane channel states its own
-    // name, because the name is what Core reads to know which channel the entry
-    // is: three entries cannot all be called "Our Free Model".
+    // name in its suggestion, because two entries that read as the same product
+    // would be indistinguishable in the provider list.
     const channelName = OUR_FREE_MODEL_CHANNEL[value]?.name;
     setProviderName(value === "workbuddy" ? nextServiceProviderName(providers, "workbuddy_login")
       : value === "workbuddyGlobal" ? nextServiceProviderName(providers, "workbuddy_global_login")
@@ -3902,7 +3988,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     modelFetchInFlight.current = true;
     setModelFetchState("loading");
     try {
-      // The channel is what Core filters by: one worker serves all three, so
+      // The channel is what Core filters by: one worker serves both, so
       // the id in the request decides which slice of the roster comes back.
       const next = await dispatchWithOutcome("our_free_model_models", { provider: providerID, refresh: true }, "providers_models", true);
       if (request !== modelFetchRequest.current) return;
@@ -4583,7 +4669,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         </View> : <>
         {step === "provider" ? <View style={styles.providerWizardFormSection}>
           <NativeFormRow label={translate("providers.wizard.providerType")}>
-            <NativePicker labels={servicePickerLabels} selectedValue={selectedServiceLabel} disabled={wizardBusy} onChange={({ nativeEvent }) => { const kinds: WizardType[] = ["api", "openai", "claude", "workbuddy", "workbuddyGlobal", "ourFreeModel", "ourFreeModelKilo", "ourFreeModelEAC"]; chooseProviderType(kinds[nativeEvent.index] ?? "api"); }} style={styles.providerWizardPicker} />
+            <NativePicker labels={servicePickerLabels} selectedValue={selectedServiceLabel} disabled={wizardBusy} onChange={({ nativeEvent }) => { const kinds: WizardType[] = ["api", "openai", "claude", "workbuddy", "workbuddyGlobal", "ourFreeModel", "ourFreeModelKilo"]; chooseProviderType(kinds[nativeEvent.index] ?? "api"); }} style={styles.providerWizardPicker} />
           </NativeFormRow>
           {providerMode === "new" && isOfficialLoginType ? <NativeFormRow label={translate("providers.wizard.authPath")}>
             <NativePicker labels={[translate("providers.wizard.pathWebLogin"), translate("providers.wizard.pathCustomKey")]} selectedValue={keyPath === "login" ? translate("providers.wizard.pathWebLogin") : translate("providers.wizard.pathCustomKey")} disabled={wizardBusy} onChange={({ nativeEvent }) => { chooseOfficialAuthPath(nativeEvent.index === 1 ? "manual" : "login"); }} style={styles.providerWizardPicker} />
@@ -4915,6 +5001,21 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     }
   }, [busy, dispatch, providers, relayStations]);
   const pendingModelIds = useRef<{ providerId: string; ids: Set<string> } | undefined>(undefined);
+  // A pick that staged nothing new — the model the fetch offered is the row
+  // already on that key, which Core now refuses to duplicate — must not leave
+  // its ids waiting: the next unrelated row to appear would otherwise steal the
+  // selection.  The effect above clears the ref only when it finds the new row,
+  // so the add's own answer is what releases a no-op pick.
+  const settlePendingModels = (next: unknown, targetProviderId: string): void => {
+    const pending = pendingModelIds.current;
+    if (!pending || pending.providerId !== targetProviderId) return;
+    const added = snapshotProviderRecords(next as CoreSnapshot | undefined)
+      .find((entry) => editorIdentifier(entry) === targetProviderId);
+    const appeared = added
+      ? asRecords(added.models).map(modelRecord).some((entry) => !pending.ids.has(editorIdentifier(entry)))
+      : false;
+    if (!appeared) pendingModelIds.current = undefined;
+  };
   // A route ＋ created is selected once the routes list carries it.  The key is
   // not known until the snapshot arrives a render later, and setting a key the
   // table does not know would be repaired to the first route — the pane would
@@ -5188,13 +5289,19 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     void native.chooseModelsToAdd({ models: candidates, providerName, keyName }).then((selection) => {
       const selectedModels = (selection ?? []).filter((model, index, all) => candidateSet.has(model) && all.indexOf(model) === index);
       if (selectedModels.length === 0) return;
+      // The rows this pick creates are new, and the pane selects the first one
+      // the moment Core answers: 获取模型's whole point is to leave the user on
+      // the route they just added, ready to set its public name and order —
+      // previously the pane stayed on whatever row happened to be selected, so
+      // the new model looked like it had not been added at all.
+      pendingModelIds.current = { providerId, ids: new Set(models.map(editorIdentifier)) };
       void dispatch("model.add_many", {
         provider_id: providerId,
         models: selectedModels.map((upstreamModel) => ({ name: upstreamModel, upstream_model: upstreamModel, api_key_name: apiKeyName, ...(apiKeyID ? { provider_key_id: apiKeyID } : {}), enabled: true, order: 0 })).map((model) => ({
           ...model,
           ...modelRecordCapabilityChanges(modelCapabilities[model.upstream_model]),
         })),
-      });
+      }).then((next) => { settlePendingModels(next, providerId); });
     }).catch(() => undefined);
   };
   /**
@@ -5228,7 +5335,11 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     }).then((selection) => {
       const chosen = (selection ?? []).filter((model, index, all) => candidates.includes(model) && all.indexOf(model) === index);
       if (chosen.length === 0) return;
+      // The pick's own rows are what the pane should show afterwards; the same
+      // reason the generic 获取模型 path records them above.
+      pendingModelIds.current = { providerId, ids: new Set(models.map(editorIdentifier)) };
       void dispatch("model.import_service_catalog", { provider_id: providerId, models: chosen })
+        .then((next) => { settlePendingModels(next, providerId); })
         .catch((reason: unknown) => { onStatus(errorMessage(reason, translate)); });
     }).catch(() => undefined);
   };
@@ -7900,7 +8011,7 @@ const NATIVE_ACTION_MENU_ITEM_LIMIT = 32;
 /** One saved provider route, as the pane's controls name and send it. */
 type ClientRoute = { model: string; provider: string; deployment_id: string; label: string };
 
-function AssistantSettingsWorkspace({ busy, native, codexModels, codexModelCatalogEnabled, codexFeatures, clientProvider, clientModel, localApiActive, onToggleCodexModelCatalog, onToggleCodexFeature, onUseLocalApi, onUseSavedModel, translate, ipc, filesToken, onOpenFile }: { busy: boolean; native: NativeLeafAdapter; codexModels: UnknownRecord[]; codexModelCatalogEnabled: boolean; codexFeatures?: UnknownRecord; clientProvider: string; clientModel: string; localApiActive: boolean; onToggleCodexModelCatalog: (enabled: boolean) => Promise<void>; onToggleCodexFeature: (feature: string, enabled: boolean) => Promise<void>; onUseLocalApi: (selection: UnknownRecord) => Promise<void>; onUseSavedModel: (selection: UnknownRecord) => Promise<void>; translate: Translate; ipc: IpcClient; filesToken: number; onOpenFile: (file: ClientFile) => void }): React.JSX.Element {
+function AssistantSettingsWorkspace({ busy, native, codexModels, codexModelCatalogEnabled, standaloneSearch, onToggleStandaloneSearch, codexFeatures, clientProvider, clientModel, localApiActive, onToggleCodexModelCatalog, onToggleCodexFeature, onUseLocalApi, onUseSavedModel, translate, ipc, filesToken, onOpenFile }: { busy: boolean; native: NativeLeafAdapter; codexModels: UnknownRecord[]; codexModelCatalogEnabled: boolean; standaloneSearch: boolean; onToggleStandaloneSearch: (enabled: boolean) => Promise<void>; codexFeatures?: UnknownRecord; clientProvider: string; clientModel: string; localApiActive: boolean; onToggleCodexModelCatalog: (enabled: boolean) => Promise<void>; onToggleCodexFeature: (feature: string, enabled: boolean) => Promise<void>; onUseLocalApi: (selection: UnknownRecord) => Promise<void>; onUseSavedModel: (selection: UnknownRecord) => Promise<void>; translate: Translate; ipc: IpcClient; filesToken: number; onOpenFile: (file: ClientFile) => void }): React.JSX.Element {
   const [files, setFiles] = useState<ClientFile[]>();
   const [error, setError] = useState<string>();
   // The rail selects one client; its detail lists that client's files only.
@@ -8122,9 +8233,15 @@ function AssistantSettingsWorkspace({ busy, native, codexModels, codexModelCatal
     : null;
 
   const featureKeys = Object.keys(codexFeatures ?? {}).filter((feature) => feature.endsWith("_use"));
-  const codexFeatureRows = featureKeys.includes("browser_use") && featureKeys.includes("computer_use")
-    ? ["browser_use", "computer_use", ...featureKeys.filter((feature) => feature !== "browser_use" && feature !== "computer_use").sort()]
-    : featureKeys.sort();
+  // Browser and Computer Use are Codex's own capabilities and are on by default
+  // there, so a switch for them here only restated another app's setting — and
+  // showed "off" for a key Codex never writes, while the capability was live.
+  // The handed-over switches stay in Codex; this pane only carries the surfaces
+  // that need an explicit opt-in on this route.
+  const codexHandedOverSurfaces = new Set(["browser_use", "computer_use"]);
+  const codexFeatureRows = featureKeys
+    .filter((feature) => !codexHandedOverSurfaces.has(feature))
+    .sort();
   return <View style={styles.externalSettingsWorkspace}>
     <SettingsRail
       rows={railRows}
@@ -8180,12 +8297,23 @@ function AssistantSettingsWorkspace({ busy, native, codexModels, codexModelCatal
             </View>
             <View style={styles.externalSettingsHelpSlot}><Text style={styles.externalSettingsHelpText}>{translate("codex.modelCatalogHint")}</Text></View>
           </View>
+          <View style={styles.externalSettingsField}>
+            <View style={styles.externalSettingsInputRow}>
+              <TooltipText numberOfLines={1} tooltip={translate("codex.standaloneSearch")} style={styles.externalSettingsFieldLabel} accessibilityLabel={translate("codex.standaloneSearch")}>{translate("codex.standaloneSearch")}</TooltipText>
+              <View style={styles.externalSettingsValueSlot}>
+                <NativeToggle
+                  accessibilityLabel={translate("codex.standaloneSearch")}
+                  value={standaloneSearch}
+                  disabled={busy}
+                  onValueChange={onToggleStandaloneSearch}
+                  style={styles.externalSettingsBooleanControl}
+                />
+              </View>
+            </View>
+            <View style={styles.externalSettingsHelpSlot}><Text style={styles.externalSettingsHelpText}>{translate("codex.standaloneSearchHint")}</Text></View>
+          </View>
           {codexFeatureRows.map((feature) => {
-            const label = translate(feature === "browser_use"
-              ? "codex.browserUse"
-              : feature === "computer_use"
-                ? "codex.computerUse"
-                : "codex.surfaceFeature");
+            const label = translate("codex.surfaceFeature");
             return <View key={feature} style={styles.externalSettingsField}>
               <View style={styles.externalSettingsInputRow}>
                 <TooltipText numberOfLines={1} tooltip={label} style={styles.externalSettingsFieldLabel} accessibilityLabel={label}>{label}</TooltipText>
@@ -8199,7 +8327,7 @@ function AssistantSettingsWorkspace({ busy, native, codexModels, codexModelCatal
                   />
                 </View>
               </View>
-              <View style={styles.externalSettingsHelpSlot}><Text style={styles.externalSettingsHelpText}>{translate(feature === "browser_use" ? "codex.browserUseHint" : feature === "computer_use" ? "codex.computerUseHint" : "codex.surfaceFeatureHint")}</Text></View>
+              <View style={styles.externalSettingsHelpSlot}><Text style={styles.externalSettingsHelpText}>{translate("codex.surfaceFeatureHint")}</Text></View>
             </View>;
           })}
         </View> : null}
@@ -8993,6 +9121,15 @@ function WebDavPasswordField({ configured, busy, translate, onSecretState }: { c
 
 type RouteTraceAttempt = {
   label: string;
+  /**
+   * What the merge compares: the route, without the wire it left on.
+   *
+   * The selection and the success of one attempt are emitted by two different
+   * hooks, and only one of them knows the wire.  Merging on the rendered label
+   * therefore split one route into two steps ("… · Chat" then "…" failed)
+   * whenever the surface was known on one record and not the other.
+   */
+  identity: string;
   state: "succeeded" | "selected" | "failed" | "attempted";
   detail: string;
   time: string;
@@ -9017,6 +9154,8 @@ type RenderedLogRecord = {
   family: string;
   /** Which login of the relay the row belongs to, when the station has more than one. */
   account: string;
+  /** The relay's own grouping for the request, which is what priced it. */
+  group: string;
   detail: string;
   original: string;
 };
@@ -9175,11 +9314,15 @@ function routeTraceServiceTierLabel(value: string, translate: Translate): string
 }
 
 function routeTraceProtocolLabel(value: string, translate: Translate): string {
+  // A protocol is a wire name, not prose: it is never translated, so a
+  // non-Chinese reader and a Chinese reader name the same endpoint.  Only the
+  // label around it is localized.
   const normalized = value.trim().toLowerCase();
-  if (normalized.includes("responses")) return translate("logs.routeTrace.protocolResponses");
-  if (normalized.includes("chat")) return translate("logs.routeTrace.protocolChat");
-  if (normalized.includes("messages") || normalized.includes("anthropic")) return translate("logs.routeTrace.protocolMessages");
-  return translate("logs.routeTrace.protocolOther");
+  if (normalized.includes("responses")) return "Responses";
+  if (normalized.includes("chat")) return "Chat";
+  if (normalized.includes("messages") || normalized.includes("anthropic")) return "Messages";
+  const fallback = value.trim();
+  return fallback ? `${translate("logs.routeTrace.protocolOther")} ${fallback}` : translate("logs.routeTrace.protocolOther");
 }
 
 const ROUTE_REASON_KEYS: Record<string, Parameters<Translate>[0]> = {
@@ -9203,6 +9346,7 @@ const ROUTE_REASON_KEYS: Record<string, Parameters<Translate>[0]> = {
   "image-generation-tool-runtime-fallback": "logs.routeTrace.reasonImageFallback",
   "no-available-deployment": "logs.noAvailableRoute",
   "model-not-configured": "logs.modelNotConfigured",
+  "local-gateway-auth-rejected": "logs.routeTrace.reasonGatewayAuth",
   other: "logs.routeTrace.reasonUnknown",
 };
 
@@ -9460,6 +9604,21 @@ function routeIdentityLabel(value: unknown, fallback: { model: string; upstreamM
   return order ? `${identity} · ${translate("logs.routeTrace.order", { value: order })}` : identity;
 }
 
+/**
+ * The wire an attempt actually left on, as a suffix for the route's label.
+ *
+ * Only `surface` is evidence: it is written by whoever adapted the attempt.
+ * `protocol_mode` is the route's *policy* ("fixed"/"fallback"), never a
+ * protocol, and the route's declared `upstream_url_surface` is the backup
+ * protocol it may fall back to — a fallback-mode route that answers
+ * /v1/responses natively still declares `openai/chat`.  Reading either as the
+ * wire labelled live Responses traffic as a chat call.
+ */
+function routeSurfaceSuffix(value: unknown, translate: Translate): string {
+  const surface = compactLogValue(asRecord(value).surface);
+  return surface ? ` · ${routeTraceProtocolLabel(surface, translate)}` : "";
+}
+
 function logRecordBaseKey(tab: LogTab, time: string, requestKey: string, event: string, action: string, original: string): string {
   const identity = [requestKey, time, event, action].filter(Boolean);
   const stablePart = identity.length > 0 ? identity.join(":") : original.split(" | ", 1)[0]?.slice(0, 180);
@@ -9552,6 +9711,9 @@ function parseTextLogRecord(record: string, tab: LogTab, _index: number, transla
     tokens,
     family: "",
     account: "",
+    // A plain-text row states no grouping of its own; the record shape is the
+    // only source that can.
+    group: "",
     detail,
     original: record,
   };
@@ -9588,6 +9750,10 @@ function onlineUsageReasonLabel(reason: string, translate: Translate): string {
     unknown_source: "logs.onlineUsageUnknownSource",
     no_credential: "logs.onlineUsageNoCredential",
     unsupported: "logs.onlineUsageUnsupported",
+    // A relay whose dashboard login the station no longer accepts can be read
+    // again after signing in, so the pane names that instead of claiming the
+    // station has no log feed.
+    login_expired: "logs.onlineUsageLoginExpired",
     no_rows: "logs.onlineUsageNoRows",
     unavailable: "logs.onlineUsageUnavailable",
   };
@@ -9644,10 +9810,14 @@ function renderOnlineUsageRecord(record: unknown, value: UnknownRecord, translat
     provider: "",
     family,
     account,
+    group: compactLogValue(value.group),
     apiKeyName: compactLogValue(value.key_name),
     event: "",
     action: "",
-    duration: compactLogValue(value.duration),
+    // The ledger records milliseconds; the column is labelled (s).  Formatting
+    // it here keeps the raw value in the double-click detail while the cell
+    // states the same seconds every other tab shows.
+    duration: formatLogDuration(compactLogValue(value.duration)),
     tokens,
     detail: details.join(" | "),
     // The double-click detail is the same labelled fields, one per line, so
@@ -9669,9 +9839,14 @@ function renderLogRecord(record: unknown, tab: LogTab, index: number, translate:
         ? translate("logs.noAvailableRoute")
         : routingState === "model_not_configured"
           ? translate("logs.modelNotConfigured")
-          : routingState === "unselected"
-            ? translate("logs.notRouted")
-            : ""
+          : routingState === "gateway_auth_rejected"
+            // This proxy refused the caller's key before choosing a route.
+            // Saying 路由前失败 left the reader to guess which side failed, and
+            // the row's own detail said 上游异常 for an upstream never called.
+            ? translate("logs.gatewayAuthRejected")
+            : routingState === "unselected"
+              ? translate("logs.notRouted")
+              : ""
       : "");
   const apiKeyName = compactLogValue(value.api_key_name);
   const publicModel = compactLogValue(value.public_model ?? value.model_group ?? value.model);
@@ -9728,7 +9903,8 @@ function renderLogRecord(record: unknown, tab: LogTab, index: number, translate:
     const failed = failedRoute === route || (!failedRoute && (hasError || /(?:error|failed|timeout)/i.test(rawEvent)));
     if (route) {
       routeAttempts.push({
-        label: route,
+        label: `${route}${routeSurfaceSuffix(value.route, translate)}`,
+        identity: route,
         state: failed
           ? "failed"
           : rawEvent === "deployment_success"
@@ -9742,7 +9918,8 @@ function renderLogRecord(record: unknown, tab: LogTab, index: number, translate:
     }
     if (failedRoute && failedRoute !== route) {
       routeAttempts.push({
-        label: failedRoute,
+        label: `${failedRoute}${routeSurfaceSuffix(value.failed_route, translate)}`,
+        identity: failedRoute,
         state: "failed",
         detail: details.filter(Boolean).join(" | "),
         time,
@@ -9768,6 +9945,7 @@ function renderLogRecord(record: unknown, tab: LogTab, index: number, translate:
     tokens,
     family: "",
     account: "",
+    group: compactLogValue(value.group),
     detail: details.filter(Boolean).join(" | "),
     original,
   };
@@ -9819,7 +9997,7 @@ function groupRouteTraceRequests(rows: RenderedLogRecord[]): RouteTraceRequest[]
     // so the route timeline reads from the requested model to the final path.
     for (const row of [...group.rows].reverse()) {
       for (const attempt of row.routeAttempts) {
-        const existing = attempts.find((candidate) => candidate.label === attempt.label);
+        const existing = attempts.find((candidate) => candidate.identity === attempt.identity);
         if (!existing) {
           attempts.push({ ...attempt });
           continue;
@@ -9832,6 +10010,11 @@ function groupRouteTraceRequests(rows: RenderedLogRecord[]): RouteTraceRequest[]
         // was picked again, which is not a reason to withdraw the success.
         if (attempt.state !== "attempted" && !(existing.state === "succeeded" && attempt.state === "selected")) {
           existing.state = attempt.state;
+        }
+        // A later record that knows the wire refines the label, but a record
+        // that does not know it never withdraws what an earlier one stated.
+        if (attempt.label !== attempt.identity && existing.label === existing.identity) {
+          existing.label = attempt.label;
         }
         if (attempt.detail && (attempt.state !== "attempted" || !existing.detail)) existing.detail = attempt.detail;
         if (!existing.time && attempt.time) existing.time = attempt.time;
@@ -9878,7 +10061,28 @@ const LOG_DETAIL_COLUMN_FLOOR = 240;
 // 148, which clipped the tail of the widest digit runs into an ellipsis.
 const LOG_TIME_COLUMN_WIDTH = 168;
 
-function logColumns(tab: LogTab, translate: Translate, hasStatus = true, hasAccount = false): LogColumn[] {
+/**
+ * Whether this page actually needs a column to tell its rows apart.
+ *
+ * A column whose every cell repeats one value restates what the control above
+ * the table already says, and on a narrow window that width is taken from a
+ * column the reader does need.
+ */
+function hasDistinct(rows: RenderedLogRecord[], value: (row: RenderedLogRecord) => string): boolean {
+  if (rows.length < 2) return false;
+  const first = value(rows[0]);
+  return rows.some((row) => value(row) !== first);
+}
+
+function logColumns(
+  tab: LogTab,
+  translate: Translate,
+  hasStatus = true,
+  hasAccount = false,
+  hasFamily = true,
+  hasSource = true,
+  hasGroup = false,
+): LogColumn[] {
   const time = { label: translate("logs.localTime"), width: LOG_TIME_COLUMN_WIDTH, value: (row: RenderedLogRecord) => row.time };
   const status = { label: translate("common.status"), width: 68, value: (row: RenderedLogRecord) => row.status };
   const detail = { label: translate("logs.detail"), width: 260, flex: true, detailFlex: true, value: (row: RenderedLogRecord) => row.detail };
@@ -9914,23 +10118,44 @@ function logColumns(tab: LogTab, translate: Translate, hasStatus = true, hasAcco
     // for, so the table stays inside its frame instead of scrolling sideways.
     //
     // The widths are sized to the content these columns actually carry (a
-    // relay name, `Sub2API`, `gemini-3.1-pro-preview`, `34113.8 / 88.5`). The
-    // type column keeps its complete label rather than truncating it.
+    // relay name, `Sub2API`, `gemini-3.1-flash-lite`, `34113.8 / 88.5`), with
+    // each one measured in the 13 pt table face plus the 8 pt cell padding.
+    // The token pair is the one width that has to be checked against its own
+    // text: a pair that overflows it is ellipsized, not narrowed.
     // The relay's name is short (`sisct2`), so it takes slack only up to a
     // name's own width and the model column — whose values are the longest on
     // the row — absorbs the rest.
-    { label: translate("logs.source"), width: 118, maxWidth: 168, flex: true, value: (row) => row.source },
-    // One relay can host several dashboard logins, and only this column says
-    // whose usage a row is. It is drawn only when a row actually carries one:
-    // a station with one login would otherwise stand empty down the table.
+    // This tab reads exactly one relay account, so every row names the same
+    // station and the same login — the very pair the dropdown above the table
+    // already states.  Two columns repeating it cost 214 pt of a narrow window,
+    // which is what pushed the duration column outside the frame.  They are
+    // drawn when a page actually mixes them; otherwise the model, the token
+    // pair, and the duration are what the row is for.
+    ...(hasSource ? [{ label: translate("logs.source"), width: 118, maxWidth: 168, flex: true, value: (row: RenderedLogRecord) => row.source }] : []),
     ...(hasAccount ? [{ label: translate("logs.account"), width: 96, value: (row: RenderedLogRecord) => row.account }] : []),
-    { label: translate("logs.type"), width: 82, value: (row) => row.family },
+    // The control plane is the station's own property, not the row's: every row
+    // of a Sub2API relay says "Sub2API". The dropdown already names it, so the
+    // column earns its 82 pt only when a page actually mixes families.
+    ...(hasFamily ? [{ label: translate("logs.type"), width: 82, value: (row: RenderedLogRecord) => row.family }] : []),
     { label: translate("providers.publicModel"), width: 164, flex: true, value: (row) => row.model },
+    // The grouping is what decided this request's rate, so it is a fact about
+    // the row.  It shares the row with the model rather than hiding in the
+    // double-click detail, and it is drawn only when the relay reports one.
+    ...(hasGroup ? [{ label: translate("logs.group"), width: 96, value: (row: RenderedLogRecord) => row.group }] : []),
     // A credential-scoped usage summary states no per-request outcome, so the
     // column is drawn only when a row actually carries one instead of
     // standing empty across the whole table.
     ...(hasStatus ? [{ ...status, width: 64 }] : []),
-    { label: translate("logs.tokenPair"), width: 128, value: (row) => row.tokens },
+    // A five-digit pair (`34113.8 / 88.5`) measures 85.7 pt in the table's
+    // 13 pt face, so 108 is the narrowest width that shows both counts with
+    // the cell's 8 pt padding. It was 128 before, which the fixed columns could
+    // not pay for, and the clipped result was an ellipsis after `32642.1 /`.
+    // The header is the widest thing in this column: `令牌 输入 / 输出(k)`
+    // measures 111.3 pt in the header's semibold 13 pt face — wider than the
+    // `34113.8 / 88.5` a row carries — so the width is that plus the cell's
+    // 8 pt padding on each side, with room for the sort indicator AppKit draws
+    // in the header.
+    { label: translate("logs.tokenPair"), width: 140, value: (row) => row.tokens },
     { label: translate("logs.duration"), width: 62, value: (row) => row.duration },
   ];
   return [
@@ -9941,52 +10166,87 @@ function logColumns(tab: LogTab, translate: Translate, hasStatus = true, hasAcco
   ];
 }
 
+/**
+ * The narrowest a column may be drawn, whatever the window.
+ *
+ * A flexible data column keeps a minimum that still shows its header and a
+ * value; the detail column keeps the shared text floor.  Below this the column
+ * is not narrow, it is gone, and the table's horizontal scroller is the honest
+ * answer for a window that cannot fit the set.
+ */
+function columnFloor(column: LogColumn): number {
+  if (column.detailFlex) return LOG_DETAIL_COLUMN_FLOOR;
+  // Header text plus the cell's own padding is what stays legible; a data
+  // column never needs less than that to remain identifiable.
+  return Math.max(72, Math.min(column.width, column.maxWidth ?? column.width));
+}
+
 function fitLogColumns(columns: LogColumn[], availableWidth: number): LogColumn[] {
   if (!Number.isFinite(availableWidth) || availableWidth <= 0) return columns;
+  // The table draws a 10 pt inset on each side of the content it is given, so
+  // the columns have to fit inside what is left.
   const usableWidth = Math.max(0, availableWidth - 20);
+  const declaredWidth = columns.reduce((total, column) => total + column.width, 0);
   const flexible = columns.filter((column) => column.flex);
   if (flexible.length === 0) return columns;
-  const fixedWidth = columns.reduce((total, column) => (column.flex ? total : total + column.width), 0);
-  // Fixed columns keep their content-sized widths so timestamps, model names,
-  // provider, key name, status, and the sent/received token pair stay fully
-  // visible. The flexible column takes the remaining width, and anything that
-  // still does not fit stays reachable through the table's horizontal scroller
-  // instead of being squeezed into an ellipsis.
+
+  // Step one: give the flexible columns what the fixed ones leave over.
   //
-  // The flex floor belongs to the detail column, whose whole job is to hold a
-  // long message. A tab whose flexible column is a *data* column declares its
-  // own width as the floor, so it shrinks to that instead of to a text-height
-  // that would push the table past its frame.
-  //
-  // A data column also keeps its declared width as a *ceiling*: the leftover
-  // space goes to the detail column, which is the one whose content grows, so
-  // a short value like a relay's name does not stretch across the window.
-  // Several flexible columns share the same leftover space, so it is divided
-  // once between them: giving each of them `remaining` would hand the table
-  // more width than it has and put the scroller back. A data column also stops
-  // at its own ceiling, and whatever it does not take is left with the detail
-  // column, which is the one whose content actually grows.
-  const remaining = usableWidth - fixedWidth;
-  let pool = remaining;
+  // A data column keeps its declared width as both floor and ceiling — a short
+  // relay name must not stretch across the window, and the model column, which
+  // holds the longest values, absorbs the rest up to its own ceiling. Only the
+  // detail column grows without a ceiling, because its content is the message.
+  const fixedWidth = declaredWidth - flexible.reduce((total, column) => total + column.width, 0);
+  let pool = usableWidth - fixedWidth;
   const widened = columns.map((column) => {
-    if (!column.flex) return { ...column, width: column.width };
+    if (!column.flex) return { ...column };
     const ceiling = column.detailFlex ? Number.POSITIVE_INFINITY : column.maxWidth ?? column.width;
-    const floor = column.detailFlex ? LOG_DETAIL_COLUMN_FLOOR : column.width;
-    const width = Math.max(floor, Math.min(ceiling, pool));
+    const width = Math.max(column.width, Math.min(ceiling, pool));
     pool -= width;
     return { ...column, width };
   });
+
   const widenedFlexible = widened.filter((column) => column.flex ?? false);
   const detail = widenedFlexible.find((column) => column.detailFlex);
   if (detail && pool > 0) {
     // Unclaimed space is the detail column's, so a row's message — not a short
     // relay name — is what fills a wide window.
     detail.width += pool;
-  } else if (pool < 0 && widenedFlexible.length > 0) {
-    // The frame is narrower than the set needs: the flexible columns give back
-    // what they can before the table resorts to its own horizontal scroller.
-    const give = Math.min(-pool, widenedFlexible.reduce((total, column) => total + column.width, 0));
-    widenedFlexible[0].width = Math.max(0, widenedFlexible[0].width - give);
+    return widened;
+  }
+  if (pool > 0 && widenedFlexible.length > 0) {
+    // No detail column on this tab, so the leftover width belongs to the data
+    // columns rather than to the empty strip beside them.  Each one grows up to
+    // its own ceiling; whatever is still unclaimed stays empty, which is what a
+    // column that declared a ceiling asked for.
+    const growable = widenedFlexible.filter(
+      (column) => column.maxWidth === undefined || column.width < column.maxWidth,
+    );
+    if (growable.length > 0) {
+      // The widest-content column absorbs it: the model names are what grow.
+      const target = growable[growable.length - 1];
+      const ceiling = target.maxWidth ?? Number.POSITIVE_INFINITY;
+      target.width += Math.max(0, Math.min(pool, ceiling - target.width));
+    }
+    return widened;
+  }
+  if (pool >= 0) return widened;
+
+  // Step two: the frame is narrower than the set needs.  Every column gives
+  // back space, not only the flexible ones: shrinking just the flexible column
+  // left the fixed columns over the edge, so the token pair was ellipsized and
+  // the duration column sat outside the window with no way to see it.  Columns
+  // shrink toward their own floor and stop there — a column taken to zero reads
+  // as a missing field, and the table's own horizontal scroller is the honest
+  // affordance for a window that genuinely cannot fit the set.
+  let deficit = -pool;
+  const shrinkOrder = [...widened].sort((left, right) => right.width - left.width);
+  for (const column of shrinkOrder) {
+    if (deficit <= 0) break;
+    const floor = columnFloor(column);
+    const reduction = Math.min(deficit, Math.max(0, column.width - floor));
+    column.width -= reduction;
+    deficit -= reduction;
   }
   return widened;
 }
@@ -10202,7 +10462,7 @@ function RouteTraceWorkspace({ requests, selectedKey, native, translate, onSelec
   </View>;
 }
 
-function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, requestedTab, requestedTabKey = 0, onStatus }: { snapshot?: CoreSnapshot; ipc: IpcClient; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; requestedTab?: typeof LOG_TABS[number]; requestedTabKey?: number; onStatus?: (status?: string) => void }): React.JSX.Element {
+function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, requestedTab, requestedTabKey = 0, onStatus, onStatusBar }: { snapshot?: CoreSnapshot; ipc: IpcClient; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; requestedTab?: typeof LOG_TABS[number]; requestedTabKey?: number; onStatus?: (status?: string) => void; onStatusBar?: (controls: React.ReactNode) => void }): React.JSX.Element {
   type PauseIntent = { tab: typeof LOG_TABS[number]; paused: boolean; token: number };
   type ClearIntent = { tab: typeof LOG_TABS[number]; token: number };
   const [selected, setSelected] = useState<typeof LOG_TABS[number]>(() => requestedTab ?? "requests");
@@ -10223,6 +10483,10 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
   const [onlineUsagePendingSourceId, setOnlineUsagePendingSourceId] = useState("");
   const onlineUsagePagePending = useRef(false);
   const [onlineUsagePagePendingTab, setOnlineUsagePagePendingTab] = useState<typeof LOG_TABS[number] | undefined>();
+  // The page number the reader is typing.  It follows the page Core answered
+  // whenever a page turn completes, so the field never states a page the table
+  // is not showing.
+  const [onlineUsagePageDraft, setOnlineUsagePageDraft] = useState("1");
   // The filter field owns its text until Core confirms it.  A poll that still
   // carries the previous filter lands between a keystroke and the 250 ms
   // dispatch, and syncing the field from it deleted the character the user had
@@ -10321,7 +10585,18 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
         selected,
         translate,
         selected !== "online-usage" || rows.some((row) => Boolean(row.status)),
-        selected === "online-usage" && rows.some((row) => Boolean(row.account)),
+        selected === "online-usage" && hasDistinct(rows, (row) => row.account),
+        // A column whose every cell repeats the same value states nothing the
+        // reader does not already know from the relay dropdown, and 82 pt of a
+        // narrow window is what pushes the duration column out of view.
+        rows.length > 1 && new Set(rows.map((row) => row.family)).size > 1,
+        // A column is worth its width only when this page needs it to tell two
+        // rows apart.  The relay is chosen by a dropdown, so its name and its
+        // login are constant until a reader answers for more than one.
+        hasDistinct(rows, (row) => row.source),
+        // The relay's grouping is a per-row fact (it prices the request), so it
+        // is drawn whenever the rows carry one.
+        rows.some((row) => Boolean(row.group)),
       ),
       tableWidth,
     ),
@@ -10421,10 +10696,13 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
   // Rows the relay reported beyond the page on screen. Reading further is a
   // view over rows already fetched, so it never re-asks the relay.
   const onlineUsageRemaining = selected === "online-usage" ? numberValue(active?.remaining) : 0;
-  const onlineUsageTotal = selected === "online-usage"
-    ? numberValue(active?.total) || lineCount + onlineUsageRemaining
-    : 0;
-  const onlineUsageNext = Math.min(onlineUsageRemaining, ONLINE_USAGE_PAGE_ROWS);
+  const onlineUsageTotal = selected === "online-usage" ? numberValue(active?.total) : 0;
+  // How many rows a page holds is a view choice, so Core states the one it used
+  // and the pane offers the same choices back.
+  const onlineUsagePageRows = selected === "online-usage"
+    ? Math.max(1, numberValue(active?.page_rows) || ONLINE_USAGE_PAGE_ROWS)
+    : ONLINE_USAGE_PAGE_ROWS;
+  const onlineUsageNext = Math.min(onlineUsageRemaining, onlineUsagePageRows);
   const onlineUsageLoadedPage = Math.max(1, numberValue(active?.page));
   const onlineUsagePageCount = Math.max(onlineUsageLoadedPage, numberValue(active?.page_count));
   // What 上一页 actually returns is the page before this one, and only the last
@@ -10434,18 +10712,20 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
   // 300 rows it would never load (`disabled` there), which is what read as a
   // wrong count beside a six-row list.
   const onlineUsagePrevious = onlineUsageLoadedPage > 1
-    ? Math.min(ONLINE_USAGE_PAGE_ROWS, onlineUsageTotal - (onlineUsageLoadedPage - 2) * ONLINE_USAGE_PAGE_ROWS)
+    ? Math.min(onlineUsagePageRows, onlineUsageTotal - (onlineUsageLoadedPage - 2) * onlineUsagePageRows)
     : 0;
+  // The strip states the row count and the pause state.  It does not repeat the
+  // page: the inline pager below states it once, in its own box, and a second
+  // copy is what made the strip and the pager disagree while a page was loading.
+  // The window strip is the only bar this tab has: the page controls sit at its
+  // right end, so the row count they page through belongs on its left, exactly
+  // where every other route states its status.
   const statusLine = [
-    selected === "online-usage" && lineCount > 0
-      ? translate("common.lines", { count: lineCount })
-      : translate(active && lineCount >= active.limit ? "logs.latestLinesAtLimit" : "common.lines", { count: lineCount }),
-    selected === "online-usage" && lineCount > 0
-      ? translate("logs.onlineUsagePage", { page: onlineUsageLoadedPage, pages: onlineUsagePageCount })
-      : "",
+    translate(active && lineCount >= active.limit ? "logs.latestLinesAtLimit" : "common.lines", { count: lineCount }),
     paused ? translate("logs.paused") : "",
   ].filter(Boolean).join(" | ");
   useEffect(() => { onStatus?.(statusLine); }, [onStatus, statusLine]);
+
   // The online-usage tab reads through Core's own log-format reader: the
   // dropdown picks which configured relay to read, and the rows land in the
   // table this window already draws. Opening the station's dashboard in a
@@ -10584,25 +10864,36 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
   // closure or re-subscribing the poll whenever the callback identity changes.
   const refreshOnlineUsageRef = useRef(refreshOnlineUsage);
   refreshOnlineUsageRef.current = refreshOnlineUsage;
-  const moveOnlineUsagePage = (action: "logs.load_more" | "logs.previous_page"): void => {
+  const moveOnlineUsagePage = (
+    action:
+      | "logs.load_more"
+      | "logs.previous_page"
+      | "logs.first_page"
+      | "logs.last_page"
+      | "logs.goto_page"
+      | "logs.set_page_rows",
+    payload: Record<string, number> = {},
+  ): void => {
     const tab = "online-usage" as const;
     if (onlineUsagePagePending.current) return;
     onlineUsageLoadingTabRef.current = tab;
     onlineUsagePagePending.current = true;
     setOnlineUsagePagePendingTab(tab);
     setOnlineUsageLoadingTab(tab);
-    // A page in flight must not queue another. Both directions move over rows
-    // Core already fetched, so neither dispatches a relay refresh.
-    void dispatch(action, { tab }, "logs").then(async () => {
+    // A page turn in flight must not queue another.  Each of these reads one
+    // page from the relay, because the relay owns the history: the older
+    // window-in-memory model could only ever reach the pages one refresh had
+    // already fetched, which is why a large account had rows past the first
+    // page it could not get to.
+    void dispatch(action, { tab, ...payload }, "logs").then(async () => {
       try {
         const result = await ipc.logs(tab);
         if (selectedTabRef.current !== tab) return;
         viewRevisionRef.current = result.revision;
         if (result.log) {
           setActiveState({ tab, log: result.log });
-          scrollOnlineUsage(result.log.source_id ?? "", action === "logs.load_more"
-            ? Math.max(0, result.log.line_count - 1)
-            : Math.max(0, result.log.line_count - ONLINE_USAGE_PAGE_ROWS));
+          // A new page starts at its own first row.
+          scrollOnlineUsage(result.log.source_id ?? "", 0);
         }
       } catch {
         // The tab's own poll reconciles the confirmed Core view.
@@ -10618,6 +10909,10 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
   };
   const loadMoreOnlineUsage = (): void => moveOnlineUsagePage("logs.load_more");
   const previousOnlineUsagePage = (): void => moveOnlineUsagePage("logs.previous_page");
+  const firstOnlineUsagePage = (): void => moveOnlineUsagePage("logs.first_page");
+  const lastOnlineUsagePage = (): void => moveOnlineUsagePage("logs.last_page");
+  const gotoOnlineUsagePage = (page: number): void => moveOnlineUsagePage("logs.goto_page", { page });
+  const setOnlineUsagePageRows = (rows: number): void => moveOnlineUsagePage("logs.set_page_rows", { rows_per_page: rows });
   const setOnlineUsageTime = useCallback(async (range: OnlineUsageRange): Promise<void> => {
     const tab = "online-usage" as const;
     const staged = await ipc.dispatch({ domain: "logs", type: "logs.set_time_range", payload: { tab, ...range } });
@@ -10688,19 +10983,53 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
       until: option === "all" ? undefined : now,
     });
   };
+  useEffect(() => {
+    // The field always names the page the table is showing, including after a
+    // relay switch, a range change, or a different page size.
+    setOnlineUsagePageDraft(String(onlineUsageLoadedPage));
+  }, [onlineUsageLoadedPage]);
   const onlineUsageLoadingMore = onlineUsageLoading && !onlineUsagePendingSourceId;
   const onlineUsageLoadingSource = onlineUsageLoadingTabRef.current === selected
     ? onlineUsagePendingLabel
     : "";
-  const onlineUsagePagerStatus = onlineUsageTimePending
-    ? translate("logs.onlineUsageFiltering")
-    : onlineUsageLoadingSource
-    ? translate("logs.onlineUsageLoading") + (onlineUsageLoadingSource ? ` ${onlineUsageLoadingSource}` : "")
-    : translate("logs.onlineUsagePage", { page: onlineUsageLoadedPage, pages: onlineUsagePageCount });
   const onlineUsagePageBusy = selected === "online-usage" && onlineUsagePagePendingTab === selected;
-  const onlineUsagePageStatus = onlineUsagePageBusy
-    ? translate("logs.onlineUsageLoadingMore")
-    : onlineUsagePagerStatus;
+  // Every pager control waits for the page in flight: a second request while
+  // one is answered would land on a page nobody asked for.
+  const onlineUsagePagerDisabled = onlineUsageLoading || onlineUsageTimePending || onlineUsagePageBusy;
+  const onlineUsagePageSizeLabels = ONLINE_USAGE_PAGE_SIZE_VALUES.map((rows) => translate("logs.onlineUsagePageRows", { count: rows }));
+  const submitOnlineUsagePage = (): void => {
+    const requested = Number(onlineUsagePageDraft.trim());
+    if (!Number.isFinite(requested) || requested < 1) {
+      // A field that cannot be parsed states the page that is actually shown.
+      setOnlineUsagePageDraft(String(onlineUsageLoadedPage));
+      return;
+    }
+    const target = Math.min(onlineUsagePageCount, Math.max(1, Math.round(requested)));
+    setOnlineUsagePageDraft(String(target));
+    if (target !== onlineUsageLoadedPage) gotoOnlineUsagePage(target);
+  };
+  // The pager is part of the window's status strip: it reports and changes the
+  // page the strip's own count describes, so it is published there rather than
+  // drawn as a second bar over the table.
+  const usageStatusControls = selected === "online-usage" ? <View style={styles.logStripControls}>
+    <NativeButton title={translate("logs.onlineUsageFirst")} accessibilityLabel={translate("logs.onlineUsageFirst")} compact disabled={onlineUsagePagerDisabled || onlineUsageLoadedPage <= 1} onPress={firstOnlineUsagePage} titleWidth="tight" />
+    <NativeButton title={translate("logs.onlineUsagePreviousShort")} accessibilityLabel={translate("logs.onlineUsagePrevious", { count: onlineUsagePrevious })} compact disabled={onlineUsagePagerDisabled || onlineUsageLoadedPage <= 1} onPress={previousOnlineUsagePage} titleWidth="tight" />
+    <View style={styles.logPagerGoto}>
+      <Text style={styles.logPagerLabel}>{translate("logs.onlineUsageGotoLabel")}</Text>
+      <NativeTextField value={onlineUsagePageDraft} onChangeText={setOnlineUsagePageDraft} onSubmitEditing={submitOnlineUsagePage} onBlur={submitOnlineUsagePage} editable={!onlineUsagePagerDisabled && onlineUsagePageCount > 1} style={styles.logPagerPageInput} accessibilityLabel={translate("logs.onlineUsageGotoLabel")} />
+      <Text style={styles.logPagerLabel}>{`/ ${onlineUsagePageCount}`}</Text>
+    </View>
+    <NativeButton title={translate("logs.onlineUsageNextShort")} accessibilityLabel={translate("logs.onlineUsageNext", { count: onlineUsageNext })} compact busy={onlineUsageLoadingMore} disabled={onlineUsagePagerDisabled || onlineUsageRemaining <= 0} onPress={loadMoreOnlineUsage} titleWidth="tight" />
+    <NativeButton title={translate("logs.onlineUsageLast")} accessibilityLabel={translate("logs.onlineUsageLast")} compact disabled={onlineUsagePagerDisabled || onlineUsageLoadedPage >= onlineUsagePageCount} onPress={lastOnlineUsagePage} titleWidth="tight" />
+    <NativePicker overlayLayer compact labels={onlineUsagePageSizeLabels} selectedValue={translate("logs.onlineUsagePageRows", { count: onlineUsagePageRows })} disabled={onlineUsagePagerDisabled} onChange={({ nativeEvent }) => {
+      const rows = ONLINE_USAGE_PAGE_SIZE_VALUES[nativeEvent.index];
+      if (rows !== undefined && rows !== onlineUsagePageRows) setOnlineUsagePageRows(rows);
+    }} style={styles.logPagerPageSize} />
+  </View> : null;
+  useEffect(() => {
+    onStatusBar?.(usageStatusControls);
+    return () => onStatusBar?.(null);
+  }, [onStatusBar, usageStatusControls]);
   const editOnlineUsageRange = (): void => {
     const prompt = native.textPrompt;
     if (!prompt) {
@@ -10752,7 +11081,11 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
           one read, the second one floating above the picker. */}
       <View style={styles.logActionsRow}>{selected === "online-usage" ? <NativePicker overlayLayer labels={onlineUsageSourceLabels} selectedValue={onlineUsagePendingLabel || (onlineUsageSourceIndex >= 0 ? onlineUsageSourceLabels[onlineUsageSourceIndex] ?? "" : "")} disabled={onlineUsageSourceLabels.length === 0} onChange={({ nativeEvent }) => { const source = onlineUsageSourceValues[nativeEvent.index]; if (source !== undefined) refreshOnlineUsage(source, onlineUsageSourceLabels[nativeEvent.index] ?? ""); }} style={styles.onlineUsageSourcePicker} /> : null}{selected === "recovery" ? <NativeButton title={translate("logs.clearRecoveryCooldown")} accessibilityLabel={translate("logs.clearRecoveryCooldown")} compact busy={cooldownClearPending} disabled={busy && !cooldownClearPending} onPress={clearCooldowns} style={styles.clearCooldownButton} /> : null}<IconButton label="" symbol={paused ? "play" : "pause"} title={paused ? translate("common.resume") : translate("common.pause")} disabled={busy} onPress={togglePaused} /><IconButton label="" symbol="trash" title={translate("common.clearView")} disabled={busy} onPress={clearLogs} /></View>
     </View>
-    {selected === "online-usage" ? <View style={styles.logRangeMessageSlot}>
+    {/* The range message is the only thing that makes this slot exist: an empty
+        row of its own height sat between the toolbar and the table for every
+        online-usage view, which is the blank band the pane showed instead of
+        its content. */}
+    {selected === "online-usage" && onlineUsageRangeError ? <View style={styles.logRangeMessageSlot}>
       <Text numberOfLines={1} style={styles.logRangeError} accessibilityLiveRegion="polite">{onlineUsageRangeError}</Text>
       {onlineUsageTimeOption === "custom" && onlineUsageRangeError === translate("logs.onlineUsageRangeInvalid") ? <Text numberOfLines={1} style={styles.logRangeErrorHint}>{translate("logs.onlineUsageRangeHint")}</Text> : null}
     </View> : null}
@@ -10774,11 +11107,9 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
           language: usageRow ? "text" : "json",
           html: readOnlyCodeEditorHtml(editorMenuLabels(translate)),
         });
-      }} scrollToRow={selected === "online-usage" && onlineUsageScrollSourceRef.current === active?.source_id ? onlineUsageScrollToRow : -1} style={styles.logTable} /></View>{selected === "online-usage" ? <View style={styles.logPager}>
-        <NativeButton title={translate("logs.onlineUsagePrevious", { count: onlineUsagePrevious })} accessibilityLabel={translate("logs.onlineUsagePrevious", { count: onlineUsagePrevious })} compact disabled={onlineUsageLoadedPage <= 1 || onlineUsageLoading || onlineUsageTimePending} onPress={previousOnlineUsagePage} titleWidth="tight" />
-        <Text accessibilityLiveRegion="polite" style={styles.logPagerStatus}>{onlineUsagePagerStatus}</Text>
-        <NativeButton title={onlineUsageLoadingMore ? translate("logs.onlineUsageLoadingMore") : translate("logs.onlineUsageNext", { count: onlineUsageNext })} accessibilityLabel={translate("logs.onlineUsageNext", { count: onlineUsageNext })} compact busy={onlineUsageLoadingMore} disabled={onlineUsageLoading || onlineUsageTimePending || onlineUsageRemaining <= 0} onPress={loadMoreOnlineUsage} titleWidth="tight" />
-      </View> : null}</View>
+      }} scrollToRow={selected === "online-usage" && onlineUsageScrollSourceRef.current === active?.source_id ? onlineUsageScrollToRow : -1} style={styles.logTable} /></View>
+
+      </View>
       : <View style={styles.logEmptySurface}>
         {onlineUsagePrompt && !onlineUsageLoading && !onlineUsagePendingLabel && !onlineUsageTimePending
           ? <Text style={styles.logEmptyText}>{translate("logs.onlineUsageSelectSourceHint")}</Text>
@@ -11677,7 +12008,13 @@ const styles = StyleSheet.create({
   menuBarHost: { flex: 1 }, error: { margin: 20, color: systemColors.red, fontSize: UI_FONT_SIZE },
   windowSurface: { flex: 1, position: "relative", backgroundColor: systemColors.window }, windowContent: { flexGrow: 1, paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, gap: 8 }, windowContentFixed: { flex: 1, minHeight: 0 }, fileEditorRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providersContent: { paddingBottom: 6, gap: 6 }, providerWizardRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providerWizardSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, logsContent: { paddingHorizontal: 12, paddingTop: 12, paddingBottom: 0 }, runtimeContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, dataManagementContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, assistantSettingsContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, windowTitleBlock: { paddingHorizontal: 20, paddingTop: 12, paddingBottom: 3, gap: 3 }, windowTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
   // Settings window: a native source-list sidebar next to the active pane.
-  settingsShell: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row" }, settingsSidebar: { width: 200, flexShrink: 0, minHeight: 0 }, settingsSidebarHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 16, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarAppIcon: { width: SETTINGS_HEADER_CONTENT_HEIGHT, height: SETTINGS_HEADER_CONTENT_HEIGHT, borderRadius: 4 }, settingsSidebarTitle: { color: systemColors.label, fontSize: SOURCE_LIST_FONT_SIZE, fontWeight: "600" }, settingsSidebarSpacer: { flex: 1, minHeight: 8 }, settingsSidebarList: { flex: 1, minHeight: 0 }, settingsRail: { width: SETTINGS_RAIL_WIDTH, flexShrink: 0, minHeight: 0, paddingTop: 6, overflow: "hidden" }, settingsRailList: { flex: 1, minHeight: 0 }, settingsRailDivider: { position: "absolute", top: 0, bottom: 0, right: 0, width: 1, backgroundColor: systemColors.separator }, settingsRailDetail: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsRailDetailHeader: { minHeight: 50, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 14, paddingVertical: 8, backgroundColor: systemColors.window }, settingsRailDetailTitleBlock: { flex: 1, minWidth: 0, gap: 2 }, settingsRailDetailActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, settingsRailDetailTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, settingsRailDetailHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16 }, settingsDetail: { minWidth: 0, flex: 1, paddingTop: SETTINGS_TITLEBAR_INSET }, settingsDetailBody: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsDetailBodyBare: { backgroundColor: "transparent" }, settingsDetailPane: { flex: 1, minWidth: 0 }, settingsPaneHeader: { flexShrink: 0, paddingHorizontal: 20, paddingTop: 10, paddingBottom: 8 }, settingsPaneTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600", lineHeight: SETTINGS_HEADER_CONTENT_HEIGHT },  routeStatusBar: { minHeight: 24, flexShrink: 0, justifyContent: "center", paddingHorizontal: 16, paddingVertical: 4, borderTopWidth: 1, borderTopColor: systemColors.separator }, routeStatusText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE },
+  settingsShell: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row" }, settingsSidebar: { width: 200, flexShrink: 0, minHeight: 0 }, settingsSidebarHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 16, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarAppIcon: { width: SETTINGS_HEADER_CONTENT_HEIGHT, height: SETTINGS_HEADER_CONTENT_HEIGHT, borderRadius: 4 }, settingsSidebarTitle: { color: systemColors.label, fontSize: SOURCE_LIST_FONT_SIZE, fontWeight: "600" }, settingsSidebarSpacer: { flex: 1, minHeight: 8 }, settingsSidebarList: { flex: 1, minHeight: 0 }, settingsRail: { width: SETTINGS_RAIL_WIDTH, flexShrink: 0, minHeight: 0, paddingTop: 6, overflow: "hidden" }, settingsRailList: { flex: 1, minHeight: 0 }, settingsRailDivider: { position: "absolute", top: 0, bottom: 0, right: 0, width: 1, backgroundColor: systemColors.separator }, settingsRailDetail: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsRailDetailHeader: { minHeight: 50, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 14, paddingVertical: 8, backgroundColor: systemColors.window }, settingsRailDetailTitleBlock: { flex: 1, minWidth: 0, gap: 2 }, settingsRailDetailActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, settingsRailDetailTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, settingsRailDetailHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16 }, settingsDetail: { minWidth: 0, flex: 1, paddingTop: SETTINGS_TITLEBAR_INSET }, settingsDetailBody: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsDetailBodyBare: { backgroundColor: "transparent" }, settingsDetailPane: { flex: 1, minWidth: 0 }, settingsPaneHeader: { flexShrink: 0, paddingHorizontal: 20, paddingTop: 10, paddingBottom: 8 }, settingsPaneTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600", lineHeight: SETTINGS_HEADER_CONTENT_HEIGHT },  // The window's one status strip.  A route may place its own controls at the
+  // right end of this row, so a pager and the status it changes read as one bar.
+  routeStatusBar: { minHeight: 24, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, justifyContent: "space-between", paddingHorizontal: 16, paddingVertical: 2, borderTopWidth: 1, borderTopColor: systemColors.separator },
+  // The usage pager is the window's status bar on this tab: the row count stays
+  // on the left where every other route states its status, and the page controls
+  // sit on the right of that same row rather than in a strip above the table.
+  usageStatusBar: { minHeight: 24, flexShrink: 0, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8, paddingHorizontal: 16, paddingVertical: 2, borderTopWidth: 1, borderTopColor: systemColors.separator }, routeStatusText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE },
   generalScroll: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, generalContent: { paddingTop: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, paddingBottom: 16, gap: 18 }, generalSection: { gap: 4 }, generalSectionTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, generalRow: { ...SETTINGS_FIELD_ROW_INDENTED }, generalRowLabel: { ...SETTINGS_FIELD_LABEL }, generalRowValue: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, generalToggle: { ...SETTINGS_FIELD_SWITCH_SLOT }, generalHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }, generalHelpText: { ...SETTINGS_FIELD_HELP_TEXT }, generalServiceAction: { minWidth: 96 }, providerToolbar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardToolbarButton: { minWidth: 104 }, toolbarSpacer: { flex: 1 }, windowTabsRow: { flex: 1, minWidth: 0, height: 28, flexDirection: "row", alignItems: "center", gap: 8 }, windowTabsToolbarRow: { flex: 1, minWidth: 0, width: "100%", height: 24, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 6, overflow: "hidden" }, windowTabs: { width: 224, height: 24 }, windowTabsWithActions: { flexShrink: 1 }, windowTabsActions: { flex: 1, minWidth: 0, maxWidth: 400, marginLeft: "auto", flexShrink: 0 },
   providerWizardSetupContent: { flex: 1, minHeight: 0, justifyContent: "flex-start", alignItems: "center", paddingHorizontal: 24, paddingTop: 18, paddingBottom: 12 }, providerWizardSetupSurface: { width: "100%", maxWidth: 520, minWidth: 0, gap: 12 }, providerWizardSetupSurfaceModel: { flex: 1, minHeight: 0 }, providerWizardSignInPanel: { width: "100%", minHeight: 160, justifyContent: "center", gap: 8, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 7, backgroundColor: systemColors.control, paddingHorizontal: 16, paddingVertical: 18 }, providerWizardAuthRow: { minHeight: 30, flexDirection: "row", alignItems: "center", gap: 8 }, providerWizardAuthStatus: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
   providerMiddlePane: { flex: 1, minWidth: 0, gap: 6 },
@@ -11757,12 +12094,25 @@ inspectorProbeFinding: { flexShrink: 1, minWidth: 0, cursor: "pointer" }, inspec
   logFilterInput: { flex: 1, minWidth: 0, height: 24 },
   logsTabs: { width: undefined, minWidth: 389, height: 24 },
   logTabControl: { flex: 1, width: undefined, minWidth: 0, height: 28 },
-  logTablesLayout: { flex: 1, minHeight: 0, minWidth: 0 },
+  // The table and the status bar are one column: the frame takes what is left
+  // after the bar, so the pager never floats over the last row.
+  logTablesLayout: { flex: 1, minHeight: 0, minWidth: 0, flexDirection: "column" },
   logTableFrame: { flex: 1, minHeight: 0, minWidth: 0 },
   logTableScroll: { flex: 1, minHeight: 0, minWidth: 0 },
   logTable: { flex: 1, minHeight: 0 },
-  logPager: { minHeight: 24, flexShrink: 0, flexDirection: "row", alignItems: "center", justifyContent: "flex-end", gap: 8, paddingHorizontal: 2 },
-  logPagerStatus: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textAlign: "center" },
+  // The pager carries seven controls plus its own status, so it wraps instead
+  // of overlapping when the window is narrow: a bar whose 末页 button lands on
+  // top of the page-size picker is unusable, and a second row is not.
+  // The strip under the table holds the view's own state on the left and the
+  // pager on the right, so a page change is reported where the row count is.
+  logStrip: { flexShrink: 0 },
+  logStripText: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE },
+  logStripControls: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 },
+  logPagerStatus: { flexShrink: 1, minWidth: 96, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textAlign: "center" },
+  logPagerGoto: { flexDirection: "row", alignItems: "center", gap: 4, flexShrink: 0 },
+  logPagerLabel: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
+  logPagerPageInput: { width: 52, flexShrink: 0 },
+  logPagerPageSize: { minWidth: 108, flexShrink: 0 },
   logEmptySurface: { flex: 1, minHeight: 0, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground },
   logEmptyText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textAlign: "center", paddingHorizontal: 20 },
   logLoadingText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textAlign: "center" },

@@ -286,6 +286,12 @@ async def _responses_chat_bridge_text_stream_from_chat_stream(
             bridge_kwargs
         )
     )
+    # One diagnostic per relayed stream: a route that streams thinking while the
+    # client asked for a summary must never end up with an empty block, and the
+    # distinction between "the route sent nothing" and "this relay dropped it"
+    # is only visible here.
+    saw_reasoning = False
+    dropped_reasoning = False
     text_parts: list[str] = []
     reasoning_parts: list[str] = []
     usage = None
@@ -381,6 +387,10 @@ async def _responses_chat_bridge_text_stream_from_chat_stream(
         if chunk_usage is not None:
             usage = chunk_usage
         reasoning_delta = _chat_stream_delta_reasoning(chunk)
+        if reasoning_delta:
+            saw_reasoning = True
+            if not deliver_reasoning:
+                dropped_reasoning = True
         delta = _chat_stream_delta_text(chunk)
         # Reasoning frames only ever precede the answer, and the item order the
         # client reads is fixed once the message opens: a route that resumed
@@ -425,6 +435,12 @@ async def _responses_chat_bridge_text_stream_from_chat_stream(
         message_index = 1 if reasoning_parts else 0
         for event in message_added_events(message_index):
             yield event
+    _web_search_native_module._trace_bridge_reasoning(
+        bridge_kwargs,
+        saw=saw_reasoning,
+        delivered=bool(reasoning_parts),
+        dropped=dropped_reasoning,
+    )
     text = "".join(text_parts)
     message = {
         "id": message_id,

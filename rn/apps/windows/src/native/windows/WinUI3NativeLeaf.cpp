@@ -24,6 +24,7 @@
 #include <winrt/Windows.ApplicationModel.h>
 #include <winrt/Windows.ApplicationModel.DataTransfer.h>
 #include <winrt/Windows.UI.h>
+#include <winrt/Windows.UI.Text.h>
 #include <winrt/Windows.System.h>
 #include <winrt/Windows.Data.Json.h>
 #include <winrt/Microsoft.UI.Interop.h>
@@ -680,7 +681,12 @@ std::optional<std::wstring> WinUI3NativeLeaf::ShowDecisionWindow(
     }
   });
   if (primary_button) primary_button.Focus(xaml::FocusState::Programmatic);
-  if (!RunOwnedModalWindow(dialog, window_handle_, {dialog_width, dialog_height}, finished)) return std::nullopt;
+  if (!RunOwnedModalWindow(
+          dialog,
+          window_handle_,
+          {static_cast<int32_t>(std::lround(dialog_width)), static_cast<int32_t>(std::lround(dialog_height))},
+          finished))
+    return std::nullopt;
   // A window closed by its own button (or its title bar) answers nothing: the
   // caller reads that as cancelled.
   if (answer.empty()) return std::nullopt;
@@ -1056,7 +1062,7 @@ std::optional<std::vector<std::wstring>> WinUI3NativeLeaf::ChooseModelsToAdd(
       controls::CheckBox item;
       item.FontSize(kUIFontSize);
       item.Content(winrt::box_value(state->models[index]));
-      item.IsChecked(state->selected[index]);
+      item.IsChecked(static_cast<bool>(state->selected[index]));
       item.HorizontalAlignment(xaml::HorizontalAlignment::Stretch);
       item.Click([weak_state, index, format_template, count_template, filtered_count_template, selected_count_template](auto const& sender, auto const&) {
         if (auto current = weak_state.lock(); current && index < current->selected.size()) {
@@ -1760,7 +1766,9 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
     std::thread([target, row, dispatcher, copy_button, show_copy_status, can_copy, failed_label, account_id] {
       std::optional<std::wstring> value;
       for (int attempt = 0; attempt < 3 && !value; ++attempt) {
-        value = CoreIPCBridge::Shared().ReadPlainTextSecret("relay_accounts", "api_key", winrt::to_string(*target));
+        if (auto raw = CoreIPCBridge::Shared().ReadPlainTextSecret("relay_accounts", "api_key", winrt::to_string(*target))) {
+          value = Utf8ToWide(*raw);
+        }
         if (value && value->empty()) value.reset();
         if (!value && attempt < 2) std::this_thread::sleep_for(std::chrono::milliseconds(250));
       }
@@ -1824,7 +1832,9 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
                  failed_label, show_copy_status] {
       std::optional<std::wstring> value;
       for (int attempt = 0; attempt < 3 && !value; ++attempt) {
-        value = CoreIPCBridge::Shared().ReadPlainTextSecret("relay_accounts", "api_key", winrt::to_string(*target));
+        if (auto raw = CoreIPCBridge::Shared().ReadPlainTextSecret("relay_accounts", "api_key", winrt::to_string(*target))) {
+          value = Utf8ToWide(*raw);
+        }
         if (value && value->empty()) value.reset();
         if (!value && attempt < 2) std::this_thread::sleep_for(std::chrono::milliseconds(250));
       }
@@ -2289,7 +2299,12 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
   models_scroll.Height(models_height);
   const double detail_height = 256.0 + models_height;
   const double window_height = 560 + std::max(0.0, detail_height - 300.0);
-  if (!RunOwnedModalWindow(dialog, window_handle_, {590, window_height}, finished)) return std::nullopt;
+  if (!RunOwnedModalWindow(
+          dialog,
+          window_handle_,
+          {590, static_cast<int32_t>(std::lround(window_height))},
+          finished))
+    return std::nullopt;
   return outcome;
 }
 

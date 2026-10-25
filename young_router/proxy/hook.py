@@ -185,6 +185,7 @@ class YoungRouterHook(CustomLogger):
             _responses_request_module._with_codex_compaction_controls,
             _responses_request_module._with_responses_native_extra_body,
             _responses_request_module._with_codex_compaction_headers,
+            _responses_request_module._with_streaming_plaintext_headers,
             _responses_request_module._with_stream_request_timeout,
             _responses_request_module._with_incoming_user_agent_header,
             _responses_request_module._with_owned_user_agent_header,
@@ -445,6 +446,17 @@ class YoungRouterHook(CustomLogger):
             ),
             request_data,
         ):
+            # A dropped chunk is not a frame.  ``deliver_chunk`` answers
+            # ``None`` for an event this client must not see (a reasoning
+            # summary it never asked for), and a ``None`` that reaches
+            # LiteLLM's serializer is written as the literal ``data: None`` --
+            # a body every Responses client rejects as malformed JSON, which is
+            # how a turn being recovered was cut by the frames meant to keep it
+            # alive.  Every delivery path below funnels through here, so the
+            # drop is applied once, at the wire boundary that would otherwise
+            # invent a payload for it.
+            if chunk is None:
+                continue
             yield chunk
 
     async def _post_call_streaming_iterator_pipeline(

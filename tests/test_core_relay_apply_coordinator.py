@@ -21,6 +21,9 @@ class RelayCoordinatorHTTP:
         self.deleted = False
         self.resource_name = "Primary"
         self.group_name = "default"
+        # The models the station's gateway answers for every key.  A test that
+        # needs a catalog to have moved sets this before its read.
+        self.model_names = ["model-a"]
         self.resource_group = "default"
         self.extra_group = ""
         self.created_ids = 0
@@ -31,7 +34,7 @@ class RelayCoordinatorHTTP:
         del origin, headers
         self.calls.append(("GET", path))
         if path == "/api/user/models":
-            return {"data": ["model-a"]}
+            return {"data": list(self.model_names)}
         if path == "/api/user/self/groups":
             # A station renames a group in place: the group it used to offer is
             # simply absent from this answer, while the key that served it still
@@ -359,6 +362,86 @@ class RelayApplyCoordinatorIntegrationTests(unittest.TestCase):
             self.assertEqual(relay_key["id"], model["provider_key_id"])
             self.assertEqual("relay_linked", model["catalog_mode"])
             self.assertNotIn("replace-secret", json.dumps(core.snapshot()))
+
+    def test_a_model_edit_resolves_only_the_key_it_touches(self) -> None:
+        """One route's stale upstream must not refuse an edit about another row.
+
+        A dependency-only Apply used to hand every linked ProviderKey in the
+        document to the relay domain.  Every one of those keys was then
+        materialized and judged against its own catalog, so a route the user was
+        not editing — a group that dropped an upstream model, a resource whose
+        key moved — reported its issue inside this edit's Apply and the whole
+        write answered ``relay_binding_failed``: the pane said the change the
+        user just made was not applied, and named nothing about it.  The edit's
+        own key is now the only one resolved, so the row being added is the row
+        being judged.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            http = RelayCoordinatorHTTP()
+            relay = RelayAccountsDomain(root, http_client=http)
+            providers = ProvidersModelsDomain(root / "config.yaml")
+            core = CoreStore(domains=[relay, providers])
+            core.dispatch(
+                {
+                    "domain": "relay_accounts",
+                    "type": "account.add",
+                    "payload": {"type": "newapi", "label": "Relay", "origin": "https://relay.example.test"},
+                }
+            )
+            account_id = relay.snapshot()["accounts"][0]["id"]
+            core.accept_relay_login(
+                account_id=account_id,
+                account_type="newapi",
+                label="Relay",
+                origin="https://relay.example.test",
+                username="person",
+                cookie="session=fixture",
+            )
+            core.refresh_relay_resources(account_id, revision=core.revision)
+            account = relay.snapshot()["accounts"][0]
+            resource_id = account["resources"][0]["id"]
+            core.import_relay_resources(account_id, [resource_id], revision=core.revision)
+            # The imported route is applied, so it belongs to the document this
+            # later edit starts from — that is what makes it "a row the user is
+            # not editing" rather than part of the same write.
+            core.apply(domain="providers_models", revision=core.revision)
+            provider = providers.snapshot()["providers"][0]
+            provider_id = provider["editor_id"]
+            slot = next(key for key in provider["key_states"] if key["source"]["kind"] == "relay")
+            self.assertEqual(1, len(provider["models"]))
+            # The station's catalog no longer names the route that was applied
+            # earlier: that row is stale, and it is not the row this edit is
+            # about.  What the edit adds is a model the catalog does serve.
+            http.model_names = ["model-b"]
+            calls_before_edit = len(http.calls)
+
+            core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "model.add",
+                    "payload": {
+                        "provider_id": provider_id,
+                        "model": {
+                            "name": "model-b",
+                            "upstream_model": "model-b",
+                            "enabled": True,
+                            "order": 0,
+                            "api_key_name": slot["name"],
+                            "provider_key_id": slot["id"],
+                        },
+                    },
+                },
+                expected_revision=core.revision,
+            )
+            applied = core.apply(domain="providers_models", revision=core.revision)
+            self.assertEqual("applied", applied["status"])
+            # The linked key this edit named already carries its credential, so
+            # the document answers for it: the Apply reads nothing from the
+            # station, and a station that is unreachable cannot fail it.
+            self.assertEqual(calls_before_edit, len(http.calls))
+            self.assertEqual([], providers.snapshot()["binding_issues"])
 
     def test_a_linked_route_the_relay_cannot_resolve_names_its_own_cause(self) -> None:
         """A binding the relay cannot resolve is not a bare rollback.

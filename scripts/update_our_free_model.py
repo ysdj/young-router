@@ -289,17 +289,16 @@ def _clone_tag(source_url: str, ref: str, destination: Path, timeout: int) -> No
     without a network round trip.
     """
 
+    command = ["git", "clone"]
+    # Local dumb-HTTP mirrors cannot advertise shallow-clone capabilities.
+    # Keep shallow clones for normal remotes, but allow an explicit full clone
+    # for an offline/local mirror used by the Windows VM build.
+    if os.environ.get("OUR_FREE_MODEL_SHALLOW_CLONE", "1").strip().lower() not in {"0", "false", "no"}:
+        command.extend(["--depth", "1"])
+    clone_url = os.environ.get("OUR_FREE_MODEL_CLONE_URL", "").strip() or source_url
+    command.extend(["--branch", ref, clone_url, str(destination)])
     result = subprocess.run(
-        [
-            "git",
-            "clone",
-            "--depth",
-            "1",
-            "--branch",
-            ref,
-            source_url,
-            str(destination),
-        ],
+        command,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

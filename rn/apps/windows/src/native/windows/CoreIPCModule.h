@@ -5,8 +5,8 @@
 
 namespace YoungRouter {
 
+REACT_MODULE(CoreIPCModule, L"LiteLLMCore");
 struct CoreIPCModule {
-  REACT_MODULE(CoreIPCModule, L"LiteLLMCore");
   REACT_INIT(Initialize);
   REACT_METHOD(Send, L"send");
   REACT_METHOD(Shutdown, L"shutdown");

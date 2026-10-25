@@ -1641,7 +1641,17 @@ class HookStreamingTimeoutTests(HookTestCase):
             )
             self.assertEqual(chunks[1]["delta"], "partial answer")
             self.assertEqual(chunks[-1]["response"]["status"], "failed")
-            self.assertEqual(chunks[-1]["response"]["error"]["code"], "upstream_route_failure")
+            # The watchdog is this worker's own verdict, so the event carries
+            # its own code instead of the unclassified ``upstream_route_failure``
+            # -- a client retries on it, and an unclassified stop it drops.
+            self.assertEqual(
+                chunks[-1]["response"]["error"]["code"],
+                "upstream_stream_idle_timeout",
+            )
+            self.assertIn(
+                "ended without",
+                chunks[-1]["response"]["error"]["message"],
+            )
 
             records = [
                 json.loads(line)

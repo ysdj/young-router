@@ -39,6 +39,9 @@ DEFAULT_LINES = 10_000
 # A page of online usage. The next pages reveal rows already read without
 # issuing another remote query.
 ONLINE_USAGE_PAGE_ROWS = 300
+# The smallest and largest page a reader may ask a station for.  The station
+# caps its own page size, so a large request is answered with what it offers.
+ONLINE_USAGE_MIN_PAGE_ROWS = 20
 MAX_LINES = 100_000
 MAX_FILTER_CHARS = 256
 RECOVERY_HEARTBEAT_TTL_SECONDS = 45.0
@@ -596,6 +599,21 @@ def _trace_detail(raw: Mapping[str, Any]) -> str:
     if event.startswith("responses_chat_bridge_preemptive") or event == "responses_chat_bridge_preemptive":
         return _trace_detail_parts(("reason", reason, ""))
 
+    if event == "responses_chat_bridge_reasoning_replay_repaired":
+        # A local repair, named as one: the request was rewritten before any
+        # upstream judged it, so the row must not read as a route event.
+        return _trace_detail_parts(
+            ("calls", _trace_count(raw.get("repaired_tool_call_ids")), ""),
+        )
+
+    if event.startswith("responses_function_tool_bridge"):
+        # This event's ``reason`` is why the client's tools were rewritten into
+        # function tools, not why an upstream failed.  It used to fall through to
+        # the generic ``reason=`` branch, where an unmapped token rendered as
+        # 上游异常: a reader was told the upstream had errored by a record that
+        # describes a local adaptation that had not been sent anywhere yet.
+        return _trace_detail_parts(("bridge", reason or "function_tools", ""))
+
     if event == "deployment_cooldown_started":
         return _trace_detail_parts(
             ("cooldown", raw.get("cooldown_remaining_seconds") or raw.get("cooldown_seconds"), "s"),
@@ -804,6 +822,8 @@ def _safe_route_identity(
     upstream_model: object = "",
     provider: object = "",
     order: object = None,
+    surface: object = None,
+    protocol_mode: object = None,
     configured_public_models: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     route_public_model = _public_model_from_route_key(route_key)
@@ -823,6 +843,16 @@ def _safe_route_identity(
         ),
         "provider": _safe_scalar(_route_key_value(route_key, "provider") or provider),
         "order": _safe_scalar(_route_key_value(route_key, "order") or order),
+        # The wire this attempt actually left on -- read only from a field an
+        # attempt wrote after adapting (``surface``), never from the route's
+        # declared ``upstream_url_surface``.  The declaration is the backup
+        # protocol, not the wire: a ``fallback`` route that answers natively on
+        # /v1/responses still declares ``openai/chat``.  Treating the
+        # declaration as the wire made the same route appear twice in one
+        # request (once with a protocol, once without) and told the reader the
+        # request had gone out as a chat call when it had not.
+        "surface": _safe_scalar(surface),
+        "protocol_mode": _safe_scalar(protocol_mode),
     }
     return {key: value for key, value in result.items() if value not in (None, "")}
 
@@ -994,6 +1024,18 @@ def _safe_route_trace_record(
             upstream_model=upstream_model or peer_entry.get("model"),
             provider=provider or peer_entry.get("provider"),
             order=deployment_order,
+            # Only the attempt's own ``surface`` (the wire it was dispatched
+            # on) is evidence about the wire.  Falling back to the route's
+            # declaration here is what made a fallback-mode route that served
+            # Responses read as a chat call: ``upstream_url_surface`` names the
+            # backup protocol, not what was sent.
+            surface=deployment.get("surface")
+            or peer_entry.get("surface"),
+            protocol_mode=(
+                deployment.get("upstream_protocol_mode")
+                or peer_entry.get("upstream_protocol_mode")
+                or request.get("upstream_protocol_mode")
+            ),
             configured_public_models=configured_public_models,
         )
         if selected_route_key or selected_deployment_id or deployment or peer_entry
@@ -1007,6 +1049,10 @@ def _safe_route_trace_record(
             upstream_model=exception.get("upstream_model"),
             provider=exception.get("provider"),
             order=exception.get("failed_deployment_order"),
+            # The wire the failed attempt was actually on.  It is the one field
+            # that separates "the route refused the Responses wire" from "the
+            # route refused after we had already bridged to chat".
+            surface=exception.get("failed_deployment_surface"),
             configured_public_models=configured_public_models,
         )
         if failed_route_key or failed_deployment_id
@@ -1600,6 +1646,60 @@ def _group_service_lines(lines: list[str]) -> list[str]:
     return grouped
 
 
+# Outcomes that say "the station was not read", as opposed to "the station
+# answered".  Only the latter may replace the rows on screen.
+_TRANSIENT_USAGE_REASONS = frozenset(
+    {
+        "Online usage logs are unavailable.",
+        "unsupported",
+        "unavailable",
+    }
+)
+
+
+def _unpack_reader_answer(answered: object) -> tuple[list[Any], str, int, int]:
+    """Split a reader's answer into rows, a reason, and the station's total.
+
+    A reader may answer with rows alone, with rows and the reason it has none,
+    or with those plus the station's own row count.  A plain string is still
+    accepted as a row, so a reader that only states one sentence produces
+    something.
+    """
+
+    if isinstance(answered, tuple):
+        values = answered[0] if answered else []
+        reason = answered[1] if len(answered) > 1 else ""
+        total = answered[2] if len(answered) > 2 and isinstance(answered[2], int) else 0
+        applied = answered[3] if len(answered) > 3 and isinstance(answered[3], int) else 0
+        rows = list(values) if isinstance(values, (list, tuple)) else [values]
+        return rows, str(reason or ""), max(0, total), max(0, applied)
+    if isinstance(answered, (list, tuple)):
+        return list(answered), "", 0, 0
+    if answered is None:
+        return [], "", 0, 0
+    return [answered], "", 0, 0
+
+
+def _call_reader_refresh(
+    refresh: object,
+    source_id: str | None,
+    *,
+    page: int,
+    rows_per_page: int,
+) -> object:
+    """Ask a usage reader for one page, tolerating a reader without paging.
+
+    A reader that predates paging answers rows only, so the page request is
+    retried in its own terms rather than failing: the pane then shows the rows
+    that reader can produce and states its own page count.
+    """
+
+    try:
+        return refresh(source_id, page=page, rows_per_page=rows_per_page)  # type: ignore[operator]
+    except TypeError:
+        return refresh(source_id)  # type: ignore[operator]
+
+
 class LogsDomain:
     name = DOMAIN_NAME
 
@@ -1609,6 +1709,7 @@ class LogsDomain:
         *,
         config_path: Path | str | None = None,
         online_usage_reader: object | None = None,
+        relay_accounts: object | None = None,
         runtime_settings_path: Path | str | None = None,
         maximum_lines: int = DEFAULT_LINES,
         maximum_read_bytes: int = MAX_READ_BYTES,
@@ -1616,6 +1717,10 @@ class LogsDomain:
         self.root = _runtime_root(runtime_root)
         self.config_path = Path(config_path).expanduser() if config_path else self.root / "config.yaml"
         self._online_usage_reader = online_usage_reader
+        # The relay-account store owns the durable login material, so a refresh
+        # token the station rotates during a usage read is kept there.  It is
+        # optional: a domain built without it still reads usage.
+        self._relay_accounts = relay_accounts
         if runtime_settings_path is None:
             from ._shared import _default_runtime_settings_path
 
@@ -1642,10 +1747,20 @@ class LogsDomain:
         # Why the last read answered no rows, so the pane can say it instead of
         # letting an empty table speak for a relay that never reported usage.
         self._online_usage_reason = ""
-        # How many of the relay's rows the view currently carries. It grows by
-        # one page each time the pane reaches the end of what it has.
-        self._online_usage_window = ONLINE_USAGE_PAGE_ROWS
-        self._online_usage_loaded = ONLINE_USAGE_PAGE_ROWS
+        # Which page of the relay's ledger this view shows, and how many rows a
+        # page holds.  The station owns the history (a busy account reports tens
+        # of thousands of rows) so the view carries one page at a time: reading
+        # the whole history before drawing anything took 28 s on a real account
+        # and left the tab spinning, and the station is the only side that can
+        # say where a page begins.
+        self._online_usage_page = 1
+        # The size the reader chose, and the size each relay actually applies —
+        # a feed that caps its own page answered 100 rows for a request of 300.
+        # They are kept per relay because one station's cap is not another's: a
+        # single shared value let a 100-row feed drag every other relay down to
+        # 100 rows a page.
+        self._online_usage_page_rows = ONLINE_USAGE_PAGE_ROWS
+        self._online_usage_applied_rows: dict[str, int] = {}
         self._online_usage_total = 0
         self._online_usage_sources: list[dict[str, str]] = []
         self._online_usage_sources_revision = -1
@@ -1860,7 +1975,7 @@ class LogsDomain:
         if reader is None:
             from ..operations import OnlineUsageReader
 
-            reader = OnlineUsageReader(self.config_path)
+            reader = OnlineUsageReader(self.config_path, self._relay_accounts)
         return reader
 
     def _online_usage_source_list(self) -> list[dict[str, str]]:
@@ -2197,14 +2312,12 @@ class LogsDomain:
 
     def _records(self, tab: str) -> tuple[bool, list[object]]:
         if tab == "online-usage":
-            # A relay can report thousands of rows, so the view carries a page
-            # of them and the pane asks for the next one as it scrolls. The
-            # rows themselves are all kept here: the page is a view over them,
-            # never the thing that decides how much usage exists.
+            # The rows held here are exactly one page, read from the station at
+            # the position the pager names.  The station owns the history, so it
+            # is the side that decides how much usage exists; `total` travels
+            # beside the page and is never inferred from what was read.
             records = self._online_usage_matching()
-            self._online_usage_total = len(records)
-            start = max(0, len(records) - self._online_usage_window)
-            return self._online_usage_refreshed, records[start:]
+            return self._online_usage_refreshed, records
         path = self._path(tab)
         if path is None:
             return False, []
@@ -2459,18 +2572,32 @@ class LogsDomain:
             value["source_id"] = self._online_usage_source_id
             value["reason"] = self._online_usage_reason
             total = self._online_usage_total
-            # The pager needs the whole picture from Core: the page's rows can
-            # be trimmed by the IPC byte cap, so a UI calculation from line
-            # count would not agree with the next-page action.
-            window_pages = (self._online_usage_window + ONLINE_USAGE_PAGE_ROWS - 1) // ONLINE_USAGE_PAGE_ROWS
-            page_count = max(1, (total + ONLINE_USAGE_PAGE_ROWS - 1) // ONLINE_USAGE_PAGE_ROWS)
-            page = max(1, min(window_pages, page_count))
+            rows_per_page = max(
+                1,
+                self._online_usage_applied_rows.get(
+                    self._online_usage_source_id, self._online_usage_page_rows
+                ),
+            )
+            # A client-side filter (the tab's text filter, or a range a reader
+            # applied locally) narrows what this page holds, so the visible
+            # count is what the pager can honestly describe.
+            if (self._filters.get("online-usage") or self._online_usage_since is not None
+                    or self._online_usage_until is not None):
+                total = len(records)
+            # The pager needs the whole picture from Core: the page's rows can be
+            # trimmed by the IPC byte cap, so a UI calculation from line count
+            # would not agree with the page the station actually answered.
+            page_count = max(1, (total + rows_per_page - 1) // rows_per_page) if total else 1
+            page = max(1, min(self._online_usage_page, page_count))
             value["total"] = total
             value["page"] = page
             value["page_count"] = page_count
+            # How many rows a page holds, so the pane can offer its own choices
+            # and state what the next page will carry.
+            value["page_rows"] = rows_per_page
             # The pane needs to know a next page exists before it offers to
             # fetch one, so the count of rows after this page travels with it.
-            value["remaining"] = max(0, total - self._online_usage_window)
+            value["remaining"] = max(0, total - page * rows_per_page)
         # Fit the records to the IPC result only after the pager describes the
         # rows held by Core: byte-cap trimming must not make an existing next
         # page look absent.
@@ -2547,6 +2674,91 @@ class LogsDomain:
             } if changed else None,
         }
 
+    def _effective_page_rows(self) -> int:
+        """The page size to ask this relay for: the chosen one, capped by its own.
+
+        A feed that answered 100 rows for a request of 300 keeps that size until
+        the reader chooses another, so paging stays in the units the feed really
+        produces.  The cap is remembered per relay, because it is a property of
+        the station and not of the pane.
+        """
+
+        applied = self._online_usage_applied_rows.get(self._online_usage_source_id)
+        if applied and applied < self._online_usage_page_rows:
+            return applied
+        return self._online_usage_page_rows
+
+    def _read_online_usage_page(self, tab: str, request: str = "") -> bool:
+        """Read the page the pager names from the chosen relay.
+
+        One read, one page.  The station owns the history, so the only honest
+        way to move through it is to ask it for the next page; re-slicing rows
+        already held could never reach a page a previous refresh did not happen
+        to fetch.
+
+        Returns False when the answer belongs to a source the user has since
+        replaced: a slower read must never overwrite the newer choice.
+        """
+
+        source_id = self._online_usage_source_id
+        self._online_usage_reason = ""
+        try:
+            reader = self._online_usage_reader_instance()
+            refresh = getattr(reader, "refresh", None)
+            if not source_id:
+                # Nothing is selected, so there is no relay to read.
+                values, reason, station_total, applied_rows = [], "", 0, 0
+            elif not callable(refresh):
+                values, reason, station_total, applied_rows = [], "Online usage logs are unavailable.", 0, 0
+            else:
+                answered = _call_reader_refresh(
+                    refresh,
+                    source_id,
+                    page=max(1, self._online_usage_page),
+                    rows_per_page=self._effective_page_rows(),
+                )
+                if request and request != self._online_usage_request:
+                    # This answer belongs to a source the user has since
+                    # replaced, so it neither becomes a row nor ends the wait
+                    # for the newer source.
+                    return False
+                values, reason, station_total, applied_rows = _unpack_reader_answer(answered)
+                self._online_usage_total = max(0, station_total) or len(values)
+                if applied_rows > 0 and source_id:
+                    # The feed capped its own page, so the pager counts pages of
+                    # what it really returns: a 38 890-row account whose feed
+                    # answers 100 rows a page has 389 pages, not 130.
+                    self._online_usage_applied_rows[source_id] = applied_rows
+            answered_rows = [
+                dict(value)
+                if isinstance(value, Mapping)
+                else {"detail": REDACT_TEXT(str(value))[:512]}
+                for value in values
+                if (isinstance(value, Mapping) and value)
+                or (isinstance(value, str) and value.strip())
+            ][-self._line_limit(tab) :]
+            # A station that could not be read is not a station with no history:
+            # keeping the last good page is what stops one failed poll from
+            # blanking a table that was already on screen.
+            transient = not answered_rows and reason in _TRANSIENT_USAGE_REASONS
+            if not (transient and self._online_usage_records):
+                self._online_usage_records = answered_rows
+            self._online_usage_reason = str(reason)[:512]
+        except Exception:
+            if request and request != self._online_usage_request:
+                return False
+            # A read that failed is not a station that answered nothing, so the
+            # rows already on screen stay: clearing them turned one slow or
+            # dropped poll into a table that went blank a while after it had
+            # filled, with nothing to act on.
+            self._online_usage_reason = "Online usage logs are unavailable."
+            self._online_usage_refreshed = True
+            self._online_usage_revision += 1
+            return True
+        self._online_usage_refreshed = True
+        self._online_usage_revision += 1
+        return True
+
     def dispatch(self, action: str, payload: object | None = None) -> dict[str, Any]:
         data = dict(payload) if isinstance(payload, Mapping) else {}
         tab = data.get("tab")
@@ -2571,8 +2783,8 @@ class LogsDomain:
             # ahead of the data.
             self._online_usage_since = _epoch_seconds(since)
             self._online_usage_until = _epoch_seconds(until)
-            self._online_usage_window = ONLINE_USAGE_PAGE_ROWS
-            self._online_usage_loaded = ONLINE_USAGE_PAGE_ROWS
+            # A new range is a new result set, so it starts at its first page.
+            self._online_usage_page = 1
             self._discard_clear(tab)
             self._source_signatures.pop(tab, None)
             self.revision += 1
@@ -2619,31 +2831,65 @@ class LogsDomain:
                 raise LogsDomainError("Log line limit is invalid")
             self._limits[str(tab)] = value
             self._discard_clear(str(tab))
-        elif operation in {"load_more", "online_usage_more"}:
+        elif operation in {
+            "load_more",
+            "online_usage_more",
+            "next_page",
+            "previous_page",
+            "first_page",
+            "last_page",
+            "goto_page",
+            "set_page_rows",
+        }:
             if tab != "online-usage":
                 raise LogsDomainError("Log tab is invalid")
-            # Reading further is a view over rows already fetched: the relay is
-            # not asked again just because the user changed pages.
-            self._online_usage_window = min(
-                MAX_LINES,
-                max(self._online_usage_window, self._online_usage_loaded) + ONLINE_USAGE_PAGE_ROWS,
-            )
-            self._online_usage_loaded = self._online_usage_window
+            # Every one of these is a page *request*: the station owns the
+            # history, so moving the pager means reading that page from it.
+            # Holding the rows locally and re-slicing them would only ever reach
+            # the pages one refresh happened to read, which is what made a
+            # 48 000-row account show a few hundred rows and no way past them.
+            # 末页 counts in the units this relay actually returns, not in the
+            # size the reader asked for: 38 890 rows at 100 a page is 389 pages.
+            rows_per_page = self._effective_page_rows()
+            if operation == "set_page_rows":
+                requested_rows = data.get("rows_per_page", data.get("limit"))
+                if (
+                    type(requested_rows) is not int
+                    or not ONLINE_USAGE_MIN_PAGE_ROWS <= requested_rows <= MAX_LINES
+                ):
+                    raise LogsDomainError("Log page size is invalid")
+                rows_per_page = requested_rows
+                self._online_usage_page_rows = requested_rows
+                self._online_usage_applied_rows.pop(self._online_usage_source_id, "")
+                # The same rows now fall on different pages, so the pager
+                # restarts at the first one rather than landing mid-history.
+                self._online_usage_page = 1
+            else:
+                current = max(1, self._online_usage_page)
+                if operation in {"load_more", "online_usage_more", "next_page"}:
+                    current += 1
+                elif operation == "previous_page":
+                    current = max(1, current - 1)
+                elif operation == "first_page":
+                    current = 1
+                elif operation == "last_page":
+                    total = max(0, self._online_usage_total)
+                    current = max(1, (total + rows_per_page - 1) // rows_per_page)
+                elif operation == "goto_page":
+                    requested_page = data.get("page")
+                    if type(requested_page) is not int or requested_page < 1:
+                        raise LogsDomainError("Log page is invalid")
+                    current = requested_page
+                self._online_usage_page = current
             self._discard_clear(str(tab))
             self._source_signatures.pop(tab, None)
-        elif operation == "previous_page":
-            if tab != "online-usage":
-                raise LogsDomainError("Log tab is invalid")
-            loaded = self._tabs.get(tab)
-            if loaded and isinstance(loaded.get("line_count"), int):
-                self._online_usage_loaded = loaded["line_count"]
-            self._online_usage_window = max(
-                ONLINE_USAGE_PAGE_ROWS,
-                self._online_usage_loaded - ONLINE_USAGE_PAGE_ROWS,
-            )
-            self._online_usage_loaded = self._online_usage_window
-            self._discard_clear(str(tab))
-            self._source_signatures.pop(tab, None)
+            # The page the pager now names is a page of the station's history,
+            # so it is read here: the rows on screen would otherwise still be
+            # the previous page's, under a pager that claims otherwise.
+            self._read_online_usage_page(str(tab))
+            self.revision += 1
+            self._refresh(str(tab), force=True)
+            return self.snapshot()
         elif operation in {"refresh", "reload", "refresh_online_usage"}:
             self._discard_clear(str(tab))
             if tab == "online-usage":
@@ -2658,59 +2904,9 @@ class LogsDomain:
                 self._online_usage_source_id = source_id
                 if isinstance(request, str) and request:
                     self._online_usage_request = request
-                self._online_usage_reason = ""
-                try:
-                    reader = self._online_usage_reader_instance()
-                    refresh = getattr(reader, "refresh", None)
-                    if not source_id:
-                        # Nothing is selected, so there is no relay to read.
-                        # Answering with every station's rows would be a
-                        # selection the user did not make; the pane asks for
-                        # one instead.
-                        values, reason = [], ""
-                    elif not callable(refresh):
-                        values, reason = [], "Online usage logs are unavailable."
-                    else:
-                        answered = refresh(source_id)
-                        # A reader may answer with rows alone or with the rows
-                        # plus the reason it has none; the reason is the pane's
-                        # own message and never a row shaped like a usage one.
-                        values, reason = answered if isinstance(answered, tuple) else (answered, "")
-                    if (
-                        isinstance(request, str)
-                        and request != self._online_usage_request
-                    ):
-                        # This answer belongs to a source the user has since
-                        # replaced, so it neither becomes a row nor ends the
-                        # wait for the newer source.
-                        return self.snapshot()
-                    # A plain string is still accepted as a row, so a reader
-                    # that only states one sentence produces something.
-                    self._online_usage_records = [
-                        dict(value)
-                        if isinstance(value, Mapping)
-                        else {"detail": REDACT_TEXT(str(value))[:512]}
-                        for value in values
-                        if (isinstance(value, Mapping) and value)
-                        or (isinstance(value, str) and value.strip())
-                    ][-self._line_limit(str(tab)) :]
-                    self._online_usage_reason = str(reason)[:512]
-                except Exception:
-                    if (
-                        isinstance(request, str)
-                        and request != self._online_usage_request
-                    ):
-                        return self.snapshot()
-                    self._online_usage_records = []
-                    self._online_usage_reason = "Online usage logs are unavailable."
-                self._online_usage_window = ONLINE_USAGE_PAGE_ROWS
-                self._online_usage_loaded = ONLINE_USAGE_PAGE_ROWS
-                # The chosen range is a view over whichever relay answered, not
-                # a property of the relay that was chosen when it was set:
-                # dropping it here left the pane's own time menu naming a range
-                # that no longer filtered anything.
-                self._online_usage_refreshed = True
-                self._online_usage_revision += 1
+                if not self._read_online_usage_page(str(tab), request if isinstance(request, str) else ""):
+                    # A newer source replaced this read while it was in flight.
+                    return self.snapshot()
         else:
             raise LogsDomainError("Log action is unavailable")
         self.revision += 1

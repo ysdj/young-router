@@ -689,6 +689,43 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
         }
     }
 
+    /// The station's dashboard, in the browser that already holds the session.
+    ///
+    /// Declared in ``AppKitNativeLeafBridge.m`` too: a bridge method without
+    /// its ``RCT_EXTERN_METHOD`` is ``undefined`` in JS, an optional chain then
+    /// no-ops with no log, and the account link did nothing at all.
+    @objc(openRelayDashboard:resolver:rejecter:)
+    func openRelayDashboard(
+        _ options: [String: Any],
+        resolver resolve: @escaping RCTPromiseResolveBlock,
+        rejecter reject: @escaping RCTPromiseRejectBlock
+    ) {
+        guard Set(options.keys).isSubset(of: ["accountId", "type", "label", "origin", "language"]),
+              let accountID = options["accountId"] as? String,
+              let type = options["type"] as? String,
+              let label = options["label"] as? String,
+              let origin = options["origin"] as? String else {
+            reject("E_NATIVE_RELAY_INPUT", "The relay account is invalid.", nil)
+            return
+        }
+        let language = (options["language"] as? String) ?? "system"
+        guard ["system", "en", "zh-Hans"].contains(language) else {
+            reject("E_NATIVE_RELAY_INPUT", "The relay account is invalid.", nil)
+            return
+        }
+        DispatchQueue.main.async {
+            self.leaf.openRelayDashboard(
+                accountID: accountID,
+                type: type,
+                label: label,
+                origin: origin,
+                language: language
+            ) {
+                DispatchQueue.main.async { resolve(nil) }
+            }
+        }
+    }
+
     @objc(restoreRelaySession:resolver:rejecter:)
     func restoreRelaySession(
         _ options: [String: Any],

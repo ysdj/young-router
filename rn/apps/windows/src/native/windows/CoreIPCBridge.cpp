@@ -212,6 +212,23 @@ bool IsWebdavRemoteOperation(std::string const& request_json) {
   }
 }
 
+// A usage read is a network read against a third-party relay: a busy station
+// answers one page in anywhere from one second to over a minute, so the 30 s
+// default abandoned the read and the pane then reported a relay it had just
+// chosen as if nothing were selected.
+bool IsOnlineUsageReadOperation(std::string const& request_json) {
+  try {
+    auto request = winrt::Windows::Data::Json::JsonObject::Parse(Utf8ToWide(request_json));
+    if (WideToUtf8(request.GetNamedString(L"method", L"").c_str()) != "dispatch") return false;
+    auto action = request.GetNamedObject(L"params").GetNamedObject(L"action");
+    if (WideToUtf8(action.GetNamedString(L"domain", L"").c_str()) != std::string("logs")) return false;
+    const std::string type = WideToUtf8(action.GetNamedString(L"type", L"").c_str());
+    return type == "logs.refresh_online_usage" || type == "logs.refresh" || type == "logs.reload";
+  } catch (...) {
+    return false;
+  }
+}
+
 // A managed-proxy lifecycle dispatch replaces the proxy, which the drain budget
 // lets run for minutes.  The 30 s default expired mid-restart and tore Core
 // down, leaving every window stating "starting" with nothing to correct it.
@@ -270,8 +287,13 @@ std::string CoreIPCBridge::Send(std::string const& request_json) {
   // A model probe waits for the deployment's own first-event budget and then
   // for a complete fingerprint answer, so it outlives the 30 s default; a
   // WebDAV remote operation and a proxy lifecycle dispatch earn the same wait.
-  const bool slow_remote_operation =
-      method == "probe" || IsWebdavRemoteOperation(request_json) || IsServiceLifecycleOperation(request_json);
+  // A usage read is a network read against a third-party relay, and a busy
+  // station answers one page in anywhere from one second to over a minute; the
+  // 30 s default abandoned those reads and the pane then reported a relay it
+  // had just chosen as if nothing were selected.
+  const bool slow_remote_operation = method == "probe" || IsWebdavRemoteOperation(request_json) ||
+                                     IsServiceLifecycleOperation(request_json) ||
+                                     IsOnlineUsageReadOperation(request_json);
   const int receive_timeout_ms = slow_remote_operation ? 900000 : 30000;
   for (int attempt = 0; attempt < 2; ++attempt) {
     auto [endpoint, session, generation] = EnsureSession();
@@ -524,10 +546,10 @@ std::optional<CoreIPCBridge::RelayLoginResult> CoreIPCBridge::AcceptRelayLogin(
       payload.SetNamedValue(L"station_origin", winrt::Windows::Data::Json::JsonValue::CreateStringValue(Utf8ToWide(*station_origin)));
     }
     if (remember_password) {
-      payload.SetNamedValue(L"remember_password", winrt::Windows::Data::Json::JsonValue::CreateBoolean(true));
+      payload.SetNamedValue(L"remember_password", winrt::Windows::Data::Json::JsonValue::CreateBooleanValue(true));
     }
     if (pending_account) {
-      payload.SetNamedValue(L"pending_account", winrt::Windows::Data::Json::JsonValue::CreateBoolean(true));
+      payload.SetNamedValue(L"pending_account", winrt::Windows::Data::Json::JsonValue::CreateBooleanValue(true));
     }
     auto body = WideToUtf8(payload.Stringify().c_str());
     if (body.size() > 96 * 1024) return std::nullopt;
@@ -576,7 +598,7 @@ std::optional<CoreIPCBridge::RelaySessionRestoreResult> CoreIPCBridge::RestoreRe
       (refresh_token && refresh_token->size() > 32768) ||
       (user_id && !user_id->empty() &&
        (user_id->size() > 32 || user_id->find_first_not_of("0123456789") != std::string::npos)) ||
-      (signed_in && (!username || username->empty() || ((!cookie || cookie->empty()) && (!access_token || access_token->empty()))) ||
+      (signed_in && (!username || username->empty() || ((!cookie || cookie->empty()) && (!access_token || access_token->empty())))) ||
       (!signed_in && ((cookie && !cookie->empty()) || (access_token && !access_token->empty()) || (refresh_token && !refresh_token->empty())))) {
     return std::nullopt;
   }

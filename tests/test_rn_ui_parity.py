@@ -112,7 +112,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # A settings pane window keeps one permanent strip: the last result
         # replaces the idle Ready label, so it never appears or disappears
         # mid-action.  A child window keeps no strip of its own.
-        self.assert_ui_has('{shell ? <View style={styles.routeStatusBar}><Text numberOfLines={2} style={styles.routeStatusText}>{routeStatus ?? translate("common.ready")}</Text></View> : null}')
+        # The strip keeps its permanent strip and, since the usage pager lives
+        # at its right end, it may also carry that route's own controls.
+        self.assert_ui_has('{shell ? <View style={styles.routeStatusBar}><Text numberOfLines={2} style={styles.routeStatusText}>{routeStatus ?? translate("common.ready")}</Text>{statusBarControls}</View> : null}')
         self.assertNotIn("{shell && routeStatus ? <View style={styles.routeStatusBar}>", self.ui)
         self.assertIn('"common.ready": "Ready"', self.en)
         self.assertIn('"common.ready": "就绪"', self.zh)
@@ -667,13 +669,21 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # A lifecycle dispatch replaces the proxy, which the drain budget lets
         # run for minutes; the 30 s cap expired mid-restart and tore Core down.
         self.assertIn('if method == "dispatch", serviceLifecycleOperation(in: request) != nil { return 900 }', macos_bridge)
+        # A usage read answers from a third-party relay, which can take over a
+        # minute; the 30 s cap abandoned the read and the pane then reported a
+        # relay the user had just chosen as if nothing were selected.
+        self.assertIn('if method == "dispatch", onlineUsageReadOperation(in: request) != nil { return 900 }', macos_bridge)
+        self.assertIn('private static func onlineUsageReadOperation(in data: Data) -> String? {', macos_bridge)
         self.assertIn('private static func serviceLifecycleOperation(in data: Data) -> String? {', macos_bridge)
         self.assertIn('guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],\n              let params = object["params"] as? [String: Any],\n              let action = params["action"] as? [String: Any],\n              action["domain"] == nil else { return nil }', macos_bridge)
         self.assertIn('return ["service.start", "service.stop", "service.restart", "service.reload"].contains(type) ? type : nil', macos_bridge)
         self.assertIn("timeoutInterval: Self.responseTimeoutInterval(for: metadata.method, request: data)", macos_bridge)
         self.assertIn('const int receive_timeout_ms = slow_remote_operation ? 900000 : 30000;', windows_bridge)
         self.assertIn('bool IsServiceLifecycleOperation(std::string const& request_json) {', windows_bridge)
-        self.assertIn('method == "probe" || IsWebdavRemoteOperation(request_json) || IsServiceLifecycleOperation(request_json);', windows_bridge)
+        self.assertIn('bool IsOnlineUsageReadOperation(std::string const& request_json) {', windows_bridge)
+        self.assertIn('method == "probe" || IsWebdavRemoteOperation(request_json) ||', windows_bridge)
+        self.assertIn('IsServiceLifecycleOperation(request_json) ||', windows_bridge)
+        self.assertIn('IsOnlineUsageReadOperation(request_json);', windows_bridge)
         self.assertIn('Request(endpoint, L"", L"POST", request_json, session, receive_timeout_ms);', windows_bridge)
 
     def test_model_detail_deep_test_names_the_degradation_probe_before_it_runs(self) -> None:
@@ -2012,7 +2022,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
     def test_logs_default_to_requests_and_show_latest_first(self) -> None:
         self.assertNotIn("logInfoBar", self.ui)
-        self.assertIn('onStatus={setResult} requestedTab=', self.ui)
+        self.assertIn('onStatus={setResult} onStatusBar={setStatusBarControls} requestedTab=', self.ui)
         bootstrap = (ROOT / "rn/packages/shared/src/bootstrap.tsx").read_text(encoding="utf-8")
         self.assertIn('setLogTabRequest(tab && LOG_TABS.includes(tab) ? tab : "requests");', bootstrap)
         self.assert_ui_has('useState<typeof LOG_TABS[number]>(() => requestedTab ?? "requests")')
@@ -3213,21 +3223,45 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("const [onlineUsageLoadingTab, setOnlineUsageLoadingTab] =", logs)
         self.assertIn("setOnlineUsageLoadingTab(tab);", logs)
         self.assertIn("settleOnlineUsageLoading(tab);", logs)
-        # Reading further or going back is a view over rows already fetched,
-        # so neither direction re-asks the relay.
-        pager = logs.split('style={styles.logPager}', 1)[1].split("</View> : null}</View>", 1)[0]
+        # The relay owns the history, so every pager control is a page request:
+        # first, one back, a typed page, one forward, last, and the page size.
+        # A view over locally held rows could never reach a page one refresh did
+        # not happen to fetch, which is what stranded a 48 000-row account.
+        pager = logs[logs.index("usageStatusControls") :]
+        self.assertIn("firstOnlineUsagePage", pager)
         self.assertIn("previousOnlineUsagePage", pager)
         self.assertIn("loadMoreOnlineUsage", pager)
-        self.assertIn('moveOnlineUsagePage("logs.previous_page")', logs)
-        self.assertIn("disabled={onlineUsageLoadedPage <= 1 || onlineUsageLoading || onlineUsageTimePending}", pager)
-        self.assertIn("disabled={onlineUsageLoading || onlineUsageTimePending || onlineUsageRemaining <= 0}", pager)
-        self.assertIn("translate(\"logs.onlineUsagePage\", { page: onlineUsageLoadedPage, pages: onlineUsagePageCount })", logs)
+        self.assertIn("lastOnlineUsagePage", pager)
+        self.assertIn("submitOnlineUsagePage", pager)
+        self.assertIn("setOnlineUsagePageRows", pager)
+        for action in (
+            "logs.first_page",
+            "logs.previous_page",
+            "logs.load_more",
+            "logs.last_page",
+            "logs.goto_page",
+            "logs.set_page_rows",
+        ):
+            self.assertIn(f'moveOnlineUsagePage("{action}"', logs)
+        self.assertIn("disabled={onlineUsagePagerDisabled || onlineUsageLoadedPage <= 1}", pager)
+        # The bar names the page once: the box states it, and a status line
+        # repeating it pushed 末页 off the edge of a narrow window.
+        self.assertNotIn("styles.logPagerStatus}>{onlineUsagePagerStatus}", pager)
+        self.assertIn("disabled={onlineUsagePagerDisabled || onlineUsageRemaining <= 0}", pager)
+        self.assertIn("disabled={onlineUsagePagerDisabled || onlineUsageLoadedPage >= onlineUsagePageCount}", pager)
+        # The page is stated once, in the pager's own box; the strip beside it
+        # states the row count and any read in flight instead of repeating it.
+        self.assertIn('{`/ ${onlineUsagePageCount}`}', logs)
+        # The window strip is this tab's only bar: the page controls sit at its
+        # right end and the row count they page through sits on its left.
+        self.assertIn("const statusLine = [", logs)
+        self.assertIn('"logs.latestLinesAtLimit" : "common.lines", { count: lineCount }', logs)
         self.assertIn("const onlineUsageLoadedPage = Math.max(1, numberValue(active?.page));", logs)
         self.assertIn("const onlineUsagePageCount = Math.max(onlineUsageLoadedPage, numberValue(active?.page_count));", logs)
-        self.assertIn("const onlineUsageNext = Math.min(onlineUsageRemaining, ONLINE_USAGE_PAGE_ROWS);", logs)
-        self.assertIn("numberValue(active?.total) || lineCount + onlineUsageRemaining", logs)
+        self.assertIn("const onlineUsageNext = Math.min(onlineUsageRemaining, onlineUsagePageRows);", logs)
+        self.assertIn("numberValue(active?.total) : 0", logs)
         self.assertIn("ONLINE_USAGE_PAGE_ROWS = 300", self.ui.split("function LogsWorkspace(", 1)[0])
-        self.assertIn('scrollOnlineUsage(result.log.source_id ?? "", action === "logs.load_more"', logs)
+        self.assertIn('scrollOnlineUsage(result.log.source_id ?? "", 0)', logs)
         self.assertIn('scrollToRow={selected === "online-usage" && onlineUsageScrollSourceRef.current === active?.source_id ? onlineUsageScrollToRow : -1}', logs)
         self.assertIn("onlineUsagePagePending.current = false;", logs)
         self.assertIn("const onlineUsageRemaining = selected === \"online-usage\" ? numberValue(active?.remaining) : 0;", logs)
@@ -3286,7 +3320,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("setOnlineUsageTimePending(false);", time_range)
         self.assertIn("if (request === onlineUsageTimeRequest.current) {\n        setOnlineUsageTimeOption(\"all\");", time_range)
         self.assertIn("onlineUsageLoadedSourceRef.current = result.log.source_id ?? \"\";", logs)
-        self.assertIn("disabled={onlineUsageLoadedPage <= 1 || onlineUsageLoading || onlineUsageTimePending}", logs)
+        self.assertIn("const onlineUsagePagerDisabled = onlineUsageLoading || onlineUsageTimePending || onlineUsagePageBusy;", logs)
         self.assertIn("parseLocalDate", logs)
         self.assertIn("textPrompt", logs)
         self.assertIn('"logs.onlineUsageAllTime": "全部时间"', self.zh)
@@ -3330,7 +3364,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('"logs.type": "TYPE"', self.en)
         self.assertIn('"logs.type": "类型"', self.zh)
         styles = UI_SOURCE.read_text(encoding="utf-8").split("const styles = StyleSheet.create({", 1)[1].split("\n});", 1)[0]
-        for style_name in ("logsWindow", "logsToolbar", "logFilterRow", "logToolbarSpacer", "logActionsRow", "onlineUsageSourcePicker", "clearCooldownButton", "toolbarLabel", "logFilterInput", "logsTabs", "logRangeMessageSlot", "logTablesLayout", "logPager", "logPagerStatus", "logTableFrame", "logTable", "logEmptySurface", "logEmptyText", "logLoadingText", "logEmptyStatusRow", "logLoadingOverlay", "logLoadingCard", "fieldLabel", "fieldHint", "fieldError", "input", "inputInvalid", "textArea", "compactTextArea", "secretFieldActions", "secretFieldButtons", "secretFieldButton", "nativeSecretControl", "nativeSecretInput", "rawEditor", "rawEditorHeader", "rawNativeEditorFrame", "rawNativeEditor", "rawEditorOverlay", "rawEditorLoading", "empty", "cardHint", "nativeSecretMultilineControl"):
+        for style_name in ("logsWindow", "logsToolbar", "logFilterRow", "logToolbarSpacer", "logActionsRow", "onlineUsageSourcePicker", "clearCooldownButton", "toolbarLabel", "logFilterInput", "logsTabs", "logRangeMessageSlot", "logTablesLayout", "logStrip", "logPagerStatus", "logTableFrame", "logTable", "logEmptySurface", "logEmptyText", "logLoadingText", "logEmptyStatusRow", "logLoadingOverlay", "logLoadingCard", "fieldLabel", "fieldHint", "fieldError", "input", "inputInvalid", "textArea", "compactTextArea", "secretFieldActions", "secretFieldButtons", "secretFieldButton", "nativeSecretControl", "nativeSecretInput", "rawEditor", "rawEditorHeader", "rawNativeEditorFrame", "rawNativeEditor", "rawEditorOverlay", "rawEditorLoading", "empty", "cardHint", "nativeSecretMultilineControl"):
             self.assertIn(f"{style_name}:", styles, style_name)
         native_table = (ROOT / "rn/apps/macos/src/native/macos/AppKitControlViews.mm").read_text(encoding="utf-8")
         logs_render = self.ui.split("function LogsWorkspace(", 1)[1].split("function EmptyState(", 1)[0]
@@ -3362,29 +3396,67 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # too wide and named a type as if it were the relay.
         # The relay's name stops at its own ceiling, so a short name does not
         # stretch across the window; the model column takes the slack.
-        self.assertIn('{ label: translate("logs.source"), width: 118, maxWidth: 168, flex: true, value: (row) => row.source }', columns)
+        # The relay and its login are chosen by a dropdown and repeat on every
+        # row, so both columns are drawn only when a page actually mixes them:
+        # two constant columns cost 214 pt that the duration column needed.
+        self.assertIn(
+            '...(hasSource ? [{ label: translate("logs.source"), width: 118, maxWidth: 168, flex: true, value: (row: RenderedLogRecord) => row.source }] : []),',
+            columns,
+        )
         # One relay can host several logins, and only the account column says
         # whose usage a row is.  It is declared the same way the status column
         # is: drawn only when a row actually carries one.
         self.assertIn('...(hasAccount ? [{ label: translate("logs.account"), width: 96, value: (row: RenderedLogRecord) => row.account }] : []),', columns)
-        self.assertIn("selected === \"online-usage\" && rows.some((row) => Boolean(row.account)),", self.ui)
-        self.assertIn('{ label: translate("logs.type"), width: 82, value: (row) => row.family }', columns)
+        self.assertIn('selected === "online-usage" && hasDistinct(rows, (row) => row.account),', self.ui)
+        # The control plane is the station's property, not the row's: it is
+        # drawn only when a page actually mixes families, because the dropdown
+        # already names it and 82 pt is what pushes the duration out of a narrow
+        # window.
+        self.assertIn(
+            '...(hasFamily ? [{ label: translate("logs.type"), width: 82, value: (row: RenderedLogRecord) => row.family }] : []),',
+            columns,
+        )
         self.assertIn('{ label: translate("providers.publicModel"), width: 164, flex: true, value: (row) => row.model }', columns)
-        self.assertIn('{ label: translate("logs.tokenPair"), width: 128, value: (row) => row.tokens }', columns)
+        # The token pair is as wide as the `34113.8 / 88.5` a busy relay
+        # reports (85.7 pt at 13 pt) plus the cell's 8 pt padding on each side.
+        # It used to be 128, which is narrower than the text: the cell painted
+        # `32642.1 /` and cut the completion count off behind an ellipsis on
+        # every row whose counts reached five digits.
+        self.assertIn('{ label: translate("logs.tokenPair"), width: 140, value: (row) => row.tokens }', columns)
         # The set must total less than the pane's own width, so a row is read
         # without scrolling sideways. The timestamp is the widest fixed column,
         # and only the relay column absorbs what is left over.
-        widths = [168, 82, 164, 128, 62]
+        widths = [168, 164, 140, 62]
         # The account column is only there when the relay has more than one
         # login, and it must still fit inside the pane at its narrowest: the
         # other fixed columns plus the relay's floor leave it room.
         self.assertLess(sum(widths) + 118 + 96, 860)
+        # Every declared width has to hold the longest value that column can
+        # carry at the table's 13 pt face: a width under the measured text is
+        # what put an ellipsis in the token pair.
+        for declared, measured, value in (
+            (168, 129.4, "2026-10-24 15:16:53"),
+            (118, 58.0, "flux-code"),
+            (96, 51.7, "river yang6"),
+            (82, 51.7, "Sub2API"),
+            (164, 127.5, "gemini-3.1-flash-lite"),
+            (140, 111.3, "令牌 输入 / 输出(k)"),
+            (62, 40.0, "1234.5"),
+        ):
+            self.assertGreaterEqual(declared, measured + 16, f"{value} needs {measured + 16} pt")
         # Several flexible columns share one pool of leftover width, so a data
         # column may absorb only up to its ceiling and the rest is the detail
         # column's: giving each flexible column `remaining` would hand the
         # table more width than it has and put the scroller back.
-        self.assertIn("let pool = remaining;", self.ui)
+        self.assertIn("let pool = usableWidth - fixedWidth;", self.ui)
         self.assertIn("pool -= width;", self.ui)
+        # A narrow window shrinks every column toward its own floor rather than
+        # only the flexible one: shrinking the flexible column alone left the
+        # fixed ones past the frame, so the token pair was ellipsized and the
+        # duration column sat outside the window invisible.
+        self.assertIn("const shrinkOrder = [...widened].sort((left, right) => right.width - left.width);", self.ui)
+        self.assertIn("const floor = columnFloor(column);", self.ui)
+        self.assertIn("function columnFloor(column: LogColumn): number {", self.ui)
         # The row keeps its timestamp, and the fields a summary endpoint leaves
         # empty share one detail column instead of standing blank beside it.
         self.assertIn("    time,", columns)
@@ -3396,12 +3468,21 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('{ label: translate("logs.duration"), width: 62, value: (row) => row.duration }', columns)
         # The flex floor belongs to the detail column alone, so a data column
         # shrinks to its own declared width instead of to the text floor.
-        self.assertIn("column.detailFlex ? LOG_DETAIL_COLUMN_FLOOR : column.width", self.ui)
+        self.assertIn("if (column.detailFlex) return LOG_DETAIL_COLUMN_FLOOR;", self.ui)
         self.assertIn("flex: true, detailFlex: true, value: (row: RenderedLogRecord) => row.detail", self.ui)
         # The status column is drawn only when a row carries one: a summary
         # endpoint has no per-request outcome to report.
         self.assertIn('...(hasStatus ? [{ ...status, width: 64 }] : []),', columns)
-        self.assertIn("function logColumns(tab: LogTab, translate: Translate, hasStatus = true, hasAccount = false): LogColumn[] {", self.ui)
+        # The grouping is a per-row fact — it is what priced the request — so it
+        # is drawn whenever the rows carry one, unlike the constant relay name.
+        self.assertIn(
+            "  hasGroup = false,\n): LogColumn[] {",
+            self.ui,
+        )
+        self.assertIn(
+            '...(hasGroup ? [{ label: translate("logs.group"), width: 96, value: (row: RenderedLogRecord) => row.group }] : []),',
+            columns,
+        )
         # The row's own fields travel in the detail, one per line, rather than
         # as a re-splitting of the joined string.
         self.assertIn("const details = detailFields.flatMap", renderer)
@@ -4181,7 +4262,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
     def test_workbuddy_provider_types_borrow_the_desktop_app_sign_in(self) -> None:
         """WorkBuddy keeps its sign-in and its model catalog in its own app."""
         for marker in (
-            'type WizardType = "api" | "openai" | "claude" | "workbuddy" | "workbuddyGlobal" | "ourFreeModel" | "ourFreeModelKilo" | "ourFreeModelEAC";',
+            'type WizardType = "api" | "openai" | "claude" | "workbuddy" | "workbuddyGlobal" | "ourFreeModel" | "ourFreeModelKilo";',
             'const isWorkBuddyType = providerType === "workbuddy" || providerType === "workbuddyGlobal";',
             'const workbuddyAuthKind: ServiceProviderKind = providerType === "workbuddyGlobal" ? "workbuddy_global_login" : "workbuddy_login";',
             'dispatchWithOutcome("workbuddy_status", { refresh }, "providers_models", true);',
@@ -4312,7 +4393,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
         for marker in (
             '{ type: "ourFreeModel", label: translate("providers.type.ourFreeModel") },',
-            'const isOurFreeModelType = providerType === "ourFreeModel" || providerType === "ourFreeModelKilo" || providerType === "ourFreeModelEAC";',
+            'const isOurFreeModelType = providerType === "ourFreeModel" || providerType === "ourFreeModelKilo";',
             'if (isOurFreeModelType) {',
             'kind: "our_free_model_login",',
             'translate("providers.wizard.ourFreeModelHint")',
@@ -4323,10 +4404,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'const fetchOurFreeModelModels = async (providerID = ourFreeModelProviderID): Promise<void> => {',
             'void (isOurFreeModelType ? fetchOurFreeModelModels(ourFreeModelProviderID) : fetchWizardModels());',
             'void fetchOurFreeModelModels(ourFreeModelProviderID);',
-            # One entry per channel: adding a channel adds that channel, so the
-            # picker offers each of them and Core reads the name to know which.
+            # One entry per channel this bridge can fetch: adding a channel adds
+            # that channel, so the picker offers each of them and Core reads the
+            # stored tag to know which.  The upstream's co-paid channel has no
+            # roster here (its seal never opens in this host), so it is not an
+            # entry: a wizard option that could only fail its import is worse
+            # than no option at all.
             '{ type: "ourFreeModelKilo", label: translate("providers.type.ourFreeModelKilo") },',
-            '{ type: "ourFreeModelEAC", label: translate("providers.type.ourFreeModelEAC") },',
+            'const kinds: WizardType[] = ["api", "openai", "claude", "workbuddy", "workbuddyGlobal", "ourFreeModel", "ourFreeModelKilo"];',
             'const ourFreeModelProviderID = ourFreeModelProviderIDFor(providerType);',
             # A channel's entry is named after the channel, because the name is
             # what Core reads to know which one it is.
@@ -4379,22 +4464,29 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # the name is what Core reads to know the channel.
         self.assertIn('"providers.type.ourFreeModel": "Our Free Model · OpenCode channel"', self.en)
         self.assertIn('"providers.type.ourFreeModelKilo": "Our Free Model · Kilo channel"', self.en)
-        self.assertIn('"providers.type.ourFreeModelEAC": "Our Free Model · EAC channel"', self.en)
         self.assertIn('"providers.type.ourFreeModel": "Our Free Model · OpenCode 通道"', self.zh)
         self.assertIn('"providers.type.ourFreeModelKilo": "Our Free Model · Kilo 通道"', self.zh)
-        self.assertIn('"providers.type.ourFreeModelEAC": "Our Free Model · EAC 协付通道"', self.zh)
+        # No wording survives for a channel this build does not offer, in either
+        # language or in the key union: a dead key is how the entry would creep
+        # back into the picker.
+        self.assertNotIn("ourFreeModelEAC", self.en)
+        self.assertNotIn("ourFreeModelEAC", self.zh)
+        self.assertNotIn("providers.laneChannel.eac", self.en)
+        self.assertNotIn("providers.laneChannel.eac", self.zh)
+        # Nothing in the shared UI still names the removed entry: a leftover
+        # wizard type or channel id is how the picker would offer it again.
+        self.assertNotIn("ourFreeModelEAC", self.ui)
+        self.assertNotIn("our-free-model-eac", self.ui)
         # One roster, several upstreams: each producer heading is its own word
         # in both languages, because the ids cannot tell the lanes apart.
         for key, zh in (
             ("providers.laneChannel.free", "OpenCode 免费通道"),
             ("providers.laneChannel.kilo", "Kilo 通道"),
-            ("providers.laneChannel.eac", "EAC 协付通道"),
         ):
             self.assertIn(f'"{key}": "{zh}"', self.zh, key)
         for key, en in (
             ("providers.laneChannel.free", "OpenCode free lane"),
             ("providers.laneChannel.kilo", "Kilo channel"),
-            ("providers.laneChannel.eac", "EAC co-paid channel"),
         ):
             self.assertIn(f'"{key}": "{en}"', self.en, key)
 
@@ -4922,7 +5014,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "onlineUsageSourcePicker: { width: 176, minWidth: 120",
             # The pager is a row of its own under the table, never an overlay
             # the native table paints over.
-            "logPager: { minHeight: 24, flexShrink: 0",
+            "usageStatusBar: { minHeight: 24, flexShrink: 0",
             "logFilterRowOnlineUsage: { flex: 1, minWidth: 50",
             "logFilterInput: { flex: 1, minWidth:",
             "logTable: { flex: 1, minHeight: 0",
@@ -4981,6 +5073,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
             ("logs.routeTrace.reasonImageUnsupported", "所有路由都不支持图像工具", "No route supports the image tool"),
             ("logs.routeTrace.reasonCompactionUnsupported", "上游不支持 Codex 压缩", "Upstream does not support Codex compaction"),
             ("logs.routeTrace.reasonImageFallback", "图像工具运行时回退", "Image tool runtime fallback"),
+            ("logs.routeTrace.reasonGatewayAuth", "本机网关拒绝了调用方的密钥", "The local gateway rejected the caller key"),
+            ("logs.gatewayAuthRejected", "本机网关拒绝密钥", "Local gateway rejected the key"),
         ):
             self.assertIn(f'"{key}": "{en}",', english)
             self.assertIn(f'"{key}": "{zh}",', chinese)
@@ -4994,6 +5088,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '"set-language-zh-Hans": "language.simplified_chinese",',
             '"no-available-deployment": "logs.noAvailableRoute",',
             '"model-not-configured": "logs.modelNotConfigured",',
+            '"local-gateway-auth-rejected": "logs.routeTrace.reasonGatewayAuth",',
+            'routingState === "gateway_auth_rejected"',
+            'translate("logs.gatewayAuthRejected")',
         ):
             self.assert_ui_has(marker)
 
@@ -5223,16 +5320,18 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('await commit("station.update", { id: station.id, name, origin, type });', relay)
         self.assertIn("translate(\"relay.stationUpdateStaged\")", relay)
         # One login state drives the status column and the account actions:
-        # 登录中 while the login is still being settled — a sign-in this pane
-        # started, or the session check it runs on mount — otherwise 已登录 /
-        # 未登录 (the expired and answered-signed-out cases read as 未登录 and
-        # keep the brown alert row). 去登录 only appears while signed out and is
-        # never disabled; 刷新资源 and 分组管理 are the controls that act on a
-        # session, so they appear only once the row reads 已登录.
-        self.assertIn('const relayLoginState = (account: RelayAccount): "signed_in" | "signing_in" | "signed_out" => {', relay)
+        # 登录中 while a sign-in this pane started is still being settled,
+        # 检测中 while the mount check is still fetching its answer, otherwise
+        # 已登录 / 未登录 (the expired and answered-signed-out cases read as 未登录
+        # and keep the brown alert row).  The two waits are not the same
+        # statement: a sign-in asks the station to mint a session, while a check
+        # only asks what the session on hand is worth. 去登录 only appears while
+        # signed out and is never disabled; 刷新资源 and 分组管理 are the controls
+        # that act on a session, so they appear only once the row reads 已登录.
+        self.assertIn('const relayLoginState = (account: RelayAccount): "signed_in" | "checking_login" | "signing_in" | "signed_out" => {', relay)
         self.assertIn('if (loading[account.id]?.session) return "signing_in";', relay)
         self.assertIn('if (effectiveLoginStatus(account) === "signed_in") return "signed_in";', relay)
-        self.assertIn('if (loading[account.id]?.checking) return "signing_in";', relay)
+        self.assertIn('if (loading[account.id]?.checking) return "checking_login";', relay)
         self.assertIn('return "signed_out";', relay)
         # 未登录 is a conclusion, not a placeholder: the mount check is a station
         # round trip whose network timeout is long enough that a row painted
@@ -5320,6 +5419,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn("markLocalSignedIn(account.id, false);\n      return false;", probe)
         self.assertIn('"relay.status.signing_in": "登录中"', self.zh)
         self.assertIn('"relay.status.signing_in": "Signing in"', self.en)
+        # The mount check is not a sign-in, so the row says 检测中 while it runs
+        # and 登录中 only while a sign-in this pane started is settling.
+        self.assertIn('"relay.status.checking_login": "检测中"', self.zh)
+        self.assertIn('"relay.status.checking_login": "Checking"', self.en)
         # The relay family has no manual select: it comes from the station
         # type or auto-detection, and grouping lives in the manager dialog.
         self.assertNotIn('translate("relay.type")', relay)
@@ -5762,7 +5865,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("nameField.trailingAnchor.constraint(equalTo: detailGuide.trailingAnchor),", mac_leaf)
         self.assertIn("modelsList.trailingAnchor.constraint(equalTo: detailGuide.trailingAnchor),", mac_leaf)
         self.assertIn("right_column.Width(xaml::GridLengthHelper::FromPixels(190));", windows_leaf)
-        self.assertIn("{590, window_height}", windows_leaf)
+        # The height is rounded to the whole DIPs the window API takes, so the
+        # measured layout decides the size instead of a truncated double.
+        self.assertIn(
+            "{590, static_cast<int32_t>(std::lround(window_height))}",
+            windows_leaf,
+        )
         self.assertIn("listFrame.widthAnchor.constraint(equalToConstant: listWidth),", mac_leaf)
         # 密钥's ＋ / － actions sit at the key list's top-right corner on both
         # hosts, not at the sheet's edge.
@@ -5987,12 +6095,24 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('account_unavailable: "providers.bindingIssueAccount",', self.ui)
         self.assertIn('resource_missing: "providers.bindingIssueResource",', self.ui)
         self.assertIn('catalog_model_missing: "providers.bindingIssueCatalog",', self.ui)
+        # The strip names the row the station refused, not only the outcome:
+        # the snapshot already says which key (and, for a catalog refusal, which
+        # route) failed, so the sentence reads that one projection instead of a
+        # second copy of the failure.
+        self.assertIn('const bindingStatus = relayBindingFailureStatus(reason, failureSnapshot, translate);', self.ui)
+        self.assertIn('if (stringValue(asRecord(reason).code) === "relay_binding_failed") {', self.ui)
+        self.assertIn('failureSnapshot = await ipc.snapshot();', self.ui)
+        self.assertIn('function relayBindingFailureStatus(reason: unknown, snapshot: unknown, translate: Translate): string | undefined {', self.ui)
+        self.assertIn('const modelLabel = code === "catalog_model_missing" || code === "multiplier_missing"', self.ui)
+        self.assertIn('translate("providers.bindingIssueCatalogModel", { key: keyLabel, model: modelLabel })', self.ui)
+        self.assertIn('if (stringValue(asRecord(reason).code) !== "relay_binding_failed") return undefined;', self.ui)
         types = (ROOT / "rn/packages/shared/src/i18n/types.ts").read_text(encoding="utf-8")
         for key in (
             "providers.bindingIssueAccount",
             "providers.bindingIssueResource",
             "providers.bindingIssueCredential",
             "providers.bindingIssueCatalog",
+            "providers.bindingIssueCatalogModel",
             "providers.bindingIssueBaseUrl",
             "providers.bindingIssueGeneric",
         ):
@@ -6221,10 +6341,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         for marker in (
             'formRow: { width: "100%", minHeight: 30, flexDirection: "column", alignItems: "stretch", gap: 5 }',
             # 刷新 and 分组 sit on the account row itself, so the relay pane has
-            # no separate action row.  The name is never clipped and owns its
-            # width; the row wraps the controls to the next line when a full
-            # address needs the room.
-            'accountNameValue: { minWidth: 0, color: colors.text, fontSize: UI_FONT_SIZE }',
+            # no separate action row.
             'fieldRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6, flexWrap: "wrap" }',
             'accountsEmpty: { minHeight: 40, alignItems: "center", justifyContent: "center", paddingHorizontal: 10, paddingVertical: 8, borderWidth: 1, borderColor: colors.separator, backgroundColor: colors.panel }',
         ):
@@ -6799,6 +6916,38 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.assertIn('"providers.chat": "OpenAI Chat Completions"', catalog)
         self.assertNotIn('"providers.responses": "响应接口"', chinese)
         self.assertNotIn('"providers.chat": "聊天接口"', chinese)
+        # The route trace names the same wires in both languages.  The word
+        # around it may be translated; the protocol may not, or two readers of
+        # one log disagree about which endpoint answered.
+        for catalog in (english, chinese):
+            self.assertIn('"logs.routeTrace.protocolResponses": "Responses"', catalog)
+            self.assertIn('"logs.routeTrace.protocolChat": "Chat"', catalog)
+            self.assertIn('"logs.routeTrace.protocolMessages": "Messages"', catalog)
+        # ...and the event words that already carried the protocol in prose.
+        self.assertNotIn('"logs.routeEvent.responses": "响应接口处理"', chinese)
+        self.assertNotIn('"logs.routeEvent.chatBridge": "切换聊天协议"', chinese)
+
+    def test_route_trace_merges_one_route_even_when_a_record_omits_the_wire(self) -> None:
+        """A record without a wire must refine, never split, its route's step.
+
+        The selection and the success of one attempt come from different hooks,
+        and only some of them know which wire the attempt left on.  Merging on
+        the rendered label turned that gap into a second step for the same
+        route, and the second one carried the first's failure ink.
+        """
+
+        for marker in (
+            "identity: string;",
+            "const existing = attempts.find((candidate) => candidate.identity === attempt.identity);",
+            "if (attempt.label !== attempt.identity && existing.label === existing.identity) {",
+            "label: `${route}${routeSurfaceSuffix(value.route, translate)}`,",
+            "label: `${failedRoute}${routeSurfaceSuffix(value.failed_route, translate)}`,",
+        ):
+            self.assert_ui_has(marker)
+        # Only an attempt-written ``surface`` is evidence about the wire; the
+        # route's policy and its declared backup protocol are not.
+        self.assert_ui_has("const surface = compactLogValue(asRecord(value).surface);")
+        self.assertNotIn("compactLogValue(route.surface) || compactLogValue(route.protocol_mode)", self.ui)
 
     def test_external_editor_is_a_native_sheet_not_an_overlay(self) -> None:
         # The editor is presented by the host (macOS sheet, Windows route), so

@@ -38,6 +38,16 @@ class FakeResponse:
 
 
 class RemoteUsageLogsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # A minted dashboard token is cached in memory per account, so one
+        # test's token must never authorize another test's read.
+        remote_usage_logs._TOKEN_CACHE.clear()
+        remote_usage_logs._REFRESH_CACHE.clear()
+        remote_usage_logs.set_rotated_refresh_sink(None)
+        self.addCleanup(remote_usage_logs._TOKEN_CACHE.clear)
+        self.addCleanup(remote_usage_logs._REFRESH_CACHE.clear)
+        self.addCleanup(remote_usage_logs.set_rotated_refresh_sink, None)
+
     @staticmethod
     def write_relay_station(path: Path, origin: str, station_type: str = "newapi", account_id: str = "") -> None:
         """Register a relay station the way the relay panes record one.
@@ -84,6 +94,19 @@ class RemoteUsageLogsTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+
+    def write_signed_in_config(self) -> Path:
+        """A relay the app holds a dashboard login for.
+
+        A usage read goes through the account's own dashboard session — the
+        per-key feed beside it answers only that key's traffic — so a fixture
+        that exercises a read has to record a login, exactly as the relay panes
+        do when the user signs in.
+        """
+
+        path = self.write_config()
+        self.write_relay_station(path, "https://relay.example.test", account_id="login-test")
+        return path
 
     def write_config(self) -> Path:
         directory = tempfile.TemporaryDirectory()
@@ -178,106 +201,6 @@ class RemoteUsageLogsTests(unittest.TestCase):
         self.write_relay_station(path, "https://relay.example.test")
         return path
 
-    def test_newapi_logs_are_sanitized_and_do_not_print_path_or_credential(self) -> None:
-        path = self.write_config()
-        seen: list[str] = []
-
-        def opener(request, timeout):
-            seen.append(request.full_url)
-            self.assertEqual(request.get_header("Authorization"), "Bearer replace-me")
-            return FakeResponse(
-                {
-                    "success": True,
-                    "data": {
-                        "items": [
-                            {
-                                "created_at": "2026-07-18T10:00:00Z",
-                                "model_name": "example-model",
-                                "status": "success",
-                                "total_tokens": 42,
-                                "request_body": "SECRET_REQUEST_BODY",
-                                "path": "/private/secret.txt",
-                            }
-                        ]
-                    },
-                }
-            )
-
-        with patch("young_router.core.remote_usage_logs.isolated_http_opener") as opener_factory:
-            opener_factory.return_value.open.side_effect = opener
-            output = remote_usage_logs.render(path, 1)
-
-        self.assertEqual(seen, ["https://relay.example.test/api/log/token"])
-        # The station is named by its own identity, not by the alias the
-        # user gave the route: the same words the relay panes show.
-        self.assertIn("relay (NewAPI)", output)
-        self.assertIn("example-model", output)
-        self.assertIn("tokens=42", output)
-        self.assertRegex(
-            output.splitlines()[0],
-            r"^Updated \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$",
-        )
-        self.assertNotIn("replace-me", output)
-        self.assertNotIn("SECRET_REQUEST_BODY", output)
-        self.assertNotIn("/private/secret.txt", output)
-
-    def test_unsupported_endpoints_do_not_expose_remote_error_text(self) -> None:
-        path = self.write_config()
-
-        def opener(request, timeout):
-            raise HTTPError(request.full_url, 404, "not found", {}, io.BytesIO())
-
-        with patch("young_router.core.remote_usage_logs.isolated_http_opener") as opener_factory:
-            opener_factory.return_value.open.side_effect = opener
-            output = remote_usage_logs.render(path, 1)
-
-        # A code, not a sentence: the pane states each outcome in the user's
-        # language, and an error text from the station never reaches it.
-        self.assertEqual(output, remote_usage_logs.USAGE_REASON_UNSUPPORTED)
-
-    def test_gateway_key_log_feed_is_used_directly(self) -> None:
-        path = self.write_config()
-        seen: list[tuple[str, str | None]] = []
-
-        def opener(request, timeout):
-            seen.append((request.full_url, request.get_header("Authorization")))
-            self.assertTrue(request.full_url.endswith("/log/token"))
-            return FakeResponse(
-                {
-                    "success": True,
-                    "data": [
-                        {
-                            "created_at": 1784368800,
-                            "model_name": "gateway-model",
-                            "prompt_tokens": 3,
-                            "completion_tokens": 5,
-                            "content": "SECRET_RESPONSE_TEXT",
-                            "ip": "203.0.113.9",
-                        }
-                    ],
-                }
-            )
-
-        with patch("young_router.core.remote_usage_logs.isolated_http_opener") as opener_factory:
-            opener_factory.return_value.open.side_effect = opener
-            output = remote_usage_logs.render(path, 1)
-
-        self.assertEqual(
-            seen,
-            [
-                ("https://relay.example.test/api/log/token", "Bearer replace-me"),
-            ],
-        )
-        # The station is named by its own identity, not by the alias the
-        # user gave the route: the same words the relay panes show.
-        self.assertIn("relay (NewAPI)", output)
-        self.assertIn("gateway-model", output)
-        self.assertIn("tokens=8", output)
-        self.assertRegex(output, r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z  gateway-model")
-        self.assertNotIn("replace-me", output)
-        self.assertNotIn("SECRET_RESPONSE_TEXT", output)
-        self.assertNotIn("203.0.113.9", output)
-
     def test_a_route_reads_usage_with_the_slot_it_names(self) -> None:
         """The slot decides, and a slot the provider does not carry reads nothing.
 
@@ -323,54 +246,6 @@ class RemoteUsageLogsTests(unittest.TestCase):
             remote_usage_logs._credential_for_model(provider, {}),
         )
 
-    def test_sub2api_credential_usage_summary_is_sanitized(self) -> None:
-        target = remote_usage_logs.UsageTarget(
-            provider="relay",
-            api_base="https://relay.example.test/v1",
-            api_key="replace-me",
-        )
-        seen: list[tuple[str, str | None]] = []
-
-        def opener(request, timeout):
-            seen.append((request.full_url, request.get_header("Authorization")))
-            if request.full_url.endswith("/v1/usage"):
-                return FakeResponse(
-                    {
-                        "mode": "unrestricted",
-                        "model_stats": [
-                            {
-                                "model": "sub2api-model",
-                                "input_tokens": 7,
-                                "output_tokens": 11,
-                                "request_id": "private-request-id",
-                                "ip_address": "203.0.113.10",
-                            }
-                        ],
-                    }
-                )
-            raise HTTPError(request.full_url, 404, "not found", {}, io.BytesIO())
-
-        with patch("young_router.core.remote_usage_logs.isolated_http_opener") as opener_factory:
-            opener_factory.return_value.open.side_effect = opener
-            source, rows = remote_usage_logs.fetch_target(target, 1)
-
-        self.assertEqual("sub2api", source)
-        self.assertEqual(1, len(rows))
-        self.assertEqual("sub2api-model", rows[0]["model"])
-        self.assertEqual("18", rows[0]["total_tokens"])
-        # The row carries only the fields the log view renders: a request id or
-        # an address the station also returned must not reach it.
-        self.assertNotIn("private-request-id", str(rows[0]))
-        self.assertNotIn("203.0.113.10", str(rows[0]))
-        self.assertEqual(
-            seen,
-            [
-                ("https://relay.example.test/api/log/token", "Bearer replace-me"),
-                ("https://relay.example.test/v1/usage", "Bearer replace-me"),
-            ],
-        )
-
-
     def test_keys_of_one_account_are_one_target(self) -> None:
         path = self.write_config()
 
@@ -405,40 +280,6 @@ class RemoteUsageLogsTests(unittest.TestCase):
         # entry adds, so the source column still reads as the relay.
         self.assertEqual("relay", targets[0].provider)
         self.assertIn("login-a", targets[0].display())
-
-    def test_a_second_accounts_rows_are_read_with_its_own_key(self) -> None:
-        """Selecting one account must never answer with the other's rows."""
-
-        path = self.write_two_account_config()
-        targets = remote_usage_logs.active_usage_targets(path)
-        second = next(target for target in targets if target.account_id == "login-b")
-        seen: list[str] = []
-
-        def opener(request, timeout):
-            seen.append(request.get_header("Authorization"))
-            return FakeResponse(
-                {
-                    "success": True,
-                    "data": {
-                        "items": [
-                            {
-                                "model_name": "second-account-model",
-                                "total_tokens": 4,
-                                "token_name": "b",
-                            }
-                        ]
-                    },
-                }
-            )
-
-        with patch("young_router.core.remote_usage_logs.isolated_http_opener") as opener_factory:
-            opener_factory.return_value.open.side_effect = opener
-            records, status = remote_usage_logs.collect(path, 1, second.source_id)
-
-        self.assertEqual("", status)
-        self.assertEqual(["Bearer replace-me-b"], seen)
-        self.assertEqual("second-account-model", records[0]["model"])
-        self.assertEqual("login-b", records[0]["account_id"])
 
     def test_a_stations_other_credentials_are_kept_as_fallbacks(self) -> None:
         directory = tempfile.TemporaryDirectory()
@@ -490,38 +331,6 @@ class RemoteUsageLogsTests(unittest.TestCase):
             target.credentials(),
         )
 
-    def test_a_target_reads_with_its_first_working_credential(self) -> None:
-        path = self.write_config()
-        target = remote_usage_logs.active_usage_targets(path)[0]
-        # The first key cannot read the feed; the second can.
-        refused = remote_usage_logs.UsageTarget(
-            provider=target.provider,
-            api_base=target.api_base,
-            api_key="replace-me-first",
-            fallback_keys=("replace-me-second",),
-        )
-        seen: list[str] = []
-
-        def opener(request, timeout):
-            authorization = request.get_header("Authorization")
-            seen.append(authorization)
-            if authorization == "Bearer replace-me-first":
-                raise HTTPError(request.full_url, 401, "unauthorized", {}, io.BytesIO())
-            return FakeResponse(
-                {
-                    "success": True,
-                    "data": {"items": [{"model_name": "fallback-model", "total_tokens": 5}]},
-                }
-            )
-
-        with patch("young_router.core.remote_usage_logs.isolated_http_opener") as opener_factory:
-            opener_factory.return_value.open.side_effect = opener
-            source, records = remote_usage_logs.fetch_target(refused, 1)
-
-        self.assertEqual("newapi", source)
-        self.assertEqual("fallback-model", records[0]["model"])
-        self.assertIn("Bearer replace-me-second", seen)
-
     def test_usage_sources_name_each_relay_without_exposing_a_credential(self) -> None:
         path = self.write_config()
 
@@ -534,7 +343,10 @@ class RemoteUsageLogsTests(unittest.TestCase):
         self.assertNotIn("replace-me", sources[0]["id"])
 
     def test_a_usage_row_carries_its_relays_full_name_and_its_own_fields(self) -> None:
-        path = self.write_config()
+        path = self.write_signed_in_config()
+        target = next(
+            t for t in remote_usage_logs.active_usage_targets(path) if t.session_headers
+        )
 
         def opener(request, timeout):
             return FakeResponse(
@@ -565,7 +377,7 @@ class RemoteUsageLogsTests(unittest.TestCase):
 
         with patch("young_router.core.remote_usage_logs.isolated_http_opener") as opener_factory:
             opener_factory.return_value.open.side_effect = opener
-            records, status = remote_usage_logs.collect(path, 1)
+            _kind, records, status, _total, _applied = remote_usage_logs.fetch_target(target, 1)
 
         self.assertEqual("", status)
         self.assertEqual(1, len(records))
@@ -585,104 +397,21 @@ class RemoteUsageLogsTests(unittest.TestCase):
         self.assertEqual("channel-one", record["channel"])
         self.assertEqual("group-one", record["group"])
         self.assertEqual("prod-key", record["key_name"])
-        self.assertEqual("1.85", record["duration"])
+        # `use_time` is seconds; the record carries milliseconds so every family
+        # lands on one unit and the column's own `(s)` label is applied once.
+        self.assertEqual("1850", record["duration"])
         self.assertEqual("1234", record["cost"])
         # The record is exactly the fields the log view renders.
         self.assertNotIn("203.0.113.9", str(record))
         self.assertNotIn("SECRET_RESPONSE_TEXT", str(record))
 
-    def test_every_key_of_a_station_is_read_not_just_the_first_that_answers(self) -> None:
-        path = self.write_config()
-        target = remote_usage_logs.active_usage_targets(path)[0]
-        multi = remote_usage_logs.UsageTarget(
-            provider=target.provider,
-            api_base=target.api_base,
-            api_key="replace-me-quiet",
-            fallback_keys=("replace-me-busy",),
-        )
-        seen: list[str] = []
-
-        def opener(request, timeout):
-            authorization = request.get_header("Authorization")
-            seen.append(authorization)
-            # The first key is valid and answers zero rows; the second is the
-            # one that served the traffic. Stopping at the first would report
-            # "no usage" for a station that was actively serving requests.
-            if authorization == "Bearer replace-me-quiet":
-                return FakeResponse({"success": True, "data": {"items": []}})
-            return FakeResponse(
-                {
-                    "success": True,
-                    "data": {
-                        "items": [
-                            {"model_name": "busy-model", "total_tokens": 9, "token_name": "busy"}
-                        ]
-                    },
-                }
-            )
-
-        with patch("young_router.core.remote_usage_logs.isolated_http_opener") as opener_factory:
-            opener_factory.return_value.open.side_effect = opener
-            source, records = remote_usage_logs.fetch_target(multi, 1)
-
-        self.assertEqual("newapi", source)
-        self.assertEqual(["busy-model"], [record["model"] for record in records])
-        self.assertIn("Bearer replace-me-busy", seen)
-
-    def test_a_row_reported_through_two_keys_is_counted_once(self) -> None:
-        path = self.write_config()
-        target = remote_usage_logs.active_usage_targets(path)[0]
-        shared = remote_usage_logs.UsageTarget(
-            provider=target.provider,
-            api_base=target.api_base,
-            api_key="replace-me-one",
-            fallback_keys=("replace-me-two",),
-        )
-        row = {
-            "created_at": "2026-07-18T10:00:00Z",
-            "model_name": "same-model",
-            "total_tokens": 7,
-            "token_name": "same",
-        }
-
-        def opener(request, timeout):
-            return FakeResponse({"success": True, "data": {"items": [dict(row)]}})
-
-        with patch("young_router.core.remote_usage_logs.isolated_http_opener") as opener_factory:
-            opener_factory.return_value.open.side_effect = opener
-            _source, records = remote_usage_logs.fetch_target(shared, 1)
-
-        self.assertEqual(1, len(records))
-
-    def test_a_large_but_valid_log_page_is_not_rejected_as_unsupported(self) -> None:
-        path = self.write_config()
-        target = remote_usage_logs.active_usage_targets(path)[0]
-        # A station's own page size is often a thousand rows, which is a
-        # several-hundred-kilobyte document. A cap below that rejected the
-        # busiest keys as if their endpoint were unsupported.
-        items = [
-            {
-                "model_name": f"model-{index}",
-                "total_tokens": index,
-                "token_name": "k",
-                "created_at": index,
-            }
-            for index in range(1000)
-        ]
-
-        def opener(request, timeout):
-            return FakeResponse({"success": True, "data": {"items": items}})
-
-        with patch("young_router.core.remote_usage_logs.isolated_http_opener") as opener_factory:
-            opener_factory.return_value.open.side_effect = opener
-            source, records = remote_usage_logs.fetch_target(target, 1)
-
-        self.assertEqual("newapi", source)
-        self.assertEqual(1000, len(records))
-
     def test_a_scoped_collect_reads_only_the_named_relay(self) -> None:
-        path = self.write_config()
-        target = remote_usage_logs.active_usage_targets(path)[0]
+        path = self.write_signed_in_config()
+        # The account's own target is the one that carries a dashboard login; the
+        # provider-derived entry has none and is not readable.
+        target = next(
+            t for t in remote_usage_logs.active_usage_targets(path) if t.session_headers
+        )
         seen: list[str] = []
 
         def opener(request, timeout):
@@ -702,7 +431,7 @@ class RemoteUsageLogsTests(unittest.TestCase):
         self.assertTrue(seen)
 
     def test_an_unknown_source_reads_no_relay_at_all(self) -> None:
-        path = self.write_config()
+        path = self.write_signed_in_config()
         seen: list[str] = []
 
         def opener(request, timeout):
@@ -715,6 +444,179 @@ class RemoteUsageLogsTests(unittest.TestCase):
 
         self.assertEqual([], seen)
         self.assertEqual(remote_usage_logs.USAGE_REASON_UNKNOWN_SOURCE, output)
+
+    def _session_target(self, provider: str = "relay", station_type: str = "newapi") -> object:
+        """A relay account the app holds a dashboard login for."""
+
+        return remote_usage_logs.UsageTarget(
+            provider=provider,
+            api_base="https://relay.example.test/v1",
+            api_key="replace-me",
+            account="tester",
+            account_id="login-tester",
+            station_type=station_type,
+            session_headers=(("Authorization", "Bearer session-token"),),
+        )
+
+    def test_newapi_usage_is_read_through_the_accounts_own_feed(self) -> None:
+        """The dashboard's endpoint, one request, and nothing private leaks.
+
+        ``/log/self`` answers the login's whole history.  The per-key feed beside
+        it answers only the traffic that key served, so it is never asked.
+        """
+
+        target = self._session_target()
+        seen: list[str] = []
+
+        def opener(request, timeout):
+            seen.append(request.full_url)
+            self.assertEqual(request.get_header("Authorization"), "Bearer session-token")
+            return FakeResponse(
+                {
+                    "success": True,
+                    "data": {
+                        "page": 1,
+                        "page_size": 100,
+                        "total": 4242,
+                        "items": [
+                            {
+                                "created_at": 1792867428,
+                                "model_name": "example-model",
+                                "use_time": 8,
+                                "prompt_tokens": 12,
+                                "completion_tokens": 3,
+                                "group": {"id": 7, "name": "混合分组"},
+                                "token_name": "secret-key-name",
+                                "ip": "203.0.113.9",
+                                "content": "SECRET_REQUEST_BODY",
+                            }
+                        ],
+                    },
+                }
+            )
+
+        with patch("young_router.core.remote_usage_logs.isolated_http_opener") as opener_factory:
+            opener_factory.return_value.open.side_effect = opener
+            kind, records, reason, total, applied = remote_usage_logs.fetch_target(target, 1)
+
+        self.assertEqual(1, len(seen))
+        self.assertIn("/api/log/self?", seen[0])
+        self.assertNotIn("/log/token", seen[0])
+        self.assertEqual("newapi", kind)
+        self.assertEqual("", reason)
+        self.assertEqual(4242, total)
+        self.assertEqual(100, applied)
+        self.assertEqual("example-model", records[0]["model"])
+        self.assertEqual("混合分组", records[0]["group"])
+        self.assertEqual("8000", records[0]["duration"])
+        flat = json.dumps(records)
+        self.assertNotIn("SECRET_REQUEST_BODY", flat)
+        self.assertNotIn("203.0.113.9", flat)
+        self.assertNotIn("session-token", flat)
+
+    def test_a_duration_keeps_its_units_across_both_station_families(self) -> None:
+        """Seconds and milliseconds must not be read as one unit.
+
+        A New API log states `use_time` in seconds; a Sub2API ledger states
+        `duration_ms` in milliseconds.  Treating both as milliseconds rendered
+        every New API row as `0`.
+        """
+
+        self.assertEqual(
+            {"model": "m", "duration": "8000"},
+            remote_usage_logs._row_details({"use_time": 8, "model": "m"}),
+        )
+        self.assertEqual(
+            {"model": "m", "duration": "3159"},
+            remote_usage_logs._row_details({"duration_ms": 3159, "model": "m"}),
+        )
+
+    def test_a_usage_read_never_uses_a_gateway_key(self) -> None:
+        """No session, no history: a key's own feed is not the account's.
+
+        One station's six keys answered the same request with 42, 53, 447 and
+        1000 rows and newest rows 32 hours apart.  Reading them one by one and
+        merging was slower than the pane could wait and still showed a partial
+        history as the account's, so a relay with no dashboard login now states
+        that instead.
+        """
+
+        target = remote_usage_logs.UsageTarget(
+            provider="relay",
+            api_base="https://relay.example.test/v1",
+            api_key="replace-me",
+            account="tester",
+            account_id="login-tester",
+            station_type="newapi",
+        )
+        seen: list[str] = []
+
+        def opener(request, timeout):
+            seen.append(request.full_url)
+            return FakeResponse({"success": True, "data": {"items": []}})
+
+        with patch("young_router.core.remote_usage_logs.isolated_http_opener") as opener_factory:
+            opener_factory.return_value.open.side_effect = opener
+            kind, records, reason, _total, _applied = remote_usage_logs.fetch_target(target, 1)
+
+        self.assertEqual([], seen)
+        self.assertEqual("", kind)
+        self.assertEqual([], records)
+        self.assertEqual(remote_usage_logs.USAGE_REASON_NO_CREDENTIAL, reason)
+
+    def test_a_newapi_page_turn_is_one_request(self) -> None:
+        """One page, one request, and the feed's own numbering.
+
+        The feed answered page one for both ``p=0`` and ``p=1``, so the reader
+        sends its one-based page directly.  Walking the history before answering
+        cost 146 requests and 118 seconds for a single page turn.
+        """
+
+        target = self._session_target()
+        seen: list[str] = []
+
+        def opener(request, timeout):
+            seen.append(request.full_url)
+            return FakeResponse(
+                {
+                    "success": True,
+                    "data": {
+                        "page": 2,
+                        "page_size": 100,
+                        "total": 4242,
+                        "items": [
+                            {"created_at": 1792867000 + index, "model_name": f"m{index}"}
+                            for index in range(100)
+                        ],
+                    },
+                }
+            )
+
+        with patch("young_router.core.remote_usage_logs.isolated_http_opener") as opener_factory:
+            opener_factory.return_value.open.side_effect = opener
+            kind, records, reason, total, applied = remote_usage_logs.fetch_target(
+                target, 1, page=2, rows_per_page=300
+            )
+
+        self.assertEqual(1, len(seen))
+        self.assertIn("p=2", seen[0])
+        self.assertIn("page_size=300", seen[0])
+        self.assertEqual(100, len(records))
+        self.assertEqual((4242, 100), (total, applied))
+        self.assertEqual("", reason)
+
+    def test_a_refused_usage_login_is_its_own_reason(self) -> None:
+        target = self._session_target()
+
+        def opener(request, timeout):
+            raise HTTPError(request.full_url, 401, "unauthorized", {}, io.BytesIO())
+
+        with patch("young_router.core.remote_usage_logs.isolated_http_opener") as opener_factory:
+            opener_factory.return_value.open.side_effect = opener
+            _kind, records, reason, _total, _applied = remote_usage_logs.fetch_target(target, 1)
+
+        self.assertEqual([], records)
+        self.assertEqual(remote_usage_logs.USAGE_REASON_LOGIN_EXPIRED, reason)
 
     def test_a_sub2api_account_reads_its_per_request_ledger_not_the_summary(self) -> None:
         """The ledger is the only shape that can fill a log table.
@@ -734,11 +636,16 @@ class RemoteUsageLogsTests(unittest.TestCase):
             account_id="login-one",
             station_type="sub2api",
             session_headers=(("Authorization", "Bearer session-token"),),
+            refresh_token="rt_ledger",
         )
         seen: list[str] = []
 
         def opener(request, timeout):
             seen.append(request.full_url)
+            if "/api/v1/auth/refresh" in request.full_url:
+                return FakeResponse(
+                    {"code": 0, "data": {"access_token": "live-token", "expires_in": 3600}}
+                )
             if "/api/v1/usage" in request.full_url:
                 return FakeResponse(
                     {
@@ -764,7 +671,7 @@ class RemoteUsageLogsTests(unittest.TestCase):
 
         with patch("young_router.core.remote_usage_logs.isolated_http_opener") as opener_factory:
             opener_factory.return_value.open.side_effect = opener
-            kind, records = remote_usage_logs.fetch_target(target, 1)
+            kind, records, _reason, _total, _applied = remote_usage_logs.fetch_target(target, 1)
 
         self.assertEqual("sub2api", kind)
         self.assertEqual(
@@ -777,37 +684,52 @@ class RemoteUsageLogsTests(unittest.TestCase):
             [record["timestamp"] for record in records],
         )
         self.assertIn("/api/v1/usage", seen[0])
+        # The station orders the ledger server-side, so the reader sends the
+        # same ordering its dashboard sends instead of taking an arbitrary
+        # window of the account's history.
+        self.assertIn("sort_by=created_at", seen[0])
+        self.assertIn("sort_order=desc", seen[0])
 
-    def test_a_newapi_log_feed_is_read_past_its_first_page(self) -> None:
-        """One page is not an account's history.
+    def test_a_refused_sub2api_ledger_never_falls_back_to_the_per_model_summary(self) -> None:
+        """A signed-out dashboard has no log feed, and the summary is not one.
 
-        The feed is paginated and its first page is a page, not the whole list;
-        reading only it reported the busiest account's usage as however many
-        rows the station's default page happened to carry.
+        ``/v1/usage`` answers one always-current row per model stamped with the
+        moment of the read.  When the dashboard login that reads the ledger had
+        expired, the reader used to fall through to that document, so the pane
+        showed as many rows as the account had models, all sharing one
+        timestamp, and read as a complete up-to-date history: nine models
+        rendered as "9 rows" no matter how much traffic the account had served.
+        A refused ledger is therefore an empty read, not a summary one.
         """
 
         target = remote_usage_logs.UsageTarget(
             provider="relay",
             api_base="https://relay.example.test/v1",
             api_key="replace-me",
+            account="someone",
+            account_id="login-one",
+            station_type="sub2api",
+            session_headers=(("Authorization", "Bearer expired-token"),),
+            refresh_token="rt_spent",
         )
-        page_size = remote_usage_logs._NEWAPI_MIN_PAGE
+        seen: list[str] = []
 
         def opener(request, timeout):
-            query = request.full_url.split("?", 1)[1] if "?" in request.full_url else ""
-            params = dict(part.split("=", 1) for part in query.split("&") if "=" in part)
-            page = int(params.get("p", "0"))
+            seen.append(request.full_url)
+            if "/api/v1/auth/refresh" in request.full_url:
+                # The refresh token is spent too, so no live token can be
+                # minted and the ledger is never even asked.
+                raise HTTPError(request.full_url, 401, "unauthorized", {}, io.BytesIO())
+            if "/api/v1/usage" in request.full_url:
+                raise HTTPError(request.full_url, 401, "unauthorized", {}, io.BytesIO())
+            # The summary document is reachable and would answer nine models.
             return FakeResponse(
                 {
                     "success": True,
                     "data": {
-                        "items": [
-                            {
-                                "created_at": 1784368800 + page * 1000 + index,
-                                "model_name": f"model-{page}",
-                                "total_tokens": 1,
-                            }
-                            for index in range(page_size)
+                        "model_stats": [
+                            {"model": f"summary-model-{index}", "total_tokens": 100 + index}
+                            for index in range(9)
                         ]
                     },
                 }
@@ -815,15 +737,162 @@ class RemoteUsageLogsTests(unittest.TestCase):
 
         with patch("young_router.core.remote_usage_logs.isolated_http_opener") as opener_factory:
             opener_factory.return_value.open.side_effect = opener
-            _kind, records = remote_usage_logs.fetch_target(target, 1)
+            kind, records, reason, _total, _applied = remote_usage_logs.fetch_target(target, 1)
 
-        # The first page plus the pages after it, up to the reader's bound.
-        self.assertGreater(len(records), page_size)
-        self.assertGreater(
-            len({record["model"] for record in records}),
-            1,
-            "a feed that answered full pages was read once and cut short",
+        self.assertEqual("", kind)
+        self.assertEqual([], records)
+        # A spent login is its own reported outcome, not "no rows" and not
+        # "this station installs no feed": signing in again is the fix.
+        self.assertEqual(remote_usage_logs.USAGE_REASON_LOGIN_EXPIRED, reason)
+        # The summary document was never asked, so it could not answer rows.
+        # The per-model summary lives at `<root>/v1/usage`; the ledger is the
+        # different path `/api/v1/usage`.  Only the ledger may be asked.
+        self.assertFalse(
+            [
+                url
+                for url in seen
+                if "/v1/usage" in url and "/api/v1/usage" not in url
+            ],
+            "the per-model summary must never be read as a log feed",
         )
+
+    def test_a_usage_read_mints_a_token_from_the_refresh_token(self) -> None:
+        """A refused stored token is replaced through the refresh token.
+
+        A spent dashboard token is the signal to exchange the refresh token, and
+        the exchange rotates it: the successor is handed to the store, because a
+        refresh token kept only in memory dies with the process and the account
+        would then have to be signed in again.
+        """
+
+        target = remote_usage_logs.UsageTarget(
+            provider="relay",
+            api_base="https://relay.example.test/v1",
+            api_key="replace-me",
+            account="someone",
+            account_id="login-fresh",
+            station_type="sub2api",
+            session_headers=(("Authorization", "Bearer stale-token"),),
+            refresh_token="rt_current",
+        )
+        calls: list[tuple[str, str]] = []
+
+        def opener(request, timeout):
+            calls.append((request.full_url, request.get_header("Authorization") or ""))
+            if "/api/v1/auth/refresh" in request.full_url:
+                self.assertEqual("rt_current", json.loads(request.data)["refresh_token"])
+                return FakeResponse(
+                    {
+                        "code": 0,
+                        "data": {
+                            "access_token": "fresh-token",
+                            "refresh_token": "rt_rotated",
+                            "expires_in": 172800,
+                            "token_type": "Bearer",
+                        },
+                    }
+                )
+            # The station refuses the token the login still stores, which is
+            # what a spent dashboard token answers.
+            if request.get_header("Authorization") == "Bearer stale-token":
+                raise HTTPError(request.full_url, 401, "unauthorized", {}, io.BytesIO())
+            return FakeResponse(
+                {
+                    "code": 0,
+                    "data": {
+                        "page": 1,
+                        "pages": 1,
+                        "page_size": 200,
+                        "total": 1,
+                        "items": [
+                            {
+                                "model": "ledger-model",
+                                "input_tokens": 10,
+                                "output_tokens": 2,
+                                "created_at": "2026-10-01T10:00:00Z",
+                            }
+                        ],
+                    },
+                }
+            )
+
+        rotated: list[tuple[str, str]] = []
+        remote_usage_logs.set_rotated_refresh_sink(lambda account_id, token: rotated.append((account_id, token)))
+        try:
+            with patch("young_router.core.remote_usage_logs.isolated_http_opener") as opener_factory:
+                opener_factory.return_value.open.side_effect = opener
+                kind, records, reason, _total, _applied = remote_usage_logs.fetch_target(target, 1)
+        finally:
+            remote_usage_logs.set_rotated_refresh_sink(None)
+
+        self.assertEqual("sub2api", kind)
+        self.assertEqual("", reason)
+        self.assertEqual(["ledger-model"], [record["model"] for record in records])
+        # A token with no readable expiry is offered to the station first: a
+        # dashboard session routinely outlives the pane, and minting a
+        # replacement for a token that still works costs a session every read.
+        ledger_calls = [headers for url, headers in calls if "/api/v1/usage" in url]
+        # The stored token is offered first, refused, and only then replaced.
+        self.assertEqual(["Bearer stale-token", "Bearer fresh-token"], ledger_calls)
+        # It was refused, so exactly one renewal happened — and it did happen,
+        # because a refusal is the one signal that the token is really spent.
+        self.assertEqual(
+            1,
+            len([url for url, _ in calls if "/api/v1/auth/refresh" in url]),
+        )
+        # The rotated refresh token is handed to the store that can keep it,
+        # because a refresh token kept only in memory dies with the process.
+        self.assertEqual([("login-fresh", "rt_rotated")], rotated)
+
+    def test_a_live_stored_token_is_never_refreshed(self) -> None:
+        """A working dashboard token is used as it stands.
+
+        Every refresh is a session at the station, and stations cap concurrent
+        sessions.  A token whose own `exp` says it is live therefore authorizes
+        the read directly: no exchange, no sign-in, no session.
+        """
+
+        import base64 as _b64
+        import time as _time
+
+        claims = _b64.urlsafe_b64encode(
+            json.dumps({"exp": int(_time.time()) + 3600}).encode()
+        ).decode().rstrip("=")
+        live = f"header.{claims}.signature"
+
+        target = remote_usage_logs.UsageTarget(
+            provider="relay",
+            api_base="https://relay.example.test/v1",
+            api_key="replace-me",
+            account="someone",
+            account_id="login-live",
+            station_type="sub2api",
+            session_headers=(("Authorization", f"Bearer {live}"),),
+            refresh_token="rt_live",
+        )
+        calls: list[str] = []
+
+        def opener(request, timeout):
+            calls.append(request.full_url)
+            if "/api/v1/auth/refresh" in request.full_url:
+                raise AssertionError("a live token must not be refreshed")
+            return FakeResponse(
+                {
+                    "code": 0,
+                    "data": {"page": 1, "pages": 1, "page_size": 200, "total": 0, "items": []},
+                }
+            )
+
+        with patch("young_router.core.remote_usage_logs.isolated_http_opener") as opener_factory:
+            opener_factory.return_value.open.side_effect = opener
+            kind, records, reason, _total, _applied = remote_usage_logs.fetch_target(target, 1)
+
+        self.assertEqual("sub2api", kind)
+        self.assertEqual([], records)
+        self.assertEqual("", reason)
+        # Exactly one request: the ledger, with the token the login already had.
+        self.assertEqual(1, len(calls))
+        self.assertIn("/api/v1/usage", calls[0])
 
     def test_an_empty_ledger_says_no_rows_not_unsupported(self) -> None:
         """An account that has served nothing is not a station without a feed.
@@ -840,9 +909,14 @@ class RemoteUsageLogsTests(unittest.TestCase):
             account_id="login-empty",
             station_type="sub2api",
             session_headers=(("Authorization", "Bearer session-token"),),
+            refresh_token="rt_empty-ledger",
         )
 
         def opener(request, timeout):
+            if "/api/v1/auth/refresh" in request.full_url:
+                return FakeResponse(
+                    {"code": 0, "data": {"access_token": "live-token", "expires_in": 3600}}
+                )
             if "/api/v1/usage" in request.full_url:
                 return FakeResponse(
                     {"code": 0, "data": {"items": [], "total": 0, "page": 1, "pages": 1}}
@@ -851,9 +925,13 @@ class RemoteUsageLogsTests(unittest.TestCase):
 
         with patch("young_router.core.remote_usage_logs.isolated_http_opener") as opener_factory:
             opener_factory.return_value.open.side_effect = opener
-            _kind, rows = remote_usage_logs.fetch_target(target, 1)
+            kind, rows, reason, _total, _applied = remote_usage_logs.fetch_target(target, 1)
 
         self.assertEqual([], rows)
+        # The station answered and has served nothing: that is its own state,
+        # not a login that stopped working.
+        self.assertEqual("sub2api", kind)
+        self.assertEqual("", reason)
 
     def test_a_provider_that_is_not_a_relay_is_never_offered(self) -> None:
         """The dropdown lists relay stations, not every provider.
