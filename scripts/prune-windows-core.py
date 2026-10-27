@@ -90,10 +90,8 @@ def prune_python_runtime(runtime: Path) -> None:
     # LiteLLM's optional web/admin payload is not used by the desktop app.
     shutil.rmtree(site / "litellm" / "proxy" / "client" / "cli", ignore_errors=True)
     (site / "litellm" / "proxy" / "_lazy_openapi_snapshot.json").unlink(missing_ok=True)
-    swagger = site / "litellm" / "proxy" / "swagger"
-    if swagger.is_dir():
-        for child in swagger.iterdir():
-            _remove(child)
+    # LiteLLM imports this directory at module load time to mount its OpenAPI
+    # endpoint, even when the desktop host never exposes the admin UI.
     admin_ui = site / "litellm" / "proxy" / "_experimental" / "out"
     shutil.rmtree(admin_ui, ignore_errors=True)
 

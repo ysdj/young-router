@@ -1107,8 +1107,17 @@ class ProvidersModelsDomainTests(unittest.TestCase):
                         "object": "list",
                         "data": [
                             {"id": "model-b", "supported_tools": ["web_search"]},
+                            {
+                                "id": "model-image",
+                                "type": "image",
+                                "architecture": {
+                                    "input_modalities": ["text", "image"],
+                                    "output_modalities": ["image"],
+                                },
+                                "supported_parameters": ["size", "quality"],
+                                "default_parameters": {"quality": "auto"},
+                            },
                             {"id": "model-a", "supports_responses_web_search": False},
-                            {"id": "model-a"},
                         ],
                     }
                 ).encode("utf-8")
@@ -1138,7 +1147,7 @@ class ProvidersModelsDomainTests(unittest.TestCase):
                 probed = domain.probe({"provider_id": "primary"})
 
             self.assertTrue(fetched["available"])
-            self.assertEqual(["model-b", "model-a"], fetched["models"])
+            self.assertEqual(["model-b", "model-image", "model-a"], fetched["models"])
             self.assertEqual(["openai-models-v1"], fetched["protocols"])
             self.assertEqual(
                 {"supports_web_search": True},
@@ -1148,8 +1157,19 @@ class ProvidersModelsDomainTests(unittest.TestCase):
                 {"supports_responses_web_search": False},
                 fetched["model_capabilities"]["model-a"],
             )
-            self.assertTrue(probed["ok"])
-            self.assertEqual(["model-b", "model-a"], probed["models"])
+            self.assertEqual(
+                {
+                    "type": "image",
+                    "input_modalities": ["text", "image"],
+                    "output_modalities": ["image"],
+                    "supported_parameters": ["size", "quality"],
+                    "default_parameters": {"quality": "auto"},
+                    "id": "model-image",
+                },
+                fetched["model_capabilities"]["model-image"]["image_model_metadata"],
+            )
+            self.assertNotIn("replace-me-secret", json.dumps(fetched))
+            self.assertEqual(["model-b", "model-image", "model-a"], probed["models"])
             self.assertEqual(
                 [("/v1/models", "Bearer replace-me-secret"), ("/v1/models", "Bearer replace-me-secret")],
                 requests,

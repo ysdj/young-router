@@ -18,6 +18,7 @@ from ..api_base import normalize_configured_api_base
 from .schema import (
     DEFAULT_API_KEY_NAME,
     MENU_API_KEY_NAME_KEY,
+    MENU_CREDENTIAL_ROUTE_KEY,
     MENU_KEY_BINDING_KEY,
     MENU_MANUAL_ORDER_KEY,
     MENU_MODEL_ENABLED_KEY,
@@ -51,6 +52,7 @@ from .schema import (
     _upstream_protocol_mode,
     _upstream_url_surface,
     canonical_litellm_model,
+    default_upstream_protocol_mode,
     infer_upstream_fallback_surface,
 )
 
@@ -314,6 +316,23 @@ def _dump_providers_section(providers: list[dict[str, Any]]) -> str:
             for item in keys:
                 lines.append(f"      - name: {_plain_scalar(item['name'])}")
                 lines.append(f"        value: {_anchor_scalar(item['value'], item['anchor'])}")
+        accounts = [
+            entry
+            for entry in _as_list(provider.get("auth_accounts"))
+            if isinstance(entry, dict) and str(entry.get("ref", "")).strip()
+        ]
+        if accounts:
+            # The accounts of a login-backed provider are config, exactly like
+            # its keys: one row keeps every account it owns, so a reload serves
+            # them all and a second sign-in needs no second provider.
+            lines.append("    auth_accounts:")
+            for entry in accounts:
+                lines.append(f"      - ref: {_plain_scalar(str(entry.get('ref', '')).strip())}")
+                label = str(entry.get("label", "") or "").strip()
+                if label:
+                    lines.append(f"        label: {_plain_scalar(label)}")
+                if entry.get("enabled") is False:
+                    lines.append("        enabled: false")
         extra = dict(_as_dict(provider.get("extra")))
         extra[MENU_RELAY_KEYS_KEY] = _provider_key_metadata(keys)
         raw_source = extra.get(MENU_PROVIDER_SOURCE_KEY)
@@ -377,6 +396,8 @@ def _entry_from_editor(
     )
     upstream_protocol_mode = _upstream_protocol_mode(
         model.get("upstream_protocol_mode")
+    ) if str(model.get("upstream_protocol_mode") or "").strip() else default_upstream_protocol_mode(
+        upstream_url_surface
     )
     auth = _provider_auth(
         {
@@ -414,6 +435,11 @@ def _entry_from_editor(
     # The route's key binding is decided below from what the route itself says;
     # a marker read back from an earlier write must not survive as stale text.
     model_info.pop(MENU_KEY_BINDING_KEY, None)
+    # Which editor row this entry was written for.  A credential-scoped entry
+    # states it explicitly (see ``config.api._credential_scopes``); every other
+    # entry is its own row and states the id it is about to be given.
+    row_id = str(model.get(MENU_CREDENTIAL_ROUTE_KEY, "")).strip().lower()
+    model_info.pop(MENU_CREDENTIAL_ROUTE_KEY, None)
     _set_if_text(entry, "model_name", model_name)
     _set_if_text(params, "model", litellm_model)
     api_base = normalize_configured_api_base(provider.get("api_base", ""))
@@ -473,7 +499,16 @@ def _entry_from_editor(
         params["api_base"] = model_api_base
     elif api_base:
         params["api_base"] = {"__alias__": _make_anchor_name(provider_name, "api_base")} if use_provider_aliases else api_base
-    if api_key:
+    if auth["kind"] == "openai_login":
+        # A ChatGPT account is not a key: the route states the account it
+        # answers with, and the adapter reads that account's own auth file.  One
+        # proxy process then serves every signed-in account, where the adapter's
+        # process-global token directory allowed exactly one.
+        credential_ref = str(provider.get("auth_credential_ref", "")).strip()
+        if not credential_ref:
+            raise ValueError(f"Provider {provider_name} has no ChatGPT credential")
+        params["api_key"] = f"young-router-auth:{credential_ref}"
+    elif api_key:
         params["api_key"] = (
             {"__alias__": api_key_item["anchor"]}
             if use_provider_aliases and api_key_item is not None
@@ -520,6 +555,15 @@ def _entry_from_editor(
     if not deployment_id:
         deployment_id = _random_deployment_id(seen_deployment_ids)
     _set_if_text(model_info, "id", deployment_id)
+    # A route row is one model, whatever number of credentials serve it: the
+    # entry records the row it belongs to, so the next read folds every
+    # credential's deployment back into that one row instead of appending one
+    # row per deployment on every save.
+    if row_id:
+        if not RANDOM_DEPLOYMENT_ID_RE.fullmatch(row_id):
+            row_id = ""
+        else:
+            model_info[MENU_CREDENTIAL_ROUTE_KEY] = row_id
     model_info["provider"] = provider_name
     model_info[MENU_ROUTE_KEY] = _deployment_route_key(
         model_name=model_name,

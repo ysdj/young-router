@@ -2219,3 +2219,152 @@ class HookStreamingToolEventTests(HookTestCase):
         self.assertTrue(hooks._should_retry_same_deployment_before_fallback(error))
         self.assertFalse(hasattr(error, "excluded_deployment_ids"))
         self.assertEqual(error.num_retries, 0)
+
+
+    async def test_guarded_stream_delivers_deferred_registry_tool_call(self) -> None:
+        """A tool from a non-leading ``additional_tools`` item is declared.
+
+        Codex sends its always-on registry first and appends the deferred one
+        -- the tools reachable only after a ``tool_search`` -- behind the
+        conversation it belongs to.  The undeclared-tool guard read only the
+        leading run, so it judged every deferred call a protocol violation and
+        answered with ``response.failed``; the client then saw "The model
+        called ``view_image``, which this request never declared" and the turn
+        ended with the tool never running.  The bridge had already forwarded
+        the tool upstream, so the request's declaration is what has to be
+        read wherever it appears.
+        """
+
+        hooks, _ = load_hook_module()
+
+        async def upstream_stream():
+            yield {
+                "type": "response.created",
+                "response": {
+                    "id": "resp_deferred",
+                    "object": "response",
+                    "status": "in_progress",
+                    "output": [],
+                },
+            }
+            yield {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_shot",
+                    "call_id": "call_shot",
+                    "name": "view_image",
+                    "arguments": '{"path":"/tmp/shot.png"}',
+                    "status": "in_progress",
+                },
+            }
+            yield {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_shot",
+                    "call_id": "call_shot",
+                    "name": "view_image",
+                    "arguments": '{"path":"/tmp/shot.png"}',
+                    "status": "completed",
+                },
+            }
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_deferred",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "id": "fc_shot",
+                            "call_id": "call_shot",
+                            "name": "view_image",
+                            "arguments": '{"path":"/tmp/shot.png"}',
+                            "status": "completed",
+                        }
+                    ],
+                },
+            }
+
+        request_data = {
+            "call_type": "aresponses",
+            "model": "balanced-chat",
+            "stream": True,
+            "client_metadata": {"x-codex-turn-metadata": '{"request_kind":"turn"}'},
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "functions",
+                    "tools": [{"type": "function", "name": "exec_command"}],
+                }
+            ],
+            "input": [
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "Be helpful."}],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Look at the screenshot."}],
+                },
+                {
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [
+                        {
+                            "type": "namespace",
+                            "name": "functions",
+                            "tools": [{"type": "function", "name": "view_image"}],
+                        }
+                    ],
+                },
+            ],
+        }
+
+        # The start buffer is where the guard runs: the real stream released it
+        # on the call's own ``output_item.added`` frame, so the rejected call is
+        # read from the buffer rather than from a later live frame.
+        start_buffer = [
+            {
+                "type": "response.created",
+                "response": {
+                    "id": "resp_deferred",
+                    "object": "response",
+                    "status": "in_progress",
+                    "output": [],
+                },
+            },
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_shot",
+                    "call_id": "call_shot",
+                    "name": "view_image",
+                    "arguments": '{"path":"/tmp/shot.png"}',
+                    "status": "in_progress",
+                },
+            },
+        ]
+
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks._yield_guarded_original_stream(
+                start_buffer,
+                upstream_stream(),
+                request_data,
+            )
+        ]
+
+        # The call reaches the client, which is the only party that can run it.
+        self.assertNotIn("response.failed", [chunk["type"] for chunk in chunks])
+        self.assertEqual(chunks[1]["item"]["name"], "view_image")
+        self.assertEqual(chunks[-1]["type"], "response.completed")
+        self.assertEqual(chunks[-1]["response"]["output"][0]["name"], "view_image")

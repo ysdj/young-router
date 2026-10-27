@@ -67,7 +67,16 @@ def _watch_windows_parent(parent_pid: int, stop: threading.Event, *, poll_interv
     kernel32.WaitForSingleObject.restype = wintypes.DWORD
     kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
     kernel32.CloseHandle.restype = wintypes.BOOL
-    handle = kernel32.OpenProcess(synchronize, False, parent_pid)
+    # MSIX full-trust hosts can deny PROCESS_SYNCHRONIZE to their child. The
+    # launcher passes its inheritable process handle in this environment
+    # value; OpenProcess remains the fallback for other Windows hosts.
+    inherited = os.environ.get("YOUNG_ROUTER_PARENT_HANDLE", "").strip()
+    try:
+        handle = wintypes.HANDLE(int(inherited, 16)) if inherited else wintypes.HANDLE()
+    except ValueError:
+        handle = wintypes.HANDLE()
+    if not handle:
+        handle = kernel32.OpenProcess(synchronize, False, parent_pid)
     if not handle:
         stop.set()
         return

@@ -1,6 +1,8 @@
 #pragma once
 
 #include <winrt/Microsoft.ReactNative.h>
+#include <functional>
+#include <string>
 
 namespace YoungRouter {
 

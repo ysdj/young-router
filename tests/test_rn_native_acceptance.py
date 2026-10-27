@@ -228,6 +228,15 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("for descendant in childPanels.filter({ $0.parent === panel }).map({ $0.window }) {", presentation)
         self.assertIn("parent.removeChildWindow(panel)", presentation)
         self.assertIn("unlockParentWindow(parent)", presentation)
+        # A window that goes away ends the children it opened. Without that the
+        # sign-in browser outlived its window, stayed in front, and its shield
+        # ate every click meant for the surface underneath: the pane looked
+        # alive while no button answered.
+        close_path = leaf.split("public func windowWillClose(_ notification: Notification) {", 1)[1].split(
+            "// MARK: - Child panels", 1
+        )[0]
+        self.assertIn("for child in childPanels.filter({ $0.parent === window }).map({ $0.window }) {", close_path)
+        self.assertIn("endChildPanel(child)", close_path)
         self.assertIn('if windowRoute == "provider-wizard" || windowRoute == "file-editor" {', open_route)
         self.assertIn("presentChildPanel(window, in: settingsWindow())", open_route)
         self.assertIn("endChildPanel(window)", close_route)
@@ -1705,7 +1714,17 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("void WinUI3NativeLeafModule::ShowReadOnlyText(", windows_module)
         self.assertIn("leaf->ShowReadOnlyText(title, text, close_label, language, html);", windows_module)
 
-    def test_official_provider_auth_webview_is_optional_and_never_captures_credentials(self) -> None:
+    def test_official_provider_auth_shares_the_relay_sign_in_window(self) -> None:
+        """One native sign-in window, two flows.
+
+        The relay station's sign-in window owns the browser, the identity, the
+        action bar and the child-panel lifecycle.  A provider's device-code
+        sign-in is the same window carrying a different flow, so the app has one
+        shell to keep coherent instead of two that drift apart.  What the
+        provider flow must never inherit is the station's *work*: it captures no
+        credential and reads nothing out of the page.
+        """
+
         types = (SHARED / "types.ts").read_text(encoding="utf-8")
         bridge = (SHARED / "platform/nativeBridge.ts").read_text(encoding="utf-8")
         platform = (SHARED / "platformEntry.ts").read_text(encoding="utf-8")
@@ -1720,37 +1739,62 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("showProviderAuth?:", platform)
         self.assertIn("showProviderAuth: bridge.showProviderAuth", bridge)
         self.assertIn("showProviderAuth: leaf.showProviderAuth", platform)
-        self.assertIn("private final class NativeProviderAuthController", mac)
-        self.assertIn("activeProviderAuthControllers: [String: NativeProviderAuthController]", mac)
-        self.assertIn("fingerprint: String?", mac)
-        controller = mac.split("private final class NativeProviderAuthController", 1)[1].split(
-            "private final class NativeActionMenuTarget", 1
-        )[0]
-        self.assertIn("configuration.websiteDataStore = .nonPersistent()", controller)
-        self.assertIn("WKWebView(frame: .zero, configuration: configuration)", controller)
+        # One window class serves both flows; the separate provider shell is gone.
+        self.assertIn("private final class NativeRelayLoginController", mac)
+        self.assertIn("activeProviderAuthControllers: [String: NativeRelayLoginController]", mac)
+        self.assertNotIn("NativeSignInWindow", mac)
+        self.assertIn("case handoff", mac)
+        self.assertIn("handoff: NativeHandoffSignIn? = nil", mac)
+        self.assertIn("self.mode = handoff == nil ? mode : .handoff", mac)
+        self.assertIn("handoff: NativeHandoffSignIn(", mac)
+        self.assertIn("controller.startHandoff {", mac)
+        # The browser, the first press, and the three ways out are the shell's,
+        # not the flow's.
+        self.assertIn("webView = NativeFirstMouseWebView(frame: .zero, configuration: configuration)", mac)
+        self.assertIn("override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }", mac)
+        for marker in (
+            "#selector(openHandoffInBrowser(_:))",
+            "#selector(reloadBrowser(_:))",
+            "#selector(copyHandoffCode(_:))",
+            "#selector(cancel(_:))",
+            "NSWorkspace.shared.open(handoff.url)",
+            "webView.reload()",
+        ):
+            self.assertIn(marker, mac)
+        # The navigation rule is the flow's, injected into the window: the
+        # station stays on its origin, a provider page follows its own policy.
         self.assertIn(
-            "NativeProviderAuthPolicy.allows(provider: provider, url: targetURL, callbackURL: callbackURL)",
-            controller,
+            "NativeProviderAuthPolicy.allows(provider: provider, url: target, callbackURL: policyCallbackURL)",
+            mac,
         )
-        self.assertIn(
-            "NativeProviderAuthPolicy.allows(provider: provider, url: responseURL, callbackURL: callbackURL)",
-            controller,
-        )
-        self.assertNotIn("WKScriptMessageHandler", controller)
-        self.assertNotIn("evaluateJavaScript", controller)
+        self.assertIn("allowed = navigationAction.request.url.map(handoff.allows) ?? false", mac)
+        self.assertIn("allowed = navigationAction.request.url.map(sameOrigin) ?? false", mac)
+        # A provider's flow is nothing but the page: Core follows the device
+        # code, so this window never reads the page it is showing.
+        handoff_start = mac.split("func startHandoff(", 1)[1].split("private func beginBrowserFlow", 1)[0]
+        for forbidden in ("evaluateJavaScript", "captureBrowserCredentials", "collectCookies", "restoreSessionAndLoad"):
+            self.assertNotIn(forbidden, handoff_start)
+        self.assertIn("webView.load(URLRequest(url: handoff.url, cachePolicy: .reloadIgnoringLocalCacheData))", handoff_start)
+        self.assertIn("reloadLabel: string;", types)
+        self.assertIn('translate("relay.officialProviderOpenBrowser")', (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8"))
         self.assertIn("@objc(showProviderAuth:resolver:rejecter:)", module)
         self.assertIn("RCT_EXTERN_METHOD(showProviderAuth:(NSDictionary *)options", bridge_header)
         policy = mac.split("private enum NativeProviderAuthPolicy", 1)[1].split(
-            "private final class NativeProviderAuthController", 1
+            "\nprivate final class NativeRelayLoginController", 1
         )[0]
         self.assertIn('url.scheme?.lowercased() == "https"', policy)
         self.assertIn('url.scheme?.lowercased() == "http"', policy)
         self.assertIn('host == "localhost" || host == "127.0.0.1"', policy)
         self.assertIn('url.path == "/callback"', policy)
         self.assertIn('host == "auth.openai.com"', policy)
-        self.assertIn('path == "/oauth/authorize"', policy)
+        # The official sign-in's proof-of-work frame runs on its own OpenAI
+        # origin. A path allowlist that omitted that host cancelled the frame,
+        # so every email/password submit waited on a proof nothing could
+        # compute: the login pane spun until the page timed out while the same
+        # step completed in a browser.
+        self.assertIn('host == "auth.openai.com" || host == "login.openai.com" || host == "sentinel.openai.com"', policy)
         self.assertIn('host == "challenges.cloudflare.com"', policy)
-        self.assertIn('path.hasPrefix("/cdn-cgi/") || path.hasPrefix("/turnstile/")', policy)
+        self.assertIn('path.hasPrefix("/ces/")', policy)
         self.assertIn('if provider == "claude" {', mac)
         self.assertIn('NSWorkspace.shared.open(url)', mac)
         self.assertLess(mac.index('if provider == "claude" {'), mac.index('let authFingerprint: String'))
@@ -2131,7 +2175,10 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         mac_leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
         windows_relay = (WIN_NATIVE / "WindowsRelayLogin.cpp").read_text(encoding="utf-8")
 
-        self.assertIn(": (originURL.host ?? originURL.absoluteString)", mac_leaf)
+        # The station flows' own header still names the station host; a
+        # provider hand-off names the provider's, and neither ever names the
+        # internal adapter.
+        self.assertIn("(handoff.map { $0.url.host ?? $0.url.absoluteString } ?? originURL.host ?? originURL.absoluteString)", mac_leaf)
         self.assertNotIn('accountLabel.stringValue = "\\(type ==', mac_leaf)
         self.assertIn("account.Text(Utf8ToWide(state->options.origin));", windows_relay)
         self.assertNotIn("auto const account_type = state->options.account_type", windows_relay)

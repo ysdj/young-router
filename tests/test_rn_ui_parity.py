@@ -13,6 +13,8 @@ MACOS_LEAF = ROOT / "rn/apps/macos/src/native/macos/AppKitNativeLeaf.swift"
 MACOS_PROJECT = ROOT / "rn/apps/macos/macos/YoungRouter.xcodeproj/project.pbxproj"
 PLATFORM_ENTRY = ROOT / "rn/packages/shared/src/platformEntry.ts"
 RELAY_MANAGER = ROOT / "rn/packages/shared/src/ui/RelayAccountManager.tsx"
+# The account list both a relay station and an OpenAI row draw.
+ACCOUNTS_TABLE = ROOT / "rn/packages/shared/src/ui/AccountsTable.tsx"
 RELAY_ORIGIN = ROOT / "rn/packages/shared/src/ui/relayOrigin.ts"
 TYPOGRAPHY = ROOT / "rn/packages/shared/src/ui/typography.ts"
 MACOS_CONTROLS = ROOT / "rn/apps/macos/src/native/macos/AppKitControlViews.mm"
@@ -843,9 +845,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
         """The mode's sentence is a tip on demand, opened beside the picker."""
 
         for marker in (
-            'function HelpTip({ open, text, title, onToggle }: { open: boolean; text: string; title: string; onToggle: () => void }): React.JSX.Element {',
+            # The popup grows away from the mark it belongs to: a tip that
+            # states which way it opens is what keeps a right-hand pane's help
+            # inside that pane instead of clipped by the column beside it.
+            'function HelpTip({ open, text, title, onToggle, align = "right" }: { open: boolean; text: string; title: string; onToggle: () => void; align?: "left" | "right" }): React.JSX.Element {',
             '<NativeButton title="" symbol="help" link plainLink toolTip={title} accessibilityLabel={title} onPress={onToggle} style={styles.helpTipButton} />',
-            '{open ? <View style={styles.helpTipPopup}><Text style={styles.helpTipText}>{text}</Text></View> : null}',
+            '{open ? <View style={align === "left" ? styles.helpTipPopupLeft : styles.helpTipPopup}><Text style={styles.helpTipText}>{text}</Text></View> : null}',
+            'helpTipPopupLeft: { position: "absolute", left: 0, bottom: 22, width: 208, zIndex: 4,',
             'const protocolHint = translate(fixed ? "providers.protocolModeFixedHint" : "providers.protocolModeFallbackHint");',
             'accessory={<HelpTip open={tipOpen} text={protocolHint} title={translate("providers.protocolModeHelp")} onToggle={() => setTipOpen((current) => !current)} />}',
             'const [tipOpen, setTipOpen] = useState(false);',
@@ -1086,7 +1092,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "tableTitleRow:",
         ):
             self.assert_ui_has(marker)
-        self.assert_ui_has('providerInspector: { width: 290, minWidth: 290, maxWidth: 290')
+        self.assert_ui_has('providerInspector: { width: 320, minWidth: 260, maxWidth: 360')
         self.assertNotIn("<ScrollView contentContainerStyle={styles.providerEditorScroll}><ProviderEditor", self.ui)
         self.assert_ui_has("providerEditorContent: { flex: 1, minHeight: 0 }")
         # The inspector pane's header row is the workspace's first row, so it
@@ -1110,12 +1116,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('<View style={styles.providerWizardModelListFrame}><PersistentScrollView style={styles.providerWizardModelListScroll} contentContainerStyle={styles.providerWizardModelList} showsVerticalScrollIndicator keyboardShouldPersistTaps="handled">')
         self.assert_ui_has("providerWizardModelList: { paddingHorizontal: 8, paddingTop: 5, paddingBottom: 10, gap: 1 }")
         self.assert_ui_has('<PersistentScrollView style={styles.providerWizardModelListScroll} contentContainerStyle={styles.providerWizardModelList} showsVerticalScrollIndicator keyboardShouldPersistTaps="handled">')
-        self.assert_ui_has('providersLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }')
+        self.assert_ui_has('providersLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 12 }')
         self.assert_ui_has('providerModelColumns: { flex: 1, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }')
         self.assert_ui_has('inspectorContent: { paddingLeft: 0, paddingRight: 6')
         self.assertNotIn("inspectorContent: { paddingTop", self.ui)
         self.assert_ui_has("providerLeftColumn: { flex: 1, minWidth: 0, minHeight: 0, gap: 6 }")
-        self.assert_ui_has("providerListPane: { width: 140, minWidth: 140, maxWidth: 140")
+        self.assert_ui_has("providerListPane: { width: 180, minWidth: 180, maxWidth: 180")
         self.assert_ui_has('columns={[{ label: translate("providers.provider"), width: 132 }]}')
         # The model list is the upstream model, the public model, and the rate
         # the route follows.  The model list keeps about 280 pt at the settings
@@ -1185,7 +1191,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has(r'cells: [`\t${modelUpstreamDisplay(editorIdentifier(entry.provider), entry.model)')
         self.assert_ui_has('rows={routeRows} disabledRowKeys={disabledRouteKeys} alertRowKeys={alertRouteKeys} selectedKey={selectedPublicModel !== undefined ? routePublicModelRowKey(selectedPublicModel) : (selectedRoute ?? "")} compact selectableSpanningRowKeys={selectableRouteGroupKeys} onSelectionChange={(key) => selectRouteTableRow(key)}')
         self.assert_ui_has('rows={providerRows} disabledRowKeys={disabledProviderKeys} alertRowKeys={alertProviderKeys} selectedKey={providerId} compact firstColumnHorizontalPadding={0} onSelectionChange=')
-        self.assert_ui_has('rows={modelRows} disabledRowKeys={disabledModelKeys} alertRowKeys={alertModelKeys} selectedKey={selectedModel ?? ""} compact firstColumnHorizontalPadding={0} preserveColumnWidths onSelectionChange=')
+        self.assert_ui_has('rows={modelRows} disabledRowKeys={disabledModelKeys} alertRowKeys={alertModelKeys} selectedKey={selectedModelRowKey} compact firstColumnHorizontalPadding={0} preserveColumnWidths onSelectionChange=')
         self.assert_ui_has('columns={nativeTableColumns} rows={nativeTableRows} selectedKey={selectedKey} compact preserveColumnWidths')
         self.assert_ui_has('rows={tableRows}')
         select_route = self.ui.split('const selectRoute = useCallback', 1)[1].split('const chooseViewMode', 1)[0]
@@ -1361,6 +1367,38 @@ class ReactNativeUiParityTests(unittest.TestCase):
         appkit_controls = (ROOT / "rn/packages/shared/src/ui/AppKitControls.tsx").read_text(encoding="utf-8")
         table_wrapper = appkit_controls.split("export function AppKitTable(", 1)[1].split("export function AppKitTextEditor(", 1)[0]
         self.assertIn("selectableSpanningRowKeys", table_wrapper)
+
+    def test_model_list_groups_are_headings_and_model_rows_open_their_inspector(self) -> None:
+        """A credential group is a heading; a model row is the entry it names.
+
+        The model list draws one group per credential, and a group is not an
+        entry: it has no model behind it, so a click on one must leave the
+        selection where it was.  The row keys separate their three parts by a
+        unit separator because a credential id is itself `account:<ref>` or
+        `key:<slot>` — a colon-joined key put the credential's prefix in front
+        of the model id, and every click on a model asked for a model named
+        after its credential: the repair effect dropped the selection and the
+        row flashed without opening the inspector.  The round trip itself is
+        executed by tests/test_rn_model_row_keys.mjs; this pins the wiring.
+        """
+
+        row_keys = (ROOT / "rn/packages/shared/src/ui/modelRowKeys.ts").read_text(encoding="utf-8")
+        self.assertIn('export const MODEL_ROW_KEY_SEPARATOR = "\\x1f";', row_keys)
+        self.assertIn("export function modelGroupRowKey(credentialID: string): string {", row_keys)
+        self.assertIn("export function modelRowKey(credentialID: string, modelID: string): string {", row_keys)
+        self.assertIn("export function modelIDFromRowKey(key: string): string | undefined {", row_keys)
+        self.assert_ui_has('import { modelGroupRowKey, modelIDFromRowKey, modelRowKey } from "./modelRowKeys";')
+        # A group header is a spanning row, which the native table refuses to
+        # select, so clicking 账号 or 密钥 cannot move the selection at all.
+        self.assert_ui_has("rows.push({ key: modelGroupRowKey(credential.id), cells: [credential.label], spanning: true });")
+        self.assert_ui_has("rows.push({ key: modelRowKey(credential.id, editorIdentifier(item)), cells: modelCells(item) });")
+        # The clicked row is what the table highlights: a model listed under
+        # several credentials keeps the highlight on the copy that was pressed.
+        self.assert_ui_has("const [selectedModelRow, setSelectedModelRow] = useState<string>();")
+        self.assert_ui_has('if (selectedModelRow && modelRows.some((row) => !row.spanning && row.key === selectedModelRow && modelIDFromRowKey(row.key) === selectedModel)) {')
+        model_table = self.ui.split("<NativeTable columns={modelTableColumns(", 1)[1].split("/></View>", 1)[0]
+        self.assertIn("const modelID = modelIDFromRowKey(key);", model_table)
+        self.assertIn("setSelectedModel(modelID); setSelectedModelRow(key);", model_table)
 
     def test_provider_empty_state_keeps_the_native_table_frames(self) -> None:
         for marker in (
@@ -1857,7 +1895,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # The sidebar draws no column rule: its vibrant material already ends
         # at the edge, and the rule read as a line floating over it.  The
         # rail's own divider is what still tells a second column apart.
-        self.assertIn('settingsSidebar: { width: 200, flexShrink: 0, minHeight: 0 }', self.ui)
+        self.assertIn('settingsSidebar: { width: 200, minWidth: 0, flexShrink: 0, minHeight: 0 }', self.ui)
         # The rail's column rule is a sibling divider, so it stays whole where
         # the list reaches past the list container's own edge.
         self.assertIn(
@@ -1893,7 +1931,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertEqual(7, self.ui.count("<NativeTable"))
         self.assertIn('settingsSidebarAppIcon: { width: SETTINGS_HEADER_CONTENT_HEIGHT, height: SETTINGS_HEADER_CONTENT_HEIGHT, borderRadius: 4 }', self.ui)
         self.assertIn('settingsPaneTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600", lineHeight: SETTINGS_HEADER_CONTENT_HEIGHT }', self.ui)
-        self.assertIn('settingsSidebarList: { flex: 1, minHeight: 0 }', self.ui)
+        self.assertIn('settingsSidebarList: { flex: 1, minWidth: 0, minHeight: 0 }', self.ui)
         shell = self.ui.split("function SettingsShell(", 1)[1].split("function RouteSurface(", 1)[0]
         self.assertIn('sourceList', shell)
         self.assertIn('framed={false}', shell)
@@ -1949,7 +1987,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("export const UI_FONT_SIZE = 13;", typography)
         self.assertIn("export const UI_TIP_FONT_SIZE = 12;", typography)
         self.assertEqual(
-            {"UI_FONT_SIZE", "UI_TIP_FONT_SIZE", "SOURCE_LIST_FONT_SIZE", "10", "15"},
+            {"UI_FONT_SIZE", "UI_TIP_FONT_SIZE", "SOURCE_LIST_FONT_SIZE", "10", "15", "17", "28"},
             {value.strip() for value in re.findall(r"fontSize:\s*([^,}\n]+)", self.ui)},
         )
         self.assertEqual(
@@ -1957,7 +1995,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             {value.strip() for value in re.findall(r"fontSize:\s*([^,}\n]+)", relay)},
         )
         self.assertEqual(
-            {"UI_FONT_SIZE", "UI_TIP_FONT_SIZE"},
+            {"UI_FONT_SIZE", "UI_TIP_FONT_SIZE", "12"},
             {value.strip() for value in re.findall(r"fontSize:\s*([^,}\n]+)", self.native_controls)},
         )
         self.assertIn("runtimeHelpText: { ...SETTINGS_FIELD_HELP_TEXT }", self.ui)
@@ -3836,7 +3874,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'const option = fetchKeyOptions[nativeEvent.index]; if (option) setFetchKeyID(option.value);',
             'const providerKeyOptions = [...keyStates.map((key) => ({',
             'value={selectedProviderKey?.id ?? ""} values={[{ value: "", label: translate("providers.undefinedKey") }, ...providerKeyOptions]} disabled={busy} onSelect={selectProviderKey}',
-            'rows.push({ key: `custom:${key.id}`, cells: [showHeaders ? `\\t${key.name}` : key.name] });',
+            'cells: (credentials ?? []).length > 0 && variant !== "inline"',
             'const pendingCustomKeyName = useRef<string | undefined>(undefined);',
             'pendingCustomKeyName.current = undefined; // selection lands after the snapshot refresh' if False else 'setSelectedKey(`custom:${added.id}`);',
             'return dispatch("provider.key_delete", { provider_id: providerId, name: selectedKeyName });',
@@ -3999,7 +4037,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("<ProviderIdentityFields", editor)
         self.assertEqual(1, editor.count("<ProviderIdentityFields"))
         self.assert_ui_has("function ProviderIdentityFields(")
-        self.assertLess(editor.index("<ProviderIdentityFields"), editor.index("{isOfficialAccount ? <View"))
+        self.assertLess(editor.index("<ProviderIdentityFields"), editor.index('{isOfficialAccount && kind !== "openai" ? <View'))
         self.assertLess(editor.index("<ProviderIdentityFields"), editor.index("<ProviderKeysPanel"))
         identity = self.ui.split("function ProviderIdentityFields(", 1)[1].split("function ProviderEditor(", 1)[0]
         # One container, one enable row, and the fields the block itself draws.
@@ -4051,10 +4089,18 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn('>{providerBaseURL}</Text>', identity)
         self.assertIn('tooltip={providerBaseURL} accessibilityLabel={providerBaseURL}', identity)
         # The account surface keeps its rule, as the keys and the stations do.
-        self.assertIn("{isOfficialAccount ? <View style={styles.officialAccountSection}>", editor)
+        self.assertIn('{isOfficialAccount && kind !== "openai" ? <View style={styles.officialAccountSection}>', editor)
+        # Which account the row stands for, above the actions that act on it:
+        # 退出登录 over a row that only says "OpenAI" names no session.
+        self.assertIn('{translate("providers.authAccount")}', editor)
+        self.assertIn("const authAccount = providerAuthAccount(provider);", editor)
+        self.assertIn('"providers.authAccount": "账号"', self.zh)
+        self.assertIn('"providers.authAccount": "Account"', self.en)
         self.assertIn("providerAccountsHeader", editor)
         self.assertIn("<ProviderKeysPanel", editor)
-        self.assert_ui_has("officialAccountSection: { minWidth: 0, gap: 5, paddingTop: 6, borderTopWidth: 1, borderTopColor: systemColors.separator }")
+        # The section paints above the columns beside it, because its question
+        # mark opens a popup that must not be clipped by them.
+        self.assert_ui_has("officialAccountSection: { minWidth: 0, gap: 5, paddingTop: 6, zIndex: 3, borderTopWidth: 1, borderTopColor: systemColors.separator }")
         self.assert_ui_has("providerSourceFields: { minWidth: 0, gap: 4 }")
         for locale in (self.zh, self.en):
             self.assertIn('"providers.providerType":', locale)
@@ -4688,14 +4734,18 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'authAction === "service_provider.auth_start"',
             'if (authAction === "service_provider.auth_start") {',
             'await dispatch(authAction, { provider_id: id }, "providers_models");',
-            '"service_provider.auth_activate"',
-            'addOfficialAccount(kind === "claude" ? "claude_login" : "openai_login")',
+            'translate("relay.officialProviderAddLogin")',
+            # A second account is a second account of this row, not a second
+            # provider: the sign-in starts on the provider the pane shows.
+            'dispatchWithOutcome("service_provider.auth_start", { provider_id: id }, "providers_models")',
             'field="provider_auth_token"',
             "officialStatusRow",
         ):
             self.assertIn(marker, editor)
         self.assert_ui_has("const callbackURL = stringValue(summary.redirect_uri);")
         self.assert_ui_has("...(callbackURL ? { callbackURL } : {})")
+        self.assertNotIn('"service_provider.auth_activate"', editor)
+        self.assert_ui_has('translate("relay.officialProviderMultiAccountHint")')
         self.assertIn("function presentProviderAuthChallenge(", self.ui)
         self.assertIn("native.showProviderAuth({", self.ui)
         # The workspace polls authorizing providers so logins started in the
@@ -5973,7 +6023,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '// Group headers only separate the two kinds; a single-kind list skips',
             '// them so custom-only vendors see a plain key table.',
             'if (showHeaders) rows.push({ key: "group:custom", cells: [`${translate("providers.keysCustom")} · ${customKeys.length}`], spanning: true });',
-            'rows.push({ key: `custom:${key.id}`, cells: [showHeaders ? `\\t${key.name}` : key.name] });',
+            'cells: (credentials ?? []).length > 0 && variant !== "inline"',
             '// The inline keys panel shows one list of a fixed height beside its editor',
             'const KEYS_INLINE_EDITOR_WIDTH = 124;',
             'const KEYS_INLINE_LIST_HEIGHT = 26 + 6 * 22;',
@@ -6028,7 +6078,15 @@ class ReactNativeUiParityTests(unittest.TestCase):
         )
         # The keys panel, the station-accounts panel, and the accounts header
         # are the three surfaces that predicate gates.
-        self.assertIn("{!isLogin ? <ProviderKeysPanel", editor)
+        # The account section lists the row's accounts, and custom keys are its
+        # peers: one OpenAI row serves both, so the keys panel is drawn for it.
+        self.assertIn('{!isLogin || kind === "openai" ? <ProviderKeysPanel', editor)
+        # An OpenAI row serves accounts and custom keys as peers, so they are
+        # one list of credentials: the accounts are handed to the keys panel as
+        # credentials, and the actions a login has ride that same list.
+        self.assertIn('credentials={kind === "openai" ? authAccounts', editor)
+        self.assertIn('credentialActions={kind === "openai" ? (ref) => (', editor)
+        self.assertIn('dispatchWithOutcome("service_provider.auth_logout", { provider_id: id, account_ref: accountRef }, "providers_models")', editor)
         self.assertIn("{!isLogin && station ? <StationAccountsPanel", editor)
         identity = self.ui.split("function ProviderIdentityFields(", 1)[1].split("\nfunction ", 1)[0]
         self.assertIn("const isLogin = isLoginProviderKind(kind);", identity)
@@ -6083,7 +6141,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('recorder(materialized.get("issues") if isinstance(materialized, Mapping) else ())', service)
         self.assertIn("const bindingIssues = asRecords(state.binding_issues);", self.ui)
         self.assertIn("const bindingIssueFor = useCallback((model: UnknownRecord): UnknownRecord | undefined => {", self.ui)
-        self.assertIn("() => models.filter((item) => modelNeedsAttention(item, translate) || Boolean(bindingIssueFor(item))).map(editorIdentifier),", self.ui)
+        self.assertIn("() => modelRowKeys(models.filter((item) => modelNeedsAttention(item, translate) || Boolean(bindingIssueFor(item))).map(editorIdentifier)),", self.ui)
         self.assertIn("alertRowKeys={alertRouteKeys}", self.ui)
         self.assertIn('<Text style={styles.fieldHint}>{bindingIssueText}</Text>', self.ui)
         # A relay key is a row in the provider's key table too, and the reason
@@ -6167,7 +6225,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertEqual(2, ui.count("{dialogsHosted ? null : dialogs}"))
         # The host is a sibling of the inspector, so no column clips it.
         self.assertIn("<RelayDialogHost />", ui)
-        self.assertIn('</View>\n    <RelayDialogHost />', ui)
+        self.assertRegex(ui, r"\}\n    <RelayDialogHost />")
         # Every confirmation that deletes or discards says so: the provider,
         # model, and API key deletes, the route close that drops staged changes,
         # and the raw file editor's discarded draft.
@@ -6300,7 +6358,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
         # Keep this semantic: empty account and key lists explain the next
         # action instead of freezing a large placeholder height.
-        self.assertIn('<View style={styles.accountsEmpty}><Text style={styles.accountsEmptyText}>{translate("relay.stationNoAccounts")}</Text></View>', relay)
+        self.assertIn('emptyText={translate("relay.stationNoAccounts")}', relay)
+        self.assertIn('styles.emptyText}>{emptyText}</Text>', ACCOUNTS_TABLE.read_text(encoding="utf-8"))
         # An empty key list keeps the area under it empty: the old hint read
         # like a value the user could edit.
         self.assertNotIn('translate("providers.keyListHint")', self.ui)
@@ -6656,7 +6715,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('"providers.keyName": "密钥名"', self.zh)
         self.assertIn('"providers.keyValue": "密钥值"', self.zh)
         self.assert_ui_has('columns={[{ label: translate("providers.provider"), width: 132 }]}')
-        self.assert_ui_has('providerListPane: { width: 140, minWidth: 140, maxWidth: 140')
+        self.assert_ui_has('providerListPane: { width: 180, minWidth: 180, maxWidth: 180')
         # The providers side's model list is the upstream model, its public
         # model, and the rate the route follows: it carries no 顺序 column,
         # because that number orders one public model's routes while these rows
@@ -6732,21 +6791,20 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
         # The accounts table uses the native compact zebra table; the keys
         # table inherits the striped default. Checkboxes stay in dialogs.
-        self.assertEqual(1, relay.count("striped"))
-        self.assertNotIn("striped={false}", relay)
-        for marker in (
-            'accountsTable: { flex: 0, height: 84, minHeight: 84, flexShrink: 0 }',
-        ):
-            self.assertIn(marker, relay)
+        shared = ACCOUNTS_TABLE.read_text(encoding="utf-8")
+        self.assertEqual(1, shared.count("striped"))
+        self.assertNotIn("striped={false}", shared)
+        self.assertNotIn("<NativeTable", relay)
+        self.assertIn("tableHeight = 84", shared)
 
     def test_relay_resource_columns_fit_the_initial_minimum_viewport(self) -> None:
         """The unified keys table is a single readable column in the detail pane."""
-        match = re.search(
-            r'columns=\{variant === "inline"\n?\s*\? \[\{ label: translate\("providers\.keys"\), width: (\d+) \}\]',
+        # A credential list states what each row is worth; a keys-only list
+        # stays one readable column of 264.
+        self.assertIn(
+            '? [{ label: translate((credentials ?? []).length > 0 ? "providers.credentials" : "providers.keys"), width: 264 }]',
             self.ui,
         )
-        self.assertIsNotNone(match, "inline keys table columns")
-        self.assertEqual((264,), tuple(int(value) for value in match.groups()))
 
     def test_webdav_form_is_integrated_into_the_unified_sync_tab(self) -> None:
         workspace = self.ui.split("function DataManagementWorkspace(", 1)[1].split(
@@ -7033,7 +7091,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # the entry instead of asking the user to hunt for it.
         self.assertIn("function modelNeedsAttention(model: UnknownRecord, translate: Translate): boolean {", self.ui)
         self.assertIn(
-            "() => models.filter((item) => modelNeedsAttention(item, translate) || Boolean(bindingIssueFor(item))).map(editorIdentifier),",
+            "() => modelRowKeys(models.filter((item) => modelNeedsAttention(item, translate) || Boolean(bindingIssueFor(item))).map(editorIdentifier)),",
             self.ui,
         )
         # A freshly created row is enabled and still carries the placeholder
@@ -7174,7 +7232,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('runMutationOnce("provider.add", () => dispatch("provider.add", { provider: { name, models: [], enabled: true } }));', self.ui)
         self.assertIn('const pendingProviderIds = useRef<Set<string> | undefined>(undefined);', self.ui)
         self.assertIn(
-            '<ActionButton title={translate("providers.addWizard")} disabled={busy} style={styles.providerWizardToolbarButton} onPress={onOpenWizard} />',
+            '<ActionButton title={translate("providers.addWizard")} titleWidth="tight" disabled={busy} style={styles.providerWizardToolbarButton} onPress={onOpenWizard} />',
             self.ui,
         )
 

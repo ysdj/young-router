@@ -7,6 +7,7 @@ import { runtimeCategoryLabel, runtimeFieldHelp, runtimeFieldLabel, runtimeOptio
 import { canonicalWindowRoute, isSettingsPaneRoute, isSettingsShellRoute, LOG_TABS, routeMenuActions, ROUTES, SETTINGS_PANES, SETTINGS_PANE_PRESENTATION } from "../routes";
 import { NativeButton, NativeBusySpinner, NativeCheckbox, NativePersistentScrollIndicator, NativePicker, NativeSecureTextInput, NativeSegmentedControl, NativeTable, NativeTextField, NativeToggle } from "./NativeControls";
 import { CodeEditorWebView, editorMenuLabels, readOnlyCodeEditorHtml } from "./code-editor/CodeEditorWebView";
+import { modelGroupRowKey, modelIDFromRowKey, modelRowKey } from "./modelRowKeys";
 import { usePendingAction } from "./pendingAction";
 import {
   accountDisplayName,
@@ -125,8 +126,12 @@ function providerAuthKind(provider: UnknownRecord | undefined): ProviderAuthKind
   return PROVIDER_AUTH_OPTIONS.includes(value as ProviderAuthKind) ? value as ProviderAuthKind : "api_key";
 }
 
+function providerAuthAccount(provider: UnknownRecord | undefined): string {
+  return stringValue(provider?.auth_account, stringValue(provider?.account)).trim();
+}
+
 function providerAuthStatus(provider: UnknownRecord | undefined): ProviderAuthStatus {
-  const value = stringValue(provider?.auth_status, "signed_out");
+  const value = stringValue(provider?.auth_status, stringValue(provider?.status, "signed_out"));
   const statuses: readonly ProviderAuthStatus[] = ["signed_out", "authorizing", "signed_in", "expired", "error", "unsupported"];
   return statuses.includes(value as ProviderAuthStatus) ? value as ProviderAuthStatus : "signed_out";
 }
@@ -862,7 +867,8 @@ type ProviderKeyState = {
 type ProviderKeyChoice = {
   id: string;
   name: string;
-  kind: "independent" | "relay";
+  /** ``account`` is a signed-in login: it is asked as that account, not by key. */
+  kind: "independent" | "relay" | "account";
   state?: ProviderKeyState;
   source?: RelaySourceOption;
 };
@@ -1716,11 +1722,16 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
   }, [route, routeRequest, snapshot]);
 
   useEffect(() => {
-    if (!isPrimaryHost) return;
     const action = nativeAction?.id;
     if (!action) return;
     const actionKey = `${nativeAction.sequence}:${action}`;
     if (handledNativeActions.current.has(actionKey)) return;
+    if (action === "open-provider-wizard") {
+      handledNativeActions.current.add(actionKey);
+      setRoute("provider-wizard");
+      return;
+    }
+    if (!isPrimaryHost) return;
     if (action.startsWith("open-")) {
       handledNativeActions.current.add(actionKey);
       void recordMenuAction(action);
@@ -1840,13 +1851,20 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
     return () => setProviderWizardOpen(false);
   }, [route]);
 
+  console.log("[yr] render route=" + route + " snapshot=" + (snapshot ? "yes" : "no") + " error=" + (error ? "yes" : "no"));
   return (
     <View style={styles.root} accessibilityLabel={translate("app.title")}>
       {error ? <Text style={styles.error}>{error}</Text> : null}
       {!error && route !== "home" && snapshot ? (isSettingsShellRoute(route)
         ? <SettingsShell route={route} windowRoute={settingsWindowRoute.current ?? canonicalWindowRoute(route)} snapshot={snapshot} ipc={ipc} native={native} translate={translate} logTabRequest={logTabRequest} nativeAction={nativeAction} onSnapshot={receiveSnapshot} onNavigate={setRoute} onClose={() => setRoute("home")} />
         : <RouteSurface route={route} snapshot={snapshot} ipc={ipc} native={native} translate={translate} logTabRequest={logTabRequest} fileIdRequest={fileIdRequest} nativeAction={nativeAction} onSnapshot={receiveSnapshot} onNavigate={setRoute} onClose={() => setRoute(route === "provider-wizard" && Platform.OS === "windows" ? "providers-models" : "home")} />) : null}
-      {!error && route === "home" ? <View style={styles.menuBarHost} /> : null}
+      {!error && route === "home" ? (Platform.OS === "windows" && !snapshot
+        // Windows keeps one visible window from launch, so "home" is a real
+        // surface here and an empty host reads as a blank app. State the wait
+        // until the first snapshot decides which window to present.
+        ? <View style={styles.startupLoading}><Text style={styles.startupLoadingText}>{translate("common.loading")}</Text></View>
+        : <View style={styles.menuBarHost} />) : null}
+      {!error && route !== "home" && !snapshot && Platform.OS === "windows" ? <View style={styles.startupLoading}><Text style={styles.startupLoadingText}>{translate("common.loading")}</Text></View> : null}
     </View>
   );
 }
@@ -2810,35 +2828,6 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
     onRegisterFlush(() => flushAndApply.current());
     return () => onRegisterFlush(undefined);
   }, [onRegisterFlush, shell]);
-  const activateProviderAndRestart = async (): Promise<boolean> => {
-    let completed = false;
-    await run(async () => {
-      await flushPendingFields();
-      await dispatchQueue.current;
-      const refreshed = await ipc.snapshot();
-      revision.current = refreshed.revision;
-      latestSnapshot.current = refreshed;
-      onSnapshot(refreshed);
-      if (refreshed.drafts.providers_models?.dirty !== true) return { cancelled: true };
-      const diskChanged = refreshed.disk.providers_models?.changed === true;
-      if (diskChanged) {
-        const accepted = await native.showConfirmation({
-          title: translate("settings.diskChangedTitle"),
-          message: translate("settings.overwriteDiskConfirm"),
-          confirmLabel: translate("settings.keepDraft"),
-        });
-        if (!accepted) return { cancelled: true };
-      }
-      const applied = await ipc.applyDomains(["providers_models"], refreshed.revision, diskChanged ? ["overwrite_external_providers_models"] : undefined);
-      revision.current = applied.revision;
-      // Core restarts the managed proxy in the background for this apply, so
-      // activation must not wait for or race a second explicit restart here.
-      await refresh();
-      completed = applied.status === "applied";
-      return applied;
-    }, null, false, false);
-    return completed;
-  };
   const inspectImportDataManagement = async (): Promise<IpcResults["import_preview"] | undefined> => {
     let inspected: IpcResults["import_preview"] | undefined;
     await runDataManagement("import", async () => {
@@ -3261,7 +3250,7 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
   return <TranslationContext.Provider value={settingsRoute ? translate : undefined}><PendingFieldContext.Provider value={fieldRegistry}><View style={styles.windowSurface}>
     {!shell && route !== "providers-models" && route !== "logs" && route !== "provider-wizard" && route !== "data-management" ? <WindowTitle title={windowTitle} /> : null}
     {route === "providers-models" || route === "provider-wizard" || route === "file-editor" || settingsRoute || route === "logs" || route === "runtime-settings" || route === "data-management" || route === "general-settings" ? <View style={[styles.windowContent, compactStyles.windowContent, styles.windowContentFixed, route === "file-editor" && styles.fileEditorRouteContent, route === "providers-models" && styles.providersContent, route === "provider-wizard" && styles.providerWizardRouteContent, settingsRoute && styles.assistantSettingsContent, route === "logs" && styles.logsContent, route === "runtime-settings" && styles.runtimeContent, route === "data-management" && styles.dataManagementContent]}>
-    {route === "providers-models" ? <ProviderWorkspace snapshot={snapshot} ipc={ipc} onSnapshot={onSnapshot} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onStatus={setResult} onSecretState={onSecretState} applyProbedSurface={applyProbedSurface} onOpenWizard={() => { if (Platform.OS === "windows") onNavigate("provider-wizard"); native.window.open("provider-wizard"); }} relay={relayBridge} addOfficialAccount={addOfficialAccount} onActivateAndRestart={activateProviderAndRestart} /> : null}
+    {route === "providers-models" ? <ProviderWorkspace snapshot={snapshot} ipc={ipc} onSnapshot={onSnapshot} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onStatus={setResult} onSecretState={onSecretState} applyProbedSurface={applyProbedSurface} onOpenWizard={() => { if (Platform.OS === "windows") onNavigate("provider-wizard"); native.window.open("provider-wizard"); }} relay={relayBridge} addOfficialAccount={addOfficialAccount} /> : null}
     {route === "file-editor" ? <FileEditorWorkspace file={inlineEditorFile} fileId={fileIdRequest} nativeAction={nativeAction} ipc={ipc} native={native} translate={translate} busy={busy} onEditorConflict={resolveRawEditorConflict} reloadToken={settingsRawReloadToken} baselineToken={settingsRawBaselineToken} syncRevision={snapshot?.revision} onFlushPendingFields={flushPendingFields} onClose={closeRoute} /> : null}
     {route === "provider-wizard" ? <ProviderSetupWizard snapshot={snapshot} native={native} providers={providerWizardProviders} relaySources={providerWizardRelaySources} relayStations={providerWizardRelayStations} busy={busy} translate={translate} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onStatus={setResult} onClose={closeRoute} onKeyToken={registerProviderWizardKeyToken} relay={relayBridge} addOfficialAccount={addOfficialAccount} status={result} /> : null}
     {settingsRoute ? <AssistantSettingsWorkspace busy={busy} native={native} codexModels={codexModelRows} codexModelCatalogEnabled={codexModelCatalogEnabled} standaloneSearch={codexStandaloneSearch} onToggleStandaloneSearch={(enabled) => dispatch("codex.search.set", { enabled }, "codex")} codexFeatures={(domainState(snapshot, "codex").structured as UnknownRecord | undefined)?.features as UnknownRecord | undefined} clientProvider={codexClientProvider} clientModel={codexClientModel} localApiActive={codexUsesLocalApi} onToggleCodexModelCatalog={(enabled) => dispatch("codex.model_catalog.set", { enabled }, "codex")} onToggleCodexFeature={(feature, enabled) => dispatch("codex.feature.set", { feature, enabled }, "codex")} onUseLocalApi={(selection) => dispatch("use_local_api", selection, "codex")} onUseSavedModel={(selection) => dispatch("use_saved_model", selection, "codex")} translate={translate} ipc={ipc} filesToken={settingsRawBaselineToken} onOpenFile={openAssistantFile} /> : null}
@@ -3685,6 +3674,8 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     const options = {
       title: label + " " + translate("relay.officialProviderLogin"),
       closeLabel: translate("status.close"),
+      reloadLabel: translate("status.reload"),
+      browserLabel: translate("relay.officialProviderOpenBrowser"),
     };
     if (native.showProviderAuth) {
       void native.showProviderAuth({
@@ -4910,6 +4901,10 @@ function presentProviderAuthChallenge(native: NativeLeafAdapter, translate: Tran
   const options = {
     title: label + " " + translate("relay.officialProviderLogin"),
     closeLabel: translate("status.close"),
+    // The handoff window offers the two things a refusal may need: the page
+    // reloaded inside this app, and the sign-in finished in a real browser.
+    reloadLabel: translate("status.reload"),
+    browserLabel: translate("relay.officialProviderOpenBrowser"),
   };
   if (native.showProviderAuth) {
     void native.showProviderAuth({
@@ -4930,7 +4925,7 @@ function presentProviderAuthChallenge(native: NativeLeafAdapter, translate: Tran
   }
 }
 
-function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate, dispatch, dispatchWithOutcome, onStatus, onSecretState, applyProbedSurface, onOpenWizard, relay, addOfficialAccount, onActivateAndRestart }: { snapshot?: CoreSnapshot; ipc: IpcClient; onSnapshot: (next: CoreSnapshot) => void; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; dispatchWithOutcome: (type: string, payload?: UnknownRecord, domain?: ConfigDomain, keepControlsEnabled?: boolean) => Promise<CoreSnapshot | undefined>; onStatus: (status?: string) => void; onSecretState: (state: SecretState) => void; applyProbedSurface: ApplyProbedSurface; onOpenWizard: () => void; relay: RelayWorkspaceBridge; addOfficialAccount: (kind: ServiceProviderKind) => Promise<string>; onActivateAndRestart: () => Promise<boolean> }): React.JSX.Element {
+function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate, dispatch, dispatchWithOutcome, onStatus, onSecretState, applyProbedSurface, onOpenWizard, relay, addOfficialAccount }: { snapshot?: CoreSnapshot; ipc: IpcClient; onSnapshot: (next: CoreSnapshot) => void; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; dispatchWithOutcome: (type: string, payload?: UnknownRecord, domain?: ConfigDomain, keepControlsEnabled?: boolean) => Promise<CoreSnapshot | undefined>; onStatus: (status?: string) => void; onSecretState: (state: SecretState) => void; applyProbedSurface: ApplyProbedSurface; onOpenWizard: () => void; relay: RelayWorkspaceBridge; addOfficialAccount: (kind: ServiceProviderKind) => Promise<string> }): React.JSX.Element {
   const [modelTableWidth, setModelTableWidth] = useState(0);
   const state = domainState(snapshot, "providers_models");
   const relaySources = useMemo(() => relaySourcesFromSnapshot(snapshot), [snapshot]);
@@ -5039,6 +5034,13 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     [provider, validationIssues],
   );
   const [selectedModel, setSelectedModel] = useState<string>();
+  // The model row that was pressed, not merely the model it named: a model
+  // with no credential of its own is listed under every credential group, so
+  // the group is part of what the user clicked.  Without it the pane repaired
+  // the selection onto the first group that lists the model, and the row under
+  // the pointer lost its highlight while another copy lit up — the click read
+  // as a flash that had not taken.
+  const [selectedModelRow, setSelectedModelRow] = useState<string>();
   const [providerSourceModel, setProviderSourceModel] = useState<string>();
   // Adding a provider from the list header selects it as soon as the snapshot
   // carries it, so the editor below opens on the provider that was just made.
@@ -5084,7 +5086,22 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   const providerHoldsNoKey = providerKindSelected === "workbuddy" || providerKindSelected === "workbuddyGlobal"
     || providerKindSelected === "ourFreeModel";
   const fetchKeyChoices = useMemo(() => {
-    if (!provider || providerKindSelected === "openai" || providerKindSelected === "claude" || providerHoldsNoKey) return [];
+    if (!provider) return [];
+    // 获取模型 asks one credential for its roster, so the picker lists the
+    // row's credentials: every signed-in account, then every key.
+    if (providerKindSelected === "openai") {
+      return [
+        ...asRecords(provider.accounts)
+          .filter((account) => providerAuthStatus(account) === "signed_in")
+          .map((account) => ({
+            id: `account:${stringValue(account.ref)}`,
+            name: providerAuthAccount(account) || translate("providers.authAccount"),
+            kind: "account" as const,
+          })),
+        ...providerKeyChoices(provider, relaySources, providerBaseURL(provider)),
+      ];
+    }
+    if (providerKindSelected === "claude" || providerHoldsNoKey) return [];
     const choices = providerKeyChoices(provider, relaySources, providerBaseURL(provider));
     // A service that mints its own slot carries that slot nowhere in the
     // list above, and this row is how a lane is asked for its roster — so a
@@ -5276,7 +5293,9 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     const modelCapabilities = asRecord(summary.model_capabilities);
     const providerName = provider ? providerDisplayName(provider) : providerId;
     const apiKeyName = stringValue(summary.api_key_name);
-    if (!apiKeyName) {
+    // An account answers without a key name: its roster is filed as models of
+    // the row, and the row serves each of them on every credential it owns.
+    if (!apiKeyName && !stringValue(summary.account_ref)) {
       onStatus(translate("providers.fetchFailed", { detail: translate("providers.fetchKeyUnavailable") }));
       return;
     }
@@ -5368,7 +5387,11 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       ? serviceCatalogRead(laneService)?.action ?? ""
       : relaySource ? "provider.fetch_relay_resource_models" : "providers.fetch_models";
     if (!action) return;
-    const payload = laneService ? { provider: serviceCatalogRead(laneService)?.providerId ?? "" } : relaySource ? {
+    const accountRef = choice?.kind === "account" ? stringValue(choice.id).replace("account:", "") : "";
+    const payload = accountRef ? {
+      provider_id: providerId,
+      account_ref: accountRef,
+    } : laneService ? { provider: serviceCatalogRead(laneService)?.providerId ?? "" } : relaySource ? {
       provider_id: providerId,
       station_id: relaySource.stationID,
       account_id: relaySource.accountID,
@@ -5752,6 +5775,26 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     () => providers.filter((item) => !booleanValue(item.enabled, true)).map(editorIdentifier),
     [providers],
   );
+  // A login row serves its models on its credentials, not on a key: every
+  // signed-in account and every custom key is a group of its own, and the model
+  // list states that hierarchy instead of dropping every row into one column.
+  const modelCredentials = useMemo(() => {
+    if (providerKindSelected !== "openai" || !provider) return [];
+    return [
+      ...asRecords(provider.accounts)
+        .filter((account) => providerAuthStatus(account) === "signed_in")
+        .map((account) => ({
+          id: `account:${stringValue(account.ref)}`,
+          label: providerAuthAccount(account) || translate("providers.authAccount"),
+        })),
+      ...providerKeyStates(provider)
+        .filter((key) => key.source.kind === "independent" && !key.managed)
+        .map((key) => ({
+          id: `key:${key.id}`,
+          label: apiKeyDisplayName(key.name, translate),
+        })),
+    ];
+  }, [provider, providerKindSelected, translate]);
   const modelRows = useMemo(() => {
     // The key name is its own column: one spanning row per key, with that
     // key's models listed (and indented) underneath it.  A model that belongs
@@ -5804,16 +5847,40 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
         modelRateText(workspaceService, stringValue(item.upstream_model).trim(), multiplier),
       ];
     };
+    if (modelCredentials.length > 0) {
+      // One group per credential, the same model listed under each of them
+      // when every credential serves it.  The header is a spanning row: a
+      // heading is not an entry, and a spanning row is one the native tables
+      // refuse to select — which is what keeps a click on the account or the
+      // key name inert instead of moving the selection to a row with no model
+      // behind it.  The label keeps its whole text: a spanning cell is drawn
+      // across the row, and the model table's own columns are fixed by
+      // preserveColumnWidths, so a full address cannot widen it.
+      for (const credential of modelCredentials) {
+        rows.push({ key: modelGroupRowKey(credential.id), cells: [credential.label], spanning: true });
+        for (const item of models) {
+          const ownKey = modelProviderKeyState(item, provider ?? {});
+          if (ownKey && !credential.id.endsWith(ownKey.id)) continue;
+          rows.push({ key: modelRowKey(credential.id, editorIdentifier(item)), cells: modelCells(item) });
+        }
+      }
+      return rows;
+    }
     for (const item of ungrouped) rows.push({ key: editorIdentifier(item), cells: modelCells(item) });
     for (const [keyID, group] of grouped) {
       rows.push({ key: `key:${keyID}`, cells: [group.label], spanning: true });
       for (const item of group.models) rows.push({ key: editorIdentifier(item), cells: modelCells(item) });
     }
     return rows;
-  }, [modelDisplayName, modelUpstreamDisplay, models, provider, providerId, relaySources, serviceRateRevision, translate, workspaceService]);
+  }, [modelCredentials, modelDisplayName, modelUpstreamDisplay, models, provider, providerId, relaySources, serviceRateRevision, translate, workspaceService]);
+  // A row key names the credential group it sits in for a login row, so every
+  // id that addresses a model row has to name that group too.
+  const modelRowKeys = useCallback((modelIDs: string[]): string[] => (modelCredentials.length > 0
+    ? modelCredentials.flatMap((credential) => modelIDs.map((modelID) => modelRowKey(credential.id, modelID)))
+    : modelIDs), [modelCredentials]);
   const disabledModelKeys = useMemo(
-    () => models.filter((item) => !booleanValue(provider?.enabled, true) || !booleanValue(item.model_enabled, booleanValue(item.enabled, true))).map(editorIdentifier),
-    [models, provider?.enabled],
+    () => modelRowKeys(models.filter((item) => !booleanValue(provider?.enabled, true) || !booleanValue(item.model_enabled, booleanValue(item.enabled, true))).map(editorIdentifier)),
+    [modelRowKeys, models, provider?.enabled],
   );
   // Rows that cannot materialize a route keep the pane honest about what
   // blocks Apply: Core rejects a model without a public name, so the row that
@@ -5831,9 +5898,32 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     });
   }, [bindingIssues]);
   const alertModelKeys = useMemo(
-    () => models.filter((item) => modelNeedsAttention(item, translate) || Boolean(bindingIssueFor(item))).map(editorIdentifier),
-    [bindingIssueFor, models, translate],
+    () => modelRowKeys(models.filter((item) => modelNeedsAttention(item, translate) || Boolean(bindingIssueFor(item))).map(editorIdentifier)),
+    [bindingIssueFor, modelRowKeys, models, translate],
   );
+  // Where a model is listed more than once, the copy that was pressed is the
+  // one that reads as selected — the group's own listing when the user picked
+  // a row inside it, otherwise the group the model's key belongs to, and the
+  // first group only when neither answers.  The pressed row is trusted only
+  // while it is still a row of this list that addresses the selected model, so
+  // a selection made by ＋ or by a snapshot never inherits a row the user has
+  // since left, and a row from another provider never claims the highlight.
+  const selectedModelRowKey = useMemo(() => {
+    if (!selectedModel) return "";
+    if (modelCredentials.length === 0) return selectedModel;
+    if (selectedModelRow && modelRows.some((row) => !row.spanning && row.key === selectedModelRow && modelIDFromRowKey(row.key) === selectedModel)) {
+      return selectedModelRow;
+    }
+    const record = models.find((item) => editorIdentifier(item) === selectedModel);
+    const ownKey = record ? modelProviderKeyState(record, provider ?? {}) : undefined;
+    const ownGroup = ownKey ? modelCredentials.find((credential) => credential.id === `key:${ownKey.id}`) : undefined;
+    return modelRowKey((ownGroup ?? modelCredentials[0]).id, selectedModel);
+  }, [modelCredentials, modelRows, models, provider, selectedModel, selectedModelRow]);
+  // An empty column is not a pane: the inspector is drawn when there is
+  // something in it to inspect, and the middle column takes the room otherwise.
+  const showProviderInspector = viewMode === "routes"
+    ? Boolean(activePublicGroup || activeRoute)
+    : Boolean(provider || model);
   const alertProviderKeys = useMemo(
     () => providers.filter((item) => {
       if (validationIssues.some((issue) => validationIssueMatchesProvider(issue, item))) return true;
@@ -5973,30 +6063,38 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
         {/* The wizard is an action, not a third tab: keep it right-aligned so
             it never reads as part of the segmented control. */}
         <View style={styles.toolbarSpacer} />
-        <ActionButton title={translate("providers.addWizard")} disabled={busy} style={styles.providerWizardToolbarButton} onPress={onOpenWizard} />
+        <ActionButton title={translate("providers.addWizard")} titleWidth="tight" disabled={busy} style={styles.providerWizardToolbarButton} onPress={onOpenWizard} />
       </View>
       {viewMode === "routes" ? <View style={styles.routeWorkspace}>
         <TablePane wide style={styles.routeTablePane} title={translate("providers.routes")} actions={<><IconButton label="+" title={translate("providers.newRoute")} disabled={busy || providers.length === 0} onPress={addRoute} />{activeRoute || selectedPublicModel !== undefined ? <IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteRoute} /> : null}<IconButton label="↑" title={routeMoveTitleKey ? translate(routeMoveTitleKey) : translate("common.moveUp")} disabled={busy || !canMoveRouteUp} onPress={() => moveRoute("up")} /><IconButton label="↓" title={routeMoveTitleKey ? translate(routeMoveTitleKey) : translate("common.moveDown")} disabled={busy || !canMoveRouteDown} onPress={() => moveRoute("down")} /></>}>
           <NativeTable columns={[{ label: translate("providers.upstream"), width: 120 }, { label: translate("providers.provider"), width: 96 }, { label: translate("providers.providerKey"), width: 130 }, { label: translate("common.order"), width: 64 }]} rows={routeRows} disabledRowKeys={disabledRouteKeys} alertRowKeys={alertRouteKeys} selectedKey={selectedPublicModel !== undefined ? routePublicModelRowKey(selectedPublicModel) : (selectedRoute ?? "")} compact selectableSpanningRowKeys={selectableRouteGroupKeys} onSelectionChange={(key) => selectRouteTableRow(key)} style={styles.nativeRouteTable} />
         </TablePane>
+      </View> : providers.length === 0 ? <View style={styles.providerEmptyState}>
+        <View style={styles.providerEmptyGlyph}><Text style={styles.providerEmptyGlyphText}>+</Text></View>
+        <Text style={styles.providerEmptyTitle}>{translate("providers.emptyTitle")}</Text>
+        <Text style={styles.providerEmptyHint}>{translate("providers.emptyHint")}</Text>
+        <View style={styles.providerEmptyActions}>
+          <ActionButton title={translate("providers.addWizard")} titleWidth="tight" primary disabled={busy} onPress={onOpenWizard} />
+        </View>
       </View> : <View style={styles.providerWorkspace}>
         <View style={styles.providerModelColumns}>
           <TablePane style={styles.providerListPane} title={translate("providers.providers")} actions={<><IconButton label="+" title={translate("providers.newProvider")} disabled={busy} onPress={addProvider} />{provider ? <IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteProvider} /> : null}</>}>
             <NativeTable columns={[{ label: translate("providers.provider"), width: 132 }]} rows={providerRows} disabledRowKeys={disabledProviderKeys} alertRowKeys={alertProviderKeys} selectedKey={providerId} compact firstColumnHorizontalPadding={0} onSelectionChange={(key) => { setSelectedProvider(key); setSelectedModel(undefined); setProviderSourceModel(undefined); }} style={styles.nativeProviderTable} />
           </TablePane>
-          <View style={styles.providerMiddlePane}>
+          <View style={styles.providerMiddlePane} onLayout={({ nativeEvent }) => setModelTableWidth(nativeEvent.layout.width)}>
             <TablePane style={[styles.modelListPane]} title={translate("providers.models")} actions={<>{provider && providerKindSelected !== "openai" && providerKindSelected !== "claude" ? <IconButton label="+" title={translate("providers.newModel")} disabled={busy} onPress={addModel} /> : null}{model ? <IconButton label="⧉" title={translate("common.copy")} disabled={busy} onPress={duplicateModel} /> : null}{model ? <IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteModel} /> : null}</>}>
-              <View style={styles.nativeModelTable} onLayout={({ nativeEvent }) => setModelTableWidth(nativeEvent.layout.width)}><NativeTable columns={modelTableColumns(modelTableWidth, translate)} rows={modelRows} disabledRowKeys={disabledModelKeys} alertRowKeys={alertModelKeys} selectedKey={selectedModel ?? ""} compact firstColumnHorizontalPadding={0} preserveColumnWidths onSelectionChange={(key) => { setSelectedModel(key); setProviderSourceModel(undefined); }} style={styles.modelTable} /></View>
-              {provider && providerKindSelected !== "openai" && providerKindSelected !== "claude" ? <View style={styles.tableBottomRow}>{fetchKeyChoices.length > 0 ? <NativePicker labels={fetchKeyOptions.length > 0 ? fetchKeyOptions.map((option) => option.label) : [translate("common.default")]} selectedValue={fetchKeyOptions.find((option) => option.value === selectedFetchKey)?.label ?? translate("common.default")} disabled={busy} onChange={({ nativeEvent }) => { const option = fetchKeyOptions[nativeEvent.index]; if (option) setFetchKeyID(option.value); }} style={styles.fetchKeyPicker} /> : null}<ActionButton title={translate("providers.fetch")} busy={fetchModelsBusy} disabled={(busy && !fetchModelsBusy) || (fetchKeyChoices.length > 0 && !selectedFetchKey)} onPress={() => { void fetchModels(); }} /></View> : null}
+              <View style={styles.nativeModelTable}><NativeTable columns={modelTableColumns(modelTableWidth, translate)} rows={modelRows} disabledRowKeys={disabledModelKeys} alertRowKeys={alertModelKeys} selectedKey={selectedModelRowKey} compact firstColumnHorizontalPadding={0} preserveColumnWidths onSelectionChange={(key) => { if (!key) { setSelectedModel(undefined); setSelectedModelRow(undefined); setProviderSourceModel(undefined); return; } const modelID = modelIDFromRowKey(key); if (modelID === undefined) return; setSelectedModel(modelID); setSelectedModelRow(key); setProviderSourceModel(undefined); }} style={styles.modelTable} /></View>
+              {provider && providerKindSelected !== "claude" ? <View style={styles.tableBottomRow}>{fetchKeyChoices.length > 0 ? <NativePicker labels={fetchKeyOptions.length > 0 ? fetchKeyOptions.map((option) => option.label) : [translate("common.default")]} selectedValue={fetchKeyOptions.find((option) => option.value === selectedFetchKey)?.label ?? translate("common.default")} disabled={busy} onChange={({ nativeEvent }) => { const option = fetchKeyOptions[nativeEvent.index]; if (option) setFetchKeyID(option.value); }} style={styles.fetchKeyPicker} /> : null}<ActionButton title={translate("providers.fetch")} busy={fetchModelsBusy} disabled={(busy && !fetchModelsBusy) || (fetchKeyChoices.length > 0 && !selectedFetchKey)} onPress={() => { void fetchModels(); }} /></View> : null}
             </TablePane>
           </View>
         </View>
       </View>}
     </View>
-    <View style={styles.providerInspector}>{viewMode === "routes" ? (activePublicGroup ? <PublicModelInspector key={`public:${activePublicGroup.name}`} group={activePublicGroup} modelContexts={modelContexts} backLabel={publicModelReturn?.label} onBackToModel={returnToPublicModelOrigin} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} onRenamed={(next) => { setSelectedPublicModel(next); setSelectedRoute(""); }} /> : activeRoute ? (providerSourceModel ? <ProviderEditor key={`provider:${editorIdentifier(activeRoute.provider)}`} provider={activeRoute.provider} relaySources={relaySources} relayStations={relayStations} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onNameDraftChange={(value) => setProviderNameDraft(editorIdentifier(activeRoute.provider), value)} sourceModel={activeRoute.model} onReturnToModel={() => { setProviderSourceModel(undefined); setSelectedModel(editorIdentifier(activeRoute.model)); }} station={stationForProvider(activeRoute.provider)} stationAccounts={stationAccountsFor(activeRoute.provider)} relay={relay} addOfficialAccount={addOfficialAccount} onActivateAndRestart={onActivateAndRestart} onStatus={onStatus} language={snapshot?.language ?? "system"} bindingIssues={bindingIssues} snapshotForCleanups={snapshot} /> : <ModelInspector key={`model:${editorIdentifier(activeRoute.provider)}:${editorIdentifier(activeRoute.model)}`} providers={providers} providerLabels={providers.map(providerDisplayName)} provider={activeRoute.provider} providerId={editorIdentifier(activeRoute.provider)} model={activeRoute.model} relaySources={relaySources} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} modelContexts={modelContexts} bindingIssue={bindingIssueFor(activeRoute.model)} {...modelProbeProps(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model), probeInputFingerprint(providerBaseURL(activeRoute.provider), modelUpstreamDisplay(editorIdentifier(activeRoute.provider), activeRoute.model), activeRoute.model))} onNameDraftChange={(value) => setModelNameDraft(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model), value)} onProviderClick={() => setProviderSourceModel(editorIdentifier(activeRoute.model))} onOpenPublicModel={() => { // The pane is keyed by the name the routes table groups under, which is
+    {showProviderInspector ? <View style={styles.providerInspector}>{viewMode === "routes" ? (activePublicGroup ? <PublicModelInspector key={`public:${activePublicGroup.name}`} group={activePublicGroup} modelContexts={modelContexts} backLabel={publicModelReturn?.label} onBackToModel={returnToPublicModelOrigin} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} onRenamed={(next) => { setSelectedPublicModel(next); setSelectedRoute(""); }} /> : activeRoute ? (providerSourceModel ? <ProviderEditor key={`provider:${editorIdentifier(activeRoute.provider)}`} provider={activeRoute.provider} relaySources={relaySources} relayStations={relayStations} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onNameDraftChange={(value) => setProviderNameDraft(editorIdentifier(activeRoute.provider), value)} sourceModel={activeRoute.model} onReturnToModel={() => { setProviderSourceModel(undefined); setSelectedModel(editorIdentifier(activeRoute.model)); }} station={stationForProvider(activeRoute.provider)} stationAccounts={stationAccountsFor(activeRoute.provider)} relay={relay} addOfficialAccount={addOfficialAccount} onStatus={onStatus} language={snapshot?.language ?? "system"} bindingIssues={bindingIssues} snapshotForCleanups={snapshot} /> : <ModelInspector key={`model:${editorIdentifier(activeRoute.provider)}:${editorIdentifier(activeRoute.model)}`} providers={providers} providerLabels={providers.map(providerDisplayName)} provider={activeRoute.provider} providerId={editorIdentifier(activeRoute.provider)} model={activeRoute.model} relaySources={relaySources} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} modelContexts={modelContexts} bindingIssue={bindingIssueFor(activeRoute.model)} {...modelProbeProps(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model), probeInputFingerprint(providerBaseURL(activeRoute.provider), modelUpstreamDisplay(editorIdentifier(activeRoute.provider), activeRoute.model), activeRoute.model))} onNameDraftChange={(value) => setModelNameDraft(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model), value)} onProviderClick={() => setProviderSourceModel(editorIdentifier(activeRoute.model))} onOpenPublicModel={() => { // The pane is keyed by the name the routes table groups under, which is
                   // the display name the drafts already project, so 设置 opens that
                   // group's settings even while the name field holds a draft.
-                  const publicModel = activeRoute.publicModel.trim(); if (!publicModel) return; selectRouteTableRow(routePublicModelRowKey(publicModel)); setPublicModelReturn({ routeKey: activeRoute.key, label: modelUpstreamDisplay(editorIdentifier(activeRoute.provider), activeRoute.model) || publicModel }); }} onProviderChange={(destinationProviderId) => dispatch("model.move_provider", { provider_id: editorIdentifier(activeRoute.provider), model_id: editorIdentifier(activeRoute.model), destination_provider_id: destinationProviderId }).then(() => { setSelectedProvider(destinationProviderId); setSelectedModel(editorIdentifier(activeRoute.model)); setSelectedRoute(`${destinationProviderId}:${activeRoute.deploymentID}`); setProviderSourceModel(undefined); })} />) : <EmptyState translate={translate} />) : provider && model ? <ModelInspector key={`model:${providerId}:${editorIdentifier(model)}`} providers={providers} providerLabels={providers.map(providerDisplayName)} provider={provider} providerId={providerId} model={model} relaySources={relaySources} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} modelContexts={modelContexts} bindingIssue={bindingIssueFor(model)} {...modelProbeProps(providerId, editorIdentifier(model), probeInputFingerprint(providerBaseURL(provider), modelUpstreamDisplay(providerId, model), model))} onNameDraftChange={(value) => setModelNameDraft(providerId, editorIdentifier(model), value)} onProviderClick={() => { setProviderSourceModel(editorIdentifier(model)); setSelectedModel(undefined); }} onOpenPublicModel={() => { const publicModel = modelDisplayName(providerId, model).trim(); if (!publicModel) return; const originRouteKey = `${providerId}:${stringValue(model.editor_id, stringValue(model.deployment_id, identifier(model))).trim()}`; setViewMode("routes"); selectRouteTableRow(routePublicModelRowKey(publicModel)); setPublicModelReturn({ routeKey: originRouteKey, label: modelUpstreamDisplay(providerId, model) || publicModel }); }} onProviderChange={(destinationProviderId) => dispatch("model.move_provider", { provider_id: providerId, model_id: editorIdentifier(model), destination_provider_id: destinationProviderId }).then(() => { setSelectedProvider(destinationProviderId); setSelectedModel(editorIdentifier(model)); setProviderSourceModel(undefined); })} /> : provider ? <ProviderEditor key={`provider:${providerId}`} provider={provider} relaySources={relaySources} relayStations={relayStations} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onNameDraftChange={(value) => setProviderNameDraft(providerId, value)} sourceModel={models.find((item) => editorIdentifier(item) === providerSourceModel)} onReturnToModel={() => { if (providerSourceModel) setSelectedModel(providerSourceModel); setProviderSourceModel(undefined); }} station={selectedStation} stationAccounts={selectedStationAccounts} relay={relay} addOfficialAccount={addOfficialAccount} onActivateAndRestart={onActivateAndRestart} onStatus={onStatus} language={snapshot?.language ?? "system"} bindingIssues={bindingIssues} snapshotForCleanups={snapshot} /> : <EmptyState translate={translate} />}</View>
+                  const publicModel = activeRoute.publicModel.trim(); if (!publicModel) return; selectRouteTableRow(routePublicModelRowKey(publicModel)); setPublicModelReturn({ routeKey: activeRoute.key, label: modelUpstreamDisplay(editorIdentifier(activeRoute.provider), activeRoute.model) || publicModel }); }} onProviderChange={(destinationProviderId) => dispatch("model.move_provider", { provider_id: editorIdentifier(activeRoute.provider), model_id: editorIdentifier(activeRoute.model), destination_provider_id: destinationProviderId }).then(() => { setSelectedProvider(destinationProviderId); setSelectedModel(editorIdentifier(activeRoute.model)); setSelectedRoute(`${destinationProviderId}:${activeRoute.deploymentID}`); setProviderSourceModel(undefined); })} />) : <EmptyState translate={translate} />) : provider && model ? <ModelInspector key={`model:${providerId}:${editorIdentifier(model)}`} providers={providers} providerLabels={providers.map(providerDisplayName)} provider={provider} providerId={providerId} model={model} relaySources={relaySources} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} modelContexts={modelContexts} bindingIssue={bindingIssueFor(model)} {...modelProbeProps(providerId, editorIdentifier(model), probeInputFingerprint(providerBaseURL(provider), modelUpstreamDisplay(providerId, model), model))} onNameDraftChange={(value) => setModelNameDraft(providerId, editorIdentifier(model), value)} onProviderClick={() => { setProviderSourceModel(editorIdentifier(model)); setSelectedModel(undefined); }} onOpenPublicModel={() => { const publicModel = modelDisplayName(providerId, model).trim(); if (!publicModel) return; const originRouteKey = `${providerId}:${stringValue(model.editor_id, stringValue(model.deployment_id, identifier(model))).trim()}`; setViewMode("routes"); selectRouteTableRow(routePublicModelRowKey(publicModel)); setPublicModelReturn({ routeKey: originRouteKey, label: modelUpstreamDisplay(providerId, model) || publicModel }); }} onProviderChange={(destinationProviderId) => dispatch("model.move_provider", { provider_id: providerId, model_id: editorIdentifier(model), destination_provider_id: destinationProviderId }).then(() => { setSelectedProvider(destinationProviderId); setSelectedModel(editorIdentifier(model)); setProviderSourceModel(undefined); })} /> : provider ? <ProviderEditor key={`provider:${providerId}`} provider={provider} relaySources={relaySources} relayStations={relayStations} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onNameDraftChange={(value) => setProviderNameDraft(providerId, value)} sourceModel={models.find((item) => editorIdentifier(item) === providerSourceModel)} onReturnToModel={() => { if (providerSourceModel) setSelectedModel(providerSourceModel); setProviderSourceModel(undefined); }} station={selectedStation} stationAccounts={selectedStationAccounts} relay={relay} addOfficialAccount={addOfficialAccount} onStatus={onStatus} language={snapshot?.language ?? "system"} bindingIssues={bindingIssues} snapshotForCleanups={snapshot} /> : <EmptyState translate={translate} />}</View>
+    : null}
     <RelayDialogHost />
   </View></ProviderWorkspaceDraftContext.Provider>;
 }
@@ -6007,11 +6105,15 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
  */
 /**
  * One key table for both key kinds: spanning group rows split 自定义密钥 and
- * 供应商提供, and the editor below always edits exactly the selected key.
+ * 供应商提供, and the editor beside it always edits exactly the selected key.
+ *
  * variant "pane" renders its own titled pane for the middle column;
- * variant "inline" renders a compact section for the right detail pane.
+ * variant "inline" renders the same list beside its editor inside the right
+ * detail pane — the layout every provider uses, because a key list is read by
+ * comparing rows and its editor is what the next click acts on, so the two
+ * belong side by side rather than stacked.
  */
-function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native, busy, translate, dispatch, onSecretState, relay, onStatus, language, bindingIssues, variant = "pane" }: { provider?: UnknownRecord; providerId: string; kind: ProviderKind; stationAccounts: RelayAccount[]; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; relay: RelayWorkspaceBridge; onStatus: (status?: string) => void; language: "system" | "en" | "zh-Hans"; bindingIssues?: UnknownRecord[]; snapshotForCleanups?: CoreSnapshot; variant?: "pane" | "inline" }): React.JSX.Element {
+function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native, busy, translate, dispatch, onSecretState, relay, onStatus, language, bindingIssues, variant = "pane", credentials, credentialActions, credentialStatus, credentialSignIn, help }: { provider?: UnknownRecord; providerId: string; kind: ProviderKind; stationAccounts: RelayAccount[]; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; relay: RelayWorkspaceBridge; onStatus: (status?: string) => void; language: "system" | "en" | "zh-Hans"; bindingIssues?: UnknownRecord[]; snapshotForCleanups?: CoreSnapshot; variant?: "pane" | "inline"; /** A login row's signed-in accounts: credentials, listed beside its keys. */ credentials?: Array<{ ref: string; name: string }>; /** What may be done to the selected account, beside the list it belongs to. */ credentialActions?: (ref: string) => React.ReactNode; /** The selected account's state, stated under the list. */ credentialStatus?: (ref: string) => string; /** The sign-in this list offers beside ＋, which adds a key of the user's. */ credentialSignIn?: { label: string; busy: boolean; disabled: boolean; onPress: () => void }; /** The mark beside the list that states how these credentials behave. */ help?: React.ReactNode }): React.JSX.Element {
   const drafts = useContext(ProviderWorkspaceDraftContext);
   const isRelay = kind === "relay";
   // A slot Core owns is not a user key, whatever the provider's kind says.
@@ -6033,7 +6135,10 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
     ? providerKeyStates(provider).filter((key) => key.source.kind === "relay"
       && !stationAccounts.some((account) => account.resources.some((resource) => resource.id === key.source.resourceID)))
     : [], [provider, stationAccounts]);
-  const firstSelectable = customKeys[0] ? `custom:${customKeys[0].id}` : providedRows[0] ? `provided:${providedRows[0].key}` : orphanSlots[0] ? `orphan:${orphanSlots[0].id}` : "";
+  const loginCredentials = credentials ?? [];
+  const firstSelectable = loginCredentials[0]
+    ? `account:${loginCredentials[0].ref}`
+    : customKeys[0] ? `custom:${customKeys[0].id}` : providedRows[0] ? `provided:${providedRows[0].key}` : orphanSlots[0] ? `orphan:${orphanSlots[0].id}` : "";
   const [selectedKey, setSelectedKey] = useState<string>(firstSelectable);
   // A cleared key selection (a click below the key rows) survives the repair
   // below: the panel keeps no key selected, hides the −, and leaves its editor
@@ -6050,6 +6155,9 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
   const [createOpen, setCreateOpen] = useState(false);
   const [remoteDelete, setRemoteDelete] = useState<{ account: RelayAccount; resource: RelayResource; label: string }>();
   const [remoteDeletePolicy, setRemoteDeletePolicy] = useState<"delete_models" | "detach_disabled" | "detach_only">("detach_disabled");
+  const selectedCredential = selectedKey.startsWith("account:")
+    ? loginCredentials.find((credential) => `account:${credential.ref}` === selectedKey)
+    : undefined;
   const selectedCustom = selectedKey.startsWith("custom:")
     ? customKeys.find((key) => `custom:${key.id}` === selectedKey)
     : undefined;
@@ -6076,6 +6184,14 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
   const controlsBusy = busy || formBusy;
   const tableRows = useMemo(() => {
     const rows: Array<{ key: string; cells: string[]; spanning?: boolean }> = [];
+    // The credentials of a login row come first, ungrouped: an account and a
+    // key are two kinds of the same thing, and a header that only counted
+    // them said nothing the rows do not.
+    for (const credential of loginCredentials) {
+      rows.push({ key: `account:${credential.ref}`, cells: (credentials ?? []).length > 0 && variant !== "inline"
+        ? [credential.name, translate("providers.authLoginType")]
+        : [credential.name] });
+    }
     // Group headers only separate the two kinds; a single-kind list skips
     // them so custom-only vendors see a plain key table.
     const showHeaders = providedRows.length > 0 && customKeys.length > 0;
@@ -6083,7 +6199,9 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
     for (const key of customKeys) {
       // Custom keys indent under their group header the same way relay keys
       // indent under their account row.
-      rows.push({ key: `custom:${key.id}`, cells: [showHeaders ? `\t${key.name}` : key.name] });
+      rows.push({ key: `custom:${key.id}`, cells: (credentials ?? []).length > 0 && variant !== "inline"
+        ? [key.name, translate("providers.authenticationKey")]
+        : [showHeaders ? `\t${key.name}` : key.name] });
     }
     // Relay keys nest under their account the way routes nest under a
     // public model: spanning account rows, indented key rows beneath.
@@ -6105,7 +6223,7 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
       }
     }
     return rows;
-  }, [customKeys, orphanSlots, providedNameDrafts, providedRows, stationAccounts, translate]);
+  }, [credentials, customKeys, loginCredentials, orphanSlots, providedNameDrafts, providedRows, stationAccounts, translate, variant]);
   const secondaryCellKeys: string[] = [];
   const runProvidedAction = async (action: () => Promise<void>, feedbackKey: string): Promise<void> => {
     setFormBusy(true);
@@ -6179,8 +6297,15 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
     // selection verbatim or every click would snap back to the first row.
     const valid = new Set(tableRows.filter((row) => !row.spanning).map((row) => row.key));
     if (valid.has(selectedKey)) return;
-    setSelectedKey(customKeys[0] ? `custom:${customKeys[0].id}` : providedRows[0] ? `provided:${providedRows[0].key}` : orphanSlots[0] ? `orphan:${orphanSlots[0].id}` : "");
-  }, [customKeys, orphanSlots, providedRows, selectedKey, selectionCleared, tableRows]);
+    // An account is a row of this same list, so the repair has to fall back to
+    // one too: the sign-in it lands on is the list's first credential, and a
+    // repair that only knew about keys and station rows kept re-selecting a key
+    // the moment the panel opened on an account — the account stayed listed and
+    // never selected, and its editor column stayed empty.
+    setSelectedKey(loginCredentials[0]
+      ? `account:${loginCredentials[0].ref}`
+      : customKeys[0] ? `custom:${customKeys[0].id}` : providedRows[0] ? `provided:${providedRows[0].key}` : orphanSlots[0] ? `orphan:${orphanSlots[0].id}` : "");
+  }, [customKeys, loginCredentials, orphanSlots, providedRows, selectedKey, selectionCleared, tableRows]);
   const addKey = (): void => {
     if (selectedGroup === "provided" && isRelay) {
       if (autoGrouping || stationAccounts.length === 0) return;
@@ -6250,11 +6375,17 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
       return dispatch("provider.key_delete", { provider_id: providerId, name: selectedKeyName });
     });
   };
-  // A + / − the current state cannot use is hidden instead of greyed out: the
-  // list header keeps only the actions that apply to what is selected.
   const canAddKey = !(selectedGroup === "provided" && (autoGrouping || stationAccounts.length === 0 || !relay.apiKeyActions.create));
   const canDeleteKey = Boolean(selectedCustom) || Boolean(selectedOrphan) || Boolean(selectedProvided && !autoGrouping);
+  // A ＋ and a − the current state cannot use are hidden instead of greyed out:
+  // the list header keeps only the actions that apply to what is selected.  A
+  // ＋ always adds a key of the user's, on every kind of row: on an
+  // account-backed row that is the action the pane did not offer at all — Core
+  // refused it — so the button was there and did nothing.  Signing another
+  // account in is a different action and states its own name, beside the
+  // account it would add to.
   const toolbar = <>
+    {help ?? null}
     {canAddKey ? <IconButton label="+" title={translate("providers.addKey")} disabled={controlsBusy} onPress={addKey} /> : null}
     {canDeleteKey ? <IconButton label="−" title={translate("common.delete")} disabled={controlsBusy} onPress={deleteSelected} /> : null}
   </>;
@@ -6266,10 +6397,12 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
   // below, and the list scrolls internally when the vendor has more keys.
   const keysTable = <NativeTable
       columns={variant === "inline"
-        ? [{ label: translate("providers.keys"), width: 264 }]
+        ? [{ label: translate((credentials ?? []).length > 0 ? "providers.credentials" : "providers.keys"), width: 264 }]
+        : (credentials ?? []).length > 0
+        ? [{ label: translate("providers.credentials"), width: 150 }, { label: translate("providers.authType"), width: 90 }]
         : [{ label: translate("common.name"), width: 150 }, { label: translate("providers.detail"), width: 170 }]}
       rows={tableRows}
-      selectedKey={selectedCustom ? `custom:${selectedCustom.id}` : selectedProvided ? `provided:${selectedProvided.key}` : ""}
+      selectedKey={selectedKey}
       disabledRowKeys={providedRows.filter((row) => row.unavailable).map((row) => `provided:${row.key}`)}
       alertRowKeys={[...providedRows.filter((row) => Boolean(bindingIssueForProvidedRow(row))).map((row) => `provided:${row.key}`), ...orphanSlots.filter((slot) => bindingIssues?.some((issue) => stringValue(issue.provider_key_id) === slot.id)).map((slot) => `orphan:${slot.id}`)]}
       compact
@@ -6277,7 +6410,11 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
       firstColumnHorizontalPadding={6}
       scrollTrailingColumnOverflow={false}
       onSelectionChange={(key) => {
-        if (key.startsWith("group:") || key.startsWith("account:")) return;
+        // A group header is a heading, not a credential: clicking one leaves the
+        // selection where it was.  A sign-in *is* a credential of this row, so
+        // it selects like any key — ignoring it left the account listed, never
+        // selectable, and its editor column permanently empty.
+        if (key.startsWith("group:")) return;
         setSelectionCleared(key === "");
         setSelectedKey(key);
       }}
@@ -6296,6 +6433,17 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
     </View>
   );
   const keysEditorView = <View style={variant === "inline" ? styles.keysEditorInline : styles.keysEditor}>
+      {selectedCredential ? <>
+        {/* A signed-in account has no key to edit, so the editor column states
+            who it is — its reference and its own state — and offers the two
+            actions a login has.  It is the same column every key beside it
+            uses, so the list stays a list of credentials: comparing one row
+            with the next is what the pane is for. */}
+        {keysEditorField("credential-account", translate("providers.authAccount"), <Text numberOfLines={2} style={styles.keysEditorValueText}>{selectedCredential.name}</Text>)}
+        {credentialStatus ? keysEditorField("credential-status", translate("providers.authStatus"), <Text numberOfLines={1} style={styles.keysEditorValueText}>{credentialStatus(selectedCredential.ref)}</Text>) : null}
+        {credentialActions ? <View style={styles.keysEditorActions}>{credentialActions(selectedCredential.ref)}</View> : null}
+        {credentialSignIn ? <View style={styles.keysEditorActions}><NativeButton title={credentialSignIn.label} compact busy={credentialSignIn.busy} disabled={credentialSignIn.disabled} onPress={credentialSignIn.onPress} /></View> : null}
+      </> : null}
       {selectedCustom ? <>
         {keysEditorField("key-name", translate("providers.keyName"), <TextField
           key={`custom-key-name:${providerId}:${selectedCustom.id}`}
@@ -6453,17 +6601,22 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
   if (variant === "inline") {
     return <View style={styles.keysInline}>
       <View style={styles.panelHeader}>
-        <Text style={styles.panelTitle}>{translate("providers.keys")}</Text>
+        <Text style={styles.panelTitle}>{translate((credentials ?? []).length > 0 ? "providers.credentials" : "providers.keys")}</Text>
         <View style={styles.panelActions}>{toolbar}</View>
       </View>
       {tableRows.length > 0 ? <View style={styles.keysInlineBody}>
         {keysTable}
         {keysEditorView}
-      </View> : keysEditorView}
+      </View> : <View style={styles.keysInlineBody}>
+        {/* No credential to select yet: the editor column would be empty, so
+            the one action that can fill this list states itself here. */}
+        {credentialSignIn ? <NativeButton title={credentialSignIn.label} compact busy={credentialSignIn.busy} disabled={credentialSignIn.disabled} onPress={credentialSignIn.onPress} /> : null}
+        {keysEditorView}
+      </View>}
       {dialogsHosted ? null : dialogs}
     </View>;
   }
-  return <TablePane style={[styles.keysPane]} title={translate("providers.keys")} actions={toolbar}>
+  return <TablePane style={[styles.keysPane]} title={translate((credentials ?? []).length > 0 ? "providers.credentials" : "providers.keys")} actions={toolbar}>
     {tableRows.length > 0 ? keysTable : null}
     {keysEditorView}
     {dialogsHosted ? null : dialogs}
@@ -6842,11 +6995,11 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
 // intact. The panel is anchored upward because these rows sit at the bottom of
 // the model inspector, where a panel opening downward would fall outside the
 // workspace.
-function HelpTip({ open, text, title, onToggle }: { open: boolean; text: string; title: string; onToggle: () => void }): React.JSX.Element {
+function HelpTip({ open, text, title, onToggle, align = "right" }: { open: boolean; text: string; title: string; onToggle: () => void; align?: "left" | "right" }): React.JSX.Element {
   return <View style={styles.helpTipAnchor}>
     {open ? <Pressable accessible={false} onPress={onToggle} style={styles.helpTipDismiss} /> : null}
     <NativeButton title="" symbol="help" link plainLink toolTip={title} accessibilityLabel={title} onPress={onToggle} style={styles.helpTipButton} />
-    {open ? <View style={styles.helpTipPopup}><Text style={styles.helpTipText}>{text}</Text></View> : null}
+    {open ? <View style={align === "left" ? styles.helpTipPopupLeft : styles.helpTipPopup}><Text style={styles.helpTipText}>{text}</Text></View> : null}
   </View>;
 }
 
@@ -7073,7 +7226,17 @@ function modelTableColumns(width: number, translate: Translate): Array<{ label: 
   // The table's own 1 pt frame is not column space: spending the last two
   // points on the columns leaves the native table scrolling by that much.
   const available = width - 2;
-  if (!(available > minimumTotal)) return labels.map((label, index) => ({ label, width: minimums[index] }));
+  if (!(available > minimumTotal)) {
+    // A pane too narrow for the floors still shows all three columns: the
+    // native table is at least as wide as the widths it is given, so keeping
+    // the floors here did not scroll anything -- it drew the table wider than
+    // its own pane and let 倍率 cover the inspector beside it.  Sharing the
+    // width that exists keeps every column in the pane it belongs to.
+    const share = Math.max(0, available) / minimumTotal;
+    const scaled = minimums.map((minimum) => Math.max(1, Math.floor(minimum * share)));
+    scaled[scaled.length - 1] = Math.max(1, available - scaled.slice(0, -1).reduce((total, value) => total + value, 0));
+    return labels.map((label, index) => ({ label, width: scaled[index] }));
+  }
   // The upstream name is the one that carries a vendor prefix and a version
   // suffix, so it takes the larger half of the slack; the rate column is a
   // word and a short number and never grows.
@@ -7363,7 +7526,7 @@ function ProviderIdentityFields({ provider, providerID, relayStations, station, 
   </View>;
 }
 
-function ProviderEditor({ provider, relaySources, relayStations, native, busy, translate, dispatch, dispatchWithOutcome, onSecretState, onNameDraftChange, sourceModel, onReturnToModel, station, stationAccounts, relay, addOfficialAccount, onActivateAndRestart, onStatus, language, bindingIssues, snapshotForCleanups }: { provider: UnknownRecord; relaySources: RelaySourceOption[]; relayStations: RelayStationOption[]; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; dispatchWithOutcome: (type: string, payload?: UnknownRecord, domain?: ConfigDomain, keepControlsEnabled?: boolean) => Promise<CoreSnapshot | undefined>; onSecretState: (state: SecretState) => void; onNameDraftChange?: (name: string) => void; sourceModel?: UnknownRecord; onReturnToModel: () => void; station?: RelayStation; stationAccounts: RelayAccount[]; relay: RelayWorkspaceBridge; addOfficialAccount: (kind: ServiceProviderKind) => Promise<string>; onActivateAndRestart: () => Promise<boolean>; onStatus: (status?: string) => void; language: "system" | "en" | "zh-Hans"; bindingIssues?: UnknownRecord[]; snapshotForCleanups?: CoreSnapshot }): React.JSX.Element {
+function ProviderEditor({ provider, relaySources, relayStations, native, busy, translate, dispatch, dispatchWithOutcome, onSecretState, onNameDraftChange, sourceModel, onReturnToModel, station, stationAccounts, relay, addOfficialAccount, onStatus, language, bindingIssues, snapshotForCleanups }: { provider: UnknownRecord; relaySources: RelaySourceOption[]; relayStations: RelayStationOption[]; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; dispatchWithOutcome: (type: string, payload?: UnknownRecord, domain?: ConfigDomain, keepControlsEnabled?: boolean) => Promise<CoreSnapshot | undefined>; onSecretState: (state: SecretState) => void; onNameDraftChange?: (name: string) => void; sourceModel?: UnknownRecord; onReturnToModel: () => void; station?: RelayStation; stationAccounts: RelayAccount[]; relay: RelayWorkspaceBridge; addOfficialAccount: (kind: ServiceProviderKind) => Promise<string>; onStatus: (status?: string) => void; language: "system" | "en" | "zh-Hans"; bindingIssues?: UnknownRecord[]; snapshotForCleanups?: CoreSnapshot }): React.JSX.Element {
   const id = editorIdentifier(provider);
   const drafts = useContext(ProviderWorkspaceDraftContext);
   const kind = providerKind(provider);
@@ -7379,7 +7542,7 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
   const isLogin = isLoginProviderKind(kind);
   // Which account action is running, so only the button that started it shows
   // the spinner; every sibling stays disabled while one of them works.
-  const [authPending, setAuthPending] = useState<"auth" | "activate" | "sibling">();
+  const [authPending, setAuthPending] = useState<string>();
   const loginBusy = authPending !== undefined;
   const [relayAddBusy, setRelayAddBusy] = useState(false);
   const [stationDraft, setStationDraft] = useState<StationDraft>({});
@@ -7412,6 +7575,16 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
   const sourceModelLabel = sourceModel ? drafts?.modelDisplayName(id, sourceModel) ?? displayLabel(sourceModel.model_name ?? sourceModel.name, translate("providers.unnamedModel")) : "";
   const authStatus = providerAuthStatus(provider);
   const authActive = booleanValue(provider.auth_active);
+  const authAccount = providerAuthAccount(provider);
+  const authAccounts = asRecords(provider.accounts);
+  const [accountHelpOpen, setAccountHelpOpen] = useState(false);
+  // One short line per state, and only behind the ?: the pane is 290 pt wide
+  // and a paragraph there pushed the fields it describes off the page.
+  const accountHelpText = [
+    kind === "openai" ? translate("relay.officialProviderWebViewHint") : translate("relay.officialProviderBrowserHint"),
+    ...(kind === "openai" && authStatus === "signed_in" ? [translate("relay.officialProviderMultiAccountHint")] : []),
+    ...(kind === "openai" ? [translate("relay.officialProviderApiKeyHint")] : []),
+  ].join("\n");
   const statusLabels: Record<ProviderAuthStatus, string> = {
     signed_out: translate("providers.authStatusSignedOut"),
     authorizing: translate("providers.authStatusAuthorizing"),
@@ -7559,30 +7732,26 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
     }
     await dispatch(authAction, { provider_id: id }, "providers_models");
   };
-  const activateProvider = async (): Promise<void> => {
-    if (kind !== "openai") return;
-    if (authPending !== undefined) return;
-    setAuthPending("activate");
-    try {
-      const activated = await dispatchWithOutcome("service_provider.auth_activate", { provider_id: id }, "providers_models");
-      if (!activated) return;
-      try {
-        if (await onActivateAndRestart()) onStatus(translate("relay.officialProviderActive"));
-      } catch (reason) {
-        onStatus(errorMessage(reason, translate));
-      }
-    } finally {
-      setAuthPending(undefined);
-    }
-  };
   const addSiblingAccount = async (): Promise<void> => {
     if (authPending !== undefined) return;
     setAuthPending("sibling");
     try {
-      const newID = await addOfficialAccount(kind === "claude" ? "claude_login" : "openai_login");
+      // One row is the service; a second account is a second account of this
+      // row, and Core appends it and answers with the account's own reference.
       const kindLogin: ServiceProviderKind = kind === "claude" ? "claude_login" : "openai_login";
-      const next = await dispatchWithOutcome("service_provider.auth_start", { provider_id: newID }, "providers_models");
-      presentProviderAuthChallenge(native, translate, next, kindLogin, providerKindLabel(kind, translate), newID, shownChallenge.current);
+      const next = await dispatchWithOutcome("service_provider.auth_start", { provider_id: id }, "providers_models");
+      presentProviderAuthChallenge(native, translate, next, kindLogin, providerKindLabel(kind, translate), id, shownChallenge.current);
+    } catch (reason) {
+      onStatus(errorMessage(reason, translate));
+    } finally {
+      setAuthPending(undefined);
+    }
+  };
+  const logoutAccount = async (accountRef: string): Promise<void> => {
+    if (!accountRef || authPending !== undefined) return;
+    setAuthPending(`logout:${accountRef}`);
+    try {
+      await dispatchWithOutcome("service_provider.auth_logout", { provider_id: id, account_ref: accountRef }, "providers_models");
     } catch (reason) {
       onStatus(errorMessage(reason, translate));
     } finally {
@@ -7682,7 +7851,7 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
       onBaseUrlDraftChange={(value) => drafts?.setProviderBaseUrlDraft(id, value)}
       onNameDraftChange={(value) => { if (drafts) drafts.setProviderNameDraft(id, value); else onNameDraftChange?.(value); }}
     />
-    {!isLogin ? <ProviderKeysPanel
+    {!isLogin || kind === "openai" ? <ProviderKeysPanel
       provider={provider}
       providerId={id}
       kind={kind}
@@ -7696,24 +7865,38 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
       onStatus={onStatus}
       language={language}
       bindingIssues={bindingIssues}
+      credentials={kind === "openai" ? authAccounts.filter((account) => stringValue(account.ref)).map((account) => ({ ref: stringValue(account.ref), name: providerAuthAccount(account) || translate("providers.authAccount") })) : undefined}
+      // The accounts of an OpenAI row are credentials of that row, so they are
+      // listed beside its keys and their actions sit in the same editor column:
+      // one list of what the row answers with, one place to act on the selected
+      // entry.  A stacked accounts block under the list made the pane read as
+      // two unrelated tables and pushed 退出登录 away from the row it ends.
+      help={<HelpTip open={accountHelpOpen} text={accountHelpText} title={translate("providers.serviceLinks")} onToggle={() => setAccountHelpOpen((current) => !current)} />}
+      credentialStatus={kind === "openai" ? (ref) => statusLabels[providerAuthStatus(authAccounts.find((account) => stringValue(account.ref) === ref))] : undefined}
+      credentialSignIn={kind === "openai" ? { label: translate("relay.officialProviderAddLogin"), busy: authPending === "sibling", disabled: (busy || loginBusy) && authPending !== "sibling", onPress: () => { void addSiblingAccount(); } } : undefined}
+      credentialActions={kind === "openai" ? (ref) => (
+        <NativeButton title={translate("relay.officialProviderLogout")} compact busy={authPending === `logout:${ref}`} disabled={busy || loginBusy || providerAuthStatus(authAccounts.find((account) => stringValue(account.ref) === ref)) !== "signed_in"} onPress={() => { void logoutAccount(ref); }} />
+      ) : undefined}
       variant="inline"
     /> : null}
-    {isOfficialAccount ? <View style={styles.officialAccountSection}>
+    {/* A Claude row keeps its own single-account block: it is one device login,
+        so there is no list of accounts to draw.  An OpenAI row's accounts are
+        credentials of that row, so the panel above lists them beside its keys. */}
+    {isOfficialAccount && kind !== "openai" ? <View style={styles.officialAccountSection}>
       <View style={styles.panelHeader}><Text style={styles.panelTitle}>{translate("providers.serviceLinks")}</Text></View>
+      {authAccount ? <View style={styles.officialStatusRow}>
+        <Text style={styles.providerAuthStatusLabel}>{translate("providers.authAccount")}</Text>
+        <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{authAccount}</Text>
+      </View> : null}
       <View style={styles.officialStatusRow}>
         <Text style={styles.providerAuthStatusLabel}>{translate("providers.authStatus")}</Text>
         <Text style={styles.providerAuthStatusValue}>{statusLabels[authStatus]}</Text>
       </View>
       <Text style={styles.providerAuthLine}>{translate("relay.officialProviderModels")}: {modelNameText}</Text>
-      <Text style={styles.keysHint}>{kind === "openai" ? translate("relay.officialProviderWebViewHint") : translate("relay.officialProviderBrowserHint")}</Text>
-      {kind === "openai" && authActive ? <Text style={styles.officialActiveHint}>{translate("relay.officialProviderActive")}</Text> : null}
-      {kind === "openai" && authStatus === "signed_in" && !authActive ? <Text style={styles.keysHint}>{translate("relay.officialProviderRestartHint")}</Text> : null}
       <View style={styles.officialActionsRow}>
-        {kind === "openai" && authStatus === "signed_in" && !authActive ? <NativeButton title={translate("relay.officialProviderActivate")} compact busy={authPending === "activate"} disabled={(busy || loginBusy) && authPending !== "activate"} onPress={() => { void activateProvider(); }} /> : null}
         <NativeButton title={authLabel} primary compact busy={authPending === "auth"} disabled={(busy || loginBusy) && authPending !== "auth"} onPress={() => { void runAuthAction(); }} />
-        <NativeButton title={translate("relay.officialProviderAddLogin")} compact busy={authPending === "sibling"} disabled={(busy || loginBusy) && authPending !== "sibling"} onPress={() => { void addSiblingAccount(); }} />
       </View>
-      {kind === "claude" && authStatus === "error" ? <NativeSecretField autoCommit label={translate("providers.authTypeClaude")} hint={translate("relay.officialProviderTokenHint")} busy={busy} disabled={busy} domain="providers_models" field="provider_auth_token" target={id} onSecretState={onSecretState} /> : null}
+      {authStatus === "error" ? <NativeSecretField autoCommit label={translate("providers.authTypeClaude")} hint={translate("relay.officialProviderTokenHint")} busy={busy} disabled={busy} domain="providers_models" field="provider_auth_token" target={id} onSecretState={onSecretState} /> : null}
     </View> : null}
     {!isLogin && station ? <StationAccountsPanel
       key={`station-accounts:${station.id}`}
@@ -12006,9 +12189,10 @@ const styles = StyleSheet.create({
   routeTraceNoSelectionText: { color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "center" },
   root: { flex: 1, minWidth: 420 },
   menuBarHost: { flex: 1 }, error: { margin: 20, color: systemColors.red, fontSize: UI_FONT_SIZE },
+  startupLoading: { flex: 1, alignItems: "center", justifyContent: "center" }, startupLoadingText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
   windowSurface: { flex: 1, position: "relative", backgroundColor: systemColors.window }, windowContent: { flexGrow: 1, paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, gap: 8 }, windowContentFixed: { flex: 1, minHeight: 0 }, fileEditorRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providersContent: { paddingBottom: 6, gap: 6 }, providerWizardRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providerWizardSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, logsContent: { paddingHorizontal: 12, paddingTop: 12, paddingBottom: 0 }, runtimeContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, dataManagementContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, assistantSettingsContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, windowTitleBlock: { paddingHorizontal: 20, paddingTop: 12, paddingBottom: 3, gap: 3 }, windowTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
   // Settings window: a native source-list sidebar next to the active pane.
-  settingsShell: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row" }, settingsSidebar: { width: 200, flexShrink: 0, minHeight: 0 }, settingsSidebarHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 16, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarAppIcon: { width: SETTINGS_HEADER_CONTENT_HEIGHT, height: SETTINGS_HEADER_CONTENT_HEIGHT, borderRadius: 4 }, settingsSidebarTitle: { color: systemColors.label, fontSize: SOURCE_LIST_FONT_SIZE, fontWeight: "600" }, settingsSidebarSpacer: { flex: 1, minHeight: 8 }, settingsSidebarList: { flex: 1, minHeight: 0 }, settingsRail: { width: SETTINGS_RAIL_WIDTH, flexShrink: 0, minHeight: 0, paddingTop: 6, overflow: "hidden" }, settingsRailList: { flex: 1, minHeight: 0 }, settingsRailDivider: { position: "absolute", top: 0, bottom: 0, right: 0, width: 1, backgroundColor: systemColors.separator }, settingsRailDetail: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsRailDetailHeader: { minHeight: 50, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 14, paddingVertical: 8, backgroundColor: systemColors.window }, settingsRailDetailTitleBlock: { flex: 1, minWidth: 0, gap: 2 }, settingsRailDetailActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, settingsRailDetailTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, settingsRailDetailHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16 }, settingsDetail: { minWidth: 0, flex: 1, paddingTop: SETTINGS_TITLEBAR_INSET }, settingsDetailBody: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsDetailBodyBare: { backgroundColor: "transparent" }, settingsDetailPane: { flex: 1, minWidth: 0 }, settingsPaneHeader: { flexShrink: 0, paddingHorizontal: 20, paddingTop: 10, paddingBottom: 8 }, settingsPaneTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600", lineHeight: SETTINGS_HEADER_CONTENT_HEIGHT },  // The window's one status strip.  A route may place its own controls at the
+  settingsShell: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row" }, settingsSidebar: { width: 200, minWidth: 0, flexShrink: 0, minHeight: 0 }, settingsSidebarHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 16, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarAppIcon: { width: SETTINGS_HEADER_CONTENT_HEIGHT, height: SETTINGS_HEADER_CONTENT_HEIGHT, borderRadius: 4 }, settingsSidebarTitle: { color: systemColors.label, fontSize: SOURCE_LIST_FONT_SIZE, fontWeight: "600" }, settingsSidebarSpacer: { height: 8, flexShrink: 0 }, settingsSidebarList: { flex: 1, minWidth: 0, minHeight: 0 }, settingsRail: { width: SETTINGS_RAIL_WIDTH, flexShrink: 0, minHeight: 0, paddingTop: 6, overflow: "hidden" }, settingsRailList: { flex: 1, minHeight: 0 }, settingsRailDivider: { position: "absolute", top: 0, bottom: 0, right: 0, width: 1, backgroundColor: systemColors.separator }, settingsRailDetail: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsRailDetailHeader: { minHeight: 50, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 14, paddingVertical: 8, backgroundColor: systemColors.window }, settingsRailDetailTitleBlock: { flex: 1, minWidth: 0, gap: 2 }, settingsRailDetailActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, settingsRailDetailTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, settingsRailDetailHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16 }, settingsDetail: { minWidth: 0, flex: 1, paddingTop: SETTINGS_TITLEBAR_INSET }, settingsDetailBody: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsDetailBodyBare: { backgroundColor: "transparent" }, settingsDetailPane: { flex: 1, minWidth: 0 }, settingsPaneHeader: { flexShrink: 0, paddingHorizontal: 20, paddingTop: 10, paddingBottom: 8 }, settingsPaneTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600", lineHeight: SETTINGS_HEADER_CONTENT_HEIGHT },  // The window's one status strip.  A route may place its own controls at the
   // right end of this row, so a pager and the status it changes read as one bar.
   routeStatusBar: { minHeight: 24, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, justifyContent: "space-between", paddingHorizontal: 16, paddingVertical: 2, borderTopWidth: 1, borderTopColor: systemColors.separator },
   // The usage pager is the window's status bar on this tab: the row count stays
@@ -12017,21 +12201,20 @@ const styles = StyleSheet.create({
   usageStatusBar: { minHeight: 24, flexShrink: 0, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8, paddingHorizontal: 16, paddingVertical: 2, borderTopWidth: 1, borderTopColor: systemColors.separator }, routeStatusText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE },
   generalScroll: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, generalContent: { paddingTop: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, paddingBottom: 16, gap: 18 }, generalSection: { gap: 4 }, generalSectionTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, generalRow: { ...SETTINGS_FIELD_ROW_INDENTED }, generalRowLabel: { ...SETTINGS_FIELD_LABEL }, generalRowValue: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, generalToggle: { ...SETTINGS_FIELD_SWITCH_SLOT }, generalHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }, generalHelpText: { ...SETTINGS_FIELD_HELP_TEXT }, generalServiceAction: { minWidth: 96 }, providerToolbar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardToolbarButton: { minWidth: 104 }, toolbarSpacer: { flex: 1 }, windowTabsRow: { flex: 1, minWidth: 0, height: 28, flexDirection: "row", alignItems: "center", gap: 8 }, windowTabsToolbarRow: { flex: 1, minWidth: 0, width: "100%", height: 24, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 6, overflow: "hidden" }, windowTabs: { width: 224, height: 24 }, windowTabsWithActions: { flexShrink: 1 }, windowTabsActions: { flex: 1, minWidth: 0, maxWidth: 400, marginLeft: "auto", flexShrink: 0 },
   providerWizardSetupContent: { flex: 1, minHeight: 0, justifyContent: "flex-start", alignItems: "center", paddingHorizontal: 24, paddingTop: 18, paddingBottom: 12 }, providerWizardSetupSurface: { width: "100%", maxWidth: 520, minWidth: 0, gap: 12 }, providerWizardSetupSurfaceModel: { flex: 1, minHeight: 0 }, providerWizardSignInPanel: { width: "100%", minHeight: 160, justifyContent: "center", gap: 8, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 7, backgroundColor: systemColors.control, paddingHorizontal: 16, paddingVertical: 18 }, providerWizardAuthRow: { minHeight: 30, flexDirection: "row", alignItems: "center", gap: 8 }, providerWizardAuthStatus: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
-  providerMiddlePane: { flex: 1, minWidth: 0, gap: 6 },
+  providerMiddlePane: { flex: 1, minWidth: 0, gap: 6 }, providerEmptyState: { flex: 1, minWidth: 0, minHeight: 0, alignItems: "center", justifyContent: "center", paddingHorizontal: 28, paddingVertical: 24, gap: 8, backgroundColor: systemColors.textBackground }, providerEmptyGlyph: { width: 44, height: 44, borderRadius: 22, alignItems: "center", justifyContent: "center", backgroundColor: systemColors.selectedContent }, providerEmptyGlyphText: { color: systemColors.selectedControlText, fontSize: 28, fontWeight: "300", lineHeight: 34 }, providerEmptyTitle: { color: systemColors.label, fontSize: 17, fontWeight: "600", textAlign: "center" }, providerEmptyHint: { maxWidth: 380, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 18, textAlign: "center" }, providerEmptyActions: { alignSelf: "center", flexDirection: "row", alignItems: "center", gap: 8, paddingTop: 6 },
   keysPane: { flex: 1, minWidth: 0, minHeight: 0 }, keysInline: { minWidth: 0, gap: 6, paddingTop: 6, borderTopWidth: 1, borderTopColor: systemColors.separator }, keysInlineBody: { minWidth: 0, height: KEYS_INLINE_LIST_HEIGHT, flexDirection: "row", alignItems: "flex-start", gap: 6 }, keysTableInline: { flex: 1, minWidth: 0, height: KEYS_INLINE_LIST_HEIGHT, minHeight: KEYS_INLINE_LIST_HEIGHT }, keysEditorInline: { width: KEYS_INLINE_EDITOR_WIDTH, minWidth: 0, flexGrow: 0, flexShrink: 0, gap: 5 }, keysEditorField: { minWidth: 0, gap: 2 }, keysEditorFieldHeader: { height: 22, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 4 }, keysEditorFieldLabel: { flexShrink: 1, color: systemColors.label, fontSize: UI_FONT_SIZE },
   keysTable: { flex: 1, minHeight: 120 },
   keysEditor: { minWidth: 0, gap: 5, paddingTop: 5, paddingLeft: 8, borderLeftWidth: 2, borderLeftColor: systemColors.separator },
   keysHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15, flexShrink: 1 },
-  panelActionButton: { width: 22, minWidth: 22, height: 22 }, keysEditorValueRow: { minWidth: 0, flexDirection: "row", alignItems: "center", gap: 6 }, keysEditorValueField: { flex: 1, minWidth: 0 },
+  panelActionButton: { width: 22, minWidth: 22, height: 22 }, keysEditorValueRow: { minWidth: 0, flexDirection: "row", alignItems: "center", gap: 6 }, keysEditorValueField: { flex: 1, minWidth: 0 }, keysEditorActions: { minWidth: 0, flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 6 }, keysEditorValueText: { color: systemColors.label, fontSize: UI_FONT_SIZE },
   providerAccountsHeader: { minWidth: 0, paddingTop: 6, borderTopWidth: 1, borderTopColor: systemColors.separator },
   panelHeader: { minHeight: 22, flexDirection: "row", alignItems: "center", gap: 6 },
   panelTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "700" },
   panelActions: { marginLeft: "auto", flexDirection: "row", alignItems: "center", gap: 4 },
-  officialAccountSection: { minWidth: 0, gap: 5, paddingTop: 6, borderTopWidth: 1, borderTopColor: systemColors.separator },
+  officialAccountSection: { minWidth: 0, gap: 5, paddingTop: 6, zIndex: 3, borderTopWidth: 1, borderTopColor: systemColors.separator },
   officialStatusRow: { minHeight: 22, flexDirection: "row", alignItems: "center", gap: 6 },
   providerAuthLine: { color: systemColors.label, fontSize: UI_FONT_SIZE },
-  officialActiveHint: { color: systemColors.green, fontSize: UI_TIP_FONT_SIZE, fontWeight: "600" },
-  officialActionsRow: { minHeight: 28, flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 6 },
+   officialActionsRow: { minHeight: 28, flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 6 },
   providerWizardSectionHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardPanelTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerWizardFormSection: { width: "100%", maxWidth: 520, minHeight: 0, paddingVertical: 0, gap: 10 }, providerWizardModelFormSection: { flex: 1, minHeight: 0, width: "100%", maxWidth: 520, paddingVertical: 0, gap: 10 }, // The model step scrolls in exactly one place: the roster box.  The step body is an
  // ordinary column, so the pane can never grow a second scroller beside the list.
  providerWizardModelPane: { flex: 1, minHeight: 0, width: "100%", justifyContent: "flex-start", paddingBottom: 8 }, // One row, so the state sentence is the part that gives way: it shrinks and
@@ -12065,9 +12248,9 @@ const styles = StyleSheet.create({
   // row is the same 24 pt row and starts at the pane's top with no extra inset,
   // so 供应商: <name> reads on one line with that button instead of sitting a few
   // points below it, and the sections under it keep the left column's row pitch.
-  providersLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }, providerWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, providerLeftColumn: { flex: 1, minWidth: 0, minHeight: 0, gap: 6 }, providerModelColumns: { flex: 1, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }, routeWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, fetchKeyPicker: { width: 170, height: 24, marginRight: 6, flexShrink: 0 }, providerListPane: { width: 140, minWidth: 140, maxWidth: 140, flexGrow: 0, flexShrink: 0 }, modelListPane: { flex: 1, minWidth: 0 }, tablePane: { flex: 1, minWidth: 0, gap: 6 }, tablePaneWide: { flex: 1, minWidth: 0 }, tableTitleRow: { height: 24, flexDirection: "row", alignItems: "center" }, tableTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, tableActions: { marginLeft: "auto", flexDirection: "row", gap: 6 }, iconButton: { minWidth: 22, width: 22, minHeight: 22, height: 22, alignItems: "center", justifyContent: "center" }, tableBottomRow: { minHeight: 26, flexDirection: "row", alignItems: "center" }, nativeProviderTable: { flex: 1, minHeight: 0 }, nativeModelTable: { flex: 1, minHeight: 0 }, modelTable: { flex: 1, minHeight: 0 }, nativeRouteTable: { flex: 1, minHeight: 0 }, providerInspector: { width: 290, minWidth: 290, maxWidth: 290, flexGrow: 0, flexShrink: 0 }, providerEditorContent: { flex: 1, minHeight: 0 }, providerEditorScrollContent: { paddingLeft: 0, paddingRight: 16, paddingBottom: 12, gap: 6 }, persistentScrollIndicator: { position: "absolute", width: 0, height: 0 }, providerEditorHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerEditorHeading: { flex: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerReturnToModel: { flexShrink: 1 }, providerEditorSection: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 3, gap: 4 }, providerEnabledRow: { minHeight: 22, flexDirection: "row", alignItems: "center" }, providerSourceFields: { minWidth: 0, gap: 4 }, inspectorContent: { paddingLeft: 0, paddingRight: 6, paddingBottom: 12, gap: 6 }, inspectorBody: { gap: 4 }, modelBreadcrumb: { minHeight: 24, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 4 }, breadcrumbProvider: { flexShrink: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, breadcrumbSeparator: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorHeading: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorDivider: { height: 1, backgroundColor: systemColors.separator }, inspectorEnabledRow: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, // A link is also a cursor: the row shows the pointing hand over the whole
+  providersLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 12 }, providerWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, providerLeftColumn: { flex: 1, minWidth: 0, minHeight: 0, gap: 6 }, providerModelColumns: { flex: 1, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }, routeWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, fetchKeyPicker: { width: 170, height: 24, marginRight: 6, flexShrink: 0 }, providerListPane: { width: 180, minWidth: 180, maxWidth: 180, flexGrow: 0, flexShrink: 0 }, modelListPane: { flex: 1, minWidth: 0 }, tablePane: { flex: 1, minWidth: 0, gap: 6 }, tablePaneWide: { flex: 1, minWidth: 0 }, tableTitleRow: { height: 24, flexDirection: "row", alignItems: "center" }, tableTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, tableActions: { marginLeft: "auto", flexDirection: "row", gap: 6 }, iconButton: { minWidth: 22, width: 22, minHeight: 22, height: 22, alignItems: "center", justifyContent: "center" }, tableBottomRow: { minHeight: 26, flexDirection: "row", alignItems: "center" }, nativeProviderTable: { flex: 1, minHeight: 0 }, nativeModelTable: { flex: 1, minHeight: 0 }, modelTable: { flex: 1, minHeight: 0 }, nativeRouteTable: { flex: 1, minHeight: 0 }, providerInspector: { width: 320, minWidth: 260, maxWidth: 360, flexGrow: 0, flexShrink: 1 }, providerEditorContent: { flex: 1, minHeight: 0 }, providerEditorScrollContent: { paddingLeft: 0, paddingRight: 16, paddingBottom: 12, gap: 6 }, persistentScrollIndicator: { position: "absolute", width: 0, height: 0 }, providerEditorHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerEditorHeading: { flex: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerReturnToModel: { flexShrink: 1 }, providerEditorSection: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 3, gap: 4 }, providerEnabledRow: { minHeight: 22, flexDirection: "row", alignItems: "center" }, providerSourceFields: { minWidth: 0, gap: 4 }, inspectorContent: { paddingLeft: 0, paddingRight: 6, paddingBottom: 12, gap: 6 }, inspectorBody: { gap: 4 }, modelBreadcrumb: { minHeight: 24, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 4 }, breadcrumbProvider: { flexShrink: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, breadcrumbSeparator: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorHeading: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorDivider: { height: 1, backgroundColor: systemColors.separator }, inspectorEnabledRow: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, // A link is also a cursor: the row shows the pointing hand over the whole
 // finding, label included, exactly like every native link in the app.
-inspectorProbeFinding: { flexShrink: 1, minWidth: 0, cursor: "pointer" }, inspectorProbeFindingText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textDecorationLine: "underline" }, inspectorEnableControl: { flexShrink: 0 }, orderEditorRow: { width: "100%", minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, orderEditorField: { flex: 1, width: undefined }, orderFollowControl: { flexShrink: 0 }, modelWindowValue: { flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 6 }, modelWindowText: { flexShrink: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE }, modelWindowLink: { flexShrink: 0 }, protocolSettings: { gap: 4 }, helpTipAnchor: { position: "relative", zIndex: 2 }, helpTipDismiss: { position: "absolute", left: -2400, right: -2400, top: -2400, bottom: -2400 }, helpTipButton: { width: 16, height: 16, minWidth: 16, minHeight: 16 }, helpTipPopup: { position: "absolute", right: 0, bottom: 22, width: 208, paddingHorizontal: 8, paddingVertical: 6, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.control, shadowColor: "#000000", shadowOpacity: 0.18, shadowRadius: 8, shadowOffset: { width: 0, height: 2 } }, helpTipText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
+inspectorProbeFinding: { flexShrink: 1, minWidth: 0, cursor: "pointer" }, inspectorProbeFindingText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textDecorationLine: "underline" }, inspectorEnableControl: { flexShrink: 0 }, orderEditorRow: { width: "100%", minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, orderEditorField: { flex: 1, width: undefined }, orderFollowControl: { flexShrink: 0 }, modelWindowValue: { flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 6 }, modelWindowText: { flexShrink: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE }, modelWindowLink: { flexShrink: 0 }, protocolSettings: { gap: 4 }, helpTipAnchor: { position: "relative", zIndex: 2 }, helpTipDismiss: { position: "absolute", left: -2400, right: -2400, top: -2400, bottom: -2400 }, helpTipButton: { width: 16, height: 16, minWidth: 16, minHeight: 16 }, helpTipPopupLeft: { position: "absolute", left: 0, bottom: 22, width: 208, zIndex: 4, paddingHorizontal: 8, paddingVertical: 6, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.control, shadowColor: "#000000", shadowOpacity: 0.18, shadowRadius: 8, shadowOffset: { width: 0, height: 2 } }, helpTipPopup: { position: "absolute", right: 0, bottom: 22, width: 208, zIndex: 4, paddingHorizontal: 8, paddingVertical: 6, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.control, shadowColor: "#000000", shadowOpacity: 0.18, shadowRadius: 8, shadowOffset: { width: 0, height: 2 } }, helpTipText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
   externalSettingsWorkspace: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }, externalSettingsFieldList: { ...SETTINGS_FIELD_LIST }, externalSettingsField: { ...SETTINGS_FIELD }, externalSettingsInputRow: { ...SETTINGS_FIELD_ROW_INDENTED }, externalSettingsFieldLabel: { ...SETTINGS_FIELD_LABEL }, externalSettingsValueSlot: { ...SETTINGS_FIELD_ROUTE_SLOT }, externalSettingsBooleanControl: { ...SETTINGS_FIELD_SWITCH_SLOT }, externalSettingsHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }, externalSettingsHelpText: { ...SETTINGS_FIELD_HELP_TEXT }, externalSettingsPane: { flex: 1, minHeight: 0 }, externalSettingsPaneContent: { paddingVertical: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, gap: 14 }, codexRawEditorBase: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, minHeight: 0, gap: 5 }, codexRawEditorHeader: { minHeight: 18 }, codexRawEditorLabel: { fontFamily: Platform.select({ macos: "Menlo", windows: "Cascadia Mono", default: "monospace" }), fontWeight: "600" }, codexRawNativeEditor: { minHeight: 0 }, codexRawEditorLoading: { minHeight: 0 },
   runtimeWorkspaceFrame: { flex: 1, minHeight: 0, gap: 6 }, runtimeWorkspaceBody: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }, runtimeWorkspace: { width: "100%", padding: SETTINGS_PANE_INSET, gap: 14 }, runtimeScrollSurface: { flex: 1, minWidth: 0, backgroundColor: systemColors.textBackground }, runtimeFieldList: { ...SETTINGS_FIELD_LIST }, runtimeField: { ...SETTINGS_FIELD }, runtimeInputRow: { ...SETTINGS_FIELD_ROW_INDENTED }, runtimeModifiedBar: { position: "absolute", left: 0, top: 3, bottom: 3, width: 2, borderRadius: 1, backgroundColor: "transparent" }, runtimeModifiedBarInline: { width: 2, alignSelf: "center", height: 16, borderRadius: 1, backgroundColor: "transparent" }, runtimeModifiedBarActive: { backgroundColor: systemColors.blue }, runtimeFieldError: { marginLeft: SETTINGS_FIELD_HELP_INDENT, color: systemColors.red, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, runtimeValueControlInvalid: { borderWidth: 1, borderColor: systemColors.red, borderRadius: 4 }, runtimeResetButton: { minWidth: 28, width: 28, height: 22, paddingHorizontal: 0 }, runtimeFieldLabel: { ...SETTINGS_FIELD_LABEL }, runtimeValueSlot: { ...SETTINGS_FIELD_VALUE_SLOT }, runtimeValueControl: { width: SETTINGS_FIELD_VALUE_WIDTH, minWidth: SETTINGS_FIELD_VALUE_WIDTH, height: 26 }, runtimeBooleanControl: { ...SETTINGS_FIELD_SWITCH_SLOT }, runtimeUnit: { width: 68, flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, runtimeActionSlot: { width: 72, minHeight: 26, flexShrink: 0, justifyContent: "center" }, runtimeHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }, runtimeHelpText: { ...SETTINGS_FIELD_HELP_TEXT }, runtimeMultilineField: { minWidth: 0, flexGrow: 1, flexBasis: "100%", maxWidth: "100%" }, runtimeMultilineHeader: { minHeight: 26, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8, paddingLeft: SETTINGS_FIELD_LEAD }, runtimeMultilineLabel: { flex: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, runtimeMultilineHeaderActions: { flexShrink: 0, minHeight: 26, justifyContent: "center" }, runtimeMultilineEditor: { width: "100%", minWidth: 0, height: 108, flex: 1, alignSelf: "stretch" }, runtimeMultilineHelpSlot: { marginLeft: 0, maxWidth: "100%", minWidth: 0, paddingTop: 6, gap: 3 }, runtimeJsonDefaultHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15, fontWeight: "600", minWidth: 0 },
   dataManagementWorkspace: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }, dataManagementPane: { flex: 1, minHeight: 0 }, dataManagementPaneScrollContent: { paddingTop: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, paddingBottom: 4, gap: 10 }, dataManagementImportIntro: { width: "100%", minHeight: 72, paddingHorizontal: 12, paddingVertical: 12, justifyContent: "center" }, dataManagementImportFileRow: { width: "100%", minHeight: 28, flexDirection: "row", alignItems: "center", gap: SETTINGS_FIELD_GAP, paddingLeft: SETTINGS_FIELD_LEAD }, dataManagementImportFileLabel: { ...SETTINGS_FIELD_LABEL }, dataManagementImportFileValue: { flex: 1, minWidth: 0, minHeight: 26, justifyContent: "center", paddingHorizontal: 8, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 4, backgroundColor: systemColors.textBackground }, dataManagementImportFilePlaceholder: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, dataManagementSelectionBar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementSelectionCount: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, dataManagementToolbarButtons: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, dataManagementSectionsField: { flex: 1, minWidth: 0, gap: 6 }, dataManagementSectionList: { gap: 4 }, dataManagementSectionItem: { minHeight: 22 }, dataManagementActionStatus: { flexShrink: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 14 }, dataManagementSensitiveHint: { color: systemColors.brown, fontSize: UI_FONT_SIZE, lineHeight: 16, paddingVertical: 5, paddingHorizontal: 7, backgroundColor: Platform.select({ macos: (PlatformColor("systemYellow") as unknown as { withAlphaComponent?: (alpha: number) => string })?.withAlphaComponent?.(0.08) ?? "rgba(255, 204, 0, 0.08)", default: "rgba(255, 204, 0, 0.08)" }), borderRadius: 4, borderWidth: 1, borderColor: Platform.select({ macos: (PlatformColor("systemYellow") as unknown as { withAlphaComponent?: (alpha: number) => string })?.withAlphaComponent?.(0.2) ?? "rgba(255, 204, 0, 0.2)", default: "rgba(255, 204, 0, 0.2)" }) }, dataManagementSyncScopeValue: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, dataManagementDirectionPicker: { width: SETTINGS_FIELD_VALUE_WIDTH, height: 24, flexGrow: 0, flexShrink: 0 },

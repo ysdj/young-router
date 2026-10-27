@@ -345,7 +345,7 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
         resolver resolve: @escaping RCTPromiseResolveBlock,
         rejecter reject: @escaping RCTPromiseRejectBlock
     ) {
-        guard Set(options.keys).isSubset(of: ["provider", "fingerprint", "verificationURL", "userCode", "callbackURL", "title", "closeLabel"]),
+        guard Set(options.keys).isSubset(of: ["provider", "fingerprint", "verificationURL", "userCode", "callbackURL", "title", "closeLabel", "reloadLabel", "browserLabel"]),
               let provider = options["provider"] as? String,
               (options["fingerprint"] == nil || options["fingerprint"] is String),
               let verificationURL = options["verificationURL"] as? String,
@@ -362,7 +362,11 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
               !title.isEmpty,
               title.utf8.count <= 320,
               !closeLabel.isEmpty,
-              closeLabel.utf8.count <= 160 else {
+              closeLabel.utf8.count <= 160,
+              let reloadLabel = options["reloadLabel"] as? String,
+              (1...160).contains(reloadLabel.utf8.count),
+              let browserLabel = options["browserLabel"] as? String,
+              (1...160).contains(browserLabel.utf8.count) else {
             reject("E_NATIVE_PROVIDER_AUTH_INPUT", "The provider authentication request is invalid.", nil)
             return
         }
@@ -375,6 +379,8 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
                 callbackURL: options["callbackURL"] as? String,
                 title: title,
                 closeTitle: closeLabel,
+                reloadTitle: reloadLabel,
+                browserTitle: browserLabel,
                 completion: { resolve(nil) }
             )
         }

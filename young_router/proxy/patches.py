@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from contextvars import ContextVar
+from pathlib import Path
 
 from .. import api_base as _api_base_module
 from . import codex_fast_tier as _codex_fast_tier_module
@@ -41,6 +43,7 @@ from .base import (
     _RESTORED_REASONING_REPLAY_KEY,
     _SELECTED_DEPLOYMENT_MARKER_PATCH_ATTR,
     _UPSTREAM_URL_SURFACE_ANTHROPIC,
+    _UPSTREAM_URL_SURFACE_KEY,
     _UPSTREAM_URL_SURFACE_OPENAI_CHAT,
     _VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY,
     _install_websocket_frame_limit_patch,
@@ -854,6 +857,10 @@ def _install_selected_deployment_marker_patch() -> None:
                 if browser_kwargs is not None:
                     kwargs.clear()
                     kwargs.update(browser_kwargs)
+                _routing_module._strip_image_generation_internal_request_keys(
+                    kwargs,
+                    function_name,
+                )
                 return result
             deployment_id = _responses_request_module._deployment_id(deployment)
             attempted_surfaces = (
@@ -876,6 +883,23 @@ def _install_selected_deployment_marker_patch() -> None:
                 surface=surface,
             )
             force_browser_headers = _responses_request_module._request_forces_browser_compatible_headers(kwargs)
+            image_request = _routing_module._request_is_standalone_image_generation(
+                kwargs,
+                function_name,
+            )
+            trace_deployment = deployment
+            if image_request and isinstance(deployment.get("model_info"), dict):
+                trace_deployment = deployment.copy()
+                trace_deployment["model_info"] = {
+                    key: value
+                    for key, value in deployment["model_info"].items()
+                    if key != _UPSTREAM_URL_SURFACE_KEY
+                }
+            request_summary = _trace_module._trace_request_summary(
+                kwargs,
+                call_type=function_name,
+                method_name=function_name,
+            )
             _trace_module._route_trace(
                 "selected_deployment",
                 request_id=_routing_module._trace_request_id(kwargs),
@@ -883,14 +907,10 @@ def _install_selected_deployment_marker_patch() -> None:
                 model_group=_responses_execution_module._request_model_group(kwargs),
                 function_name=function_name,
                 deployment=_routing_module._trace_deployment(
-                    deployment,
-                    surface=surface,
+                    trace_deployment,
+                    surface="" if image_request else surface,
                 ),
-                request=_trace_module._trace_request_summary(
-                    kwargs,
-                    call_type=function_name,
-                    method_name=function_name,
-                ),
+                request=request_summary,
                 target_order=_responses_request_module._request_target_order(kwargs),
                 excluded_deployment_ids=sorted(_responses_request_module._request_excluded_deployment_ids(kwargs)),
             )
@@ -906,6 +926,7 @@ def _install_selected_deployment_marker_patch() -> None:
                 kwargs,
                 surface,
                 deployment.get("litellm_params", {}).get("model"),
+                function_name=function_name,
             )
             if restored_reasoning_replay:
                 kwargs[_RESTORED_REASONING_REPLAY_KEY] = True
@@ -918,6 +939,10 @@ def _install_selected_deployment_marker_patch() -> None:
             if browser_kwargs is not None:
                 kwargs.clear()
                 kwargs.update(browser_kwargs)
+            _routing_module._strip_image_generation_internal_request_keys(
+                kwargs,
+                function_name,
+            )
             return result
 
         setattr(
@@ -941,6 +966,10 @@ def _install_selected_deployment_marker_patch() -> None:
         return
 
     async def patched_make_call(self: Any, original_function: Any, *args: Any, **kwargs: Any) -> Any:
+        _routing_module._strip_image_generation_internal_request_keys(
+            kwargs,
+            getattr(original_function, "__name__", None),
+        )
         token = _CURRENT_SELECTED_DEPLOYMENT.set(None)
         try:
             response = await _call_deployment_with_reasoning_parameters_compat(
@@ -2280,10 +2309,122 @@ def _install_model_listing_efforts_patch() -> None:
     litellm_proxy_utils.create_model_info_response = patched_create_model_info_response
 
 
+#: A ``chatgpt/`` deployment names the account it answers with this scheme in
+#: its ``api_key``.  LiteLLM's ChatGPT adapter resolves one token directory from
+#: the process environment at construction, so a proxy process could serve
+#: exactly one ChatGPT account: every other account was dropped as
+#: unauthenticated ("ignoring and continuing with other deployments").  The
+#: reference below is not a secret; it is the account's private directory, whose
+#: ``auth.json`` the adapter already knows how to read and refresh.
+_CHATGPT_AUTH_SCHEME = "young-router-auth:"
+_CHATGPT_ACCOUNT_ENV = "YOUNG_ROUTER_PROVIDER_AUTH_ROOT"
+_CHATGPT_ACCOUNT_REF_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"
+
+
+def _chatgpt_account_authenticator(api_key: object):
+    """The account an ``api_key`` reference names, or None for a plain key."""
+
+    if not isinstance(api_key, str) or not api_key.startswith(_CHATGPT_AUTH_SCHEME):
+        return None
+    ref = api_key[len(_CHATGPT_AUTH_SCHEME) :].strip()
+    if not re.fullmatch(_CHATGPT_ACCOUNT_REF_PATTERN, ref):
+        return None
+    root = str(os.environ.get(_CHATGPT_ACCOUNT_ENV, "") or "").strip()
+    if not root:
+        return None
+    auth_file = Path(root) / "chatgpt" / ref / "auth.json"
+    if not auth_file.is_file():
+        return None
+    from litellm.llms.chatgpt.authenticator import Authenticator
+
+    # Configured directly, exactly as the Core's own login worker does: the
+    # adapter's paths are per instance, so no process environment is involved.
+    auth = Authenticator.__new__(Authenticator)
+    auth.token_dir = str(auth_file.parent)
+    auth.auth_file = str(auth_file)
+    return auth
+
+
+def _install_chatgpt_account_credential_patch() -> None:
+    """Let each ``chatgpt/`` deployment resolve its own account.
+
+    A route's ``api_key`` carries the account reference; the adapter reads that
+    account's ``auth.json`` instead of one directory shared by the whole
+    process.  Everything above stays LiteLLM's: the token exchange, the refresh
+    on expiry, the request shape, and the streaming.  A deployment without the
+    reference keeps the adapter's own behaviour.
+    """
+
+    try:
+        from litellm.llms.chatgpt.authenticator import Authenticator
+        from litellm.llms.chatgpt.chat.transformation import ChatGPTConfig
+        from litellm.llms.chatgpt.common_utils import ensure_chatgpt_session_id, get_chatgpt_default_headers
+        from litellm.llms.openai.openai import OpenAIConfig
+    except Exception:  # pragma: no cover - an adapter that moved is reported by the caller
+        return
+    if getattr(ChatGPTConfig, "_young_router_account_credentials", False):
+        return
+
+    original_info = ChatGPTConfig._get_openai_compatible_provider_info
+    original_validate = ChatGPTConfig.validate_environment
+
+    def account_credentials(self, model, api_base, api_key, custom_llm_provider):
+        bound = _chatgpt_account_authenticator(api_key)
+        if bound is None:
+            return original_info(self, model, api_base, api_key, custom_llm_provider)
+        return bound.get_api_base(), bound.get_access_token(), custom_llm_provider
+
+    def account_headers(
+        self,
+        headers,
+        model,
+        messages,
+        optional_params,
+        litellm_params,
+        api_key=None,
+        api_base=None,
+    ):
+        bound = _chatgpt_account_authenticator(api_key)
+        if bound is None:
+            return original_validate(
+                self,
+                headers,
+                model,
+                messages,
+                optional_params,
+                litellm_params,
+                api_key,
+                api_base,
+            )
+        validated = OpenAIConfig.validate_environment(
+            self,
+            headers,
+            model,
+            messages,
+            optional_params,
+            litellm_params,
+            api_key,
+            api_base,
+        )
+        default_headers = get_chatgpt_default_headers(
+            api_key or "",
+            bound.get_account_id(),
+            ensure_chatgpt_session_id(litellm_params),
+        )
+        return {**default_headers, **validated}
+
+    setattr(account_credentials, "_original_get_openai_compatible_provider_info", original_info)
+    setattr(account_headers, "_original_validate_environment", original_validate)
+    ChatGPTConfig._get_openai_compatible_provider_info = account_credentials
+    ChatGPTConfig.validate_environment = account_headers
+    setattr(ChatGPTConfig, "_young_router_account_credentials", True)
+
+
 def install_all() -> None:
     _install_latin1_response_headers_patch()
     _install_anthropic_unversioned_endpoint_patch()
     _install_model_listing_efforts_patch()
+    _install_chatgpt_account_credential_patch()
     _install_pre_call_token_count_patch()
     _install_routing_constraint_patch()
     _install_selected_deployment_marker_patch()

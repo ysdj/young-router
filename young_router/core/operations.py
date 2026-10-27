@@ -709,6 +709,11 @@ class CoreServiceController:
         from .provider_auth import ProviderAuthManager
 
         env.update(ProviderAuthManager(self.paths.root).environment())
+        # Each ``chatgpt/`` deployment states the account it answers with (see
+        # ``config/dump.py``); the proxy's own patch resolves it under this root
+        # instead of the adapter's process-global token directory, so one proxy
+        # serves every signed-in account.
+        env["YOUNG_ROUTER_PROVIDER_AUTH_ROOT"] = str(ProviderAuthManager(self.paths.root).root)
         # The old vision-bridge settings were replaced by the single
         # dsh-vision-router JSON document. Do not let retired host variables
         # leak into the proxy process.

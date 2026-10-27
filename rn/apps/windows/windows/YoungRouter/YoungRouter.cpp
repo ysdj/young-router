@@ -5,6 +5,8 @@
 #include "YoungRouter.h"
 
 #include <algorithm>
+#include <appmodel.h>
+#include <fstream>
 #include <iterator>
 #include <shellapi.h>
 #include <string_view>
@@ -20,6 +22,11 @@
 #include "WinUI3NativeLeafModule.h"
 
 namespace {
+void AppendStartupLog(std::string const& message) {
+  std::ofstream stream("C:\\Users\\Public\\young-router-react.log", std::ios::app);
+  if (stream) stream << message << '\n';
+}
+
 std::wstring AllowedRoute(std::wstring route) {
   static constexpr std::wstring_view allowed[] = {
       L"home", L"providers-models", L"codex-settings", L"claude-settings",
@@ -117,12 +124,41 @@ struct CompReactPackageProvider
 
 // The entry point of the Win32 application
 _Use_decl_annotations_ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, PSTR /* commandLine */, int showCmd) {
+  try {
+  // A directly launched unpackaged EXE has no Package Identity.  AppInstance
+  // calls fail-fast in that mode on ARM64, so only use the single-instance
+  // activation API when Windows actually supplied package identity. Keep this
+  // check before WinRT/Windows App SDK initialization; even constructing those
+  // objects can fail-fast for an unpackaged ARM64 process.
+  UINT32 packagePathLength = 0;
+  const bool hasPackageIdentity =
+      GetCurrentPackagePath(&packagePathLength, nullptr) == ERROR_INSUFFICIENT_BUFFER;
+  if (!hasPackageIdentity) {
+    // WinUI 3's packaged host requires Package Identity. A user may still
+    // double-click the build-output EXE, so hand that launch to the installed
+    // MSIX instead of letting the framework fail-fast during initialization.
+    // AppsFolder uses the Package Family Name, which is stable across package
+    // versions and does not include the version/architecture fields.
+    constexpr wchar_t packaged_app[] =
+        L"shell:AppsFolder\\YoungRouter_44hrgrtnejmw4!App";
+    auto result = reinterpret_cast<intptr_t>(ShellExecuteW(
+        nullptr, L"open", L"explorer.exe", packaged_app, nullptr, SW_SHOWNORMAL));
+    if (result <= 32) {
+      MessageBoxW(nullptr, L"Install the Young Router MSIX package before launching this file.",
+          L"Young Router", MB_ICONERROR | MB_OK);
+    }
+    return 0;
+  }
+
   // Initialize WinRT
   winrt::init_apartment(winrt::apartment_type::single_threaded);
 
   using winrt::Microsoft::Windows::AppLifecycle::AppInstance;
-  auto activation = AppInstance::GetCurrent().GetActivatedEventArgs();
-  auto mainInstance = AppInstance::FindOrRegisterForKey(L"YoungRouter.Main");
+  winrt::Microsoft::Windows::AppLifecycle::AppActivationArguments activation{nullptr};
+  AppInstance mainInstance{nullptr};
+  winrt::event_token activationToken{};
+  activation = AppInstance::GetCurrent().GetActivatedEventArgs();
+  mainInstance = AppInstance::FindOrRegisterForKey(L"YoungRouter.Main");
   if (!mainInstance.IsCurrent()) {
     try {
       mainInstance.RedirectActivationToAsync(activation).get();
@@ -130,7 +166,7 @@ _Use_decl_annotations_ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, PSTR 
     }
     return 0;
   }
-  auto activationToken = mainInstance.Activated([](auto const&, auto const& args) {
+  activationToken = mainInstance.Activated([](auto const&, auto const& args) {
     auto route = RouteFromActivation(args);
     if (route.empty()) return;
     YoungRouter::WinUI3NativeLeaf::Shared()->DispatchAction("open-" + winrt::to_string(route));
@@ -168,6 +204,13 @@ _Use_decl_annotations_ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, PSTR 
   // Enable hot reload
   settings.UseFastRefresh(true);
 #endif
+
+  settings.NativeLogger([](winrt::Microsoft::ReactNative::LogLevel level, winrt::hstring const& message) {
+    AppendStartupLog("log " + std::to_string(static_cast<int>(level)) + ": " + winrt::to_string(message));
+  });
+  settings.InstanceLoaded([](winrt::Windows::Foundation::IInspectable const&, winrt::Microsoft::ReactNative::InstanceLoadedEventArgs const& args) {
+    AppendStartupLog(args.Failed() ? "instance-loaded failed" : "instance-loaded ok");
+  });
 #if _DEBUG
   // For Debug builds
   // Enable Direct Debugging of JS
@@ -186,6 +229,12 @@ _Use_decl_annotations_ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, PSTR 
   auto appWindow{reactNativeWin32App.AppWindow()};
   appWindow.Title(L"Young Router");
   appWindow.Resize({1120, 680});
+  // The React root is created by this host, so the leaf's window handle is
+  // known here: ``GetActiveWindow`` answers nothing during module
+  // initialization, which left every OpenRoute call with a null HWND and the
+  // window never shown, titled, or sized.
+  YoungRouter::WinUI3NativeLeaf::Shared()->Initialize(
+      winrt::Microsoft::UI::GetWindowFromWindowId(appWindow.Id()));
   YoungRouter::DisableWindowTransitions(winrt::Microsoft::UI::GetWindowFromWindowId(appWindow.Id()));
   YoungRouter::ConfigureImmediateXamlPresentation();
   appWindow.Destroying([](auto const &, auto const &) {
@@ -218,4 +267,15 @@ _Use_decl_annotations_ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, PSTR 
   // Start the app
   reactNativeWin32App.Start();
   mainInstance.Activated(activationToken);
+  } catch (winrt::hresult_error const& error) {
+    MessageBoxW(nullptr, error.message().c_str(), L"Young Router startup failure", MB_ICONERROR | MB_OK);
+    return static_cast<int>(error.code().value);
+  } catch (std::exception const& error) {
+    MessageBoxA(nullptr, error.what(), "Young Router startup failure", MB_ICONERROR | MB_OK);
+    return -1;
+  } catch (...) {
+    MessageBoxW(nullptr, L"Unknown startup failure", L"Young Router startup failure", MB_ICONERROR | MB_OK);
+    return -1;
+  }
+  return 0;
 }

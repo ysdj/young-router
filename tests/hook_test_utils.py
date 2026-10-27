@@ -189,7 +189,42 @@ def jsonable_stream_chunk(chunk):
     return chunk
 
 
+#: Codes this router alone emits for a stop it *did* classify.  A terminal
+#: event for one of these must name that cause instead of falling back to the
+#: unclassified `upstream_route_failure` sentence, which is the branch for a
+#: stop nothing in the router explains.
+_CLASSIFIED_TERMINAL_CODES = {
+    "upstream_stream_start_timeout",
+    "upstream_stream_idle_timeout",
+    "upstream_stream_interrupted",
+    "upstream_stream_truncated",
+    "upstream_stream_incomplete",
+    "upstream_connection_dropped",
+    "router_restarting",
+    "context_length_exceeded",
+    "invalid_prompt",
+    "insufficient_quota",
+    "upstream_relay_capacity",
+    "upstream_account_restricted",
+    "upstream_client_outdated",
+    "image_generation_tool_unavailable",
+    "upstream_compaction_failure",
+    "upstream_compaction_unsupported",
+}
+
+
 def assert_upstream_route_failed_terminal(testcase, chunks):
+    """Assert the turn ended terminally, and that its cause was named.
+
+    The stop was already known to be terminal for the router -- it either
+    exhausted every route and its recovery window or the body was refused.
+    What the client reads is the part that must never lie: a cause with its own
+    classifier carries its own `code` and a sentence Pi's retry classifier can
+    act on, and only a stop nothing here explains uses the unclassified
+    branch (`upstream_route_failure`) whose sentence is deliberately not a
+    retry tip.
+    """
+
     json_chunks = [jsonable_stream_chunk(chunk) for chunk in chunks]
     completed_events = [
         chunk
@@ -206,19 +241,27 @@ def assert_upstream_route_failed_terminal(testcase, chunks):
     response = failed_events[0].get("response", {})
     testcase.assertEqual(response.get("status"), "failed")
     error = response.get("error", {})
-    testcase.assertEqual(error.get("code"), "upstream_route_failure")
-    # The sentence a client renders as a retry tip is banned here: it told the
+    code = error.get("code")
+    message = error.get("message", "")
+    # The generic sentence this branch replaced is banned repo-wide: it told the
     # reader nothing and made every unexplained stop look like a route outage
-    # worth resending.  A cause that has a name gets its own branch; this is the
-    # branch for stops that have none.
-    testcase.assertNotIn(
-        "failed before a final assistant response",
-        error.get("message", ""),
-    )
-    testcase.assertIn("before the assistant answered", error.get("message", ""))
-    testcase.assertNotIn("Temporary upstream route failure", error.get("message", ""))
-    testcase.assertNotIn("LiteLLM fallback retries", error.get("message", ""))
-    testcase.assertNotIn("Retry later", error.get("message", ""))
+    # worth resending.
+    testcase.assertNotIn("failed before a final assistant response", message)
+    testcase.assertNotIn("Temporary upstream route failure", message)
+    testcase.assertNotIn("LiteLLM fallback retries", message)
+    testcase.assertNotIn("Retry later", message)
+    if code == "upstream_route_failure":
+        # This is the branch for stops that have no name; it says so and stops.
+        testcase.assertIn("before the assistant answered", message)
+    else:
+        testcase.assertIn(
+            code,
+            _CLASSIFIED_TERMINAL_CODES,
+            f"a terminal stop reported an unknown cause: {code}",
+        )
+        # A classified transient stop must carry a phrase Pi's
+        # `isRetryableAssistantError` matches, or the turn dies with no resend.
+        testcase.assertNotIn("could not classify the stop", message)
     return failed_events[0]
 
 

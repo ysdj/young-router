@@ -20,7 +20,7 @@ import stat
 import subprocess
 import threading
 import time
-from typing import Any
+from typing import Any, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
@@ -46,6 +46,36 @@ _CLAUDE_OAUTH_TIMEOUT_SECONDS = 15 * 60
 _LEGACY_OPENAI_SESSION_REF = "chatgpt-account"
 _SAFE_STATUS = {"signed_out", "authorizing", "signed_in", "expired", "error", "unsupported"}
 _MAX_ERROR_BYTES = 160
+
+
+def _chatgpt_account_identity(auth: Mapping[str, Any]) -> str:
+    """The account an OpenAI credential belongs to, as its own id token states it.
+
+    Only the display identity is taken from the token — never a token, a claim
+    beyond the address, or anything the file does not already state — and it is
+    returned only when it is a plain, bounded string a pane can print.
+    """
+
+    token = auth.get("id_token")
+    if not isinstance(token, str) or token.count(".") < 2:
+        return ""
+    payload = token.split(".")[1]
+    try:
+        raw = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
+        claims = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return ""
+    if not isinstance(claims, dict):
+        return ""
+    value = claims.get("email")
+    if not isinstance(value, str):
+        return ""
+    email = value.strip()
+    if not email or len(email) > 320 or "@" not in email:
+        return ""
+    if any(character < " " or character == "\x7f" for character in email):
+        return ""
+    return email
 
 
 def _validated_ref(value: object) -> str:
@@ -163,12 +193,14 @@ class ProviderAuthManager:
         self._states: dict[str, dict[str, Any]] = {}
         self._threads: dict[str, threading.Thread] = {}
         self._cancel: set[str] = set()
+        # One sign-in attempt per credential profile is current; every other
+        # attempt for that profile is stale and must stop writing.  The number
+        # is the generation, not a flag: LiteLLM's device-code poll cannot be
+        # interrupted, so a cancelled attempt keeps its worker alive until the
+        # poll times out, and a flag could not tell that worker apart from the
+        # attempt that replaced it.
+        self._attempts: dict[str, int] = {}
         self._claude_flows: dict[str, dict[str, Any]] = {}
-        # LiteLLM's ChatGPT adapter reads CHATGPT_TOKEN_DIR/AUTH_FILE from
-        # process-global environment at Authenticator construction time and
-        # the proxy itself has one active ChatGPT session. Serialize the
-        # short-lived device-code worker and keep each profile independent.
-        self._chatgpt_lock = threading.Lock()
         self._active_openai_file = self.root / "active-openai.json"
 
     def _canonical_ref(self, kind: str, ref: str) -> str:
@@ -313,6 +345,27 @@ class ProviderAuthManager:
         self._write_active_openai_ref(ref)
         return {"status": "signed_in", "configured": True, "active": True, "credential_ref": ref}
 
+    def chatgpt_request_credential(self, credential_ref: str) -> dict[str, str]:
+        """The bearer and account id a signed-in ChatGPT account asks with.
+
+        Reading an account's own roster is a request *as that account*, so the
+        caller needs its token; Core is the only place the token exists, and it
+        stays here — the pane asks for a model list, never for this.
+        """
+
+        ref = self._canonical_ref("openai_login", credential_ref)
+        auth = read_json(self._secure_chatgpt_auth_file(ref))
+        if not isinstance(auth, dict):
+            return {}
+        token = auth.get("access_token")
+        if not isinstance(token, str) or not token:
+            return {}
+        credential = {"access_token": token}
+        account_id = auth.get("account_id")
+        if isinstance(account_id, str) and account_id:
+            credential["account_id"] = account_id
+        return credential
+
     def status(self, kind: str, credential_ref: str) -> dict[str, Any]:
         ref = self._canonical_ref(kind, credential_ref)
         if kind == "openai_login":
@@ -320,17 +373,37 @@ class ProviderAuthManager:
             auth = read_json(auth_file)
             if isinstance(auth, dict) and isinstance(auth.get("access_token"), str) and auth.get("access_token"):
                 expires_at = auth.get("expires_at")
+                # Which account this credential belongs to.  A pane that offers
+                # "sign out" over a row that only says "OpenAI" is asking the
+                # person to end a session they cannot name, and with several
+                # accounts on one provider it cannot be inferred from the row.
+                # The id token already states it; nothing else is read from it.
+                account = _chatgpt_account_identity(auth)
+                identity = {"account": account} if account else {}
                 if isinstance(expires_at, (int, float)) and time.time() >= float(expires_at):
-                    return {"status": "expired", "configured": True, "active": self.active_openai_ref() == ref, "expires_at": expires_at}
-                return {"status": "signed_in", "configured": True, "active": self.active_openai_ref() == ref, "expires_at": expires_at}
+                    return {"status": "expired", "configured": True, "active": self.active_openai_ref() == ref, "expires_at": expires_at, **identity}
+                return {"status": "signed_in", "configured": True, "active": self.active_openai_ref() == ref, "expires_at": expires_at, **identity}
             with self._lock:
                 state = dict(self._states.get(ref, {}))
-            return {
+            result: dict[str, Any] = {
                 "status": state.get("status", "signed_out") if state.get("status") in _SAFE_STATUS else "signed_out",
                 "configured": False,
                 "active": self.active_openai_ref() == ref,
-                **({"user_code": state["user_code"], "verification_uri": state["verification_uri"]} if state.get("status") == "authorizing" else {}),
             }
+            if state.get("status") == "authorizing":
+                # Device-code issuance is asynchronous, so this projection is
+                # read while the challenge does not exist yet: ``start`` answers
+                # through it before the worker has one, and the host re-reads it
+                # to decide when to open its WebView. Indexing the two keys made
+                # that first read raise KeyError, which the login operation
+                # reports as a failed sign-in -- the flow died before the code
+                # it was waiting for was ever requested, and nothing was
+                # imported. A missing code is absence, never an error.
+                for key in ("user_code", "verification_uri"):
+                    value = state.get(key)
+                    if isinstance(value, str) and value:
+                        result[key] = value
+            return result
         if kind == "claude_login":
             record = self._read(ref)
             with self._lock:
@@ -419,16 +492,26 @@ class ProviderAuthManager:
         if kind not in {"openai_login", "claude_login"}:
             raise ValueError("Provider login method is unavailable")
         with self._lock:
-            existing = self._threads.get(ref)
-            if existing is not None and existing.is_alive():
-                return self.status(kind, ref)
+            # A press of 登录 always starts the sign-in it names.  Refusing to
+            # start while an earlier worker was still alive made a cancelled
+            # (or closed) attempt swallow every later one: LiteLLM's poll
+            # outlives the cancel by up to its own device-code timeout, so the
+            # pane sat on 未登录 and the host never received a challenge.  The
+            # superseded worker now goes stale instead of blocking the new one.
+            generation = self._attempts.get(ref, 0) + 1
+            self._attempts[ref] = generation
             self._cancel.discard(ref)
             if kind == "claude_login":
                 self._prepare_claude_start(ref)
             else:
                 self._set_state(ref, kind=kind, status="authorizing", configured=False, last_error="")
             target = self._run_chatgpt if kind == "openai_login" else self._run_claude
-            thread = threading.Thread(target=target, args=(ref,), daemon=True, name=f"litellm-auth-{ref}")
+            thread = threading.Thread(
+                target=target,
+                args=(ref, generation),
+                daemon=True,
+                name=f"litellm-auth-{ref}",
+            )
             self._threads[ref] = thread
             thread.start()
         return self.status(kind, ref)
@@ -437,6 +520,10 @@ class ProviderAuthManager:
         ref = self._cancel_ref(credential_ref)
         with self._lock:
             self._cancel.add(ref)
+            # Cancelling supersedes the attempt: a worker that asked to poll
+            # before this point must not write the credential it obtains, and
+            # must not overwrite the signed-out state this call stores.
+            self._attempts[ref] = self._attempts.get(ref, 0) + 1
             flow = self._claude_flows.get(ref)
         if flow is not None:
             wakeup = flow.get("wakeup")
@@ -512,67 +599,66 @@ class ProviderAuthManager:
                     continue
         return env
 
-    def _is_cancelled(self, ref: str) -> bool:
+    def _is_current(self, ref: str, generation: int) -> bool:
         with self._lock:
-            return ref in self._cancel
+            return self._attempts.get(ref, 0) == generation
 
-    def _run_chatgpt(self, ref: str) -> None:
-        with self._chatgpt_lock:
-            try:
-                if self._is_cancelled(ref):
-                    self._set_state(ref, kind="openai_login", status="signed_out", configured=False)
-                    return
-                auth_file = self._secure_chatgpt_auth_file(ref, create=True)
-                from litellm.llms.chatgpt.authenticator import Authenticator
-                from litellm.llms.chatgpt.common_utils import CHATGPT_DEVICE_VERIFY_URL
+    def _run_chatgpt(self, ref: str, generation: int) -> None:
+        """Run one device-code attempt for ``ref``.
 
-                # LiteLLM 1.97's Authenticator reads its paths from env only
-                # in __init__. Configure the object directly so a device-code
-                # flow never mutates the Core/proxy process environment.
-                auth = Authenticator.__new__(Authenticator)
-                auth.token_dir = str(self._chatgpt_account_root(ref))
-                auth.auth_file = str(auth_file)
-                device = auth._request_device_code()
-                self._set_state(ref, kind="openai_login", status="authorizing", configured=False, verification_uri=CHATGPT_DEVICE_VERIFY_URL, user_code=device.get("user_code", ""))
-                if self._is_cancelled(ref):
-                    self._set_state(ref, status="signed_out", configured=False)
+        The poll below is LiteLLM's and cannot be interrupted, so this worker
+        outlives its own cancellation by up to a device-code timeout.  Every
+        write therefore asks whether this attempt is still the current one, and
+        a stale attempt writes nothing -- no state, no credential.
+        """
+
+        def current() -> bool:
+            return self._is_current(ref, generation)
+
+        try:
+            if not current():
+                return
+            auth_file = self._secure_chatgpt_auth_file(ref, create=True)
+            from litellm.llms.chatgpt.authenticator import Authenticator
+            from litellm.llms.chatgpt.common_utils import CHATGPT_DEVICE_VERIFY_URL
+
+            # Each attempt owns its Authenticator: the adapter's paths are set
+            # on this instance, so no process environment is read and parallel
+            # attempts for different accounts cannot collide.
+            auth = Authenticator.__new__(Authenticator)
+            auth.token_dir = str(self._chatgpt_account_root(ref))
+            auth.auth_file = str(auth_file)
+            device = auth._request_device_code()
+            if not current():
+                return
+            self._set_state(ref, kind="openai_login", status="authorizing", configured=False, verification_uri=CHATGPT_DEVICE_VERIFY_URL, user_code=device.get("user_code", ""))
+            code = auth._poll_for_authorization_code(device)
+            if not current():
+                return
+            tokens = auth._exchange_code_for_tokens(code)
+            if not current():
+                return
+            record = auth._build_auth_record(tokens)
+            if not isinstance(record, dict) or not isinstance(record.get("access_token"), str) or not record["access_token"]:
+                raise ValueError("ChatGPT login returned an invalid token record")
+            with self._lock:
+                if self._attempts.get(ref, 0) != generation:
                     return
-                code = auth._poll_for_authorization_code(device)
-                if self._is_cancelled(ref):
-                    self._set_state(ref, status="signed_out", configured=False)
-                    return
-                tokens = auth._exchange_code_for_tokens(code)
-                if self._is_cancelled(ref):
-                    self._set_state(ref, status="signed_out", configured=False)
-                    return
-                record = auth._build_auth_record(tokens)
-                if not isinstance(record, dict) or not isinstance(record.get("access_token"), str) or not record["access_token"]:
-                    raise ValueError("ChatGPT login returned an invalid token record")
-                with self._lock:
-                    if ref in self._cancel:
-                        self._set_state(ref, status="signed_out", configured=False)
-                        return
-                    atomic_write_json(auth_file, record, mode=0o600)
-                    if ref in self._cancel:
-                        try:
-                            auth_file.unlink()
-                        except FileNotFoundError:
-                            pass
-                        self._set_state(ref, status="signed_out", configured=False)
-                        return
-                self._secure_chatgpt_auth_file(ref)
-                if not self.active_openai_ref():
-                    self._write_active_openai_ref(ref)
-                self._set_state(ref, kind="openai_login", status="signed_in", configured=True, expires_at=record.get("expires_at"), user_code="", verification_uri="")
-            except Exception as exc:
-                if self._is_cancelled(ref):
-                    self._set_state(ref, kind="openai_login", status="signed_out", configured=False, user_code="", verification_uri="")
-                else:
-                    self._set_state(ref, kind="openai_login", status="error", configured=False, last_error=_safe_error(exc), user_code="", verification_uri="")
-            finally:
-                with self._lock:
-                    if self._threads.get(ref) is threading.current_thread():
-                        self._threads.pop(ref, None)
+                atomic_write_json(auth_file, record, mode=0o600)
+            self._secure_chatgpt_auth_file(ref)
+            if not self.active_openai_ref():
+                self._write_active_openai_ref(ref)
+            if not current():
+                return
+            self._set_state(ref, kind="openai_login", status="signed_in", configured=True, expires_at=record.get("expires_at"), user_code="", verification_uri="")
+        except Exception as exc:
+            if not current():
+                return
+            self._set_state(ref, kind="openai_login", status="error", configured=False, last_error=_safe_error(exc), user_code="", verification_uri="")
+        finally:
+            with self._lock:
+                if self._threads.get(ref) is threading.current_thread():
+                    self._threads.pop(ref, None)
                     self._cancel.discard(ref)
 
     @staticmethod
@@ -630,12 +716,11 @@ class ProviderAuthManager:
             raise ValueError("token_exchange_invalid_response")
         return result
 
-    def _run_claude(self, ref: str) -> None:
+    def _run_claude(self, ref: str, generation: int) -> None:
         server: _ClaudeOAuthCallbackServer | None = None
         server_thread: threading.Thread | None = None
         try:
-            if self._is_cancelled(ref):
-                self._set_state(ref, kind="claude_login", status="signed_out", configured=False)
+            if not self._is_current(ref, generation):
                 return
             code_verifier = _base64url(secrets.token_bytes(32))
             code_challenge = _base64url(hashlib.sha256(code_verifier.encode("ascii")).digest())
@@ -677,13 +762,11 @@ class ProviderAuthManager:
                 self._write(ref, private)
             deadline = time.monotonic() + _CLAUDE_OAUTH_TIMEOUT_SECONDS
             while not wakeup.wait(timeout=0.25):
-                if self._is_cancelled(ref):
-                    self._set_state(ref, kind="claude_login", status="signed_out", configured=False)
+                if not self._is_current(ref, generation):
                     return
                 if time.monotonic() >= deadline:
                     raise TimeoutError("oauth_timeout")
-            if self._is_cancelled(ref):
-                self._set_state(ref, kind="claude_login", status="signed_out", configured=False)
+            if not self._is_current(ref, generation):
                 return
             callback_result = dict(server.result)
             if callback_result.get("error"):
@@ -719,8 +802,7 @@ class ProviderAuthManager:
             if not isinstance(scopes, str):
                 scopes = " ".join(_CLAUDE_OAUTH_SCOPES)
             with self._lock:
-                if ref in self._cancel:
-                    self._set_state(ref, status="signed_out", configured=False)
+                if self._attempts.get(ref, 0) != generation:
                     return
                 self._write(
                     ref,
@@ -746,14 +828,10 @@ class ProviderAuthManager:
                     "updated_at": int(time.time()),
                 }
         except TimeoutError:
-            if self._is_cancelled(ref):
-                self._set_state(ref, kind="claude_login", status="signed_out", configured=False)
-            else:
+            if self._is_current(ref, generation):
                 self._set_state(ref, kind="claude_login", status="error", configured=False, last_error="timeout")
         except Exception as exc:
-            if self._is_cancelled(ref):
-                self._set_state(ref, kind="claude_login", status="signed_out", configured=False)
-            else:
+            if self._is_current(ref, generation):
                 self._set_state(ref, kind="claude_login", status="error", configured=False, last_error=_safe_error(exc))
         finally:
             if server is not None:
@@ -772,7 +850,6 @@ class ProviderAuthManager:
                     self._claude_flows.pop(ref, None)
                 if self._threads.get(ref) is threading.current_thread():
                     self._threads.pop(ref, None)
-                self._cancel.discard(ref)
 
     def token(self, credential_ref: str) -> str:
         ref = _validated_ref(credential_ref)

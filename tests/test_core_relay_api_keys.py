@@ -254,6 +254,15 @@ class RelayApiKeyDomainTests(unittest.TestCase):
                 sorted(operation["resource_id"] for operation in prepared["destructive"]),
             )
             self.assertNotIn("api_key_create", [operation["kind"] for operation in prepared["operations"]])
+            # Turning the layout on *is* an alignment, so it reports the keys it
+            # retires together with the policy that governs them.  Reporting
+            # only the switch left every retired key's provider slot and routes
+            # in the document while the station call removed their credential.
+            self.assertEqual("delete_models", snapshot["last_action"]["dependency_policy"])
+            self.assertEqual(
+                ["sub2api-key-duplicate", "sub2api-key-stale", "sub2api-key-ungrouped"],
+                sorted(row["resource_id"] for row in snapshot["last_action"]["resources"]),
+            )
 
             restored = domain.dispatch(
                 "api_key.set_auto_grouping",
@@ -271,11 +280,14 @@ class RelayApiKeyDomainTests(unittest.TestCase):
             )
 
             # The periodic alignment pass is idempotent while Apply is still
-            # pending; it must not enqueue another delete for the same key.
-            domain.dispatch(
+            # pending; it must not enqueue another delete for the same key, and
+            # it must not report the previous pass's retirements as its own.
+            again = domain.dispatch(
                 "api_key.auto_group_align",
                 {"account_id": account["id"]},
             )
+            self.assertNotIn("resources", again["last_action"])
+            self.assertEqual("api_key_auto_group_align", again["last_action"]["kind"])
             prepared_again = domain.prepare_apply()
             self.assertEqual(
                 ["sub2api-key-duplicate", "sub2api-key-stale", "sub2api-key-ungrouped"],

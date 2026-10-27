@@ -2,6 +2,7 @@
 #include "WinUI3NativeLeafModule.h"
 #include "CoreIPCBridge.h"
 #include "WindowsRelayLogin.h"
+#include "WinUIControls.h"
 
 #include <algorithm>
 #include <atomic>
@@ -10,12 +11,6 @@
 #include <shobjidl_core.h>
 #include <winrt/Windows.Globalization.h>
 #include <winrt/Windows.ApplicationModel.DataTransfer.h>
-
-namespace winrt::Microsoft::ReactNative::implementation {
-struct ReactCoreInjection {
-  static uint64_t GetTopLevelWindowId(IReactPropertyBag const& properties) noexcept;
-};
-} // namespace winrt::Microsoft::ReactNative::implementation
 
 namespace {
 std::wstring Utf8ToWide(std::string const& value) {
@@ -37,8 +32,11 @@ std::optional<std::string> WideToUtf8(std::wstring const& value) {
 }
 
 HWND HostWindow(winrt::Microsoft::ReactNative::ReactContext const& context) {
-  auto value = winrt::Microsoft::ReactNative::implementation::ReactCoreInjection::GetTopLevelWindowId(context.Properties().Handle());
-  return reinterpret_cast<HWND>(value);
+  // RNW's ARM64 prebuilt composition library does not export the internal
+  // ReactCoreInjection helper; use the active WinUI host as the owner for
+  // native pickers instead.
+  (void)context;
+  return GetActiveWindow();
 }
 
 std::vector<YoungRouter::NativeMenuAction> NativeActions(winrt::Microsoft::ReactNative::JSValueArray const& actions) {
@@ -1014,7 +1012,7 @@ void WinUI3NativeLeafModule::RestoreRelaySession(
   auto username = field("username");
   static std::set<std::string> const allowed{"accountId", "type", "label", "origin", "username"};
   if (
-      std::any_of(options.begin(), options.end(), [&allowed](auto const& entry) { return allowed.find(entry.first) == allowed.end(); }) ||
+      std::any_of(options.begin(), options.end(), [](auto const& entry) { return allowed.find(entry.first) == allowed.end(); }) ||
       !account_id || !account_type || !label || !origin ||
       account_id->empty() || account_id->size() > 96 || label->empty() || label->size() > 160 ||
       origin->empty() || origin->size() > 2048 || (username && username->size() > 320) ||
@@ -1025,7 +1023,7 @@ void WinUI3NativeLeafModule::RestoreRelaySession(
   try {
     auto js_dispatcher = context_.JSDispatcher();
     WindowsRelayLoginOptions native_options{
-        *account_id, *account_type, *label, *origin, username, false};
+        *account_id, *account_type, *label, *origin, username, "system", false};
     std::thread([native_options = std::move(native_options), promise, js_dispatcher] () mutable {
       std::optional<WindowsRelaySessionRestoreResult> result;
       try {

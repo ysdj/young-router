@@ -13,14 +13,14 @@ void CoreIPCModule::Initialize(winrt::Microsoft::ReactNative::ReactContext const
 void CoreIPCModule::RegisterEventHandler() noexcept {
   try {
     if (event_handler_token_ != 0) return;
-    auto dispatcher = context_.JSDispatcher();
+    auto call_invoker = context_.CallInvoker();
     auto emitter = CoreEvent;
     // One observer per React root: the menu host and every route window each
     // hold their own lifecycle, so the bridge fans Core events out instead of
     // delivering them to whichever root registered last.
     event_handler_token_ = CoreIPCBridge::Shared().AddEventHandler(
-        [dispatcher, emitter](std::string const& event) {
-          dispatcher.Post([emitter, event] { emitter(event); });
+        [call_invoker, emitter](std::string const& event) {
+          call_invoker->invokeAsync([emitter, event](facebook::jsi::Runtime&) { emitter(event); });
         });
   } catch (...) {
   }
@@ -39,13 +39,15 @@ void CoreIPCModule::Send(
     std::string request,
     winrt::Microsoft::ReactNative::ReactPromise<std::string> promise) noexcept {
   try {
-    auto dispatcher = context_.JSDispatcher();
-    std::thread([request = std::move(request), promise = std::move(promise), dispatcher]() mutable {
+    auto call_invoker = context_.CallInvoker();
+    std::thread([request = std::move(request), promise = std::move(promise), call_invoker]() mutable {
       try {
         std::string response = CoreIPCBridge::Shared().Send(request);
-        dispatcher.Post([promise = std::move(promise), response = std::move(response)] { promise.Resolve(response); });
+        call_invoker->invokeAsync([promise = std::move(promise), response = std::move(response)](facebook::jsi::Runtime&) {
+          promise.Resolve(response);
+        });
       } catch (...) {
-        dispatcher.Post([promise = std::move(promise)] { promise.Reject("The local Core is unavailable."); });
+        call_invoker->invokeAsync([promise = std::move(promise)](facebook::jsi::Runtime&) { promise.Reject("The local Core is unavailable."); });
       }
     }).detach();
   } catch (...) {

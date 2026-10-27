@@ -946,7 +946,49 @@ class ModelCatalogTests(unittest.TestCase):
         self.assertEqual(1_048_576, model["context_window"])
         self.assertEqual(1_048_576, model["max_context_window"])
 
-    def test_upstream_refresh_uses_pi_agent_policy_before_hard_limit_catalogs(self) -> None:
+    def test_public_catalogs_supply_image_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = root / "runtime-settings.env"
+            settings.write_text("YOUNG_ROUTER_MODEL_CONTEXT_REFRESH_HOURS=24\n", encoding="utf-8")
+            cache = root / "contexts.json"
+
+            def fetch(source: str) -> object:
+                if source == MODEL_CONTEXT_SOURCES[0]:
+                    return {
+                        "openai": {
+                            "gpt-image-public": {
+                                "id": "gpt-image-public",
+                                "type": "image",
+                                "modalities": {"input": ["text"], "output": ["image"]},
+                            }
+                        }
+                    }
+                if source == MODEL_CONTEXT_SOURCES[2]:
+                    return {
+                        "openai/gpt-image-public": {
+                            "id": "openai/gpt-image-public",
+                            "type": "image",
+                            "modalities": {"input": ["text", "image"], "output": ["image"]},
+                            "supported_parameters": ["size", "quality"],
+                            "default_parameters": {"quality": "auto"},
+                        }
+                    }
+                return {}
+
+            registry = ModelContextRegistry(
+                runtime_settings_path=settings,
+                cache_path=cache,
+                refresh_enabled=True,
+                fetcher=fetch,
+                clock=lambda: 1_000_000,
+            )
+            self.assertTrue(registry.refresh_if_due(force=True))
+            metadata = registry.image_metadata_for_model_id("openai/gpt-image-public")
+            self.assertEqual("image", metadata["type"])
+            self.assertEqual(["size", "quality"], metadata["supported_parameters"])
+            self.assertEqual({"quality": "auto"}, metadata["default_parameters"])
+
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             settings = root / "runtime-settings.env"

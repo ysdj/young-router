@@ -3980,6 +3980,84 @@ class HookRoutingTests(HookTestCase):
         self.assertEqual(hooks._recovery_policy_for_exception(invalid), "error")
         self.assertFalse(hooks._is_priority_deployment_failover_error(invalid))
 
+    def test_a_route_whose_own_channel_client_is_stale_advances_and_is_parked(
+        self,
+    ) -> None:
+        """A stale channel client is the route's verdict, not the request's.
+
+        Observed as 18 identical failures over one model group: the first route
+        in the order answered every call with HTTP 400
+        ``Claude Code 2.1.63 does not support this model; version 2.1.280 or
+        newer is required``.  The status alone read as the request's own
+        verdict, so ``recovery_policy`` stayed ``error``: the route was never
+        cooled, every subsequent request selected it first again, and the turn
+        ended on it while siblings of the same group served the identical bytes.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        self.set_env(hooks._RECOVERY_POLICY_REQUEST_ERROR_ENV, None)
+
+        class BadRequestError(Exception):
+            pass
+
+        stale = BadRequestError(
+            'litellm.BadRequestError: OpenAIException - {"error":{"code":"server_error",'
+            '"message":"Claude Code 2.1.63 does not support this model; version '
+            '2.1.280 or newer is required. Run \'claude update\', or update the '
+            'Claude desktop app, then try again."}}'
+        )
+        stale.status_code = 400
+
+        self.assertTrue(hooks._is_upstream_client_version_rejected_error(stale))
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(stale),
+            "recovery_cooldown",
+        )
+        # The route is parked and the turn advances to a sibling that can answer.
+        self.assertTrue(hooks._is_priority_deployment_failover_error(stale))
+        self.assertTrue(hooks._should_count_deployment_failure_for_cooldown(stale))
+        self.assertEqual(
+            hooks._trace_exception(stale)["reason"],
+            "upstream-client-version-rejected",
+        )
+        self.assertEqual(
+            hooks._recovery_diagnostic(stale)["kind"],
+            "upstream_client_outdated",
+        )
+        # The final stop names the route's own cause and never invites the same
+        # bytes back with a retry tip.
+        sanitized = hooks._sanitized_upstream_route_failure_message(
+            "claude-opus-5-5",
+            stale,
+            {"model": "claude-opus-5-5"},
+        )
+        self.assertIn("too old", sanitized)
+        self.assertIn("claude-opus-5-5", sanitized)
+        self.assertNotIn("retry later", sanitized.lower())
+        self.assertNotIn("temporary", sanitized.lower())
+
+        # A plain "not supported" 400 is a different refusal: without a named
+        # stale client it stays the request's own verdict.
+        unsupported = BadRequestError(
+            'litellm.BadRequestError: OpenAIException - {"error":{"message":'
+            '"this model does not support tool calls"}}'
+        )
+        unsupported.status_code = 400
+        self.assertFalse(
+            hooks._is_upstream_client_version_rejected_error(unsupported)
+        )
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(unsupported), "error"
+        )
+        # The version sentence without a named client is not evidence either.
+        anonymous = BadRequestError(
+            "litellm.BadRequestError: version 2.1.280 or newer is required"
+        )
+        anonymous.status_code = 400
+        self.assertFalse(
+            hooks._is_upstream_client_version_rejected_error(anonymous)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

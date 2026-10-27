@@ -1235,6 +1235,112 @@ class HookRouteRecoveryTests(HookTestCase):
         self.assertIn({"type": "response.output_text.delta", "delta": "healthy peer"}, chunks)
         self.assertEqual(chunks[-1]["response"]["id"], "resp-healthy-peer")
 
+    async def test_a_stale_channel_client_is_parked_and_the_peer_answers(self) -> None:
+        """The refusal one route reports about its own client never ends the group.
+
+        Observed across 18 consecutive requests for one model group: the first
+        route in the order answered every call with HTTP 400 ``Claude Code
+        2.1.63 does not support this model; version 2.1.280 or newer is
+        required``.  Every one of those attempts selected that same deployment
+        again, wrote a failure row, and ended the turn while peers of the same
+        group served the identical bytes.  The route has to leave the order so
+        the next request selects a route that can answer.
+        """
+
+        hooks, proxy_server = load_hook_module()
+        calls = []
+
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        cooldown_file = Path(temp_dir.name) / "deployment-cooldowns.json"
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FILE_ENV, str(cooldown_file))
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+
+        class BadRequestError(Exception):
+            status_code = 400
+
+        async def healthy_peer_stream():
+            yield {"type": "response.output_text.delta", "delta": "peer answered"}
+            yield {"type": "response.completed", "response": {"id": "resp-peer"}}
+
+        deployments = [
+            {
+                "litellm_params": {"order": 1},
+                "model_info": {
+                    "id": "stale-client",
+                    "route_key": "model=claude-opus-5-5 / provider=stale / upstream=anthropic/claude-opus-5-5 / order=1",
+                },
+            },
+            {
+                "litellm_params": {"order": 1},
+                "model_info": {
+                    "id": "healthy-peer",
+                    "route_key": "model=claude-opus-5-5 / provider=peer / upstream=anthropic/claude-opus-5-5 / order=1",
+                },
+            },
+        ]
+
+        class FakeRouter:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return deployments if model_name == "claude-opus-5-5" else []
+
+            async def aresponses(self, **payload):
+                calls.append(payload.copy())
+                return healthy_peer_stream()
+
+        router = FakeRouter()
+        proxy_server.llm_router = router
+        request_data = {
+            "call_type": "aresponses",
+            "model": "claude-opus-5-5",
+            "input": [{"role": "user", "content": "hi"}],
+            "stream": True,
+            "model_info": {
+                "id": "stale-client",
+                "order": 1,
+                "route_key": "model=claude-opus-5-5 / provider=stale / upstream=anthropic/claude-opus-5-5 / order=1",
+            },
+        }
+        stale = BadRequestError(
+            'litellm.BadRequestError: OpenAIException - {"error":{"code":"server_error",'
+            '"message":"Claude Code 2.1.63 does not support this model; version '
+            '2.1.280 or newer is required."}}'
+        )
+        stale.failed_deployment_id = "stale-client"
+        stale.failed_deployment_order = 1
+        hooks._mark_exception_for_deployment_failover(stale, request_data)
+
+        # The route is parked, so the next selection cannot land on it again.
+        cooled, active_cooldowns, cooldown_filtered = (
+            hooks._with_active_deployment_cooldowns(
+                deployments,
+                request_kwargs=request_data,
+            )
+        )
+        self.assertTrue(cooldown_filtered)
+        self.assertEqual(
+            [item["model_info"]["id"] for item in cooled],
+            ["healthy-peer"],
+        )
+        self.assertEqual(len(active_cooldowns), 1)
+
+        # And this turn already advances to the peer that can answer it.
+        chunks = [
+            chunk
+            async for chunk in hooks._stream_route_recovery_poll(
+                request_data,
+                stale,
+            )
+        ]
+
+        self.assertEqual(len(calls), 1)
+        self.assertIn(
+            {"type": "response.output_text.delta", "delta": "peer answered"},
+            chunks,
+        )
+        self.assertEqual(chunks[-1]["response"]["id"], "resp-peer")
+
     async def test_route_recovery_poll_reuses_stream_error_fallback_marker(self) -> None:
         hooks, proxy_server = load_hook_module()
         calls = []
@@ -2390,7 +2496,15 @@ class HookRouteRecoveryTests(HookTestCase):
         ]
 
         self.assertGreaterEqual(len(calls), 1)
-        assert_upstream_route_failed_terminal(self, chunks)
+        # The poll's own start-timeout verdict is the cause the client reads.
+        # It used to arrive as ``upstream_route_failure`` + "could not classify
+        # the stop" because the terminal builder gated the timeout branch on
+        # already-visible output, and the client's retry classifier matches none
+        # of that sentence -- so a silent route ended the turn for good.
+        failed_event = assert_upstream_route_failed_terminal(self, chunks)
+        error = failed_event["response"]["error"]
+        self.assertEqual("upstream_stream_start_timeout", error["code"])
+        self.assertIn("ended without", error["message"])
 
     async def test_route_recovery_poll_uses_first_event_timeout_for_delayed_recovery(self) -> None:
         hooks, proxy_server = load_hook_module()
@@ -2775,7 +2889,13 @@ class HookRouteRecoveryTests(HookTestCase):
 
         self.assertTrue(hooks._is_route_recovery_stream_response(response))
         self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["call_type"], "anthropic_messages")
+        # ``call_type`` is the router's own binding, never a dispatch kwarg:
+        # LiteLLM builds each router method with ``call_type=`` already set and
+        # the generic dispatch re-passes it by keyword, so sending our copy
+        # raised ``_dispatch_generic_call_type() got multiple values for keyword
+        # argument 'call_type'`` before any upstream call and turned the
+        # failover that answers a truncated Anthropic stream into a TypeError.
+        self.assertNotIn("call_type", calls[0])
         self.assertEqual(calls[0]["messages"], request_data["messages"])
         self.assertEqual(calls[0]["system"], request_data["system"])
         self.assertEqual(calls[0]["max_tokens"], request_data["max_tokens"])

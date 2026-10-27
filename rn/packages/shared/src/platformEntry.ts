@@ -31,6 +31,8 @@ type NativeModule = {
     callbackURL?: string;
     title: string;
     closeLabel: string;
+    reloadLabel: string;
+    browserLabel: string;
   }) => Promise<void>;
   chooseModelsToAdd?: (models: string[], providerName: string, keyName: string) => Promise<string[] | undefined>;
   showGroupManager?: (options: {
@@ -228,6 +230,7 @@ registerYoungRouter("YoungRouter", {
   translate: createTranslator("system", systemLocale),
   subscribeNativeAction: (listener) => {
     const subscription = leafEvents.addListener("menuAction", (action: string) => {
+      console.log("[yr] native action=" + action);
       listener(action);
     });
     return () => subscription.remove();

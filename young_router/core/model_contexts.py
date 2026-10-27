@@ -146,6 +146,71 @@ def _reasoning_fields_from_payload(value: Mapping[str, Any]) -> dict[str, Any]:
     return fields
 
 
+def _image_model_metadata_from_payload(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Extract the bounded public image-model contract from a catalog record."""
+
+    architecture = value.get("architecture")
+    architecture = architecture if isinstance(architecture, Mapping) else {}
+    modalities = value.get("modalities")
+    modalities = modalities if isinstance(modalities, Mapping) else {}
+    input_modalities = architecture.get("input_modalities", modalities.get("input"))
+    output_modalities = architecture.get("output_modalities", modalities.get("output"))
+    if not isinstance(input_modalities, list):
+        input_modalities = []
+    if not isinstance(output_modalities, list):
+        output_modalities = []
+    model_type = str(value.get("type") or "").strip().lower()
+    is_image = (
+        model_type == "image"
+        or "image" in {str(item).strip().lower() for item in output_modalities}
+        or "image" in str(architecture.get("modality") or "").lower().split("->")[-1]
+    )
+    if not is_image:
+        return {}
+    metadata: dict[str, Any] = {"type": "image"}
+    for key, items in (("input_modalities", input_modalities), ("output_modalities", output_modalities)):
+        normalized = [
+            str(item).strip()
+            for item in items[:16]
+            if isinstance(item, str) and item.strip()
+        ]
+        if normalized:
+            metadata[key] = normalized
+    supported = value.get("supported_parameters")
+    if isinstance(supported, list):
+        normalized = list(dict.fromkeys(
+            str(item).strip()
+            for item in supported[:128]
+            if isinstance(item, str) and item.strip()
+        ))
+        if normalized:
+            metadata["supported_parameters"] = normalized
+    defaults = value.get("default_parameters")
+    if isinstance(defaults, Mapping):
+        safe_defaults = {
+            str(key).strip(): item
+            for key, item in list(defaults.items())[:64]
+            if isinstance(key, str)
+            and key.strip()
+            and (isinstance(item, (str, int, float, bool)) or item is None)
+        }
+        if safe_defaults:
+            metadata["default_parameters"] = safe_defaults
+    for key in ("id", "canonical_slug", "canonical_model_id", "name", "last_updated"):
+        item = value.get(key)
+        if isinstance(item, str) and item.strip():
+            metadata[key] = item.strip()
+    input_limits = value.get("inputLimits")
+    if isinstance(input_limits, Mapping):
+        safe_limits: dict[str, Any] = {}
+        for key, item in list(input_limits.items())[:16]:
+            if isinstance(key, str) and key.strip() and isinstance(item, (str, int, float, bool)):
+                safe_limits[key.strip()] = item
+        if safe_limits:
+            metadata["input_limits"] = safe_limits
+    return metadata
+
+
 def _record(
     context_window: int,
     max_context_window: int | None = None,
@@ -231,8 +296,11 @@ def _record_from_payload(value: object, *, source: str, priority: int) -> dict[s
         maximum = _positive_int(value.get("max_input_tokens")) or _positive_int(limits.get("input"))
     if context is None:
         context = maximum
-    if context is None:
+    image_metadata = _image_model_metadata_from_payload(value)
+    context_known = context is not None
+    if context is None and not image_metadata:
         return None
+    context = context or UNKNOWN_MODEL_CONTEXT_WINDOW
     maximum = max(context, maximum or context)
     percent = _positive_int(value.get("effective_context_window_percent"))
     if percent is None or percent > 100:
@@ -243,10 +311,12 @@ def _record_from_payload(value: object, *, source: str, priority: int) -> dict[s
         "max_context_window": maximum,
         "effective_context_window_percent": percent,
         "source": source,
-        "priority": priority,
+        "priority": priority if context_known else 0,
     }
     if auto_compact is not None:
         result["auto_compact_token_limit"] = auto_compact
+    if image_metadata:
+        result["image_model_metadata"] = image_metadata
     result.update(_reasoning_fields_from_payload(value))
     return result
 
@@ -282,9 +352,29 @@ def _source_records(payload: object, *, source: str, priority: int) -> dict[str,
         return _pi_source_records(payload, source=source, priority=priority)
     result: dict[str, dict[str, Any]] = {}
     if isinstance(payload, Mapping):
+        # models.dev/models.json is a flat ``provider/model`` map.
+        # Accept the nested provider form as well for compatible mirrors.
+        nested_models = any(
+            isinstance(value, Mapping) and isinstance(value.get("models"), Mapping)
+            for value in payload.values()
+        )
+        if nested_models:
+            for raw_provider, provider in payload.items():
+                if not isinstance(raw_provider, str) or not isinstance(provider, Mapping):
+                    continue
+                models = provider.get("models")
+                if not isinstance(models, Mapping):
+                    continue
+                for raw_id, item in models.items():
+                    if not isinstance(raw_id, str) or not isinstance(item, Mapping):
+                        continue
+                    model_id = str(item.get("id") or raw_id).strip()
+                    record = _record_from_payload(item, source=source, priority=priority)
+                    if record is not None:
+                        result[f"{raw_provider.strip().casefold()}/{model_id.casefold()}"] = record
+            return result
         if isinstance(payload.get("models"), Sequence) and not isinstance(payload.get("models"), (str, bytes, bytearray)):
-            items = payload["models"]
-            for item in items:
+            for item in payload["models"]:
                 if not isinstance(item, Mapping):
                     continue
                 model_id = item.get("slug") or item.get("id") or item.get("model")
@@ -316,7 +406,7 @@ def _merge_records(target: dict[str, dict[str, Any]], incoming: Mapping[str, Map
             continue
 
         merged = dict(current)
-        if priority >= (current_priority or 0):
+        if priority >= (current_priority or 0) and record.get("context_known", True):
             merged.update(record)
 
         # A hard-limit source can win the context fields while carrying no
@@ -332,6 +422,14 @@ def _merge_records(target: dict[str, dict[str, Any]], incoming: Mapping[str, Map
                 key not in current or priority >= (current_priority or 0)
             ):
                 merged[key] = record[key]
+        current_image = current.get("image_model_metadata") if isinstance(current, Mapping) else None
+        incoming_image = record.get("image_model_metadata")
+        if isinstance(incoming_image, Mapping):
+            merged_image = dict(current_image) if isinstance(current_image, Mapping) else {}
+            for key, value in incoming_image.items():
+                merged_image.setdefault(key, value)
+            if merged_image:
+                merged["image_model_metadata"] = merged_image
         target[model_id] = merged
 
 
@@ -1126,6 +1224,51 @@ class ModelContextRegistry:
         if record is None:
             record = self._resolve_provider_record(model_id)
         return record
+
+    def image_metadata_for_model_id(
+        self,
+        model_id: str,
+        *,
+        refresh: bool = False,
+    ) -> dict[str, Any] | None:
+        """Return public image metadata, optionally refreshing public catalogs."""
+
+        self._load_cache()
+        if refresh:
+            self.refresh_if_due()
+        candidates = _candidate_ids(model_id)
+        matches: list[tuple[int, int, dict[str, Any]]] = []
+        for index, (record_id, record) in enumerate(self._records.items()):
+            if not isinstance(record, Mapping) or not isinstance(record.get("image_model_metadata"), Mapping):
+                continue
+            if any(
+                record_id == candidate
+                or record_id.endswith(f"/{candidate}")
+                for candidate in candidates
+            ):
+                matches.append((_positive_int(record.get("priority")) or 0, -index, dict(record)))
+        if not matches:
+            return None
+        metadata = max(matches, key=lambda item: (item[0], item[1]))[2].get("image_model_metadata")
+        return dict(metadata) if isinstance(metadata, Mapping) else None
+
+    def image_metadata_for_model_ids(
+        self,
+        model_ids: Sequence[str],
+        *,
+        refresh: bool = False,
+    ) -> dict[str, dict[str, Any]]:
+        """Resolve image metadata for concrete route model ids."""
+
+        self._load_cache()
+        if refresh:
+            self.refresh_if_due()
+        resolved: dict[str, dict[str, Any]] = {}
+        for model_id in model_ids:
+            metadata = self.image_metadata_for_model_id(model_id)
+            if metadata:
+                resolved[str(model_id).strip()] = metadata
+        return resolved
 
     def reasoning_for_model_id(self, model_id: str) -> ReasoningCapability | None:
         """Return Pi/Codex reasoning policy for one concrete deployment model."""

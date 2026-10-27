@@ -100,29 +100,35 @@ def _native_stream_output_limit_reason(chunk: Any) -> Optional[str]:
     Chat Completions states it in ``finish_reason`` and Anthropic Messages in
     ``stop_reason``/``delta.stop_reason``; both are the provider saying "the
     answer is not finished", which is exactly the case a continuation fixes.
+
+    A transport read routinely carries the ceiling frame and the terminal frame
+    that closes it together, so every frame in the read is asked: reading only
+    the first one missed the ceiling reason beside a ``message_stop``, and the
+    withheld frame was then never recognised as one to withhold.
     """
 
     from . import streaming as _streaming_module
 
-    dumped = _streaming_module._stream_chunk_dump(chunk)
-    if not isinstance(dumped, dict):
-        return None
-    candidates: List[Any] = []
-    choices = dumped.get("choices")
-    if isinstance(choices, list):
-        for choice in choices:
-            if isinstance(choice, dict):
-                candidates.append(choice.get("finish_reason"))
-    delta = dumped.get("delta")
-    if isinstance(delta, dict):
-        candidates.append(delta.get("stop_reason"))
-    candidates.append(dumped.get("stop_reason"))
-    for candidate in candidates:
-        if not isinstance(candidate, str):
-            continue
-        reason = _streaming_module._output_limit_incomplete_reason_from_text(candidate)
-        if reason is not None:
-            return reason
+    dumps = _streaming_module._stream_chunk_dumps(chunk)
+    for dumped in dumps:
+        candidates: List[Any] = []
+        choices = dumped.get("choices")
+        if isinstance(choices, list):
+            for choice in choices:
+                if isinstance(choice, dict):
+                    candidates.append(choice.get("finish_reason"))
+        delta = dumped.get("delta")
+        if isinstance(delta, dict):
+            candidates.append(delta.get("stop_reason"))
+        candidates.append(dumped.get("stop_reason"))
+        for candidate in candidates:
+            if not isinstance(candidate, str):
+                continue
+            reason = _streaming_module._output_limit_incomplete_reason_from_text(
+                candidate
+            )
+            if reason is not None:
+                return reason
     return None
 
 

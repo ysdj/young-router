@@ -772,6 +772,55 @@ class HookResponsesRequestPrepTests(HookTestCase):
         )
         self.assertTrue(contract.is_undeclared_tool_call(request, "browser_missing"))
 
+    def test_codex_declared_set_covers_a_trailing_additional_tools_item(self) -> None:
+        """The declared set is every ``additional_tools`` item, not the leading run.
+
+        Codex sends its always-on registry as a leading item and appends the
+        deferred registry -- the tools a ``tool_search`` unlocks -- behind the
+        conversation it belongs to.  Reading only the leading run declared
+        neither ``view_image`` nor ``exec_command``, so the guard answered each
+        of their calls with ``response.failed`` ("which this request never
+        declared") even though the bridge forwarded them upstream and the
+        client could run them.  The bridge reads every item, so the contract
+        that judges the answer has to read the same set.
+        """
+
+        hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
+        request = self._codex_collaboration_request()
+        request["input"].extend(
+            [
+                {"role": "user", "content": "Re-run the failing check."},
+                {
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [
+                        {
+                            "type": "namespace",
+                            "name": "functions",
+                            "tools": [
+                                {"type": "function", "name": "view_image"},
+                                {"type": "function", "name": "exec_command"},
+                            ],
+                        }
+                    ],
+                },
+            ]
+        )
+
+        declared = contract.declared_tool_names(request)
+
+        self.assertIn("view_image", declared)
+        self.assertIn("exec_command", declared)
+        # The leading registry still counts.
+        self.assertIn("list_agents", declared)
+        self.assertFalse(contract.is_undeclared_tool_call(request, "view_image"))
+        self.assertTrue(contract.is_undeclared_tool_call(request, "browser_missing"))
+        # The trace counts the same set, so a rejection is readable afterwards.
+        summary = hooks._trace_request_summary(request)["tools"]
+        self.assertIn("view_image", summary["names"])
+        self.assertIn("additional_tools", summary["origins"])
+
     def test_codex_root_clean_snapshot_allows_tool_free_completion(self) -> None:
         hooks, _ = load_hook_module()
         contract = hooks._codex_contract_module
@@ -4641,6 +4690,66 @@ class HookResponsesToolOutputReplayWindowTests(HookTestCase):
         request = self._request(pairs=5, payload_chars=30_000)
 
         self.assertIsNone(hooks._with_elided_oversized_tool_outputs(request))
+
+    def test_the_ceiling_is_the_routes_own_window(self) -> None:
+        """Not a fixed character count: 1M tokens at 95%, less the answer's reserve.
+
+        The route this app serves most often reports 1,000,000 tokens and 95%
+        usable, and a client asks for 393,216 of them for its own answer.  What
+        is left is the whole tail this pass may replay, and it is 84x the
+        20,000 a fixed window allowed -- which is why that window emptied every
+        read the model had made instead of guarding a ceiling.
+        """
+
+        hooks, _ = load_hook_module()
+        module = hooks._responses_request_module
+
+        ceiling = module._history_tool_output_ceiling_chars_for_window(
+            context_window=1_000_000,
+            max_context_window=1_000_000,
+            effective_percent=95,
+            max_output_tokens=393_216,
+        )
+
+        self.assertEqual((950_000 - 393_216) * 3, ceiling)
+        self.assertGreater(ceiling, 20_000 * 80)
+
+    def test_an_output_reserve_cannot_claim_the_whole_window(self) -> None:
+        """A client's own maximum never removes the ceiling."""
+
+        hooks, _ = load_hook_module()
+        module = hooks._responses_request_module
+
+        ceiling = module._history_tool_output_ceiling_chars_for_window(
+            context_window=200_000,
+            max_context_window=None,
+            effective_percent=100,
+            max_output_tokens=5_000_000,
+        )
+
+        self.assertEqual(100_000 * 3, ceiling)
+
+    def test_a_tail_the_route_can_carry_is_not_a_snapshot(self) -> None:
+        """The session that motivated this pass: 630k of output on a 1M route.
+
+        Eleven of thirteen live histories hit the old fixed window, and every
+        one of them lost its entire set of records above the drop threshold --
+        including the repository guide the model had just read.
+        """
+
+        hooks, _ = load_hook_module()
+        request = self._request(pairs=10, payload_chars=63_000)
+
+        with mock.patch.object(
+            hooks._responses_request_module,
+            "_history_tool_output_ceiling_chars",
+            return_value=1_670_352,
+        ):
+            with self.assertNoLogs("young_router.route_trace", level="WARNING"):
+                updated = hooks._with_elided_oversized_tool_outputs(request)
+
+        self.assertIsNone(updated)
+
 
 
 class HookReplayedReasoningCountTests(HookTestCase):

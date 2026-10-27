@@ -559,6 +559,45 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
             saved["model_list"][0]["litellm_params"]["model"],
         )
 
+    def test_a_chatgpt_route_states_the_account_it_answers_with(self) -> None:
+        """Each ChatGPT account is one deployment, not one proxy process.
+
+        The adapter reads a token directory per process, so a route that named
+        nothing could only ever reach the one account that directory belonged
+        to. The route now carries its account's reference, which the proxy's own
+        patch resolves to that account's auth file — and the reference is not a
+        secret, so it may live in the document exactly like a relay key id does.
+        """
+
+        path = self.write_config(
+            """
+            providers:
+              openai-account:
+                x-young-router-provider-auth:
+                  kind: openai_login
+                  credential_ref: provider-auth-example
+            model_list:
+              - model_name: gpt-5.4
+                litellm_params:
+                  model: chatgpt/gpt-5.4
+                  order: 1
+                model_info:
+                  id: "00000003"
+                  provider: openai-account
+                  upstream_url_surface: openai/responses
+                  upstream_protocol_mode: fixed
+            """
+        )
+
+        payload = config_load.load_config(path)
+        config_api.save_config(payload["providers"], path)
+
+        saved = config_schema._load_yaml(path)
+        self.assertEqual(
+            "young-router-auth:provider-auth-example",
+            saved["model_list"][0]["litellm_params"]["api_key"],
+        )
+
     def test_claude_login_round_trip_uses_only_environment_reference(self) -> None:
         path = self.write_config(
             """
@@ -1291,6 +1330,98 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
             "anthropic",
             config_schema.infer_upstream_fallback_surface("anthropic/claude-sonnet"),
         )
+
+    def test_a_claude_route_defaults_to_the_wire_it_serves(self) -> None:
+        """A Claude route starts pinned to Messages, not on the client's wire.
+
+        Claude models are reached through relay channels that mount Messages and
+        refuse the Responses shape: one station answered every ``/responses``
+        call for a Claude model with HTTP 400 "Claude Code <v> does not support
+        this model", while the same bytes on ``/messages`` answered normally.
+        Left on ``fallback``, every request first pays that refused round trip
+        before the alternate surface is tried -- which is exactly the repeated
+        failure a whole model group was producing.
+
+        The mode follows the route's own surface, so a route the user pinned to
+        another protocol keeps its choice, and a non-Claude route still follows
+        the client.
+        """
+
+        self.assertEqual(
+            "fixed",
+            config_schema.default_upstream_protocol_mode("anthropic"),
+        )
+        for surface in ("openai/chat", "openai/responses", ""):
+            self.assertEqual(
+                "fallback",
+                config_schema.default_upstream_protocol_mode(surface),
+            )
+        self.assertEqual(
+            "fixed",
+            config_schema.inferred_upstream_protocol_mode("anthropic/claude-sonnet"),
+        )
+        self.assertEqual(
+            "fallback",
+            config_schema.inferred_upstream_protocol_mode("openai/gpt-5"),
+        )
+
+        # The same default is what a document that states no mode is read back
+        # with, so the next save cannot silently return the route to fallback.
+        path = self.write_config(
+            """
+            providers:
+              claude_channel:
+                api_base: "https://example.com/v1"
+                api_keys:
+                  - name: default
+                    value: "sk-test"
+            model_list:
+              - model_name: claude-opus-5-5
+                litellm_params:
+                  model: anthropic/claude-opus-5-5
+                  api_base: "https://example.com/v1"
+                  api_key: "sk-test"
+                model_info:
+                  id: "00000028"
+                  provider: claude_channel
+            """
+        )
+        payload = config_load.load_config(path)
+        model = payload["providers"][0]["models"][0]
+        self.assertEqual("anthropic", model["upstream_url_surface"])
+        self.assertEqual("fixed", model["upstream_protocol_mode"])
+
+        config_api.save_config(payload["providers"], path)
+        saved = config_schema._load_yaml(path)
+        saved_info = saved["model_list"][0]["model_info"]
+        self.assertEqual("anthropic", saved_info["upstream_url_surface"])
+        self.assertEqual("fixed", saved_info["upstream_protocol_mode"])
+
+        # A route that states its own mode keeps it: the pane offers 协议方式 on
+        # every route, and re-deciding for the user would discard that edit.
+        chosen = self.write_config(
+            """
+            providers:
+              claude_channel:
+                api_base: "https://example.com/v1"
+                api_keys:
+                  - name: default
+                    value: "sk-test"
+            model_list:
+              - model_name: claude-opus-5-5
+                litellm_params:
+                  model: anthropic/claude-opus-5-5
+                  api_base: "https://example.com/v1"
+                  api_key: "sk-test"
+                model_info:
+                  id: "00000029"
+                  provider: claude_channel
+                  upstream_url_surface: anthropic
+                  upstream_protocol_mode: fallback
+            """
+        )
+        chosen_model = config_load.load_config(chosen)["providers"][0]["models"][0]
+        self.assertEqual("fallback", chosen_model["upstream_protocol_mode"])
 
     def test_public_model_mapping_keeps_exact_namespaced_upstream_model(self) -> None:
         path = self.write_config(
@@ -2426,6 +2557,160 @@ class YamlTextParseReuseTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 config_schema.load_yaml_text(bomb, Path("config.yaml"))
 
+
+    def test_one_provider_serves_its_accounts_and_its_keys_as_peer_routes(self) -> None:
+        """An OpenAI row is the service, not one account.
+
+        Every serving account and every custom key of the same row contributes
+        one deployment per model — an account through the ChatGPT adapter with
+        its own credential reference, a key as an ordinary OpenAI route at the
+        provider's address — and the route id a credential produces survives a
+        second save, so the routes table keeps one identity per account.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text("providers: {}\nmodel_list: []\n", encoding="utf-8")
+            provider = {
+                "name": "OpenAI",
+                "enabled": True,
+                "auth_kind": "openai_login",
+                "api_base": "",
+                "auth_credential_ref": "provider-auth-one",
+                "auth_accounts": [
+                    {"ref": "provider-auth-one", "label": "", "enabled": True},
+                    {"ref": "provider-auth-two", "label": "", "enabled": False},
+                ],
+                "api_keys": [{"id": "slot-1", "name": "platform", "value": "sk-platform"}],
+                "models": [
+                    {
+                        "model_name": "gpt-5.4",
+                        "upstream_model": "gpt-5.4",
+                        "litellm_model": "chatgpt/gpt-5.4",
+                        "enabled": True,
+                        "deployment_id": "abcd1234",
+                    }
+                ],
+            }
+            config_api.save_config([provider], path=path)
+            document = yaml.safe_load(path.read_text(encoding="utf-8"))
+            routes = document["model_list"]
+            self.assertEqual(2, len(routes), routes)
+            by_key = {route["litellm_params"].get("api_key"): route for route in routes}
+            self.assertIn("young-router-auth:provider-auth-one", by_key)
+            # A parked account contributes nothing: its deployment would fail
+            # every request it was handed.
+            self.assertNotIn("young-router-auth:provider-auth-two", by_key)
+            self.assertIn("sk-platform", by_key)
+            self.assertEqual("chatgpt/gpt-5.4", by_key["young-router-auth:provider-auth-one"]["litellm_params"]["model"])
+            self.assertEqual("openai/gpt-5.4", by_key["sk-platform"]["litellm_params"]["model"])
+            self.assertEqual("https://api.openai.com/v1", by_key["sk-platform"]["litellm_params"]["api_base"])
+            # The account list is config: a reload serves every account the row
+            # owns, so a second sign-in never needs a second provider.
+            self.assertEqual(
+                ["provider-auth-one", "provider-auth-two"],
+                [entry["ref"] for entry in document["providers"]["OpenAI"]["auth_accounts"]],
+            )
+            first_ids = sorted(route["model_info"]["id"] for route in routes)
+            config_api.save_config([provider], path=path)
+            second = yaml.safe_load(path.read_text(encoding="utf-8"))["model_list"]
+            self.assertEqual(first_ids, sorted(route["model_info"]["id"] for route in second))
+
+    def test_a_credential_route_reads_back_as_the_one_row_it_belongs_to(self) -> None:
+        """One model is one row however many credentials serve it.
+
+        The writer emits an entry per credential, and every entry is a
+        *deployment* of the same row.  Read back as rows, a provider's model
+        list doubled on each save: each deployment became a row, each row was
+        written once per credential again, and the document grew without bound
+        until the proxy refused to start.  The folded row therefore keeps the
+        row's id, and a second save writes exactly the entries the first did.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text("providers: {}\nmodel_list: []\n", encoding="utf-8")
+            provider = {
+                "name": "OpenAI",
+                "enabled": True,
+                "auth_kind": "openai_login",
+                "api_base": "",
+                "auth_credential_ref": "provider-auth-one",
+                "auth_accounts": [
+                    {"ref": "provider-auth-one", "label": "", "enabled": True},
+                    {"ref": "provider-auth-two", "label": "", "enabled": True},
+                ],
+                "api_keys": [{"id": "slot-1", "name": "platform", "value": "sk-platform"}],
+                "models": [
+                    {
+                        "model_name": "gpt-5.4",
+                        "upstream_model": "gpt-5.4",
+                        "litellm_model": "chatgpt/gpt-5.4",
+                        "enabled": True,
+                        "deployment_id": "abcd1234",
+                    }
+                ],
+            }
+            config_api.save_config([provider], path=path)
+            first = yaml.safe_load(path.read_text(encoding="utf-8"))["model_list"]
+            self.assertEqual(3, len(first), first)
+
+            for _ in range(4):
+                reloaded = config_load.load_config(path)
+                self.assertEqual(1, len(reloaded["providers"][0]["models"]))
+                self.assertEqual(
+                    "abcd1234",
+                    reloaded["providers"][0]["models"][0]["deployment_id"],
+                )
+                config_api.save_config(reloaded["providers"], path=path)
+                again = yaml.safe_load(path.read_text(encoding="utf-8"))["model_list"]
+                self.assertEqual(
+                    sorted(route["model_info"]["id"] for route in first),
+                    sorted(route["model_info"]["id"] for route in again),
+                )
+
+    def test_a_login_rows_account_list_survives_a_save(self) -> None:
+        """The accounts are a field, not an unread extension.
+
+        Loading left the list in the provider's extras bucket, so the writer
+        wrote it back as an extension and the *editor* record no longer carried
+        it: the next save dropped every account but the mirrored first one, and
+        a second sign-in silently replaced the first one's session.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(
+                textwrap.dedent(
+                    """
+                providers:
+                  OpenAI:
+                    auth_accounts:
+                      - ref: provider-auth-one
+                      - ref: provider-auth-two
+                      - ref: provider-auth-parked
+                        enabled: false
+                    x-young-router-provider-auth:
+                      kind: openai_login
+                      credential_ref: provider-auth-one
+                model_list: []
+                """
+                ).lstrip(),
+                encoding="utf-8",
+            )
+            loaded = config_load.load_config(path)
+            provider = loaded["providers"][0]
+            self.assertEqual(
+                ["provider-auth-one", "provider-auth-two", "provider-auth-parked"],
+                [entry["ref"] for entry in provider["auth_accounts"]],
+            )
+            self.assertNotIn("auth_accounts", provider["extra"])
+            config_api.save_config([provider], path=path)
+            saved = yaml.safe_load(path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                ["provider-auth-one", "provider-auth-two", "provider-auth-parked"],
+                [entry["ref"] for entry in saved["providers"]["OpenAI"]["auth_accounts"]],
+            )
 
 if __name__ == "__main__":
     unittest.main()

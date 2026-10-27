@@ -45,6 +45,10 @@ export interface NativeLeafBridge {
     callbackURL?: string;
     title: string;
     closeLabel: string;
+    /** The window's own reload action: a page that stalled can be retried. */
+    reloadLabel: string;
+    /** The same page in the system browser, for a WebKit the site refuses. */
+    browserLabel: string;
   }): Promise<void>;
   chooseModelsToAdd(models: string[], providerName: string, keyName: string): Promise<string[] | undefined>;
   showGroupManager(options: {

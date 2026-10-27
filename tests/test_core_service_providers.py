@@ -356,7 +356,8 @@ class ServiceProviderBoundaryTests(unittest.TestCase):
             second_ref = domain._provider_auth_state(providers[1])["credential_ref"]
             self.assertNotEqual(first_ref, second_ref)
             self.assertTrue(providers[0]["enabled"])
-            self.assertFalse(providers[1]["enabled"])
+            # Accounts are independent routes, not one shared slot.
+            self.assertTrue(providers[1]["enabled"])
             self.assertFalse(first["providers"][0]["auth_active"])
             self.assertFalse(second["providers"][1]["auth_active"])
 
@@ -437,7 +438,13 @@ class ServiceProviderBoundaryTests(unittest.TestCase):
                 expected_revision=before,
             )
             self.assertGreater(result["revision"], before)
-            self.assertFalse(domain.draft_state()["providers"][0]["enabled"])
+            # The row is the service, not the account: it stays as the user left
+            # it, and the account it reads is the thing that stops serving — its
+            # own deployment is what leaves the config.
+            self.assertTrue(domain.draft_state()["providers"][0]["enabled"])
+            accounts = domain.snapshot()["providers"][0]["accounts"]
+            self.assertEqual(1, len(accounts))
+            self.assertFalse(accounts[0]["serving"])
 
     def test_a_workbuddy_read_answers_with_its_own_action_summary(self) -> None:
         """The catalog read a rate row asks for travels back with that read.
@@ -587,20 +594,22 @@ class ServiceProviderBoundaryTests(unittest.TestCase):
             ids = [provider["id"] for provider in domain.snapshot()["providers"]]
 
             result = domain.dispatch("service_provider.auth_activate", {"provider_id": ids[0]})
-            self.assertTrue(result["operation_summary"]["requires_restart"])
             self.assertEqual(first_ref, manager.active_openai_ref())
             active = domain.snapshot()["providers"]
             self.assertTrue(active[0]["auth_active"])
             self.assertFalse(active[1]["auth_active"])
+            # Selecting an account is a preference, not a slot: both signed-in
+            # accounts stay enabled, because each one is its own deployment.
             self.assertTrue(domain.draft_state()["providers"][0]["enabled"])
-            self.assertFalse(domain.draft_state()["providers"][1]["enabled"])
+            self.assertTrue(domain.draft_state()["providers"][1]["enabled"])
+            self.assertNotIn("requires_restart", result["operation_summary"])
 
             domain.dispatch("service_provider.activate", {"provider_id": ids[1]})
             self.assertEqual(second_ref, manager.active_openai_ref())
             active = domain.snapshot()["providers"]
             self.assertFalse(active[0]["auth_active"])
             self.assertTrue(active[1]["auth_active"])
-            self.assertFalse(domain.draft_state()["providers"][0]["enabled"])
+            self.assertTrue(domain.draft_state()["providers"][0]["enabled"])
             self.assertTrue(domain.draft_state()["providers"][1]["enabled"])
 
             domain.dispatch("service_provider.delete", {"provider_id": ids[1]})
@@ -637,7 +646,6 @@ class ServiceProviderBoundaryTests(unittest.TestCase):
             domain.dispatch("service_provider.activate", {"provider_id": first_id})
             domain.dispatch("service_provider.auth_logout", {"provider_id": first_id})
             self.assertEqual("", manager.active_openai_ref())
-            self.assertFalse(domain.draft_state()["providers"][0]["enabled"])
             self.assertEqual("signed_in", manager.status("openai_login", second_ref)["status"])
 
             # A later login auto-selects the first account again; its status
@@ -648,8 +656,11 @@ class ServiceProviderBoundaryTests(unittest.TestCase):
             )
             manager.activate("openai_login", first_ref)
             domain.dispatch("service_provider.auth_status", {"provider_id": first_id})
+            # A signed-out account is parked; a signed-in poll leaves its
+            # siblings exactly as the user left them, because they are separate
+            # deployments rather than one shared runtime slot.
             self.assertTrue(domain.draft_state()["providers"][0]["enabled"])
-            self.assertFalse(domain.draft_state()["providers"][1]["enabled"])
+            self.assertTrue(domain.draft_state()["providers"][1]["enabled"])
 
     def test_a_new_model_never_claims_a_provider_key_by_itself(self) -> None:
         directory, domain = self._domain()
@@ -979,16 +990,218 @@ class ServiceProviderBoundaryTests(unittest.TestCase):
             )
             self.assertEqual([], provider()["models"])
 
-    def test_validation_rejects_legacy_multiple_enabled_openai_accounts(self) -> None:
+    def test_a_new_key_is_staged_until_it_has_a_value(self) -> None:
+        """＋ must not be undone by the Apply that follows it.
+
+        A route that names no key resolves to the provider's first slot, so a
+        slot the user had just created was counted as *referenced* by the
+        model list — and the validation path exempts a referenced key from the
+        value check.  The empty slot then reached the document writer, which
+        drops a valueless key, so the row appeared and vanished on the next
+        read: the ＋ "flashed and reverted".  Validation now answers for a slot
+        no route names, which is the state ＋ leaves behind, and the pane gets
+        the ordinary "every key needs a value" issue instead of a disappearing
+        row.
+        """
+
+        directory, domain = self._domain()
+        with directory:
+            provider_id = domain.dispatch(
+                "service_provider.add", {"kind": "openai_login"}
+            )["providers"][0]["id"]
+            manager = domain._auth_manager()
+            ref = domain._provider_accounts(domain._draft["providers"][0])[0]["ref"]
+            atomic_write_json(
+                manager._secure_chatgpt_auth_file(ref, create=True),
+                {"access_token": "synthetic-access-token", "expires_at": 4102444800},
+            )
+            # The account's own route names no key, exactly like the live row
+            # whose list an unbound route resolves onto.
+            self.assertEqual("", domain.draft_state()["providers"][0]["models"][0].get("provider_key_id"))
+
+            domain.dispatch("provider.key_add", {"provider_id": provider_id, "name": "key-1"})
+            validation = domain.validate()
+            self.assertFalse(validation["valid"])
+            self.assertEqual("api_key_value_required", validation["issues"][0]["code"])
+
+            # A refused Apply keeps the staged row: it is the user's next edit.
+            with self.assertRaises(DomainError):
+                domain.apply()
+            names = domain.snapshot()["providers"][0]["api_key_names"]
+            self.assertEqual(["key-1"], names)
+
+            # Once the value is staged, the same draft applies and persists.
+            domain.stage_secret(
+                "api_key", f"{provider_id}\u001fkey-1", "sk-replace-placeholder"
+            )
+            self.assertTrue(domain.validate()["valid"], domain.validate())
+            domain.apply()
+            reloaded = ProvidersModelsDomain(domain.config_path).snapshot()["providers"][0]
+            self.assertEqual(["key-1"], reloaded["api_key_names"])
+
+    def test_a_key_a_route_names_but_does_not_use_keeps_its_saved_choice(self) -> None:
+        """A key the pane keeps for a disabled route needs no value yet.
+
+        The exemption this pins is about a route that *names* the key: the user
+        parked it deliberately, and demanding a credential for a route nothing
+        serves would block every Apply over a choice they already made.  It must
+        not extend to a key no route names at all, which is what the test above
+        covers.
+        """
+
+        directory, domain = self._domain()
+        with directory:
+            provider_id = domain.dispatch(
+                "provider.add",
+                {
+                    "provider": {
+                        "name": "parked",
+                        "api_base": "https://parked.example.test/v1",
+                        "create_default_api_key": True,
+                    }
+                },
+            )["providers"][0]["id"]
+            domain.dispatch("provider.key_add", {"provider_id": provider_id, "name": "spare"})
+            domain.stage_secret("api_key", f"{provider_id}\u001fdefault", "sk-replace-default")
+            domain.dispatch(
+                "model.add",
+                {
+                    "provider_id": provider_id,
+                    "model": {
+                        "name": "parked-model",
+                        "upstream_model": "parked-model",
+                        "api_key_name": "spare",
+                        "enabled": False,
+                    },
+                },
+            )
+            self.assertTrue(domain.validate()["valid"], domain.validate())
+
+    def test_a_custom_key_beside_an_account_is_a_key_of_that_row(self) -> None:
+        """One OpenAI row owns its accounts *and* the keys beside them.
+
+        An account is not the only credential a service row answers with: the
+        config writer already emits one deployment per credential, a signing-in
+        account and a plain key included.  The pane therefore offers ＋ on that
+        row, and ＋ must work there — a key list whose only visible action is
+        refused by Core is a button that does nothing, which is what the pane
+        showed before this.  The account's own credential is still out of reach:
+        what is refused now is a slot whose value Core minted, not every slot on
+        a login row.
+        """
+
+        directory, domain = self._domain()
+        with directory:
+            provider_id = domain.dispatch(
+                "service_provider.add", {"kind": "openai_login"}
+            )["providers"][0]["id"]
+            manager = domain._auth_manager()
+            ref = domain._provider_accounts(domain._draft["providers"][0])[0]["ref"]
+            atomic_write_json(
+                manager._secure_chatgpt_auth_file(ref, create=True),
+                {"access_token": "synthetic-access-token", "expires_at": 4102444800},
+            )
+
+            added = domain.dispatch(
+                "provider.key_add", {"provider_id": provider_id, "name": "platform"}
+            )
+            self.assertEqual(["platform"], added["providers"][0]["api_key_names"])
+            domain.stage_secret(
+                "api_key",
+                f"{provider_id}\u001fplatform",
+                "sk-replace-platform-placeholder",
+            )
+            self.assertTrue(domain.validate()["valid"], domain.validate())
+            domain.apply()
+
+            saved = ProvidersModelsDomain(domain.config_path).snapshot()["providers"][0]
+            self.assertEqual(["platform"], saved["api_key_names"])
+            self.assertEqual(1, len(saved["accounts"]))
+            # One model is one row however many credentials serve it: the
+            # account's deployment and the key's are both rows of it.
+            self.assertEqual(1, len(saved["models"]))
+
+    def test_a_credential_route_never_borrows_the_rows_base_or_its_account(
+        self,
+    ) -> None:
+        """A key route speaks the plain wire at the service's own address.
+
+        The account-backed row stores no base — its adapter owns the address —
+        so a key beside it must not inherit one, and the key's route must not
+        carry the account's reference.  Both were the same mistake: a shared
+        scope copied the row's fields onto every credential, so the key answered
+        with the account's credential and the account's routes moved to the
+        platform endpoint on the next save.
+        """
+
+        from young_router.config import api as config_api
+
+        directory, domain = self._domain()
+        with directory:
+            provider_id = domain.dispatch(
+                "service_provider.add", {"kind": "openai_login"}
+            )["providers"][0]["id"]
+            manager = domain._auth_manager()
+            ref = domain._provider_accounts(domain._draft["providers"][0])[0]["ref"]
+            atomic_write_json(
+                manager._secure_chatgpt_auth_file(ref, create=True),
+                {"access_token": "synthetic-access-token", "expires_at": 4102444800},
+            )
+            domain.dispatch(
+                "provider.key_add", {"provider_id": provider_id, "name": "platform"}
+            )
+            domain.stage_secret(
+                "api_key",
+                f"{provider_id}\u001fplatform",
+                "sk-replace-platform-placeholder",
+            )
+            domain.apply()
+
+            domain = ProvidersModelsDomain(domain.config_path)
+            provider = domain.draft_state()["providers"][0]
+            self.assertEqual("", provider.get("api_base"))
+            scopes = {
+                credential_id: scoped
+                for scoped, credential_id in config_api._credential_scopes(provider)
+            }
+            self.assertEqual(2, len(scopes))
+            self.assertEqual("", scopes[ref]["api_base"])
+            self.assertEqual("openai_login", scopes[ref]["auth_kind"])
+            key_scope = next(
+                scoped for credential_id, scoped in scopes.items() if credential_id != ref
+            )
+            self.assertEqual("api_key", key_scope["auth_kind"])
+            self.assertEqual("", key_scope["auth_credential_ref"])
+            self.assertEqual("https://api.openai.com/v1", key_scope["api_base"])
+
+    def test_several_enabled_openai_accounts_are_several_routes(self) -> None:
+        """The single-slot rule existed for one process-global token directory.
+
+        Each route now states its own account credential (see
+        ``config/dump.py`` and the proxy's account patch), so two signed-in
+        accounts are two deployments of the same model group and the router
+        spreads requests across them.
+        """
+
         directory, domain = self._domain()
         with directory:
             domain.dispatch("service_provider.add", {"kind": "openai_login", "name": "One"})
             domain.dispatch("service_provider.add", {"kind": "openai_login", "name": "Two"})
+            manager = domain._auth_manager()
             for provider in domain._draft["providers"]:
                 provider["enabled"] = True
+                ref = domain._provider_auth_state(provider)["credential_ref"]
+                atomic_write_json(
+                    manager._secure_chatgpt_auth_file(ref, create=True),
+                    {"access_token": f"token-{ref}", "expires_at": 4102444800},
+                )
             validation = domain.validate()
-            self.assertFalse(validation["valid"])
-            self.assertIn("Only one OpenAI login provider", validation["errors"][0])
+            self.assertTrue(validation["valid"], validation)
+            refs = [
+                domain._provider_auth_state(provider)["credential_ref"]
+                for provider in domain.draft_state()["providers"]
+            ]
+            self.assertEqual(2, len(set(refs)))
 
     def test_existing_login_provider_is_readable_but_normal_patch_is_blocked(self) -> None:
         directory, domain = self._domain()
@@ -1026,6 +1239,94 @@ class ServiceProviderBoundaryTests(unittest.TestCase):
                 },
             )
             self.assertEqual("Renamed", domain.snapshot()["providers"][0]["name"])
+
+    def test_a_new_claude_route_is_pinned_to_the_wire_it_serves(self) -> None:
+        """A key provider's Claude route starts pinned to Messages.
+
+        A relay channel that mounts Messages refuses the Responses shape for a
+        Claude model, so a route left on ``fallback`` first pays that refusal on
+        every request before the alternate surface is tried.  The mode therefore
+        follows the route's own surface for a plain-key provider, while a route
+        the user already decided keeps its choice.
+        """
+
+        directory, domain = self._domain()
+        with directory:
+            provider_id = domain.dispatch(
+                "provider.add",
+                {
+                    "provider": {
+                        "name": "Claude Channel",
+                        "api_base": "https://api.example.test/v1",
+                        "create_default_api_key": True,
+                    }
+                },
+            )["providers"][0]["id"]
+
+            snapshot = domain.dispatch(
+                "model.add",
+                {
+                    "provider_id": provider_id,
+                    "model": {
+                        "name": "claude-opus-5-5",
+                        "upstream_model": "anthropic/claude-opus-5-5",
+                        "enabled": True,
+                        "order": 0,
+                    },
+                },
+            )
+            claude_route = snapshot["providers"][0]["models"][0]
+            self.assertEqual("anthropic", claude_route["upstream_url_surface"])
+            self.assertEqual("fixed", claude_route["upstream_protocol_mode"])
+
+            # A non-Claude route on the same provider still follows the client.
+            snapshot = domain.dispatch(
+                "model.add",
+                {
+                    "provider_id": provider_id,
+                    "model": {
+                        "name": "gpt-compatible",
+                        "upstream_model": "openai/gpt-5",
+                        "enabled": True,
+                        "order": 1,
+                    },
+                },
+            )
+            models = {
+                model["model_name"]: model
+                for model in snapshot["providers"][0]["models"]
+            }
+            self.assertEqual("fallback", models["gpt-compatible"]["upstream_protocol_mode"])
+            self.assertEqual("fixed", models["claude-opus-5-5"]["upstream_protocol_mode"])
+
+            # The user's own choice survives every later edit of the group.
+            claude_id = models["claude-opus-5-5"]["editor_id"]
+            domain.dispatch(
+                "model.patch",
+                {
+                    "provider_id": provider_id,
+                    "model_id": claude_id,
+                    "changes": {"upstream_protocol_mode": "fallback"},
+                },
+            )
+            snapshot = domain.dispatch(
+                "model.add",
+                {
+                    "provider_id": provider_id,
+                    "model": {
+                        "name": "another-claude",
+                        "upstream_model": "anthropic/claude-sonnet-4-5",
+                        "enabled": True,
+                        "order": 2,
+                    },
+                },
+            )
+            models = {
+                model["model_name"]: model
+                for model in snapshot["providers"][0]["models"]
+            }
+            self.assertEqual("fallback", models["claude-opus-5-5"]["upstream_protocol_mode"])
+            self.assertEqual("fixed", models["another-claude"]["upstream_protocol_mode"])
 
 
 if __name__ == "__main__":

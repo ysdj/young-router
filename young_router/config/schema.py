@@ -92,6 +92,14 @@ MENU_API_KEY_NAME_KEY = "api_key_name"
 MENU_RELAY_KEYS_KEY = "x-young-router-relay-keys"
 MENU_RELAY_KEYS_VERSION = 1
 MENU_PROVIDER_KEY_ID_KEY = "x-young-router-provider-key-id"
+#: The route row one credential-scoped entry belongs to.
+#:
+#: An account-backed provider writes one entry per credential (see
+#: ``config.api._credential_scopes``), which is one *deployment* per account and
+#: key — not one model per row.  The entry therefore records the id of the model
+#: row it was written for, so reading the file back folds every credential's
+#: entry into that one row instead of appending a new row on each save.
+MENU_CREDENTIAL_ROUTE_KEY = "x-young-router-credential-route"
 MENU_RELAY_CATALOG_MODE_KEY = "x-young-router-relay-catalog-mode"
 MENU_RELAY_SOURCE_MODEL_KEY = "x-young-router-relay-source-model"
 # A route the user left with no key of its own (the pane's “未定义密钥”) records that
@@ -125,6 +133,17 @@ PROVIDER_AUTH_KINDS = {
     "workbuddy_login",
     "workbuddy_global_login",
     "our_free_model_login",
+}
+
+#: The public address a login-backed provider's own service answers at.
+#:
+#: An account-backed row stores no base of its own: its adapter owns the
+#: address a route is sent to.  The user's custom keys on that same row are a
+#: different credential, and they speak the plain wire at the service's public
+#: address — one table, so the config writer and Core's own key reads cannot
+#: disagree about where those keys are pointed.
+SERVICE_LOGIN_BASE_URLS = {
+    "openai_login": "https://api.openai.com/v1",
 }
 
 #: Provider authentication kinds this build no longer writes, mapped to the one
@@ -424,10 +443,14 @@ def _provider_auth(value: Any, *, required: bool = False) -> dict[str, str]:
     kind = RETIRED_PROVIDER_AUTH_KINDS.get(stored, stored) if isinstance(stored, str) else stored
     if not isinstance(kind, str) or kind not in PROVIDER_AUTH_KINDS:
         raise ValueError("Provider authentication is invalid")
+    # A login-backed provider is a *service*, and its accounts are listed beside
+    # this record: a row that exists before its first sign-in — or after the last
+    # account is removed — states the kind and no credential, which is a provider
+    # that currently serves no account rather than a malformed one.
     credential_ref = _menu_metadata_text(
         value.get("credential_ref"),
         "Provider credential reference",
-        required=kind != "api_key",
+        required=False,
     )
     if kind == "api_key":
         if credential_ref:
@@ -520,6 +543,31 @@ def infer_upstream_fallback_surface(value: Any) -> str:
     # OpenAI-compatible relay answers, and a fallback is only consulted after the
     # upstream refused the protocol the client used.
     return "openai/chat"
+
+
+def default_upstream_protocol_mode(surface: Any) -> str:
+    """The protocol mode a route starts with, decided by its own surface.
+
+    A route whose surface is the Anthropic Messages wire starts *pinned* to it.
+    Claude models are reached through relay channels that mount Messages and
+    refuse the Responses shape: one station answered every ``/responses`` call
+    for a Claude model with HTTP 400 "Claude Code <v> does not support this
+    model", while the same bytes on ``/messages`` answered normally.  Left on
+    ``fallback``, every request first pays that refused round trip before the
+    alternate surface is tried, so the wire the route can actually serve is the
+    one it must start on.
+
+    A route that has *chosen* a mode keeps it: the pane offers 协议方式 on every
+    route, and re-deciding for the user would discard the field he came to edit.
+    """
+
+    return "fixed" if _string_value(surface).strip() == "anthropic" else "fallback"
+
+
+def inferred_upstream_protocol_mode(value: Any) -> str:
+    """The protocol mode for a route that states none of its own."""
+
+    return default_upstream_protocol_mode(infer_upstream_fallback_surface(value))
 
 
 # LiteLLM adapter prefixes this app does not manage.  The first segment of a

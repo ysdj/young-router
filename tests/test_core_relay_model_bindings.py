@@ -1432,6 +1432,99 @@ model_list:
                 reloaded._draft["providers"][0]["models"][0]["api_base"],
             )
 
+    def test_dependency_policy_releases_the_routes_a_slot_id_no_longer_names(self) -> None:
+        """A route the pane shows on a retired key goes with that key.
+
+        The pane resolves a route's key by its slot id and then by the key name
+        the row carries, because a renamed provider re-derives the ids of slots
+        the document never named while the rows keep the ids they were written
+        with.  The policies read only the slot id, so the key and its models were
+        one deletion for the user and two different ones here: the route stayed
+        behind, still naming a key the station no longer served.  A slot id that
+        still resolves stays the binding, and a route that names no key at all
+        follows the provider's default key, so neither is retired with one key.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            domain = ProvidersModelsDomain(Path(directory) / "config.yaml")
+            source = relay_source()
+            domain.stage_relay_import([source])
+            domain.materialize_relay_bindings(
+                {"resources": [{**source, "api_key": "replace-materialized-credential"}]}
+            )
+            provider = domain._draft["providers"][0]
+            slot = domain._provider_api_keys(provider)[0]
+            provider["api_keys"].append(
+                {
+                    "id": "provider-slot-kept",
+                    "name": "kept",
+                    "value": "sk-replace-kept",
+                    "source": {"kind": "independent"},
+                }
+            )
+            # The relay-bound row keeps only the name its slot had before a
+            # rename re-derived the slot id it was written with.
+            stale = provider["models"][0]
+            stale["provider_key_id"] = "provider-slot-derived-before-rename"
+            stale["api_key_name"] = slot["name"]
+            provider["models"].extend(
+                [
+                    {
+                        **stale,
+                        "model_name": "kept-chat",
+                        "deployment_id": "kept0001",
+                        "provider_key_id": "provider-slot-kept",
+                        "api_key_name": slot["name"],
+                    },
+                    {
+                        **stale,
+                        "model_name": "default-chat",
+                        "deployment_id": "defa0001",
+                        "provider_key_id": "",
+                        "api_key_name": "",
+                    },
+                ]
+            )
+
+            deleted = domain.apply_relay_dependency_policy(
+                [
+                    {
+                        "station_id": "station-a",
+                        "account_id": "account-a",
+                        "resource_id": "resource-a",
+                    }
+                ],
+                "delete",
+            )
+            self.assertEqual([], deleted["issues"])
+            self.assertEqual(1, deleted["deleted_models"])
+            self.assertEqual(
+                ["kept-chat", "default-chat"],
+                [model["model_name"] for model in domain.snapshot()["providers"][0]["models"]],
+            )
+
+            # 释放为已停用的独立模型 follows the same rows: the manual delete
+            # must not leave a name-bound route still naming the removed key.
+            disabled = ProvidersModelsDomain(Path(directory) / "disabled.yaml")
+            disabled.stage_relay_import([source])
+            disabled.materialize_relay_bindings(
+                {"resources": [{**source, "api_key": "replace-materialized-credential"}]}
+            )
+            row = disabled._draft["providers"][0]["models"][0]
+            row["provider_key_id"] = "provider-slot-derived-before-rename"
+            row["api_key_name"] = disabled._provider_api_keys(
+                disabled._draft["providers"][0]
+            )[0]["name"]
+            released = disabled.apply_relay_dependency_policy(
+                [source],
+                "detach_disabled",
+            )
+            self.assertEqual([], released["issues"])
+            self.assertEqual(1, released["disabled_detached_models"])
+            released_row = disabled.snapshot()["providers"][0]["models"][0]
+            self.assertEqual("", released_row["provider_key_id"])
+            self.assertEqual("credential_required", released_row["binding_health"]["status"])
+
     def test_dependency_policy_detaches_or_disables_without_reusing_relay_key(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             domain = ProvidersModelsDomain(Path(directory) / "config.yaml")

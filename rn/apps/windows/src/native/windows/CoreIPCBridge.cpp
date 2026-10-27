@@ -43,6 +43,14 @@ std::string WideToUtf8(std::wstring const& value) {
   return result;
 }
 
+// TEMPORARY DIAGNOSTIC: trace Core startup and IPC results.
+void DebugTrace(std::string const& message) {
+  static std::mutex trace_mutex;
+  std::lock_guard guard(trace_mutex);
+  std::ofstream stream("C:\\Users\\Public\\young-router-core-trace.log", std::ios::app);
+  if (stream) stream << message << '\n';
+}
+
 std::wstring Quote(std::wstring const& value) {
   std::wstring escaped = value;
   size_t offset = 0;
@@ -134,6 +142,107 @@ bool IsExecutableFile(std::wstring const& path) {
   return attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+bool CreateJunction(std::wstring const& target, std::wstring const& source) {
+  if (GetFileAttributesW(target.c_str()) != INVALID_FILE_ATTRIBUTES) return true;
+  std::wstring command = L"cmd.exe /d /c mklink /J " + Quote(target) + L" " + Quote(source);
+  std::vector<wchar_t> mutable_command(command.begin(), command.end());
+  mutable_command.push_back(L'\0');
+  STARTUPINFOW startup{};
+  startup.cb = sizeof(startup);
+  PROCESS_INFORMATION process{};
+  if (!CreateProcessW(nullptr, mutable_command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+      nullptr, nullptr, &startup, &process)) return false;
+  CloseHandle(process.hThread);
+  WaitForSingleObject(process.hProcess, 5000);
+  DWORD exit_code = 1;
+  GetExitCodeProcess(process.hProcess, &exit_code);
+  CloseHandle(process.hProcess);
+  return exit_code == 0 && GetFileAttributesW(target.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+std::wstring PackagePythonRuntime(std::wstring const& core_directory, std::wstring const& python) {
+  // A full-trust process in an MSIX package cannot reliably launch a child
+  // executable directly from WindowsApps. Keep the large Core tree packaged,
+  // but launch the small Python loader from a writable per-user cache.
+  if (python.find(L"\\WindowsApps\\") == std::wstring::npos) return python;
+
+  wchar_t root[MAX_PATH]{ };
+  DWORD length = GetTempPathW(static_cast<DWORD>(std::size(root)), root);
+  if (length == 0 || length >= std::size(root)) return python;
+  std::wstring cache(root, length);
+  cache += L"YoungRouter\\python-runtime-v4";
+  if (!CreateDirectoryW((std::wstring(root, length) + L"YoungRouter").c_str(), nullptr) &&
+      GetLastError() != ERROR_ALREADY_EXISTS) {
+    return python;
+  }
+  if (IsExecutableFile(cache + L"\\python.exe") &&
+      IsExecutableFile(cache + L"\\.ready") &&
+      IsExecutableFile(cache + L"\\Lib\\site-packages\\litellm\\__init__.py")) {
+    return cache + L"\\python.exe";
+  }
+  // An interrupted copy can leave a partial Lib tree that cannot be repaired
+  // by copying over the read-only package files. Build the cache in a fresh
+  // directory, then publish it only after every runtime file is present.
+  std::wstring failed = cache + L".failed";
+  std::error_code error;
+  std::filesystem::remove_all(failed, error);
+  error.clear();
+  std::filesystem::rename(cache, failed, error);
+  if (error) {
+    CreateDirectoryW(failed.c_str(), nullptr);
+    for (auto const* entry : {L"python.exe", L"python3.dll", L"python312.dll", L"vcruntime140.dll",
+                              L"vcruntime140_1.dll", L"DLLs", L"Lib", L"libs", L"tcl"}) {
+      std::filesystem::rename(cache + L"\\" + entry, failed + L"\\" + entry, error);
+      error.clear();
+    }
+  }
+  if (!CreateDirectoryW(cache.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
+    std::filesystem::remove_all(failed, error);
+    return python;
+  }
+
+  std::wstring source = core_directory + L"\\runtime\\bin\\";
+  for (auto const* name : {L"python.exe", L"python3.dll", L"python312.dll", L"vcruntime140.dll", L"vcruntime140_1.dll"}) {
+    if (!CopyFileW((source + name).c_str(), (cache + L"\\" + name).c_str(), FALSE)) return python;
+  }
+  std::wstring robocopy = L"C:\\Windows\\System32\\robocopy.exe";
+  for (auto const* directory : {L"DLLs", L"Lib"}) {
+    std::wstring command = Quote(robocopy) + L" " + Quote(source + directory) + L" " +
+        Quote(cache + L"\\" + directory) + L" /E /MT:8 /NFL /NDL /NJH /NJS /NP /R:0 /W:0";
+    std::vector<wchar_t> mutable_command(command.begin(), command.end());
+    mutable_command.push_back(L'\0');
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    if (!CreateProcessW(nullptr, mutable_command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+        nullptr, nullptr, &startup, &process)) return python;
+    CloseHandle(process.hThread);
+    WaitForSingleObject(process.hProcess, INFINITE);
+    DWORD exit_code = 1;
+    GetExitCodeProcess(process.hProcess, &exit_code);
+    CloseHandle(process.hProcess);
+    if (exit_code > 7) {
+      std::filesystem::remove_all(failed, error);
+      return python;
+    }
+  }
+  for (auto const* directory : {L"libs", L"tcl"}) {
+    if (!CreateJunction(cache + L"\\" + directory, source + directory)) {
+      std::filesystem::remove_all(failed, error);
+      return python;
+    }
+  }
+  HANDLE ready = CreateFileW((cache + L"\\.ready").c_str(), GENERIC_WRITE, 0, nullptr,
+      CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (ready == INVALID_HANDLE_VALUE) {
+    std::filesystem::remove_all(failed, error);
+    return python;
+  }
+  CloseHandle(ready);
+  std::filesystem::remove_all(failed, error);
+  return cache + L"\\python.exe";
+}
+
 bool IsEnvironmentName(std::wstring_view entry, std::wstring_view name) {
   if (entry.size() <= name.size() || entry[name.size()] != L'=') return false;
   for (size_t index = 0; index < name.size(); ++index) {
@@ -142,19 +251,24 @@ bool IsEnvironmentName(std::wstring_view entry, std::wstring_view name) {
   return true;
 }
 
-std::vector<wchar_t> ChildEnvironment(std::wstring const& core_directory) {
+std::vector<wchar_t> ChildEnvironment(std::wstring const& core_directory, std::wstring const& python_home, HANDLE parent_handle) {
   LPWCH source = GetEnvironmentStringsW();
   if (!source) throw std::runtime_error("core unavailable");
   std::vector<std::wstring> entries;
   for (LPCWCH current = source; *current != L'\0'; current += wcslen(current) + 1) {
     std::wstring entry(current);
-    if (!IsEnvironmentName(entry, L"PYTHONPATH") && !IsEnvironmentName(entry, L"LITELLM_BIN")) {
+    if (!IsEnvironmentName(entry, L"PYTHONPATH") && !IsEnvironmentName(entry, L"LITELLM_BIN") &&
+        !IsEnvironmentName(entry, L"YOUNG_ROUTER_PARENT_HANDLE")) {
       entries.push_back(std::move(entry));
     }
   }
   FreeEnvironmentStringsW(source);
+  entries.push_back(L"PYTHONHOME=" + python_home);
   entries.push_back(L"PYTHONPATH=" + core_directory);
   entries.push_back(L"LITELLM_BIN=" + core_directory + L"\\runtime\\bin\\litellm.cmd");
+  wchar_t handle_value[32]{};
+  swprintf_s(handle_value, L"%llx", reinterpret_cast<unsigned long long>(parent_handle));
+  entries.push_back(L"YOUNG_ROUTER_PARENT_HANDLE=" + std::wstring(handle_value));
   std::sort(entries.begin(), entries.end(), [](std::wstring const& left, std::wstring const& right) {
     return _wcsicmp(left.c_str(), right.c_str()) < 0;
   });
@@ -281,6 +395,7 @@ void CoreIPCBridge::RemoveEventHandler(int token) {
 }
 
 std::string CoreIPCBridge::Send(std::string const& request_json) {
+  DebugTrace("Send enter method=" + RequestMethod(request_json) + " bytes=" + std::to_string(request_json.size()));
   if (stopping_) throw std::runtime_error("core unavailable");
   const std::string method = RequestMethod(request_json);
   const bool is_subscription = method == "subscribe";
@@ -319,8 +434,14 @@ std::string CoreIPCBridge::Send(std::string const& request_json) {
         recover_subscription = !is_subscription && !subscription_request_.empty() && subscription_id_.empty();
       }
       if (recover_subscription) RecoverSubscription();
+      DebugTrace("Send ok method=" + method + " status=" + std::to_string(result.status) + " bytes=" + std::to_string(result.body.size()));
       return result.body;
+    } catch (std::exception const& error) {
+      DebugTrace("Send fail method=" + method + " attempt=" + std::to_string(attempt) + " what=" + error.what());
+      InvalidateCoreIfGeneration(generation, true);
+      if (attempt != 0) throw;
     } catch (...) {
+      DebugTrace("Send fail method=" + method + " attempt=" + std::to_string(attempt) + " unknown");
       InvalidateCoreIfGeneration(generation, true);
       if (attempt != 0) throw;
     }
@@ -677,6 +798,7 @@ std::optional<CoreIPCBridge::HttpResult> CoreIPCBridge::HostRequest(
 }
 
 CoreIPCBridge::Session CoreIPCBridge::EnsureSession() {
+  DebugTrace("EnsureSession enter");
   if (stopping_) throw std::runtime_error("core unavailable");
   auto hello_expiry = [](CoreIPCBridge::HttpResult const& hello) -> double {
     if (hello.status != 200 || hello.session.empty()) throw std::runtime_error("core unavailable");
@@ -684,6 +806,7 @@ CoreIPCBridge::Session CoreIPCBridge::EnsureSession() {
     auto session = envelope.GetNamedObject(L"session", nullptr);
     auto expires_in = session ? session.GetNamedNumber(L"expires_in", 0) : 0;
     if (!envelope.GetNamedBoolean(L"ok", false) || expires_in <= 0 || expires_in > 86400) {
+      DebugTrace("hello expiry rejected expires_in=" + std::to_string(expires_in));
       throw std::runtime_error("core unavailable");
     }
     return expires_in;
@@ -757,9 +880,12 @@ CoreIPCBridge::Session CoreIPCBridge::EnsureSession() {
 
   Endpoint endpoint;
   try {
+    DebugTrace("EnsureSession starting core");
     endpoint = StartCoreLocked();
+    DebugTrace("EnsureSession core started port=" + std::to_string(endpoint.port));
     hello_registered = true;
-  } catch (...) {
+  } catch (std::exception const& error) {
+    DebugTrace(std::string("EnsureSession StartCore failed what=") + error.what());
     establishing_session_ = false;
     session_error_ = std::current_exception();
     session_condition_.notify_all();
@@ -769,7 +895,9 @@ CoreIPCBridge::Session CoreIPCBridge::EnsureSession() {
   lock.unlock();
 
   try {
+    DebugTrace("EnsureSession sending hello");
     auto hello = Request(endpoint, L"hello", L"POST", "", endpoint.bootstrap_token);
+    DebugTrace("EnsureSession hello status=" + std::to_string(hello.status) + " bytes=" + std::to_string(hello.body.size()) + " session=" + std::to_string(hello.session.size()));
     auto expires_in = hello_expiry(hello);
     lock.lock();
     if (core_generation_ != attempt_generation) {
@@ -808,8 +936,12 @@ CoreIPCBridge::Endpoint CoreIPCBridge::StartCoreLocked() {
   std::wstring descriptor = directory + L"\\endpoint.json";
   std::wstring core_directory = ExecutableDirectory() + L"\\Core";
   std::wstring python = Environment(L"YOUNG_ROUTER_CORE_PYTHON");
-  if (python.empty()) python = core_directory + L"\\runtime\\bin\\python.exe";
+  if (python.empty()) {
+    python = PackagePythonRuntime(core_directory, core_directory + L"\\runtime\\bin\\python.exe");
+  }
+  DebugTrace("StartCore python=" + WideToUtf8(python) + " core=" + WideToUtf8(core_directory));
   if (!IsExecutableFile(python) || !HasRequiredCoreFiles(core_directory)) {
+    DebugTrace("StartCore missing python or core files");
     RemoveDirectoryW(directory.c_str());
     throw std::runtime_error("core unavailable");
   }
@@ -825,14 +957,31 @@ CoreIPCBridge::Endpoint CoreIPCBridge::StartCoreLocked() {
   STARTUPINFOW startup{};
   startup.cb = sizeof(startup);
   PROCESS_INFORMATION process{};
-  std::vector<wchar_t> environment = ChildEnvironment(core_directory);
-  BOOL created = CreateProcessW(nullptr, mutable_command.data(), nullptr, nullptr, FALSE,
-      CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
-      environment.data(), core_directory.c_str(), &startup, &process);
-  if (!created) {
+  // The copied runtime owns its DLLs and stdlib. Point Python at that writable
+  // cache so imports never resolve native extensions from WindowsApps.
+  std::wstring python_home = core_directory + L"\\runtime\\bin";
+  auto python_separator = python.find_last_of(L"\\/");
+  if (python_separator != std::wstring::npos && python.find(L"\\WindowsApps\\") == std::wstring::npos) {
+    python_home = python.substr(0, python_separator);
+  }
+  HANDLE parent_handle = nullptr;
+  if (!DuplicateHandle(GetCurrentProcess(), GetCurrentProcess(), GetCurrentProcess(), &parent_handle,
+      SYNCHRONIZE, TRUE, 0)) {
     RemoveDirectoryW(directory.c_str());
     throw std::runtime_error("core unavailable");
   }
+  std::vector<wchar_t> environment = ChildEnvironment(core_directory, python_home, parent_handle);
+  DebugTrace("StartCore CreateProcess cmd=" + WideToUtf8(command));
+  BOOL created = CreateProcessW(nullptr, mutable_command.data(), nullptr, nullptr, TRUE,
+      CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+      environment.data(), core_directory.c_str(), &startup, &process);
+  CloseHandle(parent_handle);
+  if (!created) {
+    DebugTrace("StartCore CreateProcessW failed error=" + std::to_string(GetLastError()));
+    RemoveDirectoryW(directory.c_str());
+    throw std::runtime_error("core unavailable");
+  }
+  DebugTrace("StartCore CreateProcessW pid=" + std::to_string(process.dwProcessId));
   CloseHandle(process.hThread);
 
   for (int attempt = 0; attempt < 100; ++attempt) {
@@ -857,6 +1006,10 @@ CoreIPCBridge::Endpoint CoreIPCBridge::StartCoreLocked() {
       }
     }
     Sleep(50);
+  }
+  DWORD core_exit = 0;
+  if (GetExitCodeProcess(process.hProcess, &core_exit)) {
+    DebugTrace("StartCore endpoint timeout; core exit=" + std::to_string(core_exit));
   }
   StopCoreProcess(process.hProcess, directory);
   throw std::runtime_error("core unavailable");
@@ -982,8 +1135,20 @@ void CoreIPCBridge::PollEvents(std::string subscription) {
         continue;
       }
       auto outer = winrt::Windows::Data::Json::JsonObject::Parse(Utf8ToWide(result.body));
-      // A missing/null event is the expected quiet heartbeat.
-      auto event = outer.GetNamedObject(L"event", nullptr);
+      // A missing/null event is the expected quiet heartbeat.  A JSON null is
+      // a present value, so ``GetNamedObject`` throws E_ILLEGAL_METHOD_CALL
+      // instead of answering the default: every heartbeat poll (Core answers
+      // one every 20 s) looked like a dead Core and tore the whole session
+      // down. Only an actual object is an event.
+      winrt::Windows::Data::Json::JsonObject event{nullptr};
+      try {
+        auto value = outer.GetNamedValue(L"event");
+        if (value.ValueType() == winrt::Windows::Data::Json::JsonValueType::Object) {
+          event = value.GetObject();
+        }
+      } catch (...) {
+        // No event key at all, or a value shaped unlike one: nothing to emit.
+      }
       std::vector<std::function<void(std::string const&)>> handlers;
       {
         std::lock_guard guard(mutex_);

@@ -408,6 +408,11 @@ void WinUI3NativeLeaf::Initialize(winrt::Microsoft::UI::Xaml::Window const& wind
 }
 
 void WinUI3NativeLeaf::Initialize(HWND window_handle) {
+  // GetActiveWindow answers nothing while the host is still starting, and the
+  // module initializes after the app has already handed over the real
+  // window: a null handle here must not erase it, or every route opens into
+  // a window that is never titled, sized, or shown.
+  if (window_handle == nullptr && window_handle_ != nullptr) return;
   window_handle_ = window_handle;
   DisableWindowTransitions(window_handle_);
   InstallWindowHook();
@@ -462,6 +467,7 @@ void WinUI3NativeLeaf::SetLocalization(std::map<std::string, std::wstring> strin
 }
 
 void WinUI3NativeLeaf::SetActionHandler(std::function<void(std::string const&)> handler) {
+  { std::ofstream t("C:\\Users\\Public\\young-router-route.log", std::ios::app); if (t) t << "SetActionHandler pending=" << pending_actions_.size() << "\n"; }
   std::vector<std::string> pending;
   {
     std::lock_guard guard(action_mutex_);
@@ -472,6 +478,7 @@ void WinUI3NativeLeaf::SetActionHandler(std::function<void(std::string const&)> 
 }
 
 void WinUI3NativeLeaf::DispatchAction(std::string const& action) {
+  { std::ofstream t("C:\\Users\\Public\\young-router-route.log", std::ios::app); if (t) t << "Dispatch " << action << " hasHandler=" << (action_handler_ ? 1 : 0) << "\n"; }
   std::function<void(std::string const&)> handler;
   {
     std::lock_guard guard(action_mutex_);
@@ -511,7 +518,7 @@ bool WinUI3NativeLeaf::HandleWindowMessage(UINT message, WPARAM wparam, LPARAM l
   return false;
 }
 
-void WinUI3NativeLeaf::OpenRoute(std::wstring_view route) {
+void WinUI3NativeLeaf::OpenRoute(std::wstring_view route) { { std::ofstream trace("C:\\Users\\Public\\young-router-route.log", std::ios::app); if (trace) trace << "OpenRoute " << winrt::to_string(route) << " prev=" << winrt::to_string(active_route_) << " hwnd=" << (void*)window_handle_ << "\n"; } auto const previous_route = active_route_;
   active_route_ = route;
   if (route == L"home") {
     // "home" leaves the settings shell for the tray, mirroring the macOS
@@ -534,6 +541,13 @@ void WinUI3NativeLeaf::OpenRoute(std::wstring_view route) {
     }
     if (IsIconic(window_handle_)) ShowWindow(window_handle_, SW_RESTORE);
     SetForegroundWindow(window_handle_);
+  }
+  // Windows hosts one React root for every route: opening a window only sets
+  // the native title and geometry, so the shared route has to be told which
+  // surface to mount.  Dispatch once per actual change, after the window is
+  // active, so a focus call on the route already shown cannot loop.
+  if (previous_route != route) {
+    DispatchAction("open-" + WideToUtf8(std::wstring(route)));
   }
 }
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import hashlib
 import json
 import os
 import pathlib
@@ -20,6 +21,8 @@ from .load import (
 from .schema import (
     CONFIG_YAML,
     DISABLED_MODELS_KEY,
+    MENU_CREDENTIAL_ROUTE_KEY,
+    SERVICE_LOGIN_BASE_URLS,
     _as_dict,
     _as_list,
     _assert_expected_revision,
@@ -122,6 +125,142 @@ def _router_settings_restated(
     return (restated if restated is not settings else None), dropped
 
 
+def _login_provider_credentials(provider: dict[str, Any]) -> list[dict[str, Any]]:
+    """The credentials one login-backed provider offers, accounts first.
+
+    An account (a ChatGPT sign-in) and a custom key are peers of the same
+    provider: both are credentials of the service, both serve its routes, and
+    neither is a provider of its own.
+    """
+
+    credentials: list[dict[str, Any]] = []
+    accounts = provider.get("auth_accounts")
+    if not isinstance(accounts, list):
+        accounts = []
+    for entry in accounts:
+        if not isinstance(entry, dict):
+            continue
+        ref = str(entry.get("ref", "") or "").strip()
+        if not ref or entry.get("enabled") is False:
+            continue
+        credentials.append({"kind": "account", "id": ref, "ref": ref})
+    if not accounts:
+        # A document written by an older build names one account and no list;
+        # an editor record always carries the list, so the fallback is keyed on
+        # the list being absent, not on it happening to hold no entries yet.
+        legacy = str(provider.get("auth_credential_ref", "") or "").strip()
+        if legacy:
+            credentials.append({"kind": "account", "id": legacy, "ref": legacy})
+    keys = provider.get("api_keys")
+    if isinstance(keys, list):
+        for entry in keys:
+            if not isinstance(entry, dict):
+                continue
+            key_id = str(entry.get("id", "") or "").strip()
+            value = str(entry.get("value", "") or "").strip()
+            if not key_id or not value:
+                continue
+            credentials.append({"kind": "key", "id": key_id, "name": str(entry.get("name", "") or "").strip()})
+    return credentials
+
+
+def _credential_scopes(provider: dict[str, Any]) -> list[tuple[dict[str, Any], str]]:
+    """``(provider copy, credential id)`` pairs to write routes for.
+
+    A provider that is not account-backed states one credential, so it scopes to
+    itself and keeps its routes exactly as they were.  A login-backed provider
+    scopes once per credential, and each scope is written as the provider that
+    credential really is: an account speaks the adapter's protocol, a custom key
+    speaks the plain one against the provider's own address.
+    """
+
+    if str(provider.get("auth_kind", "") or "") != "openai_login":
+        return [(provider, "")]
+    credentials = _login_provider_credentials(provider)
+    if not credentials:
+        return []
+    scopes: list[tuple[dict[str, Any], str]] = []
+    for credential in credentials:
+        if credential["kind"] == "account":
+            # The account scope states its own reference: the provider's
+            # top-level one mirrors only the first account, so relying on it
+            # would write every account's route with the first account's
+            # credential.
+            scopes.append(
+                (
+                    {
+                        **provider,
+                        "auth_kind": "openai_login",
+                        "auth_credential_ref": credential["ref"],
+                        "api_keys": [],
+                    },
+                    credential["id"],
+                )
+            )
+            continue
+        key = next(
+            (entry for entry in provider.get("api_keys", []) if isinstance(entry, dict) and str(entry.get("id", "")).strip() == credential["id"]),
+            None,
+        )
+        scopes.append(
+            (
+                {
+                    **provider,
+                    # A key route authenticates the way any key provider does:
+                    # plain OpenAI transport at the provider's own address.
+                    "auth_kind": "api_key",
+                    "auth_credential_ref": "",
+                    "extra": {
+                        key_name: value
+                        for key_name, value in (provider.get("extra") or {}).items()
+                        if key_name != "x-young-router-provider-auth"
+                    },
+                    "api_base": str(provider.get("api_base", "") or "").strip()
+                    or SERVICE_LOGIN_BASE_URLS.get(str(provider.get("auth_kind", "") or ""), ""),
+                    "api_keys": [key] if key else [],
+                },
+                credential["id"],
+            )
+        )
+    return scopes
+
+
+def _row_deployment_id(model: dict[str, Any]) -> str:
+    """The row identity one model keeps, whatever number of credentials serve it.
+
+    Read from the model's own deployment id, and left empty while the row has
+    none: ``config.dump`` mints one for a row that states none, and a
+    credential route cannot know that id before the row has it.  An empty
+    marker means "this entry is its own row", which is exactly what a first
+    save writes.
+    """
+
+    value = str(model.get("deployment_id", "") or "").strip().lower()
+    return value
+
+
+def _credential_deployment_id(model: dict[str, Any], credential_id: str) -> str:
+    """A route id that is stable for one model on one credential.
+
+    Written into the document on every save, so the routes table keeps the same
+    identity for the same account-and-model across reloads; derived rather than
+    random because a credential route has no record of its own to store it in.
+    It is derived from the *row* the model belongs to, so one model's rows do
+    not change identity when the credential serving them does.
+    """
+
+    seed = "\x1f".join(
+        [
+            "young-router-credential-route-v2",
+            _row_deployment_id(model),
+            str(model.get("model_name", "") or "").strip(),
+            str(model.get("litellm_model", "") or "").strip(),
+            credential_id,
+        ]
+    )
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:8]
+
+
 def save_config(
     providers: list[dict[str, Any]],
     path: pathlib.Path = CONFIG_YAML,
@@ -169,18 +308,51 @@ def save_config(
             model_dict = _as_dict(model)
             model_enabled = _bool_value(model_dict.get("model_enabled"), _bool_value(model_dict.get("enabled"), True))
             effective_enabled = provider_enabled and model_enabled
-            enabled, entry = _entry_from_editor(
-                model_dict,
-                provider,
-                model_index,
-                use_provider_aliases=effective_enabled,
-                effective_enabled=effective_enabled,
-                seen_deployment_ids=seen_deployment_ids,
-            )
-            if enabled:
-                active_entries.append(entry)
-            else:
-                disabled_entries.append(entry)
+            # One route per credential, like a station's keys: an account and a
+            # custom key are peers of the same provider, and each answers with a
+            # deployment of its own so the router spreads requests across them
+            # and a single one can be ordered or taken out.
+            scopes = _credential_scopes(provider)
+            if not scopes:
+                # A login-backed row with no account and no key serves nothing:
+                # its routes are not written at all, which is what "signed out"
+                # means for a service.  Writing them would hand the router a
+                # deployment that cannot authenticate.
+                continue
+            for scoped, credential_id in scopes:
+                scoped_model = model_dict
+                if credential_id:
+                    scoped_model = {
+                        **model_dict,
+                        # The credential an entry answers with is the scope's, not
+                        # the one the row last carried: a row that inherited its
+                        # account's reference would otherwise hand that reference
+                        # to the custom key's route as well, and one key would
+                        # answer with another credential.
+                        "api_key": "",
+                        # Keyed by the row this entry belongs to, not by the row's
+                        # own last write: a credential route's deployment id is
+                        # derived from the *row* id, so one model keeps one row
+                        # identity however many credentials serve it.
+                        MENU_CREDENTIAL_ROUTE_KEY: _row_deployment_id(model_dict),
+                        "deployment_id": _credential_deployment_id(model_dict, credential_id),
+                    }
+                enabled, entry = _entry_from_editor(
+                    scoped_model,
+                    scoped,
+                    model_index,
+                    # The provider's anchor exists only for the address the
+                    # provider section itself wrote; a credential scope that
+                    # states its own address writes it out in full.
+                    use_provider_aliases=effective_enabled
+                    and scoped.get("api_base") == provider.get("api_base"),
+                    effective_enabled=effective_enabled,
+                    seen_deployment_ids=seen_deployment_ids,
+                )
+                if enabled:
+                    active_entries.append(entry)
+                else:
+                    disabled_entries.append(entry)
 
     _assert_unique_deployment_ids(active_entries + disabled_entries)
 

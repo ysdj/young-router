@@ -309,6 +309,40 @@ print('young-router-veridrop-import-ok')
   }
   & pnpm @RunWindowsArgs
 
+  $WindowsRelease = Join-Path $AppRoot "windows\$WindowsArch\Release"
+  $PackagePayload = Join-Path $AppRoot "windows\YoungRouter.Package\bin\$WindowsArch\Release\YoungRouter"
+  New-Item -ItemType Directory -Force -Path $PackagePayload | Out-Null
+  Copy-Item -Path (Join-Path $WindowsRelease "*") -Destination $PackagePayload -Recurse -Force
+  Remove-Item -LiteralPath (Join-Path $PackagePayload "Bundle\Bundle") -Recurse -Force -ErrorAction SilentlyContinue
+
+  # The WinUI host links Windows App SDK and can fail before WinMain when a
+  # user double-clicks the unpackaged build-output EXE on ARM64. Keep the
+  # packaged host produced above, then replace only that convenient raw-output
+  # path with a tiny launcher that hands off to the installed MSIX.
+  $LauncherSource = Join-Path $AppRoot "windows\YoungRouter\YoungRouterLauncher.cpp"
+  $LauncherOutput = Join-Path $WindowsRelease "YoungRouter.exe"
+  if (-not (Test-Path $LauncherSource) -or -not (Test-Path (Split-Path $LauncherOutput))) {
+    throw "Windows launcher source or Release output directory is missing."
+  }
+  $VsWhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+  if (-not (Test-Path $VsWhere)) {
+    throw "Visual Studio vswhere.exe is required to compile the Windows launcher."
+  }
+  $VsInstallPath = (& $VsWhere -latest -products * -property installationPath).Trim()
+  if ([string]::IsNullOrWhiteSpace($VsInstallPath)) {
+    throw "Could not locate a Visual Studio installation for the Windows launcher."
+  }
+  $VcVarsArch = if ($WindowsArch -eq "ARM64") { "arm64" } else { "x64" }
+  $VcVars = Join-Path $VsInstallPath "VC\Auxiliary\Build\vcvarsall.bat"
+  $LauncherObject = Join-Path ([System.IO.Path]::GetTempPath()) ("young-router-launcher-" + $WindowsArch + ".obj")
+  $LauncherCommand = "call `"$VcVars`" $VcVarsArch && cl.exe /nologo /O2 /MT /DUNICODE /D_UNICODE /EHsc /Fo:`"$LauncherObject`" /Fe:`"$LauncherOutput`" `"$LauncherSource`" /link /SUBSYSTEM:WINDOWS shell32.lib user32.lib"
+  & cmd.exe /d /s /c $LauncherCommand
+  if ($LASTEXITCODE -ne 0 -or -not (Test-Path $LauncherOutput)) {
+    throw "Could not compile the unpackaged Windows launcher."
+  }
+  Remove-Item -LiteralPath $LauncherObject -Force -ErrorAction SilentlyContinue
+  Write-Output "Windows raw-output launcher: $LauncherOutput"
+
   $BundledPython = Get-ChildItem -LiteralPath (Join-Path $AppRoot "windows") -Recurse -File -Filter "python.exe" |
     Where-Object { $_.FullName -match '[\\/]Core[\\/]runtime[\\/]bin[\\/]python\.exe$' } |
     Sort-Object LastWriteTimeUtc -Descending |

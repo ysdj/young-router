@@ -840,6 +840,10 @@ export interface NativeLeafAdapter {
     callbackURL?: string;
     title: string;
     closeLabel: string;
+    /** The window's own reload action: a page that stalled can be retried. */
+    reloadLabel: string;
+    /** The same page in the system browser, for a WebKit the site refuses. */
+    browserLabel: string;
   }): Promise<void>;
   /** Native subordinate sheet: the station's keys with their groups. */
   showGroupManager(options: {

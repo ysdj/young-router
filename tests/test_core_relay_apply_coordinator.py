@@ -1836,6 +1836,98 @@ class LinkedEditResolvesFromTheKeyItAlreadyHolds(unittest.TestCase):
             written = (root / "config.yaml").read_text(encoding="utf-8")
             self.assertNotIn("newapi-7", written)
 
+    def test_turning_auto_grouping_on_releases_the_key_a_dropped_group_leaves(self) -> None:
+        """Switching the layout on is alignment, and reports what it retires.
+
+        The switch is the user's instruction to keep one key per group, and Core
+        answers it by aligning.  That pass retires the key whose group the
+        station dropped — a remote delete like any other — but the switch
+        reported only itself, so the coordinator never released the provider
+        slot and the routes that named it.  The group then disappeared from the
+        layout while its models stayed behind and kept answering with a
+        credential the station no longer served.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            http = RelayCoordinatorHTTP()
+            relay = RelayAccountsDomain(root, http_client=http)
+            providers = ProvidersModelsDomain(root / "config.yaml")
+            core = CoreStore(domains=[relay, providers])
+            account_id = self._linked_provider_core(core, relay)
+            self._add_linked_model(core, providers, "public-chat", "model-a")
+            core.apply("providers_models", revision=core.revision)
+            self.assertTrue(providers.snapshot()["providers"][0]["models"])
+
+            # The station stops offering the key's group before the user turns
+            # the layout on, so this toggle's alignment is the only act that
+            # ever notices the key is no longer part of any group.
+            http.group_name = "Somewhere else"
+            http.resource_group = "Retired"
+            core.refresh_relay_resources(account_id, revision=core.revision)
+
+            core.dispatch(
+                {
+                    "domain": "relay_accounts",
+                    "type": "api_key.set_auto_grouping",
+                    "payload": {"account_id": account_id, "enabled": True},
+                },
+                expected_revision=core.revision,
+            )
+            details = relay.snapshot()["last_action"]
+            self.assertEqual("delete_models", details["dependency_policy"])
+            self.assertEqual(
+                [{"resource_id": "newapi-7"}],
+                [{"resource_id": row["resource_id"]} for row in details["resources"]],
+            )
+            # The release is staged with the retirement, so the slot and its
+            # route are gone before the Apply calls the station.
+            self.assertEqual([], providers.snapshot()["providers"])
+
+            result = core.apply("relay_accounts", revision=core.revision)
+            self.assertEqual("applied", result["status"])
+            self.assertIn(("DELETE", "/api/token/7"), http.calls)
+            written = (root / "config.yaml").read_text(encoding="utf-8")
+            self.assertNotIn("newapi-7", written)
+            self.assertNotIn("public-chat", written)
+
+    def test_an_apply_releases_the_linked_rows_of_a_journaled_delete(self) -> None:
+        """The journal, not the call that wrote it, decides what a delete releases.
+
+        A staged delete outlives the dispatch that staged it: a Core that
+        restarted, a delete written by an older build that reported no
+        dependencies, or an entry point that only reported its own name all
+        leave the operation in the journal with its policy.  What executes here
+        is that journal entry, so its own recorded policy is what releases the
+        linked slots and routes before the station is called.  Without it the
+        Apply deleted the key and left the document pointing at it.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            http = RelayCoordinatorHTTP()
+            relay = RelayAccountsDomain(root, http_client=http)
+            providers = ProvidersModelsDomain(root / "config.yaml")
+            core = CoreStore(domains=[relay, providers])
+            account_id = self._linked_provider_core(core, relay)
+            self._add_linked_model(core, providers, "public-chat", "model-a")
+            core.apply("providers_models", revision=core.revision)
+            self.assertTrue(providers.snapshot()["providers"][0]["models"])
+
+            # The durable journal entry alone: no dispatch applied its policy.
+            relay.delete_api_key(account_id, "newapi-7", dependency_policy="delete_models")
+            self.assertEqual(
+                ["newapi-7"],
+                [operation["resource_id"] for operation in relay.prepare_apply()["destructive"]],
+            )
+            self.assertTrue(providers.snapshot()["providers"][0]["models"])
+
+            result = core.apply("relay_accounts", revision=core.revision)
+            self.assertEqual("applied", result["status"])
+            self.assertIn(("DELETE", "/api/token/7"), http.calls)
+            self.assertEqual([], providers.snapshot()["providers"])
+            self.assertNotIn("newapi-7", (root / "config.yaml").read_text(encoding="utf-8"))
+
     def _linked_provider_core(self, core: CoreStore, relay: RelayAccountsDomain) -> str:
         """Sign in, refresh, and import the station's one key as a linked provider."""
 

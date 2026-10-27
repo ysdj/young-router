@@ -237,12 +237,18 @@ def _trace_effective_tools(
     request_kwargs = request_kwargs or {}
     top_level_value = request_kwargs.get("tools")
     top_level_tools = list(top_level_value) if isinstance(top_level_value, list) else []
-    additional_tools: list[Any] = []
     input_value = request_kwargs.get("input")
+    # Every ``additional_tools`` item is part of the declared surface, not only
+    # a leading run of them: Codex appends its deferred registry -- the tools a
+    # ``tool_search`` unlocks -- behind the conversation it belongs to.  Reading
+    # the leading run alone reported zero additional tools for a request that
+    # declared a whole registry, which is exactly the diagnostic a reader needs
+    # when the model's call for one of them is refused.
+    additional_tools: list[Any] = []
     if isinstance(input_value, list):
         for item in input_value:
             if not isinstance(item, dict) or item.get("type") != "additional_tools":
-                break
+                continue
             item_tools = item.get("tools")
             if isinstance(item_tools, list):
                 additional_tools.extend(item_tools)

@@ -110,7 +110,13 @@ def _replace(target: Path, data: bytes, *, mode: int, parent_mode: int | None) -
     descriptor: int | None = None
     try:
         descriptor, temporary = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
-        os.fchmod(descriptor, mode)
+        # Windows Python does not expose fchmod; chmod on the still-private
+        # temporary path provides the same best-effort mode restriction before
+        # the atomic replace.
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, mode)
+        else:
+            os.chmod(temporary, mode)
         with os.fdopen(descriptor, "wb") as handle:
             descriptor = None
             handle.write(data)

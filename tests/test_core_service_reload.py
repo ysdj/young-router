@@ -12,6 +12,7 @@ from unittest import mock
 
 from young_router.core.domains.codex import CodexSettingsDomain
 from young_router.core.domains.providers_models import ProvidersModelsDomain
+from young_router.core.persistence import atomic_write_json
 from young_router.core.service import CoreStore
 
 
@@ -721,6 +722,59 @@ class CoreServiceReloadTests(unittest.TestCase):
         core._schedule_service_reload_after_apply()
         self.assertTrue(core.wait_for_service_reload(5.0))
         self.assertEqual(["restart", "restart"], reload_calls)
+
+
+    def test_a_chatgpt_signin_is_a_route_not_a_process_replacement(self) -> None:
+        """A signed-in account is served by its own deployment.
+
+        The adapter used to read one process-global token directory, so the only
+        way to serve a newly signed-in account was to replace the proxy (a
+        reload keeps the environment the workers started with). Each route now
+        states the account it answers with, which the proxy's account patch
+        resolves per deployment -- so a status poll must not restart anything.
+        """
+
+        reload_calls: list[str] = []
+
+        def reload_service(operation: str) -> dict[str, str]:
+            reload_calls.append(operation)
+            return {"state": "running"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            domain = ProvidersModelsDomain(Path(directory) / "config.yaml")
+            core = CoreStore(
+                domains=[domain],
+                service_handlers={
+                    "status": lambda _operation: {"state": "running"},
+                    "reload": reload_service,
+                },
+            )
+            core.snapshot()
+            core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "service_provider.add",
+                    "payload": {"kind": "openai_login", "name": "OpenAI"},
+                }
+            )
+            provider_id = domain.snapshot()["providers"][0]["id"]
+            ref = domain._provider_auth_state(domain.draft_state()["providers"][0])["credential_ref"]
+            manager = domain._auth_manager()
+            atomic_write_json(
+                manager._secure_chatgpt_auth_file(ref, create=True),
+                {"access_token": "synthetic-access-token", "expires_at": 4102444800},
+            )
+            manager.activate("openai_login", ref)
+
+            result = core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "service_provider.auth_status",
+                    "payload": {"provider_id": provider_id},
+                }
+            )
+            self.assertNotIn("requires_restart", result["action_summary"])
+            self.assertEqual([], reload_calls)
 
 
 if __name__ == "__main__":

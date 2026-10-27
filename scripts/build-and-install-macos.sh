@@ -1178,6 +1178,19 @@ PYTHON_CACHE_KEY
 )"
 PYCACHE_SMOKE_DIR="$PYCACHE_SMOKE_ROOT/$PYCACHE_SMOKE_KEY"
 mkdir -p "$PYCACHE_SMOKE_ROOT"
+# The startup and relocation smokes import LiteLLM twice over a gigabyte of
+# bundle, and what they prove is the assembled Core: its sources, the release
+# it pins, and that it runs from a path it was not built in.  All three are
+# named by the fingerprint above, which is why a build that assembled a Core
+# this cache has already seen can skip them -- a JS-only change pays nothing
+# for a statement about a Core that did not change.  A miss runs them and
+# records the fingerprint on success, so a failed smoke is never remembered.
+CORE_SMOKE_STAMP_ROOT="${YOUNG_ROUTER_CORE_SMOKE_STAMP:-$STAGING_CACHE/core-smoke}"
+CORE_SMOKE_STAMP="$CORE_SMOKE_STAMP_ROOT/$PYCACHE_SMOKE_KEY.ok"
+mkdir -p "$CORE_SMOKE_STAMP_ROOT"
+if [[ -f "$CORE_SMOKE_STAMP" ]]; then
+  printf 'Reusing Core smoke result: %s\n' "$CORE_SMOKE_STAMP"
+else
 if [[ "$(cat "$PYCACHE_SMOKE_ROOT/key" 2>/dev/null || true)" != "$PYCACHE_SMOKE_KEY" ]]; then
   rm -rf "$PYCACHE_SMOKE_ROOT"
   mkdir -p "$PYCACHE_SMOKE_DIR"
@@ -1276,6 +1289,8 @@ PYTHONDONTWRITEBYTECODE=0 YOUNG_ROUTER_PYCACHE_DIR="$PYCACHE_SMOKE_DIR" \
 restore_core
 PORTABLE_MOVED=0
 trap cleanup EXIT
+  touch "$CORE_SMOKE_STAMP"
+fi
 
 # The smoke imports above deliberately exercise bytecode generation, but
 # __pycache__ entries are not part of AppKit's signed resource contract.

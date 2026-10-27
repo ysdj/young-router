@@ -2010,6 +2010,175 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
         self.assertIn("deepseek-v4.1-flash", chunk["error"]["message"])
         self.assertNotIn("retry", chunk["error"]["message"].lower())
 
+    def test_a_stale_channel_client_names_its_cause_and_never_invites_a_resend(
+        self,
+    ) -> None:
+        """A route whose own client is too old is a configuration stop.
+
+        Observed as 18 identical failures over one model group: the first route
+        answered every call with HTTP 400 ``Claude Code 2.1.63 does not support
+        this model; version 2.1.280 or newer is required``.  The stop was
+        unclassified, so the client only had a retry tip for a refusal that no
+        resend can change: the stale client is the thing that has to move.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        streaming_module = sys.modules["young_router.proxy.streaming"]
+
+        class BadRequestError(Exception):
+            status_code = 400
+
+        exception = BadRequestError(
+            "litellm.BadRequestError: OpenAIException - {\"error\":{\"code\":"
+            "\"server_error\",\"message\":\"Claude Code 2.1.63 does not support "
+            "this model; version 2.1.280 or newer is required. Run 'claude "
+            "update'\"}}"
+        )
+        request_data = {
+            "model": "claude-opus-5-5",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+        }
+
+        event = streaming_module._synthesized_failed_response_event(
+            request_data,
+            exception,
+        )
+        payload = event if isinstance(event, dict) else json.loads(event.data or "{}")
+        error = payload["response"]["error"]
+
+        self.assertEqual("invalid_request_error", error["type"])
+        self.assertEqual("upstream_client_outdated", error["code"])
+        self.assertIn("too old", error["message"])
+        self.assertIn("claude-opus-5-5", error["message"])
+        self.assertNotIn("could not classify the stop", error["message"])
+        lowered = error["message"].lower()
+        for retry_tip in ("send it again", "send the message again", "retry", "try again"):
+            self.assertNotIn(retry_tip, lowered)
+        self.assertTrue(getattr(event, "_young_router_terminal_failure", False))
+        self.assertTrue(
+            streaming_module._is_young_router_terminal_failure_event(event)
+        )
+
+        chunk = streaming_module._synthesized_native_stream_error_chunk(
+            {
+                "model": "claude-opus-5-5",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
+            exception,
+        )
+        self.assertEqual("invalid_request_error", chunk["error"]["type"])
+        self.assertEqual("upstream_client_outdated", chunk["error"]["code"])
+        self.assertIn("too old", chunk["error"]["message"])
+        self.assertNotIn("retry", chunk["error"]["message"].lower())
+
+    def test_a_route_that_never_answered_names_its_stall_instead(self) -> None:
+        """A pre-output stop with a known cause may not read as unclassifiable.
+
+        Live session, 2026-10-27: a route accepted the turn and answered with
+        zero bytes, so the start watchdog fired, the recovery poll exhausted its
+        window on the same silence, and the terminal event reported
+        ``upstream_route_failure`` / "the router could not classify the stop".
+        Pi matches that sentence against no retry phrase, so it ended a turn the
+        next request would have served -- the exact interruption this branch is
+        not allowed to produce.  The cause was already classified here
+        (``stream_start_timeout``) before the visible-output guard sent it to
+        the unclassified branch.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
+
+        class GatewayTimeout(Exception):
+            pass
+
+        exception = GatewayTimeout(
+            "young router stream start timeout after 300s without the first "
+            "stream event"
+        )
+        exception.status_code = 504
+        exception.body = {
+            "reason": "stream_start_timeout",
+            "start_seconds": 300.0,
+            "saw_chunk": False,
+            "buffered_chunks": 0,
+        }
+        request_data = {
+            "model": "deepseek-v4.1-flash",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/responses"},
+        }
+
+        # Nothing reached the client before the watchdog fired, so the recovery
+        # poll's own terminal builder is reached with ``after_visible_output``
+        # unset -- the shape that used to fall through.
+        event = streaming_module._synthesized_failed_response_event(
+            request_data,
+            exception,
+        )
+        payload = event if isinstance(event, dict) else json.loads(event.data or "{}")
+        error = payload["response"]["error"]
+
+        self.assertEqual("server_error", error["type"])
+        self.assertEqual("upstream_stream_start_timeout", error["code"])
+        self.assertNotIn("could not classify the stop", error["message"])
+        self.assertIn("deepseek-v4.1-flash", error["message"])
+        # The phrase Pi's retry classifier keys on: without it the turn dies.
+        self.assertIn("ended without", error["message"])
+        self.assertTrue(getattr(event, "_young_router_terminal_failure", False))
+
+    def test_a_retryable_route_failure_before_any_output_still_names_its_cause(
+        self,
+    ) -> None:
+        """A cooled-down pool is retryable, not unclassifiable.
+
+        The recovery poll finishes its window on a route pool that is entirely
+        in cooldown.  Nothing was rendered, so the old guard sent that to the
+        unclassified sentence even though the policy for it is
+        ``recovery_cooldown`` -- the router had classified the stop, it just had
+        not said so.  The sentence now states the cause, and its second clause
+        does not claim an answer was streaming when nothing had.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
+
+        class RouterRateLimitError(Exception):
+            pass
+
+        exception = RouterRateLimitError(
+            "no deployments available for selected model, try again in 45 "
+            "seconds. passed model=deepseek-v4.1-flash. pre-call-checks=true, "
+            "cooldown_list=[]"
+        )
+        request_data = {
+            "model": "deepseek-v4.1-flash",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/responses"},
+        }
+
+        self.assertEqual(
+            "recovery_cooldown",
+            hooks._recovery_policy_for_exception(exception),
+        )
+
+        event = streaming_module._synthesized_failed_response_event(
+            request_data,
+            exception,
+        )
+        payload = event if isinstance(event, dict) else json.loads(event.data or "{}")
+        error = payload["response"]["error"]
+
+        self.assertEqual("server_error", error["type"])
+        self.assertNotEqual("upstream_route_failure", error["code"])
+        self.assertNotIn("could not classify the stop", error["message"])
+        self.assertIn("ended without", error["message"])
+        # Truthful about what the reader saw: no answer had started.
+        self.assertNotIn("while this turn was streaming", error["message"])
+
     def test_a_response_the_upstream_cut_short_names_its_cause(self) -> None:
         """A stop this router can explain never reads as unclassifiable.
 
@@ -2273,6 +2442,36 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
                 error("Gateway", "stream start timeout", 504, {"reason": "stream_start_timeout"}),
                 {},
             ),
+            # A route pool that is entirely in cooldown, an exhausted relay
+            # channel, and a parked credential are all stops the next request
+            # can serve: the failing route is no longer first.  Their sentences
+            # must therefore carry a retry phrase too -- the sanitized wording
+            # used to end with "Retry later", which reads as advice but matches
+            # no phrase in the client's list, so the turn died there.
+            "pool in cooldown": (
+                error(
+                    "RouterRateLimitError",
+                    "no deployments available for selected model, try again in "
+                    "45 seconds",
+                ),
+                {},
+            ),
+            "relay channel exhausted": (
+                error(
+                    "BadRequestError",
+                    '{"error":{"message":"请稍后重试，暂无可用渠道"}}',
+                    400,
+                ),
+                {},
+            ),
+            "route credential parked": (
+                error(
+                    "BadRequestError",
+                    "workbuddy upstream client (http 401): invalid token",
+                    400,
+                ),
+                {},
+            ),
         }
 
         # Refusals no resend can fix, split by whether the client's own error
@@ -2285,6 +2484,13 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
             ),
             "tool history rejected": error(
                 "BadRequestError", "工具记录不完整，请新建任务", 400
+            ),
+            # The route's own balance is exhausted: a sibling may serve the same
+            # bytes, but the account that pays for *this* one cannot be fixed by
+            # resending, so the stop keeps Codex's own quota code and carries no
+            # Pi retry phrase.
+            "route balance exhausted": error(
+                "BadRequestError", "insufficient balance", 402
             ),
         }
         # No Codex error code means this.  Mapping one anyway would tell the user
@@ -2340,22 +2546,36 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
 
         for name, (exception, _kwargs) in transient.items():
             for wire in ("responses", "chat"):
-                with self.subTest(name=name, wire=wire):
-                    text = rendered(
-                        exception,
-                        wire=wire,
-                        after_visible_output=True,
-                    )
-                    # Pi: the sentence decides.
-                    self.assertTrue(
-                        retry_phrases.search(text),
-                        f"a transient stop would end the turn on {wire}: {text}",
-                    )
-                    # Codex: the code decides, and an unrecognised one retries.
-                    self.assertTrue(
-                        self._codex_retries(code_of(exception, wire=wire)),
-                        f"Codex would drop a transient stop on {wire}: {text}",
-                    )
+                for after_visible in (True, False):
+                    with self.subTest(name=name, wire=wire, visible=after_visible):
+                        text = rendered(
+                            exception,
+                            wire=wire,
+                            after_visible_output=after_visible,
+                        )
+                        # Pi: the sentence decides.
+                        self.assertTrue(
+                            retry_phrases.search(text),
+                            "a transient stop would end the turn on "
+                            f"{wire} (visible={after_visible}): {text}",
+                        )
+                        # A stop whose cause this router already classified may
+                        # never be described as one it could not: that sentence
+                        # matches none of the client's retry phrases, so it ends
+                        # the turn instead of resending it.  This is the live
+                        # failure -- a route that never produced a first event
+                        # died as "could not classify the stop" while the trace
+                        # recorded ``stream_start_timeout``.
+                        self.assertNotIn(
+                            "could not classify the stop",
+                            text,
+                            f"a classified stop was reported as unclassifiable: {text}",
+                        )
+                        # Codex: the code decides, and an unrecognised one retries.
+                        self.assertTrue(
+                            self._codex_retries(code_of(exception, wire=wire)),
+                            f"Codex would drop a transient stop on {wire}: {text}",
+                        )
 
         for name, exception in user_must_act_mapped.items():
             for wire in ("responses", "chat"):

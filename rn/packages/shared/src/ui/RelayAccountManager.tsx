@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Platform, PlatformColor, Pressable, StyleSheet, Text, View } from "react-native";
 import type { CoreSnapshot, NativeLeafAdapter, RelayGroupManagerResult } from "../types";
+import { AccountsTable } from "./AccountsTable";
 import { NativeButton, NativeCheckbox, NativePicker, NativeTable, NativeTextField } from "./NativeControls";
 import { usePendingAction } from "./pendingAction";
 import { setGroupManagerOpen } from "./providerWizardGate";
@@ -793,6 +794,25 @@ export function StationAccountsPanel({
     if (!silent) onStatus?.(undefined);
     try {
       const status = await refreshResources(target.id, { force });
+      // A checked 自动分组 is the user's standing instruction to keep one key per
+      // group, and this read is the station saying whether it still does.  The
+      // pane already draws that key list as the aligned layout, so a key whose
+      // group the station dropped disappears from it at once — and the layout
+      // has to become true at the same moment, or the routes bound to that key
+      // stay in the model table while the key itself is nowhere to be seen.  The
+      // same pair runs on the workspace's interval and when 分组管理 opens; this
+      // is the read the pane just paid for, so the layout follows it instead of
+      // waiting up to half an hour for the next tick.
+      const account = accountsRef.current.find((item) => item.id === target.id);
+      const align = account?.autoGrouping ? apiKeyActions?.alignAutoGrouping : undefined;
+      if (status === "ready" && align) {
+        try {
+          await align(target.id);
+        } catch {
+          // The layout is best-effort here: the read itself already stands, and
+          // the interval retries the alignment.
+        }
+      }
       try {
         await refreshAccounts();
       } catch {
@@ -1444,24 +1464,19 @@ export function StationAccountsPanel({
       <Text numberOfLines={2} style={styles.cleanupText}>{translate("relay.credentialsCleanupPending", { label: cleanup.label })}</Text>
       <NativeButton title={translate("relay.retryCleanup")} compact busy={pendingAction === "cleanup"} disabled={controlsBusy && pendingAction !== "cleanup"} onPress={() => { void retryCleanup(cleanup); }} style={styles.panelActionButton} />
     </View>)}
-    <View style={styles.panelHeader}>
-      <Text style={styles.panelTitle}>{translate("providers.accounts")}</Text>
-      <View style={styles.panelActions}>
-        {stationAccounts.length < 8 ? <NativeButton title="" symbol="plus" compact toolTip={translate("relay.addAccount")} accessibilityLabel={translate("relay.addAccount")} busy={pendingAction === "add"} disabled={controlsBusy && pendingAction !== "add"} onPress={() => { void beginAddLogin(); }} style={styles.panelActionButton} /> : null}
-        {selected ? <NativeButton title="" symbol="minus" compact destructive toolTip={translate("relay.removeLocal")} accessibilityLabel={translate("relay.removeLocal")} disabled={controlsBusy} onPress={() => { setRemovalPolicy("detach"); setRemoval({ account: selected }); }} style={styles.panelActionButton} /> : null}
-      </View>
-    </View>
-    {accountRows.length > 0 ? <NativeTable
+    <AccountsTable
+      title={translate("providers.accounts")}
+      actions={<>
+        {stationAccounts.length < 8 ? <NativeButton title="" symbol="plus" compact toolTip={translate("relay.addAccount")} accessibilityLabel={translate("relay.addAccount")} busy={pendingAction === "add"} disabled={controlsBusy && pendingAction !== "add"} style={styles.panelActionButton} onPress={() => { void beginAddLogin(); }} /> : null}
+        {selected ? <NativeButton title="" symbol="minus" compact destructive toolTip={translate("relay.removeLocal")} accessibilityLabel={translate("relay.removeLocal")} disabled={controlsBusy} style={styles.panelActionButton} onPress={() => { setRemovalPolicy("detach"); setRemoval({ account: selected }); }} /> : null}
+      </>}
       columns={[{ label: translate("relay.accounts"), width: 96 }, { label: translate("providers.authStatus"), width: 74 }, { label: translate("relay.balance"), width: 58 }]}
       rows={accountRows}
       selectedKey={selected?.id ?? ""}
-      disabledRowKeys={[]}
-      alertRowKeys={alertAccountRows}
-      compact
-      striped
       onSelectionChange={setSelectedID}
-      style={styles.accountsTable}
-    /> : <View style={styles.accountsEmpty}><Text style={styles.accountsEmptyText}>{translate("relay.stationNoAccounts")}</Text></View>}
+      alertRowKeys={alertAccountRows}
+      emptyText={translate("relay.stationNoAccounts")}
+    />
     {selected ? <View style={styles.accountEditor}>
       {/* One row: 账号 and its value, then the session controls.  刷新 and 分组
           sit on the account's right side instead of a row of their own.  The

@@ -141,6 +141,8 @@ from .base import (
     _TerminalFailedResponsesStreamResponse,
     _UPSTREAM_ACCOUNT_RESTRICTED_ERROR_MARKERS,
     _LOCAL_GATEWAY_AUTH_REJECTION_TYPES,
+    _UPSTREAM_CLIENT_VERSION_REJECTION_MARKERS,
+    _UPSTREAM_CLIENT_VERSION_REJECTION_PATTERN,
     _UPSTREAM_SESSION_REJECTED_ERROR_MARKERS,
     _UPSTREAM_BALANCE_ERROR_MARKERS,
     _UPSTREAM_HTML_BAD_REQUEST_MARKERS,
@@ -965,6 +967,16 @@ def _recovery_policy_for_exception(exception: Exception) -> str:
             _RECOVERY_POLICY_COOLDOWN,
         )
     if _is_upstream_account_restricted_error(exception):
+        return _recovery_policy_setting(
+            _RECOVERY_POLICY_REQUEST_ERROR_ENV,
+            _RECOVERY_POLICY_COOLDOWN,
+        )
+    if _is_upstream_client_version_rejected_error(exception):
+        # The route's channel runs a client too old for the model it was asked
+        # to serve.  No replay can change that: the same bytes were served by a
+        # sibling route of the same group, and leaving this one in front made
+        # every request pay the same refused round trip.  A cooldown is what
+        # moves the turn to the sibling that can answer.
         return _recovery_policy_setting(
             _RECOVERY_POLICY_REQUEST_ERROR_ENV,
             _RECOVERY_POLICY_COOLDOWN,
@@ -4384,13 +4396,85 @@ def _surface_adapter_model(model: Any, surface: str) -> Any:
     return f"openai/{upstream}"
 
 
+_IMAGE_GENERATION_CALL_TYPES = frozenset(
+    {
+        "image_generation",
+        "aimage_generation",
+        "image_edit",
+        "aimage_edit",
+        "image_variation",
+        "aimage_variation",
+    }
+)
+_IMAGE_GENERATION_INTERNAL_REQUEST_KEYS = (
+    "litellm_params",
+    _CURRENT_UPSTREAM_URL_SURFACE_KEY,
+    _ATTEMPTED_UPSTREAM_URL_SURFACES_KEY,
+    _UPSTREAM_URL_SURFACE_DEPLOYMENT_ID_KEY,
+    _SURFACE_TARGET_DEPLOYMENT_ID_KEY,
+)
+
+
+def _request_is_standalone_image_generation(
+    request_kwargs: Optional[dict],
+    function_name: Any = None,
+) -> bool:
+    """Identify the OpenAI Images API, whose body is not a chat surface.
+
+    LiteLLM reuses the same deployment callback for Images and chat/Responses.
+    The protocol markers are useful for routing the latter, but are internal
+    fields for ``/v1/images/*`` and can be mistaken for provider parameters.
+    """
+
+    if not isinstance(request_kwargs, dict):
+        return False
+    names = [function_name]
+    for value in names:
+        normalized = str(value or "").strip().lower().rsplit(".", 1)[-1]
+        normalized = normalized.lstrip("_")
+        if normalized in _IMAGE_GENERATION_CALL_TYPES:
+            return True
+    if any(
+        "/v1/images/generations" in value.lower()
+        or "/v1/images/edits" in value.lower()
+        or "/v1/images/variations" in value.lower()
+        for value in _request_proxy_request_values(request_kwargs)
+    ):
+        return True
+    call_type = str(request_kwargs.get("call_type") or "").strip().lower().rsplit(".", 1)[-1]
+    return call_type in _IMAGE_GENERATION_CALL_TYPES and bool(
+        request_kwargs.get("proxy_server_request")
+    )
+
+
+def _strip_image_generation_internal_request_keys(
+    request_kwargs: Optional[dict],
+    function_name: Any = None,
+) -> None:
+    """Keep router state out of the provider-facing Images request body."""
+
+    if not _request_is_standalone_image_generation(request_kwargs, function_name):
+        return
+    for key in _IMAGE_GENERATION_INTERNAL_REQUEST_KEYS:
+        request_kwargs.pop(key, None)
+    # ``use_chat_completions_api`` is a surface adapter switch, not an Images
+    # API option. It can otherwise be collected as an unknown provider field.
+    request_kwargs.pop("use_chat_completions_api", None)
+
+
 def _apply_surface_adapter_to_request(
     request_kwargs: dict,
     surface: str,
     upstream_model: Any,
+    function_name: Any = None,
 ) -> None:
+    image_request = _request_is_standalone_image_generation(
+        request_kwargs,
+        function_name,
+    )
     surface = _normalized_request_surface(surface)
     if not surface:
+        _strip_image_generation_internal_request_keys(request_kwargs, function_name)
         return
     adapted_model = _surface_adapter_model(upstream_model, surface)
     request_kwargs["model"] = adapted_model
@@ -4402,7 +4486,11 @@ def _apply_surface_adapter_to_request(
         else "openai"
     )
     request_kwargs["custom_llm_provider"] = adapter
-    if surface == _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES:
+    if image_request:
+        # Images uses the OpenAI-compatible provider regardless of which
+        # protocol surface the route advertises for text requests.
+        request_kwargs.pop("use_chat_completions_api", None)
+    elif surface == _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES:
         request_kwargs.pop("use_chat_completions_api", None)
     else:
         request_kwargs["use_chat_completions_api"] = True
@@ -4418,7 +4506,7 @@ def _apply_surface_adapter_to_request(
                 request_kwargs[container_key] = updated_container
 
     litellm_params = request_kwargs.get("litellm_params")
-    if isinstance(litellm_params, dict):
+    if isinstance(litellm_params, dict) and not image_request:
         updated_params = litellm_params.copy()
         updated_params["model"] = adapted_model
         updated_params["custom_llm_provider"] = request_kwargs[
@@ -4426,6 +4514,7 @@ def _apply_surface_adapter_to_request(
         ]
         request_kwargs["litellm_params"] = updated_params
     _api_base_module.apply_surface_api_base(request_kwargs, surface)
+    _strip_image_generation_internal_request_keys(request_kwargs, function_name)
 
 
 def _next_upstream_surface_for_failed_deployment(
@@ -4773,6 +4862,10 @@ def _trace_exception(exception: Exception) -> dict[str, Any]:
         reason = "terminal-prompt-or-policy"
     elif _is_upstream_account_restricted_error(exception):
         reason = "upstream-account-restricted"
+    elif _is_upstream_client_version_rejected_error(exception):
+        # A trace that said only ``other`` is exactly why this refusal read as
+        # the request's own 400 while the route kept being selected first.
+        reason = "upstream-client-version-rejected"
     elif _is_upstream_tool_history_rejected_error(exception):
         reason = "upstream-tool-history-rejected"
     elif _is_image_generation_tool_runtime_fallback_error(exception):
@@ -4872,6 +4965,15 @@ def _recovery_diagnostic(exception: Exception) -> dict[str, Any]:
             "detail": (
                 "The upstream refused the account behind this route, so the "
                 "route is parked and another route answers."
+            ),
+        }
+    elif _is_upstream_client_version_rejected_error(exception):
+        result = {
+            "kind": "upstream_client_outdated",
+            "title": "Upstream route client out of date",
+            "detail": (
+                "The route's own channel runs a client too old to serve this "
+                "model, so the route is parked and another route answers."
             ),
         }
     elif _is_upstream_tool_history_rejected_error(exception):
@@ -6394,6 +6496,11 @@ def _is_priority_deployment_failover_error(exception: Exception) -> bool:
         # This attempt cannot be answered by the route that refused its own
         # account; another candidate deployment still can.
         return True
+    if _is_upstream_client_version_rejected_error(exception):
+        # The route's channel client is too old for this model.  A sibling of
+        # the same group answered the identical bytes, so the attempt advances
+        # instead of ending the turn on the stale route.
+        return True
     if _is_upstream_tool_history_rejected_error(exception):
         # This route refuses the replayed tool history; a peer may accept it.
         return True
@@ -6628,6 +6735,11 @@ def _trace_deployment_success(request_kwargs: Optional[dict]) -> None:
     request_id = _trace_request_id(request_kwargs)
     if request_id and not _claim_traced_deployment_success(request_id):
         return
+    image_request = _request_is_standalone_image_generation(request_kwargs)
+    trace_model_info = _request_context_module._request_model_info(request_kwargs)
+    if image_request and isinstance(trace_model_info, dict):
+        trace_model_info = trace_model_info.copy()
+        trace_model_info.pop(_UPSTREAM_URL_SURFACE_KEY, None)
     _trace_module._route_trace(
         "deployment_success",
         request_id=request_id,
@@ -6638,17 +6750,20 @@ def _trace_deployment_success(request_kwargs: Optional[dict]) -> None:
         order=_deployment_order_from_request(request_kwargs),
         deployment=_trace_deployment(
             {
-                "model_info": _request_context_module._request_model_info(
-                    request_kwargs
-                ),
+                "model_info": trace_model_info,
                 "litellm_params": _as_dict(request_kwargs.get("litellm_params")),
             },
             # A success must name the wire the answer came back on.  A
             # ``fallback`` route often serves the client's own Responses wire
             # while declaring a chat backup, so the declaration would mislabel
-            # the served route and split it from its own selection.
-            surface=_request_current_upstream_surface(request_kwargs)
-            or _request_adapted_surface(request_kwargs),
+            # the served route and split it from its own selection. Images has
+            # no text protocol surface to report.
+            surface=(
+                ""
+                if image_request
+                else _request_current_upstream_surface(request_kwargs)
+                or _request_adapted_surface(request_kwargs)
+            ),
         ),
     )
 
@@ -7025,6 +7140,45 @@ def _is_upstream_session_rejected_error(exception: Exception) -> bool:
     return any(marker in text for marker in _UPSTREAM_SESSION_REJECTED_ERROR_MARKERS)
 
 
+def _is_upstream_client_version_rejected_error(exception: Exception) -> bool:
+    """Whether the route refused this model because *its own* client is too old.
+
+    A relay channel answered every request for one model with HTTP 400
+    ``Claude Code 2.1.63 does not support this model; version 2.1.280 or newer
+    is required``.  The sentence is about the client the station bundles, not
+    about this conversation: the same bytes were served by a sibling route of
+    the same group, and the stale channel stayed first in the order because a
+    plain 400 read as the request's own verdict -- so every request paid the
+    same refused round trip and the turn ended on it.
+
+    Read both halves: a named client *and* the version requirement.  A bare
+    "does not support" 400 is a request or model refusal and keeps its own
+    meaning.
+    """
+
+    text = _exception_text(exception)
+    if not text:
+        return False
+    if not any(marker in text for marker in _UPSTREAM_CLIENT_VERSION_REJECTION_MARKERS):
+        return False
+    return re.search(_UPSTREAM_CLIENT_VERSION_REJECTION_PATTERN, text) is not None
+
+
+def _upstream_client_version_rejected_message(model_group: str) -> str:
+    """The one sentence for a route whose bundled client cannot serve the model.
+
+    Shared by the Responses terminal event, the native chunk, and the raised
+    final failure.  It names the stale client as the route's problem, never as
+    the user's request, and never invites the same bytes to be sent again.
+    """
+
+    return (
+        "The upstream route refused this model because the client its channel "
+        f"runs is too old, and no other candidate route answered {model_group} "
+        "this turn. Update that route's client or choose another model route."
+    )
+
+
 def _is_local_gateway_auth_rejection_error(exception: Exception) -> bool:
     """Whether *this* proxy rejected the caller before any route was chosen.
 
@@ -7135,15 +7289,27 @@ def _sanitized_upstream_route_failure_message(
         # parked and the turn advances.  This is a message function: returning
         # the recovery-policy constant from here reached the client as the
         # literal word "recovery_cooldown".
+        #
+        # The route was parked, so the *next* request is served by a sibling --
+        # that is exactly the stop a client should resend, and only a phrase the
+        # client's retry classifier knows keeps the turn alive.  Note the client
+        # regex is ``connection.?lost``, which tolerates a single character and
+        # so matches "connection lost" but *not* "connection was lost"; the
+        # "stream ended without" idiom below is the unambiguous one.
         return (
             "The upstream refused the credential behind this route, so it was "
-            f"parked and another route will answer for {model_group}. Send the "
+            f"parked and another route will answer for {model_group}. This "
+            "attempt's stream ended without a terminal response event; send the "
             "message again, or refresh that route's account if it stays parked."
         )
     if _is_upstream_account_restricted_error(exception):
         # Not the "temporary / retry later" sentence below: the refusal belongs
         # to the account behind the route, and a replay is refused identically.
         return _upstream_account_restricted_message(model_group)
+    if _is_upstream_client_version_rejected_error(exception):
+        # Same rule: every replay meets the same stale client, so a retry tip
+        # would send the client back with the identical bytes.
+        return _upstream_client_version_rejected_message(model_group)
     if _is_upstream_tool_history_rejected_error(exception):
         # Same rule: only a new task changes this verdict, so a retry tip would
         # send the client back with the identical history.
@@ -7178,9 +7344,48 @@ def _sanitized_upstream_route_failure_message(
         if _is_upstream_deployment_failover_error(exception)
         else "Temporary upstream route failure"
     )
+    # Every caller of this function is a stop the router has already decided
+    # about, and the sentence has to agree with that decision.  On the Anthropic
+    # wire shape this message is all the client gets -- there is no error code
+    # there to fall back on -- so the closing clause is what decides whether Pi
+    # resends the turn or ends it:
+    #
+    # * a route whose own account, key, or TLS trust has to change cannot be
+    #   served by any replay, so it names that and offers no retry phrase;
+    # * a stop whose policy is ``error`` is a refusal no resend can change, so
+    #   it also offers none;
+    # * everything else here is transient -- a cooled-down pool, an exhausted
+    #   relay channel, a 5xx -- and must carry a phrase the client's classifier
+    #   matches.  "Retry later" read as advice but matched nothing, so those
+    #   turns ended even though the next request would have been served by a
+    #   sibling route.  "stream ended without" is on that list and is literally
+    #   true: this attempt has no terminal response event.
+    if _is_upstream_deployment_failover_error(exception) and not relay_message:
+        # A balance or auth failure on *this* route is not something a resend
+        # changes: the account behind it has to be topped up or replaced.  A
+        # relay that names its own exhaustion is not this case -- its channel
+        # pool refills on its own -- so it keeps the transient wording below
+        # together with the relay's own sentence.
+        return (
+            f"{prefix} for {model_group} ({reason}) after LiteLLM fallback "
+            "retries. The account or credential behind that route has to be "
+            "topped up or replaced before it can answer; choose another model "
+            "route for this turn."
+        )
+    if (
+        not relay_message
+        and _recovery_policy_for_exception(exception) == _RECOVERY_POLICY_ERROR
+    ):
+        return (
+            f"{prefix} for {model_group} ({reason}) after LiteLLM fallback "
+            "retries. No candidate route accepted this request, so it is not "
+            "a transport failure a resend can clear; change the route or the "
+            "request before sending it again."
+        )
     message = (
-        f"{prefix} for {model_group} ({reason}) "
-        "after LiteLLM fallback retries. Retry later or choose another model route."
+        f"{prefix} for {model_group} ({reason}) after LiteLLM fallback "
+        "retries, so the stream ended without a terminal response event. Send "
+        "the message again or choose another model route."
     )
     if relay_message:
         # The relay rejected the request because its upstream channel pool is
@@ -7617,6 +7822,13 @@ def _is_deployment_compatible_bad_request_error(exception: Exception) -> bool:
     if _is_thinking_replay_contract_error(exception):
         return False
     if _is_responses_schema_unsupported_error(exception):
+        return False
+    if _is_upstream_client_version_rejected_error(exception):
+        # A route whose bundled client is too old for the model states the
+        # refusal as a plain 400 with an ``invalid_request_error`` type on its
+        # Anthropic-shaped wire.  Without this it landed here as a generic
+        # compatibility refusal, which is read as the request's own verdict:
+        # the stale route stayed first in every order and ended the turn.
         return False
     if _is_upstream_gateway_bad_request_error(exception):
         return True

@@ -404,6 +404,63 @@ def _relay_binding_projection(state: object) -> list[tuple[str, ...]]:
     return projection
 
 
+_RELAY_DEPENDENCY_POLICY_NAMES = {
+    "delete_models": "delete",
+    "delete": "delete",
+    "detach": "detach",
+    "release": "detach",
+    "detach_disabled": "detach_disabled",
+    "rebind": "rebind",
+}
+
+
+def _relay_dependency_policy_name(value: object) -> str:
+    """The provider-side policy one relay action or journal entry states.
+
+    The relay domain owns the vocabulary a user chooses (``delete_models``,
+    ``detach_only``, ...) while the provider domain owns the effect (``delete``,
+    ``detach``, ...).  Both the dispatch that stages a key write and the Apply
+    that executes it read the policy through this one table, so a journaled
+    delete cannot be read with a different meaning than the one it was staged
+    with.
+    """
+
+    return _RELAY_DEPENDENCY_POLICY_NAMES.get(str(value or "detach"), "")
+
+
+def _relay_operation_dependencies(operations: object) -> dict[str, list[dict[str, str]]]:
+    """Group the staged remote deletions of one Apply by their own policy.
+
+    The journal is the durable record of work this Apply is about to make true,
+    so it is also the record of which provider slots and routes that work will
+    strand.  A deletion staged by an older Core, or by a dispatch that reported
+    no dependencies, is exactly the case an Apply must not inherit: reading the
+    policy from each operation is what makes releasing its linked rows a
+    property of the journal rather than of the call that happened to write it.
+    """
+
+    grouped: dict[str, list[dict[str, str]]] = {}
+    if not isinstance(operations, Sequence) or isinstance(operations, (str, bytes, bytearray)):
+        return grouped
+    for operation in operations:
+        if not isinstance(operation, Mapping):
+            continue
+        if operation.get("kind") != "api_key_delete":
+            continue
+        if operation.get("state", operation.get("status", "staged")) != "staged":
+            continue
+        policy = str(operation.get("dependency_policy") or "detach")
+        resource = {
+            "station_id": str(operation.get("station_id", "")),
+            "account_id": str(operation.get("account_id", "")),
+            "resource_id": str(operation.get("resource_id", "")),
+        }
+        if not resource["account_id"] or not resource["resource_id"]:
+            continue
+        grouped.setdefault(policy, []).append(resource)
+    return grouped
+
+
 def _relay_dependency_sources(
     provider_keys: object,
     slot_credentials: object,
@@ -3264,14 +3321,7 @@ class CoreStore:
                         resources = details.get("resources") if isinstance(details, Mapping) else None
                         policy = details.get("dependency_policy") if isinstance(details, Mapping) else None
                         if isinstance(resources, Sequence) and not isinstance(resources, (str, bytes, bytearray)):
-                            normalized_policy = {
-                                "delete_models": "delete",
-                                "delete": "delete",
-                                "detach": "detach",
-                                "release": "detach",
-                                "detach_disabled": "detach_disabled",
-                                "rebind": "rebind",
-                            }.get(str(policy or "detach"), "")
+                            normalized_policy = _relay_dependency_policy_name(policy)
                             handler = getattr(providers, "apply_relay_dependency_policy", None)
                             if not normalized_policy or not callable(handler):
                                 raise CoreError("domain_error", "Linked model dependency handling is unavailable")
@@ -4173,6 +4223,39 @@ class CoreStore:
                     raise CoreError("relay_not_ready", "Fix the relay connection or binding issues")
 
             providers = adapters.get("providers_models")
+            if providers is not None and not relay_dependency_only:
+                # The destructive phase below is the one place a key the
+                # station still serves is actually removed, so it is the one
+                # place that must leave no linked slot or route behind.  A
+                # dispatch normally released them when it staged the delete,
+                # but the journal outlives that call: a Core that restarted, a
+                # delete staged by an older build, or an entry point that
+                # reported no dependencies all hand this Apply a staged delete
+                # whose rows were never released.  Applying each operation's
+                # own recorded policy here — before the provider document is
+                # written, and before the station is called — makes the release
+                # a property of the journal instead of of whichever caller
+                # happened to write it.  Every policy is idempotent, so a
+                # delete already released by its dispatch finds nothing left to
+                # release here.  ``rebind`` is the exception: it needs the
+                # target the caller chose, which only that dispatch carries.
+                dependency_handler = getattr(providers, "apply_relay_dependency_policy", None)
+                if not callable(dependency_handler):
+                    raise CoreError("relay_apply_unavailable", "Linked model dependency handling is unavailable")
+                for recorded_policy, retired in _relay_operation_dependencies(operations).items():
+                    normalized_policy = _relay_dependency_policy_name(recorded_policy)
+                    if normalized_policy == "rebind":
+                        continue
+                    if not normalized_policy:
+                        raise CoreError("relay_apply_unavailable", "Linked model dependency handling is unavailable")
+                    released = dependency_handler(retired, normalized_policy)
+                    release_issues = released.get("issues") if isinstance(released, Mapping) else None
+                    if (
+                        isinstance(release_issues, Sequence)
+                        and not isinstance(release_issues, (str, bytes, bytearray))
+                        and release_issues
+                    ):
+                        raise CoreError("relay_apply_unavailable", "Linked model dependency handling could not be completed")
             if providers is not None:
                 materialize = getattr(providers, "materialize_relay_bindings", None)
                 dependency_summary = getattr(providers, "dependency_summary", None)

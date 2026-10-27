@@ -12,6 +12,7 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <coroutine>
 #include <cwctype>
 #include <filesystem>
 #include <map>
@@ -27,6 +28,7 @@
 #include <winrt/Microsoft.UI.Windowing.h>
 #include <winrt/Microsoft.UI.Xaml.h>
 #include <winrt/Microsoft.UI.Xaml.Controls.h>
+#include <winrt/Microsoft.UI.Xaml.Controls.Primitives.h>
 
 namespace YoungRouter {
 namespace {
@@ -41,6 +43,21 @@ constexpr size_t kMaxPasswordBytes = 4096;
 constexpr size_t kCredentialChunkBytes = 2400;
 constexpr size_t kMaxCredentialChunks = 48;
 constexpr wchar_t kCredentialRoot[] = L"Young Router/relay/";
+
+struct DispatcherQueueAwaiter {
+  winrt::Microsoft::UI::Dispatching::DispatcherQueue dispatcher{nullptr};
+
+  bool await_ready() const noexcept {
+    return !dispatcher || dispatcher.HasThreadAccess();
+  }
+
+  bool await_suspend(std::coroutine_handle<> handle) const {
+    return dispatcher && dispatcher.TryEnqueue([handle]() mutable { handle.resume(); });
+  }
+
+  void await_resume() const noexcept {}
+};
+
 constexpr wchar_t kImmediateWebPresentationScript[] = LR"JS((() => {
   const styleID = '__young_router_immediate_presentation';
   const gradientPattern = /gradient[(]/i;
@@ -701,9 +718,13 @@ std::optional<EndpointProbeResult> ProbeEndpoint(
     std::wstring headers = L"Accept: application/json\r\nContent-Type: application/json\r\n";
     // The session's agent string supplies User-Agent; naming it again on the
     // request would send the header twice.
-    headers += L"Accept-Language: " + std::wstring(kRelayBrowserAcceptLanguage) + L"\r\n";
-    std::wstring origin_header = origin.uri.SchemeName() + L"://" + origin.uri.Host();
-    if (port != (_wcsicmp(origin.uri.SchemeName().c_str(), L"https") == 0 ? 443 : 80)) {
+    headers += L"Accept-Language: ";
+    headers += kRelayBrowserAcceptLanguage;
+    headers += L"\r\n";
+    std::wstring scheme(origin.uri.SchemeName().c_str());
+    std::wstring host(origin.uri.Host().c_str());
+    std::wstring origin_header = scheme + L"://" + host;
+    if (port != (_wcsicmp(scheme.c_str(), L"https") == 0 ? 443 : 80)) {
       origin_header += L":" + std::to_wstring(port);
     }
     headers += L"Origin: " + origin_header + L"\r\nReferer: " + origin_header + L"/\r\n";
@@ -1040,7 +1061,7 @@ winrt::fire_and_forget ProbeLogin(
         // is asked for its id only in that form.
         const text = typeof value === 'number' ? String(value) : typeof value === 'string' ? value.trim() : '';
         userID = /^[0-9]{1,32}$/.test(text) ? text : '';
-      } catch {}
+      } catch (...) {}
       const access = (localStorage.getItem('auth_token') || localStorage.getItem('access_token') || userToken).slice(0,32768);
       const refresh = (localStorage.getItem('refresh_token') || '').slice(0,32768);
       const password = (document.querySelector('input[type=password],input[autocomplete=current-password]')?.value || '').slice(0,4096);
@@ -1119,7 +1140,7 @@ winrt::fire_and_forget ProbeLogin(
     // strands the flow.
     bool remember_password = false;
     if (password && !password->empty() && password != state->restored_password) {
-      co_await winrt::resume_foreground(dispatcher);
+      co_await DispatcherQueueAwaiter{dispatcher};
       if (state->canceled.load()) co_return;
       HideLoginDialog(state);
       remember_password = co_await ShowRememberPasswordPrompt(state);
@@ -1331,7 +1352,7 @@ winrt::fire_and_forget InitializeBrowser(std::shared_ptr<LoginState> state) {
           auto value = message.substr(sizeof(prefix) - 1);
           if (!value.empty() && value.size() <= kMaxPasswordBytes) current->captured_password = std::move(value);
         }
-      } catch {}
+      } catch (...) {}
     });
     co_await core.AddScriptToExecuteOnDocumentCreatedAsync(LR"JS((() => {
       const capture = (node) => { const value=node?.value; if (typeof value==='string' && value.length) chrome.webview.postMessage(`relay-password:${value.slice(0,4096)}`); };
@@ -1491,7 +1512,7 @@ std::optional<WindowsRelayLoginResult> RunWindowsRelayLogin(
         }
       }
       const access=)JS" + JsonLiteral(access) + LR"JS(; const refresh=)JS" + JsonLiteral(refresh) + LR"JS(;
-      const username=)JS" + JsonLiteral(state->options.username.value_or("")) + LR"JS(;
+      const username=)JS" + JsonLiteral(username) + LR"JS(;
       if (access) {
         localStorage.setItem('auth_token',access); localStorage.setItem('access_token',access);
         try {
@@ -1521,7 +1542,7 @@ std::optional<WindowsRelayLoginResult> RunWindowsRelayLogin(
     // renders exactly the same form while its cookies are being installed.
     // Submitting on that evidence is what minted one session per window open
     // until the account was locked out.
-    auto after = [current]() -> winrt::fire_and_forget {
+    auto after = [current, script = std::move(script)]() mutable -> winrt::fire_and_forget {
       std::wstring result;
       try {
         result = co_await current->webview.ExecuteScriptAsync(script);
@@ -1532,7 +1553,7 @@ std::optional<WindowsRelayLoginResult> RunWindowsRelayLogin(
       // asked for, so the filled password is submitted once.  A presentation
       // holding a session submits only after that session was refused.
       if (result == L"true" && current->login_submit_authorized) {
-        co_await SubmitSavedPassword(current);
+        SubmitSavedPassword(current);
         co_return;
       }
       if (current->auto_probe_pending) {
@@ -1615,8 +1636,9 @@ std::optional<WindowsRelaySessionRestoreResult> RestoreWindowsRelaySession(
     auto accepted = CoreIPCBridge::Shared().RestoreRelaySession(
         options.account_id, options.account_type, options.label, options.origin,
         "signed_out", std::nullopt, std::nullopt, std::nullopt, std::nullopt);
-    return accepted ? WindowsRelaySessionRestoreResult{
-        accepted->revision, accepted->login_status, accepted->username} : std::nullopt;
+    if (!accepted) return std::nullopt;
+    return WindowsRelaySessionRestoreResult{
+        accepted->revision, accepted->login_status, accepted->username};
   }
   bool confirmed_authentication_rejection = false;
   auto verified = ProbeEndpoint(
@@ -1632,8 +1654,9 @@ std::optional<WindowsRelaySessionRestoreResult> RestoreWindowsRelaySession(
     auto accepted = CoreIPCBridge::Shared().RestoreRelaySession(
         options.account_id, options.account_type, options.label, options.origin,
         "expired", std::nullopt, std::nullopt, std::nullopt, std::nullopt);
-    return accepted ? WindowsRelaySessionRestoreResult{
-        accepted->revision, accepted->login_status, accepted->username} : std::nullopt;
+    if (!accepted) return std::nullopt;
+    return WindowsRelaySessionRestoreResult{
+        accepted->revision, accepted->login_status, accepted->username};
   }
   auto accepted = CoreIPCBridge::Shared().RestoreRelaySession(
       options.account_id, options.account_type, options.label, options.origin,
@@ -1641,8 +1664,9 @@ std::optional<WindowsRelaySessionRestoreResult> RestoreWindowsRelaySession(
       verified->cookie.empty() ? std::nullopt : std::optional<std::string>(verified->cookie),
       verified->access_token, verified->refresh_token,
       verified->user_id.empty() ? std::nullopt : std::optional<std::string>(verified->user_id));
-  return accepted ? WindowsRelaySessionRestoreResult{
-      accepted->revision, accepted->login_status, accepted->username} : std::nullopt;
+  if (!accepted) return std::nullopt;
+  return WindowsRelaySessionRestoreResult{
+      accepted->revision, accepted->login_status, accepted->username};
 }
 
 bool ClearWindowsRelayPassword(std::string const& account_id) {

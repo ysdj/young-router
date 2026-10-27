@@ -598,6 +598,21 @@ def _with_restored_reasoning_marker(response: Any, request_kwargs: dict) -> Any:
     replayed = _restored_reasoning_replayed(request_kwargs)
     stream = callable(getattr(response, "__aiter__", None))
     marked = already or (replayed and stream)
+    image_request = _routing_module._request_is_standalone_image_generation(
+        request_kwargs
+    )
+    response_surface = (
+        ""
+        if image_request
+        else _responses_request_module._codex_request_responses_surface(
+            request_kwargs
+        )
+    )
+    adapted_surface = (
+        ""
+        if image_request
+        else _routing_module._request_adapted_surface(request_kwargs)
+    )
     _trace_module._route_trace(
         "responses_restored_reasoning_marker",
         request_id=_routing_module._trace_request_id(request_kwargs),
@@ -607,14 +622,12 @@ def _with_restored_reasoning_marker(response: Any, request_kwargs: dict) -> Any:
         codex_evidence=_responses_request_module._request_has_codex_client_evidence(
             request_kwargs
         ),
-        surface=_responses_request_module._codex_request_responses_surface(
-            request_kwargs
-        ),
+        surface=response_surface,
         flagged=request_kwargs.get(_RESTORED_REASONING_REPLAY_KEY) is True,
         request_evidence=_routing_module._request_replays_restored_reasoning(
             request_kwargs
         ),
-        adapted_surface=_routing_module._request_adapted_surface(request_kwargs),
+        adapted_surface=adapted_surface,
         stream=stream,
         already=already,
         marked=marked,

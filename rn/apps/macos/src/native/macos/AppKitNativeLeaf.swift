@@ -182,7 +182,7 @@ private enum NativeRelayOriginPolicy {
     // Keep one isolated WebView per account fingerprint. The shared UI may
     // poll several authorizations at once; a provider's account id must not
     // cause one login panel to suppress or replace another account's panel.
-    private var activeProviderAuthControllers: [String: NativeProviderAuthController] = [:]
+    private var activeProviderAuthControllers: [String: NativeRelayLoginController] = [:]
     // Retain the browser flow across the asynchronous React Native promise.
     private var activeRelayLoginController: NativeRelayLoginController?
     // The native shell is visible before React and Core publish their first
@@ -547,6 +547,15 @@ private enum NativeRelayOriginPolicy {
             routeWindows.removeValue(forKey: route)
             updateActivationPolicy()
         }
+        // The window that goes away takes its children with it. Without this a
+        // sign-in browser (or the wizard it belonged to) stayed on screen after
+        // the window that opened it closed: it kept its place in front while its
+        // parent was gone, so the next surface opened underneath it received no
+        // mouse event at all -- the pane looked alive, every button answered
+        // nothing, and the only way out was quitting the app.
+        for child in childPanels.filter({ $0.parent === window }).map({ $0.window }) {
+            endChildPanel(child)
+        }
     }
 
     // MARK: - Child panels
@@ -615,6 +624,10 @@ private enum NativeRelayOriginPolicy {
             parent.addChildWindow(panel, ordered: .above)
         }
         NSApp.activate(ignoringOtherApps: true)
+        // A sign-in window the user was just told to use has to be the key
+        // window of a frontmost app; otherwise the press that follows only
+        // activates the app and the page looks unresponsive.
+        NSRunningApplication.current.activate(options: [.activateAllWindows])
         configureImmediatePresentation(panel)
         withoutAnimations { panel.makeKeyAndOrderFront(nil) }
         prepare?()
@@ -1565,6 +1578,8 @@ private enum NativeRelayOriginPolicy {
         callbackURL: String?,
         title: String,
         closeTitle: String,
+        reloadTitle: String,
+        browserTitle: String,
         completion: @escaping () -> Void
     ) {
         guard Thread.isMainThread else {
@@ -1577,6 +1592,8 @@ private enum NativeRelayOriginPolicy {
                     callbackURL: callbackURL,
                     title: title,
                     closeTitle: closeTitle,
+                    reloadTitle: reloadTitle,
+                    browserTitle: browserTitle,
                     completion: completion
                 )
             }
@@ -1611,29 +1628,53 @@ private enum NativeRelayOriginPolicy {
         // Re-presentation for the same account replaces its stale challenge;
         // other account fingerprints keep their own window and stay usable once
         // the newest one closes.
-        activeProviderAuthControllers[authFingerprint]?.close()
-        let controller = NativeProviderAuthController(
-            provider: provider,
-            url: url,
-            userCode: userCode,
-            callbackURL: callbackURL,
-            title: title,
-            closeTitle: closeTitle,
-            instructionText: localized("providerAuthInstruction", fallback: "Complete sign-in on the official provider page. The code below is shown only for this device-code flow."),
-            codeLabelText: localized("providerAuthCode", fallback: "Device code"),
-            copyLabelText: localized("providerAuthCopy", fallback: "Copy"),
-            blockedMessage: localized("providerAuthBlocked", fallback: "This navigation was blocked because it is outside the official provider authentication flow.")
-        ) { [weak self] closedController in
-            if self?.activeProviderAuthControllers[authFingerprint] === closedController {
-                self?.activeProviderAuthControllers.removeValue(forKey: authFingerprint)
-            }
-            completion()
-        }
+        activeProviderAuthControllers[authFingerprint]?.cancelFromReact()
+        // The flow's own navigation rule, parsed here and handed to the shell:
+        // the window never decides what a provider may show.
+        let policyCallbackURL = NativeProviderAuthPolicy.callbackURL(provider: provider, string: callbackURL)
+        // The same window the relay sign-in opens: one shell, one browser, one
+        // action bar.  What differs is only the flow the window carries — this
+        // one hands the page over to the person and lets Core follow the device
+        // code, instead of capturing a station session from it.
+        let controller = NativeRelayLoginController(
+            accountID: fingerprint ?? provider,
+            type: provider,
+            label: title,
+            originURL: url,
+            // The flow's own words (title, actions, instruction, code) arrive
+            // localized from React; only this window's incidental labels
+            // ("loading", "could not load") are chosen here, so they follow the
+            // system language rather than duplicating the app's language state.
+            language: "system",
+            username: nil,
+            presentationParent: activeWindow(),
+            mode: .handoff,
+            handoff: NativeHandoffSignIn(
+                url: url,
+                allows: { target in
+                    NativeProviderAuthPolicy.allows(provider: provider, url: target, callbackURL: policyCallbackURL)
+                },
+                title: title,
+                instruction: localized("providerAuthInstruction", fallback: "Complete sign-in on the official provider page. The code below is shown only for this device-code flow."),
+                codeLabel: localized("providerAuthCode", fallback: "Device code"),
+                userCode: userCode,
+                copyTitle: localized("providerAuthCopy", fallback: "Copy"),
+                browserTitle: browserTitle,
+                reloadTitle: reloadTitle,
+                closeTitle: closeTitle
+            )
+        )
         activeProviderAuthControllers[authFingerprint] = controller
         // Its own movable window with its parent locked behind it, like every
         // other child surface. A second account's window stacks on top of this
         // one and takes over the locked window until it closes.
-        presentChildPanel(controller.panel, in: activeWindow(), prepare: { controller.loadContent() })
+        controller.startHandoff { [weak self, weak controller] in
+            guard let self, let controller else { return }
+            if self.activeProviderAuthControllers[authFingerprint] === controller {
+                self.activeProviderAuthControllers.removeValue(forKey: authFingerprint)
+            }
+            completion()
+        }
     }
 
     func showActionMenu(title: String, items: [String], anchor: [String: NSNumber]) -> Int? {
@@ -2680,7 +2721,11 @@ private enum NativeRelayOriginPolicy {
         window.title = title
         // A document editor cannot be resumed without the document it was
         // opened for, so it is never restored by AppKit.
-        window.isRestorable = route != "file-editor"
+        // A settings pane's size is this layout's, not whatever AppKit
+        // restored from an older build: the three provider columns depend on
+        // the width the layout names, and a restored 960 quietly scrolled the
+        // model table's 倍率 column out of its own pane.
+        window.isRestorable = route != "file-editor" && !Self.settingsPaneRoutes.contains(route)
         window.minSize = layout.minSize
         window.maxSize = layout.maxSize ?? Self.unconstrainedWindowSize
         window.setContentSize(layout.contentSize)
@@ -2707,9 +2752,15 @@ private enum NativeRelayOriginPolicy {
             // left its own pane seven points short and it opened on a
             // scrollbar. The window is full-size content view, so its content
             // height includes the transparent title strip.
+            // The provider workspace is three fixed columns and a model
+            // list that needs 288 pt for its own three: a 180 pt list and a
+            // 320 pt inspector beside it leave the middle pane short of that
+            // floor at 960, which scrolls 倍率 out of its table.  This is the
+            // smallest width that holds all three; the minimum keeps a resize
+            // from breaking it again.
             return RouteWindowLayout(
-                contentSize: NSSize(width: 960, height: 660),
-                minSize: NSSize(width: 900, height: 560),
+                contentSize: NSSize(width: 1120, height: 660),
+                minSize: NSSize(width: 1010, height: 560),
                 maxSize: nil
             )
         }
@@ -2808,7 +2859,7 @@ private enum NativeRelayOriginPolicy {
     public func prepareForTermination() {
         activeReadOnlyCodeController?.close()
         activeReadOnlyCodeController = nil
-        for controller in activeProviderAuthControllers.values { controller.close() }
+        for controller in activeProviderAuthControllers.values { controller.cancelFromReact() }
         activeProviderAuthControllers.removeAll()
         NSStatusBar.system.removeStatusItem(statusItem)
         for window in routeWindows.values { window.orderOut(nil) }
@@ -2838,6 +2889,15 @@ enum RelayBrowserIdentity {
 /// control of the locked window answers a click or a key while the child
 /// surface is up; the child keeps its own movable window, and the app keeps
 /// rendering and answering everywhere else.
+/// The sign-in page itself is the child window's whole point, so a click that
+/// lands on it while the app is not frontmost belongs to the page.  AppKit's
+/// default spends that click on activating the app: every control inside the
+/// WebView (the email field, the sign-in button) answered only the *second*
+/// press, which the user reads as a login page that cannot be clicked.
+private final class NativeFirstMouseWebView: WKWebView {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
 private final class NativeChildPanelShield: NSView {
     /// Called for every mouse press: the child takes the keyboard back, so a
     /// press on the locked window selects nothing in it.
@@ -5464,20 +5524,25 @@ private enum NativeProviderAuthPolicy {
         let path = url.path.isEmpty ? "/" : url.path
         switch provider {
         case "openai":
-            // Device-code issuance starts at auth.openai.com/codex/device;
-            // login.openai.com and ChatGPT are only accepted for the official
-            // first-party redirect chain.
-            if host == "auth.openai.com" {
-                return path == "/codex/device" || path.hasPrefix("/api/accounts/") || path == "/oauth/authorize" || path == "/oauth/authorize/" || path == "/deviceauth/callback" || path == "/log-in" || path == "/login" || path == "/consent" || path.hasPrefix("/cdn-cgi/")
-            }
-            if host == "login.openai.com" {
-                return path == "/" || path.hasPrefix("/login") || path.hasPrefix("/log-in") || path.hasPrefix("/authorize")
+            // The official sign-in is one flow across OpenAI's own auth
+            // origins, and both its routes and its proof-of-work frame change
+            // with every release.  A path allowlist here is what broke the
+            // login: the page's challenge runs in a
+            // ``sentinel.openai.com`` iframe, so cancelling that navigation
+            // left the email/password submit waiting on a proof that could
+            // never be computed -- the pane spun until the page's own timeout,
+            // while the identical step completed in a browser.  The origin is
+            // the boundary, and every other origin is still refused.
+            if host == "auth.openai.com" || host == "login.openai.com" || host == "sentinel.openai.com" {
+                return true
             }
             if host == "chatgpt.com" {
-                return path == "/" || path.hasPrefix("/auth") || path.hasPrefix("/login")
+                // The flow lands on ChatGPT afterwards, and the page's own
+                // registration/telemetry calls share this origin.
+                return path == "/" || path.hasPrefix("/auth") || path.hasPrefix("/login") || path.hasPrefix("/ces/") || path.hasPrefix("/backend-api/")
             }
             if host == "challenges.cloudflare.com" {
-                return path.hasPrefix("/cdn-cgi/") || path.hasPrefix("/turnstile/")
+                return true
             }
             return false
         case "claude":
@@ -5494,257 +5559,16 @@ private enum NativeProviderAuthPolicy {
     }
 }
 
-/// Native official-provider login surface. This deliberately has no script
-/// message bridge and no JavaScript that reads page values: the Core
-/// auth workflow owns token exchange/polling, while this panel only displays
-/// the provider page and the one-time code.
-private final class NativeProviderAuthController: NSObject, NSWindowDelegate, WKNavigationDelegate, WKUIDelegate {
-    let panel: NSPanel
-
-    private let provider: String
-    private let url: URL
-    private let userCode: String?
-    private let callbackURL: URL?
-    private let webView: WKWebView
-    private var onClose: ((NativeProviderAuthController) -> Void)?
-    private var stopped = false
-
-    init(
-        provider: String,
-        url: URL,
-        userCode: String?,
-        callbackURL: String?,
-        title: String,
-        closeTitle: String,
-        instructionText: String,
-        codeLabelText: String,
-        copyLabelText: String,
-        blockedMessage: String,
-        onClose: @escaping (NativeProviderAuthController) -> Void
-    ) {
-        self.provider = provider
-        self.url = url
-        self.userCode = userCode
-        self.callbackURL = NativeProviderAuthPolicy.callbackURL(provider: provider, string: callbackURL)
-        self.onClose = onClose
-
-        let configuration = WKWebViewConfiguration()
-        configuration.websiteDataStore = .nonPersistent()
-        // Cloudflare's managed challenge and the provider's OAuth page may
-        // use a first-party popup/target=_blank during the redirect. Keep it
-        // inside this isolated WebView instead of silently dropping it.
-        configuration.preferences.javaScriptCanOpenWindowsAutomatically = true
-        webView = WKWebView(frame: .zero, configuration: configuration)
-        webView.customUserAgent = RelayBrowserIdentity.userAgent
-
-        panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 860, height: 700),
-            styleMask: [.titled, .closable, .resizable],
-            backing: .buffered,
-            defer: false
-        )
-        super.init()
-
-        configureImmediatePresentation(panel)
-        panel.title = title
-        panel.minSize = NSSize(width: 640, height: 500)
-        panel.isReleasedWhenClosed = false
-        panel.delegate = self
-        panel.center()
-
-        webView.navigationDelegate = self
-        webView.uiDelegate = self
-        webView.translatesAutoresizingMaskIntoConstraints = false
-        webView.setAccessibilityLabel("Official provider authentication")
-
-        let content = NSView()
-        panel.contentView = content
-
-        let titleLabel = NSTextField(labelWithString: title)
-        titleLabel.font = nativeHeadingFont
-        titleLabel.lineBreakMode = .byTruncatingTail
-        titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-
-        let instructionLabel = NSTextField(wrappingLabelWithString: instructionText)
-        instructionLabel.font = NSFont.systemFont(ofSize: nativeUIFontSize)
-        instructionLabel.textColor = .secondaryLabelColor
-        instructionLabel.maximumNumberOfLines = 2
-
-        let codeLabel = NSTextField(labelWithString: codeLabelText)
-        codeLabel.font = nativeHeadingFont
-
-        let codeField = NSTextField(labelWithString: userCode ?? "")
-        codeField.isSelectable = true
-        codeField.isEditable = false
-        codeField.font = NSFont.monospacedSystemFont(ofSize: 17, weight: .medium)
-        codeField.alignment = .center
-        codeField.lineBreakMode = .byTruncatingMiddle
-        codeField.wantsLayer = true
-        codeField.layer?.cornerRadius = 6
-        codeField.layer?.borderWidth = 1
-        codeField.layer?.borderColor = NSColor.separatorColor.cgColor
-        codeField.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
-        codeField.setAccessibilityLabel("Device code")
-
-        let copyButton = NSButton(title: copyLabelText, target: nil, action: nil)
-        copyButton.bezelStyle = .rounded
-        copyButton.target = self
-        copyButton.action = #selector(copyCode(_:))
-        copyButton.setAccessibilityLabel("Copy device code")
-
-        let browserFrame = NSView()
-        browserFrame.wantsLayer = true
-        browserFrame.layer?.borderColor = NSColor.separatorColor.cgColor
-        browserFrame.layer?.borderWidth = 1
-        browserFrame.layer?.cornerRadius = 6
-        browserFrame.addSubview(webView)
-        webView.toolTip = blockedMessage
-
-        let closeButton = NSButton(title: closeTitle, target: self, action: #selector(closeAction(_:)))
-        closeButton.bezelStyle = .rounded
-        closeButton.keyEquivalent = "\u{1b}"
-
-        let hasUserCode = !(userCode?.isEmpty ?? true)
-        if !hasUserCode {
-            codeLabel.isHidden = true
-            codeField.isHidden = true
-            copyButton.isHidden = true
-        }
-        var controls: [NSView] = [titleLabel, instructionLabel, browserFrame, closeButton]
-        if hasUserCode {
-            controls.insert(codeLabel, at: 2)
-            controls.insert(codeField, at: 3)
-            controls.insert(copyButton, at: 4)
-        }
-        controls.forEach {
-            $0.translatesAutoresizingMaskIntoConstraints = false
-            content.addSubview($0)
-        }
-        var constraints: [NSLayoutConstraint] = [
-            titleLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: nativePanelInset),
-            titleLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -nativePanelInset),
-            titleLabel.topAnchor.constraint(equalTo: content.topAnchor, constant: nativePanelInset),
-            instructionLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
-            instructionLabel.trailingAnchor.constraint(equalTo: titleLabel.trailingAnchor),
-            instructionLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 4),
-            browserFrame.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
-            browserFrame.trailingAnchor.constraint(equalTo: titleLabel.trailingAnchor),
-            browserFrame.bottomAnchor.constraint(equalTo: closeButton.topAnchor, constant: -14),
-            webView.leadingAnchor.constraint(equalTo: browserFrame.leadingAnchor),
-            webView.trailingAnchor.constraint(equalTo: browserFrame.trailingAnchor),
-            webView.topAnchor.constraint(equalTo: browserFrame.topAnchor),
-            webView.bottomAnchor.constraint(equalTo: browserFrame.bottomAnchor),
-            // One action bar for every child window: the lone dismissal sits at
-            // the trailing edge, exactly where a window with two actions puts
-            // them, instead of floating in the middle of the panel.
-            closeButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -nativePanelInset),
-            closeButton.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -nativePanelInset),
-        ]
-        if hasUserCode {
-            constraints += [
-                codeLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
-                codeLabel.topAnchor.constraint(equalTo: instructionLabel.bottomAnchor, constant: 12),
-                codeField.leadingAnchor.constraint(equalTo: codeLabel.trailingAnchor, constant: 10),
-                codeField.centerYAnchor.constraint(equalTo: codeLabel.centerYAnchor),
-                codeField.widthAnchor.constraint(greaterThanOrEqualToConstant: 250),
-                codeField.heightAnchor.constraint(equalToConstant: 32),
-                copyButton.leadingAnchor.constraint(equalTo: codeField.trailingAnchor, constant: 8),
-                copyButton.trailingAnchor.constraint(lessThanOrEqualTo: titleLabel.trailingAnchor),
-                copyButton.centerYAnchor.constraint(equalTo: codeField.centerYAnchor),
-                browserFrame.topAnchor.constraint(equalTo: codeField.bottomAnchor, constant: 14),
-            ]
-        } else {
-            constraints.append(browserFrame.topAnchor.constraint(equalTo: instructionLabel.bottomAnchor, constant: 14))
-        }
-        NSLayoutConstraint.activate(constraints)
-        panel.initialFirstResponder = webView
-    }
-
-    /// Lay the panel out and start the provider page.  The host owns the
-    /// window's presentation — one child window with the app locked until it
-    /// closes — so this only prepares the content.
-    func loadContent() {
-        guard !stopped else { return }
-        panel.contentView?.layoutSubtreeIfNeeded()
-        webView.load(URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData))
-    }
-
-    @objc private func copyCode(_ sender: Any?) {
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        guard let userCode, !userCode.isEmpty else { return }
-        _ = pasteboard.setString(userCode, forType: .string)
-    }
-
-    @objc private func closeAction(_ sender: Any?) { close() }
-
-    func webView(
-        _ webView: WKWebView,
-        decidePolicyFor navigationAction: WKNavigationAction,
-        decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
-    ) {
-        // Cloudflare's managed challenge is a first-party iframe. Validate
-        // every frame URL, but do not require it to be the main frame.
-        guard let targetURL = navigationAction.request.url,
-              NativeProviderAuthPolicy.allows(provider: provider, url: targetURL, callbackURL: callbackURL) else {
-            decisionHandler(.cancel)
-            return
-        }
-        decisionHandler(.allow)
-    }
-
-    func webView(
-        _ webView: WKWebView,
-        decidePolicyFor navigationResponse: WKNavigationResponse,
-        decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
-    ) {
-        guard navigationResponse.isForMainFrame else {
-            decisionHandler(.allow)
-            return
-        }
-        guard let responseURL = navigationResponse.response.url,
-              NativeProviderAuthPolicy.allows(provider: provider, url: responseURL, callbackURL: callbackURL) else {
-            decisionHandler(.cancel)
-            return
-        }
-        decisionHandler(.allow)
-    }
-
-    func webView(
-        _ webView: WKWebView,
-        createWebViewWith configuration: WKWebViewConfiguration,
-        for navigationAction: WKNavigationAction,
-        windowFeatures: WKWindowFeatures
-    ) -> WKWebView? {
-        guard let targetURL = navigationAction.request.url,
-              NativeProviderAuthPolicy.allows(provider: provider, url: targetURL, callbackURL: callbackURL) else {
-            return nil
-        }
-        webView.load(navigationAction.request)
-        return nil
-    }
-
-    func windowWillClose(_ notification: Notification) { finish() }
-
-    func close() {
-        finish()
-        withoutAnimations { panel.close() }
-    }
-
-    private func finish() {
-        guard !stopped else { return }
-        stopped = true
-        panel.delegate = nil
-        webView.navigationDelegate = nil
-        webView.stopLoading()
-        webView.loadHTMLString("", baseURL: nil)
-        AppKitNativeLeaf.shared.endChildPanel(panel)
-        let completion = onClose
-        onClose = nil
-        completion?(self)
-    }
-}
-
+/// The app's one sign-in window.
+///
+/// A sign-in only a person can finish is the same surface whether the
+/// credential arrives through a station's form or through a device code: a
+/// window showing the page that person must use, with the app's one browser
+/// identity, a WebView that takes the first click, the same three actions
+/// (reopen in the system browser, reload, close), and the same child-panel
+/// lifecycle. What differs is only *how the flow learns it is done* -- the
+/// official device-code flow lets Core poll and never reads a page value,
+/// while a station hands the page to a capture delegate.
 private final class NativeActionMenuTarget: NSObject {
     private(set) var selectedIndex: Int?
 
@@ -5822,9 +5646,34 @@ private enum NativeRelayBrowserMode {
     /// the default browser.  Like the usage log it owes the sign-in flow
     /// nothing — no form watching, no automatic sign-in, no completion.
     case dashboard
+    /// A provider's own sign-in page, driven by the device-code flow.
+    ///
+    /// This is the same window as the station sign-in — same browser, same
+    /// identity, same action bar, same child-panel lifecycle — because both are
+    /// "show the official page, let the person finish it there, take the window
+    /// away when it is over".  What it does not share is the station's work: no
+    /// session capture, no automatic sign-in, no probing.  The provider page
+    /// belongs to the provider; Core learns the outcome from its own device-code
+    /// polling, so this window only has to stay open and usable.
+    case handoff
 }
 
-private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNavigationDelegate, WKScriptMessageHandler, URLSessionTaskDelegate {
+/// Everything a provider hand-off window needs that the station flow already
+/// owns: the page, the rule for which pages it may show, and its own words.
+private struct NativeHandoffSignIn {
+    let url: URL
+    let allows: (URL) -> Bool
+    let title: String
+    let instruction: String
+    let codeLabel: String
+    let userCode: String?
+    let copyTitle: String
+    let browserTitle: String
+    let reloadTitle: String
+    let closeTitle: String
+}
+
+private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler, URLSessionTaskDelegate {
     private static let embeddedHeaderHeight: CGFloat = 76
     // Embedded login is a region of the React step page. Keep the step
     // progress and actions visible while the native browser occupies only
@@ -6226,6 +6075,15 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     private let accountLabel = NSTextField(labelWithString: "")
     private let signInButton = NSButton(title: "Sign In", target: nil, action: nil)
     private let cancelButton = NSButton(title: "", target: nil, action: nil)
+    /// The hand-off window's own extra: the same page in the browser the person
+    /// already trusts, for the case where WebKit is what the provider refuses.
+    private let browserButton = NSButton(title: "", target: nil, action: nil)
+    /// A device code belongs to the provider flow only; the station sign-in has
+    /// no such step, so these stay empty outside ``.handoff``.
+    private let codeLabel = NSTextField(labelWithString: "")
+    private let codeField = NSTextField(labelWithString: "")
+    private let copyButton = NSButton(title: "", target: nil, action: nil)
+    private let handoff: NativeHandoffSignIn?
     private var finished = false
     private var checking = false
     private var result: CoreIPCBridge.RelayLoginResult?
@@ -6292,7 +6150,8 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         stationName: String? = nil,
         stationType: String? = nil,
         stationOrigin: String? = nil,
-        mode: NativeRelayBrowserMode = .login
+        mode: NativeRelayBrowserMode = .login,
+        handoff: NativeHandoffSignIn? = nil
     ) {
         self.accountID = accountID
         self.type = type
@@ -6300,7 +6159,11 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         self.originURL = originURL
         self.language = language
         self.presetUsername = username?.trimmingCharacters(in: .whitespacesAndNewlines)
-        self.mode = mode
+        // A hand-off window is this same window: it presents the provider's own
+        // page under the same chrome, and skips every station step below purely
+        // because of the mode it states here.
+        self.mode = handoff == nil ? mode : .handoff
+        self.handoff = handoff
         self.embeddedWindow = embeddedWindow
         self.embeddedClose = embeddedClose
         self.presentationParent = presentationParent
@@ -6312,14 +6175,19 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
 
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .nonPersistent()
-        configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
-        configuration.userContentController.addUserScript(
-            WKUserScript(
-                source: Self.immediateWebPresentationScript,
-                injectionTime: .atDocumentStart,
-                forMainFrameOnly: false
+        // A provider's own sign-in may open its consent in a new window
+        // (Cloudflare's challenge, an OAuth pop-up). Keep that inside this
+        // browser; the station pages never ask for it.
+        configuration.preferences.javaScriptCanOpenWindowsAutomatically = handoff != nil
+        if handoff == nil {
+            configuration.userContentController.addUserScript(
+                WKUserScript(
+                    source: Self.immediateWebPresentationScript,
+                    injectionTime: .atDocumentStart,
+                    forMainFrameOnly: false
+                )
             )
-        )
+        }
         if mode == .login {
             configuration.userContentController.addUserScript(
                 WKUserScript(
@@ -6357,7 +6225,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
                 )
             )
         }
-        webView = WKWebView(frame: .zero, configuration: configuration)
+        webView = NativeFirstMouseWebView(frame: .zero, configuration: configuration)
         // The one browser identity this app presents.  A station can bind a
         // session to its IP and User-Agent (sub2api's session binding), so the
         // page that creates the session must send the same identity as every
@@ -6414,6 +6282,26 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         }
         restoreSessionAndLoad()
         scheduleEmbeddedBrowserResize()
+        if let panel {
+            AppKitNativeLeaf.shared.presentChildPanel(panel, in: presentationParent ?? AppKitNativeLeaf.shared.activeWindow())
+        }
+    }
+
+    /// Show the provider's own sign-in page in this window.
+    ///
+    /// The station flow's own loading is skipped on purpose: there is no saved
+    /// session to restore and no page to measure, because Core — not this window
+    /// — is what follows the device code to its end.
+    func startHandoff(completion: @escaping () -> Void) {
+        self.completion = { _ in completion() }
+        beginBrowserFlow()
+        guard let handoff, isBrowserFlowLive else { return }
+        panel?.center()
+        if let panel {
+            configureImmediatePresentation(panel)
+            withoutAnimations { panel.makeKeyAndOrderFront(nil) }
+        }
+        webView.load(URLRequest(url: handoff.url, cachePolicy: .reloadIgnoringLocalCacheData))
         if let panel {
             AppKitNativeLeaf.shared.presentChildPanel(panel, in: presentationParent ?? AppKitNativeLeaf.shared.activeWindow())
         }
@@ -6522,7 +6410,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     /// page: the embedded step page and the child window laid out over the
     /// workspace. Each measures that page's geometry so the first field through
     /// the submit button stays visible.
-    private var measuresPageGeometry: Bool { panel != nil || isEmbeddedPresentation }
+    private var measuresPageGeometry: Bool { mode != .handoff && (panel != nil || isEmbeddedPresentation) }
 
     private func scheduleEmbeddedBrowserResize(delay: TimeInterval = 0.15) {
         guard measuresPageGeometry, isBrowserFlowLive, embeddedResizeAttempts < 16 else { return }
@@ -6580,10 +6468,17 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         let content = NSView()
         let header = NSView()
         webView.navigationDelegate = self
+        // The pop-up rule a provider's sign-in needs; a station page never asks
+        // for one, so its own navigation is unchanged.
+        webView.uiDelegate = self
         let titleLabel = NSTextField(labelWithString: isEmbeddedPresentation
             ? text("1 Relay URL  ›  2 Sign in", "1 中转站 URL  ›  2 登录")
-            : label)
-        let showsReloadAction = mode != .login && !isEmbeddedPresentation
+            : (handoff?.title ?? label))
+        // A hand-off window has no automatic anything to wait for, so it shows
+        // the two actions the person may need on the page itself: the same page
+        // in their own browser, and a reload of a page WebKit could not finish.
+        let showsHandoffActions = mode == .handoff && !isEmbeddedPresentation
+        let showsReloadAction = (mode != .login && !isEmbeddedPresentation) || showsHandoffActions
         // The React step owns the progress header and close action. The
         // embedded browser must not add a second native panel header.
         let showsEmbeddedClose = false
@@ -6600,29 +6495,37 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         let showsHostSubtitle = isEmbeddedPresentation || mode != .login || host.isEmpty || !label.localizedCaseInsensitiveContains(host)
         accountLabel.stringValue = isEmbeddedPresentation
             ? text("Sign-in is detected automatically", "登录成功后自动检测")
-            : (originURL.host ?? originURL.absoluteString)
-        accountLabel.isHidden = !showsHostSubtitle
+            : (handoff.map { $0.url.host ?? $0.url.absoluteString } ?? originURL.host ?? originURL.absoluteString)
+        accountLabel.isHidden = !showsHostSubtitle || mode == .handoff
         accountLabel.textColor = .secondaryLabelColor
         statusLabel.stringValue = isEmbeddedPresentation
             ? waitingForSignInStatus
-            : mode == .dashboard
-                ? text("Showing the relay site's dashboard.", "正在显示中转站仪表盘。")
-                : mode == .logs
-                    ? text("Showing the relay site's usage logs.", "正在显示中转站用量日志。")
-                    : text("Complete sign-in in the page; success is detected automatically.", "请在页面中完成登录，成功后将自动检测。")
+            : handoff.map { $0.instruction }
+                ?? (mode == .dashboard
+                    ? text("Showing the relay site's dashboard.", "正在显示中转站仪表盘。")
+                    : mode == .logs
+                        ? text("Showing the relay site's usage logs.", "正在显示中转站用量日志。")
+                        : text("Complete sign-in in the page; success is detected automatically.", "请在页面中完成登录，成功后将自动检测。"))
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.lineBreakMode = .byTruncatingTail
         signInButton.isHidden = !showsReloadAction
         cancelButton.isHidden = !showsPanelActions
         if showsReloadAction {
-            signInButton.title = text("Reload", "刷新")
+            signInButton.title = showsHandoffActions ? (handoff?.reloadTitle ?? text("Reload", "刷新")) : text("Reload", "刷新")
             signInButton.target = self
             signInButton.action = #selector(reloadBrowser(_:))
             signInButton.bezelStyle = .rounded
             signInButton.keyEquivalent = "\r"
         }
+        browserButton.isHidden = !showsHandoffActions
+        if showsHandoffActions {
+            browserButton.title = handoff?.browserTitle ?? text("Open in Browser", "在浏览器中打开")
+            browserButton.target = self
+            browserButton.action = #selector(openHandoffInBrowser(_:))
+            browserButton.bezelStyle = .rounded
+        }
         if showsPanelActions {
-            cancelButton.title = text("Close", "关闭")
+            cancelButton.title = showsHandoffActions ? (handoff?.closeTitle ?? text("Close", "关闭")) : text("Close", "关闭")
             cancelButton.target = self
             cancelButton.action = showsEmbeddedClose ? #selector(closeEmbeddedWindow(_:)) : #selector(cancel(_:))
             cancelButton.bezelStyle = .rounded
@@ -6639,7 +6542,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         let panelActionSeparator = showsPanelClose ? NSBox() : nil
         panelActionSeparator?.boxType = .separator
         if showsReloadAction {
-            ([signInButton, cancelButton] as [NSButton?]).compactMap { $0 }.forEach {
+            ([browserButton, signInButton, cancelButton] as [NSButton?]).compactMap { $0 }.forEach {
                 $0.translatesAutoresizingMaskIntoConstraints = false
                 header.addSubview($0)
             }
@@ -6653,16 +6556,50 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
                 actionBar.addSubview(separator)
             }
         }
+        // A device code is part of the provider's own flow, so its row lives in
+        // this window's chrome — above the page, below the title — exactly where
+        // the station flow keeps its status line.
+        let codeRow = mode == .handoff && !(handoff?.userCode?.isEmpty ?? true) ? NSView() : nil
+        let deviceCode = handoff?.userCode ?? ""
+        if let codeRow {
+            codeLabel.stringValue = handoff?.codeLabel ?? ""
+            codeLabel.font = NSFont.systemFont(ofSize: nativeUIFontSize)
+            codeField.stringValue = deviceCode
+            codeField.isSelectable = true
+            codeField.isEditable = false
+            codeField.font = NSFont.monospacedSystemFont(ofSize: 17, weight: .medium)
+            codeField.alignment = .center
+            codeField.lineBreakMode = .byTruncatingMiddle
+            codeField.wantsLayer = true
+            codeField.layer?.cornerRadius = 6
+            codeField.layer?.borderWidth = 1
+            codeField.layer?.borderColor = NSColor.separatorColor.cgColor
+            codeField.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
+            codeField.setAccessibilityLabel(handoff?.codeLabel ?? "Device code")
+            copyButton.title = handoff?.copyTitle ?? ""
+            copyButton.bezelStyle = .rounded
+            copyButton.target = self
+            copyButton.action = #selector(copyHandoffCode(_:))
+            copyButton.setAccessibilityLabel(handoff?.copyTitle ?? "Copy")
+            codeRow.translatesAutoresizingMaskIntoConstraints = false
+            [codeLabel, codeField, copyButton].forEach {
+                $0.translatesAutoresizingMaskIntoConstraints = false
+                codeRow.addSubview($0)
+            }
+            content.addSubview(codeRow)
+        }
         webView.translatesAutoresizingMaskIntoConstraints = false
         loadingOverlay.material = .contentBackground
         loadingOverlay.blendingMode = .withinWindow
         loadingOverlay.state = .active
         loadingOverlay.translatesAutoresizingMaskIntoConstraints = false
-        loadingLabel.stringValue = mode == .dashboard
-            ? text("Loading the dashboard...", "正在加载仪表盘...")
-            : mode == .logs
-                ? text("Loading usage logs...", "正在加载用量日志...")
-                : text("Loading sign-in page...", "正在加载登录页面...")
+        loadingLabel.stringValue = mode == .handoff
+            ? text("Loading the provider's sign-in page...", "正在加载官方登录页面...")
+            : mode == .dashboard
+                ? text("Loading the dashboard...", "正在加载仪表盘...")
+                : mode == .logs
+                    ? text("Loading usage logs...", "正在加载用量日志...")
+                    : text("Loading sign-in page...", "正在加载登录页面...")
         loadingLabel.textColor = .secondaryLabelColor
         loadingLabel.alignment = .center
         loadingLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -6675,11 +6612,13 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         header.translatesAutoresizingMaskIntoConstraints = false
         if let panel {
             configureImmediatePresentation(panel)
-            panel.title = mode == .dashboard
-                ? text("Relay Dashboard", "中转站仪表盘")
-                : mode == .logs
-                    ? text("Relay Usage Logs", "中转站用量日志")
-                    : text("Relay Account Sign In", "中转站账号登录")
+            panel.title = mode == .handoff
+                ? (handoff?.title ?? label)
+                : mode == .dashboard
+                    ? text("Relay Dashboard", "中转站仪表盘")
+                    : mode == .logs
+                        ? text("Relay Usage Logs", "中转站用量日志")
+                        : text("Relay Account Sign In", "中转站账号登录")
             // The console's own chrome has to fit before its content does; the
             // sign-in form and the usage log need only their own column.
             panel.minSize = mode == .dashboard
@@ -6743,8 +6682,27 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
                 header.trailingAnchor.constraint(equalTo: content.trailingAnchor),
                 header.topAnchor.constraint(equalTo: content.topAnchor),
                 header.heightAnchor.constraint(equalToConstant: headerHeight),
-                webView.topAnchor.constraint(equalTo: header.bottomAnchor),
             ]
+            if let codeRow {
+                constraints += [
+                    codeRow.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+                    codeRow.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+                    codeRow.topAnchor.constraint(equalTo: header.bottomAnchor),
+                    codeRow.heightAnchor.constraint(equalToConstant: 44),
+                    webView.topAnchor.constraint(equalTo: codeRow.bottomAnchor),
+                    codeLabel.leadingAnchor.constraint(equalTo: codeRow.leadingAnchor, constant: nativePanelInset),
+                    codeLabel.centerYAnchor.constraint(equalTo: codeRow.centerYAnchor),
+                    codeField.leadingAnchor.constraint(equalTo: codeLabel.trailingAnchor, constant: 10),
+                    codeField.centerYAnchor.constraint(equalTo: codeRow.centerYAnchor),
+                    codeField.widthAnchor.constraint(greaterThanOrEqualToConstant: 250),
+                    codeField.heightAnchor.constraint(equalToConstant: 30),
+                    copyButton.leadingAnchor.constraint(equalTo: codeField.trailingAnchor, constant: 8),
+                    copyButton.trailingAnchor.constraint(lessThanOrEqualTo: codeRow.trailingAnchor, constant: -nativePanelInset),
+                    copyButton.centerYAnchor.constraint(equalTo: codeRow.centerYAnchor),
+                ]
+            } else {
+                constraints.append(webView.topAnchor.constraint(equalTo: header.bottomAnchor))
+            }
         }
         if showsReloadAction {
             constraints += [
@@ -6760,6 +6718,9 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
                 signInButton.trailingAnchor.constraint(equalTo: cancelButton.leadingAnchor, constant: -8),
                 signInButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
                 signInButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 104),
+                browserButton.trailingAnchor.constraint(equalTo: signInButton.leadingAnchor, constant: -8),
+                browserButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+                browserButton.leadingAnchor.constraint(greaterThanOrEqualTo: titleLabel.trailingAnchor, constant: 16),
                 cancelButton.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -nativePanelInset),
                 cancelButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
                 cancelButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 76),
@@ -7930,6 +7891,12 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         guard isBrowserFlowLive else { return }
+        if mode == .handoff {
+            // The provider's page is the whole flow: nothing to restore, no
+            // session to capture, no form to fill. Core follows the device code.
+            revealBrowserPage()
+            return
+        }
         scheduleEmbeddedBrowserResize()
         schedulePageReadinessProbe()
         scheduleAgreementReveal()
@@ -8023,6 +7990,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     /// Lift the overlay and start the per-step work on the live page.
     private func revealBrowserPage() {
         withoutAnimations { loadingOverlay.isHidden = true }
+        guard mode != .handoff else { return }
         scheduleEmbeddedBrowserResize()
         scheduleAgreementReveal()
         if mode != .login {
@@ -8160,11 +8128,13 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         agreementRevealAttempts = 0
         automaticCheckProbe?.cancel()
         automaticCheckProbe = nil
-        loadingLabel.stringValue = mode == .dashboard
-            ? text("Loading the dashboard...", "正在加载仪表盘...")
-            : mode == .logs
-                ? text("Loading usage logs...", "正在加载用量日志...")
-                : text("Loading sign-in page...", "正在加载登录页面...")
+        loadingLabel.stringValue = mode == .handoff
+            ? text("Loading the provider's sign-in page...", "正在加载官方登录页面...")
+            : mode == .dashboard
+                ? text("Loading the dashboard...", "正在加载仪表盘...")
+                : mode == .logs
+                    ? text("Loading usage logs...", "正在加载用量日志...")
+                    : text("Loading sign-in page...", "正在加载登录页面...")
         withoutAnimations { loadingOverlay.isHidden = false }
     }
 
@@ -8174,11 +8144,13 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         loginFormRevealProbe = nil
         automaticCheckProbe?.cancel()
         automaticCheckProbe = nil
-        loadingLabel.stringValue = mode == .dashboard
-            ? text("The dashboard could not be loaded.", "仪表盘页面加载失败。")
-            : mode == .logs
-                ? text("The usage log page could not be loaded.", "用量日志页面加载失败。")
-                : text("The sign-in page could not be loaded.", "登录页面加载失败。")
+        loadingLabel.stringValue = mode == .handoff
+            ? text("The provider's sign-in page could not be loaded. Open it in your browser.", "官方登录页面加载失败，可改在浏览器中打开。")
+            : mode == .dashboard
+                ? text("The dashboard could not be loaded.", "仪表盘页面加载失败。")
+                : mode == .logs
+                    ? text("The usage log page could not be loaded.", "用量日志页面加载失败。")
+                    : text("The sign-in page could not be loaded.", "登录页面加载失败。")
         withoutAnimations { loadingOverlay.isHidden = false }
     }
 
@@ -8187,11 +8159,48 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         decidePolicyFor navigationAction: WKNavigationAction,
         decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
     ) {
-        guard let url = navigationAction.request.url, sameOrigin(url) else {
+        // One rule per flow: the station may stay on its own origin, while a
+        // provider hands its window the authentication policy it needs (the
+        // provider's sign-in hosts plus the challenge frame it embeds).
+        let allowed: Bool
+        if let handoff {
+            allowed = navigationAction.request.url.map(handoff.allows) ?? false
+        } else {
+            allowed = navigationAction.request.url.map(sameOrigin) ?? false
+        }
+        guard allowed else {
             decisionHandler(.cancel)
             return
         }
         decisionHandler(.allow)
+    }
+
+    /// A provider's sign-in sometimes continues in a pop-up (an identity
+    /// provider's consent, Cloudflare's challenge). It is the same flow, so it
+    /// is loaded in this window instead of being dropped.
+    func webView(
+        _ webView: WKWebView,
+        createWebViewWith configuration: WKWebViewConfiguration,
+        for navigationAction: WKNavigationAction,
+        windowFeatures: WKWindowFeatures
+    ) -> WKWebView? {
+        guard mode == .handoff, let handoff,
+              let target = navigationAction.request.url, handoff.allows(target) else { return nil }
+        webView.load(navigationAction.request)
+        return nil
+    }
+
+    @objc private func openHandoffInBrowser(_ sender: Any?) {
+        guard let handoff else { return }
+        NSWorkspace.shared.open(handoff.url)
+    }
+
+    @objc private func copyHandoffCode(_ sender: Any?) {
+        let code = handoff?.userCode ?? ""
+        guard !code.isEmpty else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        _ = pasteboard.setString(code, forType: .string)
     }
 }
 

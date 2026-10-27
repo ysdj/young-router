@@ -259,7 +259,7 @@ struct SecureInputLifecycle final {
   std::atomic<bool> staging{false};
 };
 
-struct ButtonComponentView final
+struct ButtonComponentView
     : winrt::implements<ButtonComponentView, winrt::IInspectable>,
       winrt::YoungRouter::Codegen::BaseLiteLLMWinUIButton<ButtonComponentView> {
   void InitializeContentIsland(ContentIslandComponentView const& island_view) noexcept {
@@ -506,7 +506,7 @@ struct ButtonComponentView final
   bool compact_applied_ = false;
 };
 
-struct SegmentedComponentView final
+struct SegmentedComponentView
     : winrt::implements<SegmentedComponentView, winrt::IInspectable>,
       winrt::YoungRouter::Codegen::BaseLiteLLMWinUISegmentedControl<SegmentedComponentView> {
   void InitializeContentIsland(ContentIslandComponentView const& island_view) noexcept {
@@ -587,7 +587,7 @@ struct SegmentedComponentView final
   std::vector<ItemDefaults> compact_items_;
 };
 
-struct PickerComponentView final
+struct PickerComponentView
     : winrt::implements<PickerComponentView, winrt::IInspectable>,
       winrt::YoungRouter::Codegen::BaseLiteLLMWinUIPicker<PickerComponentView> {
   void InitializeContentIsland(ContentIslandComponentView const& island_view) noexcept {
@@ -653,7 +653,7 @@ struct PickerComponentView final
   bool compact_applied_ = false;
 };
 
-struct CheckboxComponentView final
+struct CheckboxComponentView
     : winrt::implements<CheckboxComponentView, winrt::IInspectable>,
       winrt::YoungRouter::Codegen::BaseLiteLLMWinUICheckbox<CheckboxComponentView> {
   void InitializeContentIsland(ContentIslandComponentView const& island_view) noexcept {
@@ -710,7 +710,7 @@ struct CheckboxComponentView final
     const bool compact_changed = !old_props || old_props->compact != props.compact;
     syncing_ = true;
     if (label_changed || label_visibility_changed) {
-      checkbox_.Content(props.labelVisible.value_or(true) ? winrt::box_value(ToHString(props.label)) : nullptr);
+      checkbox_.Content(props.labelVisible ? winrt::box_value(ToHString(props.label)) : nullptr);
       winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(checkbox_, ToHString(props.label));
     }
     if (value_changed) checkbox_.IsChecked(props.value.value_or(false));
@@ -735,7 +735,7 @@ struct CheckboxComponentView final
   bool compact_applied_ = false;
 };
 
-struct TableComponentView final
+struct TableComponentView
     : winrt::implements<TableComponentView, winrt::IInspectable>,
       winrt::YoungRouter::Codegen::BaseLiteLLMWinUITable<TableComponentView> {
   void InitializeContentIsland(ContentIslandComponentView const& island_view) noexcept {
@@ -1232,7 +1232,7 @@ struct TableComponentView final
   std::vector<std::string> selectable_spanning_row_keys_;
 };
 
-struct TextEditorComponentView final
+struct TextEditorComponentView
     : winrt::implements<TextEditorComponentView, winrt::IInspectable>,
       winrt::YoungRouter::Codegen::BaseLiteLLMWinUITextEditor<TextEditorComponentView> {
   struct ViewportState final {
@@ -1372,12 +1372,12 @@ struct TextEditorComponentView final
     editor_.TextWrapping(props.wrap
         ? winrt::Microsoft::UI::Xaml::TextWrapping::Wrap
         : winrt::Microsoft::UI::Xaml::TextWrapping::NoWrap);
-    editor_.HorizontalScrollBarVisibility(
-        props.wrap
+    winrt::Microsoft::UI::Xaml::Controls::ScrollViewer::SetHorizontalScrollBarVisibility(
+        editor_, props.wrap
             ? winrt::Microsoft::UI::Xaml::Controls::ScrollBarVisibility::Disabled
             : winrt::Microsoft::UI::Xaml::Controls::ScrollBarVisibility::Auto);
-    editor_.VerticalScrollBarVisibility(
-        winrt::Microsoft::UI::Xaml::Controls::ScrollBarVisibility::Auto);
+    winrt::Microsoft::UI::Xaml::Controls::ScrollViewer::SetVerticalScrollBarVisibility(
+        editor_, winrt::Microsoft::UI::Xaml::Controls::ScrollBarVisibility::Auto);
   }
 
   bool syncing_ = false;
@@ -1387,7 +1387,7 @@ struct TextEditorComponentView final
   TextBox editor_{nullptr};
 };
 
-struct CodeWebViewComponentView final
+struct CodeWebViewComponentView
     : winrt::implements<CodeWebViewComponentView, winrt::IInspectable>,
       winrt::YoungRouter::Codegen::BaseLiteLLMWinUICodeWebView<CodeWebViewComponentView> {
   ~CodeWebViewComponentView() {
@@ -1753,7 +1753,7 @@ void RegisterCodeWebViewRecycleHandler(
       });
 }
 
-struct SplitterComponentView final
+struct SplitterComponentView
     : winrt::implements<SplitterComponentView, winrt::IInspectable>,
       winrt::YoungRouter::Codegen::BaseLiteLLMWinUISplitView<SplitterComponentView> {
   void InitializeContentIsland(ContentIslandComponentView const& island_view) noexcept {
@@ -1818,7 +1818,7 @@ struct SplitterComponentView final
   Thumb splitter_{nullptr};
 };
 
-struct TextInputComponentView final
+struct TextInputComponentView
     : winrt::implements<TextInputComponentView, winrt::IInspectable>,
       winrt::YoungRouter::Codegen::BaseLiteLLMWinUITextInput<TextInputComponentView> {
   void InitializeContentIsland(ContentIslandComponentView const& island_view) noexcept {
@@ -1898,9 +1898,8 @@ struct TextInputComponentView final
     if (keyboard_type_changed) {
       ApplyKeyboardType(text_box_, props.keyboardType);
     }
-    if (secure_text_changed) {
-      text_box_.PasswordChar(props.secureTextEntry.value_or(false) ? L'\x25cf' : L'\0');
-    }
+    // WinUI 3 TextBox has no PasswordChar property; secure fields use the
+    // dedicated PasswordBox component when masking is required.
     if (disabled_changed) {
       text_box_.IsEnabled(Enabled(props.disabled));
     }
@@ -1917,7 +1916,7 @@ struct TextInputComponentView final
   TextBox text_box_{nullptr};
 };
 
-struct SecureTextInputComponentView final
+struct SecureTextInputComponentView
     : winrt::implements<SecureTextInputComponentView, winrt::IInspectable>,
       winrt::YoungRouter::Codegen::BaseLiteLLMWinUISecureTextInput<SecureTextInputComponentView> {
   SecureTextInputComponentView() = default;
@@ -2118,7 +2117,11 @@ struct SecureTextInputComponentView final
       winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(multiline_box_, ToHString(props.label));
     }
     if (multiline_changed) {
-      island_.Content(IsMultiline() ? multiline_box_ : password_box_);
+      if (IsMultiline()) {
+        island_.Content(multiline_box_);
+      } else {
+        island_.Content(password_box_);
+      }
     }
     if (disabled_changed || reset_identity) {
       SetInputEnabled(Enabled(props.disabled) && !lifecycle_->staging.load(std::memory_order_acquire) && !loading_);
@@ -2357,7 +2360,7 @@ struct SecureTextInputComponentView final
   winrt::event_token multiline_lost_focus_token_{};
 };
 
-struct SwitchComponentView final
+struct SwitchComponentView
     : winrt::implements<SwitchComponentView, winrt::IInspectable>,
       winrt::YoungRouter::Codegen::BaseLiteLLMWinUISwitch<SwitchComponentView> {
   void InitializeContentIsland(ContentIslandComponentView const& island_view) noexcept {
@@ -2441,7 +2444,7 @@ struct SwitchComponentView final
   TextBlock glyph_{nullptr};
 };
 
-struct SelectableRowComponentView final
+struct SelectableRowComponentView
     : winrt::implements<SelectableRowComponentView, winrt::IInspectable>,
       winrt::YoungRouter::Codegen::BaseLiteLLMWinUISelectableRow<SelectableRowComponentView> {
   void InitializeContentIsland(ContentIslandComponentView const& island_view) noexcept {

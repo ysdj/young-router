@@ -642,10 +642,23 @@ _HISTORY_TOOL_OUTPUT_MIN_CHARS_ENV = "YOUNG_ROUTER_HISTORY_TOOL_OUTPUT_MIN_CHARS
 _HISTORY_TOOL_OUTPUT_DEFAULT_MIN_CHARS = 20_000
 # The tail of the history is the part the client is still working from, so a
 # record sized for it is kept whole even when it exceeds the drop threshold
-# above; only the older replay is elided.  The env name is the one the reader
-# resolves, and the default is that reader's fallback when it is unset.
+# above; only the older replay is elided.  This is a fallback, not the ceiling:
+# the ceiling is the route's own usable input window, resolved per request by
+# ``responses_request._history_tool_output_ceiling_chars``, because the same
+# replayed history costs a 1M-token route and a 128k one very different room.
+# A fixed number either deletes the working set on the big route (that is what
+# 20,000 did: a budget equal to the drop threshold above keeps exactly one
+# record, so a 27KB read was emptied the moment a newer call arrived and the
+# note it left told the model to run the tool again -- one session re-read the
+# same guide five times) or overruns the small one.  The env name still replaces
+# either with a fixed number.
 _HISTORY_TOOL_OUTPUT_KEPT_CHARS_ENV = "YOUNG_ROUTER_HISTORY_TOOL_OUTPUT_KEPT_CHARS"
-_HISTORY_TOOL_OUTPUT_DEFAULT_KEPT_CHARS = 20_000
+_HISTORY_TOOL_OUTPUT_DEFAULT_KEPT_CHARS = 600_000
+# Characters charged per token when a window becomes a ceiling.  This app's own
+# transcripts measure 4.24 chars per token, so 3 charges the route more tokens
+# than it really bills and keeps the ceiling on the safe side of a history that
+# is mostly Chinese.
+_HISTORY_TOOL_OUTPUT_CHARS_PER_TOKEN = 3
 _HISTORY_TOOL_OUTPUT_KEPT = 8
 _PREFIX_IMAGE_ORIGINAL_PATH_ENV = "YOUNG_ROUTER_PREFIX_IMAGE_ORIGINAL_PATH"
 _PREFIX_IMAGE_ORIGINAL_PATH_DEFAULT = True
@@ -1230,6 +1243,31 @@ _UPSTREAM_ACCOUNT_RESTRICTED_ERROR_MARKERS = (
 # the same history against the same route.  The refusal belongs to that route's
 # tolerance of the replay -- a peer may accept it -- and the one action that
 # changes it is starting a new task.
+# A relay's channel answered with its own client being too old for the model chart
+# it was asked to serve: ``Claude Code 2.1.63 does not support this model;
+# version 2.1.280 or newer is required``.  The refusal is about the *route's*
+# bundled client, never about this conversation: the same bytes answered on a
+# sibling route of the same group (verified against the same station), and the
+# route that said this kept being selected first because the status is a plain
+# 400, which every status-only reading classified as the request's own verdict.
+# Read the version sentence, not the status, and not the model name -- a real
+# "model not supported" 400 is a different refusal with its own meaning.
+_UPSTREAM_CLIENT_VERSION_REJECTION_MARKERS = (
+    "or newer is required",
+    "version is required",
+    "update the claude desktop app",
+    "update your claude",
+    "client version is too old",
+    "client is out of date",
+)
+# The same refusal states which client is stale and the version it needs, so a
+# trace can name the cause instead of a bare 400.  Only the pairs below are
+# recognised, because a version sentence without a client name says nothing
+# about whose version is the problem.
+_UPSTREAM_CLIENT_VERSION_REJECTION_PATTERN = (
+    r"\b(?:claude code|claude-code|claude cli|claude desktop|codex)\b"
+    r"[^\n]{0,80}\b(?:does not support|doesn't support|is too old|not supported)"
+)
 _UPSTREAM_TOOL_HISTORY_REJECTION_MARKERS = (
     "工具记录不完整",
     "工具调用记录不完整",

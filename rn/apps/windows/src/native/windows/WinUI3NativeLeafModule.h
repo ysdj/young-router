@@ -41,6 +41,8 @@ struct WinUI3NativeLeafModule {
   REACT_METHOD(RevealFile, L"revealFile");
   REACT_METHOD(Quit, L"quit");
   REACT_METHOD(SetShortcuts, L"setShortcuts");
+  REACT_METHOD(AddListener, L"addListener");
+  REACT_METHOD(RemoveListeners, L"removeListeners");
   REACT_EVENT(MenuAction, L"menuAction");
 
   void Initialize(winrt::Microsoft::ReactNative::ReactContext const& context) noexcept;
@@ -128,6 +130,8 @@ struct WinUI3NativeLeafModule {
   void RevealFile(std::wstring const& path) noexcept;
   void Quit() noexcept;
   void SetShortcuts(winrt::Microsoft::ReactNative::JSValueObject const& shortcuts) noexcept;
+  void AddListener(std::string const&) noexcept {}
+  void RemoveListeners(double) noexcept {}
 
  private:
   winrt::Microsoft::ReactNative::ReactContext context_{nullptr};

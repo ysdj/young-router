@@ -38,6 +38,7 @@ from .base import (
     _HISTORY_IMAGE_ELISION_DEFAULT_MIN_BYTES,
     _HISTORY_IMAGE_ELISION_KEEP_ENV,
     _HISTORY_IMAGE_ELISION_MIN_BYTES_ENV,
+    _HISTORY_TOOL_OUTPUT_CHARS_PER_TOKEN,
     _HISTORY_TOOL_OUTPUT_DEFAULT_KEPT_CHARS,
     _HISTORY_TOOL_OUTPUT_DEFAULT_MIN_CHARS,
     _HISTORY_TOOL_OUTPUT_KEPT_CHARS_ENV,
@@ -1387,26 +1388,35 @@ def _codex_tool_definition_name(tool: Any) -> Optional[str]:
 
 
 def _codex_declared_tools(request_kwargs: Optional[dict]) -> list[dict]:
+    """Every tool this request declares, from all three carriers it uses.
+
+    ``additional_tools`` is read wherever it appears, not only while the input
+    still begins with one.  Codex sends its always-on registry as a leading
+    item but appends the deferred registry -- the tools reachable only after a
+    ``tool_search`` -- behind the conversation it belongs to.  Reading the
+    leading run alone therefore made every deferred tool (``view_image``,
+    ``exec_command``, ...) look undeclared even though the bridge faithfully
+    forwarded it, and each call to one was answered with a terminal failure
+    that stopped the turn.  The bridge lifts tools through
+    :func:`responses_tools._responses_input_additional_tools`, which already
+    reads every item, so the contract that judges the model's answer has to
+    read the same set the request actually declared.
+    """
     if not isinstance(request_kwargs, dict):
         return []
     tools = request_kwargs.get("tools")
     declared = [tool for tool in tools if isinstance(tool, dict)] if isinstance(tools, list) else []
     input_value = request_kwargs.get("input")
     if isinstance(input_value, list):
-        for item in input_value:
-            if not isinstance(item, dict) or item.get("type") != "additional_tools":
-                break
-            item_tools = item.get("tools")
-            if isinstance(item_tools, list):
-                declared.extend(
-                    tool for tool in item_tools if isinstance(tool, dict)
-                )
-        # Codex loads deferred tools before the model can call them. The
-        # resulting tool_search_output is part of the request's declared
-        # surface just like a leading additional_tools item. Excluding it
-        # turns a valid deferred call into an undeclared-tool terminal error.
         from . import responses_tools as _responses_tools_module
 
+        declared.extend(
+            _responses_tools_module._responses_input_additional_tools(input_value)
+        )
+        # Codex loads deferred tools before the model can call them. The
+        # resulting tool_search_output is part of the request's declared
+        # surface just like an additional_tools item. Excluding it turns a
+        # valid deferred call into an undeclared-tool terminal error.
         declared.extend(
             _responses_tools_module._responses_input_tool_search_output_tools(
                 input_value
@@ -3055,7 +3065,7 @@ def _history_tool_output_min_chars() -> int:
 
 
 def _history_tool_output_kept_chars() -> int:
-    """Replayed tool-call record size kept whole at the end of the history."""
+    """The fixed ceiling an operator configured, or the fallback when none did."""
 
     value = os.getenv(_HISTORY_TOOL_OUTPUT_KEPT_CHARS_ENV, "").strip()
     if not value:
@@ -3065,6 +3075,71 @@ def _history_tool_output_kept_chars() -> int:
     except ValueError:
         return _HISTORY_TOOL_OUTPUT_DEFAULT_KEPT_CHARS
     return max(0, parsed)
+
+
+def _history_tool_output_ceiling_chars_for_window(
+    *,
+    context_window: int,
+    max_context_window: Optional[int],
+    effective_percent: int,
+    max_output_tokens: Optional[int],
+) -> int:
+    """How many characters of replayed tool records a window can carry.
+
+    The reserve is what the client asked to keep for its own answer, and it is
+    never allowed to claim more than half the window: a client that names a
+    ``max_output_tokens`` larger than the route can serve has not made the
+    route's input smaller, and reading it that way left every such request with
+    no ceiling at all.
+    """
+
+    window = max(0, int(context_window or 0))
+    maximum = max(0, int(max_context_window or window))
+    usable = min(window, maximum) if window and maximum else max(window, maximum)
+    percent = min(100, max(1, int(effective_percent or 100)))
+    headroom = usable * percent // 100
+    reserve = max(0, int(max_output_tokens or 0))
+    reserve = min(reserve, headroom // 2)
+    return max(0, headroom - reserve) * _HISTORY_TOOL_OUTPUT_CHARS_PER_TOKEN
+
+
+def _history_tool_output_ceiling_chars(request_kwargs: Optional[dict] = None) -> int:
+    """The replayed tool-call tail this request may carry before it is trimmed.
+
+    A route's own window is the only number that answers this: the same history
+    is comfortable on a 1M-token model and refused by a 128k one, and a fixed
+    character count picked for either turns into a memory budget for the other.
+    Measured on this app's sessions, the fixed 20,000 in place before fired in
+    eleven of thirteen live histories and dropped their *entire* set of records
+    over the threshold, which is why the model re-read the same files for turn
+    after turn.
+
+    ``YOUNG_ROUTER_HISTORY_TOOL_OUTPUT_KEPT_CHARS`` still wins when it is set,
+    and a request that names no route this app can size falls back to the
+    constant.
+    """
+
+    configured = os.getenv(_HISTORY_TOOL_OUTPUT_KEPT_CHARS_ENV, "").strip()
+    if configured:
+        return _history_tool_output_kept_chars()
+    if not isinstance(request_kwargs, dict):
+        return _HISTORY_TOOL_OUTPUT_DEFAULT_KEPT_CHARS
+    model = request_kwargs.get("model")
+    if not isinstance(model, str) or not model.strip():
+        return _HISTORY_TOOL_OUTPUT_DEFAULT_KEPT_CHARS
+    reserve = request_kwargs.get("max_output_tokens")
+    try:
+        from . import reasoning as _reasoning_module
+
+        record = _reasoning_module._reasoning_registry().record_for(model.strip())
+    except Exception:
+        return _HISTORY_TOOL_OUTPUT_DEFAULT_KEPT_CHARS
+    return _history_tool_output_ceiling_chars_for_window(
+        context_window=record.context_window,
+        max_context_window=record.max_context_window,
+        effective_percent=record.effective_context_window_percent,
+        max_output_tokens=reserve if isinstance(reserve, int) else None,
+    )
 
 
 def _history_tool_call_record_kind(item_type: Any) -> Optional[str]:
@@ -3211,7 +3286,17 @@ def _with_elided_oversized_tool_outputs(request_kwargs: dict) -> Optional[dict]:
     lane: a window counted in outputs kept the last eight outputs whatever they
     weighed, so a history of many medium outputs replayed whole on every turn
     until the upstream refused it -- a 141-output Codex thread kept eight of
-    them, forty-odd records once both lanes of the request are counted.
+    them, forty-odd records once both lanes of the request are counted.  The
+    budget is the route's own usable input window
+    (``_history_tool_output_ceiling_chars``), never a fixed character count:
+    the same tail is comfortable on a 1M-token route and refused by a 128k one.
+
+    Two rules keep this pass from becoming a memory budget, which is what a
+    window below the drop threshold did when it emptied every read the model
+    had made: the newest record of a lane is always kept whole, and a lane whose
+    emptied records still leave it over the ceiling keeps them all, because that
+    trim cannot make the request fit and only spends the evidence the model was
+    working from.
 
     This pass runs after the image passes, and it may only rewrite what they
     left behind: an image output already replaced by previews and path
@@ -3225,7 +3310,7 @@ def _with_elided_oversized_tool_outputs(request_kwargs: dict) -> Optional[dict]:
     min_chars = _history_tool_output_min_chars()
     if min_chars <= 0:
         return None
-    kept_chars = _history_tool_output_kept_chars()
+    kept_chars = _history_tool_output_ceiling_chars(request_kwargs)
     if kept_chars <= 0:
         return None
     lane_by_index = _tool_call_lane_by_index(input_items)
@@ -3240,6 +3325,7 @@ def _with_elided_oversized_tool_outputs(request_kwargs: dict) -> Optional[dict]:
     if not lane_weights:
         return None
     elided_by_index: dict[int, dict] = {}
+    over_ceiling_lanes: list[str] = []
     for lane, weight in lane_weights.items():
         if weight <= kept_chars:
             continue
@@ -3253,6 +3339,7 @@ def _with_elided_oversized_tool_outputs(request_kwargs: dict) -> Optional[dict]:
         # model works from, not a guarantee.  Everything older than it is
         # emptied once the lane leaves the window, record by record.
         newest_index = lane_indices[-1] if lane_indices else -1
+        lane_elisions: dict[int, dict] = {}
         for index in reversed(lane_indices):
             item = input_items[index]
             if not isinstance(item, dict):
@@ -3271,7 +3358,16 @@ def _with_elided_oversized_tool_outputs(request_kwargs: dict) -> Optional[dict]:
             updated["output"] = [
                 {"type": "input_text", "text": _elided_tool_call_note(item_weight)}
             ]
-            elided_by_index[index] = updated
+            lane_elisions[index] = updated
+        # A lane over the ceiling is trimmed as far as its own eligible records
+        # take it, and the newest record always stays whole.  Reaching the
+        # ceiling is not required for the trim to be worth it: one 150KB
+        # snapshot dropped from a 240KB tail is the case this pass exists for,
+        # even though the lane's small records still leave it over a small
+        # ceiling.
+        if weight > kept_chars:
+            over_ceiling_lanes.append(lane)
+        elided_by_index.update(lane_elisions)
     if not elided_by_index:
         return None
     # The call of an emptied record keeps its own arguments.  Rewriting them
@@ -3303,6 +3399,8 @@ def _with_elided_oversized_tool_outputs(request_kwargs: dict) -> Optional[dict]:
         request_id=_routing_module._trace_request_id(request_kwargs),
         session=_routing_module._trace_session_context(request_kwargs),
         request=_trace_module._trace_request_summary(request_kwargs),
+        ceiling_chars=kept_chars,
+        over_ceiling_lanes=over_ceiling_lanes,
         elided_tool_outputs=elided_outputs,
         elided_tool_output_chars=elided_chars,
     )

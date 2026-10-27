@@ -2470,7 +2470,16 @@ class RelayAccountsDomain:
             account_id = str(data.get("account_id", data.get("id", "")))
             enabled = data.get("enabled")
             self.set_auto_grouping(account_id, enabled)
-            details = {"kind": "api_key_set_auto_grouping", "account_id": account_id}
+            # Switching the layout on runs the same alignment the explicit
+            # align action runs, so it retires the same keys and reports them
+            # the same way.  Reporting only the switch here was the defect that
+            # left a group the station had already dropped with its models: the
+            # key was deleted by the Apply while nothing ever released the
+            # provider slot and routes that named it.
+            if enabled is True and self._last_alignment_dependencies.get("resources"):
+                details = dict(self._last_alignment_dependencies)
+            else:
+                details = {"kind": "api_key_set_auto_grouping", "account_id": account_id}
         elif name in {"api_key_auto_group_align", "relay_api_key_auto_group_align", "account_auto_group_align", "relay_account_auto_group_align"}:
             account_id = str(data.get("account_id", data.get("id", "")))
             self.align_auto_grouping(account_id)
@@ -5317,6 +5326,14 @@ class RelayAccountsDomain:
         for a resource refresh that reports groups instead.
         """
 
+        # One pass reports the keys it retires in *this* call and nothing else.
+        # The dispatcher reads ``_last_alignment_dependencies`` to release the
+        # linked provider slots a retirement strands, so a pass that retires
+        # nothing (an early return, or a second pass whose keys are already
+        # staged for deletion) must not hand over the previous pass's list: the
+        # state it described has already been released, and nothing about this
+        # pass is being asked for.
+        self._last_alignment_dependencies = {}
         index = self._index(account_id)
         account = self._accounts[index]
         if account.get("auto_grouping") is not True:
@@ -5350,6 +5367,40 @@ class RelayAccountsDomain:
             for operation in self._pending_operations
         )
         valid_group_ids = {str(group.get("id", "")) for group in groups}
+        # Every remote deletion this pass stages, with the policy that governs
+        # it.  A retirement is not one call site: a group's duplicates are
+        # retired inside the layout loop, and the keys no group adopted are
+        # retired afterwards.  Reporting only the second set left the first
+        # set's provider slots and routes behind — the group kept a key while
+        # the slot the user had imported for the duplicate stayed in the
+        # document, answering with the credential the station had just revoked.
+        # Only a staged remote delete can strand a slot: a pending create this
+        # pass drops never reached the station, so nothing could have bound it.
+        retired: list[dict[str, str]] = []
+
+        def retire(resource_id: str) -> None:
+            if not resource_id:
+                return
+            self.delete_api_key(
+                account_id,
+                resource_id,
+                dependency_policy="delete_models",
+                _allow_auto_grouping=True,
+            )
+            if not any(
+                operation.get("kind") == "api_key_delete"
+                and operation.get("state") == "staged"
+                for operation in self._pending_for_resource(str(account["id"]), resource_id)
+            ):
+                return
+            retired.append(
+                {
+                    "station_id": str(account.get("station_id", "")),
+                    "account_id": str(account.get("id", "")),
+                    "resource_id": resource_id,
+                }
+            )
+
         # Every key whose group the station no longer offers.  These are the
         # candidates a group with no key of its own is filled from, and only
         # what is left over afterwards is retired.
@@ -5429,12 +5480,7 @@ class RelayAccountsDomain:
             for duplicate in available[1:]:
                 duplicate_id = str(duplicate.get("id", ""))
                 if duplicate_id:
-                    self.delete_api_key(
-                        account_id,
-                        duplicate_id,
-                        dependency_policy="delete_models",
-                        _allow_auto_grouping=True,
-                    )
+                    retire(duplicate_id)
             resource_id = str(primary.get("id", ""))
             if str(primary.get("name", "")) != group_name:
                 self.update_api_key(
@@ -5453,38 +5499,25 @@ class RelayAccountsDomain:
         # Whatever no group adopted is retired: a key filed under a group the
         # station no longer offers is not part of a one-key-per-group layout, and
         # leaving it would put a row in the pane that no group can explain.
-        # Each of these is a remote delete, so the account records the resource
-        # and the dependency policy that governs it: the coordinator reads that
-        # record to retire the linked provider slot and its routes before the
-        # station call, and a deletion this Core stages without it leaves the
-        # document pointing at a key the station no longer serves — the pane
-        # shows the dangling key and its route keeps a credential that was
-        # revoked upstream.
-        retired: list[dict[str, str]] = []
+        # The account records each resource with the dependency policy that
+        # governs it, and the coordinator applies that policy to the linked
+        # provider slot and its routes before the station call.
         for orphan in orphans:
-            resource_id = str(orphan.get("id", ""))
-            if not resource_id:
-                continue
-            self.delete_api_key(
-                account_id,
-                resource_id,
-                dependency_policy="delete_models",
-                _allow_auto_grouping=True,
-            )
-            retired.append(
-                {
-                    "station_id": str(account.get("station_id", "")),
-                    "account_id": str(account.get("id", "")),
-                    "resource_id": resource_id,
-                }
-            )
-        self._last_alignment_dependencies = {
-            "kind": "api_key_auto_group_align",
-            "account_id": str(account.get("id", "")),
-            "station_id": str(account.get("station_id", "")),
-            "dependency_policy": "delete_models",
-            "resources": retired,
-        }
+            retire(str(orphan.get("id", "")))
+        # A pass that retires nothing reports nothing: the dispatcher hands these
+        # rows straight to the provider dependency policy, so an empty list is
+        # only a slower way of saying the same thing.
+        self._last_alignment_dependencies = (
+            {
+                "kind": "api_key_auto_group_align",
+                "account_id": str(account.get("id", "")),
+                "station_id": str(account.get("station_id", "")),
+                "dependency_policy": "delete_models",
+                "resources": retired,
+            }
+            if retired
+            else {}
+        )
         self._accounts[index]["auto_grouping"] = True
         self._accounts[index] = _private_account(self._accounts[index])
         after_resources = tuple(
@@ -5531,6 +5564,10 @@ class RelayAccountsDomain:
         index = self._index(account_id)
         account = self._accounts[index]
         canonical_account_id = str(account["id"])
+        # A toggle-off restores the draft this switch staged, so a retirement
+        # from an earlier pass is not this call's answer either.  Every entry
+        # point that can run alignment reports only what it just retired.
+        self._last_alignment_dependencies = {}
         if not enabled:
             restored = self._restore_auto_grouping_draft(canonical_account_id)
             if restored is not None:

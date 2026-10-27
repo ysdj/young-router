@@ -647,9 +647,13 @@ def _normalize_response_function_call_arguments(payload: Any) -> None:
         payload["response"] = normalized_response
 
 def _stream_chunk_error_payload(chunk: Any) -> Any:
-    sse_payload = _sse_stream_chunk_payload(chunk)
-    if sse_payload is not None:
-        return _stream_chunk_error_payload(sse_payload)
+    # A read that carries an ``event: error`` frame beside provider output is
+    # still an error: joining the read's ``data:`` lines and parsing them as one
+    # payload answered nothing, so a route that failed mid-read looked healthy.
+    for payload in _sse_stream_chunk_payloads(chunk):
+        error = _stream_chunk_error_payload(payload)
+        if error is not None:
+            return error
     if isinstance(chunk, dict):
         error = chunk.get("error")
         if error is not None:
@@ -807,27 +811,55 @@ def _stream_chunk_dump(chunk: Any) -> dict[str, Any]:
         return dumped if isinstance(dumped, dict) else {}
     return {}
 
-def _sse_stream_chunk_payload(chunk: Any) -> Optional[dict[str, Any]]:
-    """Decode a structured wire chunk for local classification, never delivery."""
+def _sse_stream_chunk_text(chunk: Any) -> Optional[str]:
+    """The wire text of an encoded stream chunk, or ``None`` for any other shape."""
 
     if isinstance(chunk, bytes):
         try:
-            text = chunk.decode("utf-8")
+            return chunk.decode("utf-8")
         except UnicodeDecodeError:
             return None
-    elif isinstance(chunk, str):
-        text = chunk
-    else:
-        return None
+    if isinstance(chunk, str):
+        return chunk
+    return None
+
+def _sse_stream_frame_payloads(text: str) -> list[dict[str, Any]]:
+    """Decode every complete SSE frame a transport read carries, in order.
+
+    A provider transport hands over whatever bytes one socket read returned, so
+    a single chunk routinely carries several frames -- ``message_delta`` and
+    ``message_stop`` are usually written together, and so are the lifecycle
+    frames of a fast answer.  Classifying only the last ``data:`` line of such a
+    read (what a flattened line scan does) sees the terminal frame but drops the
+    ceiling reason beside it, and the reverse: the terminal frame is invisible
+    to a scan that stops at the first payload.  Every predicate downstream --
+    terminal detection, the output-ceiling reason, visible output, and the
+    error classifier -- asks about one frame, so the frames are decoded here and
+    the caller asks each of them.
+
+    A read that is not a frame sequence (a bare JSON body, or a fragment still
+    missing its terminator) keeps the previous single-payload reading.
+    """
+
+    frames: list[dict[str, Any]] = []
+    for block in re.split(r"\r\n\r\n|\n\n|\r\r", text):
+        if not block.strip():
+            continue
+        payload = _sse_frame_payload_from_block(block)
+        if payload is not None:
+            frames.append(payload)
+    return frames
+
+def _sse_frame_payload_from_block(block: str) -> Optional[dict[str, Any]]:
     event_type: Optional[str] = None
     data_lines: list[str] = []
-    for line in text.splitlines():
+    for line in block.splitlines():
         if line.startswith("event:"):
             value = line.split(":", 1)[1].strip()
             event_type = value or None
         elif line.startswith("data:"):
             data_lines.append(line.split(":", 1)[1].strip())
-    payload_text = "\n".join(data_lines) if data_lines else text.strip()
+    payload_text = "\n".join(data_lines) if data_lines else block.strip()
     if not data_lines and not payload_text.startswith("{"):
         return None
     try:
@@ -847,10 +879,64 @@ def _sse_stream_chunk_payload(chunk: Any) -> Optional[dict[str, Any]]:
         payload["type"] = event_type
     return payload
 
+def _sse_stream_chunk_payloads(chunk: Any) -> list[dict[str, Any]]:
+    """Decode a structured wire chunk for local classification, never delivery.
+
+    Returns one payload per frame the read carries, so a coalesced read is read
+    as the sequence of frames it is rather than as whichever frame a flattened
+    scan happened to keep.
+    """
+
+    text = _sse_stream_chunk_text(chunk)
+    if text is None:
+        return []
+    return _sse_stream_frame_payloads(text)
+
+def _sse_stream_chunk_payload(chunk: Any) -> Optional[dict[str, Any]]:
+    """The first structured payload a wire chunk carries, if any."""
+
+    payloads = _sse_stream_chunk_payloads(chunk)
+    return payloads[0] if payloads else None
+
+def _stream_chunk_dumps(chunk: Any) -> list[dict[str, Any]]:
+    """Every frame this chunk carries, in wire order.
+
+    A dict (or a Responses event) is one frame.  An encoded native read is
+    whatever one socket read returned, which is usually several frames; the
+    yes/no questions asked below -- is this terminal, does it carry output, does
+    it carry an error -- are asked about the read as a whole, so they must see
+    every frame instead of only whichever one a flattened scan kept.
+    """
+
+    if isinstance(chunk, dict):
+        return [chunk]
+    payloads = _sse_stream_chunk_payloads(chunk)
+    if payloads:
+        return payloads
+    if hasattr(chunk, "model_dump"):
+        try:
+            dumped = chunk.model_dump()
+        except Exception:
+            return []
+        return [dumped] if isinstance(dumped, dict) else []
+    return []
+
 def _stream_chunk_type(chunk: Any) -> str:
-    dumped = _stream_chunk_dump(chunk)
-    chunk_type = dumped.get("type")
-    return chunk_type if isinstance(chunk_type, str) else ""
+    """The frame type this chunk is read as.
+
+    A coalesced transport read is named by its most advanced frame: that is the
+    one whose arrival released a start buffer or closed a lifecycle, and naming
+    the read after an earlier frame in the same read (or after nothing at all,
+    which is what an unparseable joined payload produced) hid the frame that
+    actually decided.
+    """
+
+    dumps = _stream_chunk_dumps(chunk)
+    for dumped in reversed(dumps):
+        chunk_type = dumped.get("type")
+        if isinstance(chunk_type, str) and chunk_type:
+            return chunk_type
+    return ""
 
 def _stream_chunk_response_status(chunk: Any) -> str:
     dumped = _stream_chunk_dump(chunk)
@@ -922,6 +1008,7 @@ def _is_young_router_terminal_failure_event(chunk: Any) -> bool:
         "image_generation_tool_unavailable",
         "router_restarting",
         "upstream_account_restricted",
+        "upstream_client_outdated",
         "insufficient_quota",
         "upstream_compaction_failure",
         "upstream_compaction_unsupported",
@@ -1426,10 +1513,19 @@ def _synthesized_failed_response_event(
 
     ``after_visible_output`` says the client already rendered part of this
     answer, so neither the fallback nor the recovery poll can be used: replaying
-    the turn would duplicate what the reader has already seen.  Only the sentence
-    changes for that case -- a stop the router *did* classify must not be
-    described as one it could not, and a recovery policy here means "send it
-    again", which no other branch can say.
+    the turn would duplicate what the reader has already seen.  A cause with its
+    own classifier gets the same branch and code either way -- only the sentence
+    may mention streaming -- because which way the router answers a stop has
+    nothing to do with whether the client happened to render bytes first.  A
+    classified stop that fell through to the unclassified branch was reported
+    as one the router could not explain, and Pi's retry classifier matches none
+    of that sentence, so the turn died with no resend at all.
+
+    ``after_visible_output`` also is not a statement about the router's own
+    willingness to wait: the route-recovery poll reaches this builder with the
+    exception that ended its window, and that window expiring is what makes the
+    stop terminal *here* -- not something the client can be told to sit through
+    again.
     """
     if _routing_module._is_local_shutdown_exception(exception):
         # This worker truncated the stream because it is the one being replaced,
@@ -1533,6 +1629,19 @@ def _synthesized_failed_response_event(
         message = _routing_module._upstream_account_restricted_message(model_group)
         error_type = "invalid_request_error"
         error_code = "upstream_account_restricted"
+    elif _routing_module._is_upstream_client_version_rejected_error(exception):
+        # The route's own channel client is what is stale; the same bytes meet
+        # the same answer, so this stop must not read as a retry tip.
+        model_group = (
+            _responses_execution_module._request_model_group(request_data)
+            or request_data.get("model")
+            or "the requested model"
+        )
+        message = _routing_module._upstream_client_version_rejected_message(
+            model_group
+        )
+        error_type = "invalid_request_error"
+        error_code = "upstream_client_outdated"
     elif _routing_module._is_upstream_tool_history_rejected_error(exception):
         # The route refused this replay because a tool call and its output no
         # longer pair.  The client can only fix that by starting a new task, so
@@ -1599,20 +1708,28 @@ def _synthesized_failed_response_event(
         )
         error_type = "server_error"
         error_code = "upstream_stream_truncated"
-    elif after_visible_output and _routing_module._is_local_stream_timeout_error(
-        exception
-    ):
+    elif _routing_module._is_local_stream_timeout_error(exception):
         # This worker's stall watchdog gave up on a route that had gone quiet.
-        # Scope is the active stream only: the recovery poll reaches this same
-        # builder when its whole window expires without a first event, and that
-        # verdict is deliberately terminal (the router already waited as long as
-        # it was willing to) rather than an invitation to wait again.
+        # ``after_visible_output`` is deliberately absent from this test: the
+        # watchdog fires both while an answer streams and when the route never
+        # produced a first event, and the recovery poll arrives here with the
+        # same verdict once its window expired against a silent route.  Gating
+        # on visible output left the second case -- the common one, since a
+        # route that answers nothing is what the start watchdog exists for --
+        # falling through to the unclassified branch, which said the router
+        # could not classify a stop whose trace recorded ``stream_start_timeout``
+        # exactly.  Pi matches its retry phrases against that sentence, matched
+        # none, and ended a turn a resend would have served: observed as a live
+        # 390s turn that died on a silent route.
         #
-        # The stop is transient and the route was not refused, so the event
-        # names the stall and its own code -- which also carries the word the
-        # client's retry classifier keys on, so a quiet upstream does not end
-        # the turn.  Falling through used to report it as unclassified, which
-        # was false: the trace recorded ``stream_idle_timeout``.
+        # So the stop is named with its own code either way.  Both sentences
+        # carry "ended without", one of the client's retry phrases, because the
+        # router's wait being over says nothing about the client's next request:
+        # that one is a fresh attempt whose cooled route is no longer first.
+        #
+        # The recovery poll does stop here rather than replaying the same silent
+        # route (see ``_route_recovery_poll_keep_going``); only the sentence the
+        # client reads is unaffected by that decision.
         model_group = (
             _responses_execution_module._request_model_group(request_data)
             or request_data.get("model")
@@ -1650,19 +1767,24 @@ def _synthesized_failed_response_event(
         error_type = "invalid_request_error"
         error_code = "invalid_prompt"
     elif (
-        after_visible_output
-        and _routing_module._is_route_recovery_poll_error(exception)
+        _routing_module._is_route_recovery_poll_error(exception)
         # This worker's own stall watchdog already names its cause and keeps its
         # own terminal code; reporting its verdict as an upstream drop would
         # invent a connection failure that never happened.
         and not _routing_module._is_local_stream_timeout_error(exception)
     ):
-        # Reachable only here: the stream already delivered part of this answer,
-        # so the recovery poll cannot run (a replay would duplicate output) and
-        # the route still has a retryable policy.  Falling through to the
-        # unclassified sentence below was a lie -- the trace already recorded
-        # ``upstream-network-connectivity`` -- and it gave the reader no way to
-        # know that resending is what works.
+        # The route failed with a policy the router calls retryable, so the
+        # cause is known even when nothing was rendered yet.
+        #
+        # ``after_visible_output`` used to gate this branch as well, which made
+        # every such stop before the first byte -- a cooled-down pool, a route
+        # that answered 5xx, a dropped connection the recovery poll finished its
+        # window on -- read as the unclassified stop below.  The trace recorded
+        # ``upstream-network-connectivity`` while the client was told nothing
+        # could explain the stop, so Pi's classifier matched nothing and the
+        # turn ended.  The sentence now always names the cause; only its second
+        # clause differs, because "while the answer was streaming" is false when
+        # nothing had streamed.
         #
         # The wording carries a client contract, not just a prose choice.  Pi
         # classifies a failed turn with ``isRetryableAssistantError`` in
@@ -1679,20 +1801,35 @@ def _synthesized_failed_response_event(
             or "the requested model"
         )
         if _routing_module._is_network_recovery_exception(exception):
-            message = (
-                f"{model_group} closed this connection while the answer was "
-                "streaming, so the stream ended without a terminal response "
-                "event. Send the message again and it will continue on a "
-                "working route."
-            )
+            if after_visible_output:
+                message = (
+                    f"{model_group} closed this connection while the answer was "
+                    "streaming, so the stream ended without a terminal response "
+                    "event. Send the message again and it will continue on a "
+                    "working route."
+                )
+            else:
+                message = (
+                    f"{model_group} closed the connection before this turn could "
+                    "answer, so the stream ended without a terminal response "
+                    "event. Send the message again and it will continue on a "
+                    "working route."
+                )
             error_code = "upstream_connection_dropped"
         else:
-            message = (
-                f"{model_group} stopped answering while this turn was "
-                "streaming, so the stream ended without a terminal response "
-                "event. Send the message again and it will continue on a "
-                "working route."
-            )
+            if after_visible_output:
+                message = (
+                    f"{model_group} stopped answering while this turn was "
+                    "streaming, so the stream ended without a terminal response "
+                    "event. Send the message again and it will continue on a "
+                    "working route."
+                )
+            else:
+                message = (
+                    f"{model_group} produced no answer for this turn, so the "
+                    "stream ended without a terminal response event. Send the "
+                    "message again and it will continue on a working route."
+                )
             error_code = "upstream_stream_interrupted"
         error_type = "server_error"
     else:
@@ -1768,6 +1905,7 @@ def _synthesized_native_stream_error_chunk(
             "upstream_prompt_rejected",
             "image_generation_tool_unavailable",
             "upstream_account_restricted",
+            "upstream_client_outdated",
         }
         else "server_error"
     )
@@ -1807,6 +1945,10 @@ def _native_stream_error_code(exception: Exception) -> str:
         return "upstream_relay_capacity"
     if _routing_module._is_upstream_account_restricted_error(exception):
         return "upstream_account_restricted"
+    if _routing_module._is_upstream_client_version_rejected_error(exception):
+        # A code of its own: the route's channel client is stale, which is a
+        # configuration change, not a transport hiccup worth reconnecting for.
+        return "upstream_client_outdated"
     if _routing_module._is_upstream_tool_history_rejected_error(exception):
         return "invalid_prompt"
     if _routing_module._is_upstream_deployment_failover_error(exception):
@@ -1836,15 +1978,20 @@ def _native_stream_error_message(
             "turn was terminated. Send the message again."
         )
     if _routing_module._is_local_stream_start_timeout_error(exception):
+        # The sentence itself has to carry a phrase Pi's retry classifier knows:
+        # the Anthropic wire shape below sends only this message (no error
+        # code), so a sentence that reads as advice ends the turn there even
+        # though the cause is transient and the router already cooled the route.
         return (
-            "The upstream model route produced no response in time. Send the "
-            "message again or choose another model route."
+            "The upstream model route produced no response in time, so the "
+            "stream ended without a terminal response event. Send the message "
+            "again or choose another model route."
         )
     if _routing_module._is_local_stream_timeout_error(exception):
         return (
             "The upstream model route stopped sending this response, so the "
-            "turn was cut short. Send the message again or choose another "
-            "model route."
+            "stream ended without a terminal response event. Send the message "
+            "again or choose another model route."
         )
     if _routing_module._is_context_size_error(exception):
         # A terminal ``response.failed`` event for a context refusal is read by
@@ -1871,6 +2018,15 @@ def _native_stream_error_message(
             or "the requested model"
         )
         return _routing_module._upstream_account_restricted_message(model_group)
+    if _routing_module._is_upstream_client_version_rejected_error(exception):
+        # The route's bundled client is stale, so the same bytes meet the same
+        # refusal: name the route's own problem, never a resend.
+        model_group = (
+            _responses_execution_module._request_model_group(request_data)
+            or request_data.get("model")
+            or "the requested model"
+        )
+        return _routing_module._upstream_client_version_rejected_message(model_group)
     if _routing_module._is_upstream_tool_history_rejected_error(exception):
         # The replay cannot be repaired on the client's side by sending it
         # again: the interrupted tool call stays in the history forever.
@@ -2048,13 +2204,24 @@ def _stream_chunk_has_visible_text_output(chunk: Any) -> bool:
     return any("output_text" in item_type for item_type in types)
 
 def _stream_chunk_has_visible_output(chunk: Any) -> bool:
-    dumped = _stream_chunk_dump(chunk)
-    visible_chunk = dumped if dumped else chunk
-    return bool(
-        _stream_chunk_has_visible_text_output(visible_chunk)
-        or _image_generation_module._response_has_image_generation_activity(visible_chunk)
-        or _response_has_tool_call_activity(visible_chunk)
-    )
+    """Whether any frame in this chunk carries output the client can read.
+
+    The answer is about the read, not about one frame in it: a transport read
+    that carries a delta beside its own lifecycle frames has shown the reader
+    that delta, and reading only the first frame of such a read is how a
+    delivered answer was mistaken for a route that had produced nothing.
+    """
+
+    dumps = _stream_chunk_dumps(chunk)
+    candidates = dumps if dumps else [chunk]
+    for candidate in candidates:
+        if _stream_chunk_has_visible_text_output(candidate):
+            return True
+        if _image_generation_module._response_has_image_generation_activity(candidate):
+            return True
+        if _response_has_tool_call_activity(candidate):
+            return True
+    return False
 
 def _stream_chunk_is_public_reasoning_delta(chunk: Any) -> bool:
     """Whether this frame is thinking the client can already read.
@@ -2066,14 +2233,16 @@ def _stream_chunk_is_public_reasoning_delta(chunk: Any) -> bool:
     that produced nothing but a preamble may be replaced.
     """
 
-    dumped = _stream_chunk_dump(chunk)
-    visible_chunk = dumped if dumped else chunk
-    if not _web_search_native_module._is_public_reasoning_summary_stream_event(
-        _stream_chunk_type(visible_chunk)
-    ):
-        return False
-    delta = visible_chunk.get("delta") if isinstance(visible_chunk, dict) else None
-    return isinstance(delta, str) and bool(delta.strip())
+    dumps = _stream_chunk_dumps(chunk)
+    for visible_chunk in dumps if dumps else [chunk]:
+        if not _web_search_native_module._is_public_reasoning_summary_stream_event(
+            _stream_chunk_type(visible_chunk)
+        ):
+            continue
+        delta = visible_chunk.get("delta") if isinstance(visible_chunk, dict) else None
+        if isinstance(delta, str) and delta.strip():
+            return True
+    return False
 
 
 def _stream_chunk_has_delivered_output(chunk: Any) -> bool:
@@ -2709,14 +2878,15 @@ def _stream_chunk_reasoning_only_text(chunk: Any) -> str:
     return ""
 
 def _stream_chunk_has_meaningful_delta(chunk: Any) -> bool:
-    dumped = _stream_chunk_dump(chunk)
-    chunk_type = _stream_chunk_type(dumped)
-    if isinstance(chunk_type, str) and chunk_type.endswith(".delta"):
-        delta = dumped.get("delta") if isinstance(dumped, dict) else None
-        if isinstance(delta, str):
-            return bool(delta.strip())
-        if delta not in (None, "", [], {}):
-            return True
+    dumps = _stream_chunk_dumps(chunk)
+    for dumped in dumps if dumps else [chunk]:
+        chunk_type = _stream_chunk_type(dumped)
+        if isinstance(chunk_type, str) and chunk_type.endswith(".delta"):
+            delta = dumped.get("delta") if isinstance(dumped, dict) else None
+            if isinstance(delta, str) and delta.strip():
+                return True
+            if delta not in (None, "", [], {}):
+                return True
     if _stream_chunk_reasoning_only_text(chunk).strip():
         return True
     return _stream_chunk_has_visible_output(chunk)
@@ -2976,6 +3146,9 @@ def _build_streaming_error_fallback_payload(
     merged_litellm_metadata[_STREAM_ERROR_FALLBACK_METADATA_KEY] = True
     payload["litellm_metadata"] = merged_litellm_metadata
     payload["stream"] = True
+    # The replay states its protocol here because routing reads this key to
+    # classify the retry's client surface; the router dispatch below strips it
+    # again before calling (see ``_streaming_error_fallback_dispatch_kwargs``).
     if method_name == "aresponses":
         payload.setdefault("call_type", "aresponses")
     elif method_name == "anthropic_messages":
@@ -3018,6 +3191,22 @@ def _build_streaming_error_fallback_payload(
     if header_payload is not None:
         payload = header_payload
     return payload
+
+def _streaming_error_fallback_dispatch_kwargs(payload: dict) -> dict:
+    """The kwargs one fallback dispatch hands to the router method.
+
+    ``call_type`` is the router's own binding, not a request field: every method
+    here was built by ``factory_function(..., call_type=...)``, and the generic
+    dispatch ``anthropic_messages`` goes through re-passes that same value by
+    keyword.  Sending our copy as well raised ``_dispatch_generic_call_type()
+    got multiple values for keyword argument 'call_type'`` before any upstream
+    call was made, so the one failover that could have replaced a truncated
+    Anthropic stream failed as a ``TypeError`` and the client saw the original
+    truncation instead.  Routing still needs the key on the payload (it is what
+    classifies the retry's client surface), so only the dispatch drops it.
+    """
+
+    return {key: value for key, value in payload.items() if key != "call_type"}
 
 def _apply_streaming_error_fallback_constraints(
     payload: dict,
@@ -3239,6 +3428,7 @@ async def _streaming_error_fallback_response(
     router_method = getattr(llm_router, method_name, None)
     if router_method is None:
         raise RuntimeError(f"LiteLLM router does not support {method_name} streaming fallback")
+    dispatch_kwargs = _streaming_error_fallback_dispatch_kwargs(payload)
 
     _trace_module._request_route_trace(
         "streaming_error_fallback_start", request_data,
@@ -3261,11 +3451,11 @@ async def _streaming_error_fallback_response(
         )
         if stream_start_timeout_seconds > 0:
             response = await asyncio.wait_for(
-                router_method(**payload),
+                router_method(**dispatch_kwargs),
                 timeout=stream_start_timeout_seconds,
             )
         else:
-            response = await router_method(**payload)
+            response = await router_method(**dispatch_kwargs)
         _routing_module._apply_current_selected_deployment_to_request(
             payload,
             selected_box=selected_deployment_box,
@@ -4315,6 +4505,10 @@ async def _yield_native_stream_with_output_limit_continuation(
     # Held back until the answer is finished so the client is never told an
     # unfinished answer was complete.
     withheld_ceiling_terminal: Optional[Any] = None
+    # The frames that close the answer the withheld ceiling frame belongs to.
+    # They are withheld with it and re-emitted only when no continuation runs,
+    # so the client always receives a complete terminal sequence.
+    withheld_ceiling_closers: List[Any] = []
     # Everything this answer has delivered, so a continuation resumes from the
     # end of it instead of restarting the answer.
     delivered_text_parts: List[str] = []
@@ -4358,6 +4552,12 @@ async def _yield_native_stream_with_output_limit_continuation(
             if not inspect_native_chunk(chunk):
                 return
             yield remember_delivered_text(chunk)
+        # Whether the ceiling frame has been withheld.  Once it has, the
+        # frames that close the same answer belong to it: ``message_stop``
+        # and the ``finish_reason`` terminal state the same completion the
+        # withheld frame described, so they are withheld with it rather than
+        # delivered ahead of the continuation that has not run yet.
+        ceiling_withheld = False
         async for chunk in _stream_with_idle_timeout(
             response,
             request_data,
@@ -4374,8 +4574,25 @@ async def _yield_native_stream_with_output_limit_continuation(
                 # This frame carries the answer's own completion state, so the
                 # delivery below is what decides whether it is ever sent.
                 withheld_ceiling_terminal = chunk
+                ceiling_withheld = True
                 native_chunk_count += 1
-                return
+                # The terminal frame that closes this answer arrives in its own
+                # transport read on some routes.  Returning here read the
+                # ceiling and dropped the stop: with no continuation possible
+                # the client was handed the withheld ``max_tokens`` frame and
+                # never the ``message_stop`` that ends it, so a finished answer
+                # rendered as one cut off at the route's output limit.  Keep
+                # reading and withhold the closing frames instead.
+                continue
+            if ceiling_withheld and _native_stream_chunk_is_terminal(
+                chunk,
+                request_data,
+                finished_choice_indices,
+            ):
+                # Same answer, so the same fate as the ceiling frame.
+                withheld_ceiling_closers.append(chunk)
+                native_chunk_count += 1
+                continue
             if not inspect_native_chunk(chunk):
                 return
             yield remember_delivered_text(chunk)
@@ -4439,6 +4656,11 @@ async def _yield_native_stream_with_output_limit_continuation(
         # the ceiling.
         if not continued:
             yield withheld_ceiling_terminal
+            # The frame that closes the withheld one travels with it.  Sending
+            # the ceiling alone left the client on an answer that never ended,
+            # which it renders as a reply cut off at the route's output limit.
+            for closer in withheld_ceiling_closers:
+                yield closer
         return
 
     if not saw_terminal:

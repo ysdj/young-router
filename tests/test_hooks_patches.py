@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import copy
+import json
+import tempfile
 import time
+import unittest
+from pathlib import Path
+from unittest import mock
 
 from hook_test_utils import *
 
@@ -536,6 +541,92 @@ class HookPatchTests(HookTestCase):
         self.assertEqual("openai/responses", record["deployment"]["surface"])
         self.assertEqual("openai/chat", record["deployment"]["upstream_url_surface"])
         self.assertEqual("fallback", record["deployment"]["upstream_protocol_mode"])
+
+    def test_images_surface_adapter_keeps_provider_values_but_strips_router_state(self) -> None:
+        hooks, _ = load_hook_module()
+        request = {
+            "model": "public-image",
+            "prompt": "draw a blue dot",
+            "call_type": "aimage_generation",
+            "litellm_params": {
+                "model": "openai/gpt-image-2.5-flare",
+                "api_base": "https://images.example.test/v1",
+                "custom_llm_provider": "openai",
+            },
+            "_young_router_upstream_url_surface": "openai/responses",
+            "_young_router_attempted_upstream_url_surfaces": ["openai/responses"],
+            "_young_router_upstream_url_surface_deployment_id": "image-route",
+            "_young_router_surface_target_deployment_id": "image-route",
+            "use_chat_completions_api": True,
+        }
+
+        hooks._apply_surface_adapter_to_request(
+            request,
+            "openai/responses",
+            "openai/gpt-image-2.5-flare",
+            function_name="aimage_generation",
+        )
+
+        self.assertEqual(request["model"], "openai/gpt-image-2.5-flare")
+        self.assertEqual(request["custom_llm_provider"], "openai")
+        self.assertEqual(request["api_base"], "https://images.example.test/v1")
+        for key in (
+            "litellm_params",
+            "use_chat_completions_api",
+            "_young_router_upstream_url_surface",
+            "_young_router_attempted_upstream_url_surfaces",
+            "_young_router_upstream_url_surface_deployment_id",
+            "_young_router_surface_target_deployment_id",
+        ):
+            self.assertNotIn(key, request)
+
+    def test_image_selection_trace_does_not_claim_a_text_surface(self) -> None:
+        hooks, _ = load_hook_module()
+        router_module = types.ModuleType("litellm.router")
+
+        class Router:
+            def _update_kwargs_with_deployment(self, deployment, kwargs, function_name=None):
+                kwargs["litellm_params"] = dict(deployment["litellm_params"])
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_selected_deployment_marker_patch()
+        deployment = {
+            "litellm_params": {
+                "model": "openai/gpt-image-2.5-flare",
+                "api_base": "https://images.example.test/v1",
+                "order": 1,
+            },
+            "model_info": {
+                "id": "image-route",
+                "upstream_url_surface": "openai/responses",
+            },
+        }
+        request = {
+            "model": "public-image",
+            "prompt": "draw",
+            "call_type": "aimage_generation",
+            "proxy_server_request": {
+                "url": "http://127.0.0.1:4000/v1/images/generations",
+                "method": "POST",
+            },
+        }
+
+        with self.assertLogs("young_router.route_trace", level="WARNING") as captured:
+            Router()._update_kwargs_with_deployment(
+                deployment,
+                request,
+                function_name="aimage_generation",
+            )
+
+        record = json.loads(captured.output[0].split("litellm_route_trace ", 1)[1])
+        self.assertNotIn("surface", record["deployment"])
+        self.assertIsNone(record["deployment"]["upstream_url_surface"])
+        self.assertEqual(
+            record["request"]["interface"]["effective_upstream_surface"],
+            "image_generation",
+        )
+
 
     def test_selected_deployment_marker_forwards_upstream_keywords_it_does_not_read(self) -> None:
         """A keyword LiteLLM adds to deployment selection must reach it.
@@ -4395,6 +4486,45 @@ class ChatBridgeReasoningReplayTests(HookTestCase):
         for message in built["messages"]:
             self.assertNotIn("reasoning_content", message)
 
+
+class ChatgptAccountCredentialPatchTests(unittest.TestCase):
+    """One ChatGPT account per deployment, without a second gateway."""
+
+    def test_a_route_reference_resolves_that_accounts_own_auth_file(self) -> None:
+        import young_router.proxy.patches as patches_module
+
+        with tempfile.TemporaryDirectory() as root:
+            for ref, token in (("provider-auth-a", "token-a"), ("provider-auth-b", "token-b")):
+                directory = Path(root) / "chatgpt" / ref
+                directory.mkdir(parents=True)
+                (directory / "auth.json").write_text(
+                    json.dumps({"access_token": token, "expires_at": 4102444800}),
+                    encoding="utf-8",
+                )
+
+            with mock.patch.dict("os.environ", {"YOUNG_ROUTER_PROVIDER_AUTH_ROOT": root}):
+                first = patches_module._chatgpt_account_authenticator("young-router-auth:provider-auth-a")
+                second = patches_module._chatgpt_account_authenticator("young-router-auth:provider-auth-b")
+                self.assertIsNotNone(first)
+                self.assertIsNotNone(second)
+                self.assertEqual("token-a", first.get_access_token())
+                self.assertEqual("token-b", second.get_access_token())
+                self.assertNotEqual(first.auth_file, second.auth_file)
+
+                # A plain key is not an account reference, and a reference whose
+                # account is not on disk is not silently bound to another
+                # account's credential: the adapter keeps its own behaviour.
+                self.assertIsNone(patches_module._chatgpt_account_authenticator("sk-plain-key"))
+                self.assertIsNone(patches_module._chatgpt_account_authenticator("young-router-auth:missing"))
+                self.assertIsNone(patches_module._chatgpt_account_authenticator("young-router-auth:../escape"))
+
+    def test_the_patch_is_installed_on_the_one_entry_point(self) -> None:
+        import young_router.proxy.patches as patches_module
+
+        source = (Path(__file__).resolve().parents[1] / "young_router/proxy/patches.py").read_text(encoding="utf-8")
+        install_all = source.split("def install_all() -> None:", 1)[1]
+        self.assertIn("_install_chatgpt_account_credential_patch()", install_all)
+        self.assertTrue(callable(patches_module._chatgpt_account_authenticator))
 
 if __name__ == "__main__":
     unittest.main()

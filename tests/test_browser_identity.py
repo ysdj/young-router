@@ -90,15 +90,19 @@ class BrowserIdentityLiteralTests(unittest.TestCase):
         # on WKWebView's default Safari string while every probe and dashboard
         # read sent the pinned one, so a station that binds a session to its
         # IP and User-Agent revoked the session the page had just created.
+        # One window carries every remote page now: the station sign-in and the
+        # provider hand-off are the same class, so there is one place that pins
+        # the identity for them.
+        self.assertNotIn("private final class NativeSignInWindow", macOS)
         for controller, remote in (
-            ("NativeProviderAuthController", True),
             ("NativeRelayLoginController", True),
             ("NativeReadOnlyCodeController", False),
         ):
             start = macOS.index(f"private final class {controller}")
             following = macOS.find("\nprivate final class ", start + 1)
             body = macOS[start:] if following == -1 else macOS[start:following]
-            self.assertIn("webView = WKWebView(frame: .zero, configuration: configuration)", body)
+            expected_view = "WKWebView" if remote is False else "NativeFirstMouseWebView"
+            self.assertIn(f"webView = {expected_view}(frame: .zero, configuration: configuration)", body)
             self.assertEqual(
                 remote,
                 "webView.customUserAgent = RelayBrowserIdentity.userAgent" in body,

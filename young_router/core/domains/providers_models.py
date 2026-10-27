@@ -44,6 +44,7 @@ from ...config.schema import (
     _provider_source,
     _relay_source,
     _stable_provider_key_id,
+    default_upstream_protocol_mode,
     infer_upstream_fallback_surface,
 )
 
@@ -821,6 +822,12 @@ class ProvidersModelsDomain:
                     and key in {"rpm", "tpm", "timeout", "allowed_openai_params", "drop_params", "additional_drop_params"}
                 }
                 live_probe = self._probe_overlay.get(name, {}).get(self._probe_model_key(model), {})
+                model_info_extra = model.get("model_info_extra", {})
+                image_model_metadata = (
+                    model_info_extra.get("image_model_metadata")
+                    if isinstance(model_info_extra, Mapping)
+                    else None
+                )
                 model_enabled = model.get("model_enabled", model.get("enabled", True)) is not False
                 effective_order = model.get("effective_order", model.get("order", 0))
                 manual_order = model.get("manual_order", model.get("order", 0))
@@ -900,6 +907,7 @@ class ProvidersModelsDomain:
                         ),
                         "supports_responses_image_generation_tool": bool(model.get("supports_responses_image_generation_tool")),
                         "supports_responses_image_generation_tool_present": bool(model.get("supports_responses_image_generation_tool_present")),
+                        "image_model_metadata": copy.deepcopy(image_model_metadata) if isinstance(image_model_metadata, Mapping) else None,
                         "litellm_extra": safe_litellm_extra,
                         "api_key_configured": model_key,
                         "deep_probe": self._deep_probe_plan(model),
@@ -958,6 +966,14 @@ class ProvidersModelsDomain:
             # own account window before it asks for a read.
             "auth_observed_seconds_ago": self._workbuddy_observed_age_seconds(provider_auth),
             "auth_active": self._provider_auth_active(provider_auth),
+            # One row per account this provider owns: the pane lists them the
+            # way a station lists its accounts, and each one answers, acts, and
+            # serves on its own.
+            "accounts": self._provider_account_states(provider, provider_auth),
+            # Which account stands behind this row, when the credential itself
+            # names one.  A sign-out action over a row that only says "OpenAI"
+            # asks the person to end a session they cannot identify.
+            "auth_account": self._provider_auth_account(provider_auth),
             "api_base": REDACT_TEXT(str(provider.get("api_base", ""))),
             "api_key_configured": configured_key,
             "api_key_names": api_key_names,
@@ -1035,6 +1051,57 @@ class ProvidersModelsDomain:
                 if name and isinstance(window, int) and not isinstance(window, bool) and window > 0:
                     windows[name] = window
         return windows
+
+    def _public_model_context_registry(self):
+        """Registry used by explicit model-list reads for public fallbacks."""
+
+        registry = getattr(self, "_public_model_contexts", None)
+        if registry is not None:
+            return registry
+        from ..model_contexts import ModelContextRegistry, default_context_cache_path
+
+        registry = ModelContextRegistry(
+            runtime_config_path=self.config_path,
+            runtime_settings_path=_default_runtime_settings_path(),
+            cache_path=default_context_cache_path(self.config_path.parent),
+            refresh_enabled=True,
+        )
+        self._public_model_contexts = registry
+        return registry
+
+    def _public_image_metadata(
+        self,
+        model_ids: Sequence[str],
+    ) -> dict[str, dict[str, Any]]:
+        likely_image_ids = [
+            model_id
+            for model_id in model_ids
+            if any(
+                marker in str(model_id).casefold()
+                for marker in (
+                    "image",
+                    "imagen",
+                    "flux",
+                    "dall-e",
+                    "dalle",
+                    "stable-diffusion",
+                    "recraft",
+                    "ideogram",
+                    "nano-banana",
+                    "qwen-image",
+                    "wan2.",
+                )
+            )
+        ]
+        if not likely_image_ids:
+            return {}
+        try:
+            return self._public_model_context_registry().image_metadata_for_model_ids(
+                likely_image_ids,
+                refresh=True,
+            )
+        except Exception:
+            return {}
 
     def _model_context_projection(self) -> dict[str, Any]:
         """Registry defaults for every public model the draft exposes.
@@ -1394,17 +1461,87 @@ class ProvidersModelsDomain:
         return capabilities
 
     @classmethod
+    def _model_image_metadata(cls, item: Mapping[str, Any]) -> dict[str, Any]:
+        """Keep the provider's live image-model contract, when published.
+
+        OpenRouter-compatible catalogs expose this through ``architecture`` and
+        ``supported_parameters``.  Other gateways sometimes use the same
+        fields at the top level.  This is deliberately a small allowlist: the
+        catalog is provider input, not an arbitrary object to persist into the
+        user's configuration.
+        """
+
+        architecture = item.get("architecture")
+        architecture = architecture if isinstance(architecture, Mapping) else {}
+        modalities = item.get("modalities")
+        modalities = modalities if isinstance(modalities, Mapping) else {}
+        input_modalities = architecture.get("input_modalities", modalities.get("input"))
+        output_modalities = architecture.get("output_modalities", modalities.get("output"))
+        if not isinstance(input_modalities, list):
+            input_modalities = []
+        if not isinstance(output_modalities, list):
+            output_modalities = []
+        model_type = str(item.get("type") or "").strip().lower()
+        is_image = (
+            model_type == "image"
+            or "image" in {str(value).strip().lower() for value in output_modalities}
+            or "image" in str(architecture.get("modality") or "").lower().split("->")[-1]
+        )
+        if not is_image:
+            return {}
+
+        metadata: dict[str, Any] = {"type": "image"}
+        for key, values in (
+            ("input_modalities", input_modalities),
+            ("output_modalities", output_modalities),
+        ):
+            normalized = [
+                str(value).strip()
+                for value in values[:16]
+                if isinstance(value, str) and value.strip()
+            ]
+            if normalized:
+                metadata[key] = normalized
+
+        supported = item.get("supported_parameters")
+        if isinstance(supported, list):
+            values = [
+                str(value).strip()
+                for value in supported[:128]
+                if isinstance(value, str) and value.strip()
+            ]
+            if values:
+                metadata["supported_parameters"] = list(dict.fromkeys(values))
+
+        defaults = item.get("default_parameters")
+        if isinstance(defaults, Mapping):
+            safe_defaults: dict[str, Any] = {}
+            for key, value in list(defaults.items())[:64]:
+                if not isinstance(key, str) or not key.strip():
+                    continue
+                if isinstance(value, (str, int, float, bool)) or value is None:
+                    safe_defaults[key.strip()] = value
+            if safe_defaults:
+                metadata["default_parameters"] = safe_defaults
+
+        for key in ("id", "canonical_slug", "canonical_model_id", "name", "last_updated"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                metadata[key] = value.strip()
+        return metadata
+
+    @classmethod
     def _model_catalog(
         cls,
         payload: object,
-    ) -> tuple[list[str], dict[str, dict[str, bool]], dict[str, int]] | None:
+    ) -> tuple[list[str], dict[str, dict[str, Any]], dict[str, int]] | None:
         if not isinstance(payload, Mapping):
             return None
         data = payload.get("data")
         if not isinstance(data, list):
             return None
         candidates: list[str] = []
-        capabilities: dict[str, dict[str, bool]] = {}
+        capabilities: dict[str, dict[str, Any]] = {}
         windows: dict[str, int] = {}
         seen: set[str] = set()
         for item in data:
@@ -1425,6 +1562,13 @@ class ProvidersModelsDomain:
                 if isinstance(item, Mapping)
                 else {}
             )
+            image_metadata = (
+                cls._model_image_metadata(item)
+                if isinstance(item, Mapping)
+                else {}
+            )
+            if image_metadata:
+                metadata["image_model_metadata"] = image_metadata
             if metadata:
                 # Some gateways repeat an id while attaching capability
                 # metadata only to one of the records. Merge missing fields
@@ -1557,6 +1701,13 @@ class ProvidersModelsDomain:
                 "model_count": 0,
             }
         candidates, model_capabilities, model_windows = catalog
+        public_image_metadata = self._public_image_metadata(candidates)
+        for candidate in candidates:
+            public_metadata = public_image_metadata.get(candidate)
+            if not public_metadata:
+                continue
+            existing = model_capabilities.setdefault(candidate, {})
+            existing.setdefault("image_model_metadata", public_metadata)
         result = {
             **summary,
             "available": True,
@@ -1598,6 +1749,18 @@ class ProvidersModelsDomain:
                     str(data.get("provider", "")) or catalog_provider, refresh=True
                 )
                 return self._last_operation
+        account_ref = str(data.get("account_ref", "") or "").strip()
+        if account_ref:
+            # 获取模型 on a signed-in account asks that account, not the
+            # provider's address: the roster it can serve is the one its own
+            # login grants, and no API key speaks for it.
+            summary = self._fetch_account_models(
+                provider,
+                self._safe_provider(provider, index)["id"],
+                account_ref,
+            )
+            self._last_operation = summary
+            return summary
         api_key_name = self._api_key_name(data["api_key_name"]) if "api_key_name" in data else None
         summary = self._fetch_provider_models(
             provider,
@@ -1606,6 +1769,107 @@ class ProvidersModelsDomain:
         )
         self._last_operation = summary
         return summary
+
+    _CHATGPT_MODELS_ENDPOINT = "https://chatgpt.com/backend-api/codex/models"
+    # The roster answers only a caller that names the client it is: without a
+    # client_version the request is refused as malformed before the account is
+    # even read.
+    _CHATGPT_CLIENT_VERSION = "0.48.0"
+
+    def _fetch_account_models(
+        self,
+        provider: Mapping[str, Any],
+        provider_id: str,
+        account_ref: str,
+    ) -> dict[str, Any]:
+        """List the models one signed-in ChatGPT account may serve.
+
+        A ChatGPT login does not answer ``/v1/models`` with an API key; it
+        answers its own roster endpoint as that account.  The token stays in
+        Core, and only the names it lists reach the draft.
+        """
+
+        summary: dict[str, Any] = {
+            "operation": "fetch_models",
+            "provider_id": provider_id,
+            "account_ref": account_ref,
+            "protocols": [self._MODEL_LIST_PROTOCOL],
+        }
+        credential = self._auth_manager().chatgpt_request_credential(account_ref)
+        token = credential.get("access_token", "")
+        if not token:
+            return {
+                **summary,
+                "available": False,
+                "detail": "The OpenAI account is not signed in",
+                "models": [],
+                "model_count": 0,
+            }
+        headers = browser_request_headers()
+        headers["Authorization"] = f"Bearer {token}"
+        account_id = credential.get("account_id", "")
+        if account_id:
+            headers["chatgpt-account-id"] = account_id
+        endpoint = f"{self._CHATGPT_MODELS_ENDPOINT}?client_version={self._CHATGPT_CLIENT_VERSION}"
+        request = urllib.request.Request(endpoint, headers=headers, method="GET")
+        try:
+            with isolated_http_opener().open(request, timeout=self._MODEL_LIST_TIMEOUT_SECONDS) as response:
+                status = getattr(response, "status", None)
+                if status is None:
+                    status = response.getcode()
+                body = response.read(self._MAX_MODEL_LIST_BYTES + 1)
+        except urllib.error.HTTPError as exc:
+            return {
+                **summary,
+                "available": False,
+                "detail": f"The account answered {exc.code}",
+                "models": [],
+                "model_count": 0,
+            }
+        except Exception:
+            return {
+                **summary,
+                "available": False,
+                "detail": "The OpenAI account is unreachable",
+                "models": [],
+                "model_count": 0,
+            }
+        if status != 200:
+            return {
+                **summary,
+                "available": False,
+                "detail": f"The account answered {status}",
+                "models": [],
+                "model_count": 0,
+            }
+        try:
+            payload = json.loads(body.decode("utf-8", "replace"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return {
+                **summary,
+                "available": False,
+                "detail": "The account model list could not be read",
+                "models": [],
+                "model_count": 0,
+            }
+        entries = payload.get("models") if isinstance(payload, Mapping) else None
+        names: list[str] = []
+        for entry in entries if isinstance(entries, list) else []:
+            if not isinstance(entry, Mapping):
+                continue
+            for field in ("slug", "id", "model"):
+                value = entry.get(field)
+                if isinstance(value, str) and value.strip():
+                    if value.strip() not in names:
+                        names.append(value.strip())
+                    break
+        return {
+            **summary,
+            "available": True,
+            "detail": "Account model list fetched" if names else "This account lists no models",
+            "models": names,
+            "model_count": len(names),
+        }
 
     def _fetch_pending_provider_models(self, pending: Mapping[str, Any]) -> dict[str, Any]:
         """List one not-yet-created provider's models from its staged key.
@@ -2577,6 +2841,25 @@ class ProvidersModelsDomain:
         return channel
 
     @staticmethod
+    def _provider_takes_user_keys(provider: Mapping[str, Any]) -> bool:
+        """Whether the user's own keys are a credential of this provider.
+
+        An account-backed row is a *service*, not one account: the OpenAI row
+        owns its signed-in accounts and the custom keys beside them, and the
+        config writer already writes one route per credential (see
+        ``_credential_scopes``).  So the slots those keys live in are the
+        user's to name, fill, and delete here, while a row whose transport
+        mints its own slot keeps that slot out of reach wherever the auth kind
+        is not enough on its own (a managed slot is refused by its value, see
+        ``_key_slot_is_managed``).
+        """
+
+        return ProvidersModelsDomain._provider_auth_state(provider)["kind"] in {
+            "api_key",
+            "openai_login",
+        }
+
+    @staticmethod
     def _provider_auth_state(provider: Mapping[str, Any]) -> dict[str, str]:
         """Read secret-free authentication metadata independently of endpoint source."""
 
@@ -3378,12 +3661,83 @@ class ProvidersModelsDomain:
             credential_ref = str(auth.get("credential_ref", "")).strip()
             if not credential_ref:
                 return "signed_out"
+            if kind == "openai_login":
+                # The row answers for the service, so its state is the best one
+                # any of its accounts is in: one signed-in account means the
+                # service serves, and an account still authorizing means the
+                # pane has a sign-in to follow even when another account is the
+                # first one listed.
+                states: list[str] = []
+                for entry in self._provider_accounts(provider):
+                    try:
+                        states.append(
+                            str(
+                                self._auth_manager()
+                                .status(kind, entry["ref"])
+                                .get("status", "signed_out")
+                            )
+                        )
+                    except Exception:
+                        states.append("error")
+                for candidate in ("signed_in", "authorizing", "expired", "error"):
+                    if candidate in states:
+                        return candidate
+                return "signed_out"
             try:
                 status = str(self._auth_manager().status(kind, credential_ref).get("status", "signed_out"))
             except Exception:
                 return "error"
             return status if status in {"signed_out", "authorizing", "signed_in", "expired", "error", "unsupported"} else "error"
         return "signed_in" if self._provider_auth_configured(provider, auth) else "signed_out"
+
+    def _provider_account_states(
+        self, provider: Mapping[str, Any], auth: Mapping[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Every account of this provider, with its own state and identity."""
+
+        if auth.get("kind") != "openai_login":
+            return []
+        manager = None
+        states: list[dict[str, Any]] = []
+        for entry in self._provider_accounts(provider):
+            ref = entry["ref"]
+            status: dict[str, Any] = {}
+            try:
+                manager = manager or self._auth_manager()
+                status = manager.status("openai_login", ref)
+            except Exception:
+                status = {}
+            states.append(
+                {
+                    "ref": ref,
+                    "label": entry.get("label", ""),
+                    "serving": entry.get(self._ACCOUNT_SERVING_KEY) is not False,
+                    "account": str(status.get("account", "") or ""),
+                    "status": str(status.get("status", "signed_out") or "signed_out"),
+                    "configured": bool(status.get("configured")),
+                    "expires_at": status.get("expires_at"),
+                    "active": bool(status.get("active")),
+                }
+            )
+        return states
+
+    def _provider_auth_account(self, auth: Mapping[str, Any]) -> str:
+        """The account identity a credential states, or nothing.
+
+        Read from the same live status the row's own state comes from, so the
+        pane never has to open a credential file itself.
+        """
+
+        if auth.get("kind") != "openai_login":
+            return ""
+        ref = str(auth.get("credential_ref", "")).strip()
+        if not ref:
+            return ""
+        try:
+            account = self._auth_manager().status("openai_login", ref).get("account")
+        except Exception:
+            return ""
+        return account if isinstance(account, str) and account else ""
 
     def _provider_auth_active(self, auth: Mapping[str, Any]) -> bool:
         if auth.get("kind") != "openai_login":
@@ -3395,44 +3749,6 @@ class ProvidersModelsDomain:
             return bool(self._auth_manager().status("openai_login", ref).get("active"))
         except Exception:
             return False
-
-    def _openai_runtime_slot_error(self, providers: object) -> str:
-        """Reject drafts that would route multiple accounts through one ChatGPT slot.
-
-        LiteLLM's ChatGPT adapter reads one process-global token directory.  A
-        disabled account can remain in the service-provider registry, but at
-        most one OpenAI login provider may be enabled in an applied config and
-        it must match the selected active credential when one exists.
-        """
-
-        if not isinstance(providers, list):
-            return ""
-        enabled: list[tuple[str, str]] = []
-        for provider in providers:
-            if not isinstance(provider, Mapping) or provider.get("enabled") is False:
-                continue
-            try:
-                auth = self._provider_auth_state(provider)
-            except DomainError:
-                return "Provider authentication is invalid"
-            if auth.get("kind") != "openai_login":
-                continue
-            ref = str(auth.get("credential_ref", "")).strip()
-            if not ref:
-                return "OpenAI login provider credential is unavailable"
-            enabled.append((str(provider.get("name", "")).strip(), ref))
-        if len(enabled) > 1:
-            return "Only one OpenAI login provider can be enabled at a time"
-        if not enabled:
-            return ""
-        try:
-            active_value = self._auth_manager().active_openai_ref()
-            active = active_value.strip() if isinstance(active_value, str) else ""
-        except Exception:
-            active = ""
-        if active and active != enabled[0][1]:
-            return "Enable the provider that owns the active OpenAI login"
-        return ""
 
     @staticmethod
     def _set_provider_source(provider: dict[str, Any], value: object) -> dict[str, str]:
@@ -3467,6 +3783,80 @@ class ProvidersModelsDomain:
     @staticmethod
     def _new_provider_auth_ref() -> str:
         return f"provider-auth-{uuid.uuid4().hex}"
+
+    # ------------------------------------------------------------------
+    # Accounts of one login-backed provider
+    #
+    # A ChatGPT provider is a *service*, not an account: one OpenAI row owns the
+    # accounts signed in to it, exactly as one relay station owns its relay
+    # accounts.  Signing in again must therefore add an account to the row, not
+    # a second row with a second name, and every account states its own
+    # credential reference because every account is served by its own
+    # deployment.
+    # ------------------------------------------------------------------
+
+    _ACCOUNT_SERVING_KEY = "enabled"
+
+    @classmethod
+    def _provider_accounts(cls, provider: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """The accounts of one login-backed provider, oldest first.
+
+        A provider written by an older build carries one credential reference
+        and no list; it reads as a provider with exactly that one account, so
+        every existing installation keeps serving without a migration step.
+        """
+
+        raw = provider.get("auth_accounts")
+        accounts: list[dict[str, Any]] = []
+        if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes, bytearray)):
+            for entry in raw:
+                if not isinstance(entry, Mapping):
+                    continue
+                ref = str(entry.get("ref", "")).strip()
+                if not ref:
+                    continue
+                accounts.append(
+                    {
+                        "ref": ref,
+                        "label": str(entry.get("label", "")).strip()[:320],
+                        cls._ACCOUNT_SERVING_KEY: entry.get(cls._ACCOUNT_SERVING_KEY) is not False,
+                    }
+                )
+        if not accounts:
+            legacy = provider.get("auth_credential_ref")
+            if isinstance(legacy, str) and legacy.strip():
+                accounts.append(
+                    {"ref": legacy.strip(), "label": "", cls._ACCOUNT_SERVING_KEY: True}
+                )
+        return accounts
+
+    @classmethod
+    def _set_provider_accounts(
+        cls, provider: dict[str, Any], accounts: Sequence[Mapping[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Store the list, and keep the legacy single reference in step.
+
+        The first account is mirrored into ``auth_credential_ref`` because the
+        config writer, the proxy patch's older shape, and earlier builds all
+        read that one field.  Nothing else in this module reads it for routing.
+        """
+
+        normalized = [
+            {
+                "ref": str(entry.get("ref", "")).strip(),
+                "label": str(entry.get("label", "")).strip()[:320],
+                cls._ACCOUNT_SERVING_KEY: entry.get(cls._ACCOUNT_SERVING_KEY) is not False,
+            }
+            for entry in accounts
+            if isinstance(entry, Mapping) and str(entry.get("ref", "")).strip()
+        ]
+        if normalized:
+            provider["auth_accounts"] = normalized
+            provider["auth_credential_ref"] = normalized[0]["ref"]
+        else:
+            provider.pop("auth_accounts", None)
+            provider.pop("auth_credential_ref", None)
+        return normalized
 
     @staticmethod
     def _provider_auth_env_value(credential_ref: str) -> str:
@@ -3510,6 +3900,15 @@ class ProvidersModelsDomain:
         if auth_kind == "openai_login":
             provider["api_base"] = ""
             cls._sync_primary_api_key(provider, [])
+            # One created provider owns one account until more sign in.  Written
+            # as a list from the first write, so every later read has a single
+            # shape to project instead of a special case.
+            if credential_ref:
+                cls._set_provider_accounts(
+                    provider,
+                    cls._provider_accounts(provider)
+                    or [{"ref": credential_ref, "label": ""}],
+                )
         elif auth_kind in workbuddy_module.WORKBUDDY_AUTH_KINDS:
             # The provider points at this Core's own loopback worker, never at
             # the WorkBuddy upstream: the worker owns the desktop credential,
@@ -3590,11 +3989,20 @@ class ProvidersModelsDomain:
             default_surface, default_mode = cls._account_route_defaults(provider)
             if default_surface and not str(model.get("upstream_url_surface", "")).strip():
                 model["upstream_url_surface"] = default_surface
-            if not str(model.get("upstream_protocol_mode", "")).strip():
-                model["upstream_protocol_mode"] = default_mode
             if not str(model.get("upstream_url_surface", "")).strip():
                 model["upstream_url_surface"] = infer_upstream_fallback_surface(
                     model.get("litellm_model")
+                )
+            if not str(model.get("upstream_protocol_mode", "")).strip():
+                # A provider that owns its transport states one mode for all of
+                # its routes.  A plain key states none, so the mode follows the
+                # route's own surface: an Anthropic-wire route starts pinned to
+                # the wire it serves, and every other route keeps following the
+                # client.
+                model["upstream_protocol_mode"] = (
+                    default_mode if default_surface else default_upstream_protocol_mode(
+                        model.get("upstream_url_surface")
+                    )
                 )
             model["litellm_model"] = cls._canonical_upstream_model(
                 model.get("litellm_model"), model, provider
@@ -3879,7 +4287,7 @@ class ProvidersModelsDomain:
         providers = self._draft["providers"]
         provider_index = self._provider_index(data)
         provider = self._copy_provider_for_edit(providers[provider_index])
-        if self._provider_auth_state(provider)["kind"] != "api_key":
+        if not self._provider_takes_user_keys(provider):
             raise DomainError("Provider keys are unavailable for account login")
         keys = self._provider_api_keys(provider)
 
@@ -3998,7 +4406,7 @@ class ProvidersModelsDomain:
     def _stage_provider_secret(self, provider_index: int, key_name: str | None, value: str) -> None:
         providers = self._draft["providers"]
         provider = self._copy_provider_for_edit(providers[provider_index])
-        if self._provider_auth_state(provider)["kind"] != "api_key":
+        if not self._provider_takes_user_keys(provider):
             raise DomainError("Provider keys are unavailable for account login")
         keys = self._provider_api_keys(provider)
         if key_name is None:
@@ -4017,11 +4425,11 @@ class ProvidersModelsDomain:
             raise DomainError("Relay provider key is managed by its source")
         # The provenance rule, beside the relay one because it is the same kind
         # of fact: a slot holding a reference this Core published belongs to the
-        # transport that publishes it.  The auth-kind check above already
-        # refuses an account-backed provider, but it answers only for the kinds
-        # that exist today; this refuses by what the value *is*, so a service
-        # that later mints a slot cannot be writable just because nobody added
-        # its name to a predicate.
+        # transport that publishes it.  The auth-kind check above answers for
+        # the kinds whose slots are never the user's, but it can only name the
+        # kinds that exist today; this refuses by what the value *is*, so a
+        # service that later mints a slot cannot be writable just because
+        # nobody added its name to a predicate.
         if self._key_slot_is_managed(keys[key_index].get("value")):
             raise DomainError("Provider key is owned by this deployment")
         keys[key_index]["value"] = value
@@ -4209,16 +4617,10 @@ class ProvidersModelsDomain:
         provider.pop("relay_station_id", None)
         provider["name"] = name
         provider["enabled"] = provider.get("enabled") is not False
-        # OpenAI's ChatGPT adapter has one process-global token directory.
-        # The first account owns that slot by default; subsequent accounts
-        # remain in the registry but start disabled until activation.
-        if kind == "openai_login":
-            has_openai_account = any(
-                isinstance(candidate, Mapping)
-                and self._provider_auth_state(candidate).get("kind") == "openai_login"
-                for candidate in self._draft.get("providers", [])
-            )
-            provider["enabled"] = not has_openai_account
+        # Every ChatGPT account is its own deployment (the route states its
+        # credential reference), so signed-in accounts do not compete for one
+        # runtime slot: a new one is enabled like an API-key provider, and two
+        # accounts answer as two routes of the same model group.
         provider["api_base"] = ""
         provider["models"] = []
         self._set_provider_source(provider, {"kind": "custom"})
@@ -4343,21 +4745,6 @@ class ProvidersModelsDomain:
             ):
                 raise DomainError("A provider with this name already exists")
             changes["name"] = next_name
-        if changes.get("enabled") is True and current_auth["kind"] == "openai_login":
-            try:
-                active = str(self._auth_manager().active_openai_ref()).strip()
-            except Exception:
-                active = ""
-            if active and active != current_auth.get("credential_ref", ""):
-                raise DomainError("Activate this OpenAI account before enabling it")
-            if any(
-                candidate_index != index
-                and isinstance(candidate, Mapping)
-                and candidate.get("enabled") is not False
-                and self._provider_auth_state(candidate).get("kind") == "openai_login"
-                for candidate_index, candidate in enumerate(providers)
-            ):
-                raise DomainError("Only one OpenAI login provider can be enabled at a time")
         provider.update(changes)
         self._sync_provider_identity_to_models(provider)
         providers[index] = provider
@@ -4407,16 +4794,10 @@ class ProvidersModelsDomain:
                 "auth_kind": auth["kind"],
                 "auth_status": str(result.get("status", "signed_in")),
                 "auth_active": True,
-                "requires_restart": True,
             }
-            # Keep the persisted draft truthful: all other OpenAI login
-            # accounts remain available for management but are not routable
-            # through LiteLLM's single ChatGPT runtime slot.
-            for candidate_index, candidate in enumerate(self._draft.get("providers", [])):
-                if not isinstance(candidate, dict):
-                    continue
-                if self._provider_auth_state(candidate).get("kind") == "openai_login":
-                    candidate["enabled"] = candidate_index == index
+            # Selecting an account is a UI preference (which row the pane opens
+            # on, and the marker older builds read); it no longer gates routing,
+            # because each account is its own deployment.
             return
         if action in {
             "service_provider_auth_start",
@@ -4427,11 +4808,8 @@ class ProvidersModelsDomain:
             self._service_provider_index(data)
             provider_action = action.removeprefix("service_")
             self._provider_auth_operation(provider_action, data)
-            if provider_action == "provider_auth_logout":
-                index = self._service_provider_index(data)
-                provider = self._draft["providers"][index]
-                if isinstance(provider, dict) and self._provider_auth_state(provider).get("kind") == "openai_login":
-                    provider["enabled"] = False
+            # Signing an account out ends that account, not the service: the row
+            # is what the user added once, and its account list is what changes.
             if isinstance(getattr(self, "_last_operation", None), dict):
                 self._last_operation["operation"] = action
             return
@@ -4443,12 +4821,11 @@ class ProvidersModelsDomain:
             self._draft["providers"].pop(index)
             if isinstance(removed, Mapping):
                 self._probe_overlay.pop(str(removed.get("name", "")).strip(), None)
-                try:
-                    self._auth_manager().logout(
-                        removed_auth["kind"], removed_auth["credential_ref"]
-                    )
-                except Exception:
-                    pass
+                for entry in self._provider_accounts(removed):
+                    try:
+                        self._auth_manager().logout(removed_auth["kind"], entry["ref"])
+                    except Exception:
+                        pass
             self._last_operation = {
                 "operation": "service_provider_delete",
                 "provider_id": removed_id,
@@ -4656,7 +5033,7 @@ class ProvidersModelsDomain:
         if action in {"provider_clear_key", "clear_provider_key"}:
             index = self._provider_index(data)
             provider = self._copy_provider_for_edit(providers[index])
-            if self._provider_auth_state(provider)["kind"] != "api_key":
+            if not self._provider_takes_user_keys(provider):
                 raise DomainError("Provider keys are unavailable for account login")
             self._sync_primary_api_key(provider, [])
             self._forget_provider_probe_results(provider)
@@ -4691,6 +5068,34 @@ class ProvidersModelsDomain:
             return
         raise DomainError("The requested provider action is unavailable")
 
+    def _provider_account_target(
+        self, provider: dict[str, Any], data: Mapping[str, Any], *, create: bool
+    ) -> str:
+        """The account of this provider one action is about.
+
+        ``create`` is the "add an account" case: the row itself is the service,
+        so signing in again appends an account to it instead of adding a second
+        provider with a second name.  Any other action names the account it
+        acts on, and a reference this provider does not own is refused rather
+        than applied to whichever account happens to be first.
+        """
+
+        requested = data.get("account_ref", data.get("credential_ref"))
+        ref = str(requested).strip() if isinstance(requested, str) else ""
+        accounts = self._provider_accounts(provider)
+        known = {entry["ref"] for entry in accounts}
+        if ref:
+            if ref not in known:
+                raise DomainError("The account is not part of this provider")
+            return ref
+        if create:
+            ref = self._new_provider_auth_ref()
+            self._set_provider_accounts(
+                provider, [*accounts, {"ref": ref, "label": "", self._ACCOUNT_SERVING_KEY: False}]
+            )
+            return ref
+        return accounts[0]["ref"] if accounts else ""
+
     def _provider_auth_operation(self, action: str, data: Mapping[str, Any]) -> dict[str, Any]:
         provider_index = self._provider_index(data)
         provider = self._draft["providers"][provider_index]
@@ -4698,26 +5103,55 @@ class ProvidersModelsDomain:
             raise DomainError("The selected provider is unavailable")
         auth = self._provider_auth_state(provider)
         kind = auth["kind"]
-        credential_ref = auth.get("credential_ref", "")
-        if kind == "api_key" or not credential_ref:
+        if kind == "api_key":
             raise DomainError("Account login is unavailable for this provider")
+        editable = self._draft["providers"][provider_index]
+        if not isinstance(editable, dict):
+            raise DomainError("The selected provider is unavailable")
         manager = self._auth_manager()
+        credential_ref = ""
         try:
-            if action == "provider_auth_start":
-                # Wait briefly for the device challenge so the native UI can
-                # display it in the same action result. The worker continues
-                # polling in the background after this bounded wait.
-                result = self.trusted_provider_auth_start(
-                    self._safe_provider(provider, provider_index)["id"]
-                )
-            elif action == "provider_auth_cancel":
-                result = manager.cancel(credential_ref)
-            elif action == "provider_auth_logout":
-                result = manager.logout(kind, credential_ref)
-            elif action == "provider_auth_status":
-                result = manager.status(kind, credential_ref)
+            if action == "provider_auth_logout" and not str(
+                data.get("account_ref", data.get("credential_ref", "")) or ""
+            ).strip():
+                # No account named: end every account this provider owns, which
+                # is what deleting the provider and the older single-account
+                # pane both mean.
+                for entry in self._provider_accounts(editable):
+                    try:
+                        manager.logout(kind, entry["ref"])
+                    except Exception:
+                        pass
+                self._set_provider_accounts(editable, [])
+                result = {"status": "signed_out", "configured": False}
             else:
-                raise DomainError("The requested provider login action is unavailable")
+                credential_ref = self._provider_account_target(
+                    editable, data, create=action == "provider_auth_start"
+                )
+                if not credential_ref:
+                    # A service with no account yet answers the state question
+                    # with the state it is in — nothing is signed in — instead of
+                    # refusing to answer at all: the pane polls this while the
+                    # row exists and before its first sign-in.
+                    if action != "provider_auth_status":
+                        raise DomainError("Account login is unavailable for this provider")
+                    result = {"status": "signed_out", "configured": False}
+                elif action == "provider_auth_start":
+                    # Wait briefly for the device challenge so the native UI can
+                    # display it in the same action result. The worker continues
+                    # polling in the background after this bounded wait.
+                    result = self.trusted_provider_auth_start(
+                        self._safe_provider(provider, provider_index)["id"],
+                        credential_ref,
+                    )
+                elif action == "provider_auth_cancel":
+                    result = manager.cancel(credential_ref)
+                elif action == "provider_auth_logout":
+                    result = manager.logout(kind, credential_ref)
+                elif action == "provider_auth_status":
+                    result = manager.status(kind, credential_ref)
+                else:
+                    raise DomainError("The requested provider login action is unavailable")
         except DomainError:
             raise
         except Exception:
@@ -4733,39 +5167,43 @@ class ProvidersModelsDomain:
             "auth_kind": kind,
             "auth_status": status,
             "configured": bool(result.get("configured")) if isinstance(result, Mapping) else False,
+            **({"account_ref": credential_ref} if credential_ref else {}),
         }
         if isinstance(result, Mapping):
             for key in ("verification_uri", "user_code", "redirect_uri"):
                 value = result.get(key)
                 if isinstance(value, str) and value:
                     summary[key] = value
-        if (
-            kind == "openai_login"
-            and action in {"provider_auth_cancel", "provider_auth_logout"}
-        ):
-            provider_copy = self._copy_provider_for_edit(provider)
-            provider_copy["enabled"] = False
-            self._draft["providers"][provider_index] = provider_copy
+        if kind == "openai_login" and action == "provider_auth_logout" and credential_ref:
+            # Signing one account out removes that account: a row left behind
+            # with no credential would be an account the pane cannot act on.
+            remaining = [
+                entry
+                for entry in self._provider_accounts(editable)
+                if entry["ref"] != credential_ref
+            ]
+            self._set_provider_accounts(editable, remaining)
         elif (
             kind == "openai_login"
             and action == "provider_auth_status"
             and isinstance(result, Mapping)
+            and credential_ref
         ):
-            if result.get("status") == "signed_in" and result.get("active") is True:
-                for candidate_index, candidate in enumerate(self._draft.get("providers", [])):
-                    if not isinstance(candidate, dict):
-                        continue
-                    candidate_auth = self._provider_auth_state(candidate)
-                    if candidate_auth.get("kind") == "openai_login":
-                        candidate["enabled"] = candidate_auth.get("credential_ref") == credential_ref
-            elif result.get("status") != "signed_in":
-                provider_copy = self._copy_provider_for_edit(provider)
-                provider_copy["enabled"] = False
-                self._draft["providers"][provider_index] = provider_copy
+            # Each account serves on its own: a completed sign-in marks *this*
+            # account as serving, a signed-out one parks it, and no sibling is
+            # touched.  The provider itself stays enabled while any account can
+            # serve, which is what the row's own switch then means.
+            accounts = self._provider_accounts(editable)
+            for entry in accounts:
+                if entry["ref"] == credential_ref:
+                    entry[self._ACCOUNT_SERVING_KEY] = result.get("status") == "signed_in"
+            self._set_provider_accounts(editable, accounts)
         self._last_operation = summary
         return summary
 
-    def trusted_provider_auth_start(self, provider_id: object) -> dict[str, Any]:
+    def trusted_provider_auth_start(
+        self, provider_id: object, credential_ref: object = None
+    ) -> dict[str, Any]:
         """Start login for the native host and return only the short-lived challenge."""
 
         index = self._provider_index({"provider_id": provider_id})
@@ -4773,23 +5211,25 @@ class ProvidersModelsDomain:
         if not isinstance(provider, Mapping):
             raise DomainError("The selected provider is unavailable")
         auth = self._provider_auth_state(provider)
-        if auth["kind"] == "api_key" or not auth.get("credential_ref"):
+        ref = str(credential_ref or auth.get("credential_ref", "")).strip()
+        if auth["kind"] == "api_key" or not ref:
             raise DomainError("Account login is unavailable for this provider")
         manager = self._auth_manager()
-        manager.start(auth["kind"], auth["credential_ref"])
+        manager.start(auth["kind"], ref)
         # Device-code generation is asynchronous. Return promptly with the
         # current authorizing state; the UI polls auth_status and opens the
         # WebView as soon as the challenge is available.
         deadline = time.monotonic() + 2
         result: Mapping[str, Any] = {}
         while time.monotonic() < deadline:
-            result = manager.status(auth["kind"], auth["credential_ref"])
+            result = manager.status(auth["kind"], ref)
             if result.get("user_code") or result.get("verification_uri") or result.get("status") != "authorizing":
                 break
             time.sleep(0.05)
         return {
             "provider_id": self._safe_provider(provider, index)["id"],
             "auth_kind": auth["kind"],
+            "account_ref": ref,
             "auth_status": str(result.get("status", "error")),
             **({"verification_uri": str(result["verification_uri"])} if result.get("verification_uri") else {}),
             **({"user_code": str(result["user_code"])} if result.get("user_code") else {}),
@@ -5056,7 +5496,16 @@ class ProvidersModelsDomain:
         if not str(model.get("upstream_url_surface", "")).strip():
             model["upstream_url_surface"] = self._default_upstream_surface(provider, model)
         if not str(model.get("upstream_protocol_mode", "")).strip():
-            model["upstream_protocol_mode"] = self._account_route_defaults(provider)[1]
+            # The mode follows the route's own surface when its provider states
+            # none: an Anthropic-wire route starts pinned to the wire it serves,
+            # because a relay channel that mounts Messages refuses the Responses
+            # shape and the fallback only pays that refused round trip first.
+            account_surface, account_mode = self._account_route_defaults(provider)
+            model["upstream_protocol_mode"] = (
+                account_mode
+                if account_surface
+                else default_upstream_protocol_mode(model.get("upstream_url_surface"))
+            )
         if "litellm_model" in model:
             model["litellm_model"] = self._canonical_upstream_model(
                 model["litellm_model"], model, provider
@@ -6332,6 +6781,39 @@ class ProvidersModelsDomain:
         return matched
 
     @staticmethod
+    def _policy_bound_key(
+        model: Mapping[str, Any],
+        keys: Sequence[Mapping[str, Any]],
+        target_ids: set[str],
+    ) -> str:
+        """The retired key one route is bound to, or ``""`` when it is not one.
+
+        A row's slot id is its binding whenever this provider still carries that
+        slot.  A row whose id names no slot here is the document the pane heals
+        by name — a rename re-derives every unnamed slot id, and a row keeps the
+        id it was written with — so the name decides then, and only then.  A row
+        that names no key at all follows the provider's default key, and is
+        therefore not retired together with one particular key: it follows
+        whichever key the provider keeps.  Reading only the slot id here is what
+        left such a row behind when its group's key was retired, so the pane
+        listed a route the station no longer served under a key it no longer had.
+        """
+
+        model_key_id = str(model.get("provider_key_id", "")).strip()
+        if model_key_id:
+            if model_key_id in target_ids:
+                return model_key_id
+            if any(item["id"] == model_key_id for item in keys):
+                return ""
+        model_key_name = str(model.get("api_key_name", "")).strip()
+        if not model_key_name:
+            return ""
+        for item in keys:
+            if item["name"] == model_key_name:
+                return item["id"] if item["id"] in target_ids else ""
+        return ""
+
+    @staticmethod
     def _rebind_target_id(
         rebind: object,
         old_key: Mapping[str, Any],
@@ -6447,12 +6929,13 @@ class ProvidersModelsDomain:
             for provider in working:
                 if not isinstance(provider, dict) or not isinstance(provider.get("models"), list):
                     continue
+                keys = self._provider_api_keys(provider)
                 before_count = len(provider["models"])
                 provider["models"] = [
                     model
                     for model in provider["models"]
                     if not isinstance(model, Mapping)
-                    or str(model.get("provider_key_id", "")).strip() not in target_ids
+                    or not self._policy_bound_key(model, keys, target_ids)
                 ]
                 result["deleted_models"] += before_count - len(provider["models"])
         elif policy_name == "detach":
@@ -6475,9 +6958,9 @@ class ProvidersModelsDomain:
                 if not isinstance(models, list):
                     continue
                 for model in models:
-                    if not isinstance(model, dict) or str(
-                        model.get("provider_key_id", "")
-                    ).strip() != key_id:
+                    if not isinstance(model, dict) or self._policy_bound_key(
+                        model, keys, target_ids
+                    ) != key_id:
                         continue
                     order = self._order_value(
                         model.get("effective_order", model.get("order", 0)),
@@ -6504,10 +6987,11 @@ class ProvidersModelsDomain:
                 models = provider.get("models", [])
                 if not isinstance(models, list):
                     continue
+                keys = self._provider_api_keys(provider)
                 for model in models:
-                    if not isinstance(model, dict) or str(
-                        model.get("provider_key_id", "")
-                    ).strip() not in target_ids:
+                    if not isinstance(model, dict) or not self._policy_bound_key(
+                        model, keys, target_ids
+                    ):
                         continue
                     order = self._order_value(
                         model.get("effective_order", model.get("order", 0)),
@@ -6541,20 +7025,22 @@ class ProvidersModelsDomain:
                 models = provider.get("models", [])
                 if not isinstance(models, list):
                     continue
+                keys = self._provider_api_keys(provider)
                 for model in models:
                     if not isinstance(model, Mapping):
                         continue
-                    old_key_id = str(model.get("provider_key_id", "")).strip()
-                    target = target_rebinds.get(old_key_id)
+                    old_key_id = self._policy_bound_key(model, keys, target_ids)
+                    target = target_rebinds.get(old_key_id) if old_key_id else None
                     if target is not None:
                         moves.append((provider_index, dict(model), target[0], target[1]))
             for provider in working:
                 if isinstance(provider, dict) and isinstance(provider.get("models"), list):
+                    keys = self._provider_api_keys(provider)
                     provider["models"] = [
                         model
                         for model in provider["models"]
                         if not isinstance(model, Mapping)
-                        or str(model.get("provider_key_id", "")).strip() not in target_ids
+                        or not self._policy_bound_key(model, keys, target_ids)
                     ]
             for _source_index, model, target_provider_index, target_key in moves:
                 target_provider = working[target_provider_index]
@@ -7400,10 +7886,23 @@ class ProvidersModelsDomain:
                 models = provider.get("models", [])
                 required_key_ids: set[str] = set()
                 referenced_key_ids: set[str] = set()
+                # Which keys a route names *itself*.  ``_key_for_model`` answers
+                # with the provider's first key for a route that names none, and
+                # that default must not be read as a route depending on a slot the
+                # user has only just created: it made a brand-new key "referenced",
+                # which exempted its still-empty value from the check below, and
+                # the document writer — which drops a valueless slot — then deleted
+                # the row on the next read.  That is the whole "＋ flashes and
+                # reverts" symptom.
+                named_key_ids: set[str] = set()
                 if isinstance(models, list):
                     for model in models:
                         if not isinstance(model, Mapping):
                             continue
+                        states_a_key = bool(
+                            str(model.get("provider_key_id", "")).strip()
+                            or str(model.get("api_key_name", "")).strip()
+                        )
                         key = _key_for_model(keys, model)
                         if key is None:
                             continue
@@ -7411,6 +7910,8 @@ class ProvidersModelsDomain:
                         if not key_id:
                             continue
                         referenced_key_ids.add(key_id)
+                        if states_a_key:
+                            named_key_ids.add(key_id)
                         if _model_is_live(provider, model):
                             required_key_ids.add(key_id)
                 # One coded issue per nameless-value key instead of a single
@@ -7429,7 +7930,7 @@ class ProvidersModelsDomain:
                         and key["source"].get("kind") == "relay"
                     ):
                         continue
-                    if key_id in referenced_key_ids and key_id not in required_key_ids:
+                    if key_id in named_key_ids and key_id not in required_key_ids:
                         continue
                     if key_id in self._model_edit_existing_key_ids and key_id not in required_key_ids:
                         continue
@@ -7451,9 +7952,6 @@ class ProvidersModelsDomain:
             if key_issues:
                 return {"valid": False, "issues": key_issues}
         candidate_providers = copy.deepcopy(providers)
-        runtime_slot_error = self._openai_runtime_slot_error(candidate_providers)
-        if runtime_slot_error:
-            return {"valid": False, "errors": [runtime_slot_error]}
         if allow_unmaterialized_relay_keys and isinstance(candidate_providers, list):
             for provider in candidate_providers:
                 if not isinstance(provider, dict):

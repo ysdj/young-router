@@ -10,6 +10,7 @@ from .schema import (
     current_managed_reference,
     DISABLED_MODELS_KEY,
     MENU_API_KEY_NAME_KEY,
+    MENU_CREDENTIAL_ROUTE_KEY,
     MENU_KEY_BINDING_KEY,
     MENU_MANUAL_ORDER_KEY,
     MENU_MODEL_ENABLED_KEY,
@@ -43,6 +44,7 @@ from .schema import (
     _string_value,
     _upstream_protocol_mode,
     _upstream_url_surface,
+    default_upstream_protocol_mode,
     infer_upstream_fallback_surface,
     load_yaml_text,
 )
@@ -67,18 +69,32 @@ def _provider_to_editor(name: str, value: Any) -> dict[str, Any]:
     extra = {
         key: _jsonable(raw_value)
         for key, raw_value in provider.items()
-        if key not in {"enabled", "api_base", "api_keys"}
+        # ``auth_accounts`` is read below as a field of its own: left in the
+        # extras bucket it was written back as an extension and the next save
+        # dropped the list — the row came back with one account where it had
+        # two, and a second sign-in silently replaced the first one's session.
+        if key not in {"enabled", "api_base", "api_keys", "auth_accounts"}
     }
     # Legacy documents get deterministic independent IDs on first load. The
     # dumper persists them in this existing provider-extra extension without
     # ever copying credential values into metadata.
     extra[MENU_RELAY_KEYS_KEY] = _relay_key_metadata(api_keys)
+    accounts = [
+        {
+            "ref": _string_value(_as_dict(item).get("ref")).strip(),
+            "label": _string_value(_as_dict(item).get("label")).strip(),
+            "enabled": _bool_value(_as_dict(item).get("enabled"), True),
+        }
+        for item in _as_list(provider.get("auth_accounts"))
+        if _string_value(_as_dict(item).get("ref")).strip()
+    ]
     return {
         "name": name,
         "enabled": _bool_value(provider.get("enabled"), True),
         "api_base": current_managed_reference(_string_value(provider.get("api_base"))),
         "api_key": api_key,
         "api_keys": api_keys,
+        "auth_accounts": accounts,
         "models": [],
         "extra": extra,
         "provider_type": source["kind"],
@@ -296,6 +312,7 @@ def _model_to_editor(
             "id",
             "provider",
             MENU_ROUTE_KEY,
+            MENU_CREDENTIAL_ROUTE_KEY,
             MENU_API_KEY_NAME_KEY,
             MENU_PROVIDER_KEY_ID_KEY,
             MENU_RELAY_CATALOG_MODE_KEY,
@@ -317,8 +334,10 @@ def _model_to_editor(
         if raw_upstream_url_surface is not None
         else infer_upstream_fallback_surface(params.get("model"))
     )
-    upstream_protocol_mode = _upstream_protocol_mode(
-        model_info.get(UPSTREAM_PROTOCOL_MODE_KEY)
+    upstream_protocol_mode = (
+        _upstream_protocol_mode(model_info.get(UPSTREAM_PROTOCOL_MODE_KEY))
+        if model_info.get(UPSTREAM_PROTOCOL_MODE_KEY) is not None
+        else default_upstream_protocol_mode(upstream_url_surface)
     )
     entry_extra = {
         key: _jsonable(value)
@@ -361,6 +380,7 @@ def _model_to_editor(
         "ssl_verify": _string_value(params.get("ssl_verify")) if "ssl_verify" in params else "",
         "ssl_verify_present": "ssl_verify" in params,
         "deployment_id": _editor_deployment_id(model_info.get("id")),
+        "credential_row_id": _editor_deployment_id(model_info.get(MENU_CREDENTIAL_ROUTE_KEY)),
         "supports_responses_image_generation_tool": supports_responses_image_tool,
         "supports_responses_image_generation_tool_present": supports_responses_image_tool_present,
         "upstream_url_surface": upstream_url_surface,
@@ -371,10 +391,54 @@ def _model_to_editor(
     }
 
 
+def _provider_is_account_backed(provider: dict[str, Any]) -> bool:
+    """Whether this provider's own transport is an account, not an address."""
+
+    return str(provider.get("auth_kind", "") or "") == "openai_login"
+
+
+def _credential_row_id(model: dict[str, Any], provider: dict[str, Any]) -> str:
+    """The one model row an entry is a deployment of.
+
+    An account-backed provider writes one entry per credential, and each entry
+    states the row it was written for (``config.api._credential_scopes``).  An
+    entry written before that marker existed states nothing, so a provider whose
+    entries are one-per-credential falls back to the model it serves — the same
+    public name and the same upstream, whatever credential answers for it.  A
+    file this app had already written described every model once per credential,
+    and a read that appended each of them showed the list twice over.
+
+    An ordinary provider is unaffected: one entry is one row.
+    """
+
+    row_id = str(model.get("credential_row_id", "") or "").strip().lower()
+    if row_id:
+        return row_id
+    if not _provider_is_account_backed(provider):
+        return ""
+    return "\x1f".join(
+        [
+            str(model.get("model_name", "")).strip(),
+            _wire_model_name(str(model.get("litellm_model", ""))),
+        ]
+    )
+
+
+def _wire_model_name(value: str) -> str:
+    """A route's upstream model without the adapter prefix it is served through.
+
+    One model is one row however it is reached: the account's adapter and the
+    plain key beside it name the same upstream model.
+    """
+
+    return value.split("/", 1)[1].strip() if "/" in value else value.strip()
+
+
 def _append_model_to_provider(
     providers: list[dict[str, Any]],
     provider_index: dict[str, dict[str, Any]],
     model: dict[str, Any],
+    rows: dict[tuple[str, str], dict[str, Any]] | None = None,
 ) -> None:
     provider = str(model.get("provider", "")).strip()
     if provider not in provider_index:
@@ -404,7 +468,25 @@ def _append_model_to_provider(
         )
         providers.append(provider_index[provider])
     provider_entry = provider_index[provider]
-    if not str(provider_entry.get("api_base", "")).strip():
+    row_id = _credential_row_id(model, provider_entry) if rows is not None else ""
+    if row_id:
+        existing = rows.get((provider, row_id))
+        if existing is not None:
+            # The row already holds this model: the credentials are deployments
+            # of it, and the row's own facts are the ones it already states.
+            return
+        # The row's identity is the row's, not the first credential's: the entry
+        # that opens the row carries a deployment id derived from that row, and
+        # reading it back as the row's own id would let every save re-derive the
+        # whole group from a different base.
+        model = {**model, "deployment_id": row_id}
+        rows[(provider, row_id)] = model
+    # A provider that authenticates as an account states no base of its own: its
+    # adapter owns the address, and the user's custom keys beside that account
+    # speak the service's public address (see ``_credential_scopes``).  Letting a
+    # key route's base become the provider's would point the account's own
+    # routes at the platform endpoint on the next save.
+    if not str(provider_entry.get("api_base", "")).strip() and not _provider_is_account_backed(provider_entry):
         provider_entry["api_base"] = str(model.get("api_base", "")).strip()
     # The document's own binding is the answer whenever the provider carries it:
     # the slot id the route holds, else the one name it writes.  A route whose
@@ -541,6 +623,10 @@ def load_config_document(document: Any) -> dict[str, Any]:
     # The base each provider states, so a route that merely repeats it is read
     # back as the inheritance it is rather than as an override of it.
     provider_bases: dict[str, str] = {}
+    # One model row per (provider, row id): an account-backed provider writes
+    # one entry per credential, and every one of them is a deployment of the
+    # same row.
+    rows: dict[tuple[str, str], dict[str, Any]] = {}
 
     for name, provider in provider_index.items():
         api_base = _string_value(provider.get("api_base"))
@@ -581,7 +667,7 @@ def load_config_document(document: Any) -> dict[str, Any]:
             provider_by_key_id,
             provider_bases,
         )
-        _append_model_to_provider(providers, provider_index, model)
+        _append_model_to_provider(providers, provider_index, model, rows)
 
     disabled_text = normalized_document[CONFIG_DOCUMENT_DISABLED_KEY]
     if disabled_text is not None:
@@ -600,7 +686,7 @@ def load_config_document(document: Any) -> dict[str, Any]:
                 provider_by_key_id,
                 provider_bases,
             )
-            _append_model_to_provider(providers, provider_index, model)
+            _append_model_to_provider(providers, provider_index, model, rows)
 
     _refresh_model_enabled_states(providers)
     return {"providers": providers, "document": normalized_document}

@@ -3,6 +3,7 @@ import {
   ActivityIndicator,
   Platform,
   Pressable,
+  ScrollView,
   StyleSheet,
   Text,
   TextInput,
@@ -36,7 +37,6 @@ import WinUITextInput from "./windows/NativeTextInputNativeComponent";
 import WinUIToggle from "./windows/NativeToggleNativeComponent";
 import WinUISelectableRow from "./windows/NativeSelectableRowNativeComponent";
 import WinUISplitView from "./windows/NativeSplitViewNativeComponent";
-import WinUITable from "./windows/NativeTableNativeComponent";
 import WinUITextEditor from "./windows/NativeTextEditorNativeComponent";
 import { UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
 
@@ -426,6 +426,98 @@ export function NativePicker({ labels, selectedValue, disabled, compact = true, 
 }
 
 
+function windowsSourceSymbol(symbol: string): string {
+  const glyphs: Record<string, string> = {
+    "slider.horizontal.3": "\uE700",
+    "square.stack.3d.up": "\uE7B8",
+    "gearshape.2": "\uE713",
+    terminal: "\uE756",
+    "arrow.up.arrow.down": "\uE895",
+    "list.bullet.rectangle": "\uE8A5",
+  };
+  return glyphs[symbol] ?? "•";
+}
+
+function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, framed, sourceList, rowSymbols, rowSymbolColors, disabledRowKeys, secondaryCellKeys, selectableSpanningKeys, onSelectionChange, onRowDoublePress, style, alertRowKeys }: {
+  columns: TableProps["columns"];
+  rows: TableProps["rows"];
+  selectedKey: string;
+  stripedRows: boolean;
+  compact: boolean;
+  framed: boolean;
+  sourceList: boolean;
+  rowSymbols: string[];
+  rowSymbolColors: string[];
+  disabledRowKeys: string[];
+  secondaryCellKeys: string[];
+  selectableSpanningKeys: Set<string>;
+  onSelectionChange?: (key: string, index: number) => void;
+  onRowDoublePress?: (key: string, index: number) => void;
+  style?: StyleProp<ViewStyle>;
+  alertRowKeys: string[];
+}): React.JSX.Element {
+  const lastPress = React.useRef<{ key: string; at: number } | undefined>(undefined);
+  const totalWidth = columns.reduce((sum, column) => sum + column.width, 0);
+  const select = (row: TableProps["rows"][number], index: number): void => {
+    if (row.spanning && !selectableSpanningKeys.has(row.key)) return;
+    const now = Date.now();
+    if (lastPress.current?.key === row.key && now - lastPress.current.at < 360) onRowDoublePress?.(row.key, index);
+    lastPress.current = { key: row.key, at: now };
+    onSelectionChange?.(row.key, index);
+  };
+  return <View style={[windowsTableStyles.root, !framed && windowsTableStyles.borderless, style]}>
+    {!sourceList ? <View style={[windowsTableStyles.header, { minWidth: totalWidth }]}>
+      {columns.map((column) => <Text key={column.label} numberOfLines={1} style={[windowsTableStyles.headerText, { width: column.width }]}>{column.label}</Text>)}
+    </View> : null}
+    <ScrollView horizontal showsHorizontalScrollIndicator={!sourceList} contentContainerStyle={windowsTableStyles.horizontalContent}>
+      <ScrollView style={windowsTableStyles.verticalScroll} contentContainerStyle={[windowsTableStyles.body, { minWidth: totalWidth }]} nestedScrollEnabled>
+        {rows.map((row, index) => {
+          const selected = row.key === selectedKey;
+          const disabled = disabledRowKeys.includes(row.key);
+          const alert = alertRowKeys.includes(row.key);
+          const spanning = row.spanning === true;
+          const stripe = stripedRows && !selected && index % 2 === 1;
+          const textColor = alert ? "#8a5a00" : (disabled ? "#98a2b3" : "#1f2937");
+          const rowStyle = [windowsTableStyles.row, compact ? windowsTableStyles.rowCompact : windowsTableStyles.rowRelaxed, stripe && windowsTableStyles.rowStripe, selected && windowsTableStyles.rowSelected, disabled && windowsTableStyles.rowDisabled];
+          return <Pressable key={row.key} disabled={disabled || (spanning && !selectableSpanningKeys.has(row.key))} onPress={() => select(row, index)} style={rowStyle}>
+            {spanning ? <Text numberOfLines={1} style={[windowsTableStyles.groupText, { color: textColor }]}>{row.cells[0] ?? ""}</Text> : <View style={windowsTableStyles.cells}>
+              {columns.map((column, columnIndex) => {
+                const cell = row.cells[columnIndex] ?? "";
+                const cellKey = `${row.key}\x1f${columnIndex}`;
+                const secondary = secondaryCellKeys.includes(cellKey);
+                return <Text key={`${row.key}:${columnIndex}`} numberOfLines={1} style={[windowsTableStyles.cell, { width: column.width, color: secondary ? "#667085" : textColor }, columnIndex === 0 && sourceList && windowsTableStyles.sourceCell]}>
+                  {columnIndex === 0 && sourceList && rowSymbols[index] ? <Text style={[windowsTableStyles.symbol, { backgroundColor: rowSymbolColors[index] || "#667085" }]}>{windowsSourceSymbol(rowSymbols[index])}</Text> : null}{cell.replace(/^\t/u, "")}
+                </Text>;
+              })}
+            </View>}
+          </Pressable>;
+        })}
+      </ScrollView>
+    </ScrollView>
+  </View>;
+}
+
+const windowsTableStyles = StyleSheet.create({
+  root: { minHeight: 120, overflow: "hidden", borderWidth: 1, borderColor: "#d0d5dd", borderRadius: 6, backgroundColor: "#ffffff" },
+  borderless: { borderWidth: 0, borderRadius: 0, backgroundColor: "transparent" },
+  header: { flexDirection: "row", alignItems: "center", minHeight: 30, paddingHorizontal: 8, backgroundColor: "#f8fafc", borderBottomWidth: 1, borderBottomColor: "#e4e7ec" },
+  headerText: { paddingHorizontal: 8, color: "#667085", fontSize: UI_TIP_FONT_SIZE, fontWeight: "600" },
+  horizontalContent: { flexGrow: 1 },
+  verticalScroll: { flex: 1, minHeight: 0 },
+  body: { flexGrow: 1 },
+  row: { minWidth: "100%", borderBottomWidth: 1, borderBottomColor: "#eef2f6", justifyContent: "center" },
+  rowCompact: { minHeight: 30 },
+  rowRelaxed: { minHeight: 36 },
+  rowStripe: { backgroundColor: "#fafbfc" },
+  rowSelected: { backgroundColor: "#eaf3ff", borderLeftWidth: 3, borderLeftColor: "#1677d2" },
+  rowDisabled: { opacity: 0.72 },
+  cells: { flexDirection: "row", alignItems: "center", paddingHorizontal: 8 },
+  cell: { paddingHorizontal: 8, color: "#1f2937", fontSize: UI_FONT_SIZE },
+  sourceCell: { flexDirection: "row", alignItems: "center" },
+  symbol: { width: 18, height: 18, marginRight: 7, borderRadius: 5, color: "#ffffff", fontFamily: "Segoe MDL2 Assets", fontSize: 12, lineHeight: 18, textAlign: "center" },
+  groupText: { paddingHorizontal: 12, color: "#475467", fontSize: UI_TIP_FONT_SIZE, fontWeight: "600" },
+});
+
 export function NativeTable({ columns, rows, selectedKey = "", striped = true, compact = true, followBottom = false, scrollToRow = -1, framed = true, sourceList = false, rowSymbols = [], rowSymbolColors = [], rowImageNames = [], cellHorizontalPadding = 8, firstColumnHorizontalPadding = 8, preserveColumnWidths = false, scrollTrailingColumnOverflow = false, disabledRowKeys = [], secondaryCellKeys = [], selectableSpanningRowKeys = [], onSelectionChange, onRowDoublePress, style, alertRowKeys = [] }: TableProps): React.JSX.Element {
   // Striped rows belong to the list surface, not to its contents: the native
   // table paints its alternating bands across the whole viewport, so an empty
@@ -465,8 +557,7 @@ export function NativeTable({ columns, rows, selectedKey = "", striped = true, c
     selectableSpanningRowKeys: Array.from(selectableSpanningKeys),
   };
   if (Platform.OS === "windows") {
-    const { scrollToRow: _macOSScroll, ...windowsProps } = nativeProps;
-    return <WinUITable {...windowsProps} onSelectionChange={(event) => onSelectionChange?.(event.nativeEvent.key, event.nativeEvent.index)} onRowDoublePress={(event) => onRowDoublePress?.(event.nativeEvent.key, event.nativeEvent.index)} style={[styles.table, style]} />;
+    return <WindowsTable columns={columns} rows={rows} selectedKey={selectedKey} stripedRows={stripedRows} compact={compact} framed={framed} sourceList={sourceList} rowSymbols={rowSymbols} rowSymbolColors={rowSymbolColors} disabledRowKeys={disabledRowKeys} secondaryCellKeys={secondaryCellKeys} selectableSpanningKeys={selectableSpanningKeys} onSelectionChange={onSelectionChange} onRowDoublePress={onRowDoublePress} alertRowKeys={alertRowKeys} style={[styles.table, style]} />;
   }
   if (Platform.OS === "macos") {
     return <AppKitTable {...nativeProps} cellHorizontalPadding={cellHorizontalPadding} firstColumnHorizontalPadding={firstColumnHorizontalPadding} preserveColumnWidths={preserveColumnWidths} scrollTrailingColumnOverflow={scrollTrailingColumnOverflow} onSelectionChange={(event) => onSelectionChange?.(event.nativeEvent.key, event.nativeEvent.index)} onRowDoublePress={(event) => onRowDoublePress?.(event.nativeEvent.key, event.nativeEvent.index)} style={[styles.table, style]} />;

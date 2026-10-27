@@ -2367,9 +2367,17 @@ class HookStreamingFailoverTests(HookTestCase):
         self.assertNotIn("use_chat_completions_api", calls[0])
         self.assertEqual([chunk.get("type") for chunk in chunks], ["response.failed"])
         self.assertEqual(chunks[0]["response"]["status"], "failed")
+        # A 5xx route failure the router already classified as retryable names
+        # that cause; the unclassified sentence is reserved for a stop nothing
+        # here explains, and Pi's retry classifier matches none of it.
         self.assertEqual(
             chunks[0]["response"]["error"]["code"],
-            "upstream_route_failure",
+            "upstream_stream_interrupted",
+        )
+        self.assertIn("ended without", chunks[0]["response"]["error"]["message"])
+        self.assertNotIn(
+            "could not classify the stop",
+            chunks[0]["response"]["error"]["message"],
         )
         self.assertEqual(chunks[0]["response"]["model"], "default-chat")
 
@@ -3143,3 +3151,307 @@ class HookOutputStreamContinuationTests(HookTestCase):
             assistant_text,
             expected[-continuation_module._CONTINUATION_TAIL_CHARS:],
         )
+
+
+class HookCoalescedNativeReadTests(HookTestCase):
+    """One transport read is not one frame, and must not be classified as one.
+
+    A provider hands over whatever bytes a single socket read returned, so
+    ``message_delta`` and ``message_stop`` -- and the lifecycle frames of any
+    fast answer -- routinely arrive together.  Reading such a read by joining
+    every ``data:`` line into one payload produced no parseable frame at all, so
+    the terminal frame was invisible, the ceiling reason beside it was lost, and
+    a delivered answer read as a route that had produced nothing.  The user saw
+    a truncated reply followed by "Anthropic Messages stream ended before a
+    terminal message_stop".
+    """
+
+    def _anthropic_request(self) -> dict:
+        return {
+            "model": "default-claude",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 128000,
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/messages"},
+            "model_info": {"id": "msgs-coalesced", "order": 1},
+        }
+
+    async def test_a_coalesced_terminal_read_is_recognized_as_terminal(self) -> None:
+        _, _proxy_server = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        read = (
+            b'event: message_delta\n'
+            b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\n'
+            b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+        )
+
+        self.assertEqual(streaming._stream_chunk_type(read), "message_stop")
+        self.assertTrue(
+            streaming._anthropic_messages_stream_chunk_is_terminal(read)
+        )
+        self.assertEqual(
+            [payload.get("type") for payload in streaming._sse_stream_chunk_payloads(read)],
+            ["message_delta", "message_stop"],
+        )
+
+    async def test_a_coalesced_read_still_counts_as_visible_output(self) -> None:
+        _, _proxy_server = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        read = (
+            b'event: content_block_delta\n'
+            b'data: {"type":"content_block_delta","index":0,'
+            b'"delta":{"type":"text_delta","text":"Hi there"}}\n\n'
+            b'event: content_block_stop\n'
+            b'data: {"type":"content_block_stop","index":0}\n\n'
+        )
+
+        self.assertTrue(streaming._stream_chunk_has_visible_output(read))
+        self.assertTrue(streaming._stream_chunk_has_meaningful_delta(read))
+
+    async def test_a_coalesced_error_frame_is_still_an_error(self) -> None:
+        _, _proxy_server = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        read = (
+            b'event: content_block_delta\n'
+            b'data: {"type":"content_block_delta","index":0,'
+            b'"delta":{"type":"text_delta","text":"Hi"}}\n\n'
+            b'event: error\n'
+            b'data: {"type":"error","error":{"type":"overloaded_error","message":"boom"}}\n\n'
+        )
+
+        exception = streaming._stream_chunk_error_exception(read)
+        self.assertIsNotNone(exception)
+        self.assertIn("boom", str(exception))
+
+    async def test_a_coalesced_ceiling_read_keeps_its_ceiling_reason(self) -> None:
+        _, _proxy_server = load_hook_module()
+        continuation_module = sys.modules["young_router.proxy.stream_continuation"]
+        read = (
+            b'event: message_delta\n'
+            b'data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},'
+            b'"usage":{"output_tokens":20}}\n\n'
+            b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+        )
+
+        self.assertEqual(
+            continuation_module._native_stream_output_limit_reason(read),
+            "max_tokens",
+        )
+
+    async def test_a_fragmented_read_is_never_mistaken_for_a_frame(self) -> None:
+        # A read that stops mid-frame carries no complete frame, so it answers
+        # nothing: treating its partial JSON as a payload would invent a frame
+        # the provider has not finished writing.
+        _, _proxy_server = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        torn = b'event: message_stop\ndata: {"type":"mess'
+
+        self.assertEqual(streaming._stream_chunk_type(torn), "")
+        self.assertFalse(
+            streaming._anthropic_messages_stream_chunk_is_terminal(torn)
+        )
+
+    async def test_a_coalesced_read_delivers_its_terminal_frame(self) -> None:
+        """The end-to-end shape the user hit: one read, one complete answer."""
+
+        hooks, proxy_server = load_hook_module()
+        reads = [
+            (
+                b'event: message_start\n'
+                b'data: {"type":"message_start","message":{"id":"msg-coalesced"}}\n\n'
+                b'event: content_block_start\n'
+                b'data: {"type":"content_block_start","index":0,'
+                b'"content_block":{"type":"text","text":""}}\n\n'
+            ),
+            (
+                b'event: content_block_delta\n'
+                b'data: {"type":"content_block_delta","index":0,'
+                b'"delta":{"type":"text_delta","text":"Hi there!"}}\n\n'
+            ),
+            (
+                b'event: message_delta\n'
+                b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\n'
+                b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+            ),
+        ]
+
+        async def upstream():
+            for read in reads:
+                yield read
+
+        class FakeRouter:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [
+                    {
+                        "litellm_params": {"model": "provider/default-claude"},
+                        "model_info": {"id": "msgs-coalesced"},
+                    }
+                ]
+
+            async def anthropic_messages(self, **payload):
+                raise AssertionError("a complete answer must not be replayed")
+
+        proxy_server.llm_router = FakeRouter()
+        chunks = [
+            chunk
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=upstream(),
+                request_data=self._anthropic_request(),
+            )
+        ]
+
+        self.assertEqual(chunks, reads)
+        self.assertIn(b"event: message_stop", chunks[-1])
+
+    async def test_a_ceiling_read_withholds_the_stop_that_closes_it(self) -> None:
+        """The ceiling frame and the stop that ends it must travel together.
+
+        A route states its output ceiling in ``message_delta`` and closes the
+        answer in a separate ``message_stop``.  Withholding the ceiling frame
+        and returning from the delivery loop dropped the stop, so with no
+        continuation possible the client received ``max_tokens`` as the last
+        frame of the answer and never the terminal event: a finished reply
+        rendered as one cut off at the route's output limit.
+        """
+        _, _proxy_server = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        continuation_module = sys.modules["young_router.proxy.stream_continuation"]
+        self.set_env(continuation_module._STREAM_CONTINUATION_ENV, None)
+        delta = (
+            b'event: content_block_delta\n'
+            b'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi there"}}\n\n'
+        )
+        ceiling = (
+            b'event: message_delta\n'
+            b'data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"}}\n\n'
+        )
+        stop = b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+
+        for label, reads in (
+            ("coalesced", [delta + ceiling + stop]),
+            ("separate reads", [delta, ceiling, stop]),
+        ):
+            async def upstream(reads=reads):
+                for read in reads:
+                    yield read
+
+            delivered = [
+                chunk
+                async for chunk in streaming._yield_native_stream_with_output_limit_continuation(
+                    [],
+                    upstream(),
+                    self._anthropic_request(),
+                    stream_started_at=0.0,
+                )
+            ]
+            types = [
+                frame.get("type")
+                for chunk in delivered
+                for frame in streaming._stream_chunk_dumps(chunk)
+            ]
+            with self.subTest(reads=label):
+                self.assertIn("message_stop", types)
+                self.assertEqual("message_stop", types[-1])
+
+
+class HookNativeFallbackDispatchTests(HookTestCase):
+    """The replay's own protocol name is not a router dispatch kwarg.
+
+    LiteLLM binds every router method to its call type
+    (``factory_function(..., call_type=...)``) and the generic dispatch that
+    ``anthropic_messages`` uses re-passes that value by keyword, so a replay
+    payload carrying ``call_type`` as well raised ``got multiple values for
+    keyword argument 'call_type'`` before any upstream call.  The one failover
+    that could have replaced a truncated Anthropic stream therefore failed as a
+    ``TypeError`` and the client was handed the original truncation.
+    """
+
+    async def test_the_dispatch_kwargs_drop_call_type(self) -> None:
+        _, _proxy_server = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        payload = {
+            "model": "default-claude",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 128000,
+            "stream": True,
+            "call_type": "anthropic_messages",
+        }
+
+        dispatched = streaming._streaming_error_fallback_dispatch_kwargs(payload)
+
+        self.assertNotIn("call_type", dispatched)
+        # Routing still classifies the retry from the payload's own copy.
+        self.assertEqual(payload["call_type"], "anthropic_messages")
+        self.assertEqual(dispatched["max_tokens"], 128000)
+
+    async def test_a_truncated_anthropic_stream_fails_over_to_a_peer(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        hooks._DEPLOYMENT_COOLDOWNS.clear()
+        self.addCleanup(hooks._DEPLOYMENT_COOLDOWNS.clear)
+        calls = []
+        recovered = [
+            (
+                b'event: message_start\n'
+                b'data: {"type":"message_start","message":{"id":"msg-recovered"}}\n\n'
+            ),
+            b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ]
+
+        async def truncated():
+            yield (
+                b'event: message_start\n'
+                b'data: {"type":"message_start","message":{"id":"msg-truncated"}}\n\n'
+            )
+
+        async def recovered_stream():
+            for chunk in recovered:
+                yield chunk
+
+        class FakeRouter:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [
+                    {
+                        "litellm_params": {"model": "provider/default-claude"},
+                        "model_info": {"id": "msgs-original"},
+                    },
+                    {
+                        "litellm_params": {"model": "provider/default-claude"},
+                        "model_info": {"id": "msgs-peer", "order": 2},
+                    },
+                ]
+
+            async def anthropic_messages(self, **payload):
+                calls.append(payload)
+                hooks._remember_selected_deployment(
+                    {
+                        "litellm_params": {"model": "provider/default-claude"},
+                        "model_info": {"id": "msgs-peer", "order": 2},
+                    }
+                )
+                return recovered_stream()
+
+        proxy_server.llm_router = FakeRouter()
+        request_data = {
+            "model": "default-claude",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 128000,
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/messages"},
+            "model_info": {"id": "msgs-original", "order": 1},
+        }
+
+        chunks = [
+            chunk
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=truncated(),
+                request_data=request_data,
+            )
+        ]
+
+        self.assertEqual(len(calls), 1)
+        # The replay reached the router instead of dying on its own kwarg.
+        self.assertNotIn("call_type", calls[0])
+        self.assertEqual(calls[0]["_excluded_deployment_ids"], ["msgs-original"])
+        self.assertEqual(chunks, recovered)
