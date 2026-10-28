@@ -467,7 +467,6 @@ void WinUI3NativeLeaf::SetLocalization(std::map<std::string, std::wstring> strin
 }
 
 void WinUI3NativeLeaf::SetActionHandler(std::function<void(std::string const&)> handler) {
-  { std::ofstream t("C:\\Users\\Public\\young-router-route.log", std::ios::app); if (t) t << "SetActionHandler pending=" << pending_actions_.size() << "\n"; }
   std::vector<std::string> pending;
   {
     std::lock_guard guard(action_mutex_);
@@ -478,7 +477,6 @@ void WinUI3NativeLeaf::SetActionHandler(std::function<void(std::string const&)> 
 }
 
 void WinUI3NativeLeaf::DispatchAction(std::string const& action) {
-  { std::ofstream t("C:\\Users\\Public\\young-router-route.log", std::ios::app); if (t) t << "Dispatch " << action << " hasHandler=" << (action_handler_ ? 1 : 0) << "\n"; }
   std::function<void(std::string const&)> handler;
   {
     std::lock_guard guard(action_mutex_);
@@ -518,7 +516,8 @@ bool WinUI3NativeLeaf::HandleWindowMessage(UINT message, WPARAM wparam, LPARAM l
   return false;
 }
 
-void WinUI3NativeLeaf::OpenRoute(std::wstring_view route) { { std::ofstream trace("C:\\Users\\Public\\young-router-route.log", std::ios::app); if (trace) trace << "OpenRoute " << winrt::to_string(route) << " prev=" << winrt::to_string(active_route_) << " hwnd=" << (void*)window_handle_ << "\n"; } auto const previous_route = active_route_;
+void WinUI3NativeLeaf::OpenRoute(std::wstring_view route) {
+  auto const previous_route = active_route_;
   active_route_ = route;
   if (route == L"home") {
     // "home" leaves the settings shell for the tray, mirroring the macOS

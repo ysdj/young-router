@@ -43,14 +43,6 @@ std::string WideToUtf8(std::wstring const& value) {
   return result;
 }
 
-// TEMPORARY DIAGNOSTIC: trace Core startup and IPC results.
-void DebugTrace(std::string const& message) {
-  static std::mutex trace_mutex;
-  std::lock_guard guard(trace_mutex);
-  std::ofstream stream("C:\\Users\\Public\\young-router-core-trace.log", std::ios::app);
-  if (stream) stream << message << '\n';
-}
-
 std::wstring Quote(std::wstring const& value) {
   std::wstring escaped = value;
   size_t offset = 0;
@@ -395,7 +387,6 @@ void CoreIPCBridge::RemoveEventHandler(int token) {
 }
 
 std::string CoreIPCBridge::Send(std::string const& request_json) {
-  DebugTrace("Send enter method=" + RequestMethod(request_json) + " bytes=" + std::to_string(request_json.size()));
   if (stopping_) throw std::runtime_error("core unavailable");
   const std::string method = RequestMethod(request_json);
   const bool is_subscription = method == "subscribe";
@@ -434,14 +425,11 @@ std::string CoreIPCBridge::Send(std::string const& request_json) {
         recover_subscription = !is_subscription && !subscription_request_.empty() && subscription_id_.empty();
       }
       if (recover_subscription) RecoverSubscription();
-      DebugTrace("Send ok method=" + method + " status=" + std::to_string(result.status) + " bytes=" + std::to_string(result.body.size()));
       return result.body;
     } catch (std::exception const& error) {
-      DebugTrace("Send fail method=" + method + " attempt=" + std::to_string(attempt) + " what=" + error.what());
       InvalidateCoreIfGeneration(generation, true);
       if (attempt != 0) throw;
     } catch (...) {
-      DebugTrace("Send fail method=" + method + " attempt=" + std::to_string(attempt) + " unknown");
       InvalidateCoreIfGeneration(generation, true);
       if (attempt != 0) throw;
     }
@@ -798,7 +786,6 @@ std::optional<CoreIPCBridge::HttpResult> CoreIPCBridge::HostRequest(
 }
 
 CoreIPCBridge::Session CoreIPCBridge::EnsureSession() {
-  DebugTrace("EnsureSession enter");
   if (stopping_) throw std::runtime_error("core unavailable");
   auto hello_expiry = [](CoreIPCBridge::HttpResult const& hello) -> double {
     if (hello.status != 200 || hello.session.empty()) throw std::runtime_error("core unavailable");
@@ -806,7 +793,6 @@ CoreIPCBridge::Session CoreIPCBridge::EnsureSession() {
     auto session = envelope.GetNamedObject(L"session", nullptr);
     auto expires_in = session ? session.GetNamedNumber(L"expires_in", 0) : 0;
     if (!envelope.GetNamedBoolean(L"ok", false) || expires_in <= 0 || expires_in > 86400) {
-      DebugTrace("hello expiry rejected expires_in=" + std::to_string(expires_in));
       throw std::runtime_error("core unavailable");
     }
     return expires_in;
@@ -880,12 +866,9 @@ CoreIPCBridge::Session CoreIPCBridge::EnsureSession() {
 
   Endpoint endpoint;
   try {
-    DebugTrace("EnsureSession starting core");
     endpoint = StartCoreLocked();
-    DebugTrace("EnsureSession core started port=" + std::to_string(endpoint.port));
     hello_registered = true;
   } catch (std::exception const& error) {
-    DebugTrace(std::string("EnsureSession StartCore failed what=") + error.what());
     establishing_session_ = false;
     session_error_ = std::current_exception();
     session_condition_.notify_all();
@@ -895,9 +878,7 @@ CoreIPCBridge::Session CoreIPCBridge::EnsureSession() {
   lock.unlock();
 
   try {
-    DebugTrace("EnsureSession sending hello");
     auto hello = Request(endpoint, L"hello", L"POST", "", endpoint.bootstrap_token);
-    DebugTrace("EnsureSession hello status=" + std::to_string(hello.status) + " bytes=" + std::to_string(hello.body.size()) + " session=" + std::to_string(hello.session.size()));
     auto expires_in = hello_expiry(hello);
     lock.lock();
     if (core_generation_ != attempt_generation) {
@@ -939,9 +920,7 @@ CoreIPCBridge::Endpoint CoreIPCBridge::StartCoreLocked() {
   if (python.empty()) {
     python = PackagePythonRuntime(core_directory, core_directory + L"\\runtime\\bin\\python.exe");
   }
-  DebugTrace("StartCore python=" + WideToUtf8(python) + " core=" + WideToUtf8(core_directory));
   if (!IsExecutableFile(python) || !HasRequiredCoreFiles(core_directory)) {
-    DebugTrace("StartCore missing python or core files");
     RemoveDirectoryW(directory.c_str());
     throw std::runtime_error("core unavailable");
   }
@@ -971,17 +950,14 @@ CoreIPCBridge::Endpoint CoreIPCBridge::StartCoreLocked() {
     throw std::runtime_error("core unavailable");
   }
   std::vector<wchar_t> environment = ChildEnvironment(core_directory, python_home, parent_handle);
-  DebugTrace("StartCore CreateProcess cmd=" + WideToUtf8(command));
   BOOL created = CreateProcessW(nullptr, mutable_command.data(), nullptr, nullptr, TRUE,
       CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
       environment.data(), core_directory.c_str(), &startup, &process);
   CloseHandle(parent_handle);
   if (!created) {
-    DebugTrace("StartCore CreateProcessW failed error=" + std::to_string(GetLastError()));
     RemoveDirectoryW(directory.c_str());
     throw std::runtime_error("core unavailable");
   }
-  DebugTrace("StartCore CreateProcessW pid=" + std::to_string(process.dwProcessId));
   CloseHandle(process.hThread);
 
   for (int attempt = 0; attempt < 100; ++attempt) {
@@ -1006,10 +982,6 @@ CoreIPCBridge::Endpoint CoreIPCBridge::StartCoreLocked() {
       }
     }
     Sleep(50);
-  }
-  DWORD core_exit = 0;
-  if (GetExitCodeProcess(process.hProcess, &core_exit)) {
-    DebugTrace("StartCore endpoint timeout; core exit=" + std::to_string(core_exit));
   }
   StopCoreProcess(process.hProcess, directory);
   throw std::runtime_error("core unavailable");

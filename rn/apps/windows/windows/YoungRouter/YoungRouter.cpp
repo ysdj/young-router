@@ -6,7 +6,6 @@
 
 #include <algorithm>
 #include <appmodel.h>
-#include <fstream>
 #include <iterator>
 #include <shellapi.h>
 #include <string_view>
@@ -22,11 +21,6 @@
 #include "WinUI3NativeLeafModule.h"
 
 namespace {
-void AppendStartupLog(std::string const& message) {
-  std::ofstream stream("C:\\Users\\Public\\young-router-react.log", std::ios::app);
-  if (stream) stream << message << '\n';
-}
-
 std::wstring AllowedRoute(std::wstring route) {
   static constexpr std::wstring_view allowed[] = {
       L"home", L"providers-models", L"codex-settings", L"claude-settings",
@@ -205,12 +199,6 @@ _Use_decl_annotations_ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, PSTR 
   settings.UseFastRefresh(true);
 #endif
 
-  settings.NativeLogger([](winrt::Microsoft::ReactNative::LogLevel level, winrt::hstring const& message) {
-    AppendStartupLog("log " + std::to_string(static_cast<int>(level)) + ": " + winrt::to_string(message));
-  });
-  settings.InstanceLoaded([](winrt::Windows::Foundation::IInspectable const&, winrt::Microsoft::ReactNative::InstanceLoadedEventArgs const& args) {
-    AppendStartupLog(args.Failed() ? "instance-loaded failed" : "instance-loaded ok");
-  });
 #if _DEBUG
   // For Debug builds
   // Enable Direct Debugging of JS
