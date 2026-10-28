@@ -542,6 +542,7 @@ export const en: Record<TranslationKey, string> = {
   "providers.probeInlineHttpError": "Upstream error",
   "providers.probeInlineInvalidResponse": "Bad reply",
   "providers.probeInlineInvalidConfig": "Incomplete config",
+  "providers.providerDisabledHint": "This provider is turned off. Turn the provider back on before setting this model's enabled state.",
   "providers.probeOriginalRequest": "Original request: {request}",
   "providers.probeDegradationMessage": "Authenticity check: {result}",
   "providers.probeDetails": "Probe details",

@@ -1851,7 +1851,6 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
     return () => setProviderWizardOpen(false);
   }, [route]);
 
-  console.log("[yr] render route=" + route + " snapshot=" + (snapshot ? "yes" : "no") + " error=" + (error ? "yes" : "no"));
   return (
     <View style={styles.root} accessibilityLabel={translate("app.title")}>
       {error ? <Text style={styles.error}>{error}</Text> : null}
@@ -5878,6 +5877,13 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   const modelRowKeys = useCallback((modelIDs: string[]): string[] => (modelCredentials.length > 0
     ? modelCredentials.flatMap((credential) => modelIDs.map((modelID) => modelRowKey(credential.id, modelID)))
     : modelIDs), [modelCredentials]);
+  // A route is off when either switch on its path is off: its own, or the
+  // provider's.  A provider that is turned off serves no route of its own, so
+  // its models read as disabled here — that is what the list already says by
+  // greying them — and the inspector's own 启用 box is disabled with it, so a
+  // row never offers a switch the provider has already overruled.  Turning the
+  // row on under a stopped provider would be a click that changes a stored
+  // boolean and nothing else.
   const disabledModelKeys = useMemo(
     () => modelRowKeys(models.filter((item) => !booleanValue(provider?.enabled, true) || !booleanValue(item.model_enabled, booleanValue(item.enabled, true))).map(editorIdentifier)),
     [modelRowKeys, models, provider?.enabled],
@@ -6753,6 +6759,9 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
   const drafts = useContext(ProviderWorkspaceDraftContext);
   const upstreamName = drafts?.modelUpstreamDisplay(providerId, model) ?? upstreamModelLabel(model);
   const upstreamFieldValue = upstreamName;
+  // Whether this route's provider switch is on.  A route of a provider that is
+  // off is not served, and that is the provider's fact, not the row's.
+  const providerEnabled = booleanValue(provider.enabled, true);
   const providerBaseUrl = drafts?.providerBaseURL(provider) ?? stringValue(provider.endpoint, stringValue(provider.api_base));
   // The editable field shows the model's real value: the localized placeholder
   // only labels the list row and the breadcrumb, so the pane never looks like a
@@ -6825,18 +6834,12 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
   const probeTitle = degradationIncluded
     ? translate("providers.deepTest")
     : translate("providers.probe");
-  // Probing a route is how its credential gets verified, so the pane does not
-  // refuse the press on its own belief about that credential: the probe answers
-  // with the truth (`providers.probeInlineInvalidConfig` when there is nothing
-  // to try), and a route whose key Core just materialized can be checked at
-  // once instead of staying grayed out on a belief the user cannot change from
-  // here.  Only an account-backed provider that has not signed in has no route
-  // to probe at all, and that state belongs to the provider, not to one model.
-  const probeReady = Boolean(
-    providerBaseUrl.trim()
-    && upstreamName.trim()
-    && (providerAuthKind(provider) === "api_key" || providerAuthStatus(provider) === "signed_in"),
-  );
+  // Probing a route is how its credential gets verified, so the pane never
+  // refuses the press on its own belief about the route.  A press on a route
+  // with nothing to try answers with `providers.probeInlineInvalidConfig`, the
+  // sentence that names what is missing, instead of a greyed button whose
+  // reason the reader has to guess; a route whose key Core just materialized
+  // can be checked at once.  Only a write in flight holds the button.
   // A linked key the relay could not resolve says so here, on the route that
   // failed, naming the key in the same `账号/分组` form the picker uses.
   const bindingIssueText = bindingIssue
@@ -6897,7 +6900,13 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
     <View style={styles.modelBreadcrumb}><NativeButton title={providerLabel} link disabled={busy} onPress={onProviderClick} style={styles.breadcrumbProvider} /><Text style={styles.breadcrumbSeparator}>&gt;</Text><Text numberOfLines={1} style={styles.inspectorHeading}>{displayLabel(upstreamName, translate("common.notAvailable"))}</Text></View>
     <View style={styles.inspectorDivider} />
     <View style={styles.inspectorBody}>
-      <View style={styles.inspectorEnabledRow}><View style={styles.inspectorEnableControl}><NativeCheckbox label={translate("common.enable")} value={booleanValue(model.model_enabled, booleanValue(model.enabled, true))} disabled={busy} onValueChange={(model_enabled) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { model_enabled } })} /></View><ActionButton title={probeTitle} titleWidth="tight" busy={probing} toolTip={(probePresentation.compact ? probePresentation.tooltip : "") || (degradationIncluded ? translate("providers.deepTestHint") : undefined)} disabled={(busy && !probing) || !probeReady} onPress={probe} />{probePresentation.compactSentence ? <Pressable style={styles.inspectorProbeFinding} onPress={openProbeDetails} accessibilityRole="link" accessibilityLabel={probePresentation.compactSentence}><TooltipText numberOfLines={1} ellipsizeMode="tail" tooltip={probePresentation.tooltip} style={styles.inspectorProbeFindingText}>{probePresentation.compactSentence}</TooltipText></Pressable> : null}</View>
+      <View style={styles.inspectorEnabledRow}><View style={styles.inspectorEnableControl}><NativeCheckbox label={translate("common.enable")} value={booleanValue(model.model_enabled, booleanValue(model.enabled, true))} disabled={busy || !providerEnabled} onValueChange={(model_enabled) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { model_enabled } })} /></View><ActionButton title={probeTitle} titleWidth="tight" busy={probing} toolTip={(probePresentation.compact ? probePresentation.tooltip : "") || (degradationIncluded ? translate("providers.deepTestHint") : undefined)} disabled={busy && !probing} onPress={probe} />{probePresentation.compactSentence ? <Pressable style={styles.inspectorProbeFinding} onPress={openProbeDetails} accessibilityRole="link" accessibilityLabel={probePresentation.compactSentence}><TooltipText numberOfLines={1} ellipsizeMode="tail" tooltip={probePresentation.tooltip} style={styles.inspectorProbeFindingText}>{probePresentation.compactSentence}</TooltipText></Pressable> : null}</View>
+      {/* The row's switch is disabled when its provider is off, so the reason
+          has to be stated in words: a greyed 启用 box under a stopped provider
+          otherwise reads as the app refusing the setting for no stated cause.
+          The sentence names what to do first, in the same place the reader
+          would otherwise look for the answer. */}
+      {providerEnabled ? null : <Text style={styles.fieldHint}>{translate("providers.providerDisabledHint")}</Text>}
       <TextField label={translate("providers.publicModel")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} value={modelFieldName} onDraftChange={onNameDraftChange} onCommit={(name) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { name } })} />
       {/* The context window belongs to the *public name* on the row above, so it
           is stated directly under it, and both halves of the pair the registry

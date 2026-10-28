@@ -697,7 +697,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'const probeTitle = degradationIncluded',
             '? translate("providers.deepTest")',
             ': translate("providers.probe");',
-            '<ActionButton title={probeTitle} titleWidth="tight" busy={probing} toolTip={(probePresentation.compact ? probePresentation.tooltip : "") || (degradationIncluded ? translate("providers.deepTestHint") : undefined)} disabled={(busy && !probing) || !probeReady} onPress={probe} />',
+            '<ActionButton title={probeTitle} titleWidth="tight" busy={probing} toolTip={(probePresentation.compact ? probePresentation.tooltip : "") || (degradationIncluded ? translate("providers.deepTestHint") : undefined)} disabled={busy && !probing} onPress={probe} />',
             'function probeDegradationLine(degradation: UnknownRecord, translate: Translate, detailed = false): string {',
             'function probeDegradationDetails(degradation: UnknownRecord, translate: Translate): string {',
             'const degradation = asRecord(result?.degradation ?? probe.degradation);',
@@ -905,9 +905,47 @@ class ReactNativeUiParityTests(unittest.TestCase):
             (ROOT / "rn/packages/shared/src/i18n/types.ts").read_text(encoding="utf-8"),
         )
 
+    def test_a_stopped_provider_greys_its_rows_and_holds_their_switches(self) -> None:
+        """One fact, drawn once: the provider is off, so these routes are off.
+
+        A provider that is off serves none of its routes, so its rows in the
+        model list read as disabled and each row's own 启用 box keeps the state
+        it stores while losing the press.  Rewriting that state instead would
+        be the pane editing a configuration the user never touched — and a
+        tick that clears itself on open is not a reading of the file.
+        """
+
+        # A provider that is off serves none of its routes, so its models read
+        # as disabled in the list too — the same fact the inspector states.
+        disabled = self.ui.split("const disabledModelKeys = useMemo(", 1)[1].split("// Rows that cannot materialize", 1)[0]
+        self.assertIn("!booleanValue(provider?.enabled, true) || !booleanValue(item.model_enabled, booleanValue(item.enabled, true))", disabled)
+
+        # The row's own 启用 box keeps drawing its stored state and only loses
+        # its press: the value prop is untouched, `disabled` carries the
+        # provider's state.  Rewriting the value would make the pane forget a
+        # choice the user made, and a tick that changed itself on open is not a
+        # reading of the configuration.
+        self.assert_ui_has("const providerEnabled = booleanValue(provider.enabled, true);")
+        self.assert_ui_has('value={booleanValue(model.model_enabled, booleanValue(model.enabled, true))} disabled={busy || !providerEnabled} onValueChange={(model_enabled) =>')
+        # The sentence names the precondition, and stands under the switch it
+        # explains rather than under the name field after it.
+        self.assert_ui_has('{providerEnabled ? null : <Text style={styles.fieldHint}>{translate("providers.providerDisabledHint")}</Text>}')
+        inspector = self.ui.split("function ModelInspector(", 1)[1].split("function ContextWindowHelp(", 1)[0]
+        switch_row = inspector.index('label={translate("common.enable")} value={booleanValue(model.model_enabled')
+        hint_row = inspector.index('translate("providers.providerDisabledHint")')
+        name_row = inspector.index('label={translate("providers.publicModel")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} value={modelFieldName}')
+        self.assertLess(switch_row, hint_row)
+        self.assertLess(hint_row, name_row)
+        # The sentence asks for the provider first; it is not a verdict about
+        # the route, which the user cannot act on from this row.
+        self.assertIn('"providers.providerDisabledHint": "供应商已停用，请先启用供应商，再设置本模型的启用状态。"', self.zh)
+        self.assertIn('"providers.providerDisabledHint": "This provider is turned off. Turn the provider back on before setting this model', self.en)
+        for locale in (self.zh, self.en):
+            self.assertIn('"providers.providerDisabledHint"', locale)
+
     def test_provider_probe_button_reports_progress_without_graying_out(self) -> None:
         self.assert_ui_has(
-            '<ActionButton title={probeTitle} titleWidth="tight" busy={probing} toolTip={(probePresentation.compact ? probePresentation.tooltip : "") || (degradationIncluded ? translate("providers.deepTestHint") : undefined)} disabled={(busy && !probing) || !probeReady} onPress={probe} />'
+            '<ActionButton title={probeTitle} titleWidth="tight" busy={probing} toolTip={(probePresentation.compact ? probePresentation.tooltip : "") || (degradationIncluded ? translate("providers.deepTestHint") : undefined)} disabled={busy && !probing} onPress={probe} />'
         )
         # The probe keeps its own name while it runs: the button carries the
         # progress as a leading spinner instead of a swapped title.
@@ -917,13 +955,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
         )
         self.assert_ui_not_has("probeSummaryTrigger")
         self.assert_ui_not_has('styles.probeSummary}')
-        self.assert_ui_has('const probeReady = Boolean(')
-        # The credential is what a probe exists to test, so the pane's own
-        # belief about it never holds the press: a route whose key Core just
-        # materialized can be probed at once, and a route with nothing to try
-        # answers with `providers.probeInlineInvalidConfig` instead of a button
-        # the user cannot enable from here.
-        self.assert_ui_has('&& (providerAuthKind(provider) === "api_key" || providerAuthStatus(provider) === "signed_in"),')
+        # The credential is what a probe exists to test, so nothing the pane
+        # believes about the route may grey the button: a route whose key Core
+        # just materialized can be probed at once, and a route with nothing to
+        # try answers with `providers.probeInlineInvalidConfig` — the sentence
+        # that names the missing input — instead of a dead button whose reason
+        # the reader has to guess.  Only a write in flight holds it.
+        self.assert_ui_not_has("probeReady")
         self.assert_ui_not_has("authenticationReady")
         self.assertNotIn('await flushPendingFields();\n      const before = await ipc.snapshot();', self.ui)
 
@@ -1041,7 +1079,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('const pendingModelIds = useRef<{ providerId: string; ids: Set<string> } | undefined>(undefined);')
         self.assertNotIn('knownModelIdsByProvider', self.ui)
         self.assertNotIn('Promise.all(added.map(', self.ui)
-        self.assert_ui_has('disabled={(busy && !probing) || !probeReady}')
+        self.assert_ui_has('disabled={busy && !probing}')
 
     def test_new_models_use_zero_order_without_coercing_zero_to_one(self) -> None:
         # A model added from the pane is committed by the shell right away, so

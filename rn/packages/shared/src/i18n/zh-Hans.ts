@@ -548,6 +548,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "providers.probeInlineHttpError": "上游报错",
   "providers.probeInlineInvalidResponse": "返回异常",
   "providers.probeInlineInvalidConfig": "配置不完整",
+  "providers.providerDisabledHint": "供应商已停用，请先启用供应商，再设置本模型的启用状态。",
   "providers.probeOriginalRequest": "原始请求: {request}",
   "providers.probeDegradationMessage": "真伪核验: {result}",
   "providers.probeDetails": "探测详情",

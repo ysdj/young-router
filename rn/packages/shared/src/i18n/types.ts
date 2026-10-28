@@ -554,6 +554,7 @@ export type TranslationKey =
   | "providers.probeInlineHttpError"
   | "providers.probeInlineInvalidResponse"
   | "providers.probeInlineInvalidConfig"
+  | "providers.providerDisabledHint"
   | "providers.probeOriginalRequest"
   | "providers.probeDegradationMessage"
   | "providers.probeDetails"
