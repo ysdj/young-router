@@ -134,7 +134,7 @@ _Use_decl_annotations_ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, PSTR 
     // AppsFolder uses the Package Family Name, which is stable across package
     // versions and does not include the version/architecture fields.
     constexpr wchar_t packaged_app[] =
-        L"shell:AppsFolder\\YoungRouter_44hrgrtnejmw4!App";
+        L"shell:AppsFolder\\YoungRouter_vephk5vwyzj3j!App";
     auto result = reinterpret_cast<intptr_t>(ShellExecuteW(
         nullptr, L"open", L"explorer.exe", packaged_app, nullptr, SW_SHOWNORMAL));
     if (result <= 32) {

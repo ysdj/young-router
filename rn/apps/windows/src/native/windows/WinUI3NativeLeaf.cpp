@@ -499,6 +499,9 @@ bool WinUI3NativeLeaf::HandleWindowMessage(UINT message, WPARAM wparam, LPARAM l
   if (message == kQuitMessage) {
     quitting_ = true;
     if (window_handle_ != nullptr) PostMessageW(window_handle_, WM_CLOSE, 0, 0);
+    // The window may be hidden; end the thread's message loop explicitly so
+    // Exit never depends on a hidden window's close path.
+    PostQuitMessage(0);
     return true;
   }
   if (message == kTrayMessage && wparam == tray_.uID) {
@@ -2450,12 +2453,14 @@ void WinUI3NativeLeaf::Quit() {
   quit_in_progress_ = true;
   auto window = window_handle_;
   if (window == nullptr) return;
-  std::thread([window] {
+  // Answer the click first. Stopping Core can wait on a process that is
+  // already gone; the window must still close when the user asks it to.
+  PostMessageW(window, kQuitMessage, 0, 0);
+  std::thread([] {
     try {
       CoreIPCBridge::Shared().Stop();
     } catch (...) {
     }
-    PostMessageW(window, kQuitMessage, 0, 0);
   }).detach();
 }
 
