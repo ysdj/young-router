@@ -794,89 +794,64 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("autoGroupingBaselineRows = nil", leaf)
         self.assertIn("auto auto_grouping_baseline = std::make_shared<std::optional<std::vector<SheetRow>>>();", windows)
 
+
     def test_native_tables_report_a_cleared_selection(self) -> None:
-        # A click below the rows clears the list selection, but the shared view
-        # still holds the item its + / − header and editor act on.  Both hosts
-        # report that cleared selection so the panes drop it instead of leaving
-        # a stale selection the list no longer highlights.
         mac = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
-        windows = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
         mac_table = mac.split(
             "- (void)tableViewSelectionDidChange:", 1
         )[1].split("- (void)handleRowClick:", 1)[0]
-        windows_table = windows.split(
-            "list_.SelectionChanged([this](auto const&, auto const&) {", 1
-        )[1].split("list_.ItemClick([this]", 1)[0]
+        adapter = (SHARED / "ui/NativeControls.tsx").read_text(encoding="utf-8")
         self.assertIn("if (selectedRow < 0 && !viewProps.selectedKey.empty()) {", mac_table)
         self.assertIn('LiteLLMAppKitTableEventEmitter::OnSelectionChange event{"", -1};', mac_table)
-        self.assertIn("if (index < 0) {", windows_table)
-        self.assertIn("if (!Props()->selectedKey.empty()) {", windows_table)
-        self.assertIn("args.index = -1;", windows_table)
-        self.assertIn('args.key = "";', windows_table)
+        # Windows is a React table; a row press always reaches the shared view.
+        self.assertIn('const select = (row: TableProps["rows"][number], index: number): void => {', adapter)
+        self.assertIn("onSelectionChange?.(row.key, index);", adapter)
+
 
     def test_native_tables_emit_one_selection_event_for_each_row_click(self) -> None:
         mac = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
-        windows = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
         mac_table = mac.split(
             "- (void)handleRowClick:", 1
         )[1].split("- (void)handleDoubleClick:", 1)[0]
-        windows_table = windows.split(
-            "struct TableComponentView", 1
-        )[1].split("struct CodeWebViewComponentView", 1)[0]
-
-        # AppKit's selection notification carries an ordinary row whose
-        # selection changed; its target/action carries the selectable group
-        # rows AppKit will not select itself, and the already-selected row.
+        adapter = (SHARED / "ui/NativeControls.tsx").read_text(encoding="utf-8")
         self.assertIn("![self isSelectableSpanningRow:row]", mac_table)
         self.assertNotIn("([self isSpanningRow:row] && ![self isSelectableSpanningRow:row])", mac_table)
         self.assertIn("onSelectionChange(event);", mac_table)
-        # WinUI's SelectionChanged carries a row whose selection changed.
-        # ItemClick used to send the same row again, and enabling it had no
-        # independent use.
-        self.assertIn("list_.SelectionChanged([this](auto const&, auto const&) {", windows_table)
-        self.assertNotIn("list_.ItemClick", windows_table)
-        self.assertNotIn("list_.IsItemClickEnabled(true);", windows_table)
+        # The React table has one row press path. A double press is a second
+        # report, not a second click handler.
+        self.assertIn("onPress={() => select(row, index)}", adapter)
+        self.assertIn("onRowDoublePress?.(row.key, index)", adapter)
+        self.assertIn("lastPress.current?.key === row.key", adapter)
+
 
     def test_native_tables_report_a_click_on_the_already_selected_row(self) -> None:
-        """Clicking the selected row must still reach the shared view.
-
-        The provider list sits beside the model list, and its row click also
-        returns the detail pane from a model to its provider.  That press
-        changes no native selection, so a host that reported selection changes
-        only left the pane showing the model the previous click opened.
-        """
+        """Clicking the selected row must still reach the shared view."""
         mac = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
-        windows = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
         mac_table = mac.split(
             "- (void)handleRowClick:", 1
         )[1].split("- (void)handleDoubleClick:", 1)[0]
-        windows_table = windows.split(
-            "struct TableComponentView", 1
-        )[1].split("struct CodeWebViewComponentView", 1)[0]
-
-        # AppKit's action fires for every row click, so it reports the row only
-        # when the selection notification is not already coming for it.
+        adapter = (SHARED / "ui/NativeControls.tsx").read_text(encoding="utf-8")
         self.assertIn("_tableView.selectedRow == row &&", mac_table)
         self.assertIn("row == SegmentIndex(viewProps.rowKeys, viewProps.selectedKey)", mac_table)
         self.assertIn("onSelectionChange(event);", mac_table)
-        # WinUI's ListView has no per-row press event, so the row carries one.
-        # PointerPressed runs before SelectionChanged, and the controlled
-        # selectedKey — not the live index — is what tells the two apart.
-        self.assertIn("row.PointerPressed([this, selection_index]", windows_table)
-        self.assertIn("if (Props()->selectedKey != key || list_.SelectedIndex() != selection_index) return;", windows_table)
-        self.assertIn("emitter->onSelectionChange(std::move(args));", windows_table)
-        # A press that syncs the controlled selection is not a user click.
-        self.assertIn("if (syncing_ || !Props()) return;", windows_table)
+        # The React table does not gate its press on the controlled selection.
+        self.assertIn("const select = (row: TableProps[\"rows\"][number], index: number): void => {", adapter)
+        self.assertIn("onSelectionChange?.(row.key, index);", adapter)
+        self.assertNotIn("if (row.key === selectedKey) return;", adapter)
+
 
     def test_native_pickers_do_not_emit_change_for_controlled_props(self) -> None:
         mac = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
-        windows = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
         mac_picker = mac.split("@implementation LiteLLMAppKitPickerComponentView", 1)[1].split("Class<RCTComponentViewProtocol> LiteLLMAppKitPickerCls", 1)[0]
-        win_picker = windows.split("struct PickerComponentView", 1)[1].split("struct CheckboxComponentView", 1)[0]
+        adapter = (SHARED / "ui/NativeControls.tsx").read_text(encoding="utf-8")
+        picker = adapter.split("function WindowsPicker(", 1)[1].split("const NativeButtonWithRef", 1)[0]
         self.assertIn("_picker.target = nil;", mac_picker)
         self.assertIn("_picker.target = self;", mac_picker)
-        self.assertIn("syncing_ = true;", win_picker)
-        self.assertIn("syncing_ = false;", win_picker)
+        self.assertIn("const selectedIndex = labels.indexOf(selectedValue);", picker)
+        self.assertIn("const choose = (index: number): void => {", picker)
+        self.assertIn("onChange?.({ nativeEvent: { value, index } }", picker)
+        # Opening the menu is not a change; only choosing an item reports.
+        self.assertNotIn("onChange?.", picker.split("const choose", 1)[0])
 
     def test_native_login_item_registration_follows_core_target_state(self) -> None:
         ui = (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
@@ -1597,7 +1572,8 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("let top = min(pointer.y + anchorHeight, max(bounds.maxY - 1, 0))", mac)
         self.assertIn('symbolName = @"chevron.up.chevron.down";', mac_controls)
         self.assertIn("configurationWithPointSize:LiteLLMUIFontSize - 3.5", mac_controls)
-        self.assertIn('if (symbol == "chevron-up-down") return L"\\xE70D";', windows_controls)
+        native_controls = (SHARED / "ui/NativeControls.tsx").read_text(encoding="utf-8")
+        self.assertIn(r'"chevron-up-down": "\uE70D"', native_controls)
         self.assertIn("showGroupedActionMenu:groups:anchor:resolver:rejecter:", mac_module)
         self.assertIn("MF_STRING | MF_DISABLED", windows)
         # The grouped menu itself stays one level deep.
@@ -2600,6 +2576,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("LiteLLMAppKitSecureTextInputCls", mac)
         self.assertIn("RegisterLiteLLMWinUISecureTextInputNativeComponent", windows)
 
+
     def test_shared_form_primitives_have_codegen_native_components(self) -> None:
         adapter = (SHARED / "ui/NativeControls.tsx").read_text(encoding="utf-8")
         mac_specs = "\n".join(
@@ -2610,56 +2587,37 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             path.read_text(encoding="utf-8")
             for path in sorted((SHARED / "ui/windows").glob("*NativeComponent.ts"))
         )
-
         expected = {
-            "NativeButton": ("LiteLLMAppKitButton", "LiteLLMWinUIButton"),
-            "NativeSegmentedControl": (
-                "LiteLLMAppKitSegmentedControl",
-                "LiteLLMWinUISegmentedControl",
-            ),
-            "NativeToggle": ("LiteLLMAppKitSwitch", "LiteLLMWinUISwitch"),
-            "NativeCheckbox": ("LiteLLMAppKitCheckbox", "LiteLLMWinUICheckbox"),
-            "NativePicker": ("LiteLLMAppKitPicker", "LiteLLMWinUIPicker"),
+            "NativeButton": "LiteLLMAppKitButton",
+            "NativeSegmentedControl": "LiteLLMAppKitSegmentedControl",
+            "NativeToggle": "LiteLLMAppKitSwitch",
+            "NativeCheckbox": "LiteLLMAppKitCheckbox",
+            "NativePicker": "LiteLLMAppKitPicker",
+            "NativeTextField": "LiteLLMAppKitTextField",
+            "NativeSelectableRow": "LiteLLMAppKitSelectableRow",
         }
-        for adapter_name, (mac_name, win_name) in expected.items():
+        for adapter_name, mac_name in expected.items():
             self.assertIn(f"export function {adapter_name}", adapter)
             self.assertIn(f'("{mac_name}")', mac_specs)
-            self.assertIn(f'("{win_name}")', win_specs)
-        # These two keep only their AppKit codegen component: Windows uses
-        # React Native's TextInput and has no selectable-row leaf.
-        for adapter_name, mac_name in (
-            ("NativeTextField", "LiteLLMAppKitTextField"),
-            ("NativeSelectableRow", "LiteLLMAppKitSelectableRow"),
-        ):
-            self.assertIn(f"export function {adapter_name}", adapter)
-            self.assertIn(f'("{mac_name}")', mac_specs)
+        # Windows keeps only the two leaves that still need an island: the code
+        # editor's WebView and the native secret field.
+        self.assertIn('("LiteLLMWinUICodeWebView")', win_specs)
+        self.assertIn('("LiteLLMWinUISecureTextInput")', win_specs)
+        self.assertNotIn("LiteLLMWinUIButton", win_specs)
+        self.assertNotIn("LiteLLMWinUIPicker", win_specs)
+
 
     def test_native_button_link_variant_is_a_system_navigation_control_on_each_platform(self) -> None:
         adapter = (SHARED / "ui/NativeControls.tsx").read_text(encoding="utf-8")
-        mac_spec = (SHARED / "ui/macos/NativeButtonNativeComponent.ts").read_text(
-            encoding="utf-8"
-        )
-        windows_spec = (SHARED / "ui/windows/NativeButtonNativeComponent.ts").read_text(
-            encoding="utf-8"
-        )
+        mac_spec = (SHARED / "ui/macos/NativeButtonNativeComponent.ts").read_text(encoding="utf-8")
         mac = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
-        windows = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
-
         self.assertIn("link?: boolean;", adapter)
         self.assertIn("plainLink?: boolean;", adapter)
-        for spec in (mac_spec, windows_spec):
-            self.assertIn("link?: WithDefault<boolean, false>;", spec)
-            self.assertIn("plainLink?: WithDefault<boolean, false>;", spec)
-        # A plain link keeps link behavior but drops the inline bezel and
-        # left-aligns its title, for a long value that owns its whole column.
+        self.assertIn("link?: WithDefault<boolean, false>;", mac_spec)
+        self.assertIn("plainLink?: WithDefault<boolean, false>;", mac_spec)
         self.assertIn("BOOL plainLink = link && newViewProps.plainLink;", mac)
         self.assertIn("_button.bordered = !plainLink;", mac)
         self.assertIn("_button.alignment = plainLink ? NSTextAlignmentLeft : NSTextAlignmentCenter;", mac)
-        self.assertIn("plainLink", windows)
-        # ...and it is the quiet variant: secondary ink at the row's weight,
-        # never the accent-colored navigation link, underlined at rest because
-        # the underline is the affordance, and never restating its color for
-        # hover — only the navigation link takes the accent from the pointer.
         self.assertIn("((LiteLLMNavigationLinkButton *)_button).plainLinkMode = plainLink;", mac)
         self.assertIn("NSFontWeight linkWeight = plainLink ? NSFontWeightRegular : NSFontWeightSemibold;", mac)
         self.assertIn("color = self.enabled ? NSColor.secondaryLabelColor : NSColor.tertiaryLabelColor;", mac)
@@ -2667,14 +2625,15 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("NSUnderlineStyleAttributeName: underlined ? @(NSUnderlineStyleSingle) : @0,", mac)
         self.assertIn("color = _hovering ? NSColor.controlAccentColor : NSColor.linkColor;", mac)
         self.assertNotIn("NSColor.labelColor : NSColor.secondaryLabelColor", mac)
-        self.assertIn("linkLabel.Foreground(SecondaryTextBrush());", windows)
-        self.assertIn("linkLabel.TextDecorations(winrt::Windows::UI::Text::TextDecorations::Underline);", windows)
         self.assertIn("NSBezelStyleInline", mac)
         self.assertIn("LiteLLMNavigationLinkButton", mac)
         self.assertIn("NSCursor.pointingHandCursor", mac)
         self.assertIn("((LiteLLMNavigationLinkButton *)_button).linkMode = link;", mac)
-        self.assertIn("HyperlinkButton", windows)
-        self.assertIn("hyperlink_.Visibility(link", windows)
+        # Windows draws the same link on its React leaf: no bezel, underlined
+        # title, and the same link role.
+        self.assertIn("windowsButtonLink: { borderWidth: 0, backgroundColor: \"transparent\", paddingHorizontal: 0 }", adapter)
+        self.assertIn("windowsButtonLinkTitle: { textDecorationLine: \"underline\" }", adapter)
+        self.assertIn('accessibilityRole={link ? "link" : "button"}', adapter)
 
     def test_macos_controls_use_fabric_component_views_not_legacy_managers(self) -> None:
         controls_path = MAC_NATIVE / "AppKitControlViews.mm"
@@ -2909,7 +2868,6 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("preserveColumnWidths?: WithDefault<boolean, false>;", (SHARED / "ui" / "macos" / "NativeTableNativeComponent.ts").read_text(encoding="utf-8"))
         self.assertIn("scrollTrailingColumnOverflow?: WithDefault<boolean, true>;", (SHARED / "ui" / "macos" / "NativeTableNativeComponent.ts").read_text(encoding="utf-8"))
         self.assertIn("borderless?: WithDefault<boolean, false>;", (SHARED / "ui" / "macos" / "NativeTableNativeComponent.ts").read_text(encoding="utf-8"))
-        self.assertIn("borderless?: WithDefault<boolean, false>;", (SHARED / "ui" / "windows" / "NativeTableNativeComponent.ts").read_text(encoding="utf-8"))
         native_controls = (SHARED / "ui" / "NativeControls.tsx").read_text(encoding="utf-8")
         self.assertIn("framed?: boolean;", native_controls)
         self.assertIn("borderless: !framed,", native_controls)
@@ -2967,30 +2925,12 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("_tableView.usesAlternatingRowBackgroundColors = NO;", table)
         self.assertNotIn("_frameView.framed = YES;", table)
 
+
     def test_boolean_controls_reset_their_drawn_state_when_recycled(self) -> None:
-        """A reused checkbox or switch must not paint another row's on state.
-
-        The drawn state lives in the AppKit control, not in the props, and the
-        props-update guard only repaints on a *changed* value.  A recycled
-        view handed to a row whose props equal the defaults therefore kept the
-        previous row's check painted over a configuration that said otherwise.
-        """
-
         controls = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
-        windows = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
         for implementation, exported, control, drawn in (
-            (
-                "@implementation LiteLLMAppKitCheckboxComponentView",
-                "LiteLLMAppKitCheckboxCls",
-                "_checkbox",
-                "_checkbox.state = NSControlStateValueOff;",
-            ),
-            (
-                "@implementation LiteLLMAppKitSwitchComponentView",
-                "LiteLLMAppKitSwitchCls",
-                "_switch",
-                "_switch.state = NSControlStateValueOff;",
-            ),
+            ("@implementation LiteLLMAppKitCheckboxComponentView", "LiteLLMAppKitCheckboxCls", "_checkbox", "_checkbox.state = NSControlStateValueOff;"),
+            ("@implementation LiteLLMAppKitSwitchComponentView", "LiteLLMAppKitSwitchCls", "_switch", "_switch.state = NSControlStateValueOff;"),
         ):
             start = controls.index(implementation)
             end = controls.index(f"Class<RCTComponentViewProtocol> {exported}", start)
@@ -2999,29 +2939,16 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             self.assertIn("_props = defaultProps;", view)
             self.assertIn(drawn, view)
             self.assertIn(f"{control}.enabled = YES;", view)
-            # A mount must paint the props it is given, not only a change:
-            # a switch configured on has to mount on, and the first pass after
-            # a mount or a recycle is what guarantees that.
             self.assertIn("BOOL _propsApplied;", view)
             self.assertIn("const BOOL firstPass = !_propsApplied;", view)
             self.assertIn("_propsApplied = YES;", view)
             self.assertIn("_propsApplied = NO;", view)
             self.assertIn("if (firstPass || oldViewProps.value != newViewProps.value) {", view)
             self.assertIn("if (firstPass || oldViewProps.disabled != newViewProps.disabled) {", view)
-        # The Windows mirror resets the same controlled state from the island's
-        # Destroying hook, exactly like the table and the code web view.
-        self.assertIn(
-            "void PrepareForRecycle(\n      winrt::Microsoft::ReactNative::ComponentView const&) noexcept {",
-            windows,
-        )
-        self.assertIn("checkbox_.IsChecked(false);", windows)
-        # The Windows mirror applies every prop when it has no previous props,
-        # which is the same first-pass contract.
-        self.assertIn("const bool value_changed = !old_props || old_props->value != props.value;", windows)
-        self.assertIn("const bool disabled_changed = !old_props || old_props->disabled != props.disabled;", windows)
-        self.assertIn("value_ = false;", windows)
-        self.assertIn("  RegisterCheckbox(package_builder);", windows)
-        self.assertIn("  RegisterSwitch(package_builder);", windows)
+        adapter = (SHARED / "ui/NativeControls.tsx").read_text(encoding="utf-8")
+        self.assertIn("function WindowsCheckbox(", adapter)
+        self.assertIn("accessibilityState={{ checked: value, disabled: disabled === true }}", adapter)
+        self.assertIn("return <Switch value={value} disabled={disabled} onValueChange={onValueChange}", adapter)
 
     def test_a_windows_pane_switch_keeps_the_users_window_geometry(self) -> None:
         """The initial size belongs to the first presentation, not every open.
@@ -3093,45 +3020,19 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("std::this_thread::sleep_for(std::chrono::seconds(1));", poll)
         self.assertNotIn("if (result.status != 200) continue;", poll)
 
+
     def test_windows_controls_carry_their_hint_and_their_name(self) -> None:
-        """A button's hint and a field's name reach the Windows host too.
-
-        The macOS controls state both; the Windows specs did not even declare
-        them, so every icon-only button had no hover hint (and a busy wheel no
-        wording), and every switch and text field was announced as the same
-        untranslated word or as a bare edit box.
-        """
-
-        windows = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
-        button_spec = (SHARED / "ui/windows/NativeButtonNativeComponent.ts").read_text(encoding="utf-8")
-        toggle_spec = (SHARED / "ui/windows/NativeToggleNativeComponent.ts").read_text(encoding="utf-8")
         controls = (SHARED / "ui/NativeControls.tsx").read_text(encoding="utf-8")
         mac_button_spec = (SHARED / "ui/macos/NativeButtonNativeComponent.ts").read_text(encoding="utf-8")
-
-        # Both hosts declare the same hint/name fields on their button.
-        for spec in (button_spec, mac_button_spec):
-            self.assertIn("toolTip?: string;", spec)
-            self.assertIn("accessibilityLabel?: string;", spec)
-        self.assertIn("auto const toolTip = ToHString(props.toolTip.value_or(\"\"));", windows)
-        self.assertIn("auto const hint = toolTip.empty() ? ToHString(props.title) : toolTip;", windows)
-        self.assertIn("ToolTipService::SetToolTip(button_, winrt::box_value(hint));", windows)
-        self.assertIn("ToolTipService::SetToolTip(hyperlink_, winrt::box_value(hint));", windows)
-        self.assertIn("AutomationProperties::SetName(button_, label);", windows)
-
-        # A switch names itself from the shared label. The Windows text field
-        # is React Native's own TextInput now, so its accessibility name is the
-        # ordinary TextInput prop rather than a codegen field.
-        self.assertIn("accessibilityLabel?: string;", toggle_spec)
+        self.assertIn("toolTip?: string;", mac_button_spec)
+        self.assertIn("accessibilityLabel?: string;", mac_button_spec)
+        # The React button carries a hover hint and its own accessible name.
+        self.assertIn("accessibilityLabel={accessibilityLabel ?? title}", controls)
+        self.assertIn("tooltip: toolTip ?? title", controls)
+        # The React switch and text field name themselves from the shared label.
         self.assertIn("accessibilityLabel={accessibilityLabel}", controls)
-        switch = windows.split("struct SwitchComponentView", 1)[1].split("template <typename TComponent>", 1)[0]
-        self.assertIn("winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(toggle_, label);", switch)
-        self.assertIn('<TextInput {...props}', controls)
-
-        # The generated Windows headers carry the fields the implementation reads.
-        codegen = WIN_PROJECT / "codegen/react/components/YoungRouter"
-        for name, field in (("LiteLLMWinUIButton.g.h", "toolTip"), ("LiteLLMWinUISwitch.g.h", "accessibilityLabel")):
-            header = (codegen / name).read_text(encoding="utf-8")
-            self.assertIn(f"REACT_FIELD({field})", header)
+        self.assertIn("<TextInput {...props}", controls)
+        self.assertIn('accessibilityRole={link ? "link" : "button"}', controls)
 
     def test_macos_localization_drops_the_retired_menu_strings(self) -> None:
         leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
@@ -3185,6 +3086,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("_switch.controlSize = NSControlSizeSmall;", switch)
         self.assertNotIn("NSControlSizeRegular", switch)
 
+
     def test_macos_choice_controls_keep_the_native_selection_until_react_confirms_it(self) -> None:
         controls = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
         picker = controls.split("@implementation LiteLLMAppKitPickerComponentView", 1)[1].split(
@@ -3196,7 +3098,6 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         button = controls.split("@implementation LiteLLMAppKitButtonComponentView", 1)[1].split(
             "Class<RCTComponentViewProtocol> LiteLLMAppKitButtonCls", 1
         )[0]
-
         self.assertIn("const BOOL labelsChanged = oldViewProps.labels != newViewProps.labels;", picker)
         self.assertIn("const BOOL compactChanged = oldViewProps.compact != newViewProps.compact;", picker)
         self.assertIn("if (labelsChanged || compactChanged) {\n    [_host setNeedsLayout:YES];\n  }", picker)
@@ -3215,85 +3116,43 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("_button.imagePosition = image == nil\n      ? NSNoImage\n      : (showsTitle ? (trailingSymbol ? NSImageTrailing : NSImageLeading) : NSImageOnly);", button)
         self.assertIn('symbolName = @"info.circle";', controls)
         self.assertIn('symbolName = @"questionmark.circle";', controls)
+        adapter = (SHARED / "ui/NativeControls.tsx").read_text(encoding="utf-8")
+        self.assertIn("WINDOWS_BUTTON_GLYPHS", adapter)
+        for glyph in ('check: "\\uE73E"', 'copy: "\\uE8C8"', 'edit: "\\uE70F"', 'help: "\\uE897"', 'import: "\\uE8B5"', 'refresh: "\\uE72C"', '"chevron-down": "\\uE70D"', '"chevron-up": "\\uE70E"'):
+            self.assertIn(glyph, adapter)
 
-        windows = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
-        self.assertIn('const auto symbol = props.symbol.value_or("");', windows)
-        self.assertIn('icon.FontFamily(FontFamily(L"Segoe MDL2 Assets"));', windows)
-        self.assertIn('if (symbol == "check") return L"\\xE73E";', windows)
-        self.assertIn('if (symbol == "copy") return L"\\xE8C8";', windows)
-        self.assertIn('if (symbol == "edit") return L"\\xE70F";', windows)
-        self.assertIn('if (symbol == "power-off" || symbol == "power-on") return L"\\xE7E8";', windows)
-        self.assertIn('icon.Glyph(ButtonSymbolGlyph(symbol));', windows)
-        self.assertIn('if (symbol == "check") return L"\\xE73E";', windows)
-        self.assertIn('if (symbol == "help") return L"\\xE897";', windows)
-        self.assertIn('if (symbol == "import") return L"\\xE8B5";', windows)
-        self.assertIn('if (symbol == "refresh") return L"\\xE72C";', windows)
-        self.assertIn('if (symbol == "chevron-down") return L"\\xE70D";', windows)
-        self.assertIn('if (symbol == "chevron-up") return L"\\xE70E";', windows)
-        # One map serves the icon-only button, the glyph-with-title button, and
-        # the quiet link that carries only a glyph.
-        self.assertEqual(3, windows.count('icon.Glyph(ButtonSymbolGlyph(symbol));'))
-        self.assertIn(
-            '} else if (link && props.plainLink.value_or(false) && !symbol.empty()) {',
-            windows,
-        )
 
     def test_macos_busy_buttons_center_a_spinner_with_the_title_and_stay_live(self) -> None:
         controls = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
         button = controls.split("@implementation LiteLLMAppKitButtonComponentView", 1)[1].split(
             "Class<RCTComponentViewProtocol> LiteLLMAppKitButtonCls", 1
         )[0]
-
-        # The busy prop only drives the leading image: the enabled appearance,
-        # the title, and the control's width are untouched, so a working button
-        # never turns into a greyed-out placeholder.
         self.assertIn("const BOOL busyChanged = oldViewProps.busy != newViewProps.busy;", button)
         self.assertIn("_busy = newViewProps.busy;", button)
         self.assertIn("[self updateBusyAnimation];", button)
         self.assertNotIn("newViewProps.busy", button.split("_button.enabled", 1)[1].split("\n", 1)[0])
         self.assertIn("_busyStep = 0;", button.split("- (void)prepareForRecycle", 1)[1])
         self.assertIn("[_busyTimer invalidate];", button.split("- (void)prepareForRecycle", 1)[1])
-        # The spinner is the button's own leading image, exactly like a
-        # symbol-with-title button, so AppKit centers the icon together with
-        # the title as one group. An icon-only button keeps its icon size and
-        # shows the wheel in the icon's place.
         self.assertIn("NSImage *image = _busy ? AppKitBusySpinner.frames[(NSUInteger)_busyStep] : symbolImage;", button)
         self.assertIn(": (showsTitle ? (trailingSymbol ? NSImageTrailing : NSImageLeading) : NSImageOnly);", button)
-        # A menu button keeps its chevron on the title's trailing edge; while
-        # its action runs the spinner stays the leading content.
         self.assertIn("const BOOL trailingSymbol = _symbolTrailing && !_busy;", button)
         self.assertIn("_symbolTrailing = newViewProps.symbolTrailing;", button)
         self.assertIn('_button.title = showsTitle ? title : @"";', button)
-        # The wheel turns by swapping pre-rendered frames, so nothing about the
-        # button's layout changes while it reports progress.
         self.assertIn("_busyStep = (_busyStep + 1) % AppKitBusySpinner.stepCount;", button)
         self.assertIn("_button.image = AppKitBusySpinner.frames[(NSUInteger)_busyStep];", button)
         self.assertIn("NSRunLoopCommonModes", button)
-        # The wheel is one drawing for the whole app: the Swift leaf owns the
-        # frames and the 分组管理 sheet turns the same ones beside 密钥, so this
-        # control view only swaps them.  A template image is tinted by AppKit
-        # like the title it sits beside (white on an accent-filled default
-        # button), so the wheel needs no color of its own.
         mac_leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
         self.assertNotIn("BusySpinnerFrames", controls)
-        for marker in (
-            "public static let stepCount = 12",
-            "NSColor.black.withAlphaComponent(alpha).setStroke()",
-            "image.isTemplate = true",
-            "@objc(AppKitBusySpinner)",
-        ):
+        for marker in ("public static let stepCount = 12", "NSColor.black.withAlphaComponent(alpha).setStroke()", "image.isTemplate = true", "@objc(AppKitBusySpinner)"):
             self.assertIn(marker, mac_leaf)
         self.assertIn("AppKitBusySpinner.stepInterval", button)
-        # The shared sheet turns that wheel beside 密钥 instead of a second one.
         self.assertIn("loadingSpinner?.image = AppKitBusySpinner.frames[loadingStep]", mac_leaf)
-        # The spinner is never a view laid over the bezel.
         self.assertNotIn("leadingAccessory", controls)
-
-        windows = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
-        self.assertIn("bool const busy = props.busy.value_or(false);", windows)
-        self.assertIn("auto ring = ProgressRing{};", windows)
-        self.assertIn("button_.IsEnabled(Enabled(props.disabled));", windows)
-        self.assertIn("row.Children().Append(busySpinner());", windows)
+        adapter = (SHARED / "ui/NativeControls.tsx").read_text(encoding="utf-8")
+        # A busy React button keeps its enabled Pressable and swaps a spinner
+        # into the leading content; it never disables itself.
+        self.assertIn("busy === true ? <ActivityIndicator", adapter)
+        self.assertIn("disabled={disabled}", adapter)
 
     def test_macos_buttons_clear_default_action_state_before_fabric_reuse(self) -> None:
         controls = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
@@ -3322,8 +3181,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
 
     def test_native_boolean_controls_skip_unrelated_prop_rewrites(self) -> None:
         mac = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
-        windows = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
-
+        adapter = (SHARED / "ui/NativeControls.tsx").read_text(encoding="utf-8")
         self.assertIn("const BOOL selectionChanged = oldViewProps.selectedKey != newViewProps.selectedKey;", mac)
         self.assertIn("if (selectionChanged || _tableView.selectedRow != selectedIndex)", mac)
         self.assertIn("if (selectionChanged && _scrollView.hasVerticalScroller) {", mac)
@@ -3333,46 +3191,20 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("(initialDataLoad || TableIsFollowingBottom(_scrollView, _tableView))", mac)
         self.assertIn("const BOOL wasFollowingBottom = newViewProps.followBottom && dataChanged", mac)
         self.assertIn("newViewProps.followBottom && dataChanged && wasFollowingBottom", mac)
-        checkbox = windows.split("struct CheckboxComponentView", 1)[1].split(
-            "struct TableComponentView", 1
-        )[0]
-        switch = windows.split("struct SwitchComponentView", 1)[1].split(
-            "template <typename TComponent>", 1
-        )[0]
-        self.assertIn("ApplyProps(old_props);", checkbox)
-        self.assertIn("const bool value_changed = !old_props || old_props->value != props.value;", checkbox)
-        self.assertIn("if (value_changed) checkbox_.IsChecked(props.value.value_or(false));", checkbox)
-        self.assertIn("ApplyProps(old_props);", switch)
-        self.assertIn("if (value_changed) {\n      syncing_ = true;\n      value_ = props.value.value_or(false);\n      UpdateGlyph();", switch)
-
-        table = windows.split("struct TableComponentView", 1)[1].split(
-            "struct CodeWebViewComponentView", 1
-        )[0]
-        self.assertIn("bool ListIsFollowingBottom(ListView const& list)", windows)
-        self.assertIn("const bool was_following_bottom = props.followBottom.value_or(false) && rows_changed", table)
-        self.assertIn("(!has_applied_ || ListIsFollowingBottom(list_))", table)
-        self.assertIn("props.followBottom.value_or(false) && rows_changed && was_following_bottom", table)
+        # The React controls repaint from props; the table follows the log tail
+        # and honors an explicit scroll target.
+        self.assertIn("React.useEffect(() => {", adapter)
+        self.assertIn("if (!followBottom) return;", adapter)
+        self.assertIn("verticalScroll.current?.scrollToEnd({ animated: false });", adapter)
+        self.assertIn("verticalScroll.current?.scrollTo({ y: scrollToRow * rowHeight", adapter)
 
     def test_table_scrollbars_only_appear_when_they_are_needed(self) -> None:
         native_controls = (SHARED / "ui" / "NativeControls.tsx").read_text(encoding="utf-8")
-        windows = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
-
         self.assertIn('tableFallback: { minHeight: 120, borderWidth: 1, borderColor: "#d4d4d8", overflow: "hidden" }', native_controls)
         self.assertNotIn('tableFallback: { minHeight: 120, overflow: "scroll" }', native_controls)
-        table = windows.split("struct TableComponentView", 1)[1].split(
-            "struct CodeWebViewComponentView", 1
-        )[0]
-        self.assertIn("ScrollViewer::SetHorizontalScrollBarVisibility(", table)
-        # SelectionChanged is the table's one row-selection event path; an
-        # ItemClick handler would report every ordinary row twice.
-        self.assertNotIn("list_.IsItemClickEnabled(true);", table)
-        self.assertNotIn("list_.ItemClick", table)
-        self.assertIn("ScrollBarVisibility::Disabled", table)
-        self.assertIn("ScrollViewer::SetVerticalScrollBarVisibility(", table)
-        self.assertIn("ScrollBarVisibility::Auto", table)
-        self.assertIn("std::max(88.0, static_cast<double>(widths[index]))", windows)
-        self.assertIn("table_.MinWidth(TableWidth(props.columnWidths, column_count));", table)
-        self.assertIn("horizontal_scroller_.HorizontalScrollBarVisibility(", table)
+        self.assertIn("<ScrollView horizontal showsHorizontalScrollIndicator={!sourceList}", native_controls)
+        self.assertIn("<ScrollView ref={verticalScroll} style={windowsTableStyles.verticalScroll}", native_controls)
+        self.assertIn("nestedScrollEnabled", native_controls)
 
     def test_native_text_inputs_do_not_rewrite_active_text_for_unrelated_prop_updates(self) -> None:
         mac = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
@@ -3467,41 +3299,35 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("<View style={styles.splitTrailing}>{trailing}</View>", macos)
         self.assertIn('splitView: { minHeight: 120, flexDirection: "row" }', native_controls)
 
+
     def test_windows_controls_are_registered_fabric_winui_content_islands(self) -> None:
         controls = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
         app = (WIN_PROJECT / "YoungRouter.cpp").read_text(encoding="utf-8")
-
         self.assertIn("ContentIslandComponentView", controls)
         self.assertIn("RegisterWinUIControls(packageBuilder)", app)
-        for native_class in (
-            "Button",
-            "CheckBox",
-            "ComboBox",
-            "ToggleButton",
-            "TextBox",
-            "TextBlock",
-        ):
-            self.assertIn(native_class, controls)
-        self.assertNotIn("ToggleSwitch", controls)
         for component in (
-            "RegisterLiteLLMWinUIButtonNativeComponent",
-            "RegisterLiteLLMWinUISegmentedControlNativeComponent",
-            "RegisterLiteLLMWinUISwitchNativeComponent",
-            "RegisterLiteLLMWinUICheckboxNativeComponent",
-            "RegisterLiteLLMWinUIPickerNativeComponent",
+            "RegisterLiteLLMWinUICodeWebViewNativeComponent",
+            "RegisterLiteLLMWinUISecureTextInputNativeComponent",
         ):
             self.assertIn(component, controls)
+        for removed in (
+            "RegisterLiteLLMWinUIButtonNativeComponent",
+            "RegisterLiteLLMWinUICheckboxNativeComponent",
+            "RegisterLiteLLMWinUIPickerNativeComponent",
+            "RegisterLiteLLMWinUISegmentedControlNativeComponent",
+            "RegisterLiteLLMWinUISwitchNativeComponent",
+            "RegisterLiteLLMWinUITableNativeComponent",
+        ):
+            self.assertNotIn(removed, controls)
+
 
     def test_windows_controls_use_winui_theme_resources_for_state_colors(self) -> None:
+        adapter = (SHARED / "ui/NativeControls.tsx").read_text(encoding="utf-8")
+        for color in ("#005fb8", "#c42b1c", "#98a2b3", "#eaf3ff"):
+            self.assertIn(color, adapter)
         controls = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
-
-        for resource in (
-            "AccentFillColorDefaultBrush",
-            "SystemFillColorCriticalBrush",
-            "SubtleFillColorTransparentBrush",
-        ):
-            self.assertIn(resource, controls)
-        self.assertIn("Application::Current().Resources()", controls)
+        self.assertNotIn("ThemeBrush", controls)
+        self.assertNotIn("AccentFillColorDefaultBrush", controls)
 
     def test_native_text_editors_preserve_viewport_and_follow_log_tail(self) -> None:
         mac = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")

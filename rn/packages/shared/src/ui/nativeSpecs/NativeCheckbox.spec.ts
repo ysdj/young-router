@@ -12,6 +12,8 @@ import type {
 export const APPKIT_COMPONENT_NAME = "LiteLLMAppKitCheckbox";
 export const WINUI_COMPONENT_NAME = "LiteLLMWinUICheckbox";
 
+export const PLATFORMS = ["macos"];
+
 type ChangeEvent = Readonly<{ value: boolean }>;
 
 export interface NativeCheckboxProps extends ViewProps {

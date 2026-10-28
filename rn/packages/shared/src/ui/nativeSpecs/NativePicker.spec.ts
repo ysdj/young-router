@@ -13,6 +13,8 @@ import type {
 export const APPKIT_COMPONENT_NAME = "LiteLLMAppKitPicker";
 export const WINUI_COMPONENT_NAME = "LiteLLMWinUIPicker";
 
+export const PLATFORMS = ["macos"];
+
 type ChangeEvent = Readonly<{ index: Int32; value: string }>;
 
 export interface NativePickerProps extends ViewProps {

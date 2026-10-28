@@ -9,6 +9,8 @@ import type { DirectEventHandler, WithDefault } from "react-native/Libraries/Typ
 export const APPKIT_COMPONENT_NAME = "LiteLLMAppKitButton";
 export const WINUI_COMPONENT_NAME = "LiteLLMWinUIButton";
 
+export const PLATFORMS = ["macos"];
+
 export interface NativeButtonProps extends ViewProps {
   title: string;
   symbol?: string;

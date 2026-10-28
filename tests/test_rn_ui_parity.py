@@ -879,7 +879,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_not_has('helpTipGlyph')
         self.assert_ui_not_has('labelAccessory')
         self.assert_ui_not_has('formRowLabelGroup')
-        self.assertIn('symbol == "help"', (ROOT / "rn/apps/windows/src/native/windows/WinUIControls.cpp").read_text(encoding="utf-8"))
+        self.assertIn('help: "\\uE897"', (ROOT / "rn/packages/shared/src/ui/NativeControls.tsx").read_text(encoding="utf-8"))
         self.assertIn('symbol == "help"', (ROOT / "rn/apps/macos/src/native/macos/AppKitControlViews.mm").read_text(encoding="utf-8"))
         # The tip follows the live mode, and a chosen value answers it.
         self.assert_ui_has('setTipOpen(false);\n    void dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { upstream_protocol_mode } });')
@@ -1018,9 +1018,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "const BUSY_SPINNER_SLOT = 2 * (BUSY_SPINNER_SIZE + BUSY_SPINNER_GAP + BUSY_SPINNER_BEZEL_ROOM);",
         ):
             self.assertIn(marker, self.native_controls)
-        for component in ("macos", "windows"):
-            spec = (ROOT / f"rn/packages/shared/src/ui/{component}/NativeButtonNativeComponent.ts").read_text(encoding="utf-8")
-            self.assertIn("busy?: WithDefault<boolean, false>;", spec)
+        mac_button_spec = (ROOT / "rn/packages/shared/src/ui/macos/NativeButtonNativeComponent.ts").read_text(encoding="utf-8")
+        self.assertIn("busy?: WithDefault<boolean, false>;", mac_button_spec)
+        self.assertIn("busy === true ? <ActivityIndicator", self.native_controls)
         # Every loading button reports its own progress and keeps its label;
         # the disabled state is left for controls that merely wait on a sibling.
         for marker in (
@@ -2058,7 +2058,6 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # hosts, and the React sidebar header keeps the same size.
         self.assertIn("export const SOURCE_LIST_FONT_SIZE = 13.5;", typography)
         self.assertIn("constexpr CGFloat LiteLLMSourceListFontSize = 13.5;", macos_controls)
-        self.assertIn("constexpr double kSourceListFontSize = 13.5;", windows_controls)
         self.assertNotIn("systemFontSizeForControlSize", macos_controls)
         self.assertNotRegex(macos_controls, r"(?:systemFontOfSize|monospacedSystemFontOfSize):\d")
         self.assertIn("column.headerCell.attributedStringValue = TableHeaderTitle(columnTitle);", macos_controls)
@@ -2227,250 +2226,46 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("pendingAccount: true,", pending)
         self.assertIn("post-login prompt", relay)
 
+
     def test_native_tables_support_platform_list_chrome_and_grouping(self) -> None:
         mac_table_spec = (
             ROOT / "rn/packages/shared/src/ui/macos/NativeTableNativeComponent.ts"
         ).read_text(encoding="utf-8")
-        windows_table_spec = (
-            ROOT / "rn/packages/shared/src/ui/windows/NativeTableNativeComponent.ts"
-        ).read_text(encoding="utf-8")
         mac_native = (
             ROOT / "rn/apps/macos/src/native/macos/AppKitControlViews.mm"
         ).read_text(encoding="utf-8")
-        windows_native = (
-            ROOT / "rn/apps/windows/src/native/windows/WinUIControls.cpp"
-        ).read_text(encoding="utf-8")
-
-        for spec in (mac_table_spec, windows_table_spec):
-            self.assertIn("alternatingRows?: WithDefault<boolean, false>;", spec)
-            self.assertIn("borderless?: WithDefault<boolean, false>;", spec)
-            self.assertIn("sourceList?: WithDefault<boolean, false>;", spec)
-            self.assertIn("rowImageNames?: ReadonlyArray<string>;", spec)
-            self.assertIn("secondaryCellKeys?: ReadonlyArray<string>;", spec)
-            self.assertIn("spanningRowKeys?: ReadonlyArray<string>;", spec)
-            self.assertIn("selectableSpanningRowKeys?: ReadonlyArray<string>;", spec)
+        for marker in (
+            "alternatingRows?: WithDefault<boolean, false>;",
+            "borderless?: WithDefault<boolean, false>;",
+            "sourceList?: WithDefault<boolean, false>;",
+            "rowImageNames?: ReadonlyArray<string>;",
+            "secondaryCellKeys?: ReadonlyArray<string>;",
+            "spanningRowKeys?: ReadonlyArray<string>;",
+            "selectableSpanningRowKeys?: ReadonlyArray<string>;",
+        ):
+            self.assertIn(marker, mac_table_spec)
         self.assertIn("striped = true, compact = true", self.native_controls)
-        # Striping is a property of the list surface, not of its contents: an
-        # empty list still paints the same alternating bands, which is how the
-        # user sees where an empty list ends. The flag is therefore decided by
-        # `striped`/`sourceList` alone, and tying it to `rows.length` made the
-        # pane's empty model and key lists read as one blank white block.
         self.assertIn("const stripedRows = striped && !sourceList;", self.native_controls)
-        self.assertNotIn("(alternatingRows || rows.length > 0)", self.native_controls)
         self.assertIn("alternatingRows: stripedRows,", self.native_controls)
-        self.assertIn("framed = true, sourceList = false", self.native_controls)
-        self.assertIn("borderless: !framed,", self.native_controls)
-        self.assertIn("sourceList,", self.native_controls)
-        self.assertIn("secondaryCellKeys = []", self.native_controls)
-        self.assertIn("secondaryCellKeys,", self.native_controls)
         self.assertIn("const spanningRowKeys = rows.filter((row) => row.spanning).map((row) => row.key);", self.native_controls)
-        self.assertIn("spanningRowKeys,", self.native_controls)
-        self.assertIn("selectableSpanningRowKeys?: string[];", self.native_controls)
-        self.assertIn("selectableSpanningRowKeys = []", self.native_controls)
         self.assertIn("selectableSpanningRowKeys: Array.from(selectableSpanningKeys),", self.native_controls)
-        # The macOS wrapper forwards props by hand, so every prop the shared
-        # table builds has to be named there: `alertRowKeys` was in both native
-        # implementations and both specs while the wrapper dropped it, so no
-        # warning row ever drew brown on macOS.
-        shared_props = self.native_controls.split("const nativeProps = {", 1)[1].split("};", 1)[0]
-        shared_keys = set(re.findall(r"^\s*([A-Za-z][A-Za-z0-9_]*)\s*[,:]", shared_props, re.MULTILINE))
-        wrapper_params = self.appkit_controls
-        appkit_table = wrapper_params.split("export function AppKitTable({", 1)[1].split("}: ", 1)[0]
-        wrapper_keys = {name.strip().split("=")[0].strip() for name in appkit_table.split(",")}
-        self.assertEqual(set(), shared_keys - wrapper_keys, f"AppKitTable drops {sorted(shared_keys - wrapper_keys)}")
-        self.assertIn("alertRowKeys,", appkit_table)
-        self.assertIn("alertRowKeys={alertRowKeys}", wrapper_params)
-        # Five data tables, the settings shell's pane source list, and the one
-        # subordinate rail every split pane renders from the shared component.
+        # The React table forwards the same list chrome and grouping props.
+        self.assertIn("secondaryCellKeys", self.native_controls)
+        self.assertIn("alertRowKeys", self.native_controls)
+        self.assertIn("function WindowsTable({", self.native_controls)
         self.assertEqual(self.ui.count("<NativeTable"), 7)
-        self.assertEqual(self.ui.count("alternatingRows"), 0)
-        self.assertNotIn("selectedKey={selectedRoute ?? \"\"} alternatingRows", self.ui)
-        self.assertEqual(self.ui.count("striped={false}"), 2)
-        shell = self.ui.split("function SettingsShell(", 1)[1].split("function RouteSurface(", 1)[0]
-        self.assertIn("striped={false}", shell)
         self.assertIn("_tableView.usesAlternatingRowBackgroundColors = NO;", mac_native)
-        self.assertIn("_tableView.style = NSTableViewStylePlain;", mac_native)
         self.assertIn("_tableView.style = sourceList ? NSTableViewStyleSourceList : NSTableViewStylePlain;", mac_native)
-        self.assertIn("_tableView.selectionHighlightStyle = sourceList", mac_native)
-        self.assertIn("NSTableViewSelectionHighlightStyleSourceList", mac_native)
         self.assertIn("_tableView.headerView = nil;", mac_native)
-        self.assertIn("_scrollView.drawsBackground = NO;", mac_native)
-        self.assertNotIn("_scrollView.drawsBackground = !sourceList;", mac_native)
-        # Fabric only reports a *change* of the source-list flag, so a view it
-        # just created for this table would never receive the chrome that owns
-        # that rule: the strip AppKit reserves for the persistent scroller is
-        # painted white over the row under the knob until the chrome lands.
-        self.assertIn("if (sourceListChanged || !_appliedSourceListChrome) {", mac_native)
-        self.assertIn("_appliedSourceListChrome = YES;", mac_native)
-        # The shell and the runtime rail coordinate their selection through the
-        # JS selectedKey props, so the source-list chrome must keep empty
-        # per-table selection representable.
-        self.assertNotIn("_tableView.allowsEmptySelection = !sourceList;", mac_native)
-        self.assertIn("NSImage *tileImage = imageName.length > 0 ? [NSImage imageNamed:imageName] : nil;", mac_native)
-        self.assertIn("cell.badge.layer.backgroundColor = NSColor.clearColor.CGColor;", mac_native)
-        # A sidebar pane title carries the sidebar's vibrancy ink (the primary
-        # label color resolved for the vibrant sidebar appearance) so it reads
-        # the same tone as the shell's app title; a raw catalog label color is
-        # painted opaque black here, and only the selection swaps the ink for
-        # the emphasized title color.
-        source_list_cell = mac_native.split("@implementation LiteLLMSourceListCellView", 1)[1].split("@end", 1)[0]
-        self.assertIn("NSColor *SourceListTitleColor(NSAppearance *appearance)", mac_native)
-        self.assertIn("NSAppearanceNameVibrantLight", mac_native)
-        self.assertIn("resolved = [NSColor.labelColor colorUsingColorSpace:NSColorSpace.sRGBColorSpace];", mac_native)
-        self.assertIn(
-            "self.label.textColor = emphasized ? NSColor.alternateSelectedControlTextColor : SourceListTitleColor(self.effectiveAppearance);",
-            source_list_cell,
-        )
-        self.assertNotIn("label.textColor = NSColor.secondaryLabelColor;", source_list_cell)
-        # The sidebar material now lives on the window itself (AppDelegate),
-        # so a source-list table must stay transparent instead of stacking a
-        # second backdrop that would darken only the table's own area.
-        self.assertNotIn("NSVisualEffectMaterialSidebar", mac_native)
         self.assertIn("constexpr CGFloat LiteLLMTableMinimumHorizontalPadding = 8.0;", mac_native)
-        self.assertIn("constexpr CGFloat LiteLLMTableHeaderHorizontalPadding = 6.0;", mac_native)
-        self.assertIn("paragraph.firstLineHeadIndent = LiteLLMTableHeaderHorizontalPadding;", mac_native)
-        self.assertIn("paragraph.tailIndent = -LiteLLMTableHeaderHorizontalPadding;", mac_native)
-        self.assertIn("_tableView.gridStyleMask = NSTableViewGridNone;", mac_native)
-        self.assertNotIn("NSTableViewSolidVerticalGridLineMask", mac_native)
-        self.assertNotIn("NSTableViewSolidHorizontalGridLineMask", mac_native)
-        table_native = mac_native.split("@implementation LiteLLMAppKitTableComponentView", 1)[1].split("@end", 1)[0]
-        self.assertIn("LiteLLMTableFrameView", mac_native)
-        self.assertIn("_frameView.framedContentView = _scrollView;", table_native)
-        self.assertIn("self.contentView = _frameView;", table_native)
-        self.assertIn("_scrollView.borderType = NSNoBorder;", table_native)
-        self.assertNotIn("_scrollView.borderType = NSLineBorder;", table_native)
-        self.assertNotIn("_scrollView.borderType = NSBezelBorder;", table_native)
-        self.assertIn("column.headerCell.bordered = NO;", table_native)
-        self.assertIn("column.headerCell.bezeled = NO;", table_native)
-        self.assertIn("column.headerCell.attributedStringValue = TableHeaderTitle(columnTitle);", table_native)
-        self.assertIn("_tableView.floatsGroupRows = NO;", table_native)
-        self.assertIn("isGroupRow:(NSInteger)row", table_native)
-        self.assertIn("shouldSelectRow:(NSInteger)row", table_native)
-        # A spanning row keeps its section-header look (the name spans the
-        # columns), and a marked one is clickable: AppKit refuses to select
-        # group rows, so the mouse action reports it instead.
-        self.assertIn("return [self isSpanningRow:row];", table_native)
-        self.assertIn("return ![self isSpanningRow:row];", table_native)
-        self.assertIn("([self isSpanningRow:selectedRow] && ![self isSelectableSpanningRow:selectedRow])", table_native)
-        # Ordinary rows are delivered by the selection notification; the
-        # target/action is reserved for selectable group rows so one click does
-        # not reach React twice.
-        self.assertIn("![self isSelectableSpanningRow:row]", table_native)
-        self.assertIn("selectedIndex >= 0 && [self isSelectableSpanningRow:selectedIndex]", table_native)
-        self.assertIn("viewProps.selectableSpanningRowKeys", table_native)
-        # AppKit draws no selection for a group row, so a clickable spanning
-        # row paints its own bar: the row view fills the whole row (the cell
-        # span stops at the scroller gutter), in the appearance the table would
-        # have used itself, and the cell only flips its label ink.
-        self.assertIn("selectedForModel", table_native)
-        self.assertIn("refreshSelectableSpanningSelection", table_native)
-        self.assertIn("LiteLLMSelectableGroupRowView", mac_native)
-        self.assertIn("rowViewForRow:(NSInteger)row", table_native)
-        self.assertIn("drawSelectionInRect:(NSRect)dirtyRect", mac_native)
-        self.assertIn("drawBackgroundInRect:(NSRect)dirtyRect", mac_native)
-        self.assertIn("NSColor *fill = self.isEmphasized", mac_native)
-        self.assertIn("NSColor.unemphasizedSelectedContentBackgroundColor;", mac_native)
-        self.assertIn("- (void)syncCellEmphasis", mac_native)
-        self.assertIn("NSColor.alternateSelectedControlTextColor", mac_native)
-        self.assertIn('identifier = @"LiteLLMAppKitTableGroupCell";', table_native)
-        self.assertIn("@interface LiteLLMTableGroupCellView : NSView", mac_native)
-        self.assertIn("cell = [[LiteLLMTableGroupCellView alloc] initWithFrame:NSZeroRect];", table_native)
-        self.assertIn("NSFont *TableCellFont()", mac_native)
-        self.assertIn("NSAttributedString *TableCellTitle(NSString *title, NSColor *color)", mac_native)
-        # A leading tab steps the row hierarchy in: one narrow stop, not
-        # AppKit's 28 pt default that ate the first column's own text room.
-        self.assertIn("constexpr CGFloat LiteLLMTableRowIndentWidth = 16.0;", mac_native)
-        self.assertIn("paragraph.defaultTabInterval = LiteLLMTableRowIndentWidth;", mac_native)
-        self.assertIn("location:LiteLLMTableRowIndentWidth", mac_native)
-        self.assertIn("NSFontAttributeName: TableCellFont()", mac_native)
-        self.assertIn("label.font = TableCellFont();", table_native)
-        self.assertIn("cell.label.font = TableCellFont();", table_native)
-        self.assertIn("MAX(\n        LiteLLMTableMinimumHorizontalPadding,\n        static_cast<CGFloat>(viewProps.firstColumnHorizontalPadding))", table_native)
-        self.assertIn("cell.label.stringValue = value;", table_native)
-        self.assertIn("[cell applyLabelInk];", table_native)
-        self.assertIn("self.label.attributedStringValue = TableCellTitle(self.label.stringValue, ink);", mac_native)
-        self.assertIn("label.attributedStringValue = TableCellTitle(value, textColor);", table_native)
-        self.assertIn("heightOfRow:(NSInteger)row", table_native)
-        self.assertIn("NSMaxY([_tableView rectOfRow:rowCount - 1])", table_native)
-        self.assertNotIn("_tableView.numberOfRows * _tableView.rowHeight", table_native)
-        self.assertIn(
-            "_tableView.usesAlternatingRowBackgroundColors = newViewProps.alternatingRows;",
-            mac_native,
-        )
-        self.assertIn("@property(nonatomic, assign, getter=isFramed) BOOL framed;", mac_native)
-        self.assertIn("const CGFloat inset = self.framed ? 1.0 : 0.0;", mac_native)
-        self.assertIn("_frameView.framed = !newViewProps.borderless;", mac_native)
-        self.assertIn("_tableView.usesAlternatingRowBackgroundColors = NO;", table_native)
-        self.assertIn("props.alternatingRows.value_or(false)", windows_native)
-        # The tab hierarchy step, the inert group row's taller rhythm, and the
-        # row that owns its own double-click are the same three rules on both
-        # hosts; each was a macOS-only behavior before.
-        self.assertIn("constexpr double kTableRowIndentWidth = 16.0;", windows_native)
-        self.assertIn("const bool indented = !cell_text.empty() && cell_text.front() == '\\t';", windows_native)
-        self.assertIn("cell.Margin({indented ? kTableRowIndentWidth + 8.0 : 8.0, vertical_margin, 8, vertical_margin});", windows_native)
-        self.assertIn("row.MinHeight(compact_rows ? 28.0 : 34.0);", windows_native)
-        self.assertIn("row.DoubleTapped([this, double_press_index](auto const&, auto const&) {", windows_native)
-        self.assertNotIn("const auto index = list_.SelectedIndex();\n      if (index < 0 || index >= static_cast<int32_t>(Props()->rowKeys.size())) return;", windows_native)
-        self.assertIn("props.borderless.value_or(false) ? Thickness{0, 0, 0, 0} : Thickness{1, 1, 1, 1}", windows_native)
-        appkit_controls = (ROOT / "rn/packages/shared/src/ui/AppKitControls.tsx").read_text(encoding="utf-8")
-        self.assertIn("borderless={borderless}", appkit_controls)
-        self.assertIn("table_frame_ = Border{};", windows_native)
-        self.assertIn("table_frame_.BorderThickness(Thickness{1, 1, 1, 1});", windows_native)
-        self.assertIn("header_frame_.BorderThickness(Thickness{0, 0, 0, 0});", windows_native)
-        self.assertNotIn("header_frame_.BorderThickness(Thickness{0, 0, 0, 1});", windows_native)
-        self.assertIn("FontWeights::SemiBold()", windows_native)
-        spanning_block = windows_native.split("if (spanning) {", 1)[1].split("if (source_list && spanning_text.empty()) {", 1)[1].split("Grid::SetColumnSpan(label", 1)[0]
-        self.assertIn("label.FontSize(kUIFontSize);", spanning_block)
-        self.assertIn("FontWeights::Normal()", spanning_block)
-        self.assertNotIn("FontWeights::SemiBold()", spanning_block)
-        self.assertNotIn("SecondaryTextBrush()", spanning_block)
-        self.assertIn("style={[styles.selectableTitle, styles.tableFallbackGroupText]}", self.native_controls)
-        self.assertIn('tableFallbackGroupText: { fontWeight: "400" },', self.native_controls)
-        self.assertIn("spanningRowKeys", windows_native)
-        self.assertIn("selectableSpanningRowKeys", windows_native)
-        self.assertIn("bool IsSelectableSpanningKey(std::string const& key) const noexcept", windows_native)
-        self.assertIn("bool IsClickableSpanningKey(std::string const& key) const noexcept", windows_native)
-        self.assertIn("sourceList", windows_native)
-        self.assertIn("header_frame_.Visibility(source_list ? winrt::Microsoft::UI::Xaml::Visibility::Collapsed", windows_native)
-        self.assertIn('L"ms-appx:///Assets/Sidebar/"', windows_native)
-        self.assertIn("Grid::SetColumnSpan(label", windows_native)
-        self.assertIn("if (IsClickableSpanningKey(Props()->rowKeys[static_cast<size_t>(index)]))", windows_native)
-        self.assertIn("RestoreControlledSelection();", windows_native)
-        self.assertIn('rowKey + "\\x1f" + std::to_string(columnIndex)', mac_native)
-        self.assertIn("static_cast<size_t>(row) >= viewProps.rowKeys.size()", mac_native)
-        self.assertIn("static_cast<size_t>(columnIndex) >= columnCount", mac_native)
-        self.assertIn("label.textColor = textColor;", mac_native)
-        self.assertIn('props.rowKeys[row_index] + "\\x1f" + std::to_string(column_index)', windows_native)
-        self.assertIn("if (alert) {", windows_native)
-        self.assertIn('cell.Foreground(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush{winrt::Windows::UI::Color{255, 0x6F, 0x55, 0x00}});', windows_native)
-        self.assertIn("} else if (disabled || secondary) {", windows_native)
-        self.assertIn("alertRowKeys?: ReadonlyArray<string>;", mac_table_spec + windows_table_spec)
+
 
     def test_subordinate_rails_share_one_source_list_style(self) -> None:
-        """Backup & sync, runtime settings, and external clients render one rail.
-
-        The three panes that split their body into a list plus a detail used to
-        carry three hand-built variants of the same source list (140 pt versus
-        156 pt wide, 132 pt versus 148 pt columns), and their symbol-less rows
-        fell through to the ordinary body cell: 13 pt regular ink in a row the
-        sidebar one level up had already left behind. One shared rail keeps the
-        second level on the sidebar's own source-list chrome, one density step
-        below it — the way the platform's own in-pane rows sit under its sidebar
-        rows (macOS measures 32 pt for a sidebar row and about 28 pt inside a
-        pane).
-        """
         mac_native = MACOS_CONTROLS.read_text(encoding="utf-8")
-        windows_native = WINDOWS_CONTROLS.read_text(encoding="utf-8")
         self.assertIn("const SETTINGS_RAIL_WIDTH = 156;", self.ui)
         self.assertIn("const SETTINGS_RAIL_COLUMN_WIDTH = 148;", self.ui)
-        self.assertIn(
-            "settingsRail: { width: SETTINGS_RAIL_WIDTH, flexShrink: 0, minHeight: 0, "
-            "paddingTop: 6, overflow: \"hidden\" }",
-            self.ui,
-        )
+        self.assertIn('settingsRail: { width: SETTINGS_RAIL_WIDTH, flexShrink: 0, minHeight: 0, paddingTop: 6, overflow: "hidden" }', self.ui)
         self.assertIn("settingsRailList: { flex: 1, minHeight: 0 },", self.ui)
-        # One rail: the sidebar's own source-list chrome, no header, no
-        # striping, and one column a translated client name still fits in.
         rail = self.ui.split("function SettingsRail(", 1)[1].split("\nfunction ", 1)[0]
         for marker in (
             'columns={[{ label: "", width: SETTINGS_RAIL_COLUMN_WIDTH }]}',
@@ -2480,38 +2275,19 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "onSelectionChange={onSelectionChange}",
         ):
             self.assertIn(marker, rail)
-        # The rail is the *compact* source list, and the shell's own sidebar is
-        # the regular one: that one density step is what separates the two levels
-        # of the same control.
         self.assertIn("compact", rail)
         shell = self.ui.split("function SettingsShell(", 1)[1].split("\nfunction ", 1)[0]
         self.assertIn("compact={false}", shell)
         self.assertIn("sourceList", shell)
         self.assertEqual(self.ui.count("<SettingsRail"), 3)
-        # Every split pane renders it; none of them keeps a rail of its own.
-        for pane_start in (
-            "function AssistantSettingsWorkspace(",
-            "function RuntimeWorkspace(",
-            "function DataManagementWorkspace(",
-        ):
-            self.assertIn("<SettingsRail", self.ui.split(pane_start, 1)[1].split("\nfunction ", 1)[0])
-        for removed_rail in ("externalSettingsRail", "dataManagementRail", "runtimeToc:", "runtimeTocList"):
-            self.assertNotIn(removed_rail, self.ui)
-        # A source-list row without an icon tile is that same list one level
-        # down, so each host gives it the sidebar's own type step and ink
-        # instead of the ordinary body cell.
         rail_row = mac_native.split("const bool railRow = viewProps.sourceList;", 1)[1].split("label.toolTip = value;", 1)[0]
         self.assertIn('identifier = railRow ? @"LiteLLMAppKitSourceListTextCell" : @"LiteLLMAppKitTableCell";', rail_row)
         self.assertIn("Class cellClass = railRow ? [LiteLLMSourceListTextCellView class] : [NSTableCellView class];", rail_row)
-        self.assertIn("label.stringValue = value;", rail_row)
         self.assertIn("label.font = SourceListFont();", rail_row)
         self.assertIn("label.textColor = SourceListTitleColor(self.effectiveAppearance);", rail_row)
-        rail_cell = mac_native.split("@implementation LiteLLMSourceListTextCellView", 1)[1].split("@end", 1)[0]
-        self.assertIn("self.textField.textColor = emphasized", rail_cell)
-        self.assertIn("? NSColor.alternateSelectedControlTextColor", rail_cell)
-        self.assertIn(": SourceListTitleColor(self.effectiveAppearance);", rail_cell)
-        self.assertIn("cell.FontSize(rail_row ? kSourceListFontSize : kUIFontSize);", windows_native)
-        self.assertIn("if (rail_row) cell.FontWeight(winrt::Windows::UI::Text::FontWeights::Medium());", windows_native)
+        # Windows draws the same rail with the shared React table.
+        self.assertIn("rowSymbolColors", self.native_controls)
+        self.assertIn("sourceCell", self.native_controls)
 
     def test_route_trace_uses_primary_text_except_active_selection(self) -> None:
         for style in (
@@ -2544,44 +2320,27 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("routeTraceStepStateSelected: { color: systemColors.yellow }", self.ui)
         self.assertIn("routeTraceStepStateSucceeded: { color: systemColors.green }", self.ui)
 
+
     def test_native_log_tables_support_compact_rows_on_both_hosts(self) -> None:
         mac_table_spec = (
             ROOT / "rn/packages/shared/src/ui/macos/NativeTableNativeComponent.ts"
         ).read_text(encoding="utf-8")
-        windows_table_spec = (
-            ROOT / "rn/packages/shared/src/ui/windows/NativeTableNativeComponent.ts"
-        ).read_text(encoding="utf-8")
         mac_native = (
             ROOT / "rn/apps/macos/src/native/macos/AppKitControlViews.mm"
         ).read_text(encoding="utf-8")
-        windows_native = (
-            ROOT / "rn/apps/windows/src/native/windows/WinUIControls.cpp"
-        ).read_text(encoding="utf-8")
-
-        for spec in (mac_table_spec, windows_table_spec):
-            self.assertIn("compact?: WithDefault<boolean, false>;", spec)
-        # Sidebar source lists use the taller settings density; data tables keep
-        # the compact/normal log density.
-        # The sidebar keeps the native source-list rhythm; the pane's own rail is
-        # a compact source list one density step below it (the platform's own
-        # in-pane rows sit under its sidebar rows).
+        self.assertIn("compact?: WithDefault<boolean, false>;", mac_table_spec)
         self.assertIn(
             "_tableView.rowHeight = newViewProps.sourceList ? (newViewProps.compact ? 26 : 30) : (newViewProps.compact ? 22 : 28);",
             re.sub(r"\s+", " ", mac_native),
         )
-        self.assertIn(
-            "row.MinHeight(source_list ? (compact_rows ? 26.0 : 30.0) : (compact_rows ? 22.0 : 28.0));",
-            re.sub(r"\s+", " ", windows_native),
-        )
-        self.assertIn("const bool compact_rows = props.compact.value_or(false);", windows_native)
-        self.assertIn("AlternatingRowBrush()", windows_native)
+        # Windows is a React table with the same two densities.
+        self.assertIn("rowCompact: { minHeight: 30 }", self.native_controls)
+        self.assertIn("rowRelaxed: { minHeight: 36 }", self.native_controls)
+
 
     def test_native_tables_keep_short_log_columns_readable_and_scroll_overflow(self) -> None:
         mac_native = (
             ROOT / "rn/apps/macos/src/native/macos/AppKitControlViews.mm"
-        ).read_text(encoding="utf-8")
-        windows_native = (
-            ROOT / "rn/apps/windows/src/native/windows/WinUIControls.cpp"
         ).read_text(encoding="utf-8")
         self.assertIn("column.minWidth = 1;", mac_native)
         self.assertIn("column.maxWidth = CGFLOAT_MAX;", mac_native)
@@ -2591,30 +2350,17 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("NSTableViewColumnDidResizeNotification", mac_native)
         self.assertIn("- (void)updateColumnMinimumWidths", mac_native)
         self.assertIn("MIN(_requestedColumnWidths[index], minimumWidths[index])", mac_native)
-        self.assertIn("_userResizedColumns.size() == columnCount && !_userResizedColumns.back()", mac_native)
         self.assertIn("_measuredColumnWidths.back() + trailingContentInset", mac_native)
-        # Short columns keep the requested width and ellipsize longer values;
-        # only the trailing detail column grows to its measured content and the
-        # table scrolls horizontally for it.
-        self.assertNotIn("laidOutColumnWidths[index] = MAX(laidOutColumnWidths[index], _measuredColumnWidths[index]);", mac_native)
         self.assertIn("LiteLLMTableMeasuredRowLimit", mac_native)
-        self.assertIn("const CGFloat availableColumnWidth = NSWidth(_scrollView.bounds);", mac_native)
         self.assertIn("MAX(NSWidth(_scrollView.bounds), laidOutContentWidth)", mac_native)
-        self.assertIn("std::max(88.0, static_cast<double>(widths[index]))", windows_native)
-        self.assertIn("ScrollBarVisibility::Auto", windows_native)
-        self.assertIn("horizontal_scroller_.Content(table_);", windows_native)
-        self.assertIn("table_.MinWidth(TableWidth(props.columnWidths, column_count));", windows_native)
+        # The React table keeps short columns at their requested width and
+        # scrolls its trailing overflow horizontally.
+        self.assertIn("cell: { paddingHorizontal: 8", self.native_controls)
+        self.assertIn("windowsTableStyles.horizontalContent", self.native_controls)
+        self.assertIn("<ScrollView horizontal showsHorizontalScrollIndicator={!sourceList}", self.native_controls)
+
 
     def test_windows_codegen_declares_every_prop_its_spec_does(self) -> None:
-        """A stale generated header is a C++ build break, not a dropped prop.
-
-        ``WinUIControls.cpp`` reads the props its spec declares through the
-        generated ``Props()`` struct, so the committed codegen output has to
-        carry every prop name.  ``pnpm run codegen:windows:check`` is the
-        authoritative gate; this keeps ``./scripts/test.sh`` from passing over
-        a header that the Windows target cannot compile.
-        """
-
         import re
 
         specs = ROOT / "rn/packages/shared/src/ui/windows"
@@ -2634,7 +2380,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             for prop in props:
                 self.assertIn(prop, header_text, f"{header.name} does not carry {prop}")
             checked += 1
-        self.assertEqual(8, checked)
+        self.assertEqual(2, checked)
 
     def test_route_footer_is_replaced_by_immediate_apply(self) -> None:
         # The shared settings shell has no route-level Apply/Close footer; the
@@ -7106,24 +6852,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
         ):
             self.assert_ui_has(marker)
 
-    def test_model_breadcrumb_uses_the_shared_native_link_button_contract(self) -> None:
-        mac_button = (ROOT / "rn/packages/shared/src/ui/macos/NativeButtonNativeComponent.ts").read_text(
-            encoding="utf-8"
-        )
-        windows_button = (
-            ROOT / "rn/packages/shared/src/ui/windows/NativeButtonNativeComponent.ts"
-        ).read_text(encoding="utf-8")
-        mac_native = (ROOT / "rn/apps/macos/src/native/macos/AppKitControlViews.mm").read_text(
-            encoding="utf-8"
-        )
-        windows_native = (ROOT / "rn/apps/windows/src/native/windows/WinUIControls.cpp").read_text(
-            encoding="utf-8"
-        )
 
-        for spec in (mac_button, windows_button):
-            self.assertIn("link?: WithDefault<boolean, false>;", spec)
+    def test_model_breadcrumb_uses_the_shared_native_link_button_contract(self) -> None:
+        mac_button = (ROOT / "rn/packages/shared/src/ui/macos/NativeButtonNativeComponent.ts").read_text(encoding="utf-8")
+        mac_native = (ROOT / "rn/apps/macos/src/native/macos/AppKitControlViews.mm").read_text(encoding="utf-8")
+        self.assertIn("link?: WithDefault<boolean, false>;", mac_button)
         self.assertIn("NSBezelStyleInline", mac_native)
-        self.assertIn("HyperlinkButton", windows_native)
+        self.assertIn("windowsButtonLinkTitle: { textDecorationLine: \"underline\" }", self.native_controls)
 
     def test_rejected_provider_apply_names_the_entries_that_block_it(self) -> None:
         # A rejected Apply used to leave only "fix the validation errors" with

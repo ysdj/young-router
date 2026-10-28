@@ -9,6 +9,8 @@ import type { DirectEventHandler, WithDefault } from "react-native/Libraries/Typ
 export const APPKIT_COMPONENT_NAME = "LiteLLMAppKitSwitch";
 export const WINUI_COMPONENT_NAME = "LiteLLMWinUISwitch";
 
+export const PLATFORMS = ["macos"];
+
 type ChangeEvent = Readonly<{ value: boolean }>;
 
 export interface NativeToggleProps extends ViewProps {

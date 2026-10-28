@@ -1,10 +1,12 @@
 import React from "react";
 import {
   ActivityIndicator,
+  NativeModules,
   Platform,
   Pressable,
   ScrollView,
   StyleSheet,
+  Switch,
   Text,
   TextInput,
   View,
@@ -28,12 +30,7 @@ import {
   AppKitTextField,
   AppKitToggle,
 } from "./AppKitControls";
-import WinUIButton from "./windows/NativeButtonNativeComponent";
-import WinUICheckbox from "./windows/NativeCheckboxNativeComponent";
-import WinUIPicker from "./windows/NativePickerNativeComponent";
-import WinUISegmented from "./windows/NativeSegmentedNativeComponent";
 import WinUISecureTextInput from "./windows/NativeSecureTextInputNativeComponent";
-import WinUIToggle from "./windows/NativeToggleNativeComponent";
 import { UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
 
 type ButtonProps = {
@@ -282,6 +279,137 @@ type SplitViewProps = {
   style?: StyleProp<ViewStyle>;
 };
 
+
+// The WinUI button's symbols were Segoe Fluent Icons glyphs. Keep the same
+// glyphs on the React Native leaf so an icon button does not become a word.
+const WINDOWS_BUTTON_GLYPHS: Record<NonNullable<ButtonProps["symbol"]>, string> = {
+  check: "\uE73E",
+  close: "\uE711",
+  copy: "\uE8C8",
+  edit: "\uE70F",
+  help: "\uE897",
+  import: "\uE8B5",
+  info: "\uE946",
+  minus: "\uE738",
+  pause: "\uE769",
+  play: "\uE768",
+  plus: "\uE710",
+  "power-off": "\uE7E8",
+  "power-on": "\uE7E8",
+  refresh: "\uE72C",
+  trash: "\uE74D",
+  "chevron-up": "\uE70E",
+  "chevron-down": "\uE70D",
+  "chevron-up-down": "\uE70D",
+};
+
+function WindowsButton({ title, symbol, symbolWithTitle, symbolTrailing, toolTip, accessibilityLabel, disabled, busy, primary, destructive, compact, link, plainLink, titleWidth: _titleWidth, onPress, style, ref }: ButtonProps & { ref?: React.Ref<any> }): React.JSX.Element {
+  const showsTitle = symbolWithTitle === true || !symbol;
+  const glyph = symbol ? WINDOWS_BUTTON_GLYPHS[symbol] ?? "\uE74D" : undefined;
+  const ink = disabled ? "#98a2b3" : destructive ? "#c42b1c" : primary ? "#ffffff" : link ? "#005fb8" : "#1a1a1a";
+  return <Pressable
+    ref={ref as never}
+    disabled={disabled}
+    onPress={onPress}
+    onAccessibilityTap={onPress}
+    accessibilityRole={link ? "link" : "button"}
+    accessibilityLabel={accessibilityLabel ?? title}
+    accessibilityState={{ disabled: disabled === true }}
+    {...({ tooltip: toolTip ?? title } as { tooltip: string })}
+    style={[styles.windowsButton, compact && styles.windowsButtonCompact, link && styles.windowsButtonLink, plainLink && styles.windowsButtonPlainLink, primary && styles.windowsButtonPrimary, destructive && styles.windowsButtonDestructive, disabled && styles.windowsButtonDisabled, busy && styles.buttonBusy, style]}
+  >
+    {busy === true ? <ActivityIndicator size="small" color={ink} style={styles.buttonBusyIndicator} /> : null}
+    {glyph && !symbolTrailing ? <Text style={[styles.windowsButtonGlyph, { color: ink }]}>{glyph}</Text> : null}
+    {showsTitle ? <Text numberOfLines={1} style={[styles.windowsButtonTitle, (link || plainLink) && styles.windowsButtonLinkTitle, { color: ink }, plainLink && styles.windowsButtonPlainLinkTitle]}>{title}</Text> : null}
+    {glyph && symbolTrailing ? <Text style={[styles.windowsButtonGlyph, { color: ink }]}>{glyph}</Text> : null}
+  </Pressable>;
+}
+
+const WindowsSegmentedControl = React.forwardRef<any, SegmentedProps>(function WindowsSegmentedControl({ labels, selectedValue, disabled, compact = true, onChange, style }, ref): React.JSX.Element {
+  const selectedIndex = labels.indexOf(selectedValue);
+  const choose = (label: string, index: number): void => {
+    if (index === selectedIndex) return;
+    onChange?.({ nativeEvent: { value: label, index } } as NativeSyntheticEvent<{ value: string; index: number }>);
+  };
+  return <View ref={ref} style={[styles.windowsSegmented, compact && styles.windowsSegmentedCompact, disabled && styles.windowsDisabled, style]} accessibilityRole="tablist">
+    {labels.map((label, index) => {
+      const selected = index === selectedIndex;
+      return <Pressable
+        key={`${label}:${index}`}
+        disabled={disabled}
+        onPress={() => choose(label, index)}
+        onAccessibilityTap={() => choose(label, index)}
+        accessibilityRole="tab"
+        accessibilityLabel={label}
+        accessibilityState={{ selected, disabled: disabled === true }}
+        style={[styles.windowsSegment, selected && styles.windowsSegmentSelected, index === 0 && styles.windowsSegmentFirst, index === labels.length - 1 && styles.windowsSegmentLast]}
+      >
+        <Text numberOfLines={1} style={[styles.windowsSegmentText, selected && styles.windowsSegmentTextSelected, disabled && styles.windowsDisabledText]}>{label}</Text>
+      </Pressable>;
+    })}
+  </View>;
+});
+
+function WindowsCheckbox({ label, value, disabled, compact = true, labelVisible = true, onValueChange, style }: CheckboxProps): React.JSX.Element {
+  const sizedStyle = [{ minWidth: labelVisible ? nativeCheckboxMinimumWidth(label) : 24 }, style];
+  const toggle = (): void => onValueChange?.(!value);
+  return <Pressable
+    style={[styles.checkboxFallback, compact && styles.windowsCheckboxCompact, sizedStyle]}
+    disabled={disabled}
+    onPress={toggle}
+    onAccessibilityTap={toggle}
+    accessibilityRole="checkbox"
+    accessibilityLabel={label}
+    accessibilityState={{ checked: value, disabled: disabled === true }}
+  >
+    <View style={[styles.windowsCheckboxBox, value && styles.windowsCheckboxBoxChecked, disabled && styles.windowsDisabled]}>
+      {value ? <Text style={styles.windowsCheckboxMark}>{"\u2713"}</Text> : null}
+    </View>
+    {labelVisible ? <Text numberOfLines={1} style={[styles.windowsCheckboxLabel, disabled && styles.windowsDisabledText]}>{label}</Text> : null}
+  </Pressable>;
+}
+
+type WindowsActionMenuBridge = {
+  showActionMenu?: (
+    title: string,
+    items: string[],
+    anchor: { x: number; y: number; width: number; height: number },
+  ) => Promise<number | undefined>;
+};
+
+function WindowsPicker({ labels, selectedValue, disabled, compact = true, onChange, style }: PickerProps): React.JSX.Element {
+  const triggerRef = React.useRef<View>(null);
+  const selectedIndex = labels.indexOf(selectedValue);
+  const choose = (index: number): void => {
+    const value = labels[index] ?? "";
+    onChange?.({ nativeEvent: { value, index } } as NativeSyntheticEvent<{ value: string; index: number }>);
+  };
+  const openMenu = (): void => {
+    if (disabled || labels.length === 0) return;
+    const bridge = (NativeModules as { LiteLLMNativeLeaf?: WindowsActionMenuBridge }).LiteLLMNativeLeaf;
+    triggerRef.current?.measureInWindow((x, y, width, height) => {
+      void bridge?.showActionMenu?.(selectedValue || " ", labels, { x, y, width, height })
+        .then((index) => {
+          if (typeof index === "number" && index >= 0 && index < labels.length) choose(index);
+        })
+        .catch(() => undefined);
+    });
+  };
+  return <Pressable
+    ref={triggerRef}
+    disabled={disabled}
+    onPress={openMenu}
+    onAccessibilityTap={openMenu}
+    accessibilityRole="button"
+    accessibilityLabel={selectedValue}
+    accessibilityState={{ disabled: disabled === true, selected: selectedIndex >= 0 }}
+    style={[styles.windowsPicker, compact && styles.windowsPickerCompact, disabled && styles.windowsPickerDisabled, style]}
+  >
+    <Text numberOfLines={1} style={[styles.windowsPickerText, disabled && styles.windowsDisabledText]}>{selectedValue}</Text>
+    <Text style={styles.windowsPickerChevron}>{"\u25BE"}</Text>
+  </Pressable>;
+}
+
 const NativeButtonWithRef = React.forwardRef<any, ButtonProps>(function NativeButtonWithRef({ titleWidth: titleWidthRequest, ...props }, ref): React.JSX.Element {
   const compact = props.compact ?? true;
   const buttonProps = {
@@ -314,7 +442,7 @@ const NativeButtonWithRef = React.forwardRef<any, ButtonProps>(function NativeBu
     : undefined;
   const style = [props.link ? styles.linkButton : styles.button, props.style, titleWidth];
   if (Platform.OS === "windows") {
-    return <WinUIButton {...buttonProps} ref={ref as never} onPress={() => props.onPress?.()} style={style} />;
+    return <WindowsButton {...buttonProps} ref={ref as never} style={style} />;
   }
   if (Platform.OS === "macos") {
     return <AppKitButton {...buttonProps} ref={ref as never} style={[props.style, titleWidth]} />;
@@ -351,7 +479,7 @@ export function NativeBusySpinner({ label, style }: { label: string; style?: Sty
 
 const NativeSegmentedControlWithRef = React.forwardRef<any, SegmentedProps>(function NativeSegmentedControlWithRef({ labels, selectedValue, disabled, compact = true, onChange, style }, ref): React.JSX.Element {
   if (Platform.OS === "windows") {
-    return <WinUISegmented ref={ref as never} labels={labels} selectedValue={selectedValue} disabled={disabled} compact={compact} onChange={(event) => onChange?.({ ...event, nativeEvent: event.nativeEvent })} style={[styles.segmented, style]} />;
+    return <WindowsSegmentedControl ref={ref} labels={labels} selectedValue={selectedValue} disabled={disabled} compact={compact} onChange={onChange} style={style} />;
   }
   if (Platform.OS === "macos") {
     return <AppKitSegmentedControl ref={ref} labels={labels} selectedValue={selectedValue} disabled={disabled} compact={compact} onChange={onChange} style={style} />;
@@ -397,7 +525,7 @@ export function NativeTextField({ style, onChangeText, onSubmitEditing, search =
 
 export function NativeToggle({ value, disabled, onValueChange, style, accessibilityLabel }: ToggleProps): React.JSX.Element {
   if (Platform.OS === "windows") {
-    return <WinUIToggle value={value} disabled={disabled} onValueChange={(event) => onValueChange?.(event.nativeEvent.value)} style={style} accessibilityLabel={accessibilityLabel} />;
+    return <Switch value={value} disabled={disabled} onValueChange={onValueChange} style={style} accessibilityLabel={accessibilityLabel} />;
   }
   if (Platform.OS === "macos") {
     return <AppKitToggle value={value} disabled={disabled} onValueChange={onValueChange} style={style} accessibilityLabel={accessibilityLabel} />;
@@ -415,7 +543,7 @@ export function NativeSelectableRow({ title, detail, selected, disabled, onPress
 export function NativeCheckbox({ label, value, disabled, compact = true, labelVisible = true, onValueChange, style }: CheckboxProps): React.JSX.Element {
   const sizedStyle = [{ minWidth: labelVisible ? nativeCheckboxMinimumWidth(label) : 24 }, style];
   if (Platform.OS === "windows") {
-    return <WinUICheckbox label={label} labelVisible={labelVisible} value={value} disabled={disabled} compact={compact} onValueChange={(event) => onValueChange?.(event.nativeEvent.value)} style={sizedStyle} />;
+    return <WindowsCheckbox label={label} labelVisible={labelVisible} value={value} disabled={disabled} compact={compact} onValueChange={onValueChange} style={sizedStyle} />;
   }
   if (Platform.OS === "macos") {
     return <AppKitCheckbox label={label} labelVisible={labelVisible} value={value} disabled={disabled} compact={compact} onValueChange={onValueChange} style={sizedStyle} />;
@@ -425,7 +553,7 @@ export function NativeCheckbox({ label, value, disabled, compact = true, labelVi
 
 export function NativePicker({ labels, selectedValue, disabled, compact = true, overlayLayer = false, onChange, style }: PickerProps): React.JSX.Element {
   if (Platform.OS === "windows") {
-    return <WinUIPicker labels={labels} selectedValue={selectedValue} disabled={disabled} compact={compact} onChange={(event) => onChange?.({ ...event, nativeEvent: event.nativeEvent })} style={style} />;
+    return <WindowsPicker labels={labels} selectedValue={selectedValue} disabled={disabled} compact={compact} onChange={onChange} style={style} />;
   }
   if (Platform.OS === "macos") {
     return <AppKitPicker labels={labels} selectedValue={selectedValue} disabled={disabled} compact={compact} overlayLayer={overlayLayer} onChange={onChange} style={[compact && style === undefined ? { minWidth: pickerLabelWidth(labels, selectedValue) } : null, style]} />;
@@ -446,12 +574,14 @@ function windowsSourceSymbol(symbol: string): string {
   return glyphs[symbol] ?? "•";
 }
 
-function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, framed, sourceList, rowSymbols, rowSymbolColors, disabledRowKeys, secondaryCellKeys, selectableSpanningKeys, onSelectionChange, onRowDoublePress, style, alertRowKeys }: {
+function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, followBottom, scrollToRow, framed, sourceList, rowSymbols, rowSymbolColors, disabledRowKeys, secondaryCellKeys, selectableSpanningKeys, onSelectionChange, onRowDoublePress, style, alertRowKeys }: {
   columns: TableProps["columns"];
   rows: TableProps["rows"];
   selectedKey: string;
   stripedRows: boolean;
   compact: boolean;
+  followBottom: boolean;
+  scrollToRow: number;
   framed: boolean;
   sourceList: boolean;
   rowSymbols: string[];
@@ -465,7 +595,17 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, framed
   alertRowKeys: string[];
 }): React.JSX.Element {
   const lastPress = React.useRef<{ key: string; at: number } | undefined>(undefined);
+  const verticalScroll = React.useRef<ScrollView>(null);
+  const rowHeight = compact ? 30 : 36;
   const totalWidth = columns.reduce((sum, column) => sum + column.width, 0);
+  React.useEffect(() => {
+    if (scrollToRow < 0) return;
+    verticalScroll.current?.scrollTo({ y: scrollToRow * rowHeight, animated: false });
+  }, [scrollToRow, rowHeight]);
+  React.useEffect(() => {
+    if (!followBottom) return;
+    verticalScroll.current?.scrollToEnd({ animated: false });
+  }, [followBottom, rows.length]);
   const select = (row: TableProps["rows"][number], index: number): void => {
     if (row.spanning && !selectableSpanningKeys.has(row.key)) return;
     const now = Date.now();
@@ -478,7 +618,7 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, framed
       {columns.map((column) => <Text key={column.label} numberOfLines={1} style={[windowsTableStyles.headerText, { width: column.width }]}>{column.label}</Text>)}
     </View> : null}
     <ScrollView horizontal showsHorizontalScrollIndicator={!sourceList} contentContainerStyle={windowsTableStyles.horizontalContent}>
-      <ScrollView style={windowsTableStyles.verticalScroll} contentContainerStyle={[windowsTableStyles.body, { minWidth: totalWidth }]} nestedScrollEnabled>
+      <ScrollView ref={verticalScroll} style={windowsTableStyles.verticalScroll} contentContainerStyle={[windowsTableStyles.body, { minWidth: totalWidth }]} nestedScrollEnabled>
         {rows.map((row, index) => {
           const selected = row.key === selectedKey;
           const disabled = disabledRowKeys.includes(row.key);
@@ -565,9 +705,8 @@ export function NativeTable({ columns, rows, selectedKey = "", striped = true, c
     selectableSpanningRowKeys: Array.from(selectableSpanningKeys),
   };
   if (Platform.OS === "windows") {
-    // This React table is the only Windows table path. The registered WinUI
-    // TableComponentView is leftover native code, not a second renderer.
-    return <WindowsTable columns={columns} rows={rows} selectedKey={selectedKey} stripedRows={stripedRows} compact={compact} framed={framed} sourceList={sourceList} rowSymbols={rowSymbols} rowSymbolColors={rowSymbolColors} disabledRowKeys={disabledRowKeys} secondaryCellKeys={secondaryCellKeys} selectableSpanningKeys={selectableSpanningKeys} onSelectionChange={onSelectionChange} onRowDoublePress={onRowDoublePress} alertRowKeys={alertRowKeys} style={[styles.table, style]} />;
+    // This React table is the only Windows table path.
+    return <WindowsTable columns={columns} rows={rows} selectedKey={selectedKey} stripedRows={stripedRows} compact={compact} followBottom={followBottom} scrollToRow={scrollToRow} framed={framed} sourceList={sourceList} rowSymbols={rowSymbols} rowSymbolColors={rowSymbolColors} disabledRowKeys={disabledRowKeys} secondaryCellKeys={secondaryCellKeys} selectableSpanningKeys={selectableSpanningKeys} onSelectionChange={onSelectionChange} onRowDoublePress={onRowDoublePress} alertRowKeys={alertRowKeys} style={[styles.table, style]} />;
   }
   if (Platform.OS === "macos") {
     return <AppKitTable {...nativeProps} cellHorizontalPadding={cellHorizontalPadding} firstColumnHorizontalPadding={firstColumnHorizontalPadding} preserveColumnWidths={preserveColumnWidths} scrollTrailingColumnOverflow={scrollTrailingColumnOverflow} onSelectionChange={(event) => onSelectionChange?.(event.nativeEvent.key, event.nativeEvent.index)} onRowDoublePress={(event) => onRowDoublePress?.(event.nativeEvent.key, event.nativeEvent.index)} style={[styles.table, style]} />;
@@ -630,6 +769,37 @@ const styles = StyleSheet.create({
   buttonBusyIndicator: { width: BUSY_SPINNER_SIZE, height: BUSY_SPINNER_SIZE },
   busySpinner: { width: BUSY_SPINNER_SIZE, height: BUSY_SPINNER_SIZE },
   controlText: { fontSize: UI_FONT_SIZE },
+  windowsButton: { minHeight: 24, minWidth: 28, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 4, paddingHorizontal: 8, borderRadius: 4, borderWidth: 1, borderColor: "#c8c8c8", backgroundColor: "#ffffff" },
+  windowsButtonCompact: { minHeight: 24, paddingHorizontal: 6 },
+  windowsButtonLink: { borderWidth: 0, backgroundColor: "transparent", paddingHorizontal: 0 },
+  windowsButtonPlainLink: { borderWidth: 0, backgroundColor: "transparent", paddingHorizontal: 0, justifyContent: "flex-start" },
+  windowsButtonPrimary: { borderColor: "#005fb8", backgroundColor: "#005fb8" },
+  windowsButtonDestructive: { borderColor: "#c42b1c", backgroundColor: "#c42b1c" },
+  windowsButtonDisabled: { opacity: 0.55 },
+  windowsButtonGlyph: { fontFamily: "Segoe MDL2 Assets", fontSize: UI_FONT_SIZE, lineHeight: 16 },
+  windowsButtonTitle: { fontSize: UI_FONT_SIZE, flexShrink: 1 },
+  windowsButtonLinkTitle: { textDecorationLine: "underline" },
+  windowsButtonPlainLinkTitle: { textDecorationLine: "underline", fontWeight: "400" },
+  windowsSegmented: { flexDirection: "row", alignItems: "stretch", minHeight: 24, borderRadius: 4, borderWidth: 1, borderColor: "#c8c8c8", overflow: "hidden", backgroundColor: "#ffffff" },
+  windowsSegmentedCompact: { minHeight: 24 },
+  windowsSegment: { flex: 1, minWidth: 0, alignItems: "center", justifyContent: "center", paddingHorizontal: 6, borderRightWidth: 1, borderRightColor: "#e4e7ec" },
+  windowsSegmentFirst: { borderTopLeftRadius: 3, borderBottomLeftRadius: 3 },
+  windowsSegmentLast: { borderRightWidth: 0, borderTopRightRadius: 3, borderBottomRightRadius: 3 },
+  windowsSegmentSelected: { backgroundColor: "#eaf3ff" },
+  windowsSegmentText: { color: "#475467", fontSize: UI_TIP_FONT_SIZE },
+  windowsSegmentTextSelected: { color: "#005fb8", fontWeight: "600" },
+  windowsCheckboxCompact: { minHeight: 24 },
+  windowsCheckboxBox: { width: 16, height: 16, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: "#71717a", borderRadius: 3, backgroundColor: "#ffffff" },
+  windowsCheckboxBoxChecked: { borderColor: "#005fb8", backgroundColor: "#005fb8" },
+  windowsCheckboxMark: { color: "#ffffff", fontSize: 12, lineHeight: 14, fontWeight: "700" },
+  windowsCheckboxLabel: { color: "#1a1a1a", fontSize: UI_FONT_SIZE, flexShrink: 1 },
+  windowsDisabled: { opacity: 0.55 },
+  windowsDisabledText: { color: "#98a2b3" },
+  windowsPicker: { minHeight: 24, flexDirection: "row", alignItems: "center", paddingHorizontal: 6, borderWidth: 1, borderColor: "#c8c8c8", borderRadius: 4, backgroundColor: "#ffffff" },
+  windowsPickerCompact: { minHeight: 24 },
+  windowsPickerDisabled: { opacity: 0.55 },
+  windowsPickerText: { flex: 1, minWidth: 0, color: "#1a1a1a", fontSize: UI_FONT_SIZE },
+  windowsPickerChevron: { color: "#667085", fontSize: UI_TIP_FONT_SIZE, marginLeft: 4 },
   linkButton: { minWidth: 72, minHeight: 22 },
   segmented: { minHeight: 24 },
   toggleFallback: { minWidth: 24, minHeight: 24, justifyContent: "center" },

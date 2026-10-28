@@ -9,6 +9,8 @@ import type { DirectEventHandler, Int32, WithDefault } from "react-native/Librar
 export const APPKIT_COMPONENT_NAME = "LiteLLMAppKitSegmentedControl";
 export const WINUI_COMPONENT_NAME = "LiteLLMWinUISegmentedControl";
 
+export const PLATFORMS = ["macos"];
+
 type ChangeEvent = Readonly<{ index: Int32; value: string }>;
 
 export interface NativeSegmentedProps extends ViewProps {

@@ -14,6 +14,8 @@ import type {
 export const APPKIT_COMPONENT_NAME = "LiteLLMAppKitTable";
 export const WINUI_COMPONENT_NAME = "LiteLLMWinUITable";
 
+export const PLATFORMS = ["macos"];
+
 type SelectionChangeEvent = Readonly<{ key: string; index: Int32 }>;
 type RowDoublePressEvent = Readonly<{ key: string; index: Int32 }>;
 
