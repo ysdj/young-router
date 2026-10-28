@@ -1430,10 +1430,24 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # select, so clicking 账号 or 密钥 cannot move the selection at all.
         self.assert_ui_has("rows.push({ key: modelGroupRowKey(credential.id), cells: [credential.label], spanning: true });")
         self.assert_ui_has("rows.push({ key: modelRowKey(credential.id, editorIdentifier(item)), cells: modelCells(item) });")
+        # One route is one row.  A route that names no credential belongs to
+        # the provider's own default, which is not one of these groups: listing
+        # it under every group put the same route on screen once per credential,
+        # and each copy carried the same 启用 box — so flipping one read as
+        # flipping the others.
+        self.assert_ui_has('for (const item of ungrouped) rows.push({ key: modelRowKey("", editorIdentifier(item)), cells: modelCells(item) });')
+        grouped_rows = self.ui.split("if (modelCredentials.length > 0) {", 1)[1].split("return rows;", 1)[0]
+        self.assertIn("return Boolean(ownKey) && credential.id.endsWith(ownKey!.id);", grouped_rows)
+        # A heading with nothing under it claims the credential serves routes it
+        # does not serve, so an empty group draws no heading at all.
+        self.assertIn("if (own.length === 0) continue;", grouped_rows)
         # The clicked row is what the table highlights: a model listed under
         # several credentials keeps the highlight on the copy that was pressed.
         self.assert_ui_has("const [selectedModelRow, setSelectedModelRow] = useState<string>();")
         self.assert_ui_has('if (selectedModelRow && modelRows.some((row) => !row.spanning && row.key === selectedModelRow && modelIDFromRowKey(row.key) === selectedModel)) {')
+        # The list says which row a model sits in; the pane never invents a
+        # group for it, because a route that names no credential has no group.
+        self.assert_ui_has("const listed = modelRows.find((row) => !row.spanning && modelIDFromRowKey(row.key) === selectedModel);")
         model_table = self.ui.split("<NativeTable columns={modelTableColumns(", 1)[1].split("/></View>", 1)[0]
         self.assertIn("const modelID = modelIDFromRowKey(key);", model_table)
         self.assertIn("setSelectedModel(modelID); setSelectedModelRow(key);", model_table)
@@ -2620,7 +2634,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             for prop in props:
                 self.assertIn(prop, header_text, f"{header.name} does not carry {prop}")
             checked += 1
-        self.assertEqual(12, checked)
+        self.assertEqual(8, checked)
 
     def test_route_footer_is_replaced_by_immediate_apply(self) -> None:
         # The shared settings shell has no route-level Apply/Close footer; the
@@ -4681,6 +4695,28 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.ui.index("serviceRates.set(service, { at: Date.now(), catalog: models, rates: serviceCatalogRates(models) });"),
         )
         self.assert_ui_has('if (catalog) { setServiceRate(peekServiceRate(service, upstreamModelID) ?? ""); return; }')
+
+    def test_the_rate_column_reads_the_multiplier_the_catalog_publishes(self) -> None:
+        """The staged library publishes ``creditMultiplier``; there is no ``billing``.
+
+        ``serviceCatalogRates`` is the one place a service catalog's rate is
+        turned into the string every pane prints, so the field it reads decides
+        whether 倍率 exists at all.  Reading only ``billing`` emptied the column
+        and left 跟随倍率 -- which asks whether a rate is known -- unreachable.
+        ``0`` is a real answer here, so presence decides and not truthiness.
+        """
+
+        self.assert_ui_has('if (typeof entry.creditMultiplier === "number" && Number.isFinite(entry.creditMultiplier) && entry.creditMultiplier >= 0) {')
+        self.assert_ui_has('rates[modelID] = rateSpelling(`x${entry.creditMultiplier}`);')
+        # A stated `0` must reach the column: an entry the upstream prices at
+        # nothing is a rate a route may follow, and `0` is falsy.
+        self.assertNotIn('if (entry.creditMultiplier)', self.ui)
+        # The older raw `billing` shape is still read, so a staged release that
+        # trails this build keeps answering.
+        self.assert_ui_has('rates[modelID] = rateSpelling(credits.replace(/\\s*credits?$/i, ""));')
+        # The count of the field's readers is one: the pane and the list both go
+        # through the cached catalog built here.
+        self.assertEqual(1, self.ui.count('rates[modelID] = rateSpelling(`x${entry.creditMultiplier}`);'))
 
     def test_a_rate_is_printed_without_its_trailing_zeros(self) -> None:
         """`x0.00` reads as `x0`, and `x0.10` as `x0.1`, in both places a rate shows.

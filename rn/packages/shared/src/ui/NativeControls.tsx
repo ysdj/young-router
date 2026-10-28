@@ -33,11 +33,7 @@ import WinUICheckbox from "./windows/NativeCheckboxNativeComponent";
 import WinUIPicker from "./windows/NativePickerNativeComponent";
 import WinUISegmented from "./windows/NativeSegmentedNativeComponent";
 import WinUISecureTextInput from "./windows/NativeSecureTextInputNativeComponent";
-import WinUITextInput from "./windows/NativeTextInputNativeComponent";
 import WinUIToggle from "./windows/NativeToggleNativeComponent";
-import WinUISelectableRow from "./windows/NativeSelectableRowNativeComponent";
-import WinUISplitView from "./windows/NativeSplitViewNativeComponent";
-import WinUITextEditor from "./windows/NativeTextEditorNativeComponent";
 import { UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
 
 type ButtonProps = {
@@ -376,7 +372,22 @@ type TextFieldProps = TextInputProps & {
 
 export function NativeTextField({ style, onChangeText, onSubmitEditing, search = false, borderless = false, ...props }: TextFieldProps): React.JSX.Element {
   if (Platform.OS === "windows") {
-    return <WinUITextInput value={props.value} placeholder={props.placeholder} multiline={props.multiline} secureTextEntry={props.secureTextEntry} search={search} disabled={props.editable === false} keyboardType={props.keyboardType} accessibilityLabel={props.accessibilityLabel} onChangeText={(event) => onChangeText?.(event.nativeEvent.text)} onBlur={() => props.onBlur?.({} as never)} onSubmitEditing={(event) => onSubmitEditing?.({ ...event, nativeEvent: { text: event.nativeEvent.text } } as never)} style={style} />;
+    // Windows text input is React Native's own Composition leaf: RichEdit
+    // backed, with IME, selection, and secure entry already working inside the
+    // island. A WinUI TextBox cannot be constructed there. The frame is a React
+    // view so borders and invalid states stay in the shared style layer.
+    // RNW 0.85 preview's UIA ValuePattern.SetValue crashes the host for this
+    // leaf (read-only ValuePattern reads are safe); exercise typing with the
+    // keyboard, not an automation SetValue, until that provider is fixed.
+    const flatStyle = StyleSheet.flatten(style);
+    const inputStyle = [
+      styles.windowsTextFieldInput,
+      flatStyle?.color !== undefined && { color: flatStyle.color },
+      props.multiline === true && styles.windowsTextFieldInputMultiline,
+    ];
+    return <View style={[styles.windowsTextField, style, props.editable === false && styles.windowsTextFieldDisabled]}>
+      <TextInput {...props} style={inputStyle} onChangeText={onChangeText} onSubmitEditing={onSubmitEditing} onBlur={props.onBlur} />
+    </View>;
   }
   if (Platform.OS === "macos") {
     return <AppKitTextField {...props} search={search} borderless={borderless} style={style} onChangeText={onChangeText} onSubmitEditing={onSubmitEditing} />;
@@ -395,9 +406,6 @@ export function NativeToggle({ value, disabled, onValueChange, style, accessibil
 }
 
 export function NativeSelectableRow({ title, detail, selected, disabled, onPress, style }: SelectableRowProps): React.JSX.Element {
-  if (Platform.OS === "windows") {
-    return <WinUISelectableRow title={title} detail={detail} selected={selected} disabled={disabled} onPress={() => onPress?.()} style={style} />;
-  }
   if (Platform.OS === "macos") {
     return <AppKitSelectableRow title={title} detail={detail} selected={selected} disabled={disabled} onPress={onPress} style={style} />;
   }
@@ -557,6 +565,8 @@ export function NativeTable({ columns, rows, selectedKey = "", striped = true, c
     selectableSpanningRowKeys: Array.from(selectableSpanningKeys),
   };
   if (Platform.OS === "windows") {
+    // This React table is the only Windows table path. The registered WinUI
+    // TableComponentView is leftover native code, not a second renderer.
     return <WindowsTable columns={columns} rows={rows} selectedKey={selectedKey} stripedRows={stripedRows} compact={compact} framed={framed} sourceList={sourceList} rowSymbols={rowSymbols} rowSymbolColors={rowSymbolColors} disabledRowKeys={disabledRowKeys} secondaryCellKeys={secondaryCellKeys} selectableSpanningKeys={selectableSpanningKeys} onSelectionChange={onSelectionChange} onRowDoublePress={onRowDoublePress} alertRowKeys={alertRowKeys} style={[styles.table, style]} />;
   }
   if (Platform.OS === "macos") {
@@ -576,9 +586,6 @@ export function NativeTable({ columns, rows, selectedKey = "", striped = true, c
 }
 
 export function NativeTextEditor({ value, documentKey, readOnly, wrap = true, onChangeText, style }: TextEditorProps): React.JSX.Element {
-  if (Platform.OS === "windows") {
-    return <WinUITextEditor value={value} documentKey={documentKey} readOnly={readOnly} wrap={wrap} onChangeText={(event) => onChangeText?.(event.nativeEvent.text)} style={[styles.editor, style]} />;
-  }
   if (Platform.OS === "macos") {
     return <AppKitTextEditor value={value} documentKey={documentKey} readOnly={readOnly} wrap={wrap} onChangeText={onChangeText} style={[styles.editor, style]} />;
   }
@@ -609,7 +616,7 @@ export function NativeSplitView({ paneWidth, minPaneWidth, maxPaneWidth, paneOpe
     return <View style={[styles.splitFallback, style]}><View style={styles.splitTrailing}>{trailing}</View></View>;
   }
   if (Platform.OS === "windows") {
-    return <View style={[styles.splitFallback, style]}><View style={[styles.splitLeading, { width: paneWidth }]}>{leading}</View><WinUISplitView paneWidth={paneWidth} minPaneWidth={minPaneWidth} maxPaneWidth={maxPaneWidth} paneOpen={paneOpen} disabled={disabled} onPaneWidthChange={(event) => onPaneWidthChange?.(event.nativeEvent.width)} style={styles.splitter} /><View style={styles.splitTrailing}>{trailing}</View></View>;
+    return <View style={[styles.splitFallback, style]}><View style={[styles.splitLeading, { width: paneWidth }]}>{leading}</View><View style={styles.splitTrailing}>{trailing}</View></View>;
   }
   if (Platform.OS === "macos") {
     return <AppKitSplitView paneWidth={paneWidth} minPaneWidth={minPaneWidth} maxPaneWidth={maxPaneWidth} paneOpen={paneOpen} disabled={disabled} onPaneWidthChange={onPaneWidthChange} style={[styles.splitView, style]}><View style={[styles.splitLeading, { width: paneWidth }]}>{leading}</View><View style={styles.splitTrailing}>{trailing}</View></AppKitSplitView>;
@@ -646,6 +653,10 @@ const styles = StyleSheet.create({
   tableFallbackGroupText: { fontWeight: "400" },
   editor: { minHeight: 160 },
   editorFallback: { minHeight: 160, textAlignVertical: "top", fontSize: UI_FONT_SIZE },
+  windowsTextField: { minHeight: 26, justifyContent: "center", overflow: "hidden", borderWidth: 1, borderColor: "#c8c8c8", borderRadius: 4, backgroundColor: "#ffffff" },
+  windowsTextFieldDisabled: { opacity: 0.5 },
+  windowsTextFieldInput: { flex: 1, minWidth: 0, paddingHorizontal: 8, paddingVertical: 0, fontSize: UI_FONT_SIZE, color: "#1a1a1a", backgroundColor: "transparent" },
+  windowsTextFieldInputMultiline: { textAlignVertical: "top", paddingVertical: 4 },
   splitView: { minHeight: 120, flexDirection: "row" },
   splitFallback: { minHeight: 120, flexDirection: "row" },
   splitLeading: { minWidth: 0, flexShrink: 0 },

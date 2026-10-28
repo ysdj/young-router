@@ -10,6 +10,8 @@ export const APPKIT_COMPONENT_NAME = "LiteLLMAppKitTextField";
 export const WINUI_COMPONENT_NAME = "LiteLLMWinUITextInput";
 export const OUTPUT_FILES = { windows: "NativeTextInputNativeComponent.ts" };
 
+export const PLATFORMS = ["macos"];
+
 type TextEvent = Readonly<{ text: string }>;
 
 export interface NativeTextFieldProps extends ViewProps {

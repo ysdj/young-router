@@ -9,6 +9,8 @@ import type { DirectEventHandler, WithDefault } from "react-native/Libraries/Typ
 export const APPKIT_COMPONENT_NAME = "LiteLLMAppKitSelectableRow";
 export const WINUI_COMPONENT_NAME = "LiteLLMWinUISelectableRow";
 
+export const PLATFORMS = ["macos"];
+
 export interface NativeSelectableRowProps extends ViewProps {
   title: string;
   detail?: string;

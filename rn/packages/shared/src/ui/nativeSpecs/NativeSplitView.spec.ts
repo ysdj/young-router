@@ -13,6 +13,8 @@ import type {
 export const APPKIT_COMPONENT_NAME = "LiteLLMAppKitSplitView";
 export const WINUI_COMPONENT_NAME = "LiteLLMWinUISplitView";
 
+export const PLATFORMS = ["macos"];
+
 type PaneWidthChangeEvent = Readonly<{ width: Float }>;
 
 export interface NativeSplitViewProps extends ViewProps {

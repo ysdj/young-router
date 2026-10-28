@@ -486,7 +486,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         ):
             self.assertIn(marker, mac_controls)
         for marker in (
-            "struct CodeWebViewComponentView final",
+            "struct CodeWebViewComponentView",
             "WebView2{}",
             "NavigateToString(ToHString(props.html))",
             "ExecuteScriptAsync(script)",
@@ -821,8 +821,8 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             "- (void)handleRowClick:", 1
         )[1].split("- (void)handleDoubleClick:", 1)[0]
         windows_table = windows.split(
-            "struct TableComponentView final", 1
-        )[1].split("struct TextEditorComponentView final", 1)[0]
+            "struct TableComponentView", 1
+        )[1].split("struct CodeWebViewComponentView", 1)[0]
 
         # AppKit's selection notification carries an ordinary row whose
         # selection changed; its target/action carries the selectable group
@@ -851,8 +851,8 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             "- (void)handleRowClick:", 1
         )[1].split("- (void)handleDoubleClick:", 1)[0]
         windows_table = windows.split(
-            "struct TableComponentView final", 1
-        )[1].split("struct TextEditorComponentView final", 1)[0]
+            "struct TableComponentView", 1
+        )[1].split("struct CodeWebViewComponentView", 1)[0]
 
         # AppKit's action fires for every row click, so it reports the row only
         # when the selection notification is not already coming for it.
@@ -872,7 +872,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         mac = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
         windows = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
         mac_picker = mac.split("@implementation LiteLLMAppKitPickerComponentView", 1)[1].split("Class<RCTComponentViewProtocol> LiteLLMAppKitPickerCls", 1)[0]
-        win_picker = windows.split("struct PickerComponentView final", 1)[1].split("struct CheckboxComponentView final", 1)[0]
+        win_picker = windows.split("struct PickerComponentView", 1)[1].split("struct CheckboxComponentView", 1)[0]
         self.assertIn("_picker.target = nil;", mac_picker)
         self.assertIn("_picker.target = self;", mac_picker)
         self.assertIn("syncing_ = true;", win_picker)
@@ -2617,21 +2617,22 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
                 "LiteLLMAppKitSegmentedControl",
                 "LiteLLMWinUISegmentedControl",
             ),
-            "NativeTextField": ("LiteLLMAppKitTextField", "LiteLLMWinUITextInput"),
             "NativeToggle": ("LiteLLMAppKitSwitch", "LiteLLMWinUISwitch"),
-            "NativeSelectableRow": (
-                "LiteLLMAppKitSelectableRow",
-                "LiteLLMWinUISelectableRow",
-            ),
             "NativeCheckbox": ("LiteLLMAppKitCheckbox", "LiteLLMWinUICheckbox"),
             "NativePicker": ("LiteLLMAppKitPicker", "LiteLLMWinUIPicker"),
         }
         for adapter_name, (mac_name, win_name) in expected.items():
             self.assertIn(f"export function {adapter_name}", adapter)
-            self.assertIn("codegenNativeComponent<", mac_specs)
             self.assertIn(f'("{mac_name}")', mac_specs)
-            self.assertIn("codegenNativeComponent<", win_specs)
             self.assertIn(f'("{win_name}")', win_specs)
+        # These two keep only their AppKit codegen component: Windows uses
+        # React Native's TextInput and has no selectable-row leaf.
+        for adapter_name, mac_name in (
+            ("NativeTextField", "LiteLLMAppKitTextField"),
+            ("NativeSelectableRow", "LiteLLMAppKitSelectableRow"),
+        ):
+            self.assertIn(f"export function {adapter_name}", adapter)
+            self.assertIn(f'("{mac_name}")', mac_specs)
 
     def test_native_button_link_variant_is_a_system_navigation_control_on_each_platform(self) -> None:
         adapter = (SHARED / "ui/NativeControls.tsx").read_text(encoding="utf-8")
@@ -3104,7 +3105,6 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         windows = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
         button_spec = (SHARED / "ui/windows/NativeButtonNativeComponent.ts").read_text(encoding="utf-8")
         toggle_spec = (SHARED / "ui/windows/NativeToggleNativeComponent.ts").read_text(encoding="utf-8")
-        input_spec = (SHARED / "ui/windows/NativeTextInputNativeComponent.ts").read_text(encoding="utf-8")
         controls = (SHARED / "ui/NativeControls.tsx").read_text(encoding="utf-8")
         mac_button_spec = (SHARED / "ui/macos/NativeButtonNativeComponent.ts").read_text(encoding="utf-8")
 
@@ -3118,19 +3118,18 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("ToolTipService::SetToolTip(hyperlink_, winrt::box_value(hint));", windows)
         self.assertIn("AutomationProperties::SetName(button_, label);", windows)
 
-        # A switch and a text field name themselves from the shared label.
-        for spec in (toggle_spec, input_spec):
-            self.assertIn("accessibilityLabel?: string;", spec)
+        # A switch names itself from the shared label. The Windows text field
+        # is React Native's own TextInput now, so its accessibility name is the
+        # ordinary TextInput prop rather than a codegen field.
+        self.assertIn("accessibilityLabel?: string;", toggle_spec)
         self.assertIn("accessibilityLabel={accessibilityLabel}", controls)
-        self.assertIn("accessibilityLabel={props.accessibilityLabel}", controls)
-        switch = windows.split("struct SwitchComponentView final", 1)[1].split("struct SelectableRowComponentView", 1)[0]
+        switch = windows.split("struct SwitchComponentView", 1)[1].split("template <typename TComponent>", 1)[0]
         self.assertIn("winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(toggle_, label);", switch)
-        self.assertIn("text_box_.IsEnabled(Enabled(props.disabled));", windows)
-        self.assertIn("winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(text_box_, label);", windows)
+        self.assertIn('<TextInput {...props}', controls)
 
         # The generated Windows headers carry the fields the implementation reads.
         codegen = WIN_PROJECT / "codegen/react/components/YoungRouter"
-        for name, field in (("LiteLLMWinUIButton.g.h", "toolTip"), ("LiteLLMWinUISwitch.g.h", "accessibilityLabel"), ("LiteLLMWinUITextInput.g.h", "accessibilityLabel")):
+        for name, field in (("LiteLLMWinUIButton.g.h", "toolTip"), ("LiteLLMWinUISwitch.g.h", "accessibilityLabel")):
             header = (codegen / name).read_text(encoding="utf-8")
             self.assertIn(f"REACT_FIELD({field})", header)
 
@@ -3334,11 +3333,11 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("(initialDataLoad || TableIsFollowingBottom(_scrollView, _tableView))", mac)
         self.assertIn("const BOOL wasFollowingBottom = newViewProps.followBottom && dataChanged", mac)
         self.assertIn("newViewProps.followBottom && dataChanged && wasFollowingBottom", mac)
-        checkbox = windows.split("struct CheckboxComponentView final", 1)[1].split(
-            "struct TableComponentView final", 1
+        checkbox = windows.split("struct CheckboxComponentView", 1)[1].split(
+            "struct TableComponentView", 1
         )[0]
-        switch = windows.split("struct SwitchComponentView final", 1)[1].split(
-            "struct SelectableRowComponentView final", 1
+        switch = windows.split("struct SwitchComponentView", 1)[1].split(
+            "template <typename TComponent>", 1
         )[0]
         self.assertIn("ApplyProps(old_props);", checkbox)
         self.assertIn("const bool value_changed = !old_props || old_props->value != props.value;", checkbox)
@@ -3346,8 +3345,8 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("ApplyProps(old_props);", switch)
         self.assertIn("if (value_changed) {\n      syncing_ = true;\n      value_ = props.value.value_or(false);\n      UpdateGlyph();", switch)
 
-        table = windows.split("struct TableComponentView final", 1)[1].split(
-            "struct TextEditorComponentView final", 1
+        table = windows.split("struct TableComponentView", 1)[1].split(
+            "struct CodeWebViewComponentView", 1
         )[0]
         self.assertIn("bool ListIsFollowingBottom(ListView const& list)", windows)
         self.assertIn("const bool was_following_bottom = props.followBottom.value_or(false) && rows_changed", table)
@@ -3360,8 +3359,8 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
 
         self.assertIn('tableFallback: { minHeight: 120, borderWidth: 1, borderColor: "#d4d4d8", overflow: "hidden" }', native_controls)
         self.assertNotIn('tableFallback: { minHeight: 120, overflow: "scroll" }', native_controls)
-        table = windows.split("struct TableComponentView final", 1)[1].split(
-            "struct TextEditorComponentView final", 1
+        table = windows.split("struct TableComponentView", 1)[1].split(
+            "struct CodeWebViewComponentView", 1
         )[0]
         self.assertIn("ScrollViewer::SetHorizontalScrollBarVisibility(", table)
         # SelectionChanged is the table's one row-selection event path; an
@@ -3430,15 +3429,6 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("_field.stringValue = @\"\";", mac_text_field)
         self.assertIn("_multilineField.string = @\"\";", mac_text_field)
 
-        windows_text_field = windows.split("struct TextInputComponentView final", 1)[1].split(
-            "struct SecureTextInputComponentView final", 1
-        )[0]
-        self.assertIn("ApplyProps(nullptr);", windows_text_field)
-        self.assertIn("ApplyProps(old_props);", windows_text_field)
-        self.assertIn("const bool text_changed = !old_props || old_props->value != props.value;", windows_text_field)
-        self.assertIn("if (text_changed && text_box_.Text() != value)", windows_text_field)
-        self.assertNotIn("if (text_box_.Text() != value) text_box_.Text(value);", windows_text_field)
-
     def test_macos_split_view_ignores_provisional_mount_widths(self) -> None:
         controls = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
 
@@ -3496,21 +3486,11 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         for component in (
             "RegisterLiteLLMWinUIButtonNativeComponent",
             "RegisterLiteLLMWinUISegmentedControlNativeComponent",
-            "RegisterLiteLLMWinUITextInputNativeComponent",
             "RegisterLiteLLMWinUISwitchNativeComponent",
-            "RegisterLiteLLMWinUISelectableRowNativeComponent",
             "RegisterLiteLLMWinUICheckboxNativeComponent",
             "RegisterLiteLLMWinUIPickerNativeComponent",
         ):
             self.assertIn(component, controls)
-
-    def test_windows_selectable_rows_truncate_long_account_labels(self) -> None:
-        controls = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
-        selectable_row = controls.split("struct SelectableRowComponentView final", 1)[1].split(
-            "template <typename TComponent>", 1
-        )[0]
-        self.assertEqual(2, selectable_row.count("TextWrapping(winrt::Microsoft::UI::Xaml::TextWrapping::NoWrap)"))
-        self.assertEqual(2, selectable_row.count("TextTrimming(winrt::Microsoft::UI::Xaml::TextTrimming::CharacterEllipsis)"))
 
     def test_windows_controls_use_winui_theme_resources_for_state_colors(self) -> None:
         controls = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
@@ -3518,7 +3498,6 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         for resource in (
             "AccentFillColorDefaultBrush",
             "SystemFillColorCriticalBrush",
-            "SubtleFillColorSecondaryBrush",
             "SubtleFillColorTransparentBrush",
         ):
             self.assertIn(resource, controls)
@@ -3526,19 +3505,11 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
 
     def test_native_text_editors_preserve_viewport_and_follow_log_tail(self) -> None:
         mac = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
-        windows = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
         adapter = (SHARED / "ui/NativeControls.tsx").read_text(encoding="utf-8")
         ui = (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
         mac_spec = (SHARED / "ui/macos/NativeTextEditorNativeComponent.ts").read_text(
             encoding="utf-8"
         )
-        windows_spec = (
-            SHARED / "ui/windows/NativeTextEditorNativeComponent.ts"
-        ).read_text(encoding="utf-8")
-        windows_codegen = (
-            WIN_PROJECT
-            / "codegen/react/components/YoungRouter/LiteLLMWinUITextEditor.g.h"
-        ).read_text(encoding="utf-8")
 
         self.assertIn("TextEditorIsFollowingBottom", mac)
         self.assertIn("RestoreTextEditorViewport", mac)
@@ -3550,16 +3521,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("newViewProps.documentKey", mac)
         self.assertIn("_viewportStates", mac)
 
-        self.assertIn("FindTextEditorScrollViewer", windows)
-        self.assertIn("viewer.ScrollableHeight() - previous_vertical_offset <= 4.0", windows)
-        self.assertIn("previous_selection_start", windows)
-        self.assertIn("editor_.Text().size()", windows)
-        self.assertIn("IReference<double>", windows)
-        self.assertIn("viewer.ChangeView(", windows)
-        self.assertIn("props.documentKey", windows)
-        self.assertIn("viewport_states_", windows)
-
-        for source in (mac_spec, windows_spec, adapter):
+        for source in (mac_spec, adapter):
             self.assertIn("documentKey", source)
         # Logs are rendered with the native structured table. Text-editor
         # viewport behavior is still covered by the settings editors above;
@@ -3580,7 +3542,6 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("selected === \"online-usage\" && hasDistinct(rows, (row) => row.account),", ui)
         self.assertIn("const nativeTableColumns = useMemo(", ui)
         self.assertIn("<NativeTable columns={nativeTableColumns}", ui)
-        self.assertIn("REACT_FIELD(documentKey)", windows_codegen)
 
     def test_every_react_root_receives_core_events(self) -> None:
         """One React root per window observes Core; a single handler slot does not."""

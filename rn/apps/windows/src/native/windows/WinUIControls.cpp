@@ -10,12 +10,8 @@
 #include "codegen/react/components/YoungRouter/LiteLLMWinUIPicker.g.h"
 #include "codegen/react/components/YoungRouter/LiteLLMWinUISecureTextInput.g.h"
 #include "codegen/react/components/YoungRouter/LiteLLMWinUISegmentedControl.g.h"
-#include "codegen/react/components/YoungRouter/LiteLLMWinUISelectableRow.g.h"
-#include "codegen/react/components/YoungRouter/LiteLLMWinUISplitView.g.h"
 #include "codegen/react/components/YoungRouter/LiteLLMWinUISwitch.g.h"
 #include "codegen/react/components/YoungRouter/LiteLLMWinUITable.g.h"
-#include "codegen/react/components/YoungRouter/LiteLLMWinUITextEditor.g.h"
-#include "codegen/react/components/YoungRouter/LiteLLMWinUITextInput.g.h"
 
 #include <shlobj.h>
 #include <winrt/Microsoft.UI.Xaml.Controls.h>
@@ -139,10 +135,6 @@ SolidColorBrush DestructiveBrush() {
   return ThemeBrush(L"SystemFillColorCriticalBrush", winrt::Windows::UI::Color{255, 196, 43, 28});
 }
 
-SolidColorBrush SelectionBrush() {
-  return ThemeBrush(L"SubtleFillColorSecondaryBrush", winrt::Windows::UI::Color{255, 220, 235, 252});
-}
-
 SolidColorBrush AlternatingRowBrush() {
   return ThemeBrush(L"SubtleFillColorTransparentBrush", winrt::Windows::UI::Color{20, 128, 128, 128});
 }
@@ -206,18 +198,6 @@ wchar_t const* SourceListGlyph(std::string const& symbol) {
   if (symbol == "list.bullet.rectangle") return L"\xE8A5";
   if (symbol == "info.circle") return L"\xE946";
   return L"\xE74D";
-}
-
-ScrollViewer FindTextEditorScrollViewer(
-    winrt::Microsoft::UI::Xaml::DependencyObject const& root) {
-  if (!root) return nullptr;
-  auto const child_count = winrt::Microsoft::UI::Xaml::Media::VisualTreeHelper::GetChildrenCount(root);
-  for (int32_t index = 0; index < child_count; ++index) {
-    auto const child = winrt::Microsoft::UI::Xaml::Media::VisualTreeHelper::GetChild(root, index);
-    if (auto const viewer = child.try_as<ScrollViewer>()) return viewer;
-    if (auto const viewer = FindTextEditorScrollViewer(child)) return viewer;
-  }
-  return nullptr;
 }
 
 ScrollViewer FindListScrollViewer(
@@ -1222,161 +1202,6 @@ struct TableComponentView
   std::vector<std::string> selectable_spanning_row_keys_;
 };
 
-struct TextEditorComponentView
-    : winrt::implements<TextEditorComponentView, winrt::IInspectable>,
-      winrt::YoungRouter::Codegen::BaseLiteLLMWinUITextEditor<TextEditorComponentView> {
-  struct ViewportState final {
-    double horizontal_offset = 0.0;
-    double vertical_offset = 0.0;
-    int32_t selection_start = 0;
-    int32_t selection_length = 0;
-    bool follows_bottom = true;
-  };
-
-  void InitializeContentIsland(ContentIslandComponentView const& island_view) noexcept {
-    island_ = winrt::Microsoft::UI::Xaml::XamlIsland{};
-    editor_ = TextBox{};
-    editor_.FontSize(kUIFontSize);
-    editor_.AcceptsReturn(true);
-    editor_.TextChanged([this](auto const&, auto const&) {
-      if (syncing_) return;
-      if (auto emitter = EventEmitter()) {
-        winrt::YoungRouter::Codegen::LiteLLMWinUITextEditorEventEmitter::OnChangeText args;
-        args.text = winrt::to_string(editor_.Text());
-        emitter->onChangeText(std::move(args));
-      }
-    });
-    island_.Content(editor_);
-    island_view.Connect(island_.ContentIsland());
-    ApplyProps();
-  }
-
-  void UpdateProps(
-      winrt::Microsoft::ReactNative::ComponentView const& view,
-      winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUITextEditorProps> const& props,
-      winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUITextEditorProps> const& old_props) noexcept override {
-    winrt::YoungRouter::Codegen::BaseLiteLLMWinUITextEditor<TextEditorComponentView>::UpdateProps(view, props, old_props);
-    ApplyProps();
-  }
-
- private:
-  void ApplyProps() noexcept {
-    if (!editor_ || !Props()) return;
-    auto const& props = *Props();
-    auto const next_document_key = props.documentKey.value_or("");
-    auto const document_changed = active_document_key_ != next_document_key;
-    syncing_ = true;
-    auto const value = ToHString(props.value);
-    if (document_changed && !active_document_key_.empty()) {
-      if (auto const viewer = FindTextEditorScrollViewer(editor_)) {
-        viewport_states_[active_document_key_] = ViewportState{
-            viewer.HorizontalOffset(),
-            viewer.VerticalOffset(),
-            editor_.SelectionStart(),
-            editor_.SelectionLength(),
-            viewer.ScrollableHeight() - viewer.VerticalOffset() <= 4.0,
-        };
-      }
-    }
-    if (editor_.Text() != value) {
-      editor_.ApplyTemplate();
-      editor_.UpdateLayout();
-      auto const viewer = FindTextEditorScrollViewer(editor_);
-      auto const existing_state = document_changed
-          ? viewport_states_.find(next_document_key)
-          : viewport_states_.end();
-      auto const previous_horizontal_offset = existing_state != viewport_states_.end()
-          ? existing_state->second.horizontal_offset
-          : document_changed ? 0.0 : viewer ? viewer.HorizontalOffset() : 0.0;
-      auto const previous_vertical_offset = existing_state != viewport_states_.end()
-          ? existing_state->second.vertical_offset
-          : document_changed ? 0.0 : viewer ? viewer.VerticalOffset() : 0.0;
-      auto const follow_bottom = existing_state != viewport_states_.end()
-          ? existing_state->second.follows_bottom
-          : document_changed ||
-                (viewer && viewer.ScrollableHeight() - previous_vertical_offset <= 4.0);
-      auto const previous_selection_start = existing_state != viewport_states_.end()
-          ? existing_state->second.selection_start
-          : document_changed ? 0 : editor_.SelectionStart();
-      auto const previous_selection_length = existing_state != viewport_states_.end()
-          ? existing_state->second.selection_length
-          : document_changed ? 0 : editor_.SelectionLength();
-
-      editor_.Text(value);
-      // TextBox selection offsets are UTF-16 code units, not UTF-8 bytes.
-      auto const text_length = static_cast<int32_t>(editor_.Text().size());
-      auto const selection_start = std::clamp(previous_selection_start, 0, text_length);
-      auto const selection_length = std::clamp(
-          previous_selection_length, 0, text_length - selection_start);
-      editor_.SelectionStart(selection_start);
-      editor_.SelectionLength(selection_length);
-      editor_.UpdateLayout();
-
-      if (viewer) {
-        viewer.UpdateLayout();
-        auto const horizontal_offset = std::clamp(
-            previous_horizontal_offset, 0.0, viewer.ScrollableWidth());
-        auto const vertical_offset = follow_bottom
-            ? viewer.ScrollableHeight()
-            : std::clamp(previous_vertical_offset, 0.0, viewer.ScrollableHeight());
-        auto const horizontal_reference = winrt::box_value(horizontal_offset)
-            .as<winrt::Windows::Foundation::IReference<double>>();
-        auto const vertical_reference = winrt::box_value(vertical_offset)
-            .as<winrt::Windows::Foundation::IReference<double>>();
-        viewer.ChangeView(
-            horizontal_reference,
-            vertical_reference,
-            nullptr,
-            true);
-      }
-    } else if (document_changed) {
-      auto const existing_state = viewport_states_.find(next_document_key);
-      auto const target_state = existing_state != viewport_states_.end()
-          ? existing_state->second
-          : ViewportState{};
-      editor_.ApplyTemplate();
-      editor_.UpdateLayout();
-      auto const text_length = static_cast<int32_t>(editor_.Text().size());
-      auto const selection_start = std::clamp(target_state.selection_start, 0, text_length);
-      auto const selection_length = std::clamp(
-          target_state.selection_length, 0, text_length - selection_start);
-      editor_.SelectionStart(selection_start);
-      editor_.SelectionLength(selection_length);
-      if (auto const viewer = FindTextEditorScrollViewer(editor_)) {
-        viewer.UpdateLayout();
-        auto const horizontal_offset = std::clamp(
-            target_state.horizontal_offset, 0.0, viewer.ScrollableWidth());
-        auto const vertical_offset = target_state.follows_bottom
-            ? viewer.ScrollableHeight()
-            : std::clamp(target_state.vertical_offset, 0.0, viewer.ScrollableHeight());
-        auto const horizontal_reference = winrt::box_value(horizontal_offset)
-            .as<winrt::Windows::Foundation::IReference<double>>();
-        auto const vertical_reference = winrt::box_value(vertical_offset)
-            .as<winrt::Windows::Foundation::IReference<double>>();
-        viewer.ChangeView(horizontal_reference, vertical_reference, nullptr, true);
-      }
-    }
-    syncing_ = false;
-    active_document_key_ = next_document_key;
-    editor_.IsReadOnly(props.readOnly.value_or(false));
-    editor_.TextWrapping(props.wrap
-        ? winrt::Microsoft::UI::Xaml::TextWrapping::Wrap
-        : winrt::Microsoft::UI::Xaml::TextWrapping::NoWrap);
-    winrt::Microsoft::UI::Xaml::Controls::ScrollViewer::SetHorizontalScrollBarVisibility(
-        editor_, props.wrap
-            ? winrt::Microsoft::UI::Xaml::Controls::ScrollBarVisibility::Disabled
-            : winrt::Microsoft::UI::Xaml::Controls::ScrollBarVisibility::Auto);
-    winrt::Microsoft::UI::Xaml::Controls::ScrollViewer::SetVerticalScrollBarVisibility(
-        editor_, winrt::Microsoft::UI::Xaml::Controls::ScrollBarVisibility::Auto);
-  }
-
-  bool syncing_ = false;
-  std::string active_document_key_;
-  std::unordered_map<std::string, ViewportState> viewport_states_;
-  winrt::Microsoft::UI::Xaml::XamlIsland island_{nullptr};
-  TextBox editor_{nullptr};
-};
-
 struct CodeWebViewComponentView
     : winrt::implements<CodeWebViewComponentView, winrt::IInspectable>,
       winrt::YoungRouter::Codegen::BaseLiteLLMWinUICodeWebView<CodeWebViewComponentView> {
@@ -1742,134 +1567,6 @@ void RegisterCodeWebViewRecycleHandler(
         if (auto current = weak.get()) current->PrepareForRecycle(view);
       });
 }
-
-struct SplitterComponentView
-    : winrt::implements<SplitterComponentView, winrt::IInspectable>,
-      winrt::YoungRouter::Codegen::BaseLiteLLMWinUISplitView<SplitterComponentView> {
-  void InitializeContentIsland(ContentIslandComponentView const& island_view) noexcept {
-    island_ = winrt::Microsoft::UI::Xaml::XamlIsland{};
-    root_ = Grid{};
-    splitter_ = Thumb{};
-    splitter_.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);
-    splitter_.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Stretch);
-    splitter_.DragDelta([this](auto const&, auto const& args) {
-      if (syncing_ || !Props() || Props()->disabled.value_or(false)) return;
-      const auto next_width = ClampPaneWidth(current_pane_width_ + static_cast<float>(args.HorizontalChange()));
-      current_pane_width_ = next_width;
-      EmitPaneWidth(next_width);
-    });
-    root_.Children().Append(splitter_);
-    island_.Content(root_);
-    island_view.Connect(island_.ContentIsland());
-    ApplyProps();
-  }
-
-  void UpdateProps(
-      winrt::Microsoft::ReactNative::ComponentView const& view,
-      winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUISplitViewProps> const& props,
-      winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUISplitViewProps> const& old_props) noexcept override {
-    winrt::YoungRouter::Codegen::BaseLiteLLMWinUISplitView<SplitterComponentView>::UpdateProps(view, props, old_props);
-    ApplyProps();
-  }
-
- private:
-  float ClampPaneWidth(float width) const noexcept {
-    if (!Props()) return width;
-    const auto min_width = Props()->minPaneWidth;
-    const auto max_width = std::max(min_width, Props()->maxPaneWidth);
-    return std::clamp(width, min_width, max_width);
-  }
-
-  void EmitPaneWidth(float width) noexcept {
-    if (auto emitter = EventEmitter()) {
-      winrt::YoungRouter::Codegen::LiteLLMWinUISplitViewEventEmitter::OnPaneWidthChange args;
-      args.width = width;
-      emitter->onPaneWidthChange(std::move(args));
-    }
-  }
-
-  void ApplyProps() noexcept {
-    if (!root_ || !Props()) return;
-    auto const& props = *Props();
-    syncing_ = true;
-    current_pane_width_ = ClampPaneWidth(props.paneWidth);
-    splitter_.Visibility(
-        props.paneOpen
-            ? winrt::Microsoft::UI::Xaml::Visibility::Visible
-            : winrt::Microsoft::UI::Xaml::Visibility::Collapsed);
-    splitter_.IsEnabled(Enabled(props.disabled));
-    syncing_ = false;
-  }
-
-  bool syncing_ = false;
-  float current_pane_width_ = 0;
-  winrt::Microsoft::UI::Xaml::XamlIsland island_{nullptr};
-  Grid root_{nullptr};
-  Thumb splitter_{nullptr};
-};
-
-struct TextInputComponentView
-    : winrt::implements<TextInputComponentView, winrt::IInspectable>,
-      winrt::YoungRouter::Codegen::BaseLiteLLMWinUITextInput<TextInputComponentView> {
-  void InitializeContentIsland(ContentIslandComponentView const& island_view) noexcept {
-    island_ = winrt::Microsoft::UI::Xaml::XamlIsland{};
-    // A TextBox cannot be created in this island: Text Services needs a
-    // windowed visual tree at construction time, and creating one here fails
-    // with E_FAIL inside this noexcept factory (which aborted the process).
-    // The field is drawn as the text it holds, in a framed surface that
-    // matches the other controls, and it carries the field's own accessible
-    // name so the UIA tree still reads it.
-    grid_ = Grid{};
-    border_ = Border{};
-    border_.BorderThickness(winrt::Microsoft::UI::Xaml::Thickness{1, 1, 1, 1});
-    border_.BorderBrush(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush{
-        winrt::Windows::UI::Color{0xFF, 0xC8, 0xC8, 0xC8}});
-    border_.CornerRadius(winrt::Microsoft::UI::Xaml::CornerRadius{4, 4, 4, 4});
-    border_.Padding(winrt::Microsoft::UI::Xaml::Thickness{8, 0, 8, 0});
-    border_.MinHeight(30.0);
-    text_ = TextBlock{};
-    text_.FontSize(kUIFontSize);
-    text_.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Center);
-    border_.Child(text_);
-    grid_.Children().Append(border_);
-    island_.Content(grid_);
-    island_view.Connect(island_.ContentIsland());
-    ApplyProps(nullptr);
-  }
-
-  void UpdateProps(
-      winrt::Microsoft::ReactNative::ComponentView const& view,
-      winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUITextInputProps> const& props,
-      winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUITextInputProps> const& old_props) noexcept override {
-    winrt::YoungRouter::Codegen::BaseLiteLLMWinUITextInput<TextInputComponentView>::UpdateProps(view, props, old_props);
-    ApplyProps(old_props);
-  }
-
- private:
-  void ApplyProps(
-      winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUITextInputProps> const& old_props) noexcept {
-    (void)old_props;
-    if (!text_ || !Props()) return;
-    auto const& props = *Props();
-    auto const value = ToHString(props.value.value_or(""));
-    auto const placeholder = ToHString(props.placeholder.value_or(""));
-    text_.Text(value.empty() ? placeholder : value);
-    text_.Foreground(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush{
-        value.empty() ? winrt::Windows::UI::Color{0xFF, 0x8A, 0x8A, 0x8A}
-                      : winrt::Windows::UI::Color{0xFF, 0x1A, 0x1A, 0x1A}});
-    border_.Opacity(Enabled(props.disabled) ? 1.0 : 0.5);
-    const auto label = ToHString(props.accessibilityLabel.value_or(""));
-    if (!label.empty()) {
-      winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(text_, label);
-      winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(border_, label);
-    }
-  }
-
-  winrt::Microsoft::UI::Xaml::XamlIsland island_{nullptr};
-  Grid grid_{nullptr};
-  Border border_{nullptr};
-  TextBlock text_{nullptr};
-};
 
 struct SecureTextInputComponentView
     : winrt::implements<SecureTextInputComponentView, winrt::IInspectable>,
@@ -2399,66 +2096,6 @@ struct SwitchComponentView
   TextBlock glyph_{nullptr};
 };
 
-struct SelectableRowComponentView
-    : winrt::implements<SelectableRowComponentView, winrt::IInspectable>,
-      winrt::YoungRouter::Codegen::BaseLiteLLMWinUISelectableRow<SelectableRowComponentView> {
-  void InitializeContentIsland(ContentIslandComponentView const& island_view) noexcept {
-    island_ = winrt::Microsoft::UI::Xaml::XamlIsland{};
-    button_ = Button{};
-    button_.HorizontalContentAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);
-    content_ = StackPanel{};
-    content_.Spacing(2);
-    title_ = TextBlock{};
-    title_.FontSize(kUIFontSize);
-    title_.TextWrapping(winrt::Microsoft::UI::Xaml::TextWrapping::NoWrap);
-    title_.TextTrimming(winrt::Microsoft::UI::Xaml::TextTrimming::CharacterEllipsis);
-    detail_ = TextBlock{};
-    detail_.FontSize(kUIFontSize);
-    detail_.TextWrapping(winrt::Microsoft::UI::Xaml::TextWrapping::NoWrap);
-    detail_.TextTrimming(winrt::Microsoft::UI::Xaml::TextTrimming::CharacterEllipsis);
-    detail_.Opacity(0.68);
-    content_.Children().Append(title_);
-    content_.Children().Append(detail_);
-    button_.Content(content_);
-    button_.Click([this](auto const&, auto const&) {
-      if (auto emitter = EventEmitter()) {
-        winrt::YoungRouter::Codegen::LiteLLMWinUISelectableRowEventEmitter::OnPress args;
-        emitter->onPress(std::move(args));
-      }
-    });
-    island_.Content(button_);
-    island_view.Connect(island_.ContentIsland());
-    ApplyProps();
-  }
-
-  void UpdateProps(
-      winrt::Microsoft::ReactNative::ComponentView const& view,
-      winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUISelectableRowProps> const& props,
-      winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUISelectableRowProps> const& old_props) noexcept override {
-    winrt::YoungRouter::Codegen::BaseLiteLLMWinUISelectableRow<SelectableRowComponentView>::UpdateProps(view, props, old_props);
-    ApplyProps();
-  }
-
- private:
-  void ApplyProps() noexcept {
-    if (!button_ || !Props()) return;
-    auto const& props = *Props();
-    title_.Text(ToHString(props.title));
-    auto detail = ToHString(props.detail.value_or(""));
-    detail_.Text(detail);
-    detail_.Visibility(detail.empty() ? winrt::Microsoft::UI::Xaml::Visibility::Collapsed : winrt::Microsoft::UI::Xaml::Visibility::Visible);
-    button_.IsEnabled(Enabled(props.disabled));
-    if (props.selected.value_or(false)) button_.Background(SelectionBrush());
-    else button_.Background(nullptr);
-  }
-
-  winrt::Microsoft::UI::Xaml::XamlIsland island_{nullptr};
-  Button button_{nullptr};
-  StackPanel content_{nullptr};
-  TextBlock title_{nullptr};
-  TextBlock detail_{nullptr};
-};
-
 template <typename TComponent>
 void RegisterComponent(
     winrt::Microsoft::ReactNative::IReactPackageBuilder const& package_builder,
@@ -2585,25 +2222,10 @@ void RegisterWinUIControls(
   RegisterCheckbox(package_builder);
   RegisterSwitch(package_builder);
   RegisterTable(package_builder);
-  RegisterComponent<TextEditorComponentView>(
-      package_builder,
-      winrt::YoungRouter::Codegen::RegisterLiteLLMWinUITextEditorNativeComponent<TextEditorComponentView>);
   RegisterCodeWebView(package_builder);
   RegisterComponent<SecureTextInputComponentView>(
       package_builder,
       winrt::YoungRouter::Codegen::RegisterLiteLLMWinUISecureTextInputNativeComponent<SecureTextInputComponentView>);
-  // ContentIsland children are Composition visuals, not XAML UIElements that a
-  // WinUI SplitView can accept as Pane/Content. This component is therefore a
-  // narrow native drag leaf; React owns pane layout and positions the leaf.
-  RegisterComponent<SplitterComponentView>(
-      package_builder,
-      winrt::YoungRouter::Codegen::RegisterLiteLLMWinUISplitViewNativeComponent<SplitterComponentView>);
-  RegisterComponent<TextInputComponentView>(
-      package_builder,
-      winrt::YoungRouter::Codegen::RegisterLiteLLMWinUITextInputNativeComponent<TextInputComponentView>);
-  RegisterComponent<SelectableRowComponentView>(
-      package_builder,
-      winrt::YoungRouter::Codegen::RegisterLiteLLMWinUISelectableRowNativeComponent<SelectableRowComponentView>);
 }
 
 }  // namespace YoungRouter

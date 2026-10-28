@@ -12,6 +12,8 @@ import type {
 export const APPKIT_COMPONENT_NAME = "LiteLLMAppKitTextEditor";
 export const WINUI_COMPONENT_NAME = "LiteLLMWinUITextEditor";
 
+export const PLATFORMS = ["macos"];
+
 type ChangeTextEvent = Readonly<{ text: string }>;
 
 export interface NativeTextEditorProps extends ViewProps {
