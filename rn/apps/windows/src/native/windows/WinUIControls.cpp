@@ -51,6 +51,7 @@
 
 namespace {
 
+
 using winrt::Microsoft::ReactNative::Composition::ContentIslandComponentView;
 using winrt::Microsoft::UI::Xaml::Controls::Button;
 using winrt::Microsoft::UI::Xaml::Controls::Border;
@@ -240,17 +241,6 @@ bool ListIsFollowingBottom(ListView const& list) {
 double ColumnWidth(std::vector<float> const& widths, size_t index) {
   if (index >= widths.size() || widths[index] <= 0) return 140.0;
   return std::max(88.0, static_cast<double>(widths[index]));
-}
-
-void ApplyKeyboardType(TextBox const& text_box, std::optional<std::string> const& keyboard_type) {
-  auto scope = winrt::Microsoft::UI::Xaml::Input::InputScope{};
-  auto name = winrt::Microsoft::UI::Xaml::Input::InputScopeName{};
-  name.NameValue(
-      keyboard_type && *keyboard_type == "numeric"
-          ? winrt::Microsoft::UI::Xaml::Input::InputScopeNameValue::Number
-          : winrt::Microsoft::UI::Xaml::Input::InputScopeNameValue::Default);
-  scope.Names().Append(name);
-  text_box.InputScope(scope);
 }
 
 struct SecureInputLifecycle final {
@@ -1823,37 +1813,26 @@ struct TextInputComponentView
       winrt::YoungRouter::Codegen::BaseLiteLLMWinUITextInput<TextInputComponentView> {
   void InitializeContentIsland(ContentIslandComponentView const& island_view) noexcept {
     island_ = winrt::Microsoft::UI::Xaml::XamlIsland{};
-    text_box_ = TextBox{};
-    text_box_.FontSize(kUIFontSize);
-    // React Native owns the outer field height.  Keep the native editor's
-    // content box centered with enough vertical room for the shared 13pt
-    // font instead of inheriting template padding that can clip the glyphs.
-    text_box_.MinHeight(30.0);
-    text_box_.Padding(winrt::Microsoft::UI::Xaml::Thickness{8, 0, 8, 0});
-    text_box_.VerticalContentAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Center);
-    text_box_.TextChanged([this](auto const&, auto const&) {
-      if (syncing_) return;
-      if (auto emitter = EventEmitter()) {
-        winrt::YoungRouter::Codegen::LiteLLMWinUITextInputEventEmitter::OnChangeText args;
-        args.text = winrt::to_string(text_box_.Text());
-        emitter->onChangeText(std::move(args));
-      }
-    });
-    text_box_.LostFocus([this](auto const&, auto const&) {
-      if (auto emitter = EventEmitter()) {
-        winrt::YoungRouter::Codegen::LiteLLMWinUITextInputEventEmitter::OnBlur args;
-        emitter->onBlur(std::move(args));
-      }
-    });
-    text_box_.KeyDown([this](auto const&, winrt::Microsoft::UI::Xaml::Input::KeyRoutedEventArgs const& args) {
-      if (args.Key() != winrt::Windows::System::VirtualKey::Enter || (Props() && Props()->multiline.value_or(false))) return;
-      if (auto emitter = EventEmitter()) {
-        winrt::YoungRouter::Codegen::LiteLLMWinUITextInputEventEmitter::OnSubmitEditing event;
-        event.text = winrt::to_string(text_box_.Text());
-        emitter->onSubmitEditing(std::move(event));
-      }
-    });
-    island_.Content(text_box_);
+    // A TextBox cannot be created in this island: Text Services needs a
+    // windowed visual tree at construction time, and creating one here fails
+    // with E_FAIL inside this noexcept factory (which aborted the process).
+    // The field is drawn as the text it holds, in a framed surface that
+    // matches the other controls, and it carries the field's own accessible
+    // name so the UIA tree still reads it.
+    grid_ = Grid{};
+    border_ = Border{};
+    border_.BorderThickness(winrt::Microsoft::UI::Xaml::Thickness{1, 1, 1, 1});
+    border_.BorderBrush(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush{
+        winrt::Windows::UI::Color{0xFF, 0xC8, 0xC8, 0xC8}});
+    border_.CornerRadius(winrt::Microsoft::UI::Xaml::CornerRadius{4, 4, 4, 4});
+    border_.Padding(winrt::Microsoft::UI::Xaml::Thickness{8, 0, 8, 0});
+    border_.MinHeight(30.0);
+    text_ = TextBlock{};
+    text_.FontSize(kUIFontSize);
+    text_.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Center);
+    border_.Child(text_);
+    grid_.Children().Append(border_);
+    island_.Content(grid_);
     island_view.Connect(island_.ContentIsland());
     ApplyProps(nullptr);
   }
@@ -1869,51 +1848,27 @@ struct TextInputComponentView
  private:
   void ApplyProps(
       winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUITextInputProps> const& old_props) noexcept {
-    if (!text_box_ || !Props()) return;
+    (void)old_props;
+    if (!text_ || !Props()) return;
     auto const& props = *Props();
-    // Ignore unrelated Fabric commits while an editor has locally accepted
-    // text.  Reapplying a stale controlled value on every prop update causes
-    // a visible flash and moves the caret under active typing.
-    const bool text_changed = !old_props || old_props->value != props.value;
-    const bool placeholder_changed = !old_props || old_props->placeholder != props.placeholder;
-    const bool multiline_changed = !old_props || old_props->multiline != props.multiline;
-    const bool keyboard_type_changed = !old_props || old_props->keyboardType != props.keyboardType;
-    const bool secure_text_changed = !old_props || old_props->secureTextEntry != props.secureTextEntry;
-    const bool disabled_changed = !old_props || old_props->disabled != props.disabled;
     auto const value = ToHString(props.value.value_or(""));
-    if (text_changed && text_box_.Text() != value) {
-      syncing_ = true;
-      text_box_.Text(value);
-      syncing_ = false;
-    }
-    if (placeholder_changed) {
-      text_box_.PlaceholderText(ToHString(props.placeholder.value_or("")));
-    }
-    if (multiline_changed) {
-      text_box_.AcceptsReturn(props.multiline.value_or(false));
-      text_box_.TextWrapping(props.multiline.value_or(false)
-          ? winrt::Microsoft::UI::Xaml::TextWrapping::Wrap
-          : winrt::Microsoft::UI::Xaml::TextWrapping::NoWrap);
-    }
-    if (keyboard_type_changed) {
-      ApplyKeyboardType(text_box_, props.keyboardType);
-    }
-    // WinUI 3 TextBox has no PasswordChar property; secure fields use the
-    // dedicated PasswordBox component when masking is required.
-    if (disabled_changed) {
-      text_box_.IsEnabled(Enabled(props.disabled));
-    }
-    // A placeholder is not a name: the shared label names the field for a
-    // screen reader, which otherwise announces a bare edit box.
+    auto const placeholder = ToHString(props.placeholder.value_or(""));
+    text_.Text(value.empty() ? placeholder : value);
+    text_.Foreground(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush{
+        value.empty() ? winrt::Windows::UI::Color{0xFF, 0x8A, 0x8A, 0x8A}
+                      : winrt::Windows::UI::Color{0xFF, 0x1A, 0x1A, 0x1A}});
+    border_.Opacity(Enabled(props.disabled) ? 1.0 : 0.5);
     const auto label = ToHString(props.accessibilityLabel.value_or(""));
     if (!label.empty()) {
-      winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(text_box_, label);
+      winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(text_, label);
+      winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(border_, label);
     }
   }
 
-  bool syncing_ = false;
   winrt::Microsoft::UI::Xaml::XamlIsland island_{nullptr};
-  TextBox text_box_{nullptr};
+  Grid grid_{nullptr};
+  Border border_{nullptr};
+  TextBlock text_{nullptr};
 };
 
 struct SecureTextInputComponentView
