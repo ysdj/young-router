@@ -14,13 +14,16 @@ void CoreIPCModule::RegisterEventHandler() noexcept {
   try {
     if (event_handler_token_ != 0) return;
     auto call_invoker = context_.CallInvoker();
-    auto emitter = CoreEvent;
     // One observer per React root: the menu host and every route window each
     // hold their own lifecycle, so the bridge fans Core events out instead of
-    // delivering them to whichever root registered last.
+    // delivering them to whichever root registered last.  Read the event field
+    // when the event arrives: it is filled when JS subscribes, after this
+    // registration, and a copy taken here stays empty.
     event_handler_token_ = CoreIPCBridge::Shared().AddEventHandler(
-        [call_invoker, emitter](std::string const& event) {
-          call_invoker->invokeAsync([emitter, event](facebook::jsi::Runtime&) { emitter(event); });
+        [this, call_invoker](std::string const& event) {
+          call_invoker->invokeAsync([this, event](facebook::jsi::Runtime&) {
+            if (CoreEvent) CoreEvent(event);
+          });
         });
   } catch (...) {
   }

@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <thread>
 #include <cmath>
 #include <set>
 #include <shobjidl_core.h>
@@ -127,10 +128,26 @@ void WinUI3NativeLeafModule::Initialize(winrt::Microsoft::ReactNative::ReactCont
   try {
     context_ = context;
     auto leaf = leaf_;
-    auto emitter = MenuAction;
-    auto js_dispatcher = context_.JSDispatcher();
-    leaf->SetActionHandler([emitter, js_dispatcher](std::string const& action) {
-      js_dispatcher.Post([emitter, action] { emitter(action); });
+    // REACT_EVENT fills the field with a lambda that calls EmitJSEvent,
+    // so it is safe to call from the UI thread and no JS dispatcher is
+    // needed.  Reading the field at dispatch time is what makes it
+    // non-empty: at REACT_INIT the field has not been filled yet.
+    leaf->SetActionHandler([this](std::string const& action) {
+      // The field holds the lambda REACT_EVENT installed (it calls
+      // EmitJSEvent), so it is read here rather than captured: at
+      // REACT_INIT it has not been filled yet, and a copy taken then
+      // would stay empty and silently drop every native action.
+      //
+      // The emit runs on its own thread because this handler is invoked
+      // from inside a window operation on the UI thread; emitting there
+      // re-enters React synchronously, and the surface that mounts calls
+      // a native window method back, which deadlocks the window.
+      std::thread([this, action] {
+        try {
+          if (MenuAction) MenuAction(action);
+        } catch (...) {
+        }
+      }).detach();
     });
     auto owner = HostWindow(context_);
     context_.UIDispatcher().Post([leaf, owner] { leaf->Initialize(owner); });
