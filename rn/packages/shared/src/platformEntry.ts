@@ -230,7 +230,6 @@ registerYoungRouter("YoungRouter", {
   translate: createTranslator("system", systemLocale),
   subscribeNativeAction: (listener) => {
     const subscription = leafEvents.addListener("menuAction", (action: string) => {
-      console.log("[yr] native action=" + action);
       listener(action);
     });
     return () => subscription.remove();
