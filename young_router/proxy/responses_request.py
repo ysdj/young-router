@@ -3189,14 +3189,19 @@ def _with_elided_oversized_tool_outputs(request_kwargs: dict) -> Optional[dict]:
             item_weight = _tool_record_weight(item)
             if item_weight <= min_chars:
                 continue
-            weight -= item_weight
-            if weight <= kept_chars:
-                break
             updated = dict(item)
             updated["output"] = [
                 {"type": "input_text", "text": _elided_tool_call_note(item_weight)}
             ]
+            # Keep the existing whole-record floor for small records, but do
+            # not preserve one old record that is itself larger than the
+            # latency budget merely because removing it crosses the ceiling.
+            if weight - item_weight <= kept_chars and item_weight <= kept_chars:
+                break
             lane_elisions[index] = updated
+            weight -= item_weight
+            if weight <= kept_chars:
+                break
         # A lane over the ceiling is trimmed as far as its own eligible records
         # take it, and the newest record always stays whole.  Reaching the
         # ceiling is not required for the trim to be worth it: one 150KB

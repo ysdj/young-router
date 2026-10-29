@@ -4763,6 +4763,48 @@ class HookReplayLatencyBudgetTests(HookTestCase):
         after = len(json.dumps(updated))
         self.assertLess(after, before / 2)
 
+    def test_one_oversized_old_record_is_elided_when_it_crosses_the_ceiling(self) -> None:
+        """The record that brings the tail under budget must still be rewritten."""
+
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._HISTORY_TOOL_OUTPUT_LATENCY_BUDGET_ENV, "150000")
+        request = {
+            "model": "deepseek-v4.1-flash",
+            "stream": True,
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "old",
+                    "name": "exec",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "old",
+                    "output": "x" * 500_000,
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "new",
+                    "name": "exec",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "new",
+                    "output": "small",
+                },
+            ],
+        }
+
+        updated = hooks._with_elided_oversized_tool_outputs(request)
+
+        self.assertIsNotNone(updated)
+        old_output = updated["input"][1]["output"]
+        self.assertEqual(old_output[0]["type"], "input_text")
+        self.assertIn("500002 characters elided", old_output[0]["text"])
+        self.assertLess(len(json.dumps(updated)), len(json.dumps(request)) / 2)
+
 
 class HookReplayedReasoningCountTests(HookTestCase):
     """The pre-call estimate must read a replayed item as its upstream does."""
