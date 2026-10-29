@@ -724,10 +724,16 @@ _HISTORY_TOOL_OUTPUT_DEFAULT_KEPT_CHARS = 600_000
 # the evidence, and the smaller of the two numbers is the ceiling.
 #
 # ``0`` keeps the window alone, which is what a route served over a fast link
-# wants; unset leaves it to the route's own declaration.
+# wants.  An unset or unreadable value is the default below, not a disabled
+# budget: a setting that reads as garbage must not silently restore the 25s
+# turn this exists to remove.
 _HISTORY_TOOL_OUTPUT_LATENCY_BUDGET_ENV = (
     "YOUNG_ROUTER_HISTORY_TOOL_OUTPUT_LATENCY_BUDGET_CHARS"
 )
+# The default is the knee of the curve above.  It is still 7.5x the drop floor
+# below, so a working set of several records survives while the worst case is
+# cut hard.
+_HISTORY_TOOL_OUTPUT_LATENCY_BUDGET_DEFAULT_CHARS = 150_000
 # Characters charged per token when a window becomes a ceiling.  This app's own
 # transcripts measure 4.24 chars per token, so 3 charges the route more tokens
 # than it really bills and keeps the ceiling on the safe side of a history that

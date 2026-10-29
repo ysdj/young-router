@@ -4708,21 +4708,43 @@ class HookReplayLatencyBudgetTests(HookTestCase):
         self.assertEqual(775_200, self._ceiling(hooks, "99999999"))
 
     def test_no_budget_keeps_the_window(self) -> None:
+        """``0`` is how an operator states 'let the window decide'."""
+
         hooks, _ = load_hook_module()
-        self.assertEqual(775_200, self._ceiling(hooks, None))
         self.assertEqual(775_200, self._ceiling(hooks, "0"))
 
-    def test_a_budget_that_cannot_be_read_is_ignored(self) -> None:
-        """An unreadable budget must not become an empty replay.
+    def test_an_absent_budget_is_the_default_and_not_the_window(self) -> None:
+        """The budget is on unless it is turned off; unset is not 'unbounded'.
 
-        Reading it as zero would delete every replayed record and leave the
-        model re-reading the same files turn after turn -- the failure the
-        window ceiling was introduced to stop.
+        A route's own window on a 1M-token model is several times this, and the
+        measured cost of replaying it was 10-20s per turn on a long-haul link.
+        An operator who never filled the field did not ask for that wait, and a
+        hand-broken value must not restore it either -- which is what reading an
+        unreadable budget as 'no budget' did.
         """
 
         hooks, _ = load_hook_module()
-        self.assertEqual(775_200, self._ceiling(hooks, "not-a-number"))
-        self.assertEqual(775_200, self._ceiling(hooks, "-1000"))
+        default = hooks._HISTORY_TOOL_OUTPUT_LATENCY_BUDGET_DEFAULT_CHARS
+        self.assertEqual(default, self._ceiling(hooks, None))
+        self.assertEqual(default, self._ceiling(hooks, "not-a-number"))
+        self.assertEqual(default, self._ceiling(hooks, "-1000"))
+        self.assertEqual(default, self._ceiling(hooks, ""))
+
+    def test_the_published_default_is_the_proxy_default(self) -> None:
+        """Runtime Settings shows one number, and the proxy runs another."""
+
+        from young_router.core.runtime_settings_schema import (
+            runtime_settings_metadata,
+        )
+
+        hooks, _ = load_hook_module()
+        published = {
+            str(item.get("key")): str(item.get("default"))
+            for item in runtime_settings_metadata()
+        }["YOUNG_ROUTER_HISTORY_TOOL_OUTPUT_LATENCY_BUDGET_CHARS"]
+        self.assertEqual(
+            str(hooks._HISTORY_TOOL_OUTPUT_LATENCY_BUDGET_DEFAULT_CHARS), published
+        )
 
     def test_the_budget_bounds_what_is_actually_sent(self) -> None:
         """End to end: a 1.8MB replay is trimmed to the budget, not the window."""

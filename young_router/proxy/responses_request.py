@@ -42,6 +42,7 @@ from .base import (
     _HISTORY_TOOL_OUTPUT_DEFAULT_KEPT_CHARS,
     _HISTORY_TOOL_OUTPUT_DEFAULT_MIN_CHARS,
     _HISTORY_TOOL_OUTPUT_KEPT_CHARS_ENV,
+    _HISTORY_TOOL_OUTPUT_LATENCY_BUDGET_DEFAULT_CHARS,
     _HISTORY_TOOL_OUTPUT_LATENCY_BUDGET_ENV,
     _HISTORY_TOOL_OUTPUT_MIN_CHARS_ENV,
     _PREFIX_IMAGE_MODE_DEFAULT,
@@ -2903,19 +2904,23 @@ def _history_tool_output_ceiling_chars_for_window(
 def _history_tool_output_latency_budget_chars() -> Optional[int]:
     """Replay the route can be sent before the wait outgrows the evidence.
 
-    ``None`` means the window alone decides, ``0`` is the same answer stated
-    explicitly, and a negative or unparsable value is ignored rather than
-    silently emptying the replay.
+    ``None`` means the window alone decides, which ``0`` states explicitly.  An
+    unset, negative, or unparsable value is the default budget and not a
+    disabled one: the budget exists to stop a 25s turn on this link, so a
+    setting nobody filled in -- or one a hand edit broke -- must not restore
+    it.
     """
 
     value = os.getenv(_HISTORY_TOOL_OUTPUT_LATENCY_BUDGET_ENV, "").strip()
     if not value:
-        return None
+        return _HISTORY_TOOL_OUTPUT_LATENCY_BUDGET_DEFAULT_CHARS
     try:
         parsed = int(value)
     except ValueError:
-        return None
+        return _HISTORY_TOOL_OUTPUT_LATENCY_BUDGET_DEFAULT_CHARS
     if parsed < 0:
+        return _HISTORY_TOOL_OUTPUT_LATENCY_BUDGET_DEFAULT_CHARS
+    if parsed == 0:
         return None
     return parsed
 

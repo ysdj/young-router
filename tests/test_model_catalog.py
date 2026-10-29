@@ -171,6 +171,10 @@ class ModelCatalogTests(unittest.TestCase):
             "1" if base_module._PREFIX_IMAGE_ORIGINAL_PATH_DEFAULT else "0",
             defaults_by_key["YOUNG_ROUTER_PREFIX_IMAGE_ORIGINAL_PATH"],
         )
+        self.assertEqual(
+            str(base_module._HISTORY_TOOL_OUTPUT_LATENCY_BUDGET_DEFAULT_CHARS),
+            defaults_by_key["YOUNG_ROUTER_HISTORY_TOOL_OUTPUT_LATENCY_BUDGET_CHARS"],
+        )
 
     def test_selected_names_keep_explicit_models_in_order_and_dedupe(self) -> None:
         config = {
