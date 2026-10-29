@@ -804,7 +804,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("if (selectedRow < 0 && !viewProps.selectedKey.empty()) {", mac_table)
         self.assertIn('LiteLLMAppKitTableEventEmitter::OnSelectionChange event{"", -1};', mac_table)
         # Windows is a React table; a row press always reaches the shared view.
-        self.assertIn('const select = (row: TableProps["rows"][number], index: number): void => {', adapter)
+        self.assertIn('const select = React.useCallback((row: TableProps["rows"][number], index: number): void => {', adapter)
         self.assertIn("onSelectionChange?.(row.key, index);", adapter)
 
 
@@ -819,7 +819,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("onSelectionChange(event);", mac_table)
         # The React table has one row press path. A double press is a second
         # report, not a second click handler.
-        self.assertIn("onPress={() => select(row, index)}", adapter)
+        self.assertIn("onPress={() => onSelect(row, index)}", adapter)
         self.assertIn("onRowDoublePress?.(row.key, index)", adapter)
         self.assertIn("lastPress.current?.key === row.key", adapter)
 
@@ -835,7 +835,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("row == SegmentIndex(viewProps.rowKeys, viewProps.selectedKey)", mac_table)
         self.assertIn("onSelectionChange(event);", mac_table)
         # The React table does not gate its press on the controlled selection.
-        self.assertIn("const select = (row: TableProps[\"rows\"][number], index: number): void => {", adapter)
+        self.assertIn("const select = React.useCallback((row: TableProps[\"rows\"][number], index: number): void => {", adapter)
         self.assertIn("onSelectionChange?.(row.key, index);", adapter)
         self.assertNotIn("if (row.key === selectedKey) return;", adapter)
 
@@ -3195,16 +3195,24 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # and honors an explicit scroll target.
         self.assertIn("React.useEffect(() => {", adapter)
         self.assertIn("if (!followBottom) return;", adapter)
-        self.assertIn("verticalScroll.current?.scrollToEnd({ animated: false });", adapter)
-        self.assertIn("verticalScroll.current?.scrollTo({ y: scrollToRow * rowHeight", adapter)
+        self.assertIn("verticalList.current?.scrollToEnd({ animated: false });", adapter)
+        self.assertIn("verticalList.current?.scrollToIndex({ index: scrollToRow, animated: false });", adapter)
 
     def test_table_scrollbars_only_appear_when_they_are_needed(self) -> None:
         native_controls = (SHARED / "ui" / "NativeControls.tsx").read_text(encoding="utf-8")
         self.assertIn('tableFallback: { minHeight: 120, borderWidth: 1, borderColor: "#d4d4d8", overflow: "hidden" }', native_controls)
         self.assertNotIn('tableFallback: { minHeight: 120, overflow: "scroll" }', native_controls)
         self.assertIn("<ScrollView horizontal showsHorizontalScrollIndicator={!sourceList}", native_controls)
-        self.assertIn("<ScrollView ref={verticalScroll} style={windowsTableStyles.verticalScroll}", native_controls)
+        self.assertIn("<FlatList", native_controls)
+        self.assertIn("style={windowsTableStyles.verticalList}", native_controls)
         self.assertIn("nestedScrollEnabled", native_controls)
+        # The Windows table virtualizes: one header rides the same horizontal
+        # scroller as the body, and a row count never becomes a full render.
+        self.assertIn("getItemLayout", native_controls)
+        self.assertIn("initialNumToRender={24}", native_controls)
+        self.assertIn("windowSize={7}", native_controls)
+        windows_table = native_controls.split("function WindowsTable(", 1)[1].split("const windowsTableStyles", 1)[0]
+        self.assertNotIn("rows.map(", windows_table)
 
     def test_native_text_inputs_do_not_rewrite_active_text_for_unrelated_prop_updates(self) -> None:
         mac = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
