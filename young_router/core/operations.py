@@ -797,6 +797,16 @@ class CoreServiceController:
         # module is loaded are redirected with the explicit writable cache.
         env["LITELLM_CONFIG_FILE"] = str(self.paths.config)
         env["LITELLM_RUNTIME_CONFIG"] = str(self.paths.runtime_config)
+        # LiteLLM reads ``LITELLM_MASTER_KEY`` before it loads any document and
+        # falls back to it only when the document states no ``master_key``.
+        # Handing the child the document's own key as well leaves no instant in
+        # which a worker serves with no key at all: without it, a worker that
+        # came up between the environment read and the config load knew no key,
+        # so every client's key looked like an unknown virtual key and the
+        # proxy answered "No connected db." until that worker was replaced.
+        master_key = self._configured_master_key()
+        if master_key:
+            env["LITELLM_MASTER_KEY"] = master_key
         env["YOUNG_ROUTER_RUNTIME_SETTINGS_FILE"] = str(self.paths.settings)
         env["LITELLM_NATIVE_PID_FILE"] = str(self.paths.pid)
         env["YOUNG_ROUTER_ROUTE_RECOVERY_STATE_FILE"] = str(self.paths.recovery)
@@ -833,6 +843,21 @@ class CoreServiceController:
         # a configured route starts one at proxy launch (see ``start``).
         env.update(self._managed_worker_environment(autostart=False))
         return env
+
+    def _configured_master_key(self) -> str:
+        """The key the staged document states, for the child's environment."""
+
+        from .domains.runtime import master_key_from_document
+
+        source = _provider_config_source(self.paths)
+        try:
+            text = source.read_text(encoding="utf-8")
+        except OSError:
+            return ""
+        try:
+            return master_key_from_document(text)
+        except Exception:
+            return ""
 
     def _configured_port(self, env: Mapping[str, str] | None = None) -> int:
         source = env if env is not None else self._runtime_env(strict=False)

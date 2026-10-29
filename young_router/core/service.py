@@ -78,6 +78,11 @@ _PLAINTEXT_SECRET_FIELDS = {
 _MULTILINE_SECRET_TARGETS = frozenset({
     "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON",
 })
+#: The runtime slots a native control may draw in the clear.  A proxy key is
+#: the credential this app hands the user's own clients, so its field shows it
+#: instead of a placeholder; the read still goes over the read-once native lease
+#: and never through a snapshot.
+_PLAINTEXT_RUNTIME_TARGETS = _MULTILINE_SECRET_TARGETS | {"YOUNG_ROUTER_MASTER_KEY"}
 _DSH_VISION_ROUTER_CONFIG_MAX_BYTES = 256 * 1024
 
 
@@ -1909,7 +1914,7 @@ class CoreStore:
         descriptor_key = (name, field_name)
         if descriptor_key not in _PLAINTEXT_SECRET_FIELDS:
             raise CoreError("invalid_secret", "The requested secret field is unavailable")
-        if descriptor_key == ("runtime", "setting") and target not in _MULTILINE_SECRET_TARGETS:
+        if descriptor_key == ("runtime", "setting") and target not in _PLAINTEXT_RUNTIME_TARGETS:
             raise CoreError("invalid_secret", "The requested secret field is unavailable")
         target_required = _SECRET_FIELDS[descriptor_key]
         if target_required and (
@@ -3695,6 +3700,14 @@ class CoreStore:
                 # simply reload.
                 self._schedule_service_reload_after_apply(replace_process="runtime" in applied)
             return
+        if self._applied_master_key_changed(applied):
+            # The proxy key is LiteLLM's ``master_key``, read once at startup.
+            # A rolling reload hands the new document to fresh workers of the
+            # *same* master, so the process boundary is what decides whether a
+            # client presenting the new key is accepted: it takes the same full
+            # replacement a runtime environment change takes.
+            self._schedule_service_reload_after_apply(replace_process=True)
+            return
         stager = self._service_handlers.get("stage_runtime_config")
         try:
             staged = stager("stage_runtime_config") if callable(stager) else None
@@ -3708,6 +3721,20 @@ class CoreStore:
             # the whole drain budget to load the bytes it is serving now.
             return
         self._schedule_service_reload_after_apply()
+
+    def _applied_master_key_changed(self, applied: Sequence[str]) -> bool:
+        """Whether this commit changed the key the proxy authenticates with.
+
+        The runtime adapter answers it from the Apply it just performed; a
+        domain that does not track the key answers ``False``, so this stays a
+        fact about the commit rather than a guess about the document.
+        """
+
+        if "runtime" not in applied:
+            return False
+        adapter = self._domains.get("runtime")
+        changed = getattr(adapter, "master_key_changed", None)
+        return bool(changed()) if callable(changed) else False
 
     def _schedule_service_reload_after_apply(self, *, replace_process: bool = False) -> None:
         """Queue the post-apply LiteLLM restart without blocking the commit.
@@ -4646,6 +4673,13 @@ class CoreStore:
                     relay_dependency_only=relay_dependency_only,
                 )
 
+            if "runtime" in names and len(names) > 1:
+                # The proxy key is a line of the provider document, and that
+                # document is written by the provider domain from the copy its
+                # own draft loaded.  Restating the key last means a coordinated
+                # commit ends with the key this commit states, instead of with
+                # whichever draft happened to write the file.
+                names = [name for name in names if name != "runtime"] + ["runtime"]
             transaction_adapters = dict(adapters)
             adapter_checkpoints = {
                 name: _checkpoint_adapter(adapter, error_code="apply_failed")

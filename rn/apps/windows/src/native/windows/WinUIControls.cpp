@@ -574,8 +574,11 @@ struct SecureTextInputComponentView
       return props.target.empty() &&
           (props.field == "deployment_token" || props.field == "desktop_gateway_api_key");
     }
-    return props.domain == "runtime" && props.field == "setting" &&
-        props.target == "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON";
+    if (props.domain != "runtime" || props.field != "setting") return false;
+    // The General pane's proxy key, the one credential a window draws in the
+    // clear so it can be copied into a client.
+    return props.target == "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON" ||
+        props.target == "YOUNG_ROUTER_MASTER_KEY";
   }
 
   bool IsPlainTextAutoCommitField() const noexcept {

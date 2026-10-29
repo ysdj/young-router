@@ -5,16 +5,21 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
+import re
 from pathlib import Path
 import tempfile
 from collections.abc import Mapping
 from typing import Any
+
+import yaml
 
 from ..persistence import PersistenceError, atomic_write_text
 from ..security import REDACTED, safe_exception_message
 from ._shared import (
     DomainError,
     _action_name,
+    _default_provider_config_path,
     _default_runtime_settings_path,
     _file_bytes,
     _mapping,
@@ -114,12 +119,100 @@ def _dsh_set_json_value(payload: dict[str, Any], key: str, value: str) -> None:
         payload[json_key] = value
 
 
+#: The one record ``config.yaml`` keeps its proxy credential in.
+#:
+#: ``general_settings.master_key`` is where LiteLLM reads the key every client
+#: of this machine's proxy has to present, so it stays in that document rather
+#: than becoming a second setting Core owns: the provider editor, the Codex
+#: editor, the staged runtime copy and any hand edit already read it there.
+MASTER_KEY_SETTING = "YOUNG_ROUTER_MASTER_KEY"
+#: The value a document that states no key is read as, and the one a restore
+#: writes. ``config.example.yaml`` publishes the same default.
+DEFAULT_MASTER_KEY = "sk-young-router"
+#: What a key may contain.  URL-safe base64, the ``sk-`` prefix, and every
+#: punctuation mark a generated key carries fit; whitespace, a quote, a block
+#: scalar marker and a flow indicator do not, because writing one unquoted
+#: would restructure the document around it rather than set a key.
+_MASTER_KEY_VALUE = re.compile(r"[A-Za-z0-9._~+/=:@!*(),;-]{1,256}")
+#: The first top-level ``general_settings:`` block a document holds.
+_MASTER_KEY_BLOCK = re.compile(r"^general_settings:[^\n]*\n(?:[ \t]+[^\n]*\n)*", re.MULTILINE)
+_MASTER_KEY_LINE = re.compile(r"^(?P<lead>[ \t]+)master_key[ \t]*:[ \t]*(?P<rest>.*)$", re.MULTILINE)
+
+
+def master_key_is_valid(key: object) -> bool:
+    """Whether one value can be written as a plain scalar master key."""
+
+    return isinstance(key, str) and _MASTER_KEY_VALUE.fullmatch(key) is not None
+
+
+def master_key_from_document(text: str) -> str:
+    """The key this configuration hands its clients, or the built-in one.
+
+    A document that states no key, and a key written as an ``os.environ/``
+    reference this process cannot resolve, both read as the default: the field
+    then states the key a client actually has to present, and a restore writes
+    that same value back instead of leaving an unresolvable reference in place.
+    """
+
+    try:
+        document = yaml.safe_load(text)
+    except Exception:
+        return DEFAULT_MASTER_KEY
+    settings = document.get("general_settings") if isinstance(document, Mapping) else None
+    value = settings.get("master_key") if isinstance(settings, Mapping) else None
+    if isinstance(value, str) and value.startswith("os.environ/"):
+        value = os.environ.get(value.removeprefix("os.environ/").strip(), "")
+    text_value = value.strip() if isinstance(value, str) else ""
+    return text_value or DEFAULT_MASTER_KEY
+
+
+def master_key_in_document(text: str, key: str) -> str:
+    """Rewrite one document's master key, touching nothing else.
+
+    The document is edited as text because it is the source of truth for
+    everything the provider editor does not model: comments, anchors, and the
+    order of every other section survive a one-line change here, and a
+    hand-written document keeps its own shape.  A document without a
+    ``general_settings`` block gains one, and a block that states no
+    ``master_key`` gains the line at the block's own indentation.
+    """
+
+    if not master_key_is_valid(key):
+        raise DomainError("The API key contains unsupported characters")
+    block_match = _MASTER_KEY_BLOCK.search(text)
+    if block_match is None:
+        section = f"general_settings:\n  master_key: {key}\n"
+        return section if not text.strip() else text.rstrip("\n") + "\n\n" + section
+    block = block_match.group(0)
+    body = block.split("\n", 1)[1] if "\n" in block else ""
+    indent_match = re.match(r"[ \t]+", body)
+    indent = indent_match.group(0) if indent_match is not None else "  "
+    line_match = _MASTER_KEY_LINE.search(block)
+    if line_match is None:
+        # The key leads the block, the way every document this app writes
+        # states it; everything the block already held follows unchanged.
+        head = block.split("\n", 1)[0]
+        updated = f"{head}\n{indent}master_key: {key}\n{body}"
+    else:
+        updated = (
+            block[: line_match.start()]
+            + f"{line_match.group('lead')}master_key: {key}\n"
+            + block[line_match.end() :].lstrip("\n")
+        )
+    return text[: block_match.start()] + updated + text[block_match.end() :]
+
+
 class RuntimeSettingsDomain:
     """Staged runtime settings backed by ``runtime_settings_io`` validation."""
 
     name = "runtime"
+    # The proxy key is one of these because it is a credential the user may
+    # read and replace, and the native pane renders it in the clear through the
+    # one plaintext lease.  It is *not* stored in this file: see
+    # ``master_key_path``.
     _SECRET_KEYS = frozenset({
         "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON",
+        MASTER_KEY_SETTING,
     })
 
     def __init__(self, settings_path: Path | str | None = None):
@@ -133,6 +226,17 @@ class RuntimeSettingsDomain:
         # override. New edits always write the shared JSON document directly.
         self._dsh_legacy_bases: dict[str, tuple[bool, object]] = {}
         self._baseline_bytes: bytes | None = None
+        # The proxy key lives in ``config.yaml``, not in this file, so it is
+        # read and written beside these values; the bytes it was read from are
+        # what an Apply compares against, exactly like this file's own baseline.
+        self.master_key_path: Path = _default_provider_config_path()
+        self._master_key: str = DEFAULT_MASTER_KEY
+        self._master_key_bytes: bytes | None = None
+        self._master_key_draft: str = DEFAULT_MASTER_KEY
+        # Read by Core right after this domain's Apply: the proxy authenticates
+        # with that key, so a commit that changed it needs a replaced process
+        # rather than the rolling reload a document change takes.
+        self._last_apply_master_key_changed = False
         self.revision = 0
         self.reload()
 
@@ -178,11 +282,17 @@ class RuntimeSettingsDomain:
             baseline = _file_bytes(self.settings_path)
             values = read_settings_file(self.settings_path, specs)
             values = self._canonicalize_dsh_values(values)
+            key_baseline = _file_bytes(self.master_key_path)
+            key = master_key_from_document(
+                key_baseline.decode("utf-8", "replace") if key_baseline is not None else ""
+            )
         except DomainError:
             raise
         except Exception as exc:
             raise _safe_problem(exc, "Runtime settings could not be loaded") from None
         self._metadata = metadata
+        self._master_key = key
+        self._master_key_bytes = key_baseline
         return specs, values, baseline
 
     @staticmethod
@@ -274,7 +384,12 @@ class RuntimeSettingsDomain:
         }
 
     def draft_state(self) -> object:
-        return copy.deepcopy(self._draft_values)
+        # The key is one of the values one Apply commits, so a staged key is
+        # staged work exactly like a staged threshold: Core's own dirty flag
+        # compares this projection with the applied baseline.  It rides in the
+        # same flat projection rather than a second shape, because the staging
+        # it answers for is one document-wide draft.
+        return {**copy.deepcopy(self._draft_values), MASTER_KEY_SETTING: self._master_key_draft}
 
     def _validate_values(self, values: Mapping[str, object]) -> dict[str, str]:
         from ..runtime_settings_io import validate_values
@@ -419,15 +534,21 @@ class RuntimeSettingsDomain:
         elif name in {"restore_defaults", "defaults"}:
             self._dsh_legacy_bases.clear()
             self._draft_values = self._defaults(self.specs)
+            self._master_key_draft = DEFAULT_MASTER_KEY
         elif name in {"reset", "cancel", "reload"}:
             self._dsh_legacy_bases.clear()
             self._draft_values = copy.deepcopy(self._raw_values)
+            self._master_key_draft = self._master_key
         else:
             raise DomainError("The requested runtime action is unavailable")
         self.revision += 1
         return self.snapshot()
 
     def secret_present(self, field: str, target: str | None = None) -> bool:
+        if field == "setting" and target == MASTER_KEY_SETTING:
+            # The key always has a value: a document that states none is read
+            # as the published default, and the field states that same value.
+            return bool(self._master_key_draft)
         if field != "setting" or not isinstance(target, str) or target not in self.specs:
             raise DomainError("The requested secret field is unavailable")
         if not self._is_secret_setting(target):
@@ -436,8 +557,13 @@ class RuntimeSettingsDomain:
         return self._draft_values.get(target, default) != default
 
     def trusted_secret_value(self, field: str, target: str | None = None) -> str:
-        """Return the one runtime JSON document authorized for native editing."""
+        """Return the one runtime credential authorized for native editing."""
 
+        if field == "setting" and target == MASTER_KEY_SETTING:
+            # Handed only to the native host, over a read-once lease, so the
+            # field can draw the key in the clear without Core ever putting a
+            # credential into a snapshot.
+            return self._master_key_draft
         if field != "setting" or target != "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON":
             raise DomainError("The requested secret field is unavailable")
         if target not in self.specs or not self._is_secret_setting(target):
@@ -449,6 +575,17 @@ class RuntimeSettingsDomain:
         return value
 
     def stage_secret(self, field: str, target: str | None, value: str) -> None:
+        if field == "setting" and target == MASTER_KEY_SETTING:
+            key = value.strip()
+            if not key:
+                # An empty key is LiteLLM's unauthenticated mode, which this
+                # app never offers: every route would accept any request.
+                raise DomainError("The API key cannot be empty")
+            if not master_key_is_valid(key):
+                raise DomainError("The API key contains unsupported characters")
+            self._master_key_draft = key
+            self.revision += 1
+            return
         if field != "setting" or not isinstance(target, str) or target not in self.specs:
             raise DomainError("The requested secret field is unavailable")
         if not self._is_secret_setting(target):
@@ -504,28 +641,92 @@ class RuntimeSettingsDomain:
             atomic_write_text(self.settings_path, self._encoded_draft())
         except PersistenceError as exc:
             raise DomainError(safe_exception_message(exc)) from None
+        key_changed = self._master_key_draft != self._master_key
+        if key_changed:
+            self._write_master_key()
+        self._last_apply_master_key_changed = key_changed
         self.reload()
         self._apply_values(self._raw_values)
-        return {"applied": True, **self.snapshot()}
+        # The proxy reads this key at startup, so a changed one reaches a
+        # client only after the service restarts; the caller stages that.
+        return {"applied": True, "master_key_changed": key_changed, **self.snapshot()}
+
+    def master_key_changed(self) -> bool:
+        """Whether the Apply just performed replaced the proxy's key."""
+
+        return self._last_apply_master_key_changed
+
+    def _write_master_key(self) -> None:
+        """Replace ``general_settings.master_key`` in the live document.
+
+        The document is shared with the provider editor, which writes its own
+        sections from the copy its draft loaded.  This write therefore owns one
+        line: it re-reads the file, refuses when the key it states moved, and
+        leaves every other byte this domain did not write alone.
+        """
+
+        if self._master_key_bytes is None:
+            # A key needs a document to live in: with no provider
+            # configuration there is no proxy to hand any key to.
+            raise DomainError("Provider configuration is unavailable")
+        try:
+            source = self.master_key_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise DomainError(safe_exception_message(exc)) from None
+        if master_key_from_document(source) != self._master_key:
+            raise DomainError("The provider configuration changed on disk; reload and try again")
+        updated = master_key_in_document(source, self._master_key_draft)
+        # The rewrite is verified by reading it back: the document has to parse
+        # and state this key, or the proxy would be handed a document whose
+        # clients cannot authenticate.  The provider schema is deliberately not
+        # re-validated here -- this is a one-line text edit, and refusing it
+        # would blame the user's key for a section they never touched.
+        try:
+            parsed = yaml.safe_load(updated)
+        except yaml.YAMLError:
+            raise DomainError("The provider configuration is invalid") from None
+        settings = parsed.get("general_settings") if isinstance(parsed, Mapping) else None
+        if not isinstance(settings, Mapping) or settings.get("master_key") != self._master_key_draft:
+            raise DomainError("The provider configuration is invalid")
+        try:
+            atomic_write_text(self.master_key_path, updated)
+        except PersistenceError as exc:
+            raise DomainError(safe_exception_message(exc)) from None
 
     def external_disk_state(self) -> dict[str, bool]:
-        """Compare the settings source with the last load/apply baseline."""
+        """Compare both sources with the bytes this draft was read from.
+
+        The proxy key lives in the provider document, and an edit made to that
+        file in an editor is as much a change this pane must report as an edit
+        to the settings file: the pane states the key, so it has to notice when
+        the key it states is no longer the one on disk.
+        """
 
         current = _file_bytes(self.settings_path)
-        return {"changed": current != self._baseline_bytes, "exists": current is not None}
+        key_current = _file_bytes(self.master_key_path)
+        key_moved = False
+        if key_current != self._master_key_bytes and key_current is not None:
+            key_moved = master_key_from_document(key_current.decode("utf-8", "replace")) != self._master_key
+        return {
+            "changed": current != self._baseline_bytes or key_moved,
+            "exists": current is not None,
+        }
 
     def external_disk_identity(self) -> str:
         """Return a bounded opaque identity for Core's conflict tracker."""
 
-        current = _file_bytes(self.settings_path)
-        if current is None:
-            return "missing"
-        return hashlib.sha256(b"present\\0" + current).hexdigest()
+        digest = hashlib.sha256()
+        digest.update(b"present|" + (_file_bytes(self.settings_path) or b"missing") + b"|")
+        # The key this pane states, not the whole document: the provider editor
+        # writes other lines of that file, and those are not this field's change.
+        digest.update(b"master|" + self._master_key.encode("utf-8") + b"|")
+        return digest.hexdigest()
 
     def rebase_external_disk(self) -> dict[str, Any]:
         """Accept current disk bytes as Apply's baseline without losing the draft."""
 
         self._baseline_bytes = _file_bytes(self.settings_path)
+        self._master_key_bytes = _file_bytes(self.master_key_path)
         self.revision += 1
         return self.snapshot()
 
@@ -535,6 +736,7 @@ class RuntimeSettingsDomain:
         self._raw_values = copy.deepcopy(values)
         self._draft_values = copy.deepcopy(values)
         self._baseline_bytes = baseline
+        self._master_key_draft = self._master_key
         self.revision += 1
         return self.snapshot()
 

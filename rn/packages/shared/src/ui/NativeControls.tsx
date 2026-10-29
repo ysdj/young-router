@@ -1,6 +1,7 @@
 import React from "react";
 import {
   ActivityIndicator,
+  FlatList,
   NativeModules,
   Platform,
   Pressable,
@@ -513,6 +514,11 @@ export function NativeTextField({ style, onChangeText, onSubmitEditing, search =
       flatStyle?.color !== undefined && { color: flatStyle.color },
       props.multiline === true && styles.windowsTextFieldInputMultiline,
     ];
+    // The frame is the only height the field can trust: the page styles reach
+    // this leaf with their own `minHeight` (26 for a wizard row), so the frame
+    // and the inner input both carry an explicit height instead of inheriting
+    // one. Without that, RichEdit centres its single line against the taller
+    // frame and the glyphs sit on the bottom edge, clipped.
     return <View style={[styles.windowsTextField, style, props.editable === false && styles.windowsTextFieldDisabled]}>
       <TextInput {...props} style={inputStyle} onChangeText={onChangeText} onSubmitEditing={onSubmitEditing} onBlur={props.onBlur} />
     </View>;
@@ -574,6 +580,69 @@ function windowsSourceSymbol(symbol: string): string {
   return glyphs[symbol] ?? "•";
 }
 
+// A virtualized table re-renders its mounted window on every scroll frame, so a
+// row must not re-render just because its parent did.  The key lists arrive as
+// Sets (see `WindowsTable`) so a row's lookups are O(1) rather than a scan per
+// cell, which is what made a long log list stall while rows were mounted.
+const WindowsTableRow = React.memo(function WindowsTableRow({
+  row,
+  index,
+  columns,
+  compact,
+  sourceList,
+  stripedRows,
+  selected,
+  disabled,
+  alert,
+  rowSymbol,
+  rowSymbolColor,
+  secondaryCellKeys,
+  selectableSpanning,
+  onSelect,
+}: {
+  row: TableRow;
+  index: number;
+  columns: TableColumn[];
+  compact: boolean;
+  sourceList: boolean;
+  stripedRows: boolean;
+  selected: boolean;
+  disabled: boolean;
+  alert: boolean;
+  rowSymbol?: string;
+  rowSymbolColor?: string;
+  secondaryCellKeys: Set<string>;
+  selectableSpanning: boolean;
+  onSelect: (row: TableRow, index: number) => void;
+}): React.JSX.Element {
+  const spanning = row.spanning === true;
+  const stripe = stripedRows && !selected && !disabled && index % 2 === 1;
+  const textColor = alert ? "#8a5a00" : (disabled ? "#98a2b3" : "#1f2937");
+  const rowStyle = [
+    windowsTableStyles.row,
+    { height: compact ? 30 : 36 },
+    stripe && windowsTableStyles.rowStripe,
+    selected && windowsTableStyles.rowSelected,
+    disabled && windowsTableStyles.rowDisabled,
+  ];
+  return <Pressable
+    disabled={disabled || (spanning && !selectableSpanning)}
+    onPress={() => onSelect(row, index)}
+    style={rowStyle}
+  >
+    {spanning ? <Text numberOfLines={1} style={[windowsTableStyles.groupText, { color: textColor }]}>{row.cells[0] ?? ""}</Text> : <View style={windowsTableStyles.cells}>
+      {columns.map((column, columnIndex) => {
+        const cell = row.cells[columnIndex] ?? "";
+        const cellKey = `${row.key}\x1f${columnIndex}`;
+        const secondary = secondaryCellKeys.has(cellKey);
+        return <Text key={`${row.key}:${columnIndex}`} numberOfLines={1} style={[windowsTableStyles.cell, { width: column.width, color: secondary ? "#667085" : textColor }, columnIndex === 0 && sourceList && windowsTableStyles.sourceCell]}>
+          {columnIndex === 0 && sourceList && rowSymbol ? <Text style={[windowsTableStyles.symbol, { backgroundColor: rowSymbolColor || "#667085" }]}>{windowsSourceSymbol(rowSymbol)}</Text> : null}{cell.replace(/^\t/u, "")}
+        </Text>;
+      })}
+    </View>}
+  </Pressable>;
+});
+
 function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, followBottom, scrollToRow, framed, sourceList, rowSymbols, rowSymbolColors, disabledRowKeys, secondaryCellKeys, selectableSpanningKeys, onSelectionChange, onRowDoublePress, style, alertRowKeys }: {
   columns: TableProps["columns"];
   rows: TableProps["rows"];
@@ -595,52 +664,78 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
   alertRowKeys: string[];
 }): React.JSX.Element {
   const lastPress = React.useRef<{ key: string; at: number } | undefined>(undefined);
-  const verticalScroll = React.useRef<ScrollView>(null);
+  const verticalList = React.useRef<FlatList<TableRow>>(null);
   const rowHeight = compact ? 30 : 36;
   const totalWidth = columns.reduce((sum, column) => sum + column.width, 0);
+  // Built once per prop change instead of once per mounted row per cell: a
+  // log that appends 20 entries a second otherwise rebuilt the same lookups
+  // for every visible row on every frame.
+  const disabledKeys = React.useMemo(() => new Set(disabledRowKeys), [disabledRowKeys]);
+  const alertKeys = React.useMemo(() => new Set(alertRowKeys), [alertRowKeys]);
+  const secondaryKeys = React.useMemo(() => new Set(secondaryCellKeys), [secondaryCellKeys]);
   React.useEffect(() => {
     if (scrollToRow < 0) return;
-    verticalScroll.current?.scrollTo({ y: scrollToRow * rowHeight, animated: false });
-  }, [scrollToRow, rowHeight]);
+    // `FlatList.scrollToIndex` throws on an index past the data, and the old
+    // `scrollTo({ y })` did not: a log tab that keeps a target while its rows
+    // shrink (a filter, a cleared tab, a shorter page) would otherwise throw
+    // out of this effect. That escape leaves React through the host's C++
+    // boundary and aborts the process, so the target is clamped here and a
+    // miss is a no-op rather than a crash.
+    if (scrollToRow >= rows.length) return;
+    verticalList.current?.scrollToIndex({ index: scrollToRow, animated: false });
+  }, [scrollToRow, rows.length]);
   React.useEffect(() => {
     if (!followBottom) return;
-    verticalScroll.current?.scrollToEnd({ animated: false });
+    verticalList.current?.scrollToEnd({ animated: false });
   }, [followBottom, rows.length]);
-  const select = (row: TableProps["rows"][number], index: number): void => {
+  const select = React.useCallback((row: TableProps["rows"][number], index: number): void => {
     if (row.spanning && !selectableSpanningKeys.has(row.key)) return;
     const now = Date.now();
     if (lastPress.current?.key === row.key && now - lastPress.current.at < 360) onRowDoublePress?.(row.key, index);
     lastPress.current = { key: row.key, at: now };
     onSelectionChange?.(row.key, index);
-  };
+  }, [onRowDoublePress, onSelectionChange, selectableSpanningKeys]);
+  const renderRow = React.useCallback(({ item, index }: { item: TableRow; index: number }): React.JSX.Element => <WindowsTableRow
+    row={item}
+    index={index}
+    columns={columns}
+    compact={compact}
+    sourceList={sourceList}
+    stripedRows={stripedRows}
+    selected={item.key === selectedKey}
+    disabled={disabledKeys.has(item.key)}
+    alert={alertKeys.has(item.key)}
+    rowSymbol={rowSymbols[index]}
+    rowSymbolColor={rowSymbolColors[index]}
+    secondaryCellKeys={secondaryKeys}
+    selectableSpanning={selectableSpanningKeys.has(item.key)}
+    onSelect={select}
+  />, [alertKeys, columns, compact, disabledKeys, rowSymbols, rowSymbolColors, secondaryKeys, selectableSpanningKeys, select, selectedKey, sourceList, stripedRows]);
+  const keyExtractor = React.useCallback((row: TableRow): string => row.key, []);
   return <View style={[windowsTableStyles.root, !framed && windowsTableStyles.borderless, style]}>
-    {!sourceList ? <View style={[windowsTableStyles.header, { minWidth: totalWidth }]}>
-      {columns.map((column) => <Text key={column.label} numberOfLines={1} style={[windowsTableStyles.headerText, { width: column.width }]}>{column.label}</Text>)}
-    </View> : null}
-    <ScrollView horizontal showsHorizontalScrollIndicator={!sourceList} contentContainerStyle={windowsTableStyles.horizontalContent}>
-      <ScrollView ref={verticalScroll} style={windowsTableStyles.verticalScroll} contentContainerStyle={[windowsTableStyles.body, { minWidth: totalWidth }]} nestedScrollEnabled>
-        {rows.map((row, index) => {
-          const selected = row.key === selectedKey;
-          const disabled = disabledRowKeys.includes(row.key);
-          const alert = alertRowKeys.includes(row.key);
-          const spanning = row.spanning === true;
-          const stripe = stripedRows && !selected && index % 2 === 1;
-          const textColor = alert ? "#8a5a00" : (disabled ? "#98a2b3" : "#1f2937");
-          const rowStyle = [windowsTableStyles.row, compact ? windowsTableStyles.rowCompact : windowsTableStyles.rowRelaxed, stripe && windowsTableStyles.rowStripe, selected && windowsTableStyles.rowSelected, disabled && windowsTableStyles.rowDisabled];
-          return <Pressable key={row.key} disabled={disabled || (spanning && !selectableSpanningKeys.has(row.key))} onPress={() => select(row, index)} style={rowStyle}>
-            {spanning ? <Text numberOfLines={1} style={[windowsTableStyles.groupText, { color: textColor }]}>{row.cells[0] ?? ""}</Text> : <View style={windowsTableStyles.cells}>
-              {columns.map((column, columnIndex) => {
-                const cell = row.cells[columnIndex] ?? "";
-                const cellKey = `${row.key}\x1f${columnIndex}`;
-                const secondary = secondaryCellKeys.includes(cellKey);
-                return <Text key={`${row.key}:${columnIndex}`} numberOfLines={1} style={[windowsTableStyles.cell, { width: column.width, color: secondary ? "#667085" : textColor }, columnIndex === 0 && sourceList && windowsTableStyles.sourceCell]}>
-                  {columnIndex === 0 && sourceList && rowSymbols[index] ? <Text style={[windowsTableStyles.symbol, { backgroundColor: rowSymbolColors[index] || "#667085" }]}>{windowsSourceSymbol(rowSymbols[index])}</Text> : null}{cell.replace(/^\t/u, "")}
-                </Text>;
-              })}
-            </View>}
-          </Pressable>;
-        })}
-      </ScrollView>
+    <ScrollView horizontal showsHorizontalScrollIndicator={!sourceList} style={windowsTableStyles.horizontalScroll} contentContainerStyle={windowsTableStyles.horizontalContent}>
+      <View style={[windowsTableStyles.horizontalBody, { minWidth: totalWidth }]}>
+        {!sourceList ? <View style={[windowsTableStyles.header, { minWidth: totalWidth }]}>
+          {columns.map((column) => <Text key={column.label} numberOfLines={1} style={[windowsTableStyles.headerText, { width: column.width }]}>{column.label}</Text>)}
+        </View> : null}
+        <FlatList
+          ref={verticalList}
+          data={rows}
+          renderItem={renderRow}
+          keyExtractor={keyExtractor}
+          style={windowsTableStyles.verticalList}
+          contentContainerStyle={windowsTableStyles.body}
+          nestedScrollEnabled
+          initialNumToRender={24}
+          maxToRenderPerBatch={24}
+          windowSize={7}
+          getItemLayout={(_data, index) => ({ length: rowHeight, offset: rowHeight * index, index })}
+          // A target that scrolls out of range while the list is still laying
+          // out is dropped instead of thrown: `scrollToIndex` fails loudly by
+          // design, and a thrown error here escapes into the host process.
+          onScrollToIndexFailed={() => undefined}
+        />
+      </View>
     </ScrollView>
   </View>;
 }
@@ -650,8 +745,10 @@ const windowsTableStyles = StyleSheet.create({
   borderless: { borderWidth: 0, borderRadius: 0, backgroundColor: "transparent" },
   header: { flexDirection: "row", alignItems: "center", minHeight: 30, paddingHorizontal: 8, backgroundColor: "#f8fafc", borderBottomWidth: 1, borderBottomColor: "#e4e7ec" },
   headerText: { paddingHorizontal: 8, color: "#667085", fontSize: UI_TIP_FONT_SIZE, fontWeight: "600" },
-  horizontalContent: { flexGrow: 1 },
-  verticalScroll: { flex: 1, minHeight: 0 },
+  horizontalScroll: { flex: 1, minHeight: 0 },
+  horizontalContent: { flexGrow: 1, minHeight: 0 },
+  horizontalBody: { flex: 1, minHeight: 0 },
+  verticalList: { flex: 1, minHeight: 0 },
   body: { flexGrow: 1 },
   row: { minWidth: "100%", borderBottomWidth: 1, borderBottomColor: "#eef2f6", justifyContent: "center" },
   rowCompact: { minHeight: 30 },
@@ -823,10 +920,20 @@ const styles = StyleSheet.create({
   tableFallbackGroupText: { fontWeight: "400" },
   editor: { minHeight: 160 },
   editorFallback: { minHeight: 160, textAlignVertical: "top", fontSize: UI_FONT_SIZE },
-  windowsTextField: { minHeight: 26, justifyContent: "center", overflow: "hidden", borderWidth: 1, borderColor: "#c8c8c8", borderRadius: 4, backgroundColor: "#ffffff" },
+  windowsTextField: { minHeight: 28, justifyContent: "center", overflow: "hidden", borderWidth: 1, borderColor: "#c8c8c8", borderRadius: 4, backgroundColor: "#ffffff" },
   windowsTextFieldDisabled: { opacity: 0.5 },
-  windowsTextFieldInput: { flex: 1, minWidth: 0, paddingHorizontal: 8, paddingVertical: 0, fontSize: UI_FONT_SIZE, color: "#1a1a1a", backgroundColor: "transparent" },
-  windowsTextFieldInputMultiline: { textAlignVertical: "top", paddingVertical: 4 },
+  // RNW's Windows single-line leaf ignores `textAlignVertical`, and its own
+  // vertical placement is `paddingTop + (contentFrame - naturalHeight) / 2`,
+  // where the natural height measures as zero. The line therefore sits at
+  // `(frame + paddingTop - paddingBottom) / 2 + half a line`, so the only way to
+  // centre it at any frame height is a constant difference between the two
+  // paddings: 21 DIP, i.e. one line plus its leading. Measured on the installed
+  // build at 192 DPI, this puts a 24 DIP field's ink on the optical centre of
+  // its bezel instead of against the bottom edge.
+  windowsTextFieldInput: { flex: 1, minWidth: 0, paddingHorizontal: 8, paddingTop: 0, paddingBottom: 21, fontSize: UI_FONT_SIZE, color: "#1a1a1a", backgroundColor: "transparent" },
+  // A multiline leaf aligns to the top instead (the host returns early for it),
+  // so it only needs even padding around the block of text.
+  windowsTextFieldInputMultiline: { paddingTop: 4, paddingBottom: 4, textAlignVertical: "top" },
   splitView: { minHeight: 120, flexDirection: "row" },
   splitFallback: { minHeight: 120, flexDirection: "row" },
   splitLeading: { minWidth: 0, flexShrink: 0 },

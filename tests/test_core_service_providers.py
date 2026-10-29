@@ -1557,5 +1557,46 @@ class ServiceProviderBoundaryTests(unittest.TestCase):
             self.assertEqual("fixed", models["another-claude"]["upstream_protocol_mode"])
 
 
+class RuntimeOwnedStateRootTests(unittest.TestCase):
+    """A domain and Core must name the same state directories.
+
+    A bare domain is built with the configuration document, which lives inside
+    the runtime directory.  Passing that directory as the *root* put every
+    state file one level too deep -- ``.litellm-runtime/.litellm-runtime/
+    provider-auth`` -- while Core's own instance wrote the real one, so a
+    signed-in account, a WorkBuddy catalog and an Our Free Model worker each
+    had two homes and the pane read whichever it happened to create.
+    """
+
+    def test_a_bare_domain_resolves_the_state_core_writes(self) -> None:
+        from young_router.adapters.our_free_model import OurFreeModelRuntime
+        from young_router.adapters.workbuddy import WorkBuddyRuntime
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / ".litellm-runtime"
+            runtime.mkdir()
+            config = runtime / "config.yaml"
+            config.write_text("providers: {}\nmodel_list: []\n", encoding="utf-8")
+
+            domain = ProvidersModelsDomain(
+                config, auth_manager=None, workbuddy=None, our_free_model=None
+            )
+
+            self.assertEqual(ProviderAuthManager(root).root, domain._auth_manager().root)
+            self.assertEqual(WorkBuddyRuntime(root).root, domain._workbuddy().root)
+            self.assertEqual(
+                OurFreeModelRuntime(root).root,
+                domain._our_free_model_runtime().root,
+            )
+            # One runtime directory, never a nested copy of it.
+            for adapter_root in (
+                domain._auth_manager().root,
+                domain._workbuddy().root,
+                domain._our_free_model_runtime().root,
+            ):
+                self.assertEqual(1, str(adapter_root).count(".litellm-runtime"))
+
+
 if __name__ == "__main__":
     unittest.main()

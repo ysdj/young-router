@@ -4797,7 +4797,10 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitBusySpinnerCls(void)
        ([field isEqualToString:@"deployment_token"] || [field isEqualToString:@"desktop_gateway_api_key"]) &&
        target.length == 0) ||
       ([domain isEqualToString:@"runtime"] && [field isEqualToString:@"setting"] &&
-       [target isEqualToString:@"YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON"]));
+       ([target isEqualToString:@"YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON"] ||
+        // The General pane's proxy key, the one credential a window draws in
+        // the clear so it can be copied into a client.
+        [target isEqualToString:@"YOUNG_ROUTER_MASTER_KEY"])));
   if ((identityChanged || activeControlChanged || visibleChanged || resetReadable) && readablePlainText) {
     [self loadPlainTextSecretForGeneration:_generation];
   }

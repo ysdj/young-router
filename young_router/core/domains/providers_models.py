@@ -72,6 +72,7 @@ from ._shared import (
     _index,
     _mapping,
     _move,
+    _runtime_root_for_config,
     _safe_problem,
     _selected_identifier,
 )
@@ -421,7 +422,7 @@ class ProvidersModelsDomain:
         if self.auth_manager is None:
             from ..provider_auth import ProviderAuthManager
 
-            self.auth_manager = ProviderAuthManager(self.config_path.parent)
+            self.auth_manager = ProviderAuthManager(_runtime_root_for_config(self.config_path))
         return self.auth_manager
 
     def _workbuddy(self):
@@ -430,7 +431,7 @@ class ProvidersModelsDomain:
         if self.workbuddy is None:
             from ...adapters.workbuddy import WorkBuddyRuntime
 
-            self.workbuddy = WorkBuddyRuntime(self.config_path.parent)
+            self.workbuddy = WorkBuddyRuntime(_runtime_root_for_config(self.config_path))
         return self.workbuddy
 
     def _our_free_model_runtime(self):
@@ -439,7 +440,9 @@ class ProvidersModelsDomain:
         if self.our_free_model is None:
             from ...adapters.our_free_model import OurFreeModelRuntime
 
-            self.our_free_model = OurFreeModelRuntime(self.config_path.parent)
+            self.our_free_model = OurFreeModelRuntime(
+                _runtime_root_for_config(self.config_path)
+            )
         return self.our_free_model
 
     def _workbuddy_remember(self, document: Mapping[str, Any]) -> None:
@@ -1086,7 +1089,15 @@ class ProvidersModelsDomain:
         registry = ModelContextRegistry(
             runtime_config_path=self.config_path,
             runtime_settings_path=_default_runtime_settings_path(),
-            cache_path=default_context_cache_path(self.config_path.parent),
+            # The installation's one cache, resolved from the root this
+            # document belongs to rather than from the document's own
+            # directory.  ``self.config_path.parent`` is the runtime
+            # directory, so a cache derived there was a second file that the
+            # Codex domain never refreshes: the pane then answered from a copy
+            # frozen the day the refresh started writing the real one.
+            cache_path=default_context_cache_path(
+                _runtime_root_for_config(self.config_path)
+            ),
             refresh_enabled=False,
             # The windows this pane already holds from the catalog reads it
             # performed.  Handed over rather than written down: the numbers are
@@ -1127,7 +1138,10 @@ class ProvidersModelsDomain:
         registry = ModelContextRegistry(
             runtime_config_path=self.config_path,
             runtime_settings_path=_default_runtime_settings_path(),
-            cache_path=default_context_cache_path(self.config_path.parent),
+            # One cache per installation, for the reason above.
+            cache_path=default_context_cache_path(
+                _runtime_root_for_config(self.config_path)
+            ),
             refresh_enabled=True,
         )
         self._public_model_contexts = registry
