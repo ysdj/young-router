@@ -1540,7 +1540,7 @@ model_list:
 
             self.assertEqual("calls=2", record["detail"])
 
-    def test_a_function_tool_bridge_is_not_reported_as_an_upstream_error(self) -> None:
+    def test_a_tool_adapter_is_not_reported_as_an_upstream_error(self) -> None:
         """Its ``reason`` says why client tools were rewritten, not what failed.
 
         The event fell through to the generic ``reason=`` detail, where an
@@ -1552,10 +1552,10 @@ model_list:
             root = Path(directory)
             payload = {
                 "timestamp": "2026-08-01T04:10:11Z",
-                "event": "responses_function_tool_bridge_start",
+                "event": "responses_tool_adapter_start",
                 "request_id": "req-1",
                 "model_group": "public-chat",
-                "preemptive_reason": "client_tools_need_responses_function_bridge",
+                "preemptive_reason": "client_tools_need_responses_tool_adapter",
             }
             (root / "server.log").write_text(
                 f"litellm_route_trace {json.dumps(payload)}\n",
@@ -1564,7 +1564,7 @@ model_list:
 
             record = LogsDomain(root).view("route-trace")["log"]["records"][0]
 
-            self.assertEqual("bridge=client_tools_need_responses_function_bridge", record["detail"])
+            self.assertEqual("bridge=client_tools_need_responses_tool_adapter", record["detail"])
             self.assertNotIn("reason=", record["detail"])
 
     def test_route_trace_does_not_mark_a_failed_only_route_as_selected(self) -> None:

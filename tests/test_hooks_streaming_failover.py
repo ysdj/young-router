@@ -1977,7 +1977,7 @@ class HookStreamingFailoverTests(HookTestCase):
         self.assertEqual(getattr(exc, "failed_deployment_id", None), "slow-before-stream")
         self.assertNotIn("_excluded_deployment_ids", request_kwargs)
 
-    def test_responses_function_bridge_uses_first_event_timeout(self) -> None:
+    def test_responses_tool_adapter_uses_first_event_timeout(self) -> None:
         hooks, _ = load_hook_module()
         self.set_env(hooks._REQUEST_TIMEOUT_SECONDS_ENV, "123")
         self.set_env(hooks._STREAM_START_TIMEOUT_SECONDS_ENV, "45")
@@ -1999,7 +1999,7 @@ class HookStreamingFailoverTests(HookTestCase):
             },
         }
 
-        bridge_kwargs = hooks._responses_function_tool_bridge_preemptive_kwargs(
+        bridge_kwargs = hooks._responses_tool_adapter_preemptive_kwargs(
             request_kwargs
         )
 
@@ -2011,7 +2011,7 @@ class HookStreamingFailoverTests(HookTestCase):
         )
         self.assertEqual(hooks._request_timeout_seconds(), 123.0)
 
-    def test_responses_function_bridge_stream_start_timeout_does_not_get_chat_retry(self) -> None:
+    def test_responses_tool_adapter_stream_start_timeout_does_not_get_chat_retry(self) -> None:
         hooks, _ = load_hook_module()
         request_kwargs = {
             "call_type": "aresponses",
@@ -2031,7 +2031,7 @@ class HookStreamingFailoverTests(HookTestCase):
                 "supported_upstream_url_surfaces": ["openai/responses", "openai/chat"],
             },
         }
-        bridge_kwargs = hooks._responses_function_tool_bridge_preemptive_kwargs(
+        bridge_kwargs = hooks._responses_tool_adapter_preemptive_kwargs(
             request_kwargs
         )
         self.assertIsNotNone(bridge_kwargs)
@@ -2043,7 +2043,7 @@ class HookStreamingFailoverTests(HookTestCase):
         self.assertIsNone(hooks._responses_chat_bridge_retry_kwargs(exc, request_kwargs, None))
         self.assertIsNone(hooks._responses_chat_bridge_retry_kwargs(exc, bridge_kwargs, None))
 
-    async def test_generic_wrapper_does_not_chat_bridge_after_responses_function_bridge_start_timeout(self) -> None:
+    async def test_generic_wrapper_does_not_chat_bridge_after_responses_tool_adapter_start_timeout(self) -> None:
         hooks, _ = load_hook_module()
         calls = []
         exc = TimeoutError("stream did not start")
@@ -2083,7 +2083,7 @@ class HookStreamingFailoverTests(HookTestCase):
         self.assertNotIn("use_chat_completions_api", calls[0])
         self.assertTrue(
             calls[0]["litellm_metadata"][
-                hooks._RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY
+                hooks._RESPONSES_TOOL_ADAPTER_METADATA_KEY
             ]
         )
 

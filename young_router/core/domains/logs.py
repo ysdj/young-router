@@ -606,7 +606,7 @@ def _trace_detail(raw: Mapping[str, Any]) -> str:
             ("calls", _trace_count(raw.get("repaired_tool_call_ids")), ""),
         )
 
-    if event.startswith("responses_function_tool_bridge"):
+    if event.startswith("responses_tool_adapter"):
         # This event's ``reason`` is why the client's tools were rewritten into
         # function tools, not why an upstream failed.  It used to fall through to
         # the generic ``reason=`` branch, where an unmapped token rendered as

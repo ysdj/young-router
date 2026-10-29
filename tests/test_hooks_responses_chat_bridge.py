@@ -228,7 +228,7 @@ class HookResponsesChatBridgeTests(HookTestCase):
             [{"type": "function", "name": "exec_command", "parameters": {"type": "object"}}, {"type": "web_search"}],
         )
 
-    async def test_function_tool_bridge_bad_response_status_stays_on_responses(self) -> None:
+    async def test_tool_adapter_bad_response_status_stays_on_responses(self) -> None:
         hooks, _ = load_hook_module()
         calls = []
 
@@ -332,7 +332,7 @@ class HookResponsesChatBridgeTests(HookTestCase):
             ["custom", "namespace"],
         )
         self.assertNotIn(
-            hooks._RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY,
+            hooks._RESPONSES_TOOL_ADAPTER_METADATA_KEY,
             calls[0].get("litellm_metadata", {}),
         )
         self.assertEqual(
@@ -341,16 +341,16 @@ class HookResponsesChatBridgeTests(HookTestCase):
         )
         self.assertFalse(calls[1]["parallel_tool_calls"])
         metadata = calls[1]["litellm_metadata"]
-        self.assertTrue(metadata[hooks._RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY])
+        self.assertTrue(metadata[hooks._RESPONSES_TOOL_ADAPTER_METADATA_KEY])
         self.assertEqual(
-            metadata[hooks._RESPONSES_FUNCTION_TOOL_BRIDGE_FALLBACK_REASON_KEY],
+            metadata[hooks._RESPONSES_TOOL_ADAPTER_FALLBACK_REASON_KEY],
             "native_client_tools_unsupported",
         )
         self.assertTrue(
-            metadata["responses_function_tool_bridge_native_error_fallback"]
+            metadata["responses_tool_adapter_native_error_fallback"]
         )
         self.assertNotIn(
-            hooks._RESPONSES_FUNCTION_TOOL_BRIDGE_PREEMPTIVE_METADATA_KEY,
+            hooks._RESPONSES_TOOL_ADAPTER_PREEMPTIVE_METADATA_KEY,
             metadata,
         )
 
@@ -409,7 +409,7 @@ class HookResponsesChatBridgeTests(HookTestCase):
         self.assertEqual(calls[1]["tools"][0]["name"], "read_item")
         self.assertEqual(
             calls[1]["litellm_metadata"][
-                hooks._RESPONSES_FUNCTION_TOOL_BRIDGE_FALLBACK_REASON_KEY
+                hooks._RESPONSES_TOOL_ADAPTER_FALLBACK_REASON_KEY
             ],
             "native_client_tools_unsupported",
         )
@@ -485,7 +485,7 @@ class HookResponsesChatBridgeTests(HookTestCase):
             },
         )
         self.assertNotIn(
-            hooks._RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY,
+            hooks._RESPONSES_TOOL_ADAPTER_METADATA_KEY,
             metadata,
         )
 
@@ -847,7 +847,7 @@ class HookResponsesChatBridgeTests(HookTestCase):
         self.assertFalse(calls[1]["parallel_tool_calls"])
         self.assertEqual(
             calls[1]["litellm_metadata"][
-                hooks._RESPONSES_FUNCTION_TOOL_BRIDGE_FALLBACK_REASON_KEY
+                hooks._RESPONSES_TOOL_ADAPTER_FALLBACK_REASON_KEY
             ],
             "native_client_tools_unsupported",
         )
@@ -975,7 +975,7 @@ class HookResponsesChatBridgeTests(HookTestCase):
 
             self.assertEqual(len(calls), 1)
 
-    async def test_function_tool_bridge_schema_error_retries_with_chat_bridge(self) -> None:
+    async def test_tool_adapter_schema_error_retries_with_chat_bridge(self) -> None:
         hooks, _ = load_hook_module()
         calls = []
 
@@ -1063,7 +1063,7 @@ class HookResponsesChatBridgeTests(HookTestCase):
         self.assertEqual(len(calls), 2)
         self.assertNotIn("use_chat_completions_api", calls[0])
         first_metadata = calls[0]["litellm_metadata"]
-        self.assertTrue(first_metadata[hooks._RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY])
+        self.assertTrue(first_metadata[hooks._RESPONSES_TOOL_ADAPTER_METADATA_KEY])
         self.assertEqual([tool["name"] for tool in calls[0]["tools"]], ["click", "type_text"])
         self.assertTrue(calls[1]["use_chat_completions_api"])
         second_metadata = calls[1]["litellm_metadata"]
@@ -1082,7 +1082,7 @@ class HookResponsesChatBridgeTests(HookTestCase):
         )
         self.assertEqual([tool["name"] for tool in calls[1]["tools"]], ["click", "type_text"])
 
-    async def test_function_tool_bridge_schema_error_drops_tool_search_history_for_chat_bridge(self) -> None:
+    async def test_tool_adapter_schema_error_drops_tool_search_history_for_chat_bridge(self) -> None:
         hooks, _ = load_hook_module()
         calls = []
 
@@ -1401,8 +1401,8 @@ class HookResponsesChatBridgeTests(HookTestCase):
             {"type": "function", "name": "apply_patch"},
         )
         metadata = calls[0]["litellm_metadata"]
-        self.assertTrue(metadata[hooks._RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY])
-        stats = metadata["responses_function_tool_bridge_tool_sanitized"]
+        self.assertTrue(metadata[hooks._RESPONSES_TOOL_ADAPTER_METADATA_KEY])
+        stats = metadata["responses_tool_adapter_tool_sanitized"]
         self.assertEqual(stats["bridged_custom_tools"], 1)
         self.assertEqual(stats["bridged_tool_search_tools"], 1)
         self.assertEqual(stats["bridged_namespace_tools"], 1)
@@ -2034,7 +2034,7 @@ class HookResponsesChatBridgeTests(HookTestCase):
             metadata["responses_chat_bridge_preemptive_reason"],
             "responses_endpoint_unsupported",
         )
-        self.assertNotIn(hooks._RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY, metadata)
+        self.assertNotIn(hooks._RESPONSES_TOOL_ADAPTER_METADATA_KEY, metadata)
 
     def test_selected_chat_route_does_not_retry_on_responses_function_surface(self) -> None:
         hooks, _ = load_hook_module()
@@ -2069,7 +2069,7 @@ class HookResponsesChatBridgeTests(HookTestCase):
         }
 
         self.assertIsNone(
-            hooks._responses_function_tool_bridge_retry_kwargs(
+            hooks._responses_tool_adapter_retry_kwargs(
                 error,
                 selected_chat,
                 outer_responses,
@@ -2241,9 +2241,9 @@ class HookResponsesChatBridgeTests(HookTestCase):
                 hooks._RESPONSES_CHAT_BRIDGE_METADATA_KEY: True,
                 hooks._RESPONSES_CHAT_BRIDGE_PREEMPTIVE_METADATA_KEY: True,
                 "responses_chat_bridge_preemptive_reason": "codex_compaction",
-                hooks._RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY: True,
-                hooks._RESPONSES_FUNCTION_TOOL_BRIDGE_PREEMPTIVE_METADATA_KEY: True,
-                "responses_function_tool_bridge_preemptive_reason": "client_tools_need_responses_function_bridge",
+                hooks._RESPONSES_TOOL_ADAPTER_METADATA_KEY: True,
+                hooks._RESPONSES_TOOL_ADAPTER_PREEMPTIVE_METADATA_KEY: True,
+                "responses_tool_adapter_preemptive_reason": "client_tools_need_responses_tool_adapter",
             },
         }
 
@@ -2261,9 +2261,9 @@ class HookResponsesChatBridgeTests(HookTestCase):
         self.assertNotIn(hooks._RESPONSES_CHAT_BRIDGE_METADATA_KEY, metadata)
         self.assertNotIn(hooks._RESPONSES_CHAT_BRIDGE_PREEMPTIVE_METADATA_KEY, metadata)
         self.assertNotIn("responses_chat_bridge_preemptive_reason", metadata)
-        self.assertNotIn(hooks._RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY, metadata)
-        self.assertNotIn(hooks._RESPONSES_FUNCTION_TOOL_BRIDGE_PREEMPTIVE_METADATA_KEY, metadata)
-        self.assertNotIn("responses_function_tool_bridge_preemptive_reason", metadata)
+        self.assertNotIn(hooks._RESPONSES_TOOL_ADAPTER_METADATA_KEY, metadata)
+        self.assertNotIn(hooks._RESPONSES_TOOL_ADAPTER_PREEMPTIVE_METADATA_KEY, metadata)
+        self.assertNotIn("responses_tool_adapter_preemptive_reason", metadata)
         self.assertNotIn("codex_compaction_optimized", metadata)
         self.assertNotIn("codex_compaction_max_output_tokens", metadata)
 
@@ -2370,9 +2370,9 @@ class HookResponsesChatBridgeTests(HookTestCase):
         self.assertEqual(calls[0]["tool_choice"], "auto")
         self.assertFalse(calls[0]["parallel_tool_calls"])
         metadata = calls[0].get("litellm_metadata", {})
-        self.assertNotIn(hooks._RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY, metadata)
-        self.assertNotIn(hooks._RESPONSES_FUNCTION_TOOL_BRIDGE_PREEMPTIVE_METADATA_KEY, metadata)
-        self.assertNotIn("responses_function_tool_bridge_preemptive_reason", metadata)
+        self.assertNotIn(hooks._RESPONSES_TOOL_ADAPTER_METADATA_KEY, metadata)
+        self.assertNotIn(hooks._RESPONSES_TOOL_ADAPTER_PREEMPTIVE_METADATA_KEY, metadata)
+        self.assertNotIn("responses_tool_adapter_preemptive_reason", metadata)
 
     async def test_generic_response_wrapper_chat_bridges_optional_web_search_for_subagent(self) -> None:
         hooks, _ = load_hook_module()

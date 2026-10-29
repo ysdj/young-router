@@ -4,7 +4,7 @@ from hook_test_utils import *
 
 
 class HookResponsesToolBridgeTests(HookTestCase):
-    def test_function_tool_bridge_preserves_provider_native_search_with_client_tools(self) -> None:
+    def test_tool_adapter_preserves_provider_native_search_with_client_tools(self) -> None:
         hooks, _ = load_hook_module()
         native_search = {"type": "openrouter:web_search"}
         request = {
@@ -36,7 +36,7 @@ class HookResponsesToolBridgeTests(HookTestCase):
             },
         }
 
-        bridged = hooks._responses_function_tool_bridge_preemptive_kwargs(request)
+        bridged = hooks._responses_tool_adapter_preemptive_kwargs(request)
 
         self.assertIsNotNone(bridged)
         assert bridged is not None
@@ -59,7 +59,7 @@ class HookResponsesToolBridgeTests(HookTestCase):
         self.assertEqual(stats["dropped_web_search_tools"], 1)
         self.assertIn("web_search", stats["dropped_types"])
 
-    def test_function_tool_bridge_keeps_hosted_search_declaration(self) -> None:
+    def test_tool_adapter_keeps_hosted_search_declaration(self) -> None:
         hooks, _ = load_hook_module()
         hosted = {"type": "web_search"}
 
@@ -83,14 +83,14 @@ class HookResponsesToolBridgeTests(HookTestCase):
             choice,
         )
         self.assertEqual(
-            hooks._responses_function_tool_bridge_sanitize_tool_choice(
+            hooks._responses_tool_adapter_sanitize_tool_choice(
                 choice, {"list_agents"}
             ),
             choice,
         )
 
 
-    def test_function_tool_bridge_drops_type_sibling_beside_ref(self) -> None:
+    def test_tool_adapter_drops_type_sibling_beside_ref(self) -> None:
         hooks, _ = load_hook_module()
 
         converted = hooks._responses_bridge_function_tool(
@@ -124,7 +124,7 @@ class HookResponsesToolBridgeTests(HookTestCase):
         self.assertEqual("string", parameters["properties"]["path"]["type"])
         self.assertIn("__schema20", parameters["$defs"])
 
-    def test_function_tool_bridge_normalizes_missing_parameter_object_members(self) -> None:
+    def test_tool_adapter_normalizes_missing_parameter_object_members(self) -> None:
         hooks, _ = load_hook_module()
 
         bare = hooks._responses_bridge_function_tool(
@@ -258,7 +258,7 @@ class HookResponsesToolBridgeTests(HookTestCase):
                 raise error
             return {"ok": True}
 
-        result = await hooks._execute_responses_function_tool_bridge_call(
+        result = await hooks._execute_responses_tool_adapter_call(
             original_function,
             request,
         )
@@ -287,7 +287,7 @@ class HookResponsesToolBridgeTests(HookTestCase):
         }
 
         metadata = {}
-        hooks._with_responses_function_tool_bridge_compatible_tools(
+        hooks._with_responses_tool_adapter_compatible_tools(
             request,
             metadata,
         )
@@ -836,7 +836,7 @@ class HookResponsesToolBridgeTests(HookTestCase):
             },
         }
 
-        # The Hosted declaration is the caller's tool: the function-tool bridge
+        # The Hosted declaration is the caller's tool: the tool adapter
         # forwards it untouched and never substitutes proxy-side search.
         self.assertIsNone(
             hooks._responses_chat_bridge_preemptive_kwargs(
@@ -847,22 +847,22 @@ class HookResponsesToolBridgeTests(HookTestCase):
         )
 
         responses_bridge_kwargs = (
-            hooks._responses_function_tool_bridge_preemptive_kwargs(request_kwargs)
+            hooks._responses_tool_adapter_preemptive_kwargs(request_kwargs)
         )
         self.assertIsNotNone(responses_bridge_kwargs)
         assert responses_bridge_kwargs is not None
         self.assertNotIn("use_chat_completions_api", responses_bridge_kwargs)
         self.assertFalse(responses_bridge_kwargs["parallel_tool_calls"])
         metadata = responses_bridge_kwargs["litellm_metadata"]
-        self.assertTrue(metadata[hooks._RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY])
+        self.assertTrue(metadata[hooks._RESPONSES_TOOL_ADAPTER_METADATA_KEY])
         self.assertFalse(
             metadata[
-                "responses_function_tool_bridge_parallel_tool_calls_defaulted"
+                "responses_tool_adapter_parallel_tool_calls_defaulted"
             ]
         )
         self.assertEqual(
-            metadata["responses_function_tool_bridge_preemptive_reason"],
-            "client_tools_need_responses_function_bridge",
+            metadata["responses_tool_adapter_preemptive_reason"],
+            "client_tools_need_responses_tool_adapter",
         )
         self.assertEqual(
             [tool.get("type") for tool in responses_bridge_kwargs["tools"]],
@@ -876,7 +876,7 @@ class HookResponsesToolBridgeTests(HookTestCase):
             responses_bridge_kwargs["tools"][0],
             {"type": "web_search"},
         )
-        stats = metadata["responses_function_tool_bridge_tool_sanitized"]
+        stats = metadata["responses_tool_adapter_tool_sanitized"]
         self.assertEqual(stats["bridged_custom_tools"], 1)
         self.assertEqual(stats["bridged_tool_search_tools"], 1)
         self.assertEqual(stats["bridged_namespace_tools"], 1)
@@ -889,7 +889,7 @@ class HookResponsesToolBridgeTests(HookTestCase):
         )
         self.assertIsNone(preemptive_chat_kwargs)
 
-    def test_responses_function_tool_bridge_preserves_explicit_parallel_tool_calls(self) -> None:
+    def test_responses_tool_adapter_preserves_explicit_parallel_tool_calls(self) -> None:
         hooks, _ = load_hook_module()
         request_kwargs = {
             "call_type": "aresponses",
@@ -918,7 +918,7 @@ class HookResponsesToolBridgeTests(HookTestCase):
             },
         }
 
-        bridge_kwargs = hooks._responses_function_tool_bridge_preemptive_kwargs(
+        bridge_kwargs = hooks._responses_tool_adapter_preemptive_kwargs(
             request_kwargs
         )
 
@@ -926,11 +926,11 @@ class HookResponsesToolBridgeTests(HookTestCase):
         assert bridge_kwargs is not None
         self.assertTrue(bridge_kwargs["parallel_tool_calls"])
         self.assertNotIn(
-            "responses_function_tool_bridge_parallel_tool_calls_defaulted",
+            "responses_tool_adapter_parallel_tool_calls_defaulted",
             bridge_kwargs["litellm_metadata"],
         )
 
-    def test_responses_function_tool_bridge_preserves_named_snapshot_choice(self) -> None:
+    def test_responses_tool_adapter_preserves_named_snapshot_choice(self) -> None:
         hooks, _ = load_hook_module()
         request_kwargs = {
             "call_type": "aresponses",
@@ -956,7 +956,7 @@ class HookResponsesToolBridgeTests(HookTestCase):
             },
         }
 
-        bridge_kwargs = hooks._responses_function_tool_bridge_preemptive_kwargs(
+        bridge_kwargs = hooks._responses_tool_adapter_preemptive_kwargs(
             request_kwargs
         )
 
@@ -1000,7 +1000,7 @@ class HookResponsesToolBridgeTests(HookTestCase):
         }
 
         self.assertIsNone(
-            hooks._responses_function_tool_bridge_preemptive_kwargs(
+            hooks._responses_tool_adapter_preemptive_kwargs(
                 request_kwargs
             )
         )
@@ -1030,7 +1030,7 @@ class HookResponsesToolBridgeTests(HookTestCase):
             },
         }
 
-        bridge_kwargs = hooks._responses_function_tool_bridge_preemptive_kwargs(
+        bridge_kwargs = hooks._responses_tool_adapter_preemptive_kwargs(
             request_kwargs
         )
 
@@ -1068,12 +1068,12 @@ class HookResponsesToolBridgeTests(HookTestCase):
         }
 
         self.assertIsNone(
-            hooks._responses_function_tool_bridge_preemptive_kwargs(
+            hooks._responses_tool_adapter_preemptive_kwargs(
                 request_kwargs
             )
         )
 
-    def test_responses_function_tool_bridge_converts_namespace_custom_tool(self) -> None:
+    def test_responses_tool_adapter_converts_namespace_custom_tool(self) -> None:
         hooks, _ = load_hook_module()
         request_kwargs = {
             "call_type": "aresponses",
@@ -1101,7 +1101,7 @@ class HookResponsesToolBridgeTests(HookTestCase):
             },
         }
 
-        bridge_kwargs = hooks._responses_function_tool_bridge_preemptive_kwargs(
+        bridge_kwargs = hooks._responses_tool_adapter_preemptive_kwargs(
             request_kwargs
         )
 
@@ -1133,7 +1133,7 @@ class HookResponsesToolBridgeTests(HookTestCase):
         }
 
         self.assertIsNone(
-            hooks._responses_function_tool_bridge_preemptive_kwargs(
+            hooks._responses_tool_adapter_preemptive_kwargs(
                 request_kwargs
             )
         )
@@ -1164,7 +1164,7 @@ class HookResponsesToolBridgeTests(HookTestCase):
 
         self.assertIsNone(bridge_kwargs)
 
-    def test_codex_additional_tools_are_lifted_for_responses_function_bridge(self) -> None:
+    def test_codex_additional_tools_are_lifted_for_responses_tool_adapter(self) -> None:
         hooks, _ = load_hook_module()
         request_kwargs = {
             "call_type": "aresponses",
@@ -1194,7 +1194,7 @@ class HookResponsesToolBridgeTests(HookTestCase):
             },
         }
 
-        bridge_kwargs = hooks._responses_function_tool_bridge_preemptive_kwargs(
+        bridge_kwargs = hooks._responses_tool_adapter_preemptive_kwargs(
             request_kwargs
         )
 
@@ -1210,7 +1210,7 @@ class HookResponsesToolBridgeTests(HookTestCase):
         )
         metadata = bridge_kwargs["litellm_metadata"]
         self.assertEqual(
-            metadata["responses_function_tool_bridge_input_sanitized"],
+            metadata["responses_tool_adapter_input_sanitized"],
             {
                 "changed": True,
                 "dropped_tool_search_items": 0,
@@ -1269,12 +1269,12 @@ class HookResponsesToolBridgeTests(HookTestCase):
                 "supported_upstream_url_surfaces": ["openai/chat"],
             },
             "litellm_metadata": {
-                hooks._RESPONSES_FUNCTION_TOOL_BRIDGE_PREEMPTIVE_METADATA_KEY: True,
+                hooks._RESPONSES_TOOL_ADAPTER_PREEMPTIVE_METADATA_KEY: True,
             },
         }
 
         self.assertIsNone(
-            hooks._responses_function_tool_bridge_preemptive_kwargs(request_kwargs)
+            hooks._responses_tool_adapter_preemptive_kwargs(request_kwargs)
         )
         chat_bridge_kwargs = hooks._responses_chat_bridge_preemptive_kwargs(
             request_kwargs,

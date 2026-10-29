@@ -21,9 +21,9 @@ from .base import (
     _RESPONSES_CHAT_BRIDGE_FALLBACK_REASON_KEY,
     _RESPONSES_CHAT_BRIDGE_METADATA_KEY,
     _RESPONSES_CHAT_BRIDGE_PREEMPTIVE_METADATA_KEY,
-    _RESPONSES_FUNCTION_TOOL_BRIDGE_FALLBACK_REASON_KEY,
-    _RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY,
-    _RESPONSES_FUNCTION_TOOL_BRIDGE_PREEMPTIVE_METADATA_KEY,
+    _RESPONSES_TOOL_ADAPTER_FALLBACK_REASON_KEY,
+    _RESPONSES_TOOL_ADAPTER_METADATA_KEY,
+    _RESPONSES_TOOL_ADAPTER_PREEMPTIVE_METADATA_KEY,
     _RESPONSES_NATIVE_CLIENT_TOOL_PASSTHROUGH_METADATA_KEY,
     _PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES,
     _PROTOCOL_FALLBACK_RELAX_TOOL_CHOICE_KEY,
@@ -119,7 +119,7 @@ def _with_responses_chat_bridge_compatible_tools(
     _sync_bridge_extra_body_tools(retry_kwargs, [])
 
 
-def _with_responses_function_tool_bridge_compatible_tools(
+def _with_responses_tool_adapter_compatible_tools(
     bridge_kwargs: dict,
     bridge_metadata: dict,
     outer_request_kwargs: Optional[dict] = None,
@@ -144,9 +144,9 @@ def _with_responses_function_tool_bridge_compatible_tools(
         keep_hosted_web_search=True,
     )
     if stats.get("changed"):
-        bridge_metadata["responses_function_tool_bridge_tool_sanitized"] = stats
+        bridge_metadata["responses_tool_adapter_tool_sanitized"] = stats
     if additional_tools:
-        bridge_metadata["responses_function_tool_bridge_additional_tools"] = {
+        bridge_metadata["responses_tool_adapter_additional_tools"] = {
             "item_count": sum(
                 1
                 for item in bridge_kwargs.get("input") or []
@@ -169,7 +169,7 @@ def _with_responses_function_tool_bridge_compatible_tools(
         ):
             bridge_kwargs["parallel_tool_calls"] = False
             bridge_metadata[
-                "responses_function_tool_bridge_parallel_tool_calls_defaulted"
+                "responses_tool_adapter_parallel_tool_calls_defaulted"
             ] = False
         kept_tool_names = {
             tool["name"]
@@ -181,7 +181,7 @@ def _with_responses_function_tool_bridge_compatible_tools(
             if _routing_module._protocol_fallback_relax_tool_choice(bridge_kwargs):
                 bridge_kwargs["tool_choice"] = "auto"
                 bridge_metadata[
-                    "responses_function_tool_bridge_relaxed_forced_tool_choice"
+                    "responses_tool_adapter_relaxed_forced_tool_choice"
                 ] = True
             elif not (
                 isinstance(tool_choice, dict)
@@ -190,7 +190,7 @@ def _with_responses_function_tool_bridge_compatible_tools(
                 # A Hosted choice belongs to the upstream that owns the Hosted
                 # declaration; it is never rewritten into a client function.
                 bridge_kwargs["tool_choice"] = (
-                    _responses_tools_module._responses_function_tool_bridge_sanitize_tool_choice(
+                    _responses_tools_module._responses_tool_adapter_sanitize_tool_choice(
                         tool_choice,
                         kept_tool_names,
                     )
@@ -569,7 +569,7 @@ def _request_should_try_native_responses_client_tools(
         # third-party Responses gateways do not advertise whether those native
         # tool types are accepted.  Trying the opaque namespace first adds a
         # guaranteed 400-and-retry cycle on such gateways; use the existing
-        # same-surface function bridge immediately for Codex turns instead.
+        # same-surface tool adapter immediately for Codex turns instead.
         return False
     return support is not False
 
@@ -639,21 +639,21 @@ def _request_has_preemptive_responses_chat_bridge(request_kwargs: Optional[dict]
     return False
 
 
-def _request_has_preemptive_responses_function_tool_bridge(
+def _request_has_preemptive_responses_tool_adapter(
     request_kwargs: Optional[dict],
 ) -> bool:
     for key in ("litellm_metadata", "metadata"):
         metadata = _request_context_module._request_metadata_dict(request_kwargs, key)
         if (
             metadata is not None
-            and metadata.get(_RESPONSES_FUNCTION_TOOL_BRIDGE_PREEMPTIVE_METADATA_KEY)
+            and metadata.get(_RESPONSES_TOOL_ADAPTER_PREEMPTIVE_METADATA_KEY)
             is True
         ):
             return True
     return False
 
 
-def _request_has_responses_function_tool_bridge_attempt(
+def _request_has_responses_tool_adapter_attempt(
     request_kwargs: Optional[dict],
     outer_request_kwargs: Optional[dict] = None,
 ) -> bool:
@@ -662,9 +662,9 @@ def _request_has_responses_function_tool_bridge_attempt(
             metadata = _request_context_module._request_metadata_dict(request, key)
             if metadata is None:
                 continue
-            if metadata.get(_RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY) is True:
+            if metadata.get(_RESPONSES_TOOL_ADAPTER_METADATA_KEY) is True:
                 return True
-            if metadata.get(_RESPONSES_FUNCTION_TOOL_BRIDGE_PREEMPTIVE_METADATA_KEY) is True:
+            if metadata.get(_RESPONSES_TOOL_ADAPTER_PREEMPTIVE_METADATA_KEY) is True:
                 return True
     return False
 
@@ -681,7 +681,7 @@ def _with_responses_native_client_tool_passthrough(
         return None
     if not _request_uses_responses_endpoint(request_kwargs):
         return None
-    if _request_has_responses_function_tool_bridge_attempt(
+    if _request_has_responses_tool_adapter_attempt(
         request_kwargs,
         outer_request_kwargs,
     ):
@@ -1055,7 +1055,7 @@ def _responses_chat_bridge_preemptive_kwargs(
     return bridge_kwargs
 
 
-def _responses_function_tool_bridge_preemptive_reason(
+def _responses_tool_adapter_preemptive_reason(
     request_kwargs: Optional[dict],
     outer_request_kwargs: Optional[dict] = None,
     *,
@@ -1089,10 +1089,10 @@ def _responses_function_tool_bridge_preemptive_reason(
     ):
         return None
     if plan.client_namespaces or plan.client_functions:
-        return "client_tools_need_responses_function_bridge"
+        return "client_tools_need_responses_tool_adapter"
     return None
 
-def _responses_function_tool_bridge_preemptive_kwargs(
+def _responses_tool_adapter_preemptive_kwargs(
     request_kwargs: Optional[dict],
     outer_request_kwargs: Optional[dict] = None,
 ) -> Optional[dict]:
@@ -1103,17 +1103,17 @@ def _responses_function_tool_bridge_preemptive_kwargs(
     outer_for_tool_plan = outer_request_kwargs
     # Check the selected route before honoring an inherited preemptive marker.
     # LiteLLM may reuse the original Responses kwargs for a fallback callback;
-    # that marker must not force a Responses function bridge onto a Chat route.
+    # that marker must not force a Responses tool adapter onto a Chat route.
     if _current_route_responses_endpoint_unsupported(
         request_kwargs,
         outer_for_tool_plan,
     ):
         return None
-    if _request_has_preemptive_responses_function_tool_bridge(request_kwargs):
+    if _request_has_preemptive_responses_tool_adapter(request_kwargs):
         return request_kwargs
 
     plan = _responses_tools_module._responses_hosted_tool_plan(request_kwargs, outer_for_tool_plan)
-    reason = _responses_function_tool_bridge_preemptive_reason(
+    reason = _responses_tool_adapter_preemptive_reason(
         request_kwargs,
         outer_for_tool_plan,
         plan=plan,
@@ -1124,9 +1124,9 @@ def _responses_function_tool_bridge_preemptive_kwargs(
     bridge_kwargs = request_kwargs.copy()
     litellm_metadata = _request_context_module._request_metadata_dict(bridge_kwargs, "litellm_metadata") or {}
     bridge_metadata = litellm_metadata.copy()
-    bridge_metadata[_RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY] = True
-    bridge_metadata[_RESPONSES_FUNCTION_TOOL_BRIDGE_PREEMPTIVE_METADATA_KEY] = True
-    bridge_metadata["responses_function_tool_bridge_preemptive_reason"] = (
+    bridge_metadata[_RESPONSES_TOOL_ADAPTER_METADATA_KEY] = True
+    bridge_metadata[_RESPONSES_TOOL_ADAPTER_PREEMPTIVE_METADATA_KEY] = True
+    bridge_metadata["responses_tool_adapter_preemptive_reason"] = (
         reason
     )
     _responses_execution_module._remember_responses_chat_bridge_model_group(
@@ -1134,7 +1134,7 @@ def _responses_function_tool_bridge_preemptive_kwargs(
         request_kwargs,
         outer_request_kwargs,
     )
-    _with_responses_function_tool_bridge_compatible_tools(
+    _with_responses_tool_adapter_compatible_tools(
         bridge_kwargs,
         bridge_metadata,
         outer_for_tool_plan,
@@ -1145,7 +1145,7 @@ def _responses_function_tool_bridge_preemptive_kwargs(
     )
     if input_stats.get("changed"):
         bridge_kwargs["input"] = bridge_input
-        bridge_metadata["responses_function_tool_bridge_input_sanitized"] = (
+        bridge_metadata["responses_tool_adapter_input_sanitized"] = (
             input_stats
         )
     bridge_kwargs["litellm_metadata"] = bridge_metadata
@@ -1240,7 +1240,7 @@ def _native_responses_client_tools_unsupported_error(
     # tool only as a generic invalid-parameter-combination error.  Do not
     # reinterpret that broad 400 on the first attempt: first relax an
     # explicitly forced choice on the native protocol.  If that exact retry
-    # has already failed, a same-protocol function-tool bridge is the next
+    # has already failed, a same-protocol tool adapter is the next
     # compatible representation to try before changing protocol surfaces.
     if _request_already_retried_forced_tool_choice_as_auto(
         request_kwargs,
@@ -1309,7 +1309,7 @@ def _native_responses_client_tools_unsupported_error(
     )
 
 
-def _responses_function_tool_bridge_retry_kwargs(
+def _responses_tool_adapter_retry_kwargs(
     exception: Exception,
     request_kwargs: Optional[dict],
     outer_request_kwargs: Optional[dict] = None,
@@ -1320,7 +1320,7 @@ def _responses_function_tool_bridge_retry_kwargs(
         return None
     if _responses_request_module._request_is_codex_compaction(request_kwargs):
         return None
-    if _request_has_responses_function_tool_bridge_attempt(
+    if _request_has_responses_tool_adapter_attempt(
         request_kwargs,
         outer_request_kwargs,
     ):
@@ -1351,19 +1351,19 @@ def _responses_function_tool_bridge_retry_kwargs(
         or {}
     )
     bridge_metadata = litellm_metadata.copy()
-    bridge_metadata[_RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY] = True
-    bridge_metadata[_RESPONSES_FUNCTION_TOOL_BRIDGE_FALLBACK_REASON_KEY] = (
+    bridge_metadata[_RESPONSES_TOOL_ADAPTER_METADATA_KEY] = True
+    bridge_metadata[_RESPONSES_TOOL_ADAPTER_FALLBACK_REASON_KEY] = (
         "native_client_tools_unsupported"
     )
     bridge_metadata[
-        "responses_function_tool_bridge_native_error_fallback"
+        "responses_tool_adapter_native_error_fallback"
     ] = True
     _responses_execution_module._remember_responses_chat_bridge_model_group(
         bridge_metadata,
         request_kwargs,
         outer_request_kwargs,
     )
-    _with_responses_function_tool_bridge_compatible_tools(
+    _with_responses_tool_adapter_compatible_tools(
         bridge_kwargs,
         bridge_metadata,
         outer_request_kwargs,
@@ -1377,7 +1377,7 @@ def _responses_function_tool_bridge_retry_kwargs(
     if input_stats.get("changed"):
         bridge_kwargs["input"] = bridge_input
         bridge_metadata[
-            "responses_function_tool_bridge_input_sanitized"
+            "responses_tool_adapter_input_sanitized"
         ] = input_stats
     bridge_kwargs["litellm_metadata"] = bridge_metadata
     return bridge_kwargs

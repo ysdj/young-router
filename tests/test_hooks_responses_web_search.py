@@ -764,16 +764,16 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
             "multi_agent_v2",
         )
         metadata = calls[0]["litellm_metadata"]
-        self.assertTrue(metadata[hooks._RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY])
+        self.assertTrue(metadata[hooks._RESPONSES_TOOL_ADAPTER_METADATA_KEY])
         self.assertTrue(
-            metadata[hooks._RESPONSES_FUNCTION_TOOL_BRIDGE_PREEMPTIVE_METADATA_KEY]
+            metadata[hooks._RESPONSES_TOOL_ADAPTER_PREEMPTIVE_METADATA_KEY]
         )
         self.assertEqual(
             metadata[hooks._RESPONSES_CHAT_BRIDGE_ORIGINAL_MODEL_GROUP_KEY],
             "balanced-chat",
         )
         self.assertNotIn(hooks._RESPONSES_CHAT_BRIDGE_METADATA_KEY, metadata)
-        stats = metadata["responses_function_tool_bridge_tool_sanitized"]
+        stats = metadata["responses_tool_adapter_tool_sanitized"]
         self.assertEqual(stats["dropped_web_search_tools"], 0)
         self.assertEqual(stats["bridged_custom_tools"], 1)
         self.assertEqual(stats["bridged_tool_search_tools"], 1)
@@ -846,7 +846,7 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
             ["web_search", "function"],
         )
         metadata = calls[0]["litellm_metadata"]
-        stats = metadata["responses_function_tool_bridge_tool_sanitized"]
+        stats = metadata["responses_tool_adapter_tool_sanitized"]
         self.assertEqual(stats["dropped_web_search_tools"], 0)
 
     async def test_generic_response_wrapper_tries_pure_web_search_natively_when_support_unknown(self) -> None:
@@ -905,7 +905,7 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
         )
         metadata = calls[0].get("litellm_metadata", {})
         self.assertNotIn(
-            hooks._RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY,
+            hooks._RESPONSES_TOOL_ADAPTER_METADATA_KEY,
             metadata,
         )
         self.assertNotIn(hooks._RESPONSES_CHAT_BRIDGE_METADATA_KEY, metadata)
@@ -1171,7 +1171,7 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
         self.assertNotIn("web_search_options", calls[0])
         metadata = calls[0].get("litellm_metadata", {})
         self.assertNotIn(
-            hooks._RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY,
+            hooks._RESPONSES_TOOL_ADAPTER_METADATA_KEY,
             metadata,
         )
         self.assertNotIn(hooks._RESPONSES_CHAT_BRIDGE_METADATA_KEY, metadata)

@@ -920,14 +920,14 @@ _RESPONSES_CHAT_BRIDGE_REASONING_PATCH_ATTR = (
 _RESPONSES_CHAT_BRIDGE_REASONING_REPLAY_KEY = (
     "responses_chat_bridge_reasoning_replay_repaired"
 )
-_RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY = (
-    "responses_function_tool_bridge_attempted"
+_RESPONSES_TOOL_ADAPTER_METADATA_KEY = (
+    "responses_tool_adapter_attempted"
 )
-_RESPONSES_FUNCTION_TOOL_BRIDGE_PREEMPTIVE_METADATA_KEY = (
-    "responses_function_tool_bridge_preemptive"
+_RESPONSES_TOOL_ADAPTER_PREEMPTIVE_METADATA_KEY = (
+    "responses_tool_adapter_preemptive"
 )
-_RESPONSES_FUNCTION_TOOL_BRIDGE_FALLBACK_REASON_KEY = (
-    "responses_function_tool_bridge_fallback_reason"
+_RESPONSES_TOOL_ADAPTER_FALLBACK_REASON_KEY = (
+    "responses_tool_adapter_fallback_reason"
 )
 _RESPONSES_CONTEXT_TRUNCATION_FALLBACK_METADATA_KEY = (
     "responses_context_truncation_fallback_attempted"

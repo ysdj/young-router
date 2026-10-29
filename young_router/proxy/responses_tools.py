@@ -53,7 +53,7 @@ def _responses_chat_bridge_tool_schema(value: Any) -> Any:
 
 
 def _responses_chat_bridge_function_parameters(value: Any) -> dict:
-    """Return a JSON-schema object accepted by the function-tool bridge.
+    """Return a JSON-schema object accepted by the tool adapter.
 
     The Responses function-tool shape requires an object parameter schema.
     Keep the caller's properties and required members unchanged, while making
@@ -1319,7 +1319,7 @@ def _responses_chat_bridge_sanitize_tool_choice(
     return "auto"
 
 
-def _responses_function_tool_bridge_sanitize_tool_choice(
+def _responses_tool_adapter_sanitize_tool_choice(
     tool_choice: Any,
     kept_tool_names: set[str],
 ) -> Any:
