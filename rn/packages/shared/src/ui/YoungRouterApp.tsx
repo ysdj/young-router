@@ -421,6 +421,16 @@ function serviceCatalogRates(models: UnknownRecord[]): Record<string, string> {
   for (const entry of models) {
     const modelID = stringValue(entry.id).trim();
     if (!modelID) continue;
+    // The staged library publishes the rate it parsed, as a number.  ``0`` is a
+    // real answer (a model the upstream prices at nothing), so the presence of
+    // the field decides, not its truthiness.  The number is re-stated with the
+    // catalog's own leading `x` so the pane keeps spelling an account's rate the
+    // way the upstream does, not the way a relay group's `×` is spelled.
+    if (typeof entry.creditMultiplier === "number" && Number.isFinite(entry.creditMultiplier) && entry.creditMultiplier >= 0) {
+      rates[modelID] = rateSpelling(`x${entry.creditMultiplier}`);
+      continue;
+    }
+    // An older worker forwarded the upstream's own ``billing`` document instead.
     const billing = asRecord(entry.billing);
     const credits = stringValue(billing.credits).trim();
     if (credits) {
@@ -5847,21 +5857,27 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       ];
     };
     if (modelCredentials.length > 0) {
-      // One group per credential, the same model listed under each of them
-      // when every credential serves it.  The header is a spanning row: a
-      // heading is not an entry, and a spanning row is one the native tables
-      // refuse to select — which is what keeps a click on the account or the
-      // key name inert instead of moving the selection to a row with no model
-      // behind it.  The label keeps its whole text: a spanning cell is drawn
-      // across the row, and the model table's own columns are fixed by
-      // preserveColumnWidths, so a full address cannot widen it.
+      // One group per credential, and a model is listed exactly once: under the
+      // credential it names.  A row that names no credential belongs to the
+      // provider's own default, which is not one of these groups — listing it
+      // under every group put one route on screen several times, and a 启用 box
+      // on one of those copies read as a switch for the others.  That is how a
+      // route's own enabled state appeared to move other routes with it.  So
+      // those rows come first, ungrouped, exactly as the no-credential list
+      // draws them.  The header is a spanning row: a heading is not an entry,
+      // and a spanning row is one the native tables refuse to select, which is
+      // what keeps a click on the account or the key name inert.
+      for (const item of ungrouped) rows.push({ key: modelRowKey("", editorIdentifier(item)), cells: modelCells(item) });
       for (const credential of modelCredentials) {
-        rows.push({ key: modelGroupRowKey(credential.id), cells: [credential.label], spanning: true });
-        for (const item of models) {
+        const own = models.filter((item) => {
           const ownKey = modelProviderKeyState(item, provider ?? {});
-          if (ownKey && !credential.id.endsWith(ownKey.id)) continue;
-          rows.push({ key: modelRowKey(credential.id, editorIdentifier(item)), cells: modelCells(item) });
-        }
+          return Boolean(ownKey) && credential.id.endsWith(ownKey!.id);
+        });
+        // A heading with nothing under it is not a group, it is an empty row
+        // that claims the credential serves routes it does not serve.
+        if (own.length === 0) continue;
+        rows.push({ key: modelGroupRowKey(credential.id), cells: [credential.label], spanning: true });
+        for (const item of own) rows.push({ key: modelRowKey(credential.id, editorIdentifier(item)), cells: modelCells(item) });
       }
       return rows;
     }
@@ -5873,10 +5889,17 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     return rows;
   }, [modelCredentials, modelDisplayName, modelUpstreamDisplay, models, provider, providerId, relaySources, serviceRateRevision, translate, workspaceService]);
   // A row key names the credential group it sits in for a login row, so every
-  // id that addresses a model row has to name that group too.
+  // id that addresses a model row has to name that group too.  A route that
+  // names no credential sits outside the groups and is drawn once, under the
+  // empty group, so its key is the same shape every other model row uses.
   const modelRowKeys = useCallback((modelIDs: string[]): string[] => (modelCredentials.length > 0
-    ? modelCredentials.flatMap((credential) => modelIDs.map((modelID) => modelRowKey(credential.id, modelID)))
-    : modelIDs), [modelCredentials]);
+    ? modelIDs.flatMap((modelID) => {
+      const record = models.find((item) => editorIdentifier(item) === modelID);
+      const ownKey = record ? modelProviderKeyState(record, provider ?? {}) : undefined;
+      const credential = modelCredentials.find((entry) => ownKey && entry.id.endsWith(ownKey.id));
+      return [modelRowKey(credential ? credential.id : "", modelID)];
+    })
+    : modelIDs), [modelCredentials, models, provider]);
   // A route is off when either switch on its path is off: its own, or the
   // provider's.  A provider that is turned off serves no route of its own, so
   // its models read as disabled here — that is what the list already says by
@@ -5920,11 +5943,12 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     if (selectedModelRow && modelRows.some((row) => !row.spanning && row.key === selectedModelRow && modelIDFromRowKey(row.key) === selectedModel)) {
       return selectedModelRow;
     }
-    const record = models.find((item) => editorIdentifier(item) === selectedModel);
-    const ownKey = record ? modelProviderKeyState(record, provider ?? {}) : undefined;
-    const ownGroup = ownKey ? modelCredentials.find((credential) => credential.id === `key:${ownKey.id}`) : undefined;
-    return modelRowKey((ownGroup ?? modelCredentials[0]).id, selectedModel);
-  }, [modelCredentials, modelRows, models, provider, selectedModel, selectedModelRow]);
+    // One model is one row now, so the list itself says which row that is: the
+    // first one that addresses the model, and no invented group for a route
+    // that names no credential.
+    const listed = modelRows.find((row) => !row.spanning && modelIDFromRowKey(row.key) === selectedModel);
+    return listed ? listed.key : "";
+  }, [modelRows, selectedModel, selectedModelRow]);
   // An empty column is not a pane: the inspector is drawn when there is
   // something in it to inspect, and the middle column takes the room otherwise.
   const showProviderInspector = viewMode === "routes"

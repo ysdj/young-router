@@ -138,21 +138,45 @@ def _billing_multiplier(billing: object) -> float | None:
     return None
 
 
+def _stated_multiplier(value: object) -> float | None:
+    """One catalog's own already-parsed rate, as a number.
+
+    ``dsh-connect-workbuddy`` publishes the rate as
+    ``WorkBuddyUpstreamModel.creditMultiplier`` -- a number its own
+    ``parseCreditMultiplier`` read out of the upstream's ``credits`` string --
+    and carries no ``billing`` document at all.  Both spellings are accepted so
+    an older worker, whose catalog forwarded the raw ``billing`` block, keeps
+    answering: the two never arrive from one catalog, but a staged release can
+    lag this file by a build.
+
+    ``None`` and ``0`` stay apart on purpose: an entry the upstream priced at
+    nothing is a rate a route may follow, while an entry that states no rate at
+    all is not.  Collapsing the second into ``0.0`` would let a route follow a
+    price nobody published.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    parsed = float(value)
+    return parsed if math.isfinite(parsed) and parsed >= 0 else None
+
+
 def model_rate(entry: object) -> float | None:
     """The rate one catalog entry bills at, or ``None`` when it states none.
 
     A catalog entry is the worker's own document shape, so interpreting it
-    belongs here rather than in each caller.  An entry that already carries a
-    parsed ``rate`` is answered with it; otherwise the ``billing`` document is
-    read the way the upstream spells it.
+    belongs here rather than in each caller.  The three shapes an entry has
+    carried are read in the order they were introduced: this adapter's own
+    normalized ``rate``, the staged library's ``creditMultiplier``, and the
+    upstream's raw ``billing`` document that an older worker forwarded.
     """
 
     if not isinstance(entry, Mapping):
         return None
-    parsed = entry.get("rate")
-    if not isinstance(parsed, bool) and isinstance(parsed, (int, float)):
-        value = float(parsed)
-        return value if math.isfinite(value) and value >= 0 else None
+    for key in ("rate", "creditMultiplier"):
+        parsed = _stated_multiplier(entry.get(key))
+        if parsed is not None:
+            return parsed
     return _billing_multiplier(entry.get("billing"))
 
 
@@ -673,7 +697,10 @@ class WorkBuddyRuntime:
             # The rate a route may follow is stated once, here, beside the
             # catalog entry that owns it, so every reader (the pane's 倍率
             # column and the order mode that follows it) agrees on the number.
-            rate = _billing_multiplier(entry.get("billing"))
+            # The staged library already parsed it into ``creditMultiplier``;
+            # an entry from an older worker still carries the raw ``billing``
+            # document.  ``model_rate`` reads both, in that order.
+            rate = model_rate(entry)
             if rate is not None:
                 entry["rate"] = rate
         result = {

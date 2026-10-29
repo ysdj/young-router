@@ -574,7 +574,14 @@ async function main() {
           maxTokens: model.maxTokens,
           supportsImages: model.supportsImages === true,
           reasoning: model.reasoning,
-          billing: model.billing,
+          // The catalog states a rate as a parsed number, not as the upstream's
+          // `billing` document: `WorkBuddyUpstreamModel.creditMultiplier` is
+          // what `parseUpstreamModel` publishes, and no `billing` field exists
+          // anywhere on the parsed entry.  Forwarding the name of a field the
+          // library never produces left every entry's rate `undefined`, so the
+          // pane drew no 倍率 column at all and 跟随倍率 -- which asks whether a
+          // rate is known -- had nothing to offer.
+          creditMultiplier: model.creditMultiplier,
         })),
       })
       return

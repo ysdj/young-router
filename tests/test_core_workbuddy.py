@@ -36,7 +36,7 @@ CATALOG = [
         "contextWindow": 1_000_000,
         "maxTokens": 64_000,
         "supportsImages": True,
-        "billing": {"credits": "x0.79 credits", "free": False},
+        "creditMultiplier": 0.79,
     },
     {
         "id": "hy3",
@@ -44,7 +44,7 @@ CATALOG = [
         "contextWindow": 192_000,
         "maxTokens": 64_000,
         "supportsImages": True,
-        "billing": {"credits": "x0.00 credits", "free": True},
+        "creditMultiplier": 0.0,
     },
 ]
 
@@ -346,6 +346,73 @@ class WorkBuddyProviderTests(unittest.TestCase):
             reloaded = domain.snapshot()["providers"][0]["models"][0]
             self.assertEqual(reloaded["order_mode"], "relay_multiplier")
             self.assertEqual(reloaded["effective_order"], 0.79)
+
+    def test_a_catalog_that_states_credit_multiplier_is_read_the_same_way(self) -> None:
+        """The staged library states a rate as ``creditMultiplier``, not ``billing``.
+
+        ``dsh-connect-workbuddy`` parses the upstream's ``credits`` string in
+        its own ``parseUpstreamModel`` and publishes the number as
+        ``WorkBuddyUpstreamModel.creditMultiplier``; no ``billing`` document
+        exists on a parsed entry.  Reading only ``billing`` left every route's
+        rate unknown, which is why the pane drew no 倍率 column and 跟随倍率 --
+        which asks whether a rate is known -- was never offered.  Both shapes
+        answer here, because a staged release and this adapter can each be one
+        build behind the other.
+        """
+
+        directory, domain, config = self._domain()
+        with directory:
+            provider = domain.dispatch("service_provider.add", {"kind": "workbuddy_login"})["providers"][0]
+            provider_id = provider["id"]
+            # The catalog the staged library actually answers with.
+            domain.dispatch("workbuddy_models", {"provider": "workbuddy"})
+            self.assertEqual(domain._published_rates, {"workbuddy": {"glm-5.3": 0.79, "hy3": 0.0}})
+
+            model_id = provider["models"][0]["id"]
+            domain.dispatch(
+                "model.patch",
+                {"provider_id": provider_id, "model_id": model_id, "changes": {"order_mode": "relay_multiplier"}},
+            )
+            followed = domain.snapshot()["providers"][0]["models"][0]
+            self.assertEqual(followed["effective_order"], 0.79)
+            self.assertTrue(domain.validate()["valid"])
+            self.assertTrue(domain.apply()["applied"])
+            self.assertIn("order: 0.79", config.read_text(encoding="utf-8"))
+
+    def test_a_model_that_states_no_rate_is_not_a_free_model(self) -> None:
+        """``None`` and ``0`` stay apart: an unpublished rate is not a price of zero."""
+
+        self.assertIsNone(workbuddy.model_rate({"id": "auto"}))
+        self.assertIsNone(workbuddy.model_rate({"id": "auto", "creditMultiplier": None}))
+        self.assertIsNone(workbuddy.model_rate({"id": "auto", "billing": {"badges": ["限时"]}}))
+        self.assertEqual(workbuddy.model_rate({"id": "hy3", "creditMultiplier": 0}), 0.0)
+        self.assertEqual(workbuddy.model_rate({"id": "hy3", "billing": {"credits": "x0.00 credits", "free": True}}), 0.0)
+
+    def test_the_worker_forwards_the_field_the_library_publishes(self) -> None:
+        """The worker must forward ``creditMultiplier``; the library has no ``billing``.
+
+        The seam is a plain object hand-off, so a field name the library never
+        produces fails silently: the worker answered every entry with
+        ``billing: undefined``, which serializes away, and the pane then had
+        nothing to draw.  This pins the published name against the staged
+        library's own declarations.
+        """
+
+        worker = (ROOT / "young_router" / "adapters" / "workbuddy_worker.mjs").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("creditMultiplier: model.creditMultiplier,", worker)
+        self.assertNotIn("billing: model.billing,", worker)
+        # The library's published shape is what the assertion above is about, so
+        # a staged release that renames the field again is caught here rather
+        # than by a pane that silently draws nothing.
+        staged = (
+            ROOT
+            / "rn/.staging-cache/connect-workbuddy/lib/index.d.ts"
+        )
+        if staged.exists():
+            declarations = staged.read_text(encoding="utf-8")
+            self.assertIn("creditMultiplier?: number;", declarations)
 
     def test_following_the_rate_learns_it_before_the_pane_ever_shows_it(self) -> None:
         """The rate arrives when it is asked for, not only when a pane read it.
