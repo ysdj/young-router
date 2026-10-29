@@ -2270,8 +2270,19 @@ def _prefix_image_preview_resized(image_url: str) -> str:
             target_bytes=_image_inputs_module._CODEX_VIEW_IMAGE_PREVIEW_MIN_TARGET_BYTES,
             max_edge=_image_inputs_module._INLINE_IMAGE_MANY_MAX_EDGE,
         )
-    except Exception:
+    except Exception as exc:
+        # Falling back to the original bytes is the right answer for one
+        # undecodable image, but a missing Pillow makes *every* image slide
+        # through and looks identical to "nothing needed shrinking".  Record
+        # the cause so a deployment that forgot the dependency is visible in
+        # the trace instead of only as unexplained slowness.
         resized = image_url
+        _trace_module._route_trace(
+            "prefix_image_preview_failed",
+            reason=type(exc).__name__,
+            detail=str(exc)[:200],
+            bytes=len(image_url),
+        )
     with _PREFIX_IMAGE_PREVIEW_CACHE_LOCK:
         _PREFIX_IMAGE_PREVIEW_CACHE[digest] = resized
         while len(_PREFIX_IMAGE_PREVIEW_CACHE) > _PREFIX_IMAGE_PREVIEW_CACHE_MAX_ENTRIES:
