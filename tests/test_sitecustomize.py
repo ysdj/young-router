@@ -248,6 +248,51 @@ class SiteCustomizeTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.strip(), "False")
 
+    def test_the_route_patches_install_without_the_callback_configured(self) -> None:
+        """A process must not become plain LiteLLM because callbacks is empty.
+
+        ``install_all`` ran only from ``young_router.callbacks``, imported when
+        ``litellm_settings.callbacks`` names this package's hook.  One host
+        shipped ``callbacks: []``, so no routing patch was installed: a
+        replayed reasoning item was counted by its summary text and a thread
+        with real headroom was refused as ``Context Window exceeded``
+        (measured 1,002,856 against a 1,000,000 window) while the service
+        stayed active and answered health checks.
+        """
+
+        self.require_litellm()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = Path(temp_dir) / "runtime"
+            runtime.mkdir()
+
+            result = self.run_probe(
+                runtime=runtime,
+                template=ROOT,
+                pythonpath_extra=[],
+                code=textwrap.dedent(
+                    """
+                    import sys
+
+                    import litellm.proxy.proxy_server  # noqa: F401
+                    from litellm.router import Router
+
+                    print(
+                        getattr(
+                            Router._count_pre_call_check_tokens,
+                            "_young_router_pre_call_token_count_patch",
+                            False,
+                        ),
+                        "young_router.callbacks" in sys.modules,
+                    )
+                    """
+                ),
+                extra_env={"YOUNG_ROUTER_PROXY_PROCESS": "1"},
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            # Installed, and installed without the callback being imported.
+            self.assertEqual(result.stdout.strip(), "True False")
+
     def test_the_shipped_modules_import_where_fcntl_does_not_exist(self) -> None:
         # ``fcntl`` is POSIX-only, and the Windows build loads the LiteLLM
         # callback from the packaged Core.  ``proxy/base.py`` used a bare

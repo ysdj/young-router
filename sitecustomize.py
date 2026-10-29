@@ -406,6 +406,33 @@ def _install_litellm_optional_database_error_patch() -> None:
     )
 
 
+def _install_young_router_route_patches() -> None:
+    """Install the routing patches the proxy needs to answer a long thread.
+
+    ``install_all`` ran only from ``young_router.callbacks``, which is imported
+    when ``litellm_settings.callbacks`` names this package's hook.  A config
+    that left that list empty therefore served as a plain LiteLLM: no pre-call
+    token count that reads a replayed reasoning item the way its upstream does
+    -- so a thread with real headroom was refused with ``Context Window
+    exceeded`` (measured 1,002,856 against a 1,000,000 window) -- and no
+    capacity classification, protocol bridges, or stream recovery either.  The
+    service stayed active and answered health checks throughout.
+
+    These patches belong to the process, not to one optional callback, so they
+    are installed from the same interpreter-startup hook that already raises
+    the WebSocket frame limit.  ``proxy_server`` is where Router is constructed
+    and the request path begins, so replacing its methods there cannot race
+    LiteLLM's own import of them.
+    """
+
+    def _patch(_proxy_server_module: Any) -> None:
+        from young_router.proxy.patches import install_all
+
+        install_all()
+
+    _patch_after_import("litellm.proxy.proxy_server", _patch)
+
+
 def _install_uvicorn_websocket_frame_limit_patch() -> None:
     """Raise uvicorn's inbound WebSocket frame limit before any Config exists.
 
@@ -532,6 +559,7 @@ if os.environ.get("YOUNG_ROUTER_PROXY_PROCESS") == "1":
     _install_timestamped_proxy_output()
     _install_litellm_config_callback_import_patch()
     _install_litellm_optional_database_error_patch()
+    _install_young_router_route_patches()
     _install_litellm_openai_image_edit_usage_patch()
     _install_uvicorn_websocket_frame_limit_patch()
     _install_uvicorn_shutdown_marker_patch()

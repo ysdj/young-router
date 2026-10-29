@@ -3040,14 +3040,16 @@ def _without_replayed_reasoning_summary_text(input_items: list) -> list:
     body the same route had just answered at 400k -- 1,004,863 against a
     1,000,000 window, i.e. a refusal decided entirely by this reading.
 
-    Only a summary-only item loses its text, and only for the count: the
-    request itself is untouched.  An item carrying ``encrypted_content`` keeps
-    everything (a signed prefix is re-sent byte-for-byte), and one carrying
-    ``content`` keeps it too, because that is reasoning text a client can
-    genuinely put on the wire.  The direction this can err in is the safe one --
-    a body this pass still refuses really is larger than the window, and a body
-    it accepts is then judged by the upstream's own accounting, which is what
-    the client's window was sized for.
+    Only the summary text is dropped, and only for the count: the request
+    itself is untouched.  A ``reasoning`` item's ``summary`` is the human
+    rendering of thinking that the wire carries as an opaque signature or not
+    at all -- the counter prices that prose as chat content, and no upstream
+    ever receives it as such.  An item that carries visible ``content`` keeps
+    it, because that is reasoning text a client can genuinely put on the wire.
+    The direction this can err in is the safe one -- a body this pass still
+    refuses really is larger than the window, and a body it accepts is then
+    judged by the upstream's own accounting, which is what the client's window
+    was sized for.
     """
 
     counted: list = []
@@ -3058,7 +3060,7 @@ def _without_replayed_reasoning_summary_text(input_items: list) -> list:
             isinstance(item, dict)
             and item.get("type") == "reasoning"
             and item.get("content") in (None, "", [])
-            and not _value_has_encrypted_content(item)
+            and "summary" in item
         ):
             stripped = {key: value for key, value in item.items() if key != "summary"}
             counted.append(stripped)

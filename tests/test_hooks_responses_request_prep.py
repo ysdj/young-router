@@ -4721,8 +4721,17 @@ class HookReplayedReasoningCountTests(HookTestCase):
 
         self.assertIs(counted[0], item)
 
-    def test_a_signed_reasoning_item_keeps_every_byte(self) -> None:
-        """A signed prefix is replayed verbatim, so the estimate may not hide it."""
+    def test_a_signed_reasoning_item_keeps_its_bytes_but_not_its_prose(self) -> None:
+        """The signature is the reasoning; the summary is only a rendering of it.
+
+        A replayed item carrying ``encrypted_content`` also carries the summary
+        text of the thinking it encodes.  The counter prices that prose as chat
+        content, which no upstream ever receives as such, so a signed item was
+        charged for text that is merely a human rendering of bytes it already
+        has.  That is how a thread the client measured at 647k reached
+        1,002,856 against a 1,000,000 window with only 0.3% of the overage
+        real.  The signature itself is kept: it is what gets replayed.
+        """
 
         hooks, _ = load_hook_module()
         item = {
@@ -4734,7 +4743,10 @@ class HookReplayedReasoningCountTests(HookTestCase):
 
         counted = hooks._without_replayed_reasoning_summary_text([item])
 
-        self.assertIs(counted[0], item)
+        self.assertIn("encrypted_content", counted[0])
+        self.assertNotIn("summary", counted[0])
+        # The request itself is untouched.
+        self.assertIn("summary", item)
 
     def test_every_other_input_item_is_counted_unchanged(self) -> None:
         hooks, _ = load_hook_module()
