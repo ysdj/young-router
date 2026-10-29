@@ -584,15 +584,22 @@ _PROTOCOL_FALLBACK_FAILURE_RECORDED_KEY = (
 # already tried.  LiteLLM forwards request kwargs to a provider largely as-is,
 # and the Anthropic adapter validates its payload and refuses unknown fields,
 # so a key left here is not ignored -- it fails the call with
-# "_young_router_upstream_url_surface: extra inputs are not permitted".
+# "_young_router_upstream_url_surface: extra inputs are not permitted" or
+# "litellm_params: extra inputs are not permitted".
 # ``_excluded_deployment_ids`` and ``_target_order`` were removed by hand at a
 # few call sites; these were not, so the fallback path that carries them also
 # carried that failure.  Strip every internal key at the last hook before the
 # provider, so no route can leak one and no future key has to be remembered.
+#
+# ``litellm_params`` belongs on this list even though it looks like a provider
+# parameter: this proxy builds it as a routing container, and whatever the route
+# actually needs from it -- ``api_base``, ``model`` -- is already copied onto the
+# request on its own.  The Images path strips it for the same reason.
 _INTERNAL_REQUEST_KEY_PREFIXES = (
     "_young_router_",
     "_target_order",
     "_excluded_deployment_ids",
+    "litellm_params",
 )
 
 

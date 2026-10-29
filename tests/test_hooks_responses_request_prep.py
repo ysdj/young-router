@@ -4794,6 +4794,7 @@ class HookInternalRequestKeyTests(HookTestCase):
             "_young_router_surface_target_deployment_id": "b6015391",
             "_target_order": 1.2,
             "_excluded_deployment_ids": ["b6015391"],
+            "litellm_params": {"model": "anthropic/claude-opus-5-5"},
         }
 
         stripped = hooks._without_internal_request_keys(request)
@@ -4801,6 +4802,28 @@ class HookInternalRequestKeyTests(HookTestCase):
         self.assertEqual(sorted(stripped), ["input", "model"])
         # The request the rest of the pipeline still holds is untouched.
         self.assertIn("_target_order", request)
+
+    def test_the_routing_container_is_stripped_but_api_base_survives(self) -> None:
+        """``litellm_params`` is a routing container, not a provider parameter.
+
+        This proxy builds it to carry ``api_base``/``model`` while choosing a
+        route, and copies whatever the provider needs onto the request itself.
+        Leaving it on the payload failed every fallback to an Anthropic route
+        with "litellm_params: extra inputs are not permitted" even after the
+        surface keys were removed.
+        """
+
+        hooks, _ = load_hook_module()
+        request = {
+            "model": "claude-opus-5-5",
+            "input": "hi",
+            "api_base": "https://api.sisct2.xyz",
+            "litellm_params": {"api_base": "https://api.sisct2.xyz"},
+        }
+
+        stripped = hooks._without_internal_request_keys(request)
+
+        self.assertEqual(sorted(stripped), ["api_base", "input", "model"])
 
     def test_a_request_without_internal_keys_is_left_alone(self) -> None:
         hooks, _ = load_hook_module()
