@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 from unittest import mock
 
 from hook_test_utils import *
@@ -4673,6 +4674,94 @@ class HookResponsesToolOutputReplayWindowTests(HookTestCase):
 
         self.assertIsNone(updated)
 
+
+
+class HookReplayLatencyBudgetTests(HookTestCase):
+    """What a route can hold and what it can answer quickly are two numbers.
+
+    Measured against the relay at four concurrent requests, time to first token
+    tracked payload bytes almost linearly and the relay serialised the
+    requests: 60KB 2.2s, 300KB 7.5s, 775KB 16.9s per request.  A window-sized
+    ceiling therefore spends a minute of every busy turn on room the model did
+    not need, so the budget narrows it -- and only narrows it.
+    """
+
+    def _ceiling(self, hooks, budget: str | None) -> int:
+        self.set_env(hooks._HISTORY_TOOL_OUTPUT_LATENCY_BUDGET_ENV, budget)
+        with mock.patch.object(
+            hooks._responses_request_module,
+            "_history_tool_output_window_ceiling_chars",
+            return_value=775_200,
+        ):
+            return hooks._responses_request_module._history_tool_output_ceiling_chars(
+                {"model": "deepseek-v4.1-flash", "input": []}
+            )
+
+    def test_a_budget_below_the_window_narrows_the_replay(self) -> None:
+        hooks, _ = load_hook_module()
+        self.assertEqual(150_000, self._ceiling(hooks, "150000"))
+
+    def test_a_budget_above_the_window_leaves_it_alone(self) -> None:
+        """The budget never widens: the window is still what fits."""
+
+        hooks, _ = load_hook_module()
+        self.assertEqual(775_200, self._ceiling(hooks, "99999999"))
+
+    def test_no_budget_keeps_the_window(self) -> None:
+        hooks, _ = load_hook_module()
+        self.assertEqual(775_200, self._ceiling(hooks, None))
+        self.assertEqual(775_200, self._ceiling(hooks, "0"))
+
+    def test_a_budget_that_cannot_be_read_is_ignored(self) -> None:
+        """An unreadable budget must not become an empty replay.
+
+        Reading it as zero would delete every replayed record and leave the
+        model re-reading the same files turn after turn -- the failure the
+        window ceiling was introduced to stop.
+        """
+
+        hooks, _ = load_hook_module()
+        self.assertEqual(775_200, self._ceiling(hooks, "not-a-number"))
+        self.assertEqual(775_200, self._ceiling(hooks, "-1000"))
+
+    def test_the_budget_bounds_what_is_actually_sent(self) -> None:
+        """End to end: a 1.8MB replay is trimmed to the budget, not the window."""
+
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._HISTORY_TOOL_OUTPUT_LATENCY_BUDGET_ENV, "150000")
+        request = {
+            "model": "deepseek-v4.1-flash",
+            "stream": True,
+            "input": [
+                {
+                    "type": "custom_tool_call",
+                    "call_id": f"c{index}",
+                    "name": "exec",
+                    "input": "x",
+                }
+                for index in range(30)
+            ],
+        }
+        # Interleave the outputs behind their calls so both lanes are real.
+        for index in range(30):
+            request["input"].append(
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": f"c{index}",
+                    "id": f"o{index}",
+                    "output": [
+                        {"type": "input_text", "text": "line of output\n" * 4000}
+                    ],
+                }
+            )
+        request["input"].append({"role": "user", "content": "continue"})
+
+        before = len(json.dumps(request))
+        updated = hooks._with_elided_oversized_tool_outputs(request)
+
+        self.assertIsNotNone(updated)
+        after = len(json.dumps(updated))
+        self.assertLess(after, before / 2)
 
 
 class HookReplayedReasoningCountTests(HookTestCase):

@@ -712,6 +712,22 @@ _HISTORY_TOOL_OUTPUT_DEFAULT_MIN_CHARS = 20_000
 # either with a fixed number.
 _HISTORY_TOOL_OUTPUT_KEPT_CHARS_ENV = "YOUNG_ROUTER_HISTORY_TOOL_OUTPUT_KEPT_CHARS"
 _HISTORY_TOOL_OUTPUT_DEFAULT_KEPT_CHARS = 600_000
+# The window ceiling answers how much a route can *hold*, and on a 1M-token
+# route that is far more than it can *answer quickly*.  Measured against the
+# relay at 4 concurrent requests, time to first token tracks payload bytes
+# almost linearly -- 60KB 2.2s, 150KB 3.8s, 300KB 7.5s, 500KB 12.4s, 775KB
+# 16.9s per request -- and the relay serialises those requests, so a 775K
+# ceiling costs every turn of a busy session a minute of waiting for room the
+# model did not need: 46% of live requests exceeded 600KB and the 75th
+# percentile replayed 1.8MB.  A route therefore also declares how many
+# characters of replay it can be sent before the round trip stops being worth
+# the evidence, and the smaller of the two numbers is the ceiling.
+#
+# ``0`` keeps the window alone, which is what a route served over a fast link
+# wants; unset leaves it to the route's own declaration.
+_HISTORY_TOOL_OUTPUT_LATENCY_BUDGET_ENV = (
+    "YOUNG_ROUTER_HISTORY_TOOL_OUTPUT_LATENCY_BUDGET_CHARS"
+)
 # Characters charged per token when a window becomes a ceiling.  This app's own
 # transcripts measure 4.24 chars per token, so 3 charges the route more tokens
 # than it really bills and keeps the ceiling on the safe side of a history that

@@ -42,6 +42,7 @@ from .base import (
     _HISTORY_TOOL_OUTPUT_DEFAULT_KEPT_CHARS,
     _HISTORY_TOOL_OUTPUT_DEFAULT_MIN_CHARS,
     _HISTORY_TOOL_OUTPUT_KEPT_CHARS_ENV,
+    _HISTORY_TOOL_OUTPUT_LATENCY_BUDGET_ENV,
     _HISTORY_TOOL_OUTPUT_MIN_CHARS_ENV,
     _PREFIX_IMAGE_MODE_DEFAULT,
     _PREFIX_IMAGE_MODE_ENV,
@@ -2899,6 +2900,26 @@ def _history_tool_output_ceiling_chars_for_window(
     return max(0, headroom - reserve) * _HISTORY_TOOL_OUTPUT_CHARS_PER_TOKEN
 
 
+def _history_tool_output_latency_budget_chars() -> Optional[int]:
+    """Replay the route can be sent before the wait outgrows the evidence.
+
+    ``None`` means the window alone decides, ``0`` is the same answer stated
+    explicitly, and a negative or unparsable value is ignored rather than
+    silently emptying the replay.
+    """
+
+    value = os.getenv(_HISTORY_TOOL_OUTPUT_LATENCY_BUDGET_ENV, "").strip()
+    if not value:
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        return None
+    if parsed < 0:
+        return None
+    return parsed
+
+
 def _history_tool_output_ceiling_chars(request_kwargs: Optional[dict] = None) -> int:
     """The replayed tool-call tail this request may carry before it is trimmed.
 
@@ -2912,12 +2933,31 @@ def _history_tool_output_ceiling_chars(request_kwargs: Optional[dict] = None) ->
 
     ``YOUNG_ROUTER_HISTORY_TOOL_OUTPUT_KEPT_CHARS`` still wins when it is set,
     and a request that names no route this app can size falls back to the
-    constant.
+    constant.  ``YOUNG_ROUTER_HISTORY_TOOL_OUTPUT_LATENCY_BUDGET_CHARS`` narrows
+    the result to what the route can be sent before the round trip stops being
+    worth the evidence.
     """
 
     configured = os.getenv(_HISTORY_TOOL_OUTPUT_KEPT_CHARS_ENV, "").strip()
     if configured:
         return _history_tool_output_kept_chars()
+    budget = _history_tool_output_latency_budget_chars()
+    window_ceiling = _history_tool_output_window_ceiling_chars(request_kwargs)
+    # The window says how much the route can hold; the budget says how much is
+    # worth sending it.  Whichever is smaller is the ceiling, because a request
+    # that fits but takes a minute to answer has cost the turn as much as one
+    # that did not fit.  Only a positive budget narrows anything: ``None`` and
+    # ``0`` leave the window alone.
+    if budget:
+        return min(window_ceiling, budget)
+    return window_ceiling
+
+
+def _history_tool_output_window_ceiling_chars(
+    request_kwargs: Optional[dict] = None,
+) -> int:
+    """The ceiling the route's own window alone allows."""
+
     if not isinstance(request_kwargs, dict):
         return _HISTORY_TOOL_OUTPUT_DEFAULT_KEPT_CHARS
     model = request_kwargs.get("model")
