@@ -3864,3 +3864,114 @@ class DefaultFallbackProtocolTests(unittest.TestCase):
                     "anthropic",
                     config_schema.infer_upstream_fallback_surface(model),
                 )
+
+
+class HookSlowFailureRecoveryTests(HookTestCase):
+    """How long a route took is part of what its refusal means.
+
+    A route that thinks for a minute and only then refuses answered about
+    itself -- its capacity, its account, its link -- not about the bytes it was
+    sent.  The same replay is judged in milliseconds by a sibling, so the
+    refusal must be recoverable even when its status or wording would read as
+    the request's own verdict.  A fast refusal keeps that verdict: it is the
+    cheapest possible evidence that the request, not the route, was refused.
+    """
+
+    def _api_error(self, hooks, status: int, message: str):
+        exception = RuntimeError(message)
+        exception.status_code = status
+        return exception
+
+    def _at_age(self, hooks, seconds: float, exception) -> str:
+        token = hooks._CURRENT_ATTEMPT_STARTED_AT.set(
+            hooks.time.monotonic() - seconds
+        )
+        try:
+            return hooks._recovery_policy_for_exception(exception)
+        finally:
+            hooks._CURRENT_ATTEMPT_STARTED_AT.reset(token)
+
+    def test_a_refusal_that_arrives_late_is_recoverable_whatever_it_says(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        self.set_env(hooks._SLOW_FAILURE_RECOVERY_SECONDS_ENV, "60")
+
+        for label, status, message in (
+            ("generic 400", 400, "invalid request"),
+            ("account forbidden", 502, "Upstream access forbidden"),
+            ("cloudflare block", 403, "error code: 1010"),
+        ):
+            with self.subTest(case=label):
+                exception = self._api_error(hooks, status, message)
+                self.assertEqual(
+                    hooks._RECOVERY_POLICY_COOLDOWN,
+                    self._at_age(hooks, 61.0, exception),
+                )
+
+    def test_a_refusal_that_arrives_at_once_keeps_the_request_verdict(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        self.set_env(hooks._SLOW_FAILURE_RECOVERY_SECONDS_ENV, "60")
+
+        exception = self._api_error(hooks, 400, "invalid request")
+
+        self.assertEqual(
+            hooks._RECOVERY_POLICY_ERROR,
+            self._at_age(hooks, 5.0, exception),
+        )
+
+    def test_an_oversized_payload_stays_the_requests_own_verdict(self) -> None:
+        """A minute spent uploading is the payload's delay, not the route's.
+
+        Every sibling answers the same bytes the same way, so cooling the group
+        down in turn would park all of it on one oversized request.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        self.set_env(hooks._SLOW_FAILURE_RECOVERY_SECONDS_ENV, "60")
+
+        exception = self._api_error(hooks, 400, "Prompt is too long: 200000 tokens")
+
+        self.assertEqual(
+            hooks._RECOVERY_POLICY_ERROR,
+            self._at_age(hooks, 61.0, exception),
+        )
+
+    def test_the_age_rule_can_be_switched_off(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        self.set_env(hooks._SLOW_FAILURE_RECOVERY_SECONDS_ENV, "0")
+
+        exception = self._api_error(hooks, 400, "invalid request")
+
+        self.assertEqual(
+            hooks._RECOVERY_POLICY_ERROR,
+            self._at_age(hooks, 600.0, exception),
+        )
+
+    def test_an_unstamped_attempt_cannot_claim_to_have_been_slow(self) -> None:
+        """Classification outside the request's task keeps the status verdict."""
+
+        hooks, _proxy_server = load_hook_module()
+        self.set_env(hooks._SLOW_FAILURE_RECOVERY_SECONDS_ENV, "60")
+        hooks._CURRENT_ATTEMPT_STARTED_AT.set(None)
+
+        exception = self._api_error(hooks, 400, "invalid request")
+
+        self.assertIsNone(hooks._current_attempt_elapsed_seconds())
+        self.assertEqual(
+            hooks._RECOVERY_POLICY_ERROR,
+            hooks._recovery_policy_for_exception(exception),
+        )
+
+    def test_selecting_a_deployment_starts_the_clock_it_is_judged_by(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        hooks._CURRENT_ATTEMPT_STARTED_AT.set(None)
+
+        hooks._remember_selected_deployment(
+            {
+                "model_info": {"id": "dep-slow", "order": 1},
+                "litellm_params": {"api_base": "https://route.test/v1", "model": "m"},
+            }
+        )
+
+        elapsed = hooks._current_attempt_elapsed_seconds()
+        self.assertIsNotNone(elapsed)
+        self.assertGreaterEqual(elapsed, 0.0)

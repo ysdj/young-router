@@ -61,6 +61,14 @@ _RESPONSES_CHAT_BRIDGE_FALLBACK_REASON_KEY = (
 _STREAM_ERROR_FALLBACK_START_BUFFER_CHUNKS = 20
 _STALL_TIMEOUT_SECONDS_ENV = "YOUNG_ROUTER_STALL_TIMEOUT_SECONDS"
 _STALL_TIMEOUT_DEFAULT_SECONDS = 120.0
+# How long an attempt may run before its failure stops being read as the
+# request's own verdict.  A route that thinks for a minute and only then
+# refuses answered about its own capacity, its own account, or its own link --
+# not about the bytes it was sent, which every sibling would have judged in
+# milliseconds.  Reading such a refusal as terminal ended turns that a sibling
+# route could have served, so past this age every failure is recoverable.
+_SLOW_FAILURE_RECOVERY_SECONDS_ENV = "YOUNG_ROUTER_SLOW_FAILURE_RECOVERY_SECONDS"
+_SLOW_FAILURE_RECOVERY_DEFAULT_SECONDS = 60.0
 _STREAM_KEEPALIVE_INTERVAL_SECONDS_ENV = (
     "YOUNG_ROUTER_STREAM_KEEPALIVE_INTERVAL_SECONDS"
 )
@@ -959,6 +967,13 @@ _SESSION_NAME_KEY_FRAGMENTS = (
 _ROUTE_TRACE_LOGGER = logging.getLogger("young_router.route_trace")
 _CURRENT_SELECTED_DEPLOYMENT = contextvars.ContextVar(
     "current_selected_deployment",
+    default=None,
+)
+# Wall clock of the attempt in flight.  Set where a deployment becomes the one
+# being called, read when its failure is classified, so the classification can
+# weigh how long the route took to refuse instead of only what it said.
+_CURRENT_ATTEMPT_STARTED_AT = contextvars.ContextVar(
+    "current_attempt_started_at",
     default=None,
 )
 _CURRENT_SELECTED_DEPLOYMENT_BOX = contextvars.ContextVar(

@@ -29,6 +29,7 @@ from .base import (
     _CODEX_COMPACTION_CAPABILITY_TTL_SECONDS_ENV,
     _CODEX_COMPACTION_CAPABILITY_UNSUPPORTED_ATTR,
     _CURRENT_EXCLUDED_DEPLOYMENT_IDS,
+    _CURRENT_ATTEMPT_STARTED_AT,
     _CURRENT_SURFACE_TARGET_DEPLOYMENT_ID,
     _CURRENT_UPSTREAM_URL_SURFACE_KEY,
     _CURRENT_SELECTED_DEPLOYMENT,
@@ -118,6 +119,8 @@ from .base import (
     _SESSION_NAME_KEY_FRAGMENTS,
     _STALL_TIMEOUT_DEFAULT_SECONDS,
     _STALL_TIMEOUT_SECONDS_ENV,
+    _SLOW_FAILURE_RECOVERY_SECONDS_ENV,
+    _SLOW_FAILURE_RECOVERY_DEFAULT_SECONDS,
     _SESSION_DEPLOYMENT_AFFINITY,
     _SESSION_DEPLOYMENT_AFFINITY_ENV,
     _SESSION_DEPLOYMENT_AFFINITY_LOCK,
@@ -609,6 +612,51 @@ def _time_to_first_token_ms(
         return None
 
 
+def _slow_failure_recovery_seconds() -> float:
+    """Age past which a failure stops being read as the request's verdict.
+
+    ``0`` disables the rule, which restores pure status-and-wording
+    classification.
+    """
+
+    return _env_float_seconds(
+        _SLOW_FAILURE_RECOVERY_SECONDS_ENV,
+        _SLOW_FAILURE_RECOVERY_DEFAULT_SECONDS,
+        minimum=0.0,
+    )
+
+
+def _mark_attempt_started() -> None:
+    """Stamp the attempt that is about to call a deployment."""
+
+    _CURRENT_ATTEMPT_STARTED_AT.set(time.monotonic())
+
+
+def _current_attempt_elapsed_seconds() -> Optional[float]:
+    """How long the attempt in flight has been running, if it was stamped.
+
+    ``None`` when this task never stamped an attempt -- a classification that
+    runs outside the request's own task cannot claim the failure was slow, and
+    answering ``None`` keeps the status-and-wording verdict instead of
+    inventing an age for it.
+    """
+
+    started_at = _CURRENT_ATTEMPT_STARTED_AT.get()
+    if not isinstance(started_at, (int, float)):
+        return None
+    return max(0.0, time.monotonic() - float(started_at))
+
+
+def _is_slow_failure(exception: Exception) -> bool:
+    """Whether this route took long enough that the refusal is about the route."""
+
+    threshold = _slow_failure_recovery_seconds()
+    if threshold <= 0:
+        return False
+    elapsed = _current_attempt_elapsed_seconds()
+    return elapsed is not None and elapsed >= threshold
+
+
 def _stall_timeout_seconds() -> float:
     value = os.getenv(_STALL_TIMEOUT_SECONDS_ENV, "").strip()
     if not value:
@@ -900,6 +948,28 @@ def _recovery_policy_for_exception(exception: Exception) -> str:
         # said nothing. No route can be quarantined, and no recovery wait can
         # outlast the process that owns it, so the failure is terminal here.
         return _RECOVERY_POLICY_ERROR
+
+    if _is_slow_failure(exception) and not (
+        _is_context_size_error(exception)
+        or _is_request_body_size_rejection_error(exception)
+    ):
+        # The route took longer than any request-level verdict is worth and
+        # only then refused.  A replay that a sibling route judges in
+        # milliseconds was not the problem; this route was, whether it ran out
+        # of capacity, lost its account, or sat on a dead link.  Every such
+        # refusal is recoverable for that reason alone -- reading the status
+        # and the wording alone ended turns a sibling could have served, and
+        # the turn had already paid the route's slow answer to learn nothing.
+        #
+        # Size refusals are the exception, and not for their status: they are
+        # slow here for a reason that has nothing to do with the route -- a
+        # payload that takes a minute to upload is the payload's own delay --
+        # and every sibling would answer the same bytes the same way.  Cooling
+        # them down in turn parks the whole group on one oversized request.
+        return _recovery_policy_setting(
+            _RECOVERY_POLICY_SERVER_ENV,
+            _RECOVERY_POLICY_COOLDOWN,
+        )
 
     status_code = _exception_status_code(exception)
     # A transport wrapper can hide a server's own answer behind its own class
@@ -4625,6 +4695,9 @@ def _remember_selected_deployment(
     marker = _selected_deployment_request_marker(deployment)
     if marker is None:
         return
+    # Beginning of the attempt: the clock that later decides whether this
+    # route's refusal was about the route or about the request.
+    _mark_attempt_started()
     surface = _normalized_request_surface(surface)
     if surface:
         marker[_CURRENT_UPSTREAM_URL_SURFACE_KEY] = surface
