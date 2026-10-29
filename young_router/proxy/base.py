@@ -580,6 +580,49 @@ _PROTOCOL_FALLBACK_FAILURE_RECORDED_ATTR = (
 _PROTOCOL_FALLBACK_FAILURE_RECORDED_KEY = (
     "_young_router_protocol_fallback_failure_recorded"
 )
+# Router state that rides on a request so a retry can tell which deployment was
+# already tried.  LiteLLM forwards request kwargs to a provider largely as-is,
+# and the Anthropic adapter validates its payload and refuses unknown fields,
+# so a key left here is not ignored -- it fails the call with
+# "_young_router_upstream_url_surface: extra inputs are not permitted".
+# ``_excluded_deployment_ids`` and ``_target_order`` were removed by hand at a
+# few call sites; these were not, so the fallback path that carries them also
+# carried that failure.  Strip every internal key at the last hook before the
+# provider, so no route can leak one and no future key has to be remembered.
+_INTERNAL_REQUEST_KEY_PREFIXES = (
+    "_young_router_",
+    "_target_order",
+    "_excluded_deployment_ids",
+)
+
+
+def _internal_request_keys(request_kwargs: Any) -> list:
+    """The keys of *request_kwargs* that are this proxy's own bookkeeping."""
+
+    if not isinstance(request_kwargs, dict):
+        return []
+    return [
+        key
+        for key in request_kwargs
+        if isinstance(key, str) and key.startswith(_INTERNAL_REQUEST_KEY_PREFIXES)
+    ]
+
+
+def _without_internal_request_keys(request_kwargs: Any) -> Optional[dict]:
+    """Return *request_kwargs* with this proxy's own keys removed.
+
+    Returns ``None`` when there is nothing to remove, so a caller built around
+    ``update_request`` can keep that contract: a step that changes nothing
+    returns ``None``.  The caller's dict is never mutated.
+    """
+
+    keys = _internal_request_keys(request_kwargs)
+    if not keys:
+        return None
+    stripped = dict(request_kwargs)
+    for key in keys:
+        stripped.pop(key, None)
+    return stripped
 _RESPONSES_CHAT_BRIDGE_PREEMPTIVE_METADATA_KEY = (
     "responses_chat_bridge_preemptive"
 )

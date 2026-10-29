@@ -25,6 +25,7 @@ from .base import (
     Dict,
     List,
     Optional,
+    _without_internal_request_keys,
     litellm,
 )
 
@@ -236,6 +237,13 @@ class YoungRouterHook(CustomLogger):
             changed = True
         if not is_compaction_capability_probe:
             await _routing_module._ensure_codex_compaction_capability(modified_kwargs)
+        # Last stop before the provider: this proxy's own routing keys must not
+        # reach a payload validator.  The Anthropic adapter rejects unknown
+        # fields outright, and these ride along on exactly the fallback path
+        # that most needs to keep working.
+        stripped_kwargs = _without_internal_request_keys(modified_kwargs)
+        if stripped_kwargs is not None:
+            return stripped_kwargs
         return modified_kwargs if changed else None
     async def async_filter_deployments(
         self,

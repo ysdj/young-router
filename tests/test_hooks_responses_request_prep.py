@@ -4770,3 +4770,45 @@ class HookReplayedReasoningCountTests(HookTestCase):
         self.assertEqual(
             hooks._without_replayed_reasoning_summary_text("hello"), "hello"
         )
+
+
+class HookInternalRequestKeyTests(HookTestCase):
+    """Routing bookkeeping must never reach a provider's payload validator.
+
+    ``_young_router_upstream_url_surface`` and friends ride on a request so a
+    retry can tell which deployment was already tried.  LiteLLM forwards
+    request kwargs to a provider largely as-is, and the Anthropic adapter
+    rejects unknown fields, so one of these keys in the payload fails the call
+    outright: "_young_router_upstream_url_surface: extra inputs are not
+    permitted".  That is the fallback path -- the one already recovering from a
+    failure -- so it turned a recoverable miss into a 400.
+    """
+
+    def test_every_internal_key_is_stripped(self) -> None:
+        hooks, _ = load_hook_module()
+        request = {
+            "model": "claude-opus-5-5",
+            "input": [{"role": "user", "content": "hi"}],
+            "_young_router_upstream_url_surface": "openai_chat",
+            "_young_router_attempted_upstream_url_surfaces": ["openai_chat"],
+            "_young_router_surface_target_deployment_id": "b6015391",
+            "_target_order": 1.2,
+            "_excluded_deployment_ids": ["b6015391"],
+        }
+
+        stripped = hooks._without_internal_request_keys(request)
+
+        self.assertEqual(sorted(stripped), ["input", "model"])
+        # The request the rest of the pipeline still holds is untouched.
+        self.assertIn("_target_order", request)
+
+    def test_a_request_without_internal_keys_is_left_alone(self) -> None:
+        hooks, _ = load_hook_module()
+
+        self.assertIsNone(hooks._without_internal_request_keys({"model": "x"}))
+
+    def test_a_client_field_that_merely_starts_with_an_underscore_survives(self) -> None:
+        hooks, _ = load_hook_module()
+        request = {"model": "x", "_custom_client_field": "keep"}
+
+        self.assertIsNone(hooks._without_internal_request_keys(request))
