@@ -96,6 +96,35 @@ class ReactNativeUiParityTests(unittest.TestCase):
             start = source.find(f"<{name}", index)
         return tags
 
+    def test_a_render_fault_states_a_pane_instead_of_aborting_the_app(self) -> None:
+        """An uncaught render error is a dead process, not a blank pane.
+
+        A pane that read a `const` before its declaration threw a `TypeError`
+        while rendering.  Nothing caught it: the throw left the window's root
+        with no live child, travelled out of React's TurboModule call as a C++
+        exception, and `std::terminate` aborted the app — the pane the user
+        clicked took every other window with it.
+
+        React only stops a render error in `componentDidCatch`, so every window's
+        root is one boundary.  A THROW here is a bug in a pane, and the user's
+        window survives it with the cause stated.
+        """
+
+        boundary = (ROOT / "rn/packages/shared/src/ui/renderFaultBoundary.tsx").read_text(encoding="utf-8")
+        self.assertIn("export class RenderFaultBoundary extends React.Component<", boundary)
+        self.assertIn("static getDerivedStateFromError(error: unknown): RenderFaultState {", boundary)
+        self.assertIn("componentDidCatch(error: Error): void {", boundary)
+        # The handler of last resort may not throw again: a failure inside it
+        # aborts the very process the boundary exists to protect.
+        handler = boundary.split("componentDidCatch(error: Error): void {", 1)[1].split("render(): React.ReactNode {", 1)[0]
+        self.assertIn("} catch {", handler)
+        bootstrap = (ROOT / "rn/packages/shared/src/bootstrap.tsx").read_text(encoding="utf-8")
+        self.assertIn('import { RenderFaultBoundary } from "./ui/renderFaultBoundary";', bootstrap)
+        # One boundary per window root, wrapping the whole app.
+        self.assertEqual(1, bootstrap.count("<RenderFaultBoundary>"))
+        self.assertIn("return <RenderFaultBoundary><YoungRouterApp {...dependencies}", bootstrap)
+        self.assertIn("nativeAction={nativeAction} /></RenderFaultBoundary>;", bootstrap)
+
     def test_menu_bar_home_is_not_a_dashboard_or_sidebar_shell(self) -> None:
         """The menu-bar host stays hidden; the status icon opens the settings shell."""
         self.assert_ui_has('route === "home" ? <View style={styles.menuBarHost} />')
@@ -231,7 +260,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # The new row states what is left where its own fields are, and says
         # that it is already live (a create is enabled).
         self.assert_ui_has("function isDraftModel(model: UnknownRecord, translate: Translate): boolean {")
-        self.assert_ui_has('<Text style={styles.fieldHint}>{translate(selectedProviderKey ? "providers.draftModelHint" : "providers.draftModelKeylessHint")}</Text>')
+        # An account-backed route is just as finished as a key-backed one: the
+        # hint asks whether the route names a credential of either kind.
+        self.assert_ui_has('<Text style={styles.fieldHint}>{translate(selectedProviderKey || routeCredential ? "providers.draftModelHint" : "providers.draftModelKeylessHint")}</Text>')
         self.assertIn('"providers.draftModelKeylessHint": "新建的模型默认启用：请填写公开模型名与上游模型，并选择密钥。"', self.zh)
         self.assertIn('"providers.draftModelHint": "新建的模型默认启用：请填写公开模型名与上游模型，客户端即可使用它。"', self.zh)
         self.assertIn('"providers.draftModelHint": "A new model starts enabled: fill in the public name and the upstream model for clients to use it."', self.en)
@@ -1219,7 +1250,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # The routes table leads with the upstream model — the model a route
         # actually calls — then names its provider, key, and order.
         self.assert_ui_has('{ label: translate("common.order"), width: 64 }]} rows={routeRows}')
-        self.assert_ui_has(r'cells: [`\t${modelUpstreamDisplay(editorIdentifier(entry.provider), entry.model) || translate("common.notAvailable")}`, providerDisplayName(entry.provider), modelProviderKeyLabel(entry.model, entry.provider, translate, undefined, relaySources), order]')
+        self.assert_ui_has(r'cells: [`\t${modelUpstreamDisplay(editorIdentifier(entry.provider), entry.model) || translate("common.notAvailable")}`, providerDisplayName(entry.provider), modelProviderKeyLabel(entry.model, entry.provider, translate, undefined, relaySources, providerCredentials(entry.provider, translate)), order]')
         self.assertNotIn('providers.orderSource', self.ui)
         self.assertNotIn('providers.effectiveOrder', self.ui)
         self.assert_ui_has('const activeRouteGroupUsesMultiplier = activeRouteGroup.some((entry) => modelOrderMode(entry.model) === "relay_multiplier");')
@@ -1406,6 +1437,67 @@ class ReactNativeUiParityTests(unittest.TestCase):
         table_wrapper = appkit_controls.split("export function AppKitTable(", 1)[1].split("export function AppKitTextEditor(", 1)[0]
         self.assertIn("selectableSpanningRowKeys", table_wrapper)
 
+    def test_the_account_lists_minus_is_the_sign_out(self) -> None:
+        """One action, one control: − ends the account it is selected on.
+
+        The list's − used to remove an account while a second 退出登录 button in
+        the editor signed the same account out, so the same decision had two
+        controls and the row's own removal read as something that happened to a
+        different thing.  An account is one row of this list, so ending it is
+        removing that row — the station pane's own rule, on the same table.
+        """
+
+        account_block = self.ui.split('{kind === "openai" ? <View style={styles.officialAccountSection}>', 1)[1].split('</View> : null}', 1)[0]
+        # The list keeps its ＋ and its −, and − is the destructive one.
+        self.assertIn('symbol="plus"', account_block)
+        self.assertIn('symbol="minus" compact destructive', account_block)
+        # − reads the list's own selection, which falls back to the first
+        # account exactly as the pane below it does: a − that appeared only
+        # after a click was a second rule for the same list.
+        self.assertIn("void logoutAccount(stringValue(selectedAuthAccount.ref));", account_block)
+        self.assertIn('selectedKey={stringValue(selectedAuthAccount?.ref)}', account_block)
+        # The editor states who the account is and nothing else: no second
+        # sign-out control under the row that already carries it.
+        editor_row = account_block.split("<View style={styles.accountEditor}>", 1)[1]
+        self.assertNotIn("runAuthAction", editor_row)
+        self.assertNotIn("relay.officialProviderLogout", editor_row)
+        self.assertIn('translate("relay.accountField")', editor_row)
+        self.assertIn('translate("providers.authStatus")', editor_row)
+
+    def test_an_account_backed_route_is_filed_under_the_account_it_answers_with(
+        self,
+    ) -> None:
+        """The model list groups by credential, and an account is one.
+
+        A route of an account-backed row answers with exactly one credential:
+        an account through the adapter, or a custom key at the service address.
+        The list used to ask for a *key* first, so every account's route fell
+        into the ungrouped bucket beside the group that existed to hold it —
+        the pane showed a bare model row above the account heading, and Core's
+        account projection was never read at all.
+        """
+
+        rows = self.ui.split("const modelRows = useMemo(", 1)[1].split("}, [modelCredentials", 1)[0]
+        # The two cases are decided by whether the row has credentials to file
+        # under, not by whether one of them happens to be a key.
+        self.assertIn("if (modelCredentials.length === 0) {", rows)
+        self.assertIn("const key = modelProviderKeyState(item, provider ?? {});", rows)
+        self.assertIn("if (!modelCredential(item, provider ?? {}, modelCredentials)) {", rows)
+        # A route the row cannot file is still listed, so it can be repaired or
+        # deleted instead of silently disappearing from the pane.
+        self.assertIn("ungrouped.push(item);", rows)
+        # The group a route lands in is the credential it names.
+        self.assertIn(
+            "const own = models.filter((item) => modelCredential(item, provider ?? {}, modelCredentials)?.id === credential.id);",
+            rows,
+        )
+        # The groups are every credential the row owns, an account included.
+        self.assert_ui_has("function providerCredentials(provider: UnknownRecord | undefined, translate: Translate): ProviderCredential[] {")
+        self.assertIn('id: `account:${stringValue(account.ref)}`', self.ui)
+        self.assertIn("accountRef: stringValue(account.ref),", self.ui)
+        self.assert_ui_has("function modelCredential(")
+        self.assertIn('const accountRef = stringValue(model.account_ref);', self.ui)
+
     def test_model_list_groups_are_headings_and_model_rows_open_their_inspector(self) -> None:
         """A credential group is a heading; a model row is the entry it names.
 
@@ -1437,7 +1529,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # flipping the others.
         self.assert_ui_has('for (const item of ungrouped) rows.push({ key: modelRowKey("", editorIdentifier(item)), cells: modelCells(item) });')
         grouped_rows = self.ui.split("if (modelCredentials.length > 0) {", 1)[1].split("return rows;", 1)[0]
-        self.assertIn("return Boolean(ownKey) && credential.id.endsWith(ownKey!.id);", grouped_rows)
+        # A route answers with exactly one credential — an account or a key —
+        # and Core projects the account it resolves to, so the group a route
+        # lands in is decided by that one answer rather than by whichever
+        # groups happen to end with its key slot's id.
+        self.assertIn("const own = models.filter((item) => modelCredential(item, provider ?? {}, modelCredentials)?.id === credential.id);", grouped_rows)
         # A heading with nothing under it claims the credential serves routes it
         # does not serve, so an empty group draws no heading at all.
         self.assertIn("if (own.length === 0) continue;", grouped_rows)
@@ -4162,7 +4258,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # provider keeps its key slot and fetch path.
             '{translate(providerService(provider) ? "providers.serviceLinks" : "providers.accounts")}',
             '{(!isLogin || isWorkBuddyAccount) && !station ? <View style={styles.providerAccountsHeader}>',
-            'providerKindSelected !== "openai" && providerKindSelected !== "claude"',
+            # An account-backed row is a real provider: it takes ＋ for a model
+            # that names the account it answers with, so only the single-login
+            # Claude row keeps its list read-only.
+            'provider && providerKindSelected !== "claude" ? <IconButton label="+"',
             # An unread account is handed to the desktop app, then confirmed.
             'const workbuddySignedIn = stringValue(workbuddyAccount?.state) === "signed-in"',
             '|| stringValue(asRecord(provider.auth_observed).state) === "signed-in";',
@@ -4216,10 +4315,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         """
 
         wizard = self.ui.split("function ProviderSetupWizard(", 1)[1].split("function ProviderWorkspace(", 1)[0]
-        # One standalone wheel per branch (the lane's roster and the generic
-        # listing), and the buttons that start those reads draw none of their
-        # own for the same wait.
-        self.assertEqual(2, wizard.count("<NativeBusySpinner"))
+        # One standalone wheel per branch (the official account's roster, the
+        # lane's roster, and the generic listing), and the buttons that start
+        # those reads draw none of their own for the same wait.
+        self.assertEqual(3, wizard.count("<NativeBusySpinner"))
         self.assertNotIn('busy={modelFetchState === "loading"}', wizard)
         self.assertNotIn("providerWizardModelLoading", wizard)
         self.assertNotIn("providerWizardModelLoading", self.ui)
@@ -5901,11 +6000,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # The account section lists the row's accounts, and custom keys are its
         # peers: one OpenAI row serves both, so the keys panel is drawn for it.
         self.assertIn('{!isLogin || kind === "openai" ? <ProviderKeysPanel', editor)
-        # An OpenAI row serves accounts and custom keys as peers, so they are
-        # one list of credentials: the accounts are handed to the keys panel as
-        # credentials, and the actions a login has ride that same list.
-        self.assertIn('credentials={kind === "openai" ? authAccounts', editor)
-        self.assertIn('credentialActions={kind === "openai" ? (ref) => (', editor)
+        # An account is not a key slot, so it never enters the key editor: the
+        # signed-in accounts get their own list, drawn with the station's own
+        # shared table under the name that associations use everywhere.
+        self.assertNotIn('credentials={kind === "openai" ? authAccounts', editor)
+        self.assertIn('{kind === "openai" ? <View style={styles.officialAccountSection}>', editor)
+        self.assertIn('<AccountsTable\n        title={translate("providers.accountLinks")}', editor)
         self.assertIn('dispatchWithOutcome("service_provider.auth_logout", { provider_id: id, account_ref: accountRef }, "providers_models")', editor)
         self.assertIn("{!isLogin && station ? <StationAccountsPanel", editor)
         identity = self.ui.split("function ProviderIdentityFields(", 1)[1].split("\nfunction ", 1)[0]
@@ -5935,8 +6035,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
         self.assertIn('return source ? [source.accountLabel, source.resourceLabel].filter(Boolean).join("/") : "";', self.ui)
         self.assertIn('return relaySourceName(relaySourceForKey(key, relaySources)) || name;', self.ui)
+        # An account is not a key, so the same column names it before it ever
+        # reaches a key lookup: an account-backed route reads as its account.
+        self.assertIn('const credential = modelCredential(model, provider, credentials);', self.ui)
         self.assertIn('grouped.set(key.id, { label: modelProviderKeyLabel(item, provider ?? {}, translate, undefined, relaySources), models: [item] });', self.ui)
-        self.assertIn('providerDisplayName(entry.provider), modelProviderKeyLabel(entry.model, entry.provider, translate, undefined, relaySources), order],', self.ui)
+        self.assertIn('modelProviderKeyLabel(entry.model, entry.provider, translate, undefined, relaySources, providerCredentials(entry.provider, translate)), order],', self.ui)
         self.assertIn('const sourceName = relaySourceName(choice.source) || name;', self.ui)
         self.assertIn('label={relaySourceName(source) || source.resourceLabel}', self.ui)
         self.assertIn('label: remoteDelete.label', self.ui)
@@ -6928,8 +7031,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '{provider ? <IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteProvider} /> : null}',
             self.ui,
         )
+        # An account-backed row takes ＋ too: a model added there names the
+        # account it answers with, so the row is a first-class provider and not
+        # a read-only projection of what the account happened to list.
         self.assertIn(
-            '{provider && providerKindSelected !== "openai" && providerKindSelected !== "claude" ? <IconButton label="+" title={translate("providers.newModel")} disabled={busy} onPress={addModel} /> : null}',
+            '{provider && providerKindSelected !== "claude" ? <IconButton label="+" title={translate("providers.newModel")} disabled={busy} onPress={addModel} /> : null}',
             self.ui,
         )
         self.assertIn(

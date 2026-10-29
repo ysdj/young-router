@@ -2,6 +2,7 @@ import React, { useEffect, useState } from "react";
 import { AppRegistry } from "react-native";
 import { canonicalWindowRoute, DESKTOP_ROUTES, isSettingsPaneRoute, LOG_TABS } from "./routes";
 import { YoungRouterApp } from "./ui/YoungRouterApp";
+import { RenderFaultBoundary } from "./ui/renderFaultBoundary";
 import type { AppRoute, IpcClient, LogTab, NativeLeafAdapter } from "./types";
 
 export interface DesktopHostDependencies {
@@ -44,6 +45,10 @@ export function registerYoungRouter(componentName: string, dependencies: Desktop
       }
     }, [isPrimaryHost, nativeAction, props.initialRoute]);
 
-    return <YoungRouterApp {...dependencies} initialSnapshot={initialSnapshot} isPrimaryHost={isPrimaryHost} isWindowManagerHost={props.isWindowManagerHost === true} routeRequest={routeRequest ?? props.initialRoute} routeRequestSequence={routeRequestSequence} logTabRequest={logTabRequest ?? props.initialLogTab} fileIdRequest={props.initialFileTarget} nativeAction={nativeAction} />;
+    // Every window's root is one boundary, so a render that throws leaves a
+    // stated pane instead of an aborted process.  See RenderFaultBoundary for
+    // the failure this answers: an uncaught render error escapes the React
+    // TurboModule call as a C++ exception and takes the app down with it.
+    return <RenderFaultBoundary><YoungRouterApp {...dependencies} initialSnapshot={initialSnapshot} isPrimaryHost={isPrimaryHost} isWindowManagerHost={props.isWindowManagerHost === true} routeRequest={routeRequest ?? props.initialRoute} routeRequestSequence={routeRequestSequence} logTabRequest={logTabRequest ?? props.initialLogTab} fileIdRequest={props.initialFileTarget} nativeAction={nativeAction} /></RenderFaultBoundary>;
   });
 }

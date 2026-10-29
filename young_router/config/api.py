@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import shutil
 import sys
 from typing import Any
@@ -21,6 +22,7 @@ from .load import (
 from .schema import (
     CONFIG_YAML,
     DISABLED_MODELS_KEY,
+    MENU_ACCOUNT_REF_KEY,
     MENU_CREDENTIAL_ROUTE_KEY,
     SERVICE_LOGIN_BASE_URLS,
     _as_dict,
@@ -32,6 +34,65 @@ from .schema import (
     _string_value,
     load_yaml_text,
 )
+
+
+#: How many stamped copies of one document a save leaves behind.
+#:
+#: Every Apply copies the file it is about to replace, and nothing used to
+#: remove the copies: an installation opened a few hundred times held a thousand
+#: of them and nineteen megabytes of configuration history no pane reads.  The
+#: copy exists so one write can be undone by hand, which the newest few answer;
+#: anything older is a version of a document the newest copy already superseded.
+BACKUP_RETENTION = 5
+#: The stamp a backup name carries, exactly as `_write_backup` writes it.
+#:
+#: Seconds are not enough to name one copy: the shell's Apply is debounced, but
+#: two windows saving in the same second produced the same name, so the second
+#: copy overwrote the first and the archive held one entry for a whole session.
+#: The microsecond field keeps each copy distinct, and the fixed width keeps
+#: newest-first a plain string comparison.
+_BACKUP_NAME = re.compile(r"\.bak-\d{8}-\d{6}-\d{6}$")
+
+
+def _backup_stamp() -> str:
+    """A stamp no other copy in this second can share."""
+
+    return _dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+
+
+def _write_backup(path: pathlib.Path, stamp: str) -> pathlib.Path:
+    """Copy one document aside before it is replaced, and prune older copies.
+
+    The backup keeps the bytes the save is about to overwrite, so a wrong Apply
+    can be undone without trusting an editor draft.  Only the newest
+    ``BACKUP_RETENTION`` copies of *this* document name survive: the stamp is
+    fixed width, so newest-first is a plain string comparison.  A file this
+    build did not write -- ``config.yaml.bak-before-key-switch-20260920`` and
+    the like -- is never deleted, because its name states an intent no
+    rotation rule can know.
+    """
+
+    backup = path.with_name(f"{path.name}.bak-{stamp}")
+    shutil.copy2(path, backup)
+    os.chmod(backup, 0o600)
+    prefix = f"{path.name}.bak-"
+    stamped: list[str] = []
+    for candidate in path.parent.glob(f"{path.name}.bak-*"):
+        if _BACKUP_NAME.search(candidate.name) is None:
+            continue
+        try:
+            if not candidate.is_file() or candidate.is_symlink():
+                continue
+        except OSError:
+            continue
+        stamped.append(candidate.name[len(prefix):])
+    stamped.sort(reverse=True)
+    for stale in stamped[BACKUP_RETENTION:]:
+        try:
+            path.with_name(prefix + stale).unlink()
+        except OSError:
+            pass
+    return backup
 
 
 def _assert_unique_deployment_ids(entries: list[dict[str, Any]]) -> None:
@@ -179,50 +240,100 @@ def _credential_scopes(provider: dict[str, Any]) -> list[tuple[dict[str, Any], s
     credentials = _login_provider_credentials(provider)
     if not credentials:
         return []
-    scopes: list[tuple[dict[str, Any], str]] = []
-    for credential in credentials:
-        if credential["kind"] == "account":
-            # The account scope states its own reference: the provider's
-            # top-level one mirrors only the first account, so relying on it
-            # would write every account's route with the first account's
-            # credential.
-            scopes.append(
-                (
-                    {
-                        **provider,
-                        "auth_kind": "openai_login",
-                        "auth_credential_ref": credential["ref"],
-                        "api_keys": [],
-                    },
-                    credential["id"],
-                )
-            )
-            continue
-        key = next(
-            (entry for entry in provider.get("api_keys", []) if isinstance(entry, dict) and str(entry.get("id", "")).strip() == credential["id"]),
-            None,
+    return [_account_backed_scope(provider, credential) for credential in credentials]
+
+
+def _account_backed_scope(
+    provider: dict[str, Any], credential: dict[str, Any]
+) -> tuple[dict[str, Any], str]:
+    """One login-backed provider written as the credential that answers."""
+
+    if credential["kind"] == "account":
+        # The account scope states its own reference: the provider's
+        # top-level one mirrors only the first account, so relying on it
+        # would write every account's route with the first account's
+        # credential.
+        return (
+            {
+                **provider,
+                "auth_kind": "openai_login",
+                "auth_credential_ref": credential["ref"],
+                "api_keys": [],
+            },
+            credential["id"],
         )
-        scopes.append(
-            (
-                {
-                    **provider,
-                    # A key route authenticates the way any key provider does:
-                    # plain OpenAI transport at the provider's own address.
-                    "auth_kind": "api_key",
-                    "auth_credential_ref": "",
-                    "extra": {
-                        key_name: value
-                        for key_name, value in (provider.get("extra") or {}).items()
-                        if key_name != "x-young-router-provider-auth"
-                    },
-                    "api_base": str(provider.get("api_base", "") or "").strip()
-                    or SERVICE_LOGIN_BASE_URLS.get(str(provider.get("auth_kind", "") or ""), ""),
-                    "api_keys": [key] if key else [],
-                },
-                credential["id"],
-            )
-        )
-    return scopes
+    key = next(
+        (
+            entry
+            for entry in provider.get("api_keys", [])
+            if isinstance(entry, dict) and str(entry.get("id", "")).strip() == credential["id"]
+        ),
+        None,
+    )
+    return (
+        {
+            **provider,
+            # A key route authenticates the way any key provider does:
+            # plain OpenAI transport at the provider's own address.
+            "auth_kind": "api_key",
+            "auth_credential_ref": "",
+            "extra": {
+                key_name: value
+                for key_name, value in (provider.get("extra") or {}).items()
+                if key_name != "x-young-router-provider-auth"
+            },
+            "api_base": str(provider.get("api_base", "") or "").strip()
+            or SERVICE_LOGIN_BASE_URLS.get(str(provider.get("auth_kind", "") or ""), ""),
+            "api_keys": [key] if key else [],
+        },
+        credential["id"],
+    )
+
+
+def _model_credential(
+    provider: dict[str, Any], model: dict[str, Any]
+) -> dict[str, Any] | None:
+    """The one credential a route answers with, or ``None`` for no credential.
+
+    A route of a login-backed provider names what serves it, exactly as a
+    station's route names the key it answers with: an account through
+    ``account_ref``, a custom key through the key slot it names.  A route that
+    names neither follows the row's default credential -- the first account it
+    owns, else its first key -- which is how a document written before a route
+    could name an account keeps answering.
+
+    Writing one entry per credential for every route is what made the pane
+    unable to say which account or key a model belonged to: every route served
+    every credential, so each model appeared under all of them at once.
+    """
+
+    if str(provider.get("auth_kind", "") or "") != "openai_login":
+        return None
+    credentials = _login_provider_credentials(provider)
+    if not credentials:
+        return None
+    named_key_id = str(model.get("provider_key_id", "") or "").strip()
+    named_key_name = str(model.get("api_key_name", "") or "").strip()
+    if named_key_id or named_key_name:
+        for credential in credentials:
+            if credential["kind"] != "key":
+                continue
+            if named_key_id and credential["id"] == named_key_id:
+                return credential
+            if named_key_name and credential.get("name", "") == named_key_name:
+                return credential
+        # A route that names a key this row does not carry serves nothing: the
+        # write refuses it (``model_provider_key_missing``) rather than answering
+        # with another credential the user never chose.
+        return None
+    named_account = str(model.get("account_ref", "") or "").strip()
+    accounts = [credential for credential in credentials if credential["kind"] == "account"]
+    if named_account:
+        for credential in accounts:
+            if credential["ref"] == named_account:
+                return credential
+        return None
+    return accounts[0] if accounts else None
 
 
 def _row_deployment_id(model: dict[str, Any]) -> str:
@@ -308,51 +419,64 @@ def save_config(
             model_dict = _as_dict(model)
             model_enabled = _bool_value(model_dict.get("model_enabled"), _bool_value(model_dict.get("enabled"), True))
             effective_enabled = provider_enabled and model_enabled
-            # One route per credential, like a station's keys: an account and a
-            # custom key are peers of the same provider, and each answers with a
-            # deployment of its own so the router spreads requests across them
-            # and a single one can be ordered or taken out.
-            scopes = _credential_scopes(provider)
-            if not scopes:
-                # A login-backed row with no account and no key serves nothing:
-                # its routes are not written at all, which is what "signed out"
-                # means for a service.  Writing them would hand the router a
-                # deployment that cannot authenticate.
-                continue
-            for scoped, credential_id in scopes:
+            # A route of an account-backed provider answers with the one
+            # credential it names, exactly as a station's route names the key it
+            # answers with: an account or a custom key is a *choice*, not a list
+            # of parallel deployments.  Writing every route once per credential
+            # made each model appear under all of them at once, so the pane could
+            # not say which account or key a model belonged to.  An ordinary
+            # provider states one credential of its own (itself).
+            credential = _model_credential(provider, model_dict)
+            if str(provider.get("auth_kind", "") or "") == "openai_login":
+                if credential is None:
+                    # A login-backed row whose route names no credential it owns
+                    # serves nothing: its entry is not written at all, which is
+                    # what "signed out" means for a service.  Writing it would
+                    # hand the router a deployment that cannot authenticate.
+                    # ``_validate`` marks the route, so this is only the write
+                    # that follows a validation the pane already refused.
+                    continue
+                scoped, credential_id = _account_backed_scope(provider, credential)
+                scoped_model = {
+                    **model_dict,
+                    # The credential an entry answers with is the one it names,
+                    # not the one the row last carried: a row that inherited its
+                    # account's reference would otherwise hand that reference to
+                    # the custom key's route as well, and one key would answer
+                    # with another credential.
+                    "api_key": "",
+                    # Keyed by the row this entry belongs to, not by the row's
+                    # own last write: a credential route's deployment id is
+                    # derived from the *row* id, so one model keeps one row
+                    # identity however many credentials serve it.
+                    MENU_CREDENTIAL_ROUTE_KEY: _row_deployment_id(model_dict),
+                    "deployment_id": _credential_deployment_id(model_dict, credential_id),
+                }
+                if credential["kind"] == "account":
+                    # Which account this deployment answers with, recorded beside
+                    # the row id: an account is not one of the row's keys, so
+                    # ``api_key_name`` cannot say it, and the read-back needs it
+                    # to file the entry under the account it belongs to.
+                    scoped_model[MENU_ACCOUNT_REF_KEY] = credential["ref"]
+            else:
+                scoped, credential_id = provider, ""
                 scoped_model = model_dict
-                if credential_id:
-                    scoped_model = {
-                        **model_dict,
-                        # The credential an entry answers with is the scope's, not
-                        # the one the row last carried: a row that inherited its
-                        # account's reference would otherwise hand that reference
-                        # to the custom key's route as well, and one key would
-                        # answer with another credential.
-                        "api_key": "",
-                        # Keyed by the row this entry belongs to, not by the row's
-                        # own last write: a credential route's deployment id is
-                        # derived from the *row* id, so one model keeps one row
-                        # identity however many credentials serve it.
-                        MENU_CREDENTIAL_ROUTE_KEY: _row_deployment_id(model_dict),
-                        "deployment_id": _credential_deployment_id(model_dict, credential_id),
-                    }
-                enabled, entry = _entry_from_editor(
-                    scoped_model,
-                    scoped,
-                    model_index,
-                    # The provider's anchor exists only for the address the
-                    # provider section itself wrote; a credential scope that
-                    # states its own address writes it out in full.
-                    use_provider_aliases=effective_enabled
-                    and scoped.get("api_base") == provider.get("api_base"),
-                    effective_enabled=effective_enabled,
-                    seen_deployment_ids=seen_deployment_ids,
-                )
-                if enabled:
-                    active_entries.append(entry)
-                else:
-                    disabled_entries.append(entry)
+            enabled, entry = _entry_from_editor(
+                scoped_model,
+                scoped,
+                model_index,
+                # The provider's anchor exists only for the address the
+                # provider section itself wrote; a credential scope that
+                # states its own address writes it out in full.
+                use_provider_aliases=effective_enabled
+                and scoped.get("api_base") == provider.get("api_base"),
+                effective_enabled=effective_enabled,
+                seen_deployment_ids=seen_deployment_ids,
+            )
+            if enabled:
+                active_entries.append(entry)
+            else:
+                disabled_entries.append(entry)
 
     _assert_unique_deployment_ids(active_entries + disabled_entries)
 
@@ -415,12 +539,10 @@ def save_config(
         )
         next_disabled_text = next_disabled_text.rstrip() + "\n"
 
-    stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    stamp = _backup_stamp()
     backup: pathlib.Path | None = None
     if path.exists():
-        backup = path.with_name(f"{path.name}.bak-{stamp}")
-        shutil.copy2(path, backup)
-        os.chmod(backup, 0o600)
+        backup = _write_backup(path, stamp)
     else:
         # A first-run editor starts from a validated in-memory empty document.
         # Create only after the complete candidate above has validated and the
@@ -441,16 +563,10 @@ def save_config(
     disabled_backup = ""
     if disabled_entries:
         if disabled_path.exists():
-            disabled_backup_path = disabled_path.with_name(f"{disabled_path.name}.bak-{stamp}")
-            shutil.copy2(disabled_path, disabled_backup_path)
-            os.chmod(disabled_backup_path, 0o600)
-            disabled_backup = str(disabled_backup_path)
+            disabled_backup = str(_write_backup(disabled_path, stamp))
         _write_atomic(disabled_path, next_disabled_text)
     elif disabled_path.exists():
-        disabled_backup_path = disabled_path.with_name(f"{disabled_path.name}.bak-{stamp}")
-        shutil.copy2(disabled_path, disabled_backup_path)
-        os.chmod(disabled_backup_path, 0o600)
-        disabled_backup = str(disabled_backup_path)
+        disabled_backup = str(_write_backup(disabled_path, stamp))
         disabled_path.unlink()
 
     return {

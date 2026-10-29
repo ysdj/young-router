@@ -322,13 +322,23 @@ class ServiceProviderBoundaryTests(unittest.TestCase):
             self.assertTrue(core.snapshot()["drafts"]["providers_models"]["dirty"])
 
     def test_service_provider_defaults_name_and_model(self) -> None:
+        """An OpenAI row starts empty; its models come from the account.
+
+        The roster an account may call is the account's own fact, and the pane's
+        获取模型 reads exactly that.  A model invented at create time was a route
+        the user never asked for — a name this build happened to ship with,
+        listed until they noticed and deleted it.  A service that *does* state a
+        default (Claude's one device login) keeps it.
+        """
+
         directory, domain = self._domain()
         with directory:
             snapshot = domain.dispatch("service_provider.add", {"kind": "openai_login"})
             provider = snapshot["providers"][0]
             self.assertEqual("OpenAI", provider["name"])
             self.assertEqual("openai_login", provider["auth_kind"])
-            self.assertEqual("chatgpt/gpt-5.4", provider["models"][0]["litellm_model"])
+            self.assertEqual([], provider["models"])
+            self.assertEqual(1, len(snapshot["providers"][0]["accounts"]))
 
             with self.assertRaisesRegex(DomainError, "already exists"):
                 domain.dispatch("service_provider.add", {"kind": "openai_login"})
@@ -1015,9 +1025,9 @@ class ServiceProviderBoundaryTests(unittest.TestCase):
                 manager._secure_chatgpt_auth_file(ref, create=True),
                 {"access_token": "synthetic-access-token", "expires_at": 4102444800},
             )
-            # The account's own route names no key, exactly like the live row
-            # whose list an unbound route resolves onto.
-            self.assertEqual("", domain.draft_state()["providers"][0]["models"][0].get("provider_key_id"))
+            # A row created empty answers on its account alone: nothing it owns
+            # names a key, so adding one leaves that key unreferenced.
+            self.assertEqual([], domain.draft_state()["providers"][0]["models"])
 
             domain.dispatch("provider.key_add", {"provider_id": provider_id, "name": "key-1"})
             validation = domain.validate()
@@ -1117,9 +1127,9 @@ class ServiceProviderBoundaryTests(unittest.TestCase):
             saved = ProvidersModelsDomain(domain.config_path).snapshot()["providers"][0]
             self.assertEqual(["platform"], saved["api_key_names"])
             self.assertEqual(1, len(saved["accounts"]))
-            # One model is one row however many credentials serve it: the
-            # account's deployment and the key's are both rows of it.
-            self.assertEqual(1, len(saved["models"]))
+            # A row created empty invents no model: its first rows arrive
+            # through 获取模型, which asks the account or key the user picked.
+            self.assertEqual([], saved["models"])
 
     def test_a_credential_route_never_borrows_the_rows_base_or_its_account(
         self,
@@ -1173,6 +1183,224 @@ class ServiceProviderBoundaryTests(unittest.TestCase):
             self.assertEqual("api_key", key_scope["auth_kind"])
             self.assertEqual("", key_scope["auth_credential_ref"])
             self.assertEqual("https://api.openai.com/v1", key_scope["api_base"])
+
+    def test_a_route_answers_with_the_one_account_it_names(self) -> None:
+        """One route, one credential: an account or a key, never both.
+
+        A row's routes used to answer with every credential it owned, so the
+        pane listed each model under all of the row's accounts and keys at once
+        and could not say which one it belonged to.  A route now names the
+        credential it answers with — ``account_ref`` for an account, the key
+        slot for a key — and Core projects the account it resolves to, so the
+        list files every route in exactly one group.
+        """
+
+        directory, domain = self._domain()
+        with directory:
+            provider_id = domain.dispatch(
+                "service_provider.add", {"kind": "openai_login"}
+            )["providers"][0]["id"]
+            manager = domain._auth_manager()
+            provider = domain._draft["providers"][0]
+            first_ref = domain._provider_accounts(provider)[0]["ref"]
+            atomic_write_json(
+                manager._secure_chatgpt_auth_file(first_ref, create=True),
+                {"access_token": "synthetic-first", "expires_at": 4102444800},
+            )
+            # A second account, signed in as well: two routes may each name one.
+            started = domain.dispatch(
+                "service_provider.auth_start", {"provider_id": provider_id}
+            )
+            second_ref = started["operation_summary"]["account_ref"]
+            self.assertNotEqual(first_ref, second_ref)
+            atomic_write_json(
+                manager._secure_chatgpt_auth_file(second_ref, create=True),
+                {"access_token": "synthetic-second", "expires_at": 4102444800},
+            )
+
+            domain.dispatch(
+                "model.add",
+                {
+                    "provider_id": provider_id,
+                    "model": {
+                        "name": "first-model",
+                        "upstream_model": "first-model",
+                        "account_ref": first_ref,
+                        "enabled": True,
+                    },
+                },
+            )
+            domain.dispatch(
+                "model.add",
+                {
+                    "provider_id": provider_id,
+                    "model": {
+                        "name": "second-model",
+                        "upstream_model": "second-model",
+                        "account_ref": second_ref,
+                        "enabled": True,
+                    },
+                },
+            )
+
+            models = {
+                entry["model_name"]: entry
+                for entry in domain.snapshot()["providers"][0]["models"]
+            }
+            self.assertEqual(first_ref, models["first-model"]["account_ref"])
+            self.assertEqual(second_ref, models["second-model"]["account_ref"])
+            # The key column of either route states no key: an account is not a
+            # key slot, and a route answers with one thing.
+            for entry in models.values():
+                self.assertEqual("", entry["provider_key_id"])
+
+            # A route that names an account the row no longer owns is refused,
+            # rather than written as a deployment nothing can authenticate.
+            with self.assertRaisesRegex(DomainError, "account is unavailable"):
+                domain.dispatch(
+                    "model.patch",
+                    {
+                        "provider_id": provider_id,
+                        "model_id": models["first-model"]["editor_id"],
+                        "changes": {"account_ref": "provider-auth-unknown"},
+                    },
+                )
+
+    def test_a_key_route_states_no_account_and_a_login_row_needs_a_credential(
+        self,
+    ) -> None:
+        """A key route answers with its key; a credential-less row is an error.
+
+        A route that names a custom key must not also carry an account — one
+        deployment answers with one credential, and the two fields would
+        disagree the moment either changed.  A route that names neither has
+        nothing to answer as, so Apply refuses it instead of silently writing no
+        route while the pane still lists the model.
+        """
+
+        directory, domain = self._domain()
+        with directory:
+            provider_id = domain.dispatch(
+                "service_provider.add", {"kind": "openai_login"}
+            )["providers"][0]["id"]
+            manager = domain._auth_manager()
+            provider = domain._draft["providers"][0]
+            ref = domain._provider_accounts(provider)[0]["ref"]
+            atomic_write_json(
+                manager._secure_chatgpt_auth_file(ref, create=True),
+                {"access_token": "synthetic-access-token", "expires_at": 4102444800},
+            )
+            domain.dispatch(
+                "provider.key_add", {"provider_id": provider_id, "name": "platform"}
+            )
+            domain.stage_secret(
+                "api_key",
+                f"{provider_id}\u001fplatform",
+                "sk-replace-platform-placeholder",
+            )
+            key = domain._provider_api_keys(domain._draft["providers"][0])[0]
+
+            added = domain.dispatch(
+                "model.add",
+                {
+                    "provider_id": provider_id,
+                    "model": {
+                        "name": "keyed",
+                        "upstream_model": "keyed",
+                        "provider_key_id": key["id"],
+                        "api_key_name": key["name"],
+                        "account_ref": ref,
+                        "enabled": True,
+                    },
+                },
+            )
+            model = added["providers"][0]["models"][0]
+            # The key wins: an account reference beside it is dropped, because
+            # one deployment answers with one credential.
+            self.assertEqual("", model["account_ref"])
+            self.assertEqual(key["id"], model["provider_key_id"])
+
+            # Clearing the key falls back to the row's default account, because
+            # a route that names no credential answers with that account — the
+            # same reading a document written before routes could name one has.
+            cleared = domain.dispatch(
+                "model.patch",
+                {
+                    "provider_id": provider_id,
+                    "model_id": model["editor_id"],
+                    "changes": {"provider_key_id": "", "api_key_name": ""},
+                },
+            )
+            fallback = cleared["providers"][0]["models"][0]
+            self.assertEqual("", fallback["provider_key_id"])
+            self.assertEqual(ref, fallback["account_ref"])
+
+            # A row with no account and no key serves nothing, so its routes are
+            # refused rather than written as deployments nothing can authenticate.
+            domain.dispatch(
+                "service_provider.auth_logout", {"provider_id": provider_id}
+            )
+            validation = domain.validate()
+            self.assertFalse(validation["valid"])
+            self.assertEqual("model_credential_required", validation["issues"][0]["code"])
+
+    def test_signing_one_account_out_moves_its_routes_to_the_row_default(
+        self,
+    ) -> None:
+        """Removing an account keeps its routes answering.
+
+        A route names the account it answers with, so signing that account out
+        would leave the route naming a credential the row no longer owns — and a
+        login-backed row writes no route it cannot authenticate.  The routes move
+        to the row's own default, which is the same choice a route that names
+        nothing already means.
+        """
+
+        directory, domain = self._domain()
+        with directory:
+            provider_id = domain.dispatch(
+                "service_provider.add", {"kind": "openai_login"}
+            )["providers"][0]["id"]
+            manager = domain._auth_manager()
+            provider = domain._draft["providers"][0]
+            first_ref = domain._provider_accounts(provider)[0]["ref"]
+            atomic_write_json(
+                manager._secure_chatgpt_auth_file(first_ref, create=True),
+                {"access_token": "synthetic-first", "expires_at": 4102444800},
+            )
+            started = domain.dispatch(
+                "service_provider.auth_start", {"provider_id": provider_id}
+            )
+            second_ref = started["operation_summary"]["account_ref"]
+            atomic_write_json(
+                manager._secure_chatgpt_auth_file(second_ref, create=True),
+                {"access_token": "synthetic-second", "expires_at": 4102444800},
+            )
+            added = domain.dispatch(
+                "model.add",
+                {
+                    "provider_id": provider_id,
+                    "model": {
+                        "name": "second-only",
+                        "upstream_model": "second-only",
+                        "account_ref": second_ref,
+                        "enabled": True,
+                    },
+                },
+            )
+            model_id = added["providers"][0]["models"][0]["editor_id"]
+
+            domain.dispatch(
+                "service_provider.auth_logout",
+                {"provider_id": provider_id, "account_ref": second_ref},
+            )
+            model = domain.draft_state()["providers"][0]["models"][0]
+            self.assertEqual(first_ref, model["account_ref"])
+            self.assertTrue(domain.validate()["valid"], domain.validate())
+            # The route the pane shows is the route the document writes.
+            snapshot = domain.snapshot()["providers"][0]["models"][0]
+            self.assertEqual(first_ref, snapshot["account_ref"])
+            self.assertEqual(model_id, snapshot["editor_id"])
 
     def test_several_enabled_openai_accounts_are_several_routes(self) -> None:
         """The single-slot rule existed for one process-global token directory.

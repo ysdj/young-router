@@ -17,6 +17,7 @@ from ..api_base import normalize_configured_api_base
 
 from .schema import (
     DEFAULT_API_KEY_NAME,
+    MENU_ACCOUNT_REF_KEY,
     MENU_API_KEY_NAME_KEY,
     MENU_CREDENTIAL_ROUTE_KEY,
     MENU_KEY_BINDING_KEY,
@@ -577,6 +578,12 @@ def _entry_from_editor(
         model_info[MENU_API_KEY_NAME_KEY] = api_key_name
     if provider_key_id:
         model_info[MENU_PROVIDER_KEY_ID_KEY] = provider_key_id
+    # Which account of an account-backed provider this deployment answers with.
+    # An account is not one of the row's keys, so ``api_key_name`` cannot say
+    # it; the entry carries the reference the read-back files it under.
+    account_ref = str(model.get(MENU_ACCOUNT_REF_KEY, "")).strip()
+    if account_ref:
+        model_info[MENU_ACCOUNT_REF_KEY] = account_ref
     # Relay ownership is persisted once on the ProviderKey slot.  Older
     # model-level relay fields are accepted by the loader but deliberately
     # removed on the next save so they cannot drift from the selected key.

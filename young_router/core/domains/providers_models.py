@@ -720,6 +720,63 @@ class ProvidersModelsDomain:
         prefix = cls._upstream_model_prefix(model, provider)
         return f"{prefix}/{name}"
 
+    def _account_backed_model_without_credential(
+        self, provider: Mapping[str, Any], model: Mapping[str, Any]
+    ) -> bool:
+        """Whether a route of an account-backed row can answer with nothing.
+
+        Such a row serves each route on one credential: an account it owns or a
+        key it carries.  A route that names neither the row's default account
+        nor a key it carries is a deployment with no way to authenticate, and
+        the write emits none for it — so the draft must say that, instead of
+        validating and then silently dropping a model the pane still lists.
+        """
+
+        try:
+            auth_kind = self._provider_auth_state(provider)["kind"]
+        except DomainError:
+            return False
+        if auth_kind != "openai_login":
+            return False
+        if str(model.get("provider_key_id", "")).strip() or str(
+            model.get("api_key_name", "")
+        ).strip():
+            return False
+        return self._model_account_ref(provider, model) == ""
+
+    def _model_account_ref(
+        self, provider: Mapping[str, Any], model: Mapping[str, Any]
+    ) -> str:
+        """The signed-in account this route answers with, or nothing.
+
+        An account-backed row's routes each answer with one credential: an
+        account's own adapter or a key at the service address.  The account is
+        not a key slot, so it is projected as its own field — the pane files
+        each route under the account it names, and a route that names a key
+        states no account here.
+
+        Read from the account list rather than the model's own stored text, so
+        a route that names nothing reads as the row's default account (the
+        first one it owns) instead of appearing under no group at all.
+        """
+
+        try:
+            auth_kind = self._provider_auth_state(provider)["kind"]
+        except DomainError:
+            return ""
+        if auth_kind != "openai_login":
+            return ""
+        if str(model.get("provider_key_id", "")).strip() or str(
+            model.get("api_key_name", "")
+        ).strip():
+            # A key-backed route answers with that key, not with an account.
+            return ""
+        named = str(model.get("account_ref", "")).strip()
+        accounts = self._provider_accounts(provider)
+        if named:
+            return named if any(entry["ref"] == named for entry in accounts) else named
+        return accounts[0]["ref"] if accounts else ""
+
     @staticmethod
     def _binding_health(
         model: Mapping[str, Any],
@@ -862,6 +919,13 @@ class ProvidersModelsDomain:
                         "api_base": REDACT_TEXT(str(model.get("api_base", ""))),
                         "api_key_name": model_key_name,
                         "provider_key_id": provider_key_id,
+                        # Which account of this row the route answers with, when
+                        # it answers with one.  A route serves exactly one
+                        # credential, so the pane files it under the account it
+                        # names instead of listing it under every account the
+                        # row owns.  An account is not a key slot, so this is
+                        # its own field; a key-backed route states none.
+                        "account_ref": self._model_account_ref(provider, model),
                         # Relation state is derived from the chosen ProviderKey
                         # so a stale legacy model field cannot claim a relay
                         # association after the key was changed.
@@ -4007,8 +4071,15 @@ class ProvidersModelsDomain:
             model["litellm_model"] = cls._canonical_upstream_model(
                 model.get("litellm_model"), model, provider
             )
-            model["provider_key_id"] = selected_key["id"] if selected_key else ""
-            model["api_key_name"] = selected_key["name"] if selected_key else ""
+            # A row whose transport owns its only slot restates that slot on
+            # every route, because there is exactly one credential to state.
+            # An account-backed row is the opposite: it holds several credentials
+            # (accounts and custom keys), and every route answers with the one it
+            # names — so clearing the key here is what left each model listed
+            # under the row's accounts and never under the key that served it.
+            if selected_key is not None:
+                model["provider_key_id"] = selected_key["id"]
+                model["api_key_name"] = selected_key["name"]
 
     @staticmethod
     def _sync_provider_identity_to_models(provider: dict[str, Any]) -> None:
@@ -4175,6 +4246,47 @@ class ProvidersModelsDomain:
         auth_kind = ProvidersModelsDomain._provider_auth_state(provider)["kind"]
         return auth_kind in managed_adapters.rate_publishing_auth_kinds()
 
+    def _normalize_model_account(
+        self,
+        provider: Mapping[str, Any],
+        model: dict[str, Any],
+    ) -> None:
+        """Keep one route's account and its key slot from disagreeing.
+
+        An account-backed row serves its routes on one credential each: an
+        account through the adapter, or a custom key at the service address.
+        A route therefore states at most one of the two, and a route that names
+        an account the row no longer owns is refused here rather than written as
+        a deployment nothing can authenticate.
+
+        A route that names neither follows the row's own default, and that
+        default is not stored: it is the first account the row owns, which is
+        what a document written before a route could name an account means.
+        """
+
+        try:
+            auth_kind = self._provider_auth_state(provider)["kind"]
+        except DomainError:
+            auth_kind = "api_key"
+        if auth_kind != "openai_login":
+            model.pop("account_ref", None)
+            return
+        named_key_id = str(model.get("provider_key_id", "")).strip()
+        named_key_name = str(model.get("api_key_name", "")).strip()
+        named_account = str(model.get("account_ref", "")).strip()
+        if named_key_id or named_key_name:
+            # A key-backed route answers with that key.  An account reference
+            # beside it would be a second credential for one deployment, and the
+            # two would disagree the moment either changed.
+            model.pop("account_ref", None)
+            return
+        if not named_account:
+            return
+        accounts = self._provider_accounts(provider)
+        if not any(entry["ref"] == named_account for entry in accounts):
+            raise DomainError("The selected provider account is unavailable")
+        model["account_ref"] = named_account
+
     def _normalize_model_binding(
         self,
         provider: Mapping[str, Any],
@@ -4183,6 +4295,7 @@ class ProvidersModelsDomain:
         order_mode = str(model.get("order_mode", "manual")).strip() or "manual"
         if order_mode not in MODEL_ORDER_MODES:
             raise DomainError("Order mode must be manual or relay_multiplier")
+        self._normalize_model_account(provider, model)
         explicit_key_id = str(model.get("provider_key_id", "")).strip()
         explicit_key_name = str(model.get("api_key_name", "")).strip()
         key = self._model_provider_key(provider, model)
@@ -4521,10 +4634,13 @@ class ProvidersModelsDomain:
         }
     )
     _SERVICE_PROVIDER_DEFAULTS: dict[str, dict[str, str]] = {
+        # The OpenAI row carries no default model.  What an account may call is
+        # a fact only its own roster knows, and the pane's 获取模型 reads it as
+        # that account — so a model invented at create time is a route the
+        # user never asked for, on a name this build happened to ship with,
+        # sitting in the list until they noticed and deleted it.
         "openai_login": {
             "name": "OpenAI",
-            "model_name": "gpt-5.4",
-            "upstream_model": "gpt-5.4",
         },
         "claude_login": {
             "name": "Claude",
@@ -4639,7 +4755,10 @@ class ProvidersModelsDomain:
 
         # A newly added account gets one useful default model unless the caller
         # explicitly supplied a model list. The model list remains editable by
-        # the service-management surface, but no raw secret crosses IPC.
+        # the service-management surface, but no raw secret crosses IPC.  A
+        # service that states no default (OpenAI: only the account's own roster
+        # knows what it may call) is created empty, and its first models arrive
+        # through 获取模型, which asks that account.
         raw_models = supplied.get("models")
         if raw_models is None and kind in workbuddy_module.WORKBUDDY_AUTH_KINDS:
             # A WorkBuddy account owns no free-text roster: the desktop app's
@@ -4660,14 +4779,19 @@ class ProvidersModelsDomain:
             raw_models = self._our_free_model_catalog_models(kind, lane_provider)
         if raw_models is None:
             raw_model = supplied.get("model")
-            raw_models = [raw_model] if isinstance(raw_model, Mapping) else [
-                {
-                    "name": defaults["model_name"],
-                    "upstream_model": defaults["upstream_model"],
-                    "enabled": True,
-                    "order": IMPORTED_MODEL_ORDER,
-                }
-            ]
+            if isinstance(raw_model, Mapping):
+                raw_models = [raw_model]
+            elif defaults.get("model_name") and defaults.get("upstream_model"):
+                raw_models = [
+                    {
+                        "name": defaults["model_name"],
+                        "upstream_model": defaults["upstream_model"],
+                        "enabled": True,
+                        "order": IMPORTED_MODEL_ORDER,
+                    }
+                ]
+            else:
+                raw_models = []
         if not isinstance(raw_models, Sequence) or isinstance(raw_models, (str, bytes, bytearray)):
             raise DomainError("Service provider models must be a list")
         used_deployment_ids = {
@@ -5183,6 +5307,7 @@ class ProvidersModelsDomain:
                 if entry["ref"] != credential_ref
             ]
             self._set_provider_accounts(editable, remaining)
+            self._detach_removed_account(editable, credential_ref)
         elif (
             kind == "openai_login"
             and action == "provider_auth_status"
@@ -5200,6 +5325,35 @@ class ProvidersModelsDomain:
             self._set_provider_accounts(editable, accounts)
         self._last_operation = summary
         return summary
+
+    def _detach_removed_account(
+        self, provider: dict[str, Any], credential_ref: str
+    ) -> None:
+        """Keep every route of a row answering after one account goes away.
+
+        A route names the account it answers with, so removing that account
+        would leave the route naming a credential the row no longer owns — and
+        a login-backed row writes no route it cannot authenticate.  The routes
+        move to the row's own default (the first account it still owns), which
+        is the same choice a route that names nothing already means; a row with
+        no account and no key left serves nothing, and its routes stay staged
+        for whoever signs in next.
+        """
+
+        models = provider.get("models")
+        if not isinstance(models, list):
+            return
+        accounts = self._provider_accounts(provider)
+        fallback = accounts[0]["ref"] if accounts else ""
+        for model in models:
+            if not isinstance(model, dict):
+                continue
+            if str(model.get("account_ref", "")).strip() != credential_ref:
+                continue
+            if fallback:
+                model["account_ref"] = fallback
+            else:
+                model.pop("account_ref", None)
 
     def trusted_provider_auth_start(
         self, provider_id: object, credential_ref: object = None
@@ -8091,6 +8245,20 @@ class ProvidersModelsDomain:
                             "path": location,
                             "code": "model_provider_key_missing",
                             "message": "The selected provider key is unavailable",
+                            "severity": "error",
+                        }
+                    )
+                elif self._account_backed_model_without_credential(provider, model):
+                    # An account-backed row serves each route on one credential,
+                    # and a route that names neither an account nor a key is a
+                    # deployment with nothing to answer as: no account is signed
+                    # in, so Core writes no route for it.  Staging it as valid
+                    # let Apply silently drop a model the pane still lists.
+                    issues.append(
+                        {
+                            "path": location,
+                            "code": "model_credential_required",
+                            "message": "Sign in to an account or select a key for this model",
                             "severity": "error",
                         }
                     )

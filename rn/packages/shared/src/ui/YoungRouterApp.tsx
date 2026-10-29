@@ -8,6 +8,7 @@ import { canonicalWindowRoute, isSettingsPaneRoute, isSettingsShellRoute, LOG_TA
 import { NativeButton, NativeBusySpinner, NativeCheckbox, NativePersistentScrollIndicator, NativePicker, NativeSecureTextInput, NativeSegmentedControl, NativeTable, NativeTextField, NativeToggle } from "./NativeControls";
 import { CodeEditorWebView, editorMenuLabels, readOnlyCodeEditorHtml } from "./code-editor/CodeEditorWebView";
 import { modelGroupRowKey, modelIDFromRowKey, modelRowKey } from "./modelRowKeys";
+import { AccountsTable } from "./AccountsTable";
 import { usePendingAction } from "./pendingAction";
 import {
   accountDisplayName,
@@ -883,6 +884,71 @@ type ProviderKeyChoice = {
   source?: RelaySourceOption;
 };
 
+/**
+ * One credential of a login-backed row, as the model list files its routes.
+ *
+ * An account and a custom key are peers of one provider row: both are things a
+ * route answers with, and every route answers with exactly one of them.  `id`
+ * is the same `account:<ref>` / `key:<slot>` spelling the model-list row keys
+ * carry, so a group heading and the routes beneath it address one credential.
+ */
+type ProviderCredential = {
+  id: string;
+  label: string;
+  /** The account this credential signs in, for an account credential. */
+  accountRef?: string;
+  /** The key slot this credential holds, for a key credential. */
+  key?: ProviderKeyState;
+};
+
+/**
+ * Every credential a row answers with, in the order the pane lists them.
+ *
+ * Only an account-backed row has more than one: an ordinary provider's key
+ * slots are already its key table, so its model list stays the flat list it
+ * was.
+ */
+function providerCredentials(provider: UnknownRecord | undefined, translate: Translate): ProviderCredential[] {
+  if (!provider || providerKind(provider) !== "openai") return [];
+  return [
+    ...asRecords(provider.accounts)
+      .filter((account) => stringValue(account.ref))
+      .map((account) => ({
+        id: `account:${stringValue(account.ref)}`,
+        label: providerAuthAccount(account) || stringValue(account.label) || translate("providers.authAccount"),
+        accountRef: stringValue(account.ref),
+      })),
+    ...providerKeyStates(provider)
+      .filter((key) => key.source.kind === "independent" && !key.managed)
+      .map((key) => ({
+        id: `key:${key.id}`,
+        label: apiKeyDisplayName(key.name, translate),
+        key,
+      })),
+  ];
+}
+
+/**
+ * The one credential a route of an account-backed row answers with.
+ *
+ * A route serves exactly one credential, and it says which: an account through
+ * its own `account_ref`, a custom key through the slot it names.  Core projects
+ * the account a route resolves to, so a route that names nothing reads as the
+ * row's default account rather than appearing under no group at all.
+ */
+function modelCredential(
+  model: UnknownRecord | undefined,
+  provider: UnknownRecord,
+  credentials: ProviderCredential[],
+): ProviderCredential | undefined {
+  if (!model || credentials.length === 0) return undefined;
+  const key = modelProviderKeyState(model, provider);
+  if (key) return credentials.find((credential) => credential.id === `key:${key.id}`);
+  const accountRef = stringValue(model.account_ref);
+  if (!accountRef) return undefined;
+  return credentials.find((credential) => credential.accountRef === accountRef);
+}
+
 function relaySourcesFromSnapshot(snapshot: CoreSnapshot | undefined): RelaySourceOption[] {
   const relay = domainState(snapshot, "relay_accounts");
   const accounts = asRecords(relay.accounts);
@@ -1059,7 +1125,11 @@ function relaySourceName(source: RelaySourceOption | undefined): string {
   return source ? [source.accountLabel, source.resourceLabel].filter(Boolean).join("/") : "";
 }
 
-function modelProviderKeyLabel(model: UnknownRecord, provider: UnknownRecord, translate: Translate, keyName?: (keyID: string, name: string) => string, relaySources: RelaySourceOption[] = []): string {
+function modelProviderKeyLabel(model: UnknownRecord, provider: UnknownRecord, translate: Translate, keyName?: (keyID: string, name: string) => string, relaySources: RelaySourceOption[] = [], credentials: ProviderCredential[] = []): string {
+  // An account-backed route answers with one credential, and naming the other
+  // kind would state a key it does not use: an account names the account.
+  const credential = modelCredential(model, provider, credentials);
+  if (credential) return credential.label;
   const key = modelProviderKeyState(model, provider);
   if (!key) return displayLabel(model.api_key_name, translate("providers.undefinedKey"));
   const name = keyName?.(key.id, key.name) ?? key.name;
@@ -3583,7 +3653,6 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       return { value: id, label: stringValue(entry.display_name, stringValue(entry.name, id)) };
     });
   const officialStatus = isOfficialLoginType && selectedProvider ? providerAuthStatus(selectedProvider) : "signed_out";
-  const modelChoicesForOfficial = useMemo(() => (isOfficialLoginType && selectedProvider ? asRecords(selectedProvider.models).map(modelRecord) : []), [isOfficialLoginType, selectedProvider]);
   const servicePickerItems: Array<{ type: WizardType; label: string }> = [
     { type: "api", label: translate("providers.wizard.typeApi") },
     { type: "openai", label: translate("providers.type.openai") },
@@ -4109,14 +4178,53 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       if (request === modelFetchRequest.current) modelFetchInFlight.current = false;
     }
   };
+  /**
+   * List the models one signed-in OpenAI account may serve.
+   *
+   * A ChatGPT login answers its own roster endpoint as that account, and the
+   * answer is Core's (`providers.fetch_models` with `account_ref`): this step
+   * only shows what came back, so the models a wizard creates are the ones the
+   * account itself lists.  Nothing here invents a model name.
+   */
+  const fetchOfficialAccountModels = async (): Promise<void> => {
+    if (modelFetchInFlight.current) return;
+    const accountRef = stringValue(asRecords(selectedProvider?.accounts).find((account) => providerAuthStatus(account) === "signed_in")?.ref);
+    if (!providerID || !accountRef) {
+      setModelFetchState("unavailable");
+      return;
+    }
+    const request = ++modelFetchRequest.current;
+    modelFetchInFlight.current = true;
+    setModelFetchState("loading");
+    try {
+      const next = await dispatchWithOutcome("providers.fetch_models", { provider_id: providerID, account_ref: accountRef }, "providers_models", true);
+      if (request !== modelFetchRequest.current) return;
+      const summary = asRecord(asRecord(next?.action_summaries?.providers_models).operation_summary);
+      if (summary.available === false) {
+        setModelFetchState("unavailable");
+        setValidation(stringValue(summary.detail));
+        return;
+      }
+      const candidates = [...new Set(stringList(summary.models).map((value) => value.trim()).filter(Boolean))];
+      setFetchedModelCandidates(candidates);
+      setSelectedModels(candidates);
+      setModelFetchState(candidates.length > 0 ? "ready" : "empty");
+    } catch {
+      if (request === modelFetchRequest.current) setModelFetchState("unavailable");
+    } finally {
+      if (request === modelFetchRequest.current) modelFetchInFlight.current = false;
+    }
+  };
   useEffect(() => {
     // One listing per ticket, and only while the model step is the surface.
     // This sits after the listing's own declaration so calling it here is not
     // a temporal-dead-zone reference.
     if (modelFetchTicket === 0 || step !== "model") return;
-    // This lane lists its roster from the staged adapter; every other provider
-    // lists from the key/address its keys step staged.
-    void (isOurFreeModelType ? fetchOurFreeModelModels(ourFreeModelProviderID) : fetchWizardModels());
+    // An official login lists the account's own roster; a lane lists the staged
+    // adapter's; every other provider lists from the key/address its keys step
+    // staged.
+    if (isOfficialLoginType && keyPath === "login") void fetchOfficialAccountModels();
+    else void (isOurFreeModelType ? fetchOurFreeModelModels(ourFreeModelProviderID) : fetchWizardModels());
     // The ticket is the trigger; the listing's own inputs are read from this
     // render, which is the model step's.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -4382,9 +4490,9 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       stepRef.current = "keys";
       return;
     }
-    if (isOurFreeModelType) setModelFetchState("loading");
+    if (isOurFreeModelType || (isOfficialLoginType && keyPath === "login")) setModelFetchState("loading");
     advanceStepToModel();
-    if (isOurFreeModelType) setModelFetchTicket((current) => current + 1);
+    if (isOurFreeModelType || (isOfficialLoginType && keyPath === "login")) setModelFetchTicket((current) => current + 1);
   };
   const goNext = async (): Promise<void> => {
     // The primary button keeps reporting its own progress, so the guard that
@@ -4527,8 +4635,35 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     }
     // Model step.
     if (isOfficialLoginType && keyPath === "login") {
-      onStatus(translate("providers.wizard.complete"));
-      onClose();
+      // 完成 records the roster the user kept: the account's own models were
+      // listed on this step, and leaving without them would leave the row
+      // empty for no reason the wizard ever stated.  Nothing picked is still a
+      // finished wizard — the provider pane offers 获取模型 on the account.
+      if (selectedModels.length === 0) {
+        onStatus(translate("providers.wizard.complete"));
+        onClose();
+        return;
+      }
+      setProcessing(true);
+      try {
+        if (!providerID) return;
+        const accountRef = stringValue(asRecords(selectedProvider?.accounts).find((account) => providerAuthStatus(account) === "signed_in")?.ref);
+        const next = await dispatchWithOutcome("model.add_many", {
+          provider_id: providerID,
+          models: selectedModels.map((name) => ({
+            name,
+            upstream_model: name,
+            enabled: true,
+            order: 0,
+            ...(accountRef ? { account_ref: accountRef } : {}),
+          })),
+        });
+        if (!next) return;
+        onStatus(translate("providers.wizard.complete"));
+        onClose();
+      } finally {
+        setProcessing(false);
+      }
       return;
     }
     // WorkBuddy imported nothing here: its models arrive with the account in
@@ -4762,19 +4897,28 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
             </>}
           </>}
         </View> : null}
-        {step === "model" ? isOfficialLoginType && keyPath === "login" ? <View style={styles.providerWizardFormSection}>
-          <View style={styles.providerWizardSectionHeader}><Text style={styles.providerWizardPanelTitle}>{translate("providers.wizard.models")}</Text><Text numberOfLines={1} style={styles.providerWizardHint}>{translate("providers.wizard.providerName")}: {selectedProviderName}</Text></View>
-          <Text style={styles.providerWizardHint}>{translate("providers.wizard.officialModelsHint")}</Text>
-          <View style={styles.providerWizardModelList}>
-            {modelChoicesForOfficial.map((model) => {
-              const modelID = editorIdentifier(model);
-              return <View key={modelID} style={styles.providerWizardManualModelRow}>
-                <Text numberOfLines={1} style={styles.providerWizardManualModelUpstream}>{stringValue(model.display_name, stringValue(model.name, modelID))}</Text>
-                {stringValue(model.upstream_model) ? <Text numberOfLines={1} style={styles.providerWizardManualModelUpstream}>{stringValue(model.upstream_model)}</Text> : null}
-              </View>;
-            })}
-            {modelChoicesForOfficial.length === 0 ? <Text style={styles.providerWizardHint}>{translate("common.loading")}</Text> : null}
+        {step === "model" ? isOfficialLoginType && keyPath === "login" ? <View style={styles.providerWizardModelPane}>
+          {/* The roster is the account's own: 获取模型 asks that account what it
+              may serve, exactly as the provider pane does, so a wizard never
+              writes a model name this build guessed.  Every row it answered is
+              offered and every one starts checked, because the step exists to
+              record a choice the user can now make — a model list they have to
+              fill in by hand would be the invention this replaces. */}
+          <View style={styles.providerWizardModelFormSection}>
+            <View style={styles.providerWizardSectionHeader}><Text style={styles.providerWizardPanelTitle}>{translate("providers.wizard.models")}</Text><Text numberOfLines={1} style={styles.providerWizardHint}>{translate("providers.wizard.providerName")}: {selectedProviderName}</Text></View>
+            <Text style={styles.providerWizardHint}>{translate("providers.wizard.officialModelsHint")}</Text>
+            <View style={styles.providerWizardModelToolbar}>
+              {modelFetchState === "loading" ? <NativeBusySpinner label={translate("providers.wizard.fetchingModels")} /> : <>
+                {fetchedModelCandidates.length > 0 ? <NativeButton title={translate(selectedModels.length === fetchedModelCandidates.length ? "dataManagement.deselectAll" : "dataManagement.selectAll")} compact link disabled={wizardBusy} onPress={() => { setSelectedModels(selectedModels.length === fetchedModelCandidates.length ? [] : [...fetchedModelCandidates]); setValidation(""); }} /> : null}
+                <NativeButton title={translate("providers.wizard.refreshModels")} compact link disabled={wizardBusy} onPress={() => { void fetchOfficialAccountModels(); }} />
+              </>}
+            </View>
           </View>
+          <View style={styles.providerWizardModelListFrame}><PersistentScrollView style={styles.providerWizardModelListScroll} contentContainerStyle={styles.providerWizardModelList} showsVerticalScrollIndicator keyboardShouldPersistTaps="handled">
+            {fetchedModelCandidates.map((name) => <NativeCheckbox key={`official:${name}`} label={name} value={selectedModels.includes(name)} disabled={wizardBusy} onValueChange={(checked) => { setSelectedModels((current) => checked ? (current.includes(name) ? current : [...current, name]) : current.filter((item) => item !== name)); setValidation(""); }} style={styles.providerWizardModelCheckbox} />)}
+            {modelFetchState === "empty" ? <Text style={styles.providerWizardHint}>{translate("providers.fetchEmpty")}</Text> : null}
+            {modelFetchState === "unavailable" ? <Text style={styles.providerWizardHint}>{validation || translate("providers.wizard.loginFirstHint")}</Text> : null}
+          </PersistentScrollView></View>
         </View> : isWorkBuddyType ? <View style={styles.providerWizardFormSection}>
           <View style={styles.providerWizardSectionHeader}><Text style={styles.providerWizardPanelTitle}>{translate("providers.wizard.models")}</Text><Text numberOfLines={1} style={styles.providerWizardHint}>{translate("providers.wizard.providerName")}: {selectedProviderName}</Text></View>
           <Text style={styles.providerWizardHint}>{translate("providers.wizard.workbuddyAssociationHint")}</Text>
@@ -5468,7 +5612,15 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     const inheritedKey = modelProviderKeyState(model, provider)
       ?? providerKeyStates(provider).find((key) => key.id === selectedFetchKey)
       ?? providerKeyStates(provider)[0];
-    runMutationOnce(`model.add:${providerId}`, () => dispatch("model.add", { provider_id: providerId, model: { name, upstream_model: name, enabled: true, order: 0, ...(inheritedKey ? { api_key_name: inheritedKey.name, provider_key_id: inheritedKey.id } : {}) } }));
+    // An account is a credential too, and an account-backed row's ＋ lands on
+    // the account the row's own routes answer with — the one the list is
+    // showing, else the first it owns — so the new row is filed in a group the
+    // user can see instead of under a credential it does not have.
+    const inheritedAccount = inheritedKey || providerKindSelected !== "openai"
+      ? ""
+      : modelCredential(model, provider, providerCredentials(provider, translate))?.accountRef
+        ?? stringValue(asRecords(provider.accounts)[0]?.ref);
+    runMutationOnce(`model.add:${providerId}`, () => dispatch("model.add", { provider_id: providerId, model: { name, upstream_model: name, enabled: true, order: 0, ...(inheritedKey ? { api_key_name: inheritedKey.name, provider_key_id: inheritedKey.id } : {}), ...(inheritedAccount ? { account_ref: inheritedAccount } : {}) } }));
   };
 
   const addProvider = (): void => {
@@ -5787,23 +5939,16 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   // A login row serves its models on its credentials, not on a key: every
   // signed-in account and every custom key is a group of its own, and the model
   // list states that hierarchy instead of dropping every row into one column.
-  const modelCredentials = useMemo(() => {
-    if (providerKindSelected !== "openai" || !provider) return [];
-    return [
-      ...asRecords(provider.accounts)
-        .filter((account) => providerAuthStatus(account) === "signed_in")
-        .map((account) => ({
-          id: `account:${stringValue(account.ref)}`,
-          label: providerAuthAccount(account) || translate("providers.authAccount"),
-        })),
-      ...providerKeyStates(provider)
-        .filter((key) => key.source.kind === "independent" && !key.managed)
-        .map((key) => ({
-          id: `key:${key.id}`,
-          label: apiKeyDisplayName(key.name, translate),
-        })),
-    ];
-  }, [provider, providerKindSelected, translate]);
+  // A login row serves its models on its credentials, not on a key: every
+  // account and every custom key is a group of its own, and the model list
+  // states that hierarchy instead of dropping every row into one column.  The
+  // groups are every account the row owns — a signed-out one included, because
+  // its routes are still listed and a heading is how the reader sees that
+  // they are parked — and then every custom key.
+  const modelCredentials = useMemo(
+    () => providerCredentials(provider, translate),
+    [provider, translate],
+  );
   const modelRows = useMemo(() => {
     // The key name is its own column: one spanning row per key, with that
     // key's models listed (and indented) underneath it.  A model that belongs
@@ -5836,17 +5981,29 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     const ungrouped: UnknownRecord[] = [];
     const grouped = new Map<string, { label: string; models: UnknownRecord[] }>();
     for (const item of models) {
-      const key = modelProviderKeyState(item, provider ?? {});
-      if (!key) {
+      // A route of an account-backed row is filed by the credential it answers
+      // with, and an account is not a key slot: asking the key first put every
+      // account's route in the ungrouped bucket, beside the group that was
+      // there to hold it.
+      if (modelCredentials.length === 0) {
+        const key = modelProviderKeyState(item, provider ?? {});
+        if (!key) {
+          ungrouped.push(item);
+          continue;
+        }
+        const list = grouped.get(key.id);
+        if (list) {
+          list.models.push(item);
+          continue;
+        }
+        grouped.set(key.id, { label: modelProviderKeyLabel(item, provider ?? {}, translate, undefined, relaySources), models: [item] });
+        continue;
+      }
+      if (!modelCredential(item, provider ?? {}, modelCredentials)) {
+        // Neither an account nor a key this row carries: the list still has to
+        // show the row so it can be repaired or deleted.
         ungrouped.push(item);
-        continue;
       }
-      const list = grouped.get(key.id);
-      if (list) {
-        list.models.push(item);
-        continue;
-      }
-      grouped.set(key.id, { label: modelProviderKeyLabel(item, provider ?? {}, translate, undefined, relaySources), models: [item] });
     }
     const modelCells = (item: UnknownRecord): string[] => {
       const multiplier = relaySourceForKey(modelProviderKeyState(item, provider ?? {}), relaySources)?.multiplier;
@@ -5858,21 +6015,19 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     };
     if (modelCredentials.length > 0) {
       // One group per credential, and a model is listed exactly once: under the
-      // credential it names.  A row that names no credential belongs to the
-      // provider's own default, which is not one of these groups — listing it
-      // under every group put one route on screen several times, and a 启用 box
-      // on one of those copies read as a switch for the others.  That is how a
-      // route's own enabled state appeared to move other routes with it.  So
-      // those rows come first, ungrouped, exactly as the no-credential list
-      // draws them.  The header is a spanning row: a heading is not an entry,
-      // and a spanning row is one the native tables refuse to select, which is
-      // what keeps a click on the account or the key name inert.
+      // credential it answers with.  A route of an account-backed row serves
+      // exactly one credential — an account through its own adapter, or a key
+      // at the service address — and Core projects the account it resolves to,
+      // so every route lands in exactly one group and no group heading claims
+      // routes it does not serve.  A route no group can claim (a key slot that
+      // was deleted in another window) still has to be listed and acted on, so
+      // it comes first, ungrouped.  The header is a spanning row: a heading is
+      // not an entry, and a spanning row is one the native tables refuse to
+      // select, which is what keeps a click on the account or the key name
+      // inert.
       for (const item of ungrouped) rows.push({ key: modelRowKey("", editorIdentifier(item)), cells: modelCells(item) });
       for (const credential of modelCredentials) {
-        const own = models.filter((item) => {
-          const ownKey = modelProviderKeyState(item, provider ?? {});
-          return Boolean(ownKey) && credential.id.endsWith(ownKey!.id);
-        });
+        const own = models.filter((item) => modelCredential(item, provider ?? {}, modelCredentials)?.id === credential.id);
         // A heading with nothing under it is not a group, it is an empty row
         // that claims the credential serves routes it does not serve.
         if (own.length === 0) continue;
@@ -5895,8 +6050,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   const modelRowKeys = useCallback((modelIDs: string[]): string[] => (modelCredentials.length > 0
     ? modelIDs.flatMap((modelID) => {
       const record = models.find((item) => editorIdentifier(item) === modelID);
-      const ownKey = record ? modelProviderKeyState(record, provider ?? {}) : undefined;
-      const credential = modelCredentials.find((entry) => ownKey && entry.id.endsWith(ownKey.id));
+      const credential = record ? modelCredential(record, provider ?? {}, modelCredentials) : undefined;
       return [modelRowKey(credential ? credential.id : "", modelID)];
     })
     : modelIDs), [modelCredentials, models, provider]);
@@ -5976,7 +6130,11 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
           key: entry.key,
           // The upstream model leads the row: it is what tells the routes of
           // one public model apart, before the provider that serves it.
-          cells: [`\t${modelUpstreamDisplay(editorIdentifier(entry.provider), entry.model) || translate("common.notAvailable")}`, providerDisplayName(entry.provider), modelProviderKeyLabel(entry.model, entry.provider, translate, undefined, relaySources), order],
+          // The credential column names what this route answers with: an
+          // account of its row, a relay key's `账号/分组`, or a key slot.  An
+          // account is not a key, so the row's own credential list decides
+          // the label instead of a key lookup that would print 未定义密钥.
+          cells: [`\t${modelUpstreamDisplay(editorIdentifier(entry.provider), entry.model) || translate("common.notAvailable")}`, providerDisplayName(entry.provider), modelProviderKeyLabel(entry.model, entry.provider, translate, undefined, relaySources, providerCredentials(entry.provider, translate)), order],
         });
       }
     }
@@ -6112,7 +6270,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
             <NativeTable columns={[{ label: translate("providers.provider"), width: 132 }]} rows={providerRows} disabledRowKeys={disabledProviderKeys} alertRowKeys={alertProviderKeys} selectedKey={providerId} compact firstColumnHorizontalPadding={0} onSelectionChange={(key) => { setSelectedProvider(key); setSelectedModel(undefined); setProviderSourceModel(undefined); }} style={styles.nativeProviderTable} />
           </TablePane>
           <View style={styles.providerMiddlePane} onLayout={({ nativeEvent }) => setModelTableWidth(nativeEvent.layout.width)}>
-            <TablePane style={[styles.modelListPane]} title={translate("providers.models")} actions={<>{provider && providerKindSelected !== "openai" && providerKindSelected !== "claude" ? <IconButton label="+" title={translate("providers.newModel")} disabled={busy} onPress={addModel} /> : null}{model ? <IconButton label="⧉" title={translate("common.copy")} disabled={busy} onPress={duplicateModel} /> : null}{model ? <IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteModel} /> : null}</>}>
+            <TablePane style={[styles.modelListPane]} title={translate("providers.models")} actions={<>{provider && providerKindSelected !== "claude" ? <IconButton label="+" title={translate("providers.newModel")} disabled={busy} onPress={addModel} /> : null}{model ? <IconButton label="⧉" title={translate("common.copy")} disabled={busy} onPress={duplicateModel} /> : null}{model ? <IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteModel} /> : null}</>}>
               <View style={styles.nativeModelTable}><NativeTable columns={modelTableColumns(modelTableWidth, translate)} rows={modelRows} disabledRowKeys={disabledModelKeys} alertRowKeys={alertModelKeys} selectedKey={selectedModelRowKey} compact firstColumnHorizontalPadding={0} preserveColumnWidths onSelectionChange={(key) => { if (!key) { setSelectedModel(undefined); setSelectedModelRow(undefined); setProviderSourceModel(undefined); return; } const modelID = modelIDFromRowKey(key); if (modelID === undefined) return; setSelectedModel(modelID); setSelectedModelRow(key); setProviderSourceModel(undefined); }} style={styles.modelTable} /></View>
               {provider && providerKindSelected !== "claude" ? <View style={styles.tableBottomRow}>{fetchKeyChoices.length > 0 ? <NativePicker labels={fetchKeyOptions.length > 0 ? fetchKeyOptions.map((option) => option.label) : [translate("common.default")]} selectedValue={fetchKeyOptions.find((option) => option.value === selectedFetchKey)?.label ?? translate("common.default")} disabled={busy} onChange={({ nativeEvent }) => { const option = fetchKeyOptions[nativeEvent.index]; if (option) setFetchKeyID(option.value); }} style={styles.fetchKeyPicker} /> : null}<ActionButton title={translate("providers.fetch")} busy={fetchModelsBusy} disabled={(busy && !fetchModelsBusy) || (fetchKeyChoices.length > 0 && !selectedFetchKey)} onPress={() => { void fetchModels(); }} /></View> : null}
             </TablePane>
@@ -6814,6 +6972,9 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
   // with the user's keys only; the auth-kind gate above then narrows that to
   // providers that have any.
   const keyStates = providerAuthKind(provider) === "api_key" ? providerKeyStates(provider).filter((key) => !key.managed) : [];
+  // An account-backed row's route names one credential, and both kinds are
+  // offered: the accounts the row owns and the custom keys it carries.
+  const routeCredentials = providerAuthKind(provider) === "openai_login" ? providerCredentials(provider, translate) : [];
   const selectedProviderKey = keyStates.find((key) => key.id === stringValue(model.provider_key_id))
     ?? keyStates.find((key) => key.name === stringValue(model.api_key_name));
   const usesRelayKey = selectedProviderKey?.source.kind === "relay";
@@ -6914,6 +7075,35 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
       changes: { provider_key_id: providerKey.id, api_key_name: providerKeyName },
     });
   };
+  // Which credential this route answers with, for a row that holds more than
+  // one kind.  An account and a custom key are peers of the same provider, and
+  // a route serves exactly one of them: the choice is a field of the route, not
+  // of the row, which is why it is edited here beside 上游 and 顺序 rather than
+  // only in the key list.  Choosing an account drops the key the route named
+  // (one deployment answers with one credential); choosing a key drops the
+  // account.
+  const credentialChoices = providerAuthKind(provider) === "openai_login" ? routeCredentials : [];
+  const routeCredential = modelCredential(model, provider, credentialChoices);
+  const selectRouteCredential = (credentialID: string): void => {
+    const credential = credentialChoices.find((entry) => entry.id === credentialID);
+    if (!credential) return;
+    if (credential.accountRef) {
+      void dispatch("model.patch", {
+        provider_id: providerId,
+        model_id: id,
+        changes: { account_ref: credential.accountRef, provider_key_id: "", api_key_name: "" },
+      });
+      return;
+    }
+    const key = credential.key;
+    if (!key) return;
+    const keyName = drafts?.providerKeyDisplayName(providerId, key.id, key.name) ?? key.name;
+    void dispatch("model.patch", {
+      provider_id: providerId,
+      model_id: id,
+      changes: { account_ref: "", provider_key_id: key.id, api_key_name: keyName },
+    });
+  };
   return <View style={styles.inspectorContent}>
     {/* The second segment names the model this detail edits, not the public
         name the group above it shares: the public name already labels the
@@ -6957,7 +7147,15 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
         </View>
       </View> : null}
       <PickerField label={translate("providers.provider")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} allowShrink value={providerLabel} values={providerLabels} disabled={busy || providers.length <= 1} onSelect={(label) => { const next = providers[providerLabels.indexOf(label)]; if (next) onProviderChange(editorIdentifier(next)); }} />
-      {isDraftModel(model, translate) ? <Text style={styles.fieldHint}>{translate(selectedProviderKey ? "providers.draftModelHint" : "providers.draftModelKeylessHint")}</Text> : null}
+      {isDraftModel(model, translate) ? <Text style={styles.fieldHint}>{translate(selectedProviderKey || routeCredential ? "providers.draftModelHint" : "providers.draftModelKeylessHint")}</Text> : null}
+      {/* An account-backed route states the one credential it answers with,
+          and every credential the row holds is offered — an account by its
+          account, a key by its name — so a model is filed under the account or
+          key the user chose instead of every credential the row happens to
+          own.  This field does not exist for an ordinary provider: there a
+          key slot *is* the credential, and the key picker below already says
+          it. */}
+      {credentialChoices.length > 1 ? <PickerField label={translate("providers.routeCredential")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} allowShrink value={routeCredential?.id ?? ""} values={credentialChoices.map((credential) => ({ value: credential.id, label: credential.label }))} disabled={busy} onSelect={selectRouteCredential} /> : null}
       {providerKeyOptions.length > 0 ? <PickerField label={translate("providers.providerKey")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} allowShrink value={selectedProviderKey?.id ?? ""} values={[{ value: "", label: translate("providers.undefinedKey") }, ...providerKeyOptions]} disabled={busy} onSelect={selectProviderKey} /> : null}
       {bindingIssueText ? <Text style={styles.fieldHint}>{bindingIssueText}</Text> : null}
       {serviceRate.trim() ? <View style={styles.formRow}>
@@ -7626,6 +7824,29 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
     error: translate("providers.authStatusError"),
     unsupported: translate("providers.authStatusUnsupported"),
   };
+  // The account the list highlights, and the rows it draws.  The list owns the
+  // selection the way the station's does: an explicitly cleared one (a click
+  // below the rows) leaves the editor empty instead of acting on an account the
+  // list no longer highlights, while the first account still opens the block on
+  // load.
+  //
+  // These derive from `statusLabels`, which is a `const` declared above them and
+  // *below* the identity fields: reading it any earlier is a temporal dead zone
+  // read, and the `TypeError` it throws inside this component's render reaches
+  // React's TurboModule call and aborts the whole app.  A status word is the
+  // last thing this block needs, so the block is stated last.
+  const [selectedAuthAccountRef, setSelectedAuthAccountRef] = useState<string>();
+  const selectedAuthAccount = authAccounts.find((account) => stringValue(account.ref) === (selectedAuthAccountRef ?? stringValue(authAccounts[0]?.ref)))
+    ?? (selectedAuthAccountRef === undefined ? authAccounts[0] : undefined);
+  const authAccountRows = authAccounts
+    .filter((account) => stringValue(account.ref))
+    .map((account) => ({
+      key: stringValue(account.ref),
+      cells: [
+        providerAuthAccount(account) || stringValue(account.label) || translate("providers.authAccount"),
+        statusLabels[providerAuthStatus(account)],
+      ],
+    }));
   const model = asRecords(provider.models)[0];
   const modelNameText = model ? stringValue(model.display_name, stringValue(model.name, stringValue(model.upstream_model, translate("common.notAvailable")))) : translate("common.notAvailable");
   useEffect(() => {
@@ -7898,23 +8119,61 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
       onStatus={onStatus}
       language={language}
       bindingIssues={bindingIssues}
-      credentials={kind === "openai" ? authAccounts.filter((account) => stringValue(account.ref)).map((account) => ({ ref: stringValue(account.ref), name: providerAuthAccount(account) || translate("providers.authAccount") })) : undefined}
-      // The accounts of an OpenAI row are credentials of that row, so they are
-      // listed beside its keys and their actions sit in the same editor column:
-      // one list of what the row answers with, one place to act on the selected
-      // entry.  A stacked accounts block under the list made the pane read as
-      // two unrelated tables and pushed 退出登录 away from the row it ends.
-      help={<HelpTip open={accountHelpOpen} text={accountHelpText} title={translate("providers.serviceLinks")} onToggle={() => setAccountHelpOpen((current) => !current)} />}
-      credentialStatus={kind === "openai" ? (ref) => statusLabels[providerAuthStatus(authAccounts.find((account) => stringValue(account.ref) === ref))] : undefined}
-      credentialSignIn={kind === "openai" ? { label: translate("relay.officialProviderAddLogin"), busy: authPending === "sibling", disabled: (busy || loginBusy) && authPending !== "sibling", onPress: () => { void addSiblingAccount(); } } : undefined}
-      credentialActions={kind === "openai" ? (ref) => (
-        <NativeButton title={translate("relay.officialProviderLogout")} compact busy={authPending === `logout:${ref}`} disabled={busy || loginBusy || providerAuthStatus(authAccounts.find((account) => stringValue(account.ref) === ref)) !== "signed_in"} onPress={() => { void logoutAccount(ref); }} />
-      ) : undefined}
+      // An OpenAI row's accounts are not keys of that row: an account is a
+      // credential Core holds and the adapter resolves, so the key panel lists
+      // the row's custom keys alone.  The accounts get the same list a station
+      // draws, under the same title a station uses — 账号关联 — because they
+      // answer the same question: which signed-in account this row serves from.
+      help={kind === "openai" ? <HelpTip open={accountHelpOpen} text={accountHelpText} title={translate("providers.accountLinks")} onToggle={() => setAccountHelpOpen((current) => !current)} /> : undefined}
       variant="inline"
     /> : null}
+    {/* One signed-in account is not a key slot: it is a credential Core holds
+        and the adapter resolves, so it is listed and acted on in its own block
+        rather than mixed into the key table.  The block is the station's own
+        shape — the shared account list, its ±, then the selected account's
+        actions — so the two kinds of association read the same, and the pane
+        never draws an account as an editable API key. */}
+    {kind === "openai" ? <View style={styles.officialAccountSection}>
+      <AccountsTable
+        title={translate("providers.accountLinks")}
+        actions={<>
+          {authAccounts.length < 8 ? <NativeButton title="" symbol="plus" compact toolTip={translate("relay.officialProviderAddLogin")} accessibilityLabel={translate("relay.officialProviderAddLogin")} busy={authPending === "sibling"} disabled={(busy || loginBusy) && authPending !== "sibling"} style={styles.iconButton} onPress={() => { void addSiblingAccount(); }} /> : null}
+          {/* − ends the account the list highlights: signing it out removes it
+              from this row, so the one control does both.  It reads the list's
+              own selection, which falls back to the first account exactly as
+              the pane below it does — the station's − behaves the same way, and
+              a control that vanished until a row was clicked was a second rule
+              for the same list. */}
+          {selectedAuthAccount ? <NativeButton title="" symbol="minus" compact destructive toolTip={translate("relay.officialProviderLogout")} accessibilityLabel={translate("relay.officialProviderLogout")} busy={authPending === `logout:${stringValue(selectedAuthAccount.ref)}`} disabled={(busy || loginBusy) && authPending !== `logout:${stringValue(selectedAuthAccount.ref)}`} style={styles.iconButton} onPress={() => { void logoutAccount(stringValue(selectedAuthAccount.ref)); }} /> : null}
+        </>}
+        columns={[{ label: translate("relay.accounts"), width: 96 }, { label: translate("providers.authStatus"), width: 74 }]}
+        rows={authAccountRows}
+        selectedKey={stringValue(selectedAuthAccount?.ref)}
+        onSelectionChange={(key) => setSelectedAuthAccountRef(key || undefined)}
+        alertRowKeys={authAccounts.filter((account) => providerAuthStatus(account) === "expired").map((account) => stringValue(account.ref))}
+        emptyText={translate("relay.stationNoAccounts")}
+      />
+      {selectedAuthAccount ? <View style={styles.accountEditor}>
+        {/* One row, the station's own shape: 账号, its value, then 状态.  The
+            account is stated as a reading — its email, its own state — because
+            it is the service's identity, not something this pane may edit.
+
+            There is no 退出登录 here: the list's − *is* the sign-out.  An account
+            is one row of this list, and ending it is removing that row — the
+            same decision the station's own − makes, on the same surface, with
+            the same words.  A second button for it put two controls on one
+            action and made the row's own removal look like a thing that
+            happened to something else. */}
+        <View style={styles.fieldRow}>
+          <Text style={styles.fieldLabel}>{translate("relay.accountField")}</Text>
+          <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{providerAuthAccount(selectedAuthAccount) || stringValue(selectedAuthAccount.label) || translate("providers.authAccount")}</Text>
+          <Text style={styles.fieldLabel}>{translate("providers.authStatus")}</Text>
+          <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{statusLabels[providerAuthStatus(selectedAuthAccount)]}</Text>
+        </View>
+      </View> : null}
+    </View> : null}
     {/* A Claude row keeps its own single-account block: it is one device login,
-        so there is no list of accounts to draw.  An OpenAI row's accounts are
-        credentials of that row, so the panel above lists them beside its keys. */}
+        so there is no list of accounts to draw. */}
     {isOfficialAccount && kind !== "openai" ? <View style={styles.officialAccountSection}>
       <View style={styles.panelHeader}><Text style={styles.panelTitle}>{translate("providers.serviceLinks")}</Text></View>
       {authAccount ? <View style={styles.officialStatusRow}>
@@ -8577,6 +8836,12 @@ function AssistantSettingsWorkspace({ busy, native, codexModels, codexModelCatal
 }
 
 function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServiceAction, translate, onStatus, onSnapshot }: { snapshot?: CoreSnapshot; ipc: IpcClient; native: NativeLeafAdapter; busy: boolean; dispatch: Dispatch; dispatchServiceAction: (type: string) => Promise<unknown>; translate: Translate; onStatus: (message?: string) => void; onSnapshot: (next: CoreSnapshot) => void }): React.JSX.Element {
+  // The API-key field is native, so its result reaches this pane as a state
+  // event rather than a dispatch result; a failure belongs in the window's one
+  // status strip, beside every other result this pane reports.
+  const onApiKeyState = useCallback((state: SecretState) => {
+    if (state.status === "error" && state.error !== "") onStatus(state.error);
+  }, [onStatus]);
   const [autoStartBusy, setAutoStartBusy] = useState(false);
   const [serviceBusy, setServiceBusy] = useState(false);
   const [requestedAutoStart, setRequestedAutoStart] = useState<boolean>();
@@ -8601,6 +8866,10 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
   const portItem = runtimeSettings.find((item) => identifier(item) === "LITELLM_PORT");
   const portValue = stringValue(portItem?.value, "");
   const portDefault = stringValue(portItem?.default, "12390");
+  // The proxy's API key is the credential this window hands the user's own
+  // clients, so its field is the one credential the pane draws in the clear:
+  // the native control holds the value, Core hands it over the read-once
+  // native lease, and no snapshot ever carries it.
   const validatePort = (next: string): string | undefined => {
     const trimmed = next.trim();
     if (!/^\d+$/.test(trimmed)) return translate("runtime.invalidInteger");
@@ -8735,6 +9004,16 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
         <RuntimeValueField label={translate("general.port")} value={portValue} keyboardType="numeric" validate={validatePort} onCommit={(next) => dispatch("set_setting", { key: "LITELLM_PORT", value: next })} />
       </View>
       <View style={styles.generalHelpSlot}><Text style={styles.generalHelpText}>{translate("general.portHint", { default: portDefault })}</Text></View>
+      <View style={styles.generalRow}>
+        <Text style={styles.generalRowLabel}>{translate("general.apiKey")}</Text>
+        {/* The one plaintext credential field: the key is drawn so it can be
+            copied into a client, and the value arrives over the native read
+            lease rather than through a Core snapshot. */}
+        <View style={styles.generalApiKeyField}>
+          <NativeSecretInputControl label={translate("general.apiKey")} hint={translate("general.apiKeyPlaceholder")} busy={busy || snapshot === undefined} domain="runtime" field="setting" target="YOUNG_ROUTER_MASTER_KEY" plainText autoCommit onSecretState={onApiKeyState} />
+        </View>
+      </View>
+      <View style={styles.generalHelpSlot}><Text style={styles.generalHelpText}>{translate("general.apiKeyHint")}</Text></View>
     </View>
   </PersistentScrollView>;
 }
@@ -12232,9 +12511,14 @@ const styles = StyleSheet.create({
   // on the left where every other route states its status, and the page controls
   // sit on the right of that same row rather than in a strip above the table.
   usageStatusBar: { minHeight: 24, flexShrink: 0, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8, paddingHorizontal: 16, paddingVertical: 2, borderTopWidth: 1, borderTopColor: systemColors.separator }, routeStatusText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE },
-  generalScroll: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, generalContent: { paddingTop: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, paddingBottom: 16, gap: 18 }, generalSection: { gap: 4 }, generalSectionTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, generalRow: { ...SETTINGS_FIELD_ROW_INDENTED }, generalRowLabel: { ...SETTINGS_FIELD_LABEL }, generalRowValue: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, generalToggle: { ...SETTINGS_FIELD_SWITCH_SLOT }, generalHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }, generalHelpText: { ...SETTINGS_FIELD_HELP_TEXT }, generalServiceAction: { minWidth: 96 }, providerToolbar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardToolbarButton: { minWidth: 104 }, toolbarSpacer: { flex: 1 }, windowTabsRow: { flex: 1, minWidth: 0, height: 28, flexDirection: "row", alignItems: "center", gap: 8 }, windowTabsToolbarRow: { flex: 1, minWidth: 0, width: "100%", height: 24, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 6, overflow: "hidden" }, windowTabs: { width: 224, height: 24 }, windowTabsWithActions: { flexShrink: 1 }, windowTabsActions: { flex: 1, minWidth: 0, maxWidth: 400, marginLeft: "auto", flexShrink: 0 },
+  generalScroll: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, generalContent: { paddingTop: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, paddingBottom: 16, gap: 18 }, generalSection: { gap: 4 }, generalSectionTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, generalRow: { ...SETTINGS_FIELD_ROW_INDENTED }, generalRowLabel: { ...SETTINGS_FIELD_LABEL }, generalRowValue: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, generalToggle: { ...SETTINGS_FIELD_SWITCH_SLOT }, generalHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }, generalHelpText: { ...SETTINGS_FIELD_HELP_TEXT }, generalServiceAction: { minWidth: 96 }, generalApiKeyField: { flex: 1, minWidth: 0, maxWidth: 320 }, providerToolbar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardToolbarButton: { minWidth: 104 }, toolbarSpacer: { flex: 1 }, windowTabsRow: { flex: 1, minWidth: 0, height: 28, flexDirection: "row", alignItems: "center", gap: 8 }, windowTabsToolbarRow: { flex: 1, minWidth: 0, width: "100%", height: 24, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 6, overflow: "hidden" }, windowTabs: { width: 224, height: 24 }, windowTabsWithActions: { flexShrink: 1 }, windowTabsActions: { flex: 1, minWidth: 0, maxWidth: 400, marginLeft: "auto", flexShrink: 0 },
   providerWizardSetupContent: { flex: 1, minHeight: 0, justifyContent: "flex-start", alignItems: "center", paddingHorizontal: 24, paddingTop: 18, paddingBottom: 12 }, providerWizardSetupSurface: { width: "100%", maxWidth: 520, minWidth: 0, gap: 12 }, providerWizardSetupSurfaceModel: { flex: 1, minHeight: 0 }, providerWizardSignInPanel: { width: "100%", minHeight: 160, justifyContent: "center", gap: 8, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 7, backgroundColor: systemColors.control, paddingHorizontal: 16, paddingVertical: 18 }, providerWizardAuthRow: { minHeight: 30, flexDirection: "row", alignItems: "center", gap: 8 }, providerWizardAuthStatus: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
-  providerMiddlePane: { flex: 1, minWidth: 0, gap: 6 }, providerEmptyState: { flex: 1, minWidth: 0, minHeight: 0, alignItems: "center", justifyContent: "center", paddingHorizontal: 28, paddingVertical: 24, gap: 8, backgroundColor: systemColors.textBackground }, providerEmptyGlyph: { width: 44, height: 44, borderRadius: 22, alignItems: "center", justifyContent: "center", backgroundColor: systemColors.selectedContent }, providerEmptyGlyphText: { color: systemColors.selectedControlText, fontSize: 28, fontWeight: "300", lineHeight: 34 }, providerEmptyTitle: { color: systemColors.label, fontSize: 17, fontWeight: "600", textAlign: "center" }, providerEmptyHint: { maxWidth: 380, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 18, textAlign: "center" }, providerEmptyActions: { alignSelf: "center", flexDirection: "row", alignItems: "center", gap: 8, paddingTop: 6 },
+  providerMiddlePane: { flex: 1, minWidth: 0, gap: 6 }, // The empty pane reads as the top of a list that has no rows yet, not as a
+  // poster centred in a large window: it keeps the column's width and the
+  // window's whole height (a `flex: 1` the sibling panes rely on), but packs its
+  // glyph, title, and action against the top so the space below stays available
+  // for the first provider that arrives instead of reading as a blank page.
+  providerEmptyState: { flex: 1, minWidth: 0, minHeight: 0, alignItems: "center", justifyContent: "flex-start", paddingHorizontal: 28, paddingTop: 24, paddingBottom: 24, gap: 8, backgroundColor: systemColors.textBackground }, providerEmptyGlyph: { width: 44, height: 44, borderRadius: 22, alignItems: "center", justifyContent: "center", backgroundColor: systemColors.selectedContent }, providerEmptyGlyphText: { color: systemColors.selectedControlText, fontSize: 28, fontWeight: "300", lineHeight: 34 }, providerEmptyTitle: { color: systemColors.label, fontSize: 17, fontWeight: "600", textAlign: "center" }, providerEmptyHint: { maxWidth: 380, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 18, textAlign: "center" }, providerEmptyActions: { alignSelf: "center", flexDirection: "row", alignItems: "center", gap: 8, paddingTop: 6 },
   keysPane: { flex: 1, minWidth: 0, minHeight: 0 }, keysInline: { minWidth: 0, gap: 6, paddingTop: 6, borderTopWidth: 1, borderTopColor: systemColors.separator }, keysInlineBody: { minWidth: 0, height: KEYS_INLINE_LIST_HEIGHT, flexDirection: "row", alignItems: "flex-start", gap: 6 }, keysTableInline: { flex: 1, minWidth: 0, height: KEYS_INLINE_LIST_HEIGHT, minHeight: KEYS_INLINE_LIST_HEIGHT }, keysEditorInline: { width: KEYS_INLINE_EDITOR_WIDTH, minWidth: 0, flexGrow: 0, flexShrink: 0, gap: 5 }, keysEditorField: { minWidth: 0, gap: 2 }, keysEditorFieldHeader: { height: 22, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 4 }, keysEditorFieldLabel: { flexShrink: 1, color: systemColors.label, fontSize: UI_FONT_SIZE },
   keysTable: { flex: 1, minHeight: 120 },
   keysEditor: { minWidth: 0, gap: 5, paddingTop: 5, paddingLeft: 8, borderLeftWidth: 2, borderLeftColor: systemColors.separator },
@@ -12248,6 +12532,10 @@ const styles = StyleSheet.create({
   officialStatusRow: { minHeight: 22, flexDirection: "row", alignItems: "center", gap: 6 },
   providerAuthLine: { color: systemColors.label, fontSize: UI_FONT_SIZE },
    officialActionsRow: { minHeight: 28, flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 6 },
+  // The selected account's own row under the account list: 账号 and its value,
+  // then 状态 and the session action, wrapping before anything overlaps.
+  accountEditor: { minWidth: 0, gap: 5 },
+  fieldRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6, flexWrap: "wrap" },
   providerWizardSectionHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardPanelTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerWizardFormSection: { width: "100%", maxWidth: 520, minHeight: 0, paddingVertical: 0, gap: 10 }, providerWizardModelFormSection: { flex: 1, minHeight: 0, width: "100%", maxWidth: 520, paddingVertical: 0, gap: 10 }, // The model step scrolls in exactly one place: the roster box.  The step body is an
  // ordinary column, so the pane can never grow a second scroller beside the list.
  providerWizardModelPane: { flex: 1, minHeight: 0, width: "100%", justifyContent: "flex-start", paddingBottom: 8 }, // One row, so the state sentence is the part that gives way: it shrinks and

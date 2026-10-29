@@ -371,6 +371,9 @@ export const zhHans: Record<TranslationKey, string> = {
   "general.serviceHint": "本地代理随应用启动；启动失败时可在此重试。",
   "general.port": "本地端口",
   "general.portHint": "默认值: {default} · 端口被占用时自动顺延到下一个可用端口；修改后会自动重启服务。",
+  "general.apiKey": "API Key",
+  "general.apiKeyHint": "客户端访问本机代理时使用的 Bearer 密钥。此处明文显示，方便复制到客户端；修改后会自动重启服务，并同步改写已指向本机代理的客户端。",
+  "general.apiKeyPlaceholder": "sk-young-router",
   "runtime.invalidNumber": "请输入数字",
   "runtime.invalidInteger": "请输入整数",
   "runtime.outOfRange": "请输入 {min} - {max} 之间的值",
@@ -614,6 +617,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "providers.deleteApiKeyModelsMessage": "将同时删除该密钥下模型:\n{models}",
   "providers.deleteApiKeyNoModelsMessage": "没有模型使用此密钥。",
   "providers.relayKeyValueHint": "由服务商管理",
+  "providers.routeCredential": "关联账号",
   "providers.providerKey": "密钥名",
   "providers.keyOrderColumn": "密钥名 / 顺序",
   "providers.order": "顺序",
@@ -713,6 +717,10 @@ export const zhHans: Record<TranslationKey, string> = {
   "providers.keysProvided": "供应商提供",
   "providers.orphanKeyHint": "该密钥在中转站上已不存在，只在本地保留。删除它不会影响中转站。",
   "providers.providedKeysNeedAccount": "还没有已登录账号。在右侧“账号管理”中添加并登录账号后，供应商提供的密钥会显示在这里。",
+  // The same association block a 中转站 provider draws, under the name that
+  // service uses: an account row links the accounts it signs in, exactly as a
+  // station row links the accounts of its station.
+  "providers.accountLinks": "账号关联",
   "providers.accounts": "中转站关联",
   "providers.detail": "详情",
   "providers.wizard.typeApi": "API 供应商",

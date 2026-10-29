@@ -10,6 +10,7 @@ from .schema import (
     current_managed_reference,
     DISABLED_MODELS_KEY,
     MENU_API_KEY_NAME_KEY,
+    MENU_ACCOUNT_REF_KEY,
     MENU_CREDENTIAL_ROUTE_KEY,
     MENU_KEY_BINDING_KEY,
     MENU_MANUAL_ORDER_KEY,
@@ -88,6 +89,14 @@ def _provider_to_editor(name: str, value: Any) -> dict[str, Any]:
         for item in _as_list(provider.get("auth_accounts"))
         if _string_value(_as_dict(item).get("ref")).strip()
     ]
+    if not accounts and auth.get("kind") == "openai_login" and auth.get("credential_ref"):
+        # A document written before the account list existed names exactly one
+        # account, in the mirrored reference.  Reading it as the list keeps every
+        # later answer about this row the same shape — and a route that folds in
+        # another account's entry appends to a list rather than replacing one.
+        accounts = [
+            {"ref": auth["credential_ref"], "label": "", "enabled": True}
+        ]
     return {
         "name": name,
         "enabled": _bool_value(provider.get("enabled"), True),
@@ -313,6 +322,7 @@ def _model_to_editor(
             "provider",
             MENU_ROUTE_KEY,
             MENU_CREDENTIAL_ROUTE_KEY,
+            MENU_ACCOUNT_REF_KEY,
             MENU_API_KEY_NAME_KEY,
             MENU_PROVIDER_KEY_ID_KEY,
             MENU_RELAY_CATALOG_MODE_KEY,
@@ -371,6 +381,7 @@ def _model_to_editor(
         "api_key": api_key,
         "api_key_name": api_key_name,
         "provider_key_id": provider_key_id,
+        "account_ref": _string_value(model_info.get(MENU_ACCOUNT_REF_KEY)).strip(),
         "catalog_mode": catalog_mode,
         "source_model_id": _string_value(model_info.get(MENU_RELAY_SOURCE_MODEL_KEY)).strip(),
         "order_mode": order_mode,
@@ -432,6 +443,29 @@ def _wire_model_name(value: str) -> str:
     """
 
     return value.split("/", 1)[1].strip() if "/" in value else value.strip()
+
+
+#: The scheme a ``chatgpt/`` route names its account with (see
+#: ``config.dump``).  Read here so a document written before a route could state
+#: its account reads back as the account it answers with.
+_ACCOUNT_CREDENTIAL_SCHEME = "young-router-auth:"
+
+
+def _account_from_credential(model: dict[str, Any]) -> str:
+    """The account a legacy route's own credential names, or nothing.
+
+    A document written before routes named their account wrote every route once
+    per credential instead, and each account's entry states the account in the
+    credential itself.  Folding such a file into one row per model would
+    otherwise drop the only record of which account the row answers with, so the
+    reference is read back here: the row states its account, and the next save
+    writes the shape the pane reads.
+    """
+
+    credential = str(model.get("api_key", "")).strip()
+    if not credential.startswith(_ACCOUNT_CREDENTIAL_SCHEME):
+        return ""
+    return credential[len(_ACCOUNT_CREDENTIAL_SCHEME):].strip()
 
 
 def _append_model_to_provider(
@@ -499,6 +533,22 @@ def _append_model_to_provider(
     # credential value, because there the value is the only evidence left.  Two
     # keys that read alike are never one key: a route bound to a linked slot must
     # not answer with a hand-made slot that happens to hold the same credential.
+    # Which account this entry answers with, when its own credential names one.
+    # It is recorded on the row and the entry alike, so a later save writes the
+    # account the pane shows and a second save is not a rewrite.
+    account_ref = _account_from_credential(model)
+    if account_ref:
+        model["account_ref"] = account_ref
+        accounts = provider_entry.get("auth_accounts")
+        known = {
+            _string_value(_as_dict(item).get("ref")).strip()
+            for item in _as_list(accounts)
+        }
+        if account_ref not in known:
+            provider_entry["auth_accounts"] = [
+                *_as_list(accounts),
+                {"ref": account_ref, "label": "", "enabled": True},
+            ]
     provider_key_rows = [
         {
             "id": _string_value(_as_dict(item).get("id")).strip()
@@ -537,7 +587,9 @@ def _append_model_to_provider(
     # that key by default.  The recorded marker is the same statement, made
     # explicitly by a file this app wrote.
     states_a_key = bool(model_key_name or model_key_id)
-    heals_by_value = not states_a_key and bool(str(model.get("api_key", "")).strip())
+    # An entry whose credential names an account is not a key route: its
+    # credential is the adapter's own reference, not a value any key slot holds.
+    heals_by_value = not states_a_key and not account_ref and bool(str(model.get("api_key", "")).strip())
     if heals_by_value and not unbound_entry:
         key_name = _ensure_provider_key(
             provider_entry,

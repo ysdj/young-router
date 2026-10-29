@@ -2482,6 +2482,104 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
             )
 
 
+class ConfigBackupRetentionTests(unittest.TestCase):
+    """A save keeps a hand-undoable copy, not the whole edit history.
+
+    Every Apply copies the document it is about to replace.  Nothing removed
+    those copies, so an installation opened a few hundred times held a thousand
+    of them and nineteen megabytes of configuration history no pane reads.
+    """
+
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.path = self.root / "config.yaml"
+        self.path.write_text(
+            textwrap.dedent(
+                """
+                providers:
+                  primary:
+                    api_base: "https://example.test/v1"
+                    api_keys:
+                      - name: default
+                        value: "sk-replace-me-secret"
+                model_list:
+                  - model_name: default-chat
+                    litellm_params:
+                      model: openai/default-chat
+                      api_base: "https://example.test/v1"
+                      api_key: "sk-replace-me-secret"
+                    model_info:
+                      id: "00000091"
+                      provider: primary
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+
+    def _apply(self) -> dict:
+        loaded = config_api.load_config(self.path)
+        return config_api.save_config(
+            loaded["providers"],
+            self.path,
+            _revision_of(self.path),
+            loaded["document"],
+        )
+
+    def test_only_the_newest_copies_of_one_document_survive(self) -> None:
+        for _ in range(config_api.BACKUP_RETENTION + 4):
+            self._apply()
+
+        stamps = sorted(
+            candidate.name
+            for candidate in self.root.glob("config.yaml.bak-*")
+        )
+        self.assertEqual(config_api.BACKUP_RETENTION, len(stamps))
+        # The newest copy is the document one Apply ago, not the first one.
+        self.assertTrue(stamps[-1].endswith(_newest_stamp(self.root)))
+
+    def test_a_copy_this_build_did_not_write_is_never_deleted(self) -> None:
+        """A hand-made name states an intent no rotation rule can know."""
+
+        handmade = self.root / "config.yaml.bak-before-key-switch-20260920-215017"
+        handmade.write_text("kept\n", encoding="utf-8")
+
+        for _ in range(config_api.BACKUP_RETENTION + 2):
+            self._apply()
+
+        self.assertTrue(handmade.exists())
+        self.assertEqual("kept\n", handmade.read_text(encoding="utf-8"))
+
+    def test_the_stamped_copies_still_bound_the_disabled_companion(self) -> None:
+        companion = config_api._disabled_models_path(self.path)
+        companion.write_text("disabled_model_list: []\n", encoding="utf-8")
+
+        for _ in range(config_api.BACKUP_RETENTION + 3):
+            self._apply()
+            # A copy is only written when the file it guards exists, so the
+            # companion has to be present before each save that may drop it.
+            companion.write_text("disabled_model_list: []\n", encoding="utf-8")
+
+        self.assertEqual(
+            config_api.BACKUP_RETENTION,
+            len(list(self.root.glob(f"{companion.name}.bak-*"))),
+        )
+
+
+def _revision_of(path: Path) -> str:
+    return config_schema._config_revision(path)
+
+
+def _newest_stamp(root: Path) -> str:
+    stamps = sorted(
+        candidate.name.rsplit(".bak-", 1)[1]
+        for candidate in root.glob("config.yaml.bak-*")
+        if re.fullmatch(r"config\.yaml\.bak-\d{8}-\d{6}-\d{6}", candidate.name)
+    )
+    return stamps[-1]
+
+
 class YamlTextParseReuseTests(unittest.TestCase):
     """One settings action must not re-parse the same document ten times.
 
@@ -2559,13 +2657,17 @@ class YamlTextParseReuseTests(unittest.TestCase):
 
 
     def test_one_provider_serves_its_accounts_and_its_keys_as_peer_routes(self) -> None:
-        """An OpenAI row is the service, not one account.
+        """A route answers with the one credential it names.
 
-        Every serving account and every custom key of the same row contributes
-        one deployment per model — an account through the ChatGPT adapter with
-        its own credential reference, a key as an ordinary OpenAI route at the
-        provider's address — and the route id a credential produces survives a
-        second save, so the routes table keeps one identity per account.
+        An OpenAI row is the service, and its routes pick what serves them: an
+        account through the ChatGPT adapter, or a custom key as an ordinary
+        OpenAI route at the provider's address.  One route is one deployment of
+        one credential, and the route id a credential produces survives a second
+        save, so the routes table keeps one identity per account.
+
+        Writing a route once per credential is the shape this replaces: every
+        route answered with every credential, so the pane listed each model under
+        every account and key at once and could not say which one it belonged to.
         """
 
         with tempfile.TemporaryDirectory() as directory:
@@ -2589,7 +2691,18 @@ class YamlTextParseReuseTests(unittest.TestCase):
                         "litellm_model": "chatgpt/gpt-5.4",
                         "enabled": True,
                         "deployment_id": "abcd1234",
-                    }
+                    },
+                    {
+                        # The same model on the row's key is a second route, and
+                        # only that one answers with the key.
+                        "model_name": "gpt-5.4",
+                        "upstream_model": "gpt-5.4",
+                        "litellm_model": "chatgpt/gpt-5.4",
+                        "provider_key_id": "slot-1",
+                        "api_key_name": "platform",
+                        "enabled": True,
+                        "deployment_id": "abcd5678",
+                    },
                 ],
             }
             config_api.save_config([provider], path=path)
@@ -2602,7 +2715,17 @@ class YamlTextParseReuseTests(unittest.TestCase):
             # every request it was handed.
             self.assertNotIn("young-router-auth:provider-auth-two", by_key)
             self.assertIn("sk-platform", by_key)
-            self.assertEqual("chatgpt/gpt-5.4", by_key["young-router-auth:provider-auth-one"]["litellm_params"]["model"])
+            account_route = by_key["young-router-auth:provider-auth-one"]
+            self.assertEqual("chatgpt/gpt-5.4", account_route["litellm_params"]["model"])
+            # The entry records which account it answers with, because an account
+            # is not one of the row's key slots and ``api_key_name`` cannot say it.
+            self.assertEqual(
+                "provider-auth-one",
+                account_route["model_info"]["x-young-router-account-ref"],
+            )
+            self.assertNotIn(
+                "x-young-router-account-ref", by_key["sk-platform"]["model_info"]
+            )
             self.assertEqual("openai/gpt-5.4", by_key["sk-platform"]["litellm_params"]["model"])
             self.assertEqual("https://api.openai.com/v1", by_key["sk-platform"]["litellm_params"]["api_base"])
             # The account list is config: a reload serves every account the row
@@ -2617,14 +2740,14 @@ class YamlTextParseReuseTests(unittest.TestCase):
             self.assertEqual(first_ids, sorted(route["model_info"]["id"] for route in second))
 
     def test_a_credential_route_reads_back_as_the_one_row_it_belongs_to(self) -> None:
-        """One model is one row however many credentials serve it.
+        """One model is one row, and every credential's route is the same row.
 
-        The writer emits an entry per credential, and every entry is a
-        *deployment* of the same row.  Read back as rows, a provider's model
-        list doubled on each save: each deployment became a row, each row was
-        written once per credential again, and the document grew without bound
-        until the proxy refused to start.  The folded row therefore keeps the
-        row's id, and a second save writes exactly the entries the first did.
+        A row's routes are one per credential they name, and each entry states
+        the row it belongs to.  Read back as rows, a provider's model list
+        doubled on each save: each deployment became a row, each row was written
+        again, and the document grew without bound until the proxy refused to
+        start.  The folded row therefore keeps the row's id, and a second save
+        writes exactly the entries the first did.
         """
 
         with tempfile.TemporaryDirectory() as directory:
@@ -2653,7 +2776,9 @@ class YamlTextParseReuseTests(unittest.TestCase):
             }
             config_api.save_config([provider], path=path)
             first = yaml.safe_load(path.read_text(encoding="utf-8"))["model_list"]
-            self.assertEqual(3, len(first), first)
+            # One route, one credential: the row's default account.  The key
+            # beside the account serves only a route that names it.
+            self.assertEqual(1, len(first), first)
 
             for _ in range(4):
                 reloaded = config_load.load_config(path)
@@ -2668,6 +2793,54 @@ class YamlTextParseReuseTests(unittest.TestCase):
                     sorted(route["model_info"]["id"] for route in first),
                     sorted(route["model_info"]["id"] for route in again),
                 )
+
+    def test_a_legacy_route_reads_back_as_the_account_its_credential_names(
+        self,
+    ) -> None:
+        """A file written before routes named an account still says which one.
+
+        The shape this replaces wrote every route once per credential, so a file
+        on disk carries one entry per account with the account stated only in the
+        credential itself (``young-router-auth:<ref>``).  Folding those entries
+        into one row per model dropped the only record of which account the row
+        answers with: the pane then showed the model under no account at all, and
+        the next save wrote it with whatever account happened to be first.  The
+        read puts the reference back on the row and on the account list, so the
+        account the pane shows is the one the file already answered with.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(
+                "providers:\n"
+                "  OpenAI:\n"
+                "    x-young-router-provider-auth:\n"
+                "      kind: openai_login\n"
+                "      credential_ref: provider-auth-one\n"
+                "model_list:\n"
+                "  - model_name: gpt-5.4\n"
+                "    litellm_params:\n"
+                "      model: chatgpt/gpt-5.4\n"
+                "      api_key: young-router-auth:provider-auth-two\n"
+                "    model_info:\n"
+                "      provider: OpenAI\n"
+                "      id: abcd1234\n",
+                encoding="utf-8",
+            )
+            loaded = config_load.load_config(path)
+            provider = loaded["providers"][0]
+            self.assertEqual(
+                ["provider-auth-one", "provider-auth-two"],
+                [entry["ref"] for entry in provider["auth_accounts"]],
+            )
+            self.assertEqual(1, len(provider["models"]))
+            # The entry's own credential decides, not the row's mirrored one:
+            # the route answered with the second account, so that is what it says.
+            self.assertEqual("provider-auth-two", provider["models"][0]["account_ref"])
+            # ...and it is not read back as a key slot: the adapter's reference
+            # is not a value any key holds.
+            self.assertEqual("", provider["models"][0]["provider_key_id"])
+            self.assertEqual("", provider["models"][0]["api_key_name"])
 
     def test_a_login_rows_account_list_survives_a_save(self) -> None:
         """The accounts are a field, not an unread extension.

@@ -92,6 +92,16 @@ MENU_API_KEY_NAME_KEY = "api_key_name"
 MENU_RELAY_KEYS_KEY = "x-young-router-relay-keys"
 MENU_RELAY_KEYS_VERSION = 1
 MENU_PROVIDER_KEY_ID_KEY = "x-young-router-provider-key-id"
+#: The signed-in account one route of a login-backed provider answers with.
+#:
+#: An account and a custom key are peers of one provider row, so the key slot a
+#: route names (its ``api_key_name``) cannot also say which account it answers
+#: with: an account is not one of the row's keys, it is a credential the adapter
+#: resolves from its own auth file.  The account-backed scope therefore records
+#: the account reference here, exactly as it records ``MENU_CREDENTIAL_ROUTE_KEY``
+#: above for the row the entry belongs to, so the read-back knows which of the
+#: row's credentials produced this deployment.
+MENU_ACCOUNT_REF_KEY = "x-young-router-account-ref"
 #: The route row one credential-scoped entry belongs to.
 #:
 #: An account-backed provider writes one entry per credential (see
