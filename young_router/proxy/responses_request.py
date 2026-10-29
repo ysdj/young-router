@@ -2055,6 +2055,41 @@ def _codex_view_image_output_parts(output: Any) -> list[dict]:
     ]
 
 
+def _request_has_view_image_history(input_items: Any) -> bool:
+    """Recognize image-tool history when LiteLLM stripped Codex metadata.
+
+    The gateway can receive a complete Responses rollout without the headers
+    or metadata used by the normal Codex evidence check.  A paired image
+    output from a dedicated ``view_image`` call (or the older ``exec`` script
+    shape) is specific enough to authorize the image replay pass on its own.
+    """
+
+    if not isinstance(input_items, list):
+        return False
+    view_image_call_ids: set[str] = set()
+    image_output_ids: list[set[str]] = []
+    for item in input_items:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type in {"custom_tool_call", "function_call"}:
+            is_view_image_call = item.get("name") == "view_image"
+            if not is_view_image_call:
+                source = _codex_view_image_call_source(item)
+                is_view_image_call = (
+                    source is not None and "view_image" in source
+                )
+            if is_view_image_call:
+                view_image_call_ids.update(_item_pair_identifiers(item))
+        elif item_type in {"custom_tool_call_output", "function_call_output"}:
+            if _codex_view_image_output_parts(item.get("output")):
+                image_output_ids.append(set(_item_pair_identifiers(item)))
+    return any(
+        output_ids and view_image_call_ids.intersection(output_ids)
+        for output_ids in image_output_ids
+    )
+
+
 def _codex_view_image_referenced_paths(value: Any) -> set[str]:
     """Read path references already emitted in mutable tool-output text."""
 
@@ -3473,8 +3508,10 @@ def _with_prefix_image_previews(request_kwargs: dict) -> Optional[dict]:
         _trace_prefix_image_preview_gate(request_kwargs, "not-responses-shape")
         return None
     if not _request_has_codex_client_evidence(request_kwargs):
-        _trace_prefix_image_preview_gate(request_kwargs, "no-codex-evidence")
-        return None
+        input_items = request_kwargs.get("input")
+        if not _request_has_view_image_history(input_items):
+            _trace_prefix_image_preview_gate(request_kwargs, "no-codex-evidence")
+            return None
     input_items = request_kwargs.get("input")
     if not isinstance(input_items, list):
         _trace_prefix_image_preview_gate(request_kwargs, "no-input-list")

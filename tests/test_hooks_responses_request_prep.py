@@ -1627,6 +1627,60 @@ class HookResponsesRequestPrepTests(HookTestCase):
         # The client's own history is never mutated.
         self.assertEqual(original["input"][1]["output"][1]["image_url"], frozen_output["output"][1]["image_url"])
 
+    def test_prefix_image_previews_accept_native_view_image_without_codex_metadata(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
+        self.set_env(hooks._PREFIX_IMAGE_PREVIEW_MIN_BYTES_ENV, "1000")
+        oversized_url = "data:image/png;base64," + ("N" * 160_000)
+        call = {
+            "type": "function_call",
+            "id": "fc-native-replay",
+            "call_id": "call-native-replay",
+            "name": "view_image",
+            "arguments": '{"path":"/tmp/native-replay.png"}',
+        }
+        output = {
+            "type": "function_call_output",
+            "id": "fco-native-replay",
+            "call_id": "call-native-replay",
+            "output": [{"type": "input_image", "image_url": oversized_url}],
+        }
+        request = {
+            "call_type": "aresponses",
+            "input": [
+                call,
+                output,
+                {"type": "reasoning", "encrypted_content": "opaque"},
+            ],
+        }
+
+        hooks._PREFIX_IMAGE_PREVIEW_CACHE.clear()
+        with mock.patch.object(
+            hooks._image_inputs_module,
+            "_resize_data_url",
+            return_value="data:image/jpeg;base64,native-replay-preview",
+        ):
+            modified = hooks._with_prefix_image_previews(request)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        updated_output = modified["input"][1]["output"]
+        self.assertIn(
+            hooks._CODEX_VIEW_IMAGE_REFERENCE_MARKER,
+            updated_output[0]["text"],
+        )
+        self.assertIn("/tmp/native-replay.png", updated_output[0]["text"])
+        self.assertEqual(
+            updated_output[1]["image_url"],
+            "data:image/jpeg;base64,native-replay-preview",
+        )
+        mismatched_output = dict(output, call_id="call-unrelated")
+        self.assertFalse(
+            hooks._request_has_view_image_history(
+                [call, mismatched_output, request["input"][2]]
+            )
+        )
+
     async def test_pre_call_hook_reduces_prefix_images_before_context_selection(self) -> None:
         hooks, _ = load_hook_module()
         self.use_replay_image_cache()
