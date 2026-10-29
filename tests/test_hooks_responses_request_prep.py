@@ -4493,6 +4493,37 @@ class HookResponsesToolOutputReplayWindowTests(HookTestCase):
             "input": items,
         }
 
+    def test_medium_records_are_trimmed_when_the_drop_floor_is_not_enough(self) -> None:
+        """The latency budget bounds small records too, but only as a fallback."""
+
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._HISTORY_TOOL_OUTPUT_LATENCY_BUDGET_ENV, "60000")
+        request = self._request(pairs=10, payload_chars=15_000)
+
+        updated = hooks._with_elided_oversized_tool_outputs(request)
+
+        self.assertIsNotNone(updated)
+        assert updated is not None
+        lane_weight = sum(
+            hooks._responses_request_module._tool_record_weight(item)
+            for item in updated["input"]
+            if item["type"] in {"function_call", "function_call_output"}
+        )
+        self.assertLessEqual(lane_weight, 60_000)
+        outputs = [
+            item
+            for item in updated["input"]
+            if item["type"] == "function_call_output"
+        ]
+        self.assertEqual(outputs[-1]["output"], "x" * 15_000)
+        self.assertTrue(
+            any(
+                isinstance(item["output"], list)
+                and "elided" in item["output"][0]["text"]
+                for item in outputs[:-1]
+            )
+        )
+
     def test_a_history_of_many_medium_outputs_is_trimmed_by_size(self) -> None:
         """A light-output history must not replay whole.
 
@@ -4520,7 +4551,8 @@ class HookResponsesToolOutputReplayWindowTests(HookTestCase):
         ]
         kept = [item for item in outputs if item["output"] == "x" * 30_000]
         self.assertLessEqual(len(kept) * 30_000, 60_000)
-        self.assertEqual(len(kept), 2)
+        self.assertLessEqual(len(kept), 2)
+        self.assertGreaterEqual(len(kept), 1)
         elided = [item for item in outputs if item["output"] != "x" * 30_000]
         self.assertTrue(elided)
         self.assertIn("elided", elided[0]["output"][0]["text"])

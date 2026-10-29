@@ -3171,10 +3171,9 @@ def _with_elided_oversized_tool_outputs(request_kwargs: dict) -> Optional[dict]:
 
     Two rules keep this pass from becoming a memory budget, which is what a
     window below the drop threshold did when it emptied every read the model
-    had made: the newest record of a lane is always kept whole, and a lane whose
-    emptied records still leave it over the ceiling keeps them all, because that
-    trim cannot make the request fit and only spends the evidence the model was
-    working from.
+    had made: the newest record of a lane is always kept whole, and small
+    records are touched only when the larger records did not bring the lane
+    under the ceiling.
 
     This pass runs after the image passes, and it may only rewrite what they
     left behind: an image output already replaced by previews and path
@@ -3218,36 +3217,56 @@ def _with_elided_oversized_tool_outputs(request_kwargs: dict) -> Optional[dict]:
         # emptied once the lane leaves the window, record by record.
         newest_index = lane_indices[-1] if lane_indices else -1
         lane_elisions: dict[int, dict] = {}
-        for index in reversed(lane_indices):
+
+        def elide_output(index: int) -> bool:
+            nonlocal weight
+            if index == newest_index or index in lane_elisions:
+                return False
             item = input_items[index]
-            if not isinstance(item, dict):
-                continue
-            if index == newest_index:
-                continue
-            if not item.get("type", "").endswith("_output"):
-                continue
+            if not isinstance(item, dict) or not item.get("type", "").endswith("_output"):
+                return False
             item_weight = _tool_record_weight(item)
-            if item_weight <= min_chars:
-                continue
+            if item_weight <= 0:
+                return False
             updated = dict(item)
             updated["output"] = [
                 {"type": "input_text", "text": _elided_tool_call_note(item_weight)}
             ]
-            # Keep the existing whole-record floor for small records, but do
-            # not preserve one old record that is itself larger than the
-            # latency budget merely because removing it crosses the ceiling.
-            if weight - item_weight <= kept_chars and item_weight <= kept_chars:
-                break
+            updated_weight = _tool_record_weight(updated)
+            # A tiny output can be shorter than its explanatory note.  Replacing
+            # it would make the request larger, so leave it intact.
+            if updated_weight >= item_weight:
+                return False
             lane_elisions[index] = updated
-            weight -= item_weight
+            weight -= item_weight - updated_weight
+            return True
+
+        # First remove records above the normal drop floor.  This preserves the
+        # useful small outputs in the common case where the budget is met
+        # without touching them.
+        for index in reversed(lane_indices):
+            if index == newest_index:
+                continue
+            item = input_items[index]
+            if not isinstance(item, dict) or not item.get("type", "").endswith("_output"):
+                continue
+            if _tool_record_weight(item) <= min_chars:
+                continue
+            elide_output(index)
             if weight <= kept_chars:
                 break
-        # A lane over the ceiling is trimmed as far as its own eligible records
-        # take it, and the newest record always stays whole.  Reaching the
-        # ceiling is not required for the trim to be worth it: one 150KB
-        # snapshot dropped from a 240KB tail is the case this pass exists for,
-        # even though the lane's small records still leave it over a small
-        # ceiling.
+
+        # A history made of many medium records can remain over the budget
+        # because each record is below the drop floor.  Once the large records
+        # are gone, spend only the remaining excess on older small outputs.
+        if weight > kept_chars:
+            for index in reversed(lane_indices):
+                if elide_output(index) and weight <= kept_chars:
+                    break
+
+        # A lane can still exceed the ceiling when its newest record alone is
+        # larger than it.  Keep that record whole, but record the exception so
+        # the trace distinguishes it from a lane we could not trim further.
         if weight > kept_chars:
             over_ceiling_lanes.append(lane)
         elided_by_index.update(lane_elisions)
