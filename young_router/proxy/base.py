@@ -662,18 +662,15 @@ _HISTORY_TOOL_OUTPUT_CHARS_PER_TOKEN = 3
 _HISTORY_TOOL_OUTPUT_KEPT = 8
 _PREFIX_IMAGE_ORIGINAL_PATH_ENV = "YOUNG_ROUTER_PREFIX_IMAGE_ORIGINAL_PATH"
 _PREFIX_IMAGE_ORIGINAL_PATH_DEFAULT = True
-# A replayed image may only be replaced by a path reference when the client can
-# still open that path later.  When it cannot, the same bytes are copied next to
-# the file they came from: the model derives its crop paths from the path it
-# reads, so a copy belongs in that file's own directory.  Only a source inside
-# the router's own storage (or one with no usable directory) falls back to OS
-# temporary storage; the router never advertises a path inside its own storage.
+# A replayed image may only be replaced by a path reference the producing call
+# itself wrote.  This proxy does not know whether it can see the filesystem that
+# path belongs to -- a desktop proxy shares it with the client, a remote gateway
+# does not -- so it neither substitutes a copy of its own (which a remote
+# client's view_image cannot open) nor declares the path dead because this host
+# cannot see it.  ``YOUNG_ROUTER_IMAGE_CACHE_DIR`` still relocates a
+# router-owned literal the model is about to write (see
+# ``_neutral_attachment_copy``), and is the one directory this module bounds.
 _PREFIX_IMAGE_CACHE_DIR_ENV = "YOUNG_ROUTER_IMAGE_CACHE_DIR"
-_PREFIX_IMAGE_CACHE_MAX_FILES_ENV = "YOUNG_ROUTER_IMAGE_CACHE_MAX_FILES"
-_PREFIX_IMAGE_CACHE_MAX_FILES_DEFAULT = 2048
-_PREFIX_IMAGE_CACHE_MAX_BYTES_ENV = "YOUNG_ROUTER_IMAGE_CACHE_MAX_BYTES"
-_PREFIX_IMAGE_CACHE_MAX_BYTES_DEFAULT = 2 * 1024 * 1024 * 1024
-_PREFIX_IMAGE_CACHE_GRACE_SECONDS = 900
 # Keep the old name as the public upper-bound constant used by diagnostics and
 # tests.  It is intentionally the maximum, not a fixed per-image size.
 _CODEX_VIEW_IMAGE_PREVIEW_TARGET_BYTES = _CODEX_VIEW_IMAGE_PREVIEW_MAX_TARGET_BYTES

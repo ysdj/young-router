@@ -51,11 +51,6 @@ from .base import (
     _PREFIX_IMAGE_ORIGINAL_PATH_DEFAULT,
     _PREFIX_IMAGE_ORIGINAL_PATH_ENV,
     _PREFIX_IMAGE_CACHE_DIR_ENV,
-    _PREFIX_IMAGE_CACHE_GRACE_SECONDS,
-    _PREFIX_IMAGE_CACHE_MAX_BYTES_DEFAULT,
-    _PREFIX_IMAGE_CACHE_MAX_BYTES_ENV,
-    _PREFIX_IMAGE_CACHE_MAX_FILES_DEFAULT,
-    _PREFIX_IMAGE_CACHE_MAX_FILES_ENV,
     _CHAT_COMPAT_REASONING_EFFORT,
     _FALLBACK_BROWSER_USER_AGENT,
     _MAX_COMPAT_REASONING_EFFORT,
@@ -2284,17 +2279,6 @@ def _prefix_image_preview_resized(image_url: str) -> str:
     return resized
 
 
-_REPLAY_IMAGE_CACHE_EXTENSIONS = {
-    "image/jpeg": ".jpg",
-    "image/jpg": ".jpg",
-    "image/png": ".png",
-    "image/webp": ".webp",
-    "image/gif": ".gif",
-    "image/bmp": ".bmp",
-    "image/tiff": ".tiff",
-}
-
-
 def _configured_replay_image_cache_root() -> Optional[Path]:
     """Return the operator-configured copy directory, when one is set."""
 
@@ -2356,30 +2340,6 @@ def _future_replay_image_copy_path(source: Path) -> str:
     return str(root / name)
 
 
-def _prefix_image_cache_max_files() -> int:
-    raw = os.getenv(_PREFIX_IMAGE_CACHE_MAX_FILES_ENV, "").strip()
-    if raw:
-        try:
-            parsed = int(raw)
-        except ValueError:
-            parsed = -1
-        if parsed > 0:
-            return parsed
-    return _PREFIX_IMAGE_CACHE_MAX_FILES_DEFAULT
-
-
-def _prefix_image_cache_max_bytes() -> int:
-    raw = os.getenv(_PREFIX_IMAGE_CACHE_MAX_BYTES_ENV, "").strip()
-    if raw:
-        try:
-            parsed = int(raw)
-        except ValueError:
-            parsed = -1
-        if parsed > 0:
-            return parsed
-    return _PREFIX_IMAGE_CACHE_MAX_BYTES_DEFAULT
-
-
 def _temporary_path_roots() -> List[Path]:
     roots: List[Path] = []
     for candidate in (
@@ -2418,24 +2378,6 @@ def _path_lives_in_temporary_storage(path: Path) -> bool:
         parts[index] == "var" and parts[index + 1] == "folders"
         for index in range(len(parts) - 1)
     )
-
-
-def _replay_image_path_is_reopenable(path: Any) -> bool:
-    """True when the client can still open this path for the whole task."""
-
-    if not isinstance(path, str) or not path.strip():
-        return False
-    candidate = Path(path.strip())
-    if not candidate.is_absolute():
-        return False
-    try:
-        if not candidate.is_file():
-            return False
-        if candidate.stat().st_size <= 0:
-            return False
-    except OSError:
-        return False
-    return not _path_lives_in_temporary_storage(candidate)
 
 
 def _router_storage_roots() -> List[Path]:
@@ -2481,17 +2423,6 @@ def _router_storage_roots() -> List[Path]:
     return roots
 
 
-def _path_lives_in_router_storage(path: Path) -> bool:
-    """True when this path belongs to the router rather than to the client.
-
-    The attachment directory this module advertises from is excluded: a copy it
-    materialized is a client-facing attachment even when an operator configured
-    it inside the router's runtime root.
-    """
-
-    return _router_storage_relative_path(path) is not None
-
-
 def _router_storage_relative_path(path: Path) -> Optional[Path]:
     """Return a router-owned path's position below its storage root."""
 
@@ -2513,119 +2444,6 @@ def _router_storage_relative_path(path: Path) -> Optional[Path]:
         if root in resolved.parents:
             return resolved.relative_to(root)
     return None
-
-
-def _replay_image_cache_target(
-    image_url: Any,
-    source: Optional[Path] = None,
-) -> Optional[tuple[Path, bytes]]:
-    parsed = _image_inputs_module._split_image_data_url(image_url)
-    if parsed is None:
-        return None
-    header, encoded = parsed
-    media_type = header[len("data:") :].split(";", 1)[0].strip().lower()
-    extension = _REPLAY_IMAGE_CACHE_EXTENSIONS.get(media_type)
-    if extension is None:
-        return None
-    try:
-        raw = base64.b64decode(encoded, validate=False)
-    except (binascii.Error, ValueError):
-        return None
-    if not raw:
-        return None
-    return (
-        _replay_image_copy_root(source) / _replay_image_copy_name(raw, source, extension),
-        raw,
-    )
-
-
-def _materialize_replay_image(image_url: Any, source: Optional[Path] = None) -> Optional[str]:
-    """Persist one replay image next to its source and return that path."""
-
-    target = _replay_image_cache_target(image_url, source)
-    if target is None:
-        return None
-    path, raw = target
-    try:
-        directory = path.parent
-        directory.mkdir(parents=True, exist_ok=True)
-        try:
-            os.chmod(directory, 0o700)
-        except OSError:
-            pass
-        try:
-            existing_size: Optional[int] = path.stat().st_size if path.exists() else None
-        except OSError:
-            existing_size = None
-        if existing_size != len(raw):
-            tmp_path = path.with_name(f".{path.name}.tmp.{os.getpid()}.{time.time_ns()}")
-            with open(tmp_path, "wb") as handle:
-                handle.write(raw)
-            try:
-                os.chmod(tmp_path, 0o600)
-            except OSError:
-                pass
-            os.replace(tmp_path, path)
-        os.utime(path, None)
-    except OSError:
-        return None
-    return str(path)
-
-
-_REPLAY_IMAGE_CACHE_FILE_PATTERN = re.compile(
-    r"^(?:[0-9a-f]{32}|.+\.[0-9a-f]{32})\.(?:jpg|png|webp|gif|bmp|tiff)$"
-)
-
-
-def _is_managed_replay_image_file(name: str) -> bool:
-    """True for a copy this cache created; every other file is left alone.
-
-    The advertised directory is an ordinary attachment location: the client
-    model writes the crops it derives next to the image it reads, and the user
-    may keep files there too.  Pruning may only ever remove this cache's own
-    digest-named copies, never what the model or the user put there.
-    """
-
-    return bool(_REPLAY_IMAGE_CACHE_FILE_PATTERN.match(name))
-
-
-def _prune_replay_image_cache(directory: Path, *, keep: set[str]) -> None:
-    """Bound the durable replay-image cache by file count and total bytes."""
-
-    max_files = _prefix_image_cache_max_files()
-    max_bytes = _prefix_image_cache_max_bytes()
-    try:
-        entries: List[tuple[float, int, Path]] = []
-        total_bytes = 0
-        for entry in directory.iterdir():
-            if not entry.is_file() or entry.name.startswith("."):
-                continue
-            if not _is_managed_replay_image_file(entry.name):
-                continue
-            try:
-                stat = entry.stat()
-            except OSError:
-                continue
-            entries.append((stat.st_mtime, stat.st_size, entry))
-            total_bytes += stat.st_size
-    except OSError:
-        return
-    remaining_files = len(entries)
-    if remaining_files <= max_files and total_bytes <= max_bytes:
-        return
-    entries.sort(key=lambda item: item[0])
-    deadline = time.time() - _PREFIX_IMAGE_CACHE_GRACE_SECONDS
-    for modified, size, entry in entries:
-        if remaining_files <= max_files and total_bytes <= max_bytes:
-            break
-        if entry.name in keep or modified > deadline:
-            continue
-        try:
-            entry.unlink()
-        except OSError:
-            continue
-        remaining_files -= 1
-        total_bytes -= size
 
 
 # Any absolute path token in a replayed script or tool output: quoted,
@@ -2708,7 +2526,13 @@ def _restore_missing_replay_paths(input_items: list[Any]) -> int:
             if not raw:
                 continue
             try:
-                candidate.parent.mkdir(parents=True, exist_ok=True)
+                # The path belongs to a filesystem this proxy may not see.  A
+                # missing parent is not restored into existence: on a remote
+                # gateway that would invent a directory tree (/Users, /home) the
+                # client never had, and the file itself would still be
+                # unreachable from the machine that runs view_image.
+                if not candidate.parent.is_dir():
+                    continue
                 tmp_path = candidate.with_name(f".{candidate.name}.tmp.{os.getpid()}.{time.time_ns()}")
                 with open(tmp_path, "wb") as handle:
                     handle.write(raw)
@@ -2901,45 +2725,6 @@ def _with_neutral_attachment_paths(request_kwargs: dict) -> Optional[dict]:
         restored_paths=restored_paths,
     )
     return modified_kwargs
-
-
-def _reopenable_replay_image_references(
-    paths: List[str],
-    image_parts: List[dict],
-) -> tuple[List[str], List[str], bool]:
-    """Return the reference paths a replayed output may advertise.
-
-    A path the client can no longer open (a deleted clipboard paste, an
-    expired temp crop) is replaced by a durable copy of the same bytes.  The
-    third value reports whether every image has a reopenable reference; when
-    it is false the caller must keep the inline image instead of deleting the
-    model's only view of it.
-    """
-
-    references: List[str] = []
-    materialized: List[str] = []
-    reopenable = True
-    for path, part in zip(paths, image_parts):
-        source: Optional[Path] = None
-        if isinstance(path, str) and path.strip():
-            candidate = Path(path.strip())
-            if candidate.is_absolute():
-                source = candidate
-        if (
-            _replay_image_path_is_reopenable(path)
-            and source is not None
-            and not _path_lives_in_router_storage(source)
-        ):
-            references.append(path)
-            continue
-        cached = _materialize_replay_image(part.get("image_url"), source)
-        if cached is None:
-            references.append(path)
-            reopenable = False
-            continue
-        references.append(cached)
-        materialized.append(cached)
-    return references, materialized, reopenable
 
 
 def _trace_prefix_image_reference_paths(
@@ -3596,7 +3381,15 @@ def _with_prefix_image_previews(request_kwargs: dict) -> Optional[dict]:
     previews only for the most recent image outputs (count from
     ``YOUNG_ROUTER_PREFIX_IMAGE_RECENT_COUNT``, default 6) and replaces older
     ones with pure path references, and ``off`` disables the pass entirely.
-    Outputs without any reopenable path are never path-ified in any mode.
+
+    A reference only ever names a path the client's own tool call wrote.  This
+    proxy does not know whether it can see that filesystem -- a desktop proxy
+    shares it with the client, a remote gateway does not -- and must not guess:
+    substituting a copy it materialized would name a path that a remote client's
+    ``view_image`` cannot open, while declaring the client's path dead because
+    this host cannot see it would delete the one path that works.  The model
+    still keeps a readable preview either way and can re-open the original with
+    one more ``view_image`` call.
     """
 
     if not _prefix_image_preview_enabled():
@@ -3685,59 +3478,60 @@ def _with_prefix_image_previews(request_kwargs: dict) -> Optional[dict]:
             output = item.get("output")
             if isinstance(output, list) and _codex_view_image_output_parts(output):
                 image_output_items += 1
-    if not call_paths:
-        if image_output_items:
-            from collections import Counter
+    if not call_paths and image_output_items:
+        # No view_image call survived with a path.  The image outputs are still
+        # bounded in place below (a reduced preview, no reference): the bytes
+        # are what the gateway counts and the client discounts, and dropping
+        # them entirely would delete the model's only view of the image.  The
+        # record exists because a history whose calls lost their path is what
+        # made the previous pass skip every output.
+        from collections import Counter
 
-            type_counts: "Counter[str]" = Counter()
-            view_image_types: "Counter[str]" = Counter()
-            wire_shapes: dict[str, Any] = {}
-            arguments_sample: Optional[str] = None
-            for item in input_items:
-                if not isinstance(item, dict):
-                    continue
-                item_type = item.get("type")
-                if not isinstance(item_type, str):
-                    item_type = type(item).__name__
-                type_counts[item_type] += 1
-                if "view_image" in json.dumps(item, default=str):
-                    view_image_types[item_type] += 1
-                    if item_type not in wire_shapes:
-                        wire_shapes[item_type] = {
-                            key: (
-                                type(value).__name__
-                                if not isinstance(value, str)
-                                else f"str[{len(value)}]"
-                            )
-                            for key, value in item.items()
-                        }
-                    if item_type == "function_call" and arguments_sample is None:
-                        for key in ("arguments", "input"):
-                            raw = item.get(key)
-                            if isinstance(raw, str):
-                                import re as _re
+        type_counts: "Counter[str]" = Counter()
+        view_image_types: "Counter[str]" = Counter()
+        wire_shapes: dict[str, Any] = {}
+        arguments_sample: Optional[str] = None
+        for item in input_items:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if not isinstance(item_type, str):
+                item_type = type(item).__name__
+            type_counts[item_type] += 1
+            if "view_image" in json.dumps(item, default=str):
+                view_image_types[item_type] += 1
+                if item_type not in wire_shapes:
+                    wire_shapes[item_type] = {
+                        key: (
+                            type(value).__name__
+                            if not isinstance(value, str)
+                            else f"str[{len(value)}]"
+                        )
+                        for key, value in item.items()
+                    }
+                if item_type == "function_call" and arguments_sample is None:
+                    for key in ("arguments", "input"):
+                        raw = item.get(key)
+                        if isinstance(raw, str):
+                            import re as _re
 
-                                arguments_sample = _re.sub(
-                                    r"/[^\"'\\s,;)]{4,}",
-                                    "/<path>",
-                                    raw,
-                                )[:180]
-                                break
-            _trace_prefix_image_preview_gate(
-                request_kwargs,
-                "no-view-image-calls",
-                extra={
-                    "input_items": len(input_items),
-                    "item_type_counts": dict(type_counts.most_common(10)),
-                    "view_image_item_types": dict(view_image_types.most_common(6)),
-                    "wire_shapes": wire_shapes,
-                    "arguments_sample": arguments_sample,
-                },
-            )
-        # No path-backed call survives in the history.  An unsigned history may
-        # still have had a path-less image dropped above, and that rewrite is
-        # the whole result.
-        return elision_result
+                            arguments_sample = _re.sub(
+                                r"/[^\"'\\s,;)]{4,}",
+                                "/<path>",
+                                raw,
+                            )[:180]
+                            break
+        _trace_prefix_image_preview_gate(
+            request_kwargs,
+            "no-view-image-calls",
+            extra={
+                "input_items": len(input_items),
+                "item_type_counts": dict(type_counts.most_common(10)),
+                "view_image_item_types": dict(view_image_types.most_common(6)),
+                "wire_shapes": wire_shapes,
+                "arguments_sample": arguments_sample,
+            },
+        )
 
     recent_count = _prefix_image_recent_count() if mode == "path-recent" else 0
     candidate_indices: list[int] = []
@@ -3784,8 +3578,10 @@ def _with_prefix_image_previews(request_kwargs: dict) -> Optional[dict]:
             claimed_call_ids,
         )
         if not paths:
-            skipped_unpaired += 1
-            continue
+            # No path was named by the producing call, so none may be invented:
+            # bound the bytes in place and claim no reference at all.
+            paths = []
+            is_original = False
         if is_original and not _prefix_image_original_path_enabled():
             skipped_original += 1
             continue
@@ -3803,23 +3599,19 @@ def _with_prefix_image_previews(request_kwargs: dict) -> Optional[dict]:
     )
     updated_items = list(input_items)
     changed = False
-    materialized_paths: List[str] = []
     kept_inline_candidates = 0
     for index in candidate_indices:
         item = input_items[index]
         output = item["output"]
         image_parts = _codex_view_image_output_parts(output)
         paired = len(candidate_paths[index]) == len(image_parts)
-        reference_paths: List[str] = []
-        reopenable = False
-        if paired:
-            reference_paths, materialized, reopenable = (
-                _reopenable_replay_image_references(
-                    candidate_paths[index], image_parts
-                )
-            )
-            if materialized:
-                materialized_paths.extend(materialized)
+        # A path reference is only ever the one the producing call wrote.  This
+        # proxy does not substitute a copy of its own: on a remote gateway that
+        # copy names a file the client's view_image cannot open.
+        reference_paths: List[str] = (
+            list(candidate_paths[index]) if paired else []
+        )
+        reopenable = paired
         if not reopenable:
             kept_inline_candidates += 1
         references = "\n".join(
@@ -3909,17 +3701,10 @@ def _with_prefix_image_previews(request_kwargs: dict) -> Optional[dict]:
         changed = True
 
     configured_root = _configured_replay_image_cache_root()
-    if materialized_paths and configured_root is not None:
-        # Copies that live next to their sources belong to those directories;
-        # only an operator-configured cache directory is bounded by this code.
-        _prune_replay_image_cache(
-            configured_root,
-            keep={Path(path).name for path in materialized_paths},
-        )
-    if materialized_paths or kept_inline_candidates:
+    if kept_inline_candidates:
         _trace_prefix_image_reference_paths(
             request_kwargs,
-            materialized=materialized_paths,
+            materialized=[],
             kept_inline=kept_inline_candidates,
         )
 

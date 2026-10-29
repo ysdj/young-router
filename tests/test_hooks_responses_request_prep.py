@@ -1608,16 +1608,13 @@ class HookResponsesRequestPrepTests(HookTestCase):
         reference = updated["output"][0]
         self.assertEqual("input_text", reference["type"])
         self.assertIn(hooks._CODEX_VIEW_IMAGE_REFERENCE_MARKER, reference["text"])
-        # The client's temp path cannot be reopened later: the advertised
-        # reference is a durable copy of the same bytes instead.
-        advertised = self.reference_paths(reference["text"])
-        self.assertEqual(len(advertised), 1)
-        self.assertNotIn("/tmp/scan/frozen.png", reference["text"])
-        self.assertTrue(advertised[0].startswith(str(cache_dir)))
-        self.assertTrue(advertised[0].endswith(".png"))
+        # The reference repeats the path the client's own call wrote.  Whether
+        # this proxy can see that file is not evidence about the client, so no
+        # copy is substituted for it.
+        # The reference repeats the path the fixture's call itself named.
         self.assertEqual(
-            base64.b64decode("A" * 200_000),
-            Path(advertised[0]).read_bytes(),
+            self.reference_paths(reference["text"]),
+            ["/tmp/scan/frozen.png"],
         )
         self.assertEqual(updated["output"][1], frozen_output["output"][0])
         self.assertEqual(
@@ -1628,6 +1625,94 @@ class HookResponsesRequestPrepTests(HookTestCase):
         self.assertEqual(modified["input"][0], original["input"][0])
         # The client's own history is never mutated.
         self.assertEqual(original["input"][1]["output"][1]["image_url"], frozen_output["output"][1]["image_url"])
+
+    async def test_pre_call_hook_reduces_prefix_images_before_context_selection(self) -> None:
+        hooks, _ = load_hook_module()
+        self.use_replay_image_cache()
+        self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
+        self.set_env(hooks._PREFIX_IMAGE_PREVIEW_MIN_BYTES_ENV, "1000")
+        original = self._prefix_preview_request()
+        original_url = original["input"][1]["output"][1]["image_url"]
+
+        with mock.patch.object(
+            hooks._responses_request_module,
+            "_prefix_image_preview_resized",
+            return_value="data:image/jpeg;base64,pre-call-preview",
+        ) as preview:
+            modified = await hooks.YoungRouterHook().async_pre_call_hook(
+                None,
+                None,
+                original,
+                "aresponses",
+            )
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(
+            modified["input"][1]["output"][2]["image_url"],
+            "data:image/jpeg;base64,pre-call-preview",
+        )
+        preview.assert_called_once_with(original_url)
+        self.assertEqual(
+            original["input"][1]["output"][1]["image_url"],
+            original_url,
+        )
+
+    def test_prefix_image_previews_advertise_the_client_path(self) -> None:
+        hooks, _ = load_hook_module()
+        cache_dir = self.use_replay_image_cache()
+        self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
+        self.set_env(hooks._PREFIX_IMAGE_PREVIEW_MIN_BYTES_ENV, "1000")
+        request = self._prefix_preview_request()
+
+        with mock.patch.object(
+            hooks._responses_request_module,
+            "_prefix_image_preview_resized",
+            return_value="data:image/jpeg;base64,client-preview",
+        ):
+            modified = hooks._with_prefix_image_previews(request)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        output = modified["input"][1]["output"]
+        # The reference is prepended, so the client's own text and the bounded
+        # preview follow it in their original order.
+        reference = output[0]["text"]
+        self.assertIn(hooks._CODEX_VIEW_IMAGE_REFERENCE_MARKER, reference)
+        self.assertEqual(output[1], {"type": "input_text", "text": "Script completed"})
+        self.assertEqual(output[2]["image_url"], "data:image/jpeg;base64,client-preview")
+        # The reference names the client's own path, so one more view_image call
+        # can still reach the original from the machine that runs the tool.
+        self.assertIn("/tmp/scan/frozen.png", reference)
+        # The advertised path is the client's, never a copy this proxy made.
+        self.assertNotIn(str(cache_dir), reference)
+
+    def test_prefix_image_previews_bound_unpaired_images_without_a_reference(self) -> None:
+        hooks, _ = load_hook_module()
+        self.use_replay_image_cache()
+        self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
+        self.set_env(hooks._PREFIX_IMAGE_PREVIEW_MIN_BYTES_ENV, "1000")
+        request = self._prefix_preview_request()
+        request["input"] = request["input"][1:]
+
+        with mock.patch.object(
+            hooks._responses_request_module,
+            "_prefix_image_preview_resized",
+            return_value="data:image/jpeg;base64,unpaired-preview",
+        ):
+            modified = hooks._with_prefix_image_previews(request)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(
+            modified["input"][0]["output"][1]["image_url"],
+            "data:image/jpeg;base64,unpaired-preview",
+        )
+        # No path was named by the producing call, so none may be invented.
+        self.assertNotIn(
+            hooks._CODEX_VIEW_IMAGE_REFERENCE_MARKER,
+            json.dumps(modified["input"][0]["output"]),
+        )
 
     def test_prefix_image_previews_preview_unpaired_images_without_reference_text(self) -> None:
         hooks, _ = load_hook_module()
@@ -1790,12 +1875,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
         self.assertEqual(updated["id"], "fco_wire")
         self.assertEqual("input_text", updated["output"][0]["type"])
         advertised = self.reference_paths(updated["output"][0]["text"])
-        self.assertEqual(len(advertised), 1)
-        self.assertTrue(advertised[0].startswith(str(cache_dir)))
-        self.assertEqual(
-            base64.b64decode("W" * 150_000),
-            Path(advertised[0]).read_bytes(),
-        )
+        self.assertEqual(advertised, ["/tmp/wire.png"])
         self.assertEqual(
             "data:image/jpeg;base64,wire-preview",
             updated["output"][1]["image_url"],
@@ -1862,15 +1942,15 @@ class HookResponsesRequestPrepTests(HookTestCase):
         for output, client_path in ((out0, "/tmp/old1.png"), (out1, "/tmp/old2.png")):
             advertised = self.reference_paths(output[0]["text"])
             self.assertEqual(len(advertised), 1)
-            self.assertNotEqual(client_path, advertised[0])
-            self.assertTrue(advertised[0].startswith(str(cache_dir)))
-            self.assertTrue(Path(advertised[0]).is_file())
+            # The reference is the client's own path: this proxy never invents
+            # one, so a remote client's view_image can still open it.
+            self.assertEqual(client_path, advertised[0])
         # 最近的输出 -> 预览 + 路径引用
         out2 = modified["input"][5]["output"]
         advertised_recent = self.reference_paths(out2[0]["text"])
         self.assertEqual(len(advertised_recent), 1)
-        self.assertTrue(advertised_recent[0].startswith(str(cache_dir)))
-        self.assertTrue(Path(advertised_recent[0]).is_file())
+        self.assertEqual("/tmp/recent.png", advertised_recent[0])
+        self.assertEqual(list(cache_dir.iterdir()), [])
         image_parts2 = [p for p in out2 if p.get("type") == "input_image"]
         self.assertEqual(len(image_parts2), 1)
         self.assertEqual("data:image/jpeg;base64,preview", image_parts2[0]["image_url"])
@@ -1987,27 +2067,19 @@ class HookResponsesRequestPrepTests(HookTestCase):
             assert modified is not None
             advertised = self.reference_paths(modified["input"][1]["output"][0]["text"])
             self.assertEqual(len(advertised), 1)
-            self.assertNotEqual(advertised[0], str(crop_path))
-            self.assertTrue(advertised[0].startswith(str(cache_dir)))
-            crop_path.unlink()
-            self.assertEqual(
-                base64.b64decode("D" * 150_000),
-                Path(advertised[0]).read_bytes(),
-            )
+            # A remote gateway cannot see this path, and must not pretend it
+            # can: it repeats the path the client's own call wrote and leaves
+            # the bytes in the client's hands.
+            self.assertEqual(advertised[0], str(crop_path))
+            self.assertEqual(list(cache_dir.iterdir()), [])
 
-    def test_prefix_image_path_reference_falls_back_to_inline_preview(self) -> None:
+    def test_prefix_image_path_reference_never_needs_a_local_copy(self) -> None:
         hooks, _ = load_hook_module()
         contract = hooks._codex_contract_module
-        blocker = tempfile.NamedTemporaryFile(prefix="young-router-cache-blocker-")
-        self.addCleanup(blocker.close)
         self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
         self.set_env(hooks._PREFIX_IMAGE_PREVIEW_MIN_BYTES_ENV, "1000")
         self.set_env(hooks._PREFIX_IMAGE_MODE_ENV, "path-recent")
         self.set_env(hooks._PREFIX_IMAGE_RECENT_COUNT_ENV, "0")
-        # A cache root that cannot be created must never cost the model its
-        # only copy of the image: the aged output keeps the reduced preview
-        # instead of a path the client cannot open.
-        self.set_env(hooks._PREFIX_IMAGE_CACHE_DIR_ENV, blocker.name)
 
         hooks._PREFIX_IMAGE_PREVIEW_CACHE.clear()
         with mock.patch.object(
@@ -2022,13 +2094,16 @@ class HookResponsesRequestPrepTests(HookTestCase):
         self.assertIsNotNone(modified)
         assert modified is not None
         output = modified["input"][1]["output"]
-        self.assertNotIn(
+        # Nothing on this host is touched to honor the reference: the path is
+        # the client's and stays valid on the client whatever this proxy can see.
+        self.assertIn(
             hooks._CODEX_VIEW_IMAGE_REFERENCE_MARKER,
             json.dumps(output),
         )
-        image_parts = [p for p in output if p.get("type") == "input_image"]
-        self.assertEqual(len(image_parts), 1)
-        self.assertEqual("data:image/jpeg;base64,preview", image_parts[0]["image_url"])
+        self.assertEqual(
+            self.reference_paths(output[0]["text"]),
+            ["/tmp/lost-crop.png"],
+        )
 
     def test_prefix_image_previews_pair_split_identifier_wire_shapes(self) -> None:
         hooks, _ = load_hook_module()
@@ -2142,12 +2217,11 @@ class HookResponsesRequestPrepTests(HookTestCase):
             self.assertIn("replaced by local-path", output[0]["text"])
             advertised = self.reference_paths(output[0]["text"])
             self.assertEqual(len(advertised), 1)
-            self.assertTrue(advertised[0].startswith(str(cache_dir)))
-            self.assertTrue(Path(advertised[0]).is_file())
             self.assertEqual(
-                base64.b64decode("O" * 150_000),
-                Path(advertised[0]).read_bytes(),
+                advertised[0],
+                "/tmp/orig-old1.png" if idx == 1 else "/tmp/orig-old2.png",
             )
+            self.assertEqual(list(cache_dir.iterdir()), [])
         # 保留窗口内的原图输出 -> 预览 + 路径引用（不再内联原始字节）
         recent_output = modified["input"][5]["output"]
         recent_images = [p for p in recent_output if p.get("type") == "input_image"]
@@ -2155,8 +2229,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
         self.assertEqual(recent_images[0]["image_url"], "data:image/jpeg;base64,preview")
         self.assertIn(hooks._CODEX_VIEW_IMAGE_REFERENCE_MARKER, recent_output[0]["text"])
         advertised = self.reference_paths(recent_output[0]["text"])
-        self.assertEqual(len(advertised), 1)
-        self.assertTrue(Path(advertised[0]).is_file())
+        self.assertEqual(advertised, ["/tmp/orig-recent.png"])
         self.assertEqual(modified["input"][6], request["input"][6])
 
     def test_prefix_image_original_path_switch_off_preserves_original_outputs(self) -> None:
@@ -2411,9 +2484,11 @@ class HookResponsesRequestPrepTests(HookTestCase):
             hooks._image_data_url_size(output[1]["image_url"]),
             hooks._image_data_url_size(oversized_url),
         )
-        advertised = self.reference_paths(output[0]["text"])
-        self.assertEqual(len(advertised), 1)
-        self.assertTrue(Path(advertised[0]).is_file())
+        # The path comes from the call itself and is repeated verbatim.
+        self.assertEqual(
+            self.reference_paths(output[0]["text"]),
+            ["/tmp/yr_shot.png"],
+        )
 
     def test_codex_view_image_reopen_marks_repeated_path_as_original(self) -> None:
         hooks, _ = load_hook_module()
@@ -2683,12 +2758,10 @@ class HookResponsesRequestPrepTests(HookTestCase):
             hooks._image_data_url_size(output[1]["image_url"]),
             16_384,
         )
-        # The named file does not exist on this checkout, so the reference is a
-        # durable copy of the same bytes rather than a path the client could
-        # never open; the reference still arms an on-demand re-open.
+        # The reference repeats the path the client's own call wrote, whatever
+        # this host can see of it: that is the one a re-open can reach.
         advertised = self.reference_paths(output[0]["text"])
-        self.assertEqual(len(advertised), 1)
-        self.assertTrue(advertised[0].endswith(".original.jpg"))
+        self.assertEqual(advertised, [path])
         self.assertEqual(original["input"][2]["output"][0]["image_url"], original_url)
 
     async def test_iterative_original_image_is_bounded_after_encrypted_boundary(self) -> None:
@@ -3911,15 +3984,10 @@ class HookResponsesRequestPrepTests(HookTestCase):
         )
         self.assertEqual(updated["output"][2]["detail"], "original")
         self.assertIn(hooks._CODEX_VIEW_IMAGE_REFERENCE_MARKER, reference["text"])
-        # The advertised reference is a durable copy of the same bytes: the
-        # client's file lives in temporary storage, so a replay must never
-        # promise a path the system may clean up later.
-        advertised = self.reference_paths(reference["text"])
-        self.assertEqual(len(advertised), 1)
-        self.assertTrue(advertised[0].startswith(str(cache_dir)))
+        # The reference repeats the path this test's own call named.
         self.assertEqual(
-            base64.b64decode("A" * 200_000),
-            Path(advertised[0]).read_bytes(),
+            self.reference_paths(reference["text"]),
+            [str(durable_path)],
         )
         # The call item and the signed item stay byte-identical, and the
         # client's own history is never mutated.
@@ -4012,151 +4080,6 @@ class HookResponsesRequestPrepTests(HookTestCase):
         request = {"call_type": "aresponses", "input": [output_item]}
 
         self.assertIsNone(hooks._with_bounded_image_inputs(request))
-
-    def test_replay_image_copies_beside_their_source(self) -> None:
-        """Advertised copies live with the file they came from.
-
-        The model derives its crop paths from the path it reads, so a copy
-        belongs in that file's own directory; a router-owned source (or one with
-        no directory) falls back to OS temporary storage, never to a
-        router-created folder or the router's own storage.
-        """
-
-        hooks, _ = load_hook_module()
-        contract = hooks._codex_contract_module
-        self.set_env("YOUNG_ROUTER_IMAGE_CACHE_DIR", None)
-        self.set_env("LITELLM_RUNTIME_ROOT", None)
-        self.set_env("YOUNG_ROUTER_HOME", None)
-        workspace = tempfile.TemporaryDirectory(prefix="image-copy-source-")
-        self.addCleanup(workspace.cleanup)
-        # A deleted source keeps its directory: the copy still belongs there.
-        source = Path(workspace.name) / "sub" / "flow-sheet.jpg"
-        source.parent.mkdir(parents=True, exist_ok=True)
-        image_part = {
-            "type": "input_image",
-            "image_url": (
-                "data:image/jpeg;base64,"
-                + base64.b64encode(b"photo bytes").decode("ascii")
-            ),
-        }
-
-        references, materialized, reopenable = (
-            hooks._reopenable_replay_image_references(
-                [str(source)],
-                [image_part],
-            )
-        )
-
-        self.assertTrue(reopenable)
-        self.assertEqual(len(materialized), 1)
-        self.assertEqual(Path(references[0]).parent, source.parent)
-        self.assertEqual(Path(references[0]).read_bytes(), b"photo bytes")
-        self.assertIn("flow-sheet", Path(references[0]).name)
-        self.assertNotIn("router-home", str(references[0]))
-        self.assertNotIn(" ", str(references[0]))
-
-        # A router-owned source cannot advertise its own directory, so its copy
-        # lands in OS temporary storage instead of a router-created folder.
-        router_copy = Path(tempfile.gettempdir()) / "young-router-owned.jpg"
-        router_root = tempfile.TemporaryDirectory(prefix="router-home-")
-        self.addCleanup(router_root.cleanup)
-        self.set_env("YOUNG_ROUTER_HOME", router_root.name)
-        owned = Path(router_root.name) / "image-cache" / "owned.jpg"
-        owned.parent.mkdir(parents=True, exist_ok=True)
-        owned.write_bytes(b"owned bytes")
-        owned_part = {
-            "type": "input_image",
-            "image_url": (
-                "data:image/jpeg;base64,"
-                + base64.b64encode(b"owned bytes").decode("ascii")
-            ),
-        }
-        owned_refs, owned_materialized, owned_reopenable = (
-            hooks._reopenable_replay_image_references(
-                [str(owned)],
-                [owned_part],
-            )
-        )
-        self.assertTrue(owned_reopenable)
-        self.assertEqual(len(owned_materialized), 1)
-        self.assertEqual(Path(owned_refs[0]).parent, Path(tempfile.gettempdir()))
-        self.assertNotIn(router_root.name, str(owned_refs[0]))
-        del router_copy
-
-        configured = self.use_replay_image_cache()
-        self.assertEqual(
-            hooks._configured_replay_image_cache_root(),
-            configured,
-        )
-
-    def test_replay_image_cache_prunes_only_its_own_copies(self) -> None:
-        hooks, _ = load_hook_module()
-        contract = hooks._codex_contract_module
-        cache_dir = self.use_replay_image_cache()
-        self.set_env(hooks._PREFIX_IMAGE_CACHE_MAX_FILES_ENV, "1")
-        self.set_env(hooks._PREFIX_IMAGE_CACHE_MAX_BYTES_ENV, "1000000")
-        model_crop = cache_dir / "derived_B_top.png"
-        model_crop.write_bytes(b"the model's own crop")
-        user_file = cache_dir / "flow-sheet.jpg"
-        user_file.write_bytes(b"a file the user keeps here")
-        stale_copy = cache_dir / ("a" * 32 + ".png")
-        stale_copy.write_bytes(b"x" * 16)
-        recent_copy = cache_dir / ("b" * 32 + ".jpg")
-        recent_copy.write_bytes(b"y" * 16)
-        stale = time.time() - hooks._PREFIX_IMAGE_CACHE_GRACE_SECONDS - 60
-        os.utime(stale_copy, (stale, stale))
-
-        hooks._prune_replay_image_cache(cache_dir, keep=set())
-
-        # Only this cache's own digest-named copies are candidates: a crop the
-        # model derived from a replayed image and the user's own file survive.
-        self.assertFalse(stale_copy.exists())
-        self.assertTrue(recent_copy.exists())
-        self.assertTrue(model_crop.exists())
-        self.assertTrue(user_file.exists())
-        self.assertFalse(hooks._is_managed_replay_image_file("derived_B_top.png"))
-        self.assertFalse(hooks._is_managed_replay_image_file("flow-sheet.jpg"))
-        self.assertFalse(hooks._is_managed_replay_image_file("a" * 31 + ".png"))
-        self.assertTrue(hooks._is_managed_replay_image_file("b" * 32 + ".jpg"))
-
-    def test_replay_image_reference_moves_a_router_owned_path_out_of_view(self) -> None:
-        """A router-internal path is copied somewhere the model may read.
-
-        An existing file inside the router's own storage is still not something
-        the client model should be pointed at, so its bytes are re-materialized
-        where the model may safely read and crop them.
-        """
-
-        hooks, _ = load_hook_module()
-        contract = hooks._codex_contract_module
-        cache_dir = self.use_replay_image_cache()
-        legacy_root = tempfile.TemporaryDirectory(prefix="young-router-legacy-")
-        self.addCleanup(legacy_root.cleanup)
-        self.set_env("YOUNG_ROUTER_HOME", legacy_root.name)
-        branded = Path(legacy_root.name) / "image-cache" / "6984af2576d7c2ebf38f2033f4ba258e.jpg"
-        branded.parent.mkdir(parents=True, exist_ok=True)
-        branded.write_bytes(b"original photo bytes")
-        image_part = {
-            "type": "input_image",
-            "image_url": (
-                "data:image/jpeg;base64,"
-                + base64.b64encode(b"original photo bytes").decode("ascii")
-            ),
-        }
-
-        references, materialized, reopenable = (
-            hooks._reopenable_replay_image_references(
-                [str(branded)],
-                [image_part],
-            )
-        )
-
-        self.assertTrue(reopenable)
-        self.assertEqual(len(materialized), 1)
-        self.assertFalse(str(references[0]).startswith(legacy_root.name))
-        self.assertTrue(str(references[0]).startswith(str(cache_dir)))
-        self.assertTrue(Path(references[0]).is_file())
-        self.assertEqual(Path(references[0]).read_bytes(), b"original photo bytes")
 
     def test_neutral_attachment_paths_move_router_literals_out_of_replay(self) -> None:
         """A replayed tool call never keeps naming the router's own storage.

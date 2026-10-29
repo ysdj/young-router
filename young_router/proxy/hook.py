@@ -43,11 +43,12 @@ class YoungRouterHook(CustomLogger):
         ``Router._pre_call_checks`` refuses a request whose token count exceeds
         a deployment's ``model_info.max_input_tokens``, and it runs at
         deployment selection -- before ``async_pre_call_deployment_hook``,
-        where oversized replayed tool outputs are normally elided.  The limit
-        it compares against is the same number the Core publishes to the
-        client as that model's context budget, which the client has already
-        applied to its own window: a conversation the client measured as
-        fitting was refused locally, with no upstream contacted at all.
+        where oversized replayed tool outputs and image histories are normally
+        elided.  The limit it compares against is the same number the Core
+        publishes to the client as that model's context budget, which the
+        client has already applied to its own window: a conversation the client
+        measured as fitting was refused locally, with no upstream contacted at
+        all.
 
         Eliding here is the only ordering in which the count describes the
         request that is actually sent.
@@ -57,16 +58,24 @@ class YoungRouterHook(CustomLogger):
             return None
         if not _responses_request_module._request_is_responses_api(data):
             return None
-        # Recorded here, before any bridge or surface adapter rewrites the
-        # input: a Chat-shaped route replays this history as messages and the
-        # answer it returns covers the whole restored context.
+        # Record this before any bridge or surface adapter rewrites the input:
+        # a Chat-shaped route replays this history as messages and the answer it
+        # returns covers the whole restored context.
         _routing_module._remember_restored_reasoning_replay(
             data,
             _responses_execution_module._chat_bridge_reasoning_included(data),
         )
-        elided = _responses_request_module._with_elided_oversized_tool_outputs(data)
+        # Image history is reduced before deployment selection as well as in the
+        # deployment hook.  The second pass is intentionally retained because
+        # LiteLLM may rebuild request kwargs between those two callback points.
+        prepared = _responses_request_module._with_prefix_image_previews(data)
+        if prepared is None:
+            prepared = data
+        elided = _responses_request_module._with_elided_oversized_tool_outputs(
+            prepared
+        )
         if elided is None:
-            return None
+            return prepared if prepared is not data else None
         # ``pre_call_hook`` replaces the request wholesale, so every field the
         # elision pass did not carry over has to travel with it.
         for key, value in data.items():
