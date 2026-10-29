@@ -66,6 +66,21 @@ def _default_runtime_settings_path() -> Path:
     return Path(configured).expanduser() if configured else _default_runtime_root() / "runtime-settings.env"
 
 
+def _runtime_root_for_config(config_path: Path) -> Path:
+    """The installation root a configuration document belongs to.
+
+    Everything an installation shares lives beside its configuration, not
+    beside the directory that document happens to sit in: the runtime directory
+    is one level down from the root, and ``LITELLM_CONFIG_FILE`` may name a
+    path that is nowhere near it.  A reader that owns no cache of its own -- a
+    pane snapshot resolving metadata the Codex domain refreshes -- must find
+    the one file by this root, or it reads a second cache nobody writes.
+    """
+
+    parent = Path(config_path).expanduser().parent
+    return parent.parent if parent.name == config_paths.RUNTIME_DIRECTORY else parent
+
+
 def _default_webdav_enabled_path(settings_path: Path) -> Path:
     configured = os.environ.get("LITELLM_WEBDAV_SYNC_ENABLED_FILE", "").strip()
     return Path(configured).expanduser() if configured else settings_path.parent / ".litellm-runtime" / "webdav-sync.enabled"
@@ -133,9 +148,10 @@ def local_proxy_endpoint() -> tuple[str, str]:
             port = candidate
     except Exception:
         pass
-    key = codex_config.DEFAULT_KEY
+    key = ""
     candidates = (
         codex_config.default_config_path(),
+        _default_runtime_root() / ".litellm_runtime" / "config.yaml",
         _default_runtime_root() / ".litellm-runtime" / "config.yaml",
     )
     for candidate in candidates:
@@ -144,4 +160,12 @@ def local_proxy_endpoint() -> tuple[str, str]:
             break
         except Exception:
             continue
+    if not key:
+        # Returning the built-in placeholder here is what makes this failure
+        # misleading: the client is handed a key the proxy will refuse with
+        # "No connected db.", which names a database instead of the key.
+        raise DomainError(
+            "The local proxy's master key could not be read from its config; "
+            "the client was not switched to it."
+        )
     return f"http://127.0.0.1:{port}/v1", key

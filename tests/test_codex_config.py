@@ -1181,5 +1181,40 @@ class CodexConfigTests(unittest.TestCase):
             self.assertEqual(original_auth, auth_path.read_text(encoding="utf-8"))
 
 
+class LocalApiKeyTests(unittest.TestCase):
+    """A key handed to a client must be the one the proxy will accept.
+
+    LiteLLM looks a non-master key up as a virtual key, needs the database, and
+    refuses with "No connected db.".  A placeholder handed to the client
+    therefore reads as a database problem while the real cause is the key.
+    """
+
+    def test_the_configured_master_key_is_returned(self) -> None:
+        key = "sk-lv-Ha7otT0x56GNc9McyJDNtcZ2wWGoykH3NNf6aRH9"
+        config = {"general_settings": {"master_key": key}}
+
+        self.assertEqual(codex_config.local_api_key(config), key)
+
+    def test_a_config_without_a_key_is_an_error_not_a_placeholder(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("LITELLM_MASTER_KEY", None)
+            with self.assertRaises(codex_config.EditorError):
+                codex_config.local_api_key({"general_settings": {}})
+
+    def test_an_env_reference_the_client_cannot_resolve_is_an_error(self) -> None:
+        config = {"general_settings": {"master_key": "os.environ/NOT_SET_ANYWHERE"}}
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("NOT_SET_ANYWHERE", None)
+            with self.assertRaises(codex_config.EditorError):
+                codex_config.local_api_key(config)
+
+    def test_the_env_var_is_used_when_the_config_names_none(self) -> None:
+        with mock.patch.dict(os.environ, {"LITELLM_MASTER_KEY": "sk-env-key"}):
+            self.assertEqual(
+                codex_config.local_api_key({"general_settings": {}}), "sk-env-key"
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

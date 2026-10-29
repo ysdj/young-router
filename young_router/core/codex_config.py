@@ -269,14 +269,28 @@ def load_yaml(path: pathlib.Path) -> dict[str, Any]:
 
 
 def local_api_key(config: dict[str, Any]) -> str:
+    """The key this machine's clients must present to its own proxy.
+
+    A key that is not the proxy's master key is looked up as a virtual key,
+    needs the database, and is refused with ``No connected db.`` -- a sentence
+    that says nothing about the key.  So this never guesses: a config whose
+    ``master_key`` cannot be read raises instead of returning the built-in
+    placeholder, because a placeholder silently written into the client's
+    ``OPENAI_API_KEY`` produces exactly that error and sends the reader looking
+    for a database.
+    """
+
     settings = config.get("general_settings")
     value = settings.get("master_key") if isinstance(settings, dict) else None
     if isinstance(value, str) and value.startswith("os.environ/"):
         variable = value.removeprefix("os.environ/").strip()
         value = os.environ.get(variable) if variable else None
-    value = str(value or os.environ.get("LITELLM_MASTER_KEY") or DEFAULT_KEY).strip()
+    value = str(value or os.environ.get("LITELLM_MASTER_KEY") or "").strip()
     if not value or "\n" in value or "\r" in value:
-        raise EditorError("LiteLLM master key is unavailable or malformed")
+        raise EditorError(
+            "LiteLLM master key is unavailable or malformed: the proxy would "
+            "refuse a client that presented a placeholder key."
+        )
     return value
 
 
