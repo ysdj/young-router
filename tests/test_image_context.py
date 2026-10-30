@@ -115,6 +115,11 @@ class _ImageContextCase(unittest.TestCase):
                 image_context_module.IMAGE_CONTEXT_ENABLED_ENV: "1",
                 image_context_module.IMAGE_CONTEXT_DATA_DIR_ENV: self.data_dir,
                 image_context_module.IMAGE_CONTEXT_MIN_BYTES_ENV: "1024",
+                # The replay cache has its own default under the runtime root;
+                # a test must never write there.
+                store_module.REPLAY_CACHE_DIR_ENV: os.path.join(
+                    self.directory.name, "replays"
+                ),
             },
         )
         self.environment.start()
