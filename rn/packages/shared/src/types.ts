@@ -474,6 +474,19 @@ export interface IpcParams {
   import: { import_plan_token: string; sections: ConfigDomain[]; revision: number };
 }
 
+/** One stored image of one task, for a panel preview. */
+export interface ImageContextImage {
+  task: string;
+  id: string;
+  mime: string;
+  bytes: number;
+  width: number | null;
+  height: number | null;
+  turn: number | null;
+  name: string | null;
+  data_url: string | null;
+}
+
 export interface IpcResults {
   snapshot: { snapshot: CoreSnapshot };
   disk_state: { revision: number; disk: Partial<Record<ConfigDomain, DiskState>> };
@@ -501,17 +514,7 @@ export interface IpcResults {
     baseline: string;
   };
   files: { revision: number; files: ClientFile[] };
-  image_context_image: {
-    task: string;
-    id: string;
-    mime: string;
-    bytes: number;
-    width: number | null;
-    height: number | null;
-    turn: number | null;
-    name: string | null;
-    data_url: string | null;
-  };
+  image_context_image: ImageContextImage;
   dispatch: { revision: number; action_summary?: Record<string, unknown> };
   subscribe: { subscription_id: string };
   validate: { validate: ValidationSummary };
