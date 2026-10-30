@@ -30,9 +30,10 @@ from typing import Any, Mapping, Optional
 from . import image_context as _image_context_module
 from . import image_context_mcp as _mcp_module
 
-# Both spellings are served: a client configured against ``/mcp`` keeps working
-# if the deployment later moves the proxy under a path prefix.
-MCP_PATHS = ("/mcp", "/v1/mcp")
+# Not ``/mcp``: LiteLLM serves its own MCP gateway there, and a route added after
+# it never matches.  These two spellings are this app's own, and the ``/v1`` one
+# survives a deployment that puts the proxy behind a path prefix.
+MCP_PATHS = ("/v1/image-context/mcp", "/image-context/mcp")
 MAX_BODY_BYTES = 1 * 1024 * 1024
 
 
