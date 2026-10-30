@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .. import api_base as _api_base_module
 from . import codex_fast_tier as _codex_fast_tier_module
+from . import context_window as _context_window_module
 from . import responses_request as _responses_request_module
 from . import request_context as _request_context_module
 from . import responses_execution as _responses_execution_module
@@ -1396,6 +1397,12 @@ def _install_generic_deployment_failover_patch() -> None:
                     wrapped_original_function,
                     **kwargs,
                 )
+                if _context_window_module.request_was_shrunk():
+                    # This payload reached the deployment only because a size
+                    # refusal was answered with a shorter one.  Remembering it
+                    # lets the next turn start inside the real ceiling instead
+                    # of paying for the same discovery again.
+                    _context_window_module.record_accepted_size(kwargs, model=model)
                 if getattr(
                     response,
                     "_young_router_terminal_failed_stream",

@@ -4,6 +4,7 @@ from . import image_generation as _image_generation_module
 from . import image_context as _image_context_module
 from . import image_inputs as _image_inputs_module
 from . import codex_contract as _codex_contract_module
+from . import context_window as _context_window_module
 from . import responses_output as _responses_output_module
 from . import responses_request as _responses_request_module
 from . import request_context as _request_context_module
@@ -59,6 +60,14 @@ class YoungRouterHook(CustomLogger):
             data,
             _responses_execution_module._chat_bridge_reasoning_included(data),
         )
+        # This hook is the only place that runs before deployment selection, and
+        # deployment selection is what refuses an oversized replay outright
+        # ("no models have context window large enough for this call").
+        # Shortening has to happen here or not at all: afterwards the refusal
+        # exists and Codex has already told the user to start a new thread.
+        fitted = _context_window_module.apply(data)
+        if fitted is not None:
+            return fitted
         return None
 
     def _record_recent_request_started(self, kwargs: Dict[str, Any]) -> None:

@@ -8,6 +8,7 @@ from . import routing as _routing_module
 from . import streaming as _streaming_module
 from . import trace as _trace_module
 from . import image_inputs as _image_inputs_module
+from . import context_window as _context_window_module
 
 
 from .base import (
@@ -1112,6 +1113,25 @@ def _with_codex_compaction_controls(request_kwargs: dict) -> Optional[dict]:
     return modified_kwargs if changed else None
 
 
+def _responses_context_truncation_attempts(
+    request_kwargs: Optional[dict],
+) -> int:
+    """How many truncation retries this request has already spent."""
+
+    for metadata_key in ("litellm_metadata", "metadata"):
+        metadata = _request_context_module._request_metadata_dict(
+            request_kwargs, metadata_key
+        )
+        if metadata is None:
+            continue
+        value = metadata.get(_RESPONSES_CONTEXT_TRUNCATION_FALLBACK_METADATA_KEY)
+        if isinstance(value, bool):
+            return 1 if value else 0
+        if isinstance(value, int):
+            return value
+    return 0
+
+
 def _request_already_attempted_responses_context_truncation_fallback(
     request_kwargs: Optional[dict],
 ) -> bool:
@@ -1180,9 +1200,8 @@ def _responses_context_truncation_fallback_kwargs(
         return None
     if _request_disables_responses_truncation_fallback(request_kwargs):
         return None
-    if _request_already_attempted_responses_context_truncation_fallback(
-        request_kwargs
-    ):
+    attempts = _responses_context_truncation_attempts(request_kwargs)
+    if attempts >= len(_context_window_module._RETRY_FRACTIONS):
         return None
     if not _routing_module._is_context_size_error(exception):
         return None
@@ -1193,8 +1212,18 @@ def _responses_context_truncation_fallback_kwargs(
         _request_context_module._request_metadata_dict(retry_kwargs, "litellm_metadata") or {}
     )
     retry_metadata = litellm_metadata.copy()
-    retry_metadata[_RESPONSES_CONTEXT_TRUNCATION_FALLBACK_METADATA_KEY] = True
+    retry_metadata[_RESPONSES_CONTEXT_TRUNCATION_FALLBACK_METADATA_KEY] = attempts + 1
     retry_kwargs["litellm_metadata"] = retry_metadata
+    # ``truncation=auto`` asks the upstream to drop the oldest tokens, and the
+    # relays that refuse these turns in their own words generally ignore it.
+    # Shortening the payload here is what actually changes the verdict; the
+    # flag stays because the API it names is still the documented fallback.
+    _context_window_module.retry_for_refusal(
+        retry_kwargs,
+        exception,
+        attempt=attempts,
+        model=_request_context_module._request_model_group(request_kwargs),
+    )
     _trace_module._route_trace(
         "responses_context_truncation_fallback_start",
         request_id=_routing_module._trace_request_id(request_kwargs),

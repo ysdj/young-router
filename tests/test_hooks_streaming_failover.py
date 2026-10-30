@@ -1594,13 +1594,94 @@ class HookStreamingFailoverTests(HookTestCase):
         self.assertNotIn("truncation", calls[0])
         self.assertEqual(calls[1]["truncation"], "auto")
         self.assertEqual(calls[1]["model_info"], {"id": "same-deployment"})
-        self.assertIs(calls[1]["input"], original_input)
         self.assertTrue(
             calls[1]["litellm_metadata"][
                 hooks._RESPONSES_CONTEXT_TRUNCATION_FALLBACK_METADATA_KEY
             ]
         )
         self.assertEqual(original_input[2]["output"], first_output)
+        # With no measured size there is nothing to scale from, so this retry
+        # carries the payload unchanged and leans on ``truncation=auto`` alone.
+        self.assertIs(calls[1]["input"], original_input)
+
+    async def test_a_measured_refusal_shortens_the_payload_the_relay_refuses(self) -> None:
+        """A relay may hold the model to a window its route never declared.
+
+        Codex's turn then dies with "ran out of room" for a request the router
+        was happy to send.  ``truncation=auto`` alone did not help: the real
+        log shows the flag going out and the same oversized prompt coming back
+        refused.  When the pre-call pass measured the request, the retry has to
+        carry a shorter payload, and the ladder has to keep descending while
+        the relay keeps refusing.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        context_window = hooks._context_window_module
+        router_module = types.ModuleType("litellm.router")
+        sizes = []
+
+        class Router:
+            async def _ageneric_api_call_with_fallbacks_helper(
+                self,
+                model,
+                original_generic_function,
+                **kwargs,
+            ):
+                return await original_generic_function(**kwargs)
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_generic_deployment_failover_patch()
+
+        original_input = [
+            {
+                "type": "function_call",
+                "call_id": "call_big",
+                "name": "shell",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_big",
+                "output": "x" * 900000,
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Continue."}],
+            },
+        ]
+
+        async def always_refused(**kwargs):
+            sizes.append(len(str(kwargs.get("input"))))
+            exc = RuntimeError(
+                "workbuddy upstream failed: prompt is too long (upstream code 11115)"
+            )
+            exc.status_code = 400
+            raise exc
+
+        context_window._MEASURED_INPUT_TOKENS.set(900000)
+        try:
+            await Router()._ageneric_api_call_with_fallbacks_helper(
+                "deepseek-v4.1-flash",
+                always_refused,
+                call_type="aresponses",
+                input=original_input,
+                stream=True,
+                client_metadata={"thread_id": "thread-relay-ceiling"},
+            )
+        except Exception:
+            # The ladder is exhausted and the relay's own refusal is what the
+            # caller gets; the sizes it saw are the point of this test.
+            pass
+
+        # Two rungs of the ladder, each shorter than the last.
+        self.assertGreaterEqual(len(sizes), 2)
+        self.assertLess(sizes[1], sizes[0])
+        if len(sizes) > 2:
+            self.assertLess(sizes[2], sizes[1])
+        # The refusal that ends the turn is still the relay's own.
+        self.assertEqual(original_input[1]["output"][:1], "x")
 
     async def test_generic_response_wrapper_does_not_override_explicit_truncation(self) -> None:
         hooks, _proxy_server = load_hook_module()
@@ -1652,6 +1733,67 @@ class HookStreamingFailoverTests(HookTestCase):
 
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["input"][1]["output"], large_output)
+
+    async def test_chat_bridge_preemptive_refusal_is_retried_shorter(self) -> None:
+        """The bridge is the deployment's first call, so nothing retries it.
+
+        Real turn: a Chat-only relay answered the preemptive bridge with
+        "prompt is too long (upstream code 11115)" and the turn ended as
+        "Codex ran out of room" -- no truncation fallback, no second attempt,
+        because that repair lives on the native-Responses path below it.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        context_window = hooks._context_window_module
+        sizes = []
+
+        async def original_generic_function(**kwargs):
+            sizes.append(len(str(kwargs.get("input"))))
+            if len(sizes) == 1:
+                exc = RuntimeError(
+                    "workbuddy upstream failed: prompt is too long (upstream code 11115)"
+                )
+                exc.status_code = 400
+                raise exc
+            return {"ok": True}
+
+        wrapped = hooks._wrap_generic_function_for_deployment_failover(
+            original_generic_function
+        )
+        context_window._MEASURED_INPUT_TOKENS.set(900000)
+        response = await wrapped(
+            call_type="aresponses",
+            model="deepseek-v4.1-flash",
+            input=[
+                {
+                    "type": "function_call",
+                    "call_id": "call_big",
+                    "name": "shell",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_big",
+                    "output": "x" * 900000,
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Continue."}],
+                },
+            ],
+            stream=True,
+            model_info={
+                "provider": "workbuddy",
+                "upstream_url_surface": "openai/chat",
+            },
+            _young_router_upstream_url_surface="openai/chat",
+            client_metadata={"thread_id": "thread-relay-ceiling"},
+        )
+
+        self.assertEqual(response, {"ok": True})
+        self.assertEqual(len(sizes), 2)
+        self.assertLess(sizes[1], sizes[0])
 
     async def test_generic_response_wrapper_does_not_context_retry_compaction_request(self) -> None:
         hooks, _proxy_server = load_hook_module()

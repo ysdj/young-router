@@ -987,6 +987,23 @@ def _deployment_allows_images(request_kwargs: Mapping[str, Any]) -> bool:
     return True
 
 
+def rewrite_for_size(
+    request_kwargs: dict,
+    *,
+    keep: int = 0,
+) -> Optional[dict]:
+    """Omit earlier images although the setting is off.
+
+    This is the same rewrite the setting performs, reached a different way: the
+    replay cannot be sent at all otherwise.  A thread that keeps calling
+    ``view_image`` carries every image it ever looked at, and an upstream that
+    prices those bytes refuses the prompt long before any token counter says
+    the window is full -- so the choice is a placeholder or a dead turn.
+    """
+
+    return _rewrite(request_kwargs, forced=True, keep=keep)
+
+
 def _with_codex_image_context(request_kwargs: dict) -> Optional[dict]:
     """Leave the current turn's images in place and omit the earlier ones.
 
@@ -996,7 +1013,16 @@ def _with_codex_image_context(request_kwargs: dict) -> Optional[dict]:
     a replay whose only images are all in the current turn.
     """
 
-    if not enabled():
+    return _rewrite(request_kwargs)
+
+
+def _rewrite(
+    request_kwargs: dict,
+    *,
+    forced: bool = False,
+    keep: Optional[int] = None,
+) -> Optional[dict]:
+    if not forced and not enabled():
         return None
     request_kwargs = request_kwargs if isinstance(request_kwargs, dict) else {}
     if not _deployment_allows_images(request_kwargs):
@@ -1032,13 +1058,13 @@ def _with_codex_image_context(request_kwargs: dict) -> Optional[dict]:
     # carried an image: an image from an earlier turn is older than it even
     # when the current turn is pure text.
     current_turn = _turn_count(input_items)
-    keep = keep_recent()
+    keep = keep_recent() if keep is None else keep
     minimum = min_bytes()
 
     thread_id = _thread_id(request_kwargs)
     selection = read_selection(thread_id)
     auto = selection.get("auto")
-    automatic = auto if isinstance(auto, bool) else mode() == "auto"
+    automatic = True if forced else (auto if isinstance(auto, bool) else mode() == "auto")
     unchecked = set(selection.get("unchecked") or set())
     pinned = set(selection.get("pinned") or set())
 
@@ -1113,7 +1139,15 @@ def _with_codex_image_context(request_kwargs: dict) -> Optional[dict]:
     # The final line may only name the fetch tool when that tool exists here;
     # otherwise the model is told to ask the user, which is the one action that
     # can still bring the image back on a gateway with no tool of its own.
-    _PLACEHOLDER_KIND[lang] = fetch_kind() if automatic else "ask"
+    kind = fetch_kind() if automatic else "ask"
+    if forced and kind == "ask" and _client_config_present():
+        # The proxy and the client share this machine, and the replay cache has
+        # already written every image to disk, so a placeholder can name a path
+        # the client's own viewer opens -- the one avenue that needs no tool and
+        # no change to the client's configuration.  A remote gateway has no such
+        # path to offer, so there it keeps saying "ask the user".
+        kind = "file"
+    _PLACEHOLDER_KIND[lang] = kind
     for image in omitted:
         if image.copy_of is not None:
             replacements.setdefault(image.item, {})[image.part or 0] = str(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from . import context_window as _context_window_module
 from . import image_generation as _image_generation_module
 from . import responses_output as _responses_output_module
 from . import image_inputs as _image_inputs_module
@@ -1588,31 +1589,57 @@ def _wrap_generic_function_for_deployment_failover(
             allow_selected_marker=True,
         )
         if preemptive_bridge_kwargs is not None:
-            try:
-                return await _execute_responses_chat_bridge_call(
-                    surface_adapted_original_function,
-                    preemptive_bridge_kwargs,
-                    original_request_kwargs=kwargs,
-                    outer_request_kwargs=outer_request_kwargs,
-                    start_event="responses_chat_bridge_preemptive_start",
-                    error_event="responses_chat_bridge_preemptive_error",
-                )
-            except Exception as exc:
-                if not _routing_module._is_responses_endpoint_not_found_error(
-                    exc,
-                    preemptive_bridge_kwargs,
-                    outer_request_kwargs,
-                ):
-                    raise
-                return await _execute_responses_chat_bridge_call(
-                    surface_adapted_original_function,
-                    preemptive_bridge_kwargs,
-                    original_request_kwargs=kwargs,
-                    outer_request_kwargs=outer_request_kwargs,
-                    original_exception=exc,
-                    start_event="responses_chat_bridge_preemptive_retry_start",
-                    error_event="responses_chat_bridge_preemptive_retry_error",
-                )
+            # This bridge is the deployment's *first* call, so a size refusal
+            # here never reaches the truncation fallback below it: the relay
+            # refused a prompt the router was willing to send, and the turn
+            # ended as "ran out of room" with nothing tried.  Shorten the
+            # payload the bridge replays and ask again.
+            shrink_attempt = 0
+            while True:
+                try:
+                    return await _execute_responses_chat_bridge_call(
+                        surface_adapted_original_function,
+                        preemptive_bridge_kwargs,
+                        original_request_kwargs=kwargs,
+                        outer_request_kwargs=outer_request_kwargs,
+                        start_event="responses_chat_bridge_preemptive_start",
+                        error_event="responses_chat_bridge_preemptive_error",
+                    )
+                except Exception as exc:
+                    if _routing_module._is_responses_endpoint_not_found_error(
+                        exc,
+                        preemptive_bridge_kwargs,
+                        outer_request_kwargs,
+                    ):
+                        return await _execute_responses_chat_bridge_call(
+                            surface_adapted_original_function,
+                            preemptive_bridge_kwargs,
+                            original_request_kwargs=kwargs,
+                            outer_request_kwargs=outer_request_kwargs,
+                            original_exception=exc,
+                            start_event="responses_chat_bridge_preemptive_retry_start",
+                            error_event="responses_chat_bridge_preemptive_retry_error",
+                        )
+                    if not _context_window_module.retry_for_refusal(
+                        kwargs,
+                        exc,
+                        attempt=shrink_attempt,
+                        model=_request_context_module._request_model_group(kwargs),
+                    ):
+                        raise
+                    shrink_attempt += 1
+                    shortened_bridge_kwargs = (
+                        _responses_surfaces_module._responses_chat_bridge_preemptive_kwargs(
+                            kwargs,
+                            outer_request_kwargs,
+                            include_hosted_web_search_unsupported=True,
+                            include_client_tool_unsupported=True,
+                            allow_selected_marker=True,
+                        )
+                    )
+                    if shortened_bridge_kwargs is None:
+                        raise
+                    preemptive_bridge_kwargs = shortened_bridge_kwargs
         try:
             response = surface_adapted_original_function(**kwargs)
             response = await _responses_request_module._await_streaming_fallback_candidate_response(
