@@ -59,6 +59,27 @@ def cache_dir(environ: Optional[Dict[str, str]] = None) -> str:
     return os.path.join(base, "image-context", "replays")
 
 
+def files_dir(environ: Optional[Dict[str, str]] = None) -> str:
+    """Where the same images are also written as files.
+
+    A client that already has a way to read a local file needs no tool of its
+    own: the placeholder can name the file and the client's own image viewer can
+    open it.  Those files live beside the replay they belong to.
+    """
+
+    return os.path.join(cache_dir(environ), "files")
+
+
+def _ext_for(mime: Any) -> str:
+    return {
+        "image/png": ".png",
+        "image/jpeg": ".jpg",
+        "image/jpg": ".jpg",
+        "image/webp": ".webp",
+        "image/gif": ".gif",
+    }.get(str(mime or "").strip().lower(), ".png")
+
+
 def _path_for(thread_id: str, environ: Optional[Dict[str, str]] = None) -> str:
     return os.path.join(cache_dir(environ), f"{thread_id}.json")
 
@@ -102,6 +123,7 @@ def store(thread_id: Any, request_kwargs: Dict[str, Any]) -> int:
         return 0
     root = cache_dir()
     os.makedirs(root, exist_ok=True)
+    _write_files(safe, images)
     target = _path_for(safe)
     temporary = f"{target}.tmp.{os.getpid()}"
     payload = {"threadId": safe, "at": time.time(), "images": images}
@@ -117,6 +139,71 @@ def store(thread_id: Any, request_kwargs: Dict[str, Any]) -> int:
         return 0
     _sweep(root)
     return len(images)
+
+
+def _write_files(thread_id: str, images: List[Dict[str, Any]]) -> None:
+    """Write each stored image as a file and note the path on its record.
+
+    Best effort: a host where the file cannot be written simply keeps offering
+    the tool-shaped fetch, so a failed write must not lose the replay.
+    """
+
+    folder = os.path.join(files_dir(), thread_id)
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except OSError:
+        return
+    for image in images:
+        encoded = image.get("base64")
+        if not isinstance(encoded, str) or not encoded:
+            continue
+        path = os.path.join(folder, f"{image.get('id')}{_ext_for(image.get('mime'))}")
+        try:
+            raw = base64.b64decode(encoded)
+            temporary = f"{path}.tmp.{os.getpid()}"
+            with open(temporary, "wb") as handle:
+                handle.write(raw)
+            os.replace(temporary, path)
+        except (OSError, ValueError):
+            continue
+        image["file"] = path
+
+
+def paths(thread_id: Any, environ: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """``id -> path`` for the stored images that are still on disk."""
+
+    found: Dict[str, str] = {}
+    for image in load(thread_id, environ):
+        path = image.get("file")
+        if isinstance(path, str) and path and os.path.exists(path):
+            found[str(image.get("id"))] = path
+    return found
+
+
+def forget(thread_id: Any, environ: Optional[Dict[str, str]] = None) -> bool:
+    """Drop one task's replay and the files written beside it."""
+
+    safe = _safe_thread_id(thread_id)
+    if not safe:
+        return False
+    removed = False
+    try:
+        os.unlink(_path_for(safe, environ))
+        removed = True
+    except OSError:
+        pass
+    folder = os.path.join(files_dir(environ), safe)
+    try:
+        for name in os.listdir(folder):
+            try:
+                os.unlink(os.path.join(folder, name))
+            except OSError:
+                pass
+        os.rmdir(folder)
+        removed = True
+    except OSError:
+        pass
+    return removed
 
 
 def _sweep(root: str) -> None:
@@ -144,6 +231,29 @@ def _sweep(root: str) -> None:
     for _, path in sorted(entries, reverse=True)[REPLAY_CACHE_MAX_TASKS:]:
         try:
             os.unlink(path)
+        except OSError:
+            pass
+    _sweep_files(now)
+
+
+def _sweep_files(now: float) -> None:
+    root = files_dir()
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return
+    for name in names:
+        folder = os.path.join(root, name)
+        try:
+            modified = os.path.getmtime(folder)
+        except OSError:
+            continue
+        if now - modified <= REPLAY_CACHE_MAX_AGE_SECONDS:
+            continue
+        try:
+            for entry in os.listdir(folder):
+                os.unlink(os.path.join(folder, entry))
+            os.rmdir(folder)
         except OSError:
             pass
 

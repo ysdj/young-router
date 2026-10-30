@@ -152,8 +152,8 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # window; it only needs to fit the widest workspace and the tallest
         # detail pane, which is the provider detail at 535 pt of content
         # beneath 112 pt of chrome.
-        self.assertIn("contentSize: NSSize(width: 960, height: 660)", leaf)
-        self.assertIn("minSize: NSSize(width: 900, height: 560)", leaf)
+        self.assertIn("contentSize: NSSize(width: 1120, height: 660)", leaf)
+        self.assertIn("minSize: NSSize(width: 1010, height: 560)", leaf)
         self.assertNotIn("applySettingsPaneLayout", leaf)
         # The General pane joins the shared settings window on both hosts.
         self.assertIn('"general-settings", "providers-models", "runtime-settings"', leaf)
@@ -237,7 +237,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         )[0]
         self.assertIn("for child in childPanels.filter({ $0.parent === window }).map({ $0.window }) {", close_path)
         self.assertIn("endChildPanel(child)", close_path)
-        self.assertIn('if windowRoute == "provider-wizard" || windowRoute == "file-editor" {', open_route)
+        self.assertIn('if windowRoute == "provider-wizard" || windowRoute == "file-editor" || windowRoute == "image-context" {', open_route)
         self.assertIn("presentChildPanel(window, in: settingsWindow())", open_route)
         self.assertIn("endChildPanel(window)", close_route)
         self.assertIn('let restoreProviderModels = selectedRoute == "provider-wizard"', close_route)
@@ -397,7 +397,9 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("DWORD const grace_result = WaitForSingleObject(process, 8000);", windows)
         self.assertIn("if (grace_result != WAIT_OBJECT_0)", windows)
         self.assertIn("StopCoreProcess(process.hProcess, directory);", windows)
-        self.assertNotIn("WaitForSingleObject(process.hProcess, INFINITE);", windows)
+        stop_core = windows.split("void StopCoreProcess(", 1)[1].split(chr(10) + "}" + chr(10), 1)[0]
+        self.assertIn("TerminateProcess(process, 0);", stop_core)
+        self.assertLess(stop_core.index("TerminateProcess(process, 0);"), stop_core.index("WaitForSingleObject(process, INFINITE);"))
 
     def test_macos_core_bootstrap_waits_only_for_the_control_endpoint(self) -> None:
         mac = (MAC_NATIVE / "CoreIPCBridge.swift").read_text(encoding="utf-8")
@@ -1200,12 +1202,12 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # an explicit route whitelist; a whitelist silently dropped General
         # onto a plain titled window while the shared shell still reserved its
         # title-bar inset.
-        self.assertIn('NSSet<NSString *> *standaloneRoutes = [NSSet setWithArray:@[@"home", @"provider-wizard", @"file-editor"]];', app_delegate)
+        self.assertIn('NSSet<NSString *> *standaloneRoutes = [NSSet setWithArray:@[@"home", @"provider-wizard", @"file-editor", @"image-context"]];', app_delegate)
         self.assertIn("const BOOL settingsShell = ![standaloneRoutes containsObject:route];", app_delegate)
         # The material belongs to the window; a per-table backdrop would stack
         # a second vibrancy layer over only the table's own rows.
         self.assertNotIn("NSVisualEffectMaterialSidebar", controls)
-        self.assertIn("contentSize: NSSize(width: 960, height: 660)", leaf)
+        self.assertIn("contentSize: NSSize(width: 1120, height: 660)", leaf)
 
     def test_macos_reopen_shows_the_primary_configuration_window(self) -> None:
         app_delegate = (MAC_PROJECT / "YoungRouter-macOS/AppDelegate.mm").read_text(encoding="utf-8")
@@ -1367,7 +1369,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # A warm editor window boots its React root off screen; the shared
         # child-surface presentation is what puts it in front of the app.
         self.assertIn("if warmOnly {", mac_leaf)
-        self.assertIn('if windowRoute == "provider-wizard" || windowRoute == "file-editor" {', mac_leaf)
+        self.assertIn('if windowRoute == "provider-wizard" || windowRoute == "file-editor" || windowRoute == "image-context" {', mac_leaf)
         self.assertIn("presentChildPanel(window, in: settingsWindow())", mac_leaf)
         # The editor sheet exists for exactly one document: a bare deep link or
         # an AppKit-restored window must not present an empty editor.
@@ -1381,7 +1383,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("RCT_EXTERN_METHOD(prepareFileEditor)", mac_bridge)
         self.assertIn("RCT_EXTERN__BLOCKING_SYNCHRONOUS_METHOD(pendingFileEditorTarget)", mac_bridge)
         app_delegate = (MAC_PROJECT / "YoungRouter-macOS/AppDelegate.mm").read_text(encoding="utf-8")
-        self.assertIn('standaloneRoutes = [NSSet setWithArray:@[@"home", @"provider-wizard", @"file-editor"]];', app_delegate)
+        self.assertIn('standaloneRoutes = [NSSet setWithArray:@[@"home", @"provider-wizard", @"file-editor", @"image-context"]];', app_delegate)
         self.assertIn('props[@"initialFileTarget"] = fileId;', app_delegate)
         self.assertIn("NSString *fileId, NSWindow *existingWindow", app_delegate)
         self.assertIn('if (route == L"file-editor") return {900, 560};', win_leaf)
@@ -2288,7 +2290,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn('REACT_METHOD(RestoreRelaySession, L"restoreRelaySession")', windows_header)
         self.assertIn("void WinUI3NativeLeafModule::RestoreRelaySession(", windows_module)
         self.assertIn('auto username = field("username");', windows_module)
-        self.assertIn("*account_id, *account_type, *label, *origin, username, false", windows_module)
+        self.assertIn('*account_id, *account_type, *label, *origin, username, "system", false', windows_module)
         self.assertIn("RestoreWindowsRelaySession(", windows_relay)
         self.assertIn('HostRequest(L"host/relay/restore"', windows_core)
         self.assertIn('"/v1/host/relay/restore"', core_ipc)
@@ -2665,7 +2667,8 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertNotIn("NSFocusRingTypeDefault", single_line)
         self.assertIn("InstallInstantFocusBorder(self);", controls)
         self.assertIn("[CATransaction setDisableActions:YES];", controls)
-        self.assertIn("self.layer.borderWidth = borderVisible ? 3.0 : 0.0;", controls)
+        self.assertIn("self.layer.cornerRadius = 4.0;", controls)
+        self.assertIn("self.layer.borderWidth = borderVisible ? 2.0 : 0.0;", controls)
         self.assertIn("[field addSubview:border positioned:NSWindowAbove relativeTo:nil];", controls)
         self.assertNotIn("ConfigureImmediateView(field);", controls)
         self.assertIn("NSColor.keyboardFocusIndicatorColor", controls)
@@ -2964,9 +2967,92 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         open_route = windows.split("void WinUI3NativeLeaf::OpenRoute(", 1)[1].split("\n}\n", 1)[0]
         self.assertIn("if (!window_sized_) {", open_route)
         self.assertIn("window_sized_ = true;", open_route)
-        self.assertIn("if (IsIconic(window_handle_)) ShowWindow(window_handle_, SW_RESTORE);", open_route)
+        self.assertIn("if (IsIconic(window_handle_)) {", open_route)
+        self.assertIn("ShowWindow(window_handle_, SW_RESTORE);", open_route)
+        # A tray click after CloseRoute ordered the window out must make it
+        # visible again, and only that hidden case may use SW_SHOWNORMAL:
+        # an already visible window must not be re-shown or repositioned.
+        self.assertIn("else if (!IsWindowVisible(window_handle_)) {", open_route)
+        self.assertIn("ShowWindow(window_handle_, SW_SHOWNORMAL);", open_route)
         self.assertEqual(1, open_route.count("SW_RESTORE"))
         self.assertIn("bool window_sized_ = false;", header)
+
+    def test_windows_settings_shell_extends_into_the_native_title_bar(self) -> None:
+        """The shell's React header is the window strip, not a second title.
+
+        The native caption is removed only for the routes that render the
+        settings shell, and the draggable region is recomputed on resize and
+        DPI changes so the caption buttons never move out from under it.
+        """
+
+        windows = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
+        header = (WIN_NATIVE / "WinUI3NativeLeaf.h").read_text(encoding="utf-8")
+        ui = (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
+        self.assertIn("kIntegratedTitleBarHeightDip = 38", windows)
+        self.assertIn("title_bar.ExtendsContentIntoTitleBar(enabled);", windows)
+        self.assertIn("title_bar.SetDragRectangles(regions);", windows)
+        self.assertIn("ApplyIntegratedTitleBar(UsesIntegratedTitleBar(route));", windows)
+        self.assertIn("if (message == WM_SIZE || message == WM_DPICHANGED) UpdateTitleBarDragRegions();", windows)
+        self.assertIn("bool integrated_title_bar_ = false;", header)
+        for route in (
+            "general-settings",
+            "providers-models",
+            "runtime-settings",
+            "codex-settings",
+            "claude-settings",
+            "data-management",
+            "logs",
+        ):
+            self.assertIn(f'route == L"{route}"', windows)
+        # The sheets and the hidden home surface keep the native caption.
+        integrated = windows.split("bool UsesIntegratedTitleBar", 1)[1].split(chr(10) + "}", 1)[0]
+        for standalone in ("home", "provider-wizard", "file-editor", "image-context"):
+            self.assertNotIn(f'route == L"{standalone}"', integrated)
+
+        # One RouteSurface stays mounted across pane switches: remounting it
+        # rebuilt every native table and secret field on the way to Settings.
+        self.assertNotIn("RouteSurface key={pane}", ui)
+        self.assertIn("<RouteSurface route={pane} shell", ui)
+        self.assertIn("height: SETTINGS_TITLEBAR_INSET + 38", ui)
+
+    def test_windows_source_list_uses_the_bundled_sidebar_tiles(self) -> None:
+        adapter = (SHARED / "ui/NativeControls.tsx").read_text(encoding="utf-8")
+        self.assertIn('return `ms-appx:///Assets/Sidebar/${imageName}.png`;', adapter)
+        self.assertIn("rowImageNames={rowImageNames}", adapter)
+        self.assertIn("rowImageName={rowImageNames[index]}", adapter)
+        self.assertIn("sourceImage:", adapter)
+        for image in ("SidebarGeneral", "SidebarProviders", "SidebarRuntime", "SidebarCodex", "SidebarData", "SidebarLogs"):
+            self.assertTrue((WIN_PROJECT / "Assets/Sidebar" / f"{image}.png").is_file(), image)
+
+    def test_windows_tray_uses_the_packaged_app_mark(self) -> None:
+        windows = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
+        ensure_tray = windows.split("void WinUI3NativeLeaf::EnsureTray()", 1)[1].split(chr(10) + "}" + chr(10), 1)[0]
+        self.assertIn("kWindowIconResource", ensure_tray)
+        self.assertIn("LoadImageW(", ensure_tray)
+        self.assertIn("MAKEINTRESOURCEW(kWindowIconResource)", ensure_tray)
+        project = WIN_PROJECT
+        self.assertIn("#define IDI_ICON1 1008", (project / "resource.h").read_text(encoding="utf-8"))
+        self.assertIn('IDI_ICON1               ICON                    "small.ico"', (project / "YoungRouter.rc").read_text(encoding="utf-8"))
+
+    def test_windows_package_manifest_names_the_logos_the_build_ships(self) -> None:
+        package = ROOT / "rn/apps/windows/windows/YoungRouter.Package"
+        manifest = (package / "Package.appxmanifest").read_text(encoding="utf-8")
+        wapproj = (package / "YoungRouter.Package.wapproj").read_text(encoding="utf-8")
+        app_manifest = (WIN_PROJECT / "Package.appxmanifest").read_text(encoding="utf-8")
+        for name in (
+            "Square150x150Logo.scale-200.png",
+            "Square44x44Logo.scale-200.png",
+            "Wide310x150Logo.scale-200.png",
+            "SplashScreen.scale-200.png",
+        ):
+            self.assertIn("Images" + chr(92) + name, manifest)
+            self.assertIn("Images" + chr(92) + name, wapproj)
+            self.assertTrue((package / "Images" / name).is_file(), name)
+            # The app project carries the same assets under Assets; its own
+            # manifest is only a template, but it must still name files that
+            # exist beside it.
+            self.assertIn("Assets" + chr(92) + name, app_manifest)
+            self.assertTrue((WIN_PROJECT / "Assets" / name).is_file(), name)
 
     def test_both_trays_open_the_same_pane_on_a_left_click(self) -> None:
         """macOS opens 供应商与模型; Windows took the first `open-` action.
@@ -3329,9 +3415,27 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             self.assertNotIn(removed, controls)
 
 
-    def test_windows_general_master_key_uses_a_win32_secret_editor(self) -> None:
+    def test_windows_general_master_key_is_an_inline_secret_field(self) -> None:
         ui = (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
         general = ui.split("function GeneralWorkspace", 1)[1].split("function RuntimeWorkspace", 1)[0]
+
+        # The shared form is the only place this credential is edited: no
+        # per-host modal path and no platform branch in the General pane.
+        self.assertIn("const masterKeyField = <NativeSecretInputControl", general)
+        self.assertIn('domain="runtime"', general)
+        self.assertIn('field="setting"', general)
+        self.assertIn('target="YOUNG_ROUTER_MASTER_KEY"', general)
+        self.assertIn("plainText", general)
+        self.assertIn("autoCommit", general)
+        self.assertNotIn("native.editSecret({", general)
+        self.assertNotIn('Platform.OS === "windows"', general)
+        self.assertNotIn("function WindowsMasterKeyEditor", ui)
+        self.assertNotIn("allowClear: false", general)
+
+    def test_windows_legacy_secret_editor_stays_off_the_shared_form(self) -> None:
+        """The old Win32 editor is a compatibility capability, not the UI."""
+
+        ui = (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
         leaf = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
         module = (WIN_NATIVE / "WinUI3NativeLeafModule.cpp").read_text(encoding="utf-8")
         editor = leaf.split("std::optional<NativeSecretEditResult> WinUI3NativeLeaf::EditSecret", 1)[1].split(
@@ -3341,15 +3445,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             "void WinUI3NativeLeafModule::ShowGroupManager", 1
         )[0]
 
-        self.assertIn("function WindowsMasterKeyEditor", ui)
-        self.assertIn('native.editSecret({', ui)
-        self.assertIn('domain: "runtime"', ui)
-        self.assertIn('target: "YOUNG_ROUTER_MASTER_KEY"', ui)
-        # Core rejects an empty proxy key, so the editor must not offer Clear.
-        self.assertIn("allowClear: false", ui)
-        self.assertIn('Platform.OS === "windows"', general)
-        self.assertNotIn('target="YOUNG_ROUTER_MASTER_KEY" plainText autoCommit onSecretState={onApiKeyState}', general)
-
+        self.assertNotIn("native.editSecret({", ui)
         # The host is a Win32 React Native window without a XAML Application:
         # constructing Microsoft.UI.Xaml.Window there throws RPC_E_WRONG_THREAD.
         self.assertIn("DialogBoxIndirectParamW(", editor)

@@ -1792,18 +1792,27 @@ class CodexSettingsDomain:
         return patch
 
     def sync_image_context_mcp(self) -> bool:
-        """Write Codex's fetch-server entry to match the image-context switch.
+        """Keep this app's own MCP entry out of the client's file.
 
-        Reads the switch from the runtime settings and adds or removes this
-        app's own MCP entry, touching nothing else in the client's file.  The
-        document is written here rather than staged: the switch is already
-        committed when this runs, and a staged edit would leave Codex without
-        the tool for exactly the turns the placeholders start appearing in.
+        The pass normally needs nothing from Codex's configuration: the desktop
+        client can open a file the pass writes, and a gateway client adds the
+        endpoint itself if it wants it.  So this only ever *removes* the entry an
+        earlier build added, unless an operator picked the MCP server explicitly
+        (``stdio``), in which case the entry is written to match.
         """
 
         import sys as _sys
 
-        enabled_now = bool(image_context_settings().get("enabled"))
+        # Nothing in the client's file is written for the ordinary case any
+        # more: a desktop client already has an image viewer, so the pass hands
+        # it a file path instead of adding a server.  An entry is only kept when
+        # an operator explicitly asks for the MCP server, and one written by an
+        # earlier build is removed here rather than left behind.
+        from ...proxy import image_context as _image_context_module
+
+        enabled_now = _image_context_module.fetch_mode() == "stdio" and bool(
+            image_context_settings().get("enabled")
+        )
         structured = self._draft.get("structured")
         structured = structured if isinstance(structured, Mapping) else {}
         if enabled_now == image_context_mcp_registered(structured):

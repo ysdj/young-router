@@ -115,6 +115,9 @@ class _ImageContextCase(unittest.TestCase):
                 image_context_module.IMAGE_CONTEXT_ENABLED_ENV: "1",
                 image_context_module.IMAGE_CONTEXT_DATA_DIR_ENV: self.data_dir,
                 image_context_module.IMAGE_CONTEXT_MIN_BYTES_ENV: "1024",
+                # Which promise a placeholder may make depends on the host, so
+                # every test states it instead of inheriting the developer's.
+                image_context_module.IMAGE_CONTEXT_FETCH_ENV: "off",
                 # The replay cache has its own default under the runtime root;
                 # a test must never write there.
                 store_module.REPLAY_CACHE_DIR_ENV: os.path.join(
@@ -213,21 +216,27 @@ class ImageContextRewriteTests(_ImageContextCase):
         self.assertIn("120×90", text)
         self.assertIn("[Image #1]", text)
 
-    def test_a_signed_prefix_is_never_rewritten(self) -> None:
+    def test_a_signed_item_is_kept_byte_exact_but_history_before_it_is_not(self) -> None:
+        # A client with server-side storage off stamps an encrypted reasoning
+        # item on every turn, so treating the last one as an immovable boundary
+        # froze all of history and nothing was ever omitted.  The signed item
+        # itself must survive untouched; the images around it are this pass's
+        # own business.
+        signed = {"type": "reasoning", "encrypted_content": "opaque"}
         items = [
-            {"type": "reasoning", "encrypted_content": "opaque"},
             _user_turn("第一轮", _upload_parts(_png(120, 90, noisy=True))),
+            signed,
             _user_turn("第二轮"),
             _user_turn("第三轮"),
         ]
 
         result = self.rewritten(items)
 
-        # Everything up to and including the signed item is byte-identical, so
-        # the upstream's cached prefix stays the prefix it signed.  The images
-        # after it are still bounded, and the note follows the signed prefix.
-        self.assertEqual(result["input"][0], items[0])
-        self.assertIn("IMG-0001", result["input"][2]["content"][1]["text"])
+        self.assertEqual(result["input"][2], signed)
+        self.assertIn("IMG-0001", result["input"][1]["content"][1]["text"])
+        # The placeholder is what the note introduced; the note itself sits just
+        # before the turn it explains.
+        self.assertIn("上下文管理说明", json.dumps(result["input"], ensure_ascii=False))
 
     def test_the_note_explains_the_placeholders_once_before_their_turn(self) -> None:
         items = [
@@ -466,6 +475,82 @@ class ImageContextCopyTests(_ImageContextCase):
         self.assertTrue(
             any(part.get("type") == "input_image" for part in newest["content"])
         )
+
+
+class ImageContextFileFetchTests(_ImageContextCase):
+    """The fetch that changes nothing in the client: a file and its own viewer."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.thread = "thread-file"
+        self.metadata = json.dumps({"thread_id": self.thread, "turn_id": "t1"})
+
+    def aged(self) -> list:
+        return [
+            _user_turn("第一轮", _upload_parts(_png(120, 90, noisy=True))),
+            _user_turn("第二轮"),
+            _user_turn("第三轮"),
+        ]
+
+    def rewrite_in_path_mode(self) -> dict:
+        with mock.patch.dict(
+            os.environ, {image_context_module.IMAGE_CONTEXT_FETCH_ENV: "path"}
+        ):
+            return self.rewritten(
+                self.aged(),
+                headers={
+                    "Originator": "codex_cli_rs",
+                    "x-codex-turn-metadata": self.metadata,
+                },
+            )
+
+    def test_the_placeholder_names_a_file_the_client_can_open(self) -> None:
+        result = self.rewrite_in_path_mode()
+
+        text = result["input"][1]["content"][1]["text"]
+        self.assertIn("view_image", text)
+        self.assertNotIn("view_image_by_id", text)
+        path = text.split("“")[1].split("”")[0]
+        self.assertTrue(path.endswith("IMG-0001.png"), path)
+        self.assertTrue(os.path.isfile(path), path)
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read()[:8], b"\x89PNG\r\n\x1a\n")
+
+    def test_the_note_names_the_viewer_and_not_a_server(self) -> None:
+        result = self.rewrite_in_path_mode()
+
+        note = [
+            item["content"][0]["text"]
+            for item in result["input"]
+            if item.get("role") == "developer"
+        ][0]
+        self.assertIn("view_image", note)
+        self.assertNotIn("view_image_by_id", note)
+        self.assertNotIn("需要 IMG-", note)
+
+    def test_a_host_with_no_client_configuration_promises_nothing(self) -> None:
+        # A gateway sees no client configuration, so the only evidence that a
+        # tool exists out there is that a client has actually used it.
+        with mock.patch.dict(
+            os.environ,
+            {
+                "HOME": os.path.join(self.directory.name, "gateway-home"),
+                image_context_module.IMAGE_CONTEXT_FETCH_ENV: "auto",
+            },
+        ):
+            self.assertEqual("ask", image_context_module.fetch_kind())
+            image_context_module.mark_endpoint_served()
+            self.assertEqual("tool", image_context_module.fetch_kind())
+
+    def test_forgetting_a_task_removes_its_files_too(self) -> None:
+        self.rewrite_in_path_mode()
+        folder = os.path.dirname(store_module.paths(self.thread)["IMG-0001"])
+        self.assertTrue(os.path.isdir(folder))
+
+        self.assertTrue(store_module.forget(self.thread))
+
+        self.assertFalse(os.path.isdir(folder))
+        self.assertEqual({}, store_module.paths(self.thread))
 
 
 class ImageContextFetchTests(_ImageContextCase):

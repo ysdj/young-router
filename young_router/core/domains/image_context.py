@@ -62,6 +62,10 @@ class ImageContextDomain:
         return {
             "mode": _image_context.mode(env),
             "fetch": _image_context.fetch_mode(env),
+            # What the placeholders actually promise on this host: a file the
+            # client opens, the fetch tool, or asking the user.  The panel says
+            # this in words, so it never shows a raw enum to a person.
+            "fetch_kind": _image_context.fetch_kind(env),
             "fetch_available": _image_context.fetch_available(env),
             "enabled": _image_context.enabled(env),
             "cache_dir": str(self.cache_dir()),

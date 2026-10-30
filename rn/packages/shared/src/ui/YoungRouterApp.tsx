@@ -1655,7 +1655,7 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
       routeGeneralSettings: translate("status.general"),
       routeCodexSettings: translate("status.codex"), routeClaudeSettings: translate("card.claudeSettings"),
       routeRuntimeSettings: translate("card.runtimeSettings"),
-      routeDataManagement: translate("card.dataManagement"), routeProviderWizard: translate("providers.wizard.title"), routeFileEditor: translate("settings.editFile"), routeLogs: translate("card.logs"),
+      routeDataManagement: translate("card.dataManagement"), routeImageContext: translate("status.imageContext"), routeProviderWizard: translate("providers.wizard.title"), routeFileEditor: translate("settings.editFile"), routeLogs: translate("card.logs"),
       providerAuthInstruction: translate("relay.officialProviderWebViewHint"),
       providerAuthBlocked: translate("relay.officialProviderAuthBlocked"),
       logOriginal: translate("logs.originalRecord"),
@@ -2040,43 +2040,49 @@ function SettingsShell({ route, windowRoute, snapshot, ipc, native, translate, l
     // keeps the active route in sync so a later close hides that window.
     native.window.open(next);
   };
-  return <View style={styles.settingsShell}>
-    <View style={styles.settingsSidebar}>
-      <View style={styles.settingsSidebarHeader}>
+  return <View style={styles.settingsShellFrame}>
+    <View style={styles.settingsShellHeader}>
+      <View style={[styles.settingsSidebarHeader, styles.settingsSidebarHeaderIntegrated]}>
         {appInfo?.icon ? <Image source={{ uri: appInfo.icon }} style={styles.settingsSidebarAppIcon} /> : null}
         <Text numberOfLines={1} style={styles.settingsSidebarTitle}>{translate("app.title")}</Text>
       </View>
-      <NativeTable
-        columns={SETTINGS_SIDEBAR_COLUMNS}
-        rows={paneRows}
-        selectedKey={pane}
-        striped={false}
-        compact={false}
-        sourceList
-        // The sidebar draws no list frame.  A source list on a vibrant
-        // sidebar material is bounded by the material itself, so the 1 pt
-        // box only read as three lines floating over it: the top and bottom
-        // rules that did not belong to any row, and a right edge drawn
-        // where the column already ends.  The rail is the one other list
-        // without a frame, for the reason its own component states; every
-        // content list keeps its box.
-        framed={false}
-        rowSymbols={paneSymbols}
-        rowSymbolColors={paneSymbolColors}
-        rowImageNames={paneImageNames}
-        cellHorizontalPadding={12}
-        firstColumnHorizontalPadding={12}
-        scrollTrailingColumnOverflow
-        onSelectionChange={selectPane}
-        style={styles.settingsSidebarList}
-      />
-      <View style={styles.settingsSidebarSpacer} />
+      <View style={[styles.settingsPaneHeader, styles.settingsPaneHeaderIntegrated]}>
+        <Text numberOfLines={1} style={styles.settingsPaneTitle}>{translate(paneTitleKey)}</Text>
+      </View>
     </View>
-    <View style={styles.settingsDetail}>
-      <View style={styles.settingsPaneHeader}><Text numberOfLines={1} style={styles.settingsPaneTitle}>{translate(paneTitleKey)}</Text></View>
-      <View style={[styles.settingsDetailBody, (pane === "runtime-settings" || pane === "data-management" || isAssistantSettingsRoute(pane)) && styles.settingsDetailBodyBare]}>
-        <View style={styles.settingsDetailPane}>
-          <RouteSurface key={pane} route={pane} shell windowRoute={windowRoute} snapshot={snapshot} ipc={ipc} native={native} translate={translate} logTabRequest={logTabRequest} nativeAction={nativeAction} onSnapshot={onSnapshot} onNavigate={onNavigate} onClose={onClose} onRegisterFlush={registerFlush} />
+    <View style={styles.settingsShell}>
+      <View style={styles.settingsSidebar}>
+        <NativeTable
+          columns={SETTINGS_SIDEBAR_COLUMNS}
+          rows={paneRows}
+          selectedKey={pane}
+          striped={false}
+          compact={false}
+          sourceList
+          // The sidebar draws no list frame.  A source list on a vibrant
+          // sidebar material is bounded by the material itself, so the 1 pt
+          // box only read as three lines floating over it: the top and bottom
+          // rules that did not belong to any row, and a right edge drawn
+          // where the column already ends.  The rail is the one other list
+          // without a frame, for the reason its own component states; every
+          // content list keeps its box.
+          framed={false}
+          rowSymbols={paneSymbols}
+          rowSymbolColors={paneSymbolColors}
+          rowImageNames={paneImageNames}
+          cellHorizontalPadding={12}
+          firstColumnHorizontalPadding={12}
+          scrollTrailingColumnOverflow
+          onSelectionChange={selectPane}
+          style={styles.settingsSidebarList}
+        />
+        <View style={styles.settingsSidebarSpacer} />
+      </View>
+      <View style={[styles.settingsDetail, styles.settingsDetailIntegrated]}>
+        <View style={[styles.settingsDetailBody, (pane === "runtime-settings" || pane === "data-management" || isAssistantSettingsRoute(pane)) && styles.settingsDetailBodyBare]}>
+          <View style={styles.settingsDetailPane}>
+            <RouteSurface route={pane} shell windowRoute={windowRoute} snapshot={snapshot} ipc={ipc} native={native} translate={translate} logTabRequest={logTabRequest} nativeAction={nativeAction} onSnapshot={onSnapshot} onNavigate={onNavigate} onClose={onClose} onRegisterFlush={registerFlush} />
+          </View>
         </View>
       </View>
     </View>
@@ -3334,10 +3340,21 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
   // the usage pager belongs beside the status it changes, not in a second row
   // above an empty strip.
   const [statusBarControls, setStatusBarControls] = React.useState<React.ReactNode>(null);
+  // The shell keeps this RouteSurface mounted while the user moves between
+  // panes.  Only the pane body is swapped, so the dispatch queue, pending
+  // fields, relay reads, and the warmed file-editor window survive a switch;
+  // the previous pane's one status line does not follow the new pane in.
+  const shownRoute = useRef(route);
+  React.useEffect(() => {
+    if (shownRoute.current === route) return;
+    shownRoute.current = route;
+    setResult(undefined);
+    setStatusBarControls(null);
+  }, [route]);
 
   return <TranslationContext.Provider value={settingsRoute ? translate : undefined}><PendingFieldContext.Provider value={fieldRegistry}><View style={styles.windowSurface}>
     {!shell && route !== "providers-models" && route !== "logs" && route !== "provider-wizard" && route !== "data-management" ? <WindowTitle title={windowTitle} /> : null}
-    {route === "providers-models" || route === "provider-wizard" || route === "file-editor" || settingsRoute || route === "logs" || route === "runtime-settings" || route === "data-management" || route === "general-settings" ? <View style={[styles.windowContent, compactStyles.windowContent, styles.windowContentFixed, route === "file-editor" && styles.fileEditorRouteContent, route === "providers-models" && styles.providersContent, route === "provider-wizard" && styles.providerWizardRouteContent, settingsRoute && styles.assistantSettingsContent, route === "logs" && styles.logsContent, route === "runtime-settings" && styles.runtimeContent, route === "data-management" && styles.dataManagementContent]}>
+    {route === "providers-models" || route === "provider-wizard" || route === "file-editor" || settingsRoute || route === "logs" || route === "runtime-settings" || route === "data-management" || route === "general-settings" || route === "image-context" ? <View style={[styles.windowContent, compactStyles.windowContent, styles.windowContentFixed, route === "file-editor" && styles.fileEditorRouteContent, route === "providers-models" && styles.providersContent, route === "provider-wizard" && styles.providerWizardRouteContent, settingsRoute && styles.assistantSettingsContent, route === "logs" && styles.logsContent, route === "runtime-settings" && styles.runtimeContent, route === "data-management" && styles.dataManagementContent]}>
     {route === "providers-models" ? <ProviderWorkspace snapshot={snapshot} ipc={ipc} onSnapshot={onSnapshot} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onStatus={setResult} onSecretState={onSecretState} applyProbedSurface={applyProbedSurface} onOpenWizard={() => { if (Platform.OS === "windows") onNavigate("provider-wizard"); native.window.open("provider-wizard"); }} relay={relayBridge} addOfficialAccount={addOfficialAccount} /> : null}
     {route === "file-editor" ? <FileEditorWorkspace file={inlineEditorFile} fileId={fileIdRequest} nativeAction={nativeAction} ipc={ipc} native={native} translate={translate} busy={busy} onEditorConflict={resolveRawEditorConflict} reloadToken={settingsRawReloadToken} baselineToken={settingsRawBaselineToken} syncRevision={snapshot?.revision} onFlushPendingFields={flushPendingFields} onClose={closeRoute} /> : null}
     {route === "provider-wizard" ? <ProviderSetupWizard snapshot={snapshot} native={native} providers={providerWizardProviders} relaySources={providerWizardRelaySources} relayStations={providerWizardRelayStations} busy={busy} translate={translate} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onStatus={setResult} onClose={closeRoute} onKeyToken={registerProviderWizardKeyToken} relay={relayBridge} addOfficialAccount={addOfficialAccount} status={result} /> : null}
@@ -3345,6 +3362,7 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
     {route === "logs" ? <LogsWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} translate={translate} dispatch={dispatch} onStatus={setResult} onStatusBar={setStatusBarControls} requestedTab={nativeAction?.id === "open-recovery" ? "recovery" : logTabRequest} requestedTabKey={nativeAction?.sequence ?? 0} /> : null}
     {route === "general-settings" ? <GeneralWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} dispatch={dispatch} dispatchServiceAction={enqueueServiceDispatch} translate={translate} onStatus={setResult} onSnapshot={onSnapshot} /> : null}
     {route === "runtime-settings" ? <RuntimeWorkspace snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} clearSecret={clearSecret} native={native} ipc={ipc} /> : null}
+    {route === "image-context" ? <ImageContextWorkspace snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} ipc={ipc} native={native} /> : null}
     {route === "data-management" ? <DataManagementWorkspace snapshot={snapshot} tab={dataManagementTab} onTabChange={setDataManagementTab} statuses={dataManagementStatuses} busy={busy} webDavOperationBusy={webDavOperationBusy} translate={translate} dispatch={dispatchDataManagement} onSecretState={onSecretState} onFlushPendingFields={flushPendingFields} onTabSwitchError={(tab, reason) => setDataManagementStatuses((current) => ({ ...current, [tab]: errorMessage(reason, translate) }))} onInspectImport={inspectImportDataManagement} onImport={importDataManagement} onConfirmImportReplace={confirmImportDraftReplacement} onExport={exportDataManagement} onProbeWebDav={probeWebDav} onSyncWebDav={syncWebDav} onCommitWebDavSettings={commitWebDavSettings} /> : null}
     </View> : null}
     {/* One permanent status strip per settings window: the last result replaces
@@ -8844,45 +8862,10 @@ function AssistantSettingsWorkspace({ busy, native, codexModels, codexModelCatal
   </View>;
 }
 
-function WindowsMasterKeyEditor({ native, busy, translate, onStatus }: { native: NativeLeafAdapter; busy: boolean; translate: Translate; onStatus: (message?: string) => void }): React.JSX.Element {
-  const [present, setPresent] = useState(false);
-  const [editing, setEditing] = useState(false);
-  const edit = useCallback(async () => {
-    setEditing(true);
-    try {
-      const result = await native.editSecret({
-        domain: "runtime",
-        field: "setting",
-        target: "YOUNG_ROUTER_MASTER_KEY",
-        title: translate("general.apiKey"),
-        // Core refuses an empty proxy key (that would turn LiteLLM into
-        // unauthenticated mode), so the editor must not offer Clear for it.
-        allowClear: false,
-      });
-      if (result) {
-        setPresent(result.present);
-        onStatus(translate(result.present ? "common.saved" : "common.cleared"));
-      }
-    } catch (reason: unknown) {
-      onStatus(errorMessage(reason, translate));
-    } finally {
-      setEditing(false);
-    }
-  }, [native, onStatus, translate]);
-  return <NativeButton
-    title={present ? translate("common.edit") : translate("common.set")}
-    compact
-    busy={editing}
-    disabled={busy || editing}
-    accessibilityLabel={translate("general.apiKey")}
-    onPress={() => { void edit(); }}
-  />;
-}
-
 function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServiceAction, translate, onStatus, onSnapshot }: { snapshot?: CoreSnapshot; ipc: IpcClient; native: NativeLeafAdapter; busy: boolean; dispatch: Dispatch; dispatchServiceAction: (type: string) => Promise<unknown>; translate: Translate; onStatus: (message?: string) => void; onSnapshot: (next: CoreSnapshot) => void }): React.JSX.Element {
-  // Windows uses the native modal editor for this one field. It avoids the
-  // WinUI ContentIsland lifetime that crashes when the General pane unmounts,
-  // while the value remains entirely inside the native secret capability.
+  // The proxy API key is edited in the form itself. The value never enters
+  // React state: the native secret control reads it over Core's read-once
+  // lease and commits it back through the same capability.
   const [autoStartBusy, setAutoStartBusy] = useState(false);
   const [serviceBusy, setServiceBusy] = useState(false);
   const [requestedAutoStart, setRequestedAutoStart] = useState<boolean>();
@@ -8910,9 +8893,9 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
   // The proxy's API key is the credential this window hands the user's own
   // clients, so its field is the one credential the pane draws in the clear:
   // the native control holds the value, Core hands it over the read-once
-  // native lease, and no snapshot ever carries it. Windows uses this embedded
-  // field too; the old native dialog remains only as an unused compatibility
-  // capability for older callers.
+  // native lease, and no snapshot ever carries it. Both hosts use this
+  // embedded field; the old native dialog remains only as an unused
+  // compatibility capability for older callers.
   const masterKeyField = <NativeSecretInputControl
     label={translate("general.apiKey")}
     hint={translate("general.apiKeyPlaceholder")}
@@ -9069,6 +9052,11 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
 
 /** The runtime category whose surface is the image-context panel. */
 const IMAGE_CONTEXT_CATEGORY = "Codex Images";
+// Cards load their own picture, so only a handful are worth fetching: enough to
+// recognise a conversation by, and small enough that opening the pane stays
+// instant.  Anything bigger than a card can show opens in the preview.
+const THUMBNAIL_LIMIT = 6;
+const THUMBNAIL_MAX_BYTES = 1_500_000;
 
 function RuntimeWorkspace({ snapshot, busy, translate, dispatch, onSecretState, clearSecret, native, ipc }: { snapshot?: CoreSnapshot; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; clearSecret: NativeSecretClear; native: NativeLeafAdapter; ipc: IpcClient }): React.JSX.Element {
   const state = domainState(snapshot, "runtime");
@@ -9083,6 +9071,8 @@ function RuntimeWorkspace({ snapshot, busy, translate, dispatch, onSecretState, 
   // category's settings, so the whole domain stays navigable without one
   // continuous scroll whose position has to drive the selection back.
   const [activeCategory, setActiveCategory] = useState("");
+  // The task list is a surface of its own: it grows with the conversations the
+  // pass has seen, so it opens over the pane instead of lengthening it.
   const selectedCategory = categories.includes(activeCategory) ? activeCategory : (categories[0] ?? "");
   const tocRows = useMemo(() => categories.map((name) => ({ key: name, cells: [runtimeCategoryLabel(name, translate)] })), [categories, translate]);
   const dshSyncToken = DSH_VISION_ROUTER_QUICK_KEYS.map((key) => `${key}:${stringValue(settings.find((item) => identifier(item) === key)?.value)}`).join("|");
@@ -9101,7 +9091,7 @@ function RuntimeWorkspace({ snapshot, busy, translate, dispatch, onSecretState, 
             the new category instead of inheriting the previous scroll offset. */}
         <PersistentScrollView key={selectedCategory} style={styles.runtimeScrollSurface} contentContainerStyle={styles.runtimeWorkspace}>
           {selectedCategory === "" ? <EmptyState translate={translate} /> : <View style={styles.runtimeFieldList}>{(groups[selectedCategory] ?? []).map((item) => <RuntimeField key={identifier(item)} item={item} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} clearSecret={clearSecret} dshSyncToken={dshSyncToken} />)}
-            {selectedCategory === IMAGE_CONTEXT_CATEGORY ? <ImageContextPanel snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} ipc={ipc} /> : null}
+            {selectedCategory === IMAGE_CONTEXT_CATEGORY ? <ImageContextWindowLink snapshot={snapshot} busy={busy} translate={translate} native={native} /> : null}
           </View>}
         </PersistentScrollView>
       </View>
@@ -9118,71 +9108,154 @@ function RuntimeWorkspace({ snapshot, busy, translate, dispatch, onSecretState, 
  * and writes the same selection Context Attachment Manager writes, which is why
  * a task curated in either place behaves the same.
  */
-function ImageContextPanel({ snapshot, busy, translate, dispatch, ipc }: { snapshot?: CoreSnapshot; busy: boolean; translate: Translate; dispatch: Dispatch; ipc: IpcClient }): React.JSX.Element {
-  // Everything about a task travels in the image-context domain's snapshot; the
-  // bytes of one previewed image do not, because a snapshot redacts and bounds
-  // every string it exposes.  So the preview is the one read this panel makes
-  // for itself.
+/**
+ * The image-context window: one task at a time, chosen from a list that can be
+ * searched, because a task per conversation grows without bound and a settings
+ * pane is the wrong shape for that.  The window keeps the pass's own bookkeeping
+ * visible — what is sent next turn, and which images are held back — and lets a
+ * person override any single image.
+ */
+/** The line the runtime pane keeps: what the pass is doing, and a way in. */
+function ImageContextWindowLink({ snapshot, busy, translate, native }: { snapshot?: CoreSnapshot; busy: boolean; translate: Translate; native: NativeLeafAdapter }): React.JSX.Element {
+  const state = domainState(snapshot, "image_context");
+  const tasks = asRecords(state.tasks);
+  const environment = asRecord(state.environment);
+  return <View style={styles.runtimeField}>
+    <View style={styles.runtimeImageRow}>
+      <ActionButton title={translate("imageContext.open")} titleWidth="auto" disabled={busy} onPress={() => { native.window.open("image-context"); native.window.focus("image-context"); }} />
+      <Text style={styles.externalSettingsHelpText}>{translate("imageContext.openHint", { tasks: String(tasks.length) })}</Text>
+    </View>
+    <View style={styles.runtimeImageRow}>
+      <Text style={styles.runtimeImageRowLabel}>{translate("imageContext.modelFetch")}</Text>
+      <Text style={styles.runtimeImageRowValue}>{translate(stringValue(environment.fetch_kind) === "file" ? "imageContext.fetchFile" : stringValue(environment.fetch_kind) === "tool" ? "imageContext.fetchTool" : "imageContext.fetchAsk")}</Text>
+    </View>
+  </View>;
+}
+
+function ImageContextWorkspace({ snapshot, busy, translate, dispatch, ipc, native }: { snapshot?: CoreSnapshot; busy: boolean; translate: Translate; dispatch: Dispatch; ipc: IpcClient; native: NativeLeafAdapter }): React.JSX.Element {
   const state = domainState(snapshot, "image_context");
   const tasks = asRecords(state.tasks);
   const environment = asRecord(state.environment);
   const task = asRecord(state.task);
   const images = asRecords(task.images);
-  const selectedTaskId = stringValue(asRecord(task.task).id) || stringValue(tasks[0]?.id);
+  const selectedTaskId = stringValue(asRecord(task.task).id);
+  const [query, setQuery] = useState("");
+  const [pictures, setPictures] = useState<Record<string, string | null>>({});
   const [preview, setPreview] = useState<{ id: string; dataUrl: string | null } | undefined>(undefined);
   useEffect(() => {
+    setPictures({});
     setPreview(undefined);
   }, [selectedTaskId, snapshot?.revision]);
-  if (tasks.length === 0) {
-    return <View style={styles.runtimeField}><Text style={styles.externalSettingsHelpText}>{translate("imageContext.empty")}</Text></View>;
-  }
-  // A tick means two different things, because automatic selection does two
-  // different things: with it on, earlier turns are omitted by the pass itself,
-  // so a tick can only mean "send this every turn" (pinned).  With it off, the
-  // tick is the plain send/don't-send the attachment manager's panel uses.
+  const visibleTasks = query.trim()
+    ? tasks.filter((entry) => stringValue(entry.id).toLowerCase().includes(query.trim().toLowerCase()) || stringValue(entry.updated_at).includes(query.trim()))
+    : tasks;
+  // A card shows the picture itself: a list of ids asked the reader to imagine
+  // what the window is about.  Only the newest few are loaded, and anything
+  // larger than a card can show opens in the preview instead.
+  useEffect(() => {
+    if (!selectedTaskId) return;
+    let cancelled = false;
+    for (const image of images.slice(0, THUMBNAIL_LIMIT)) {
+      const id = stringValue(image.id);
+      if (!id || pictures[id] !== undefined) continue;
+      void ipc.imageContextImage(selectedTaskId, id).then(
+        (answer) => { if (!cancelled) setPictures((current) => ({ ...current, [id]: stringValue(answer.data_url) || null })); },
+        () => { if (!cancelled) setPictures((current) => ({ ...current, [id]: null })); },
+      );
+    }
+    return () => { cancelled = true; };
+  }, [ipc, selectedTaskId, images, pictures]);
   const automatic = booleanValue(task.auto);
-  const setIncluded = (id: string, included: boolean): void => {
-    void dispatch(automatic ? "pin" : "set", automatic ? { task: selectedTaskId, id, pinned: included } : { task: selectedTaskId, id, included }, "image_context");
-  };
+  const sent = numberValue(asRecord(task.next).sent, 0);
+  const omitted = numberValue(asRecord(task.next).omitted, 0);
+  const fetchKind = stringValue(environment.fetch_kind);
   const openPreview = (id: string): void => {
     void ipc.imageContextImage(selectedTaskId, id).then(
       (answer) => setPreview({ id, dataUrl: stringValue(answer.data_url) || null }),
       () => setPreview({ id, dataUrl: null }),
     );
   };
-  return <View style={styles.runtimeField}>
-    <View style={styles.runtimeImageTools}>
-      <View style={styles.runtimeImageTasks}>{tasks.map((entry) => {
-        const id = stringValue(entry.id);
-        // A task's id is a UUID nobody reads; what a person recognises is how
-        // many images it holds and when it last ran.
-        const label = translate("imageContext.taskChip", {
-          images: String(numberValue(entry.images, 0)),
-          at: stringValue(entry.updated_at).slice(5, 16).replace("T", " "),
-        });
-        return <ActionButton key={id} title={label} titleWidth="auto" toolTip={id} disabled={busy} onPress={() => { void dispatch("open", { task: id }, "image_context"); }} />;
-      })}</View>
-      <NativeToggle accessibilityLabel={translate("imageContext.auto")} value={automatic} disabled={busy || !selectedTaskId} onValueChange={(enabled) => { void dispatch("auto", { task: selectedTaskId, enabled }, "image_context"); }} style={styles.runtimeBooleanControl} />
-      <ActionButton title={translate("imageContext.forget")} titleWidth="auto" disabled={busy || !selectedTaskId} onPress={() => { void dispatch("forget", { task: selectedTaskId }, "image_context"); }} />
+  const setIncluded = (id: string, included: boolean): void => {
+    // A tick means two different things, because automatic selection does two
+    // different things: with it on, earlier turns are omitted by the pass
+    // itself, so a tick can only mean "send this every turn" (pinned).
+    void dispatch(automatic ? "pin" : "set", automatic ? { task: selectedTaskId, id, pinned: included } : { task: selectedTaskId, id, included }, "image_context");
+  };
+  return <View style={styles.imageContextWindow}>
+    <View style={styles.imageContextHeader}>
+      <View style={styles.imageContextHeaderTitle}>
+        <Text style={styles.imageContextTitle}>{translate("status.imageContext")}</Text>
+        <Text numberOfLines={2} style={styles.imageContextLead}>{translate("imageContext.lead")}</Text>
+      </View>
+      <ActionButton title={translate("status.close")} titleWidth="auto" onPress={() => native.window.close("image-context")} />
     </View>
-    <Text style={styles.externalSettingsHelpText}>{translate("imageContext.autoHint")}</Text>
-    <Text style={styles.externalSettingsHelpText}>{translate("imageContext.next", { sent: String(numberValue(asRecord(task.next).sent, 0)), omitted: String(numberValue(asRecord(task.next).omitted, 0)) })}</Text>
-    <View style={styles.runtimeImageGrid}>{images.map((image) => {
-      const id = stringValue(image.id);
-      const included = automatic ? booleanValue(image.pinned) : !booleanValue(image.unchecked);
-      return <View key={id} style={styles.runtimeImageCell}>
-        <ActionButton title={translate("imageContext.preview")} titleWidth="auto" disabled={busy} onPress={() => openPreview(id)} />
-        <Text numberOfLines={1} style={styles.runtimeImageCellLabel}>{id}</Text>
-        <Text numberOfLines={1} style={styles.externalSettingsHelpText}>{`${numberValue(image.width, 0)}×${numberValue(image.height, 0)}`}</Text>
-        <NativeCheckbox label={translate(automatic ? "imageContext.everyTurn" : "imageContext.send")} value={included} disabled={busy} onValueChange={(next) => setIncluded(id, next)} />
-      </View>;
-    })}</View>
-    {preview ? <View style={styles.runtimeImagePreviewSurface}>
-      <Text numberOfLines={1} style={styles.runtimeImageCellLabel}>{preview.id}</Text>
-      {preview.dataUrl ? <Image source={{ uri: preview.dataUrl }} style={styles.runtimeImagePreview} /> : <Text style={styles.externalSettingsHelpText}>{translate("imageContext.noPreview")}</Text>}
-      <ActionButton title={translate("status.close")} titleWidth="auto" onPress={() => setPreview(undefined)} />
-    </View> : null}
-    {stringValue(environment.mode) ? <Text style={styles.externalSettingsHelpText}>{translate("imageContext.environment", { mode: stringValue(environment.mode), fetch: stringValue(environment.fetch) })}</Text> : null}
+    <View style={styles.imageContextBody}>
+      <View style={styles.imageContextList}>
+        <View style={styles.imageContextSearch}>
+          <NativeTextField value={query} onChangeText={setQuery} placeholder={translate("imageContext.search")} accessibilityLabel={translate("imageContext.search")} search />
+        </View>
+        {visibleTasks.length === 0 ? <Text style={styles.imageContextEmpty}>{translate(tasks.length === 0 ? "imageContext.empty" : "imageContext.noMatch")}</Text> : <FlatList
+          data={visibleTasks}
+          keyExtractor={(entry) => stringValue(entry.id)}
+          renderItem={({ item }) => {
+            const id = stringValue(item.id);
+            return <Pressable
+              accessibilityRole="button"
+              accessibilityLabel={translate("imageContext.taskChip", { images: String(numberValue(item.images, 0)), at: stringValue(item.updated_at).slice(5, 16).replace("T", " ") })}
+              onPress={() => { void dispatch("open", { task: id }, "image_context"); }}
+              style={[styles.imageContextTaskRow, id === selectedTaskId && styles.imageContextTaskRowSelected]}
+            >
+              <Text numberOfLines={1} style={[styles.imageContextTaskCount, id === selectedTaskId && styles.imageContextSelectedText]}>{translate("imageContext.taskChip", { images: String(numberValue(item.images, 0)), at: stringValue(item.updated_at).slice(5, 16).replace("T", " ") })}</Text>
+              <Text numberOfLines={1} style={styles.imageContextTaskId}>{id}</Text>
+            </Pressable>;
+          }}
+        />}
+      </View>
+      <View style={styles.imageContextDetail}>
+        {tasks.length === 0 ? <Text style={styles.imageContextEmpty}>{translate("imageContext.empty")}</Text> : <>
+          <View style={styles.imageContextRow}>
+            <Text style={styles.imageContextRowLabel}>{translate("imageContext.auto")}</Text>
+            <NativeToggle accessibilityLabel={translate("imageContext.auto")} value={automatic} disabled={busy || !selectedTaskId} onValueChange={(enabled) => { void dispatch("auto", { task: selectedTaskId, enabled }, "image_context"); }} style={styles.runtimeBooleanControl} />
+            <Text style={styles.imageContextRowValue}>{translate(automatic ? "imageContext.autoOn" : "imageContext.autoOff")}</Text>
+          </View>
+          <Text style={styles.imageContextHelp}>{translate("imageContext.autoHint")}</Text>
+          <Text style={styles.imageContextStandfirst}>{translate("imageContext.next", { sent: String(sent), omitted: String(omitted) })}</Text>
+          <FlatList
+            data={images}
+            keyExtractor={(image) => stringValue(image.id)}
+            numColumns={4}
+            columnWrapperStyle={styles.imageContextGridRow}
+            style={styles.imageContextGrid}
+            renderItem={({ item }) => {
+              const id = stringValue(item.id);
+              const included = automatic ? booleanValue(item.pinned) : !booleanValue(item.unchecked);
+              const picture = pictures[id];
+              return <View style={styles.imageContextCard}>
+                <Pressable accessibilityRole="button" accessibilityLabel={translate("imageContext.preview")} disabled={busy} style={styles.imageContextThumb} onPress={() => openPreview(id)}>
+                  {picture ? <Image source={{ uri: picture }} style={styles.imageContextThumbPicture} /> : <Text style={styles.imageContextThumbFallback}>{translate("imageContext.preview")}</Text>}
+                </Pressable>
+                <Text numberOfLines={1} style={styles.imageContextCardLabel}>{translate("imageContext.imageLine", { id, size: `${numberValue(item.width, 0)}×${numberValue(item.height, 0)}` })}</Text>
+                <NativeCheckbox label={translate(automatic ? "imageContext.everyTurn" : "imageContext.send")} value={included} disabled={busy} onValueChange={(next) => setIncluded(id, next)} />
+              </View>;
+            }}
+          />
+          <Text style={styles.imageContextHelp}>{translate(automatic ? "imageContext.everyTurnHint" : "imageContext.sendHint")}</Text>
+          <View style={styles.imageContextRow}>
+            <Text style={styles.imageContextRowLabel}>{translate("imageContext.modelFetch")}</Text>
+            <Text style={styles.imageContextRowValue}>{translate(fetchKind === "file" ? "imageContext.fetchFile" : fetchKind === "tool" ? "imageContext.fetchTool" : "imageContext.fetchAsk")}</Text>
+          </View>
+          <View style={styles.imageContextRow}>
+            <ActionButton title={translate("imageContext.forget")} titleWidth="auto" disabled={busy || !selectedTaskId} onPress={() => { void dispatch("forget", { task: selectedTaskId }, "image_context"); }} />
+            <Text style={styles.imageContextHelp}>{translate("imageContext.forgetHint")}</Text>
+          </View>
+        </>}
+      </View>
+      {preview ? <View style={styles.imageContextPreview}>
+        <Image source={preview.dataUrl ? { uri: preview.dataUrl } : undefined} style={styles.imageContextPreviewPicture} />
+        {preview.dataUrl ? null : <Text style={styles.imageContextHelp}>{translate("imageContext.noPreview")}</Text>}
+        <ActionButton title={translate("status.close")} titleWidth="auto" onPress={() => setPreview(undefined)} />
+      </View> : null}
+    </View>
   </View>;
 }
 
@@ -12545,13 +12618,46 @@ const assistantFileSurfaceStyles = StyleSheet.create({
 });
 
 const styles = StyleSheet.create({
-  runtimeImageTools: { flexDirection: "row", alignItems: "center", gap: 6, flexWrap: "wrap" },
+  runtimeImageRow: { flexDirection: "row", alignItems: "center", gap: 8, flexWrap: "wrap", paddingLeft: SETTINGS_FIELD_LEAD },
+  runtimeImageRowLabel: { width: 84, flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
+  runtimeImageRowValue: { color: systemColors.label, fontSize: UI_FONT_SIZE },
   runtimeImageTasks: { flex: 1, minWidth: 0, flexDirection: "row", gap: 4, flexWrap: "wrap" },
-  runtimeImageGrid: { flexDirection: "row", gap: 6, flexWrap: "wrap" },
-  runtimeImageCell: { width: 132, gap: 2, paddingVertical: 4 },
+  runtimeImageStandfirst: { paddingLeft: SETTINGS_FIELD_LEAD, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
+  runtimeImageGrid: { flexDirection: "row", gap: 10, flexWrap: "wrap", paddingLeft: SETTINGS_FIELD_LEAD },
+  runtimeImageCell: { width: 148, gap: 3, paddingVertical: 4 },
+  runtimeImageThumb: { width: 148, height: 96, borderRadius: 6, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground, alignItems: "center", justifyContent: "center", overflow: "hidden" },
+  runtimeImageThumbPicture: { width: 148, height: 96, resizeMode: "contain" },
+  runtimeImageThumbFallback: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE },
   runtimeImageCellLabel: { color: systemColors.label, fontSize: UI_TIP_FONT_SIZE, fontWeight: "600" },
-  runtimeImagePreviewSurface: { gap: 4, paddingVertical: 6, alignItems: "flex-start" },
-  runtimeImagePreview: { width: 320, height: 240, resizeMode: "contain", backgroundColor: systemColors.textBackground },
+  imageContextWindow: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window },
+  imageContextHeader: { flexShrink: 0, flexDirection: "row", alignItems: "flex-start", gap: 12, paddingHorizontal: 18, paddingTop: SETTINGS_TITLEBAR_INSET + 12, paddingBottom: 10, borderBottomWidth: 1, borderBottomColor: systemColors.separator },
+  imageContextHeaderTitle: { flex: 1, minWidth: 0, gap: 3 },
+  imageContextTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600" },
+  imageContextLead: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16 },
+  imageContextBody: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row" },
+  imageContextList: { width: 232, flexShrink: 0, minHeight: 0, borderRightWidth: 1, borderRightColor: systemColors.separator },
+  imageContextSearch: { paddingHorizontal: 10, paddingVertical: 8 },
+  imageContextTaskRow: { paddingHorizontal: 12, paddingVertical: 7, gap: 1 },
+  imageContextTaskRowSelected: { backgroundColor: systemColors.selectedContent },
+  imageContextTaskCount: { color: systemColors.label, fontSize: UI_FONT_SIZE },
+  imageContextSelectedText: { color: systemColors.selectedControlText },
+  imageContextTaskId: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, fontFamily: Platform.select({ macos: "Menlo", windows: "Cascadia Mono", default: "monospace" }) },
+  imageContextDetail: { flex: 1, minWidth: 0, minHeight: 0, paddingHorizontal: 18, paddingVertical: 14, gap: 6 },
+  imageContextRow: { flexDirection: "row", alignItems: "center", gap: 8, flexWrap: "wrap" },
+  imageContextRowLabel: { width: 84, flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
+  imageContextRowValue: { flex: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE },
+  imageContextHelp: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16 },
+  imageContextEmpty: { padding: 16, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 18 },
+  imageContextStandfirst: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
+  imageContextGrid: { flexGrow: 0, minHeight: 0 },
+  imageContextGridRow: { gap: 12 },
+  imageContextCard: { width: 152, gap: 3, paddingBottom: 10 },
+  imageContextThumb: { width: 152, height: 104, borderRadius: 6, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground, alignItems: "center", justifyContent: "center", overflow: "hidden" },
+  imageContextThumbPicture: { width: 152, height: 104, resizeMode: "contain" },
+  imageContextThumbFallback: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE },
+  imageContextCardLabel: { color: systemColors.label, fontSize: UI_TIP_FONT_SIZE, fontWeight: "600" },
+  imageContextPreview: { position: "absolute", right: 18, bottom: 18, width: 392, gap: 6, padding: 12, borderRadius: 8, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.window, alignItems: "flex-start" },
+  imageContextPreviewPicture: { width: 368, height: 276, resizeMode: "contain", backgroundColor: systemColors.textBackground },
   routeTraceWorkspace: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 6 },
   routeTraceRequestPane: { width: "31%", minWidth: 252, maxWidth: 360, minHeight: 0, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground },
   routeTraceRequestScroll: { flex: 1, minHeight: 0 },
@@ -12629,8 +12735,7 @@ const styles = StyleSheet.create({
   startupLoading: { flex: 1, alignItems: "center", justifyContent: "center" }, startupLoadingText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
   windowSurface: { flex: 1, position: "relative", backgroundColor: systemColors.window }, windowContent: { flexGrow: 1, paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, gap: 8 }, windowContentFixed: { flex: 1, minHeight: 0 }, fileEditorRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providersContent: { paddingBottom: 6, gap: 6 }, providerWizardRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providerWizardSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, logsContent: { paddingHorizontal: 12, paddingTop: 12, paddingBottom: 0 }, runtimeContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, dataManagementContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, assistantSettingsContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, windowTitleBlock: { paddingHorizontal: 20, paddingTop: 12, paddingBottom: 3, gap: 3 }, windowTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
   // Settings window: a native source-list sidebar next to the active pane.
-  settingsShell: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row" }, settingsSidebar: { width: 200, minWidth: 0, flexShrink: 0, minHeight: 0 }, settingsSidebarHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 16, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarAppIcon: { width: SETTINGS_HEADER_CONTENT_HEIGHT, height: SETTINGS_HEADER_CONTENT_HEIGHT, borderRadius: 4 }, settingsSidebarTitle: { color: systemColors.label, fontSize: SOURCE_LIST_FONT_SIZE, fontWeight: "600" }, settingsSidebarSpacer: { height: 8, flexShrink: 0 }, settingsSidebarList: { flex: 1, minWidth: 0, minHeight: 0 }, settingsRail: { width: SETTINGS_RAIL_WIDTH, flexShrink: 0, minHeight: 0, paddingTop: 6, overflow: "hidden" }, settingsRailList: { flex: 1, minHeight: 0 }, settingsRailDivider: { position: "absolute", top: 0, bottom: 0, right: 0, width: 1, backgroundColor: systemColors.separator }, settingsRailDetail: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsRailDetailHeader: { minHeight: 50, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 14, paddingVertical: 8, backgroundColor: systemColors.window }, settingsRailDetailTitleBlock: { flex: 1, minWidth: 0, gap: 2 }, settingsRailDetailActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, settingsRailDetailTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, settingsRailDetailHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16 }, settingsDetail: { minWidth: 0, flex: 1, paddingTop: SETTINGS_TITLEBAR_INSET }, settingsDetailBody: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsDetailBodyBare: { backgroundColor: "transparent" }, settingsDetailPane: { flex: 1, minWidth: 0 }, settingsPaneHeader: { flexShrink: 0, paddingHorizontal: 20, paddingTop: 10, paddingBottom: 8 }, settingsPaneTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600", lineHeight: SETTINGS_HEADER_CONTENT_HEIGHT },  // The window's one status strip.  A route may place its own controls at the
-  // right end of this row, so a pager and the status it changes read as one bar.
+  settingsShellFrame: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, settingsShellHeader: { flexShrink: 0, flexDirection: "row", minWidth: 0, backgroundColor: systemColors.window, borderBottomWidth: 1, borderBottomColor: systemColors.separator }, settingsShell: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row" }, settingsSidebar: { width: 200, minWidth: 0, flexShrink: 0, minHeight: 0 }, settingsSidebarHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 16, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarHeaderIntegrated: { width: 200, height: SETTINGS_TITLEBAR_INSET + 38, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarAppIcon: { width: SETTINGS_HEADER_CONTENT_HEIGHT, height: SETTINGS_HEADER_CONTENT_HEIGHT, borderRadius: 4 }, settingsSidebarTitle: { color: systemColors.label, fontSize: SOURCE_LIST_FONT_SIZE, fontWeight: "600" }, settingsSidebarSpacer: { height: 8, flexShrink: 0 }, settingsSidebarList: { flex: 1, minWidth: 0, minHeight: 0 }, settingsPaneHeader: { flexShrink: 0, paddingHorizontal: 20, paddingTop: 10, paddingBottom: 8 }, settingsPaneHeaderIntegrated: { flex: 1, minWidth: 0, height: SETTINGS_TITLEBAR_INSET + 38, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsDetail: { minWidth: 0, flex: 1, paddingTop: SETTINGS_TITLEBAR_INSET }, settingsDetailIntegrated: { paddingTop: 0 }, settingsDetailBody: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsDetailBodyBare: { backgroundColor: "transparent" }, settingsDetailPane: { flex: 1, minWidth: 0 }, settingsPaneTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600", lineHeight: SETTINGS_HEADER_CONTENT_HEIGHT }, settingsRail: { width: SETTINGS_RAIL_WIDTH, flexShrink: 0, minHeight: 0, paddingTop: 6, overflow: "hidden" }, settingsRailList: { flex: 1, minHeight: 0 }, settingsRailDivider: { position: "absolute", top: 0, bottom: 0, right: 0, width: 1, backgroundColor: systemColors.separator }, settingsRailDetail: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsRailDetailHeader: { minHeight: 50, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 14, paddingVertical: 8, backgroundColor: systemColors.window }, settingsRailDetailTitleBlock: { flex: 1, minWidth: 0, gap: 2 }, settingsRailDetailActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, settingsRailDetailTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, settingsRailDetailHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16 },
   routeStatusBar: { minHeight: 24, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, justifyContent: "space-between", paddingHorizontal: 16, paddingVertical: 2, borderTopWidth: 1, borderTopColor: systemColors.separator },
   // The usage pager is the window's status bar on this tab: the row count stays
   // on the left where every other route states its status, and the page controls

@@ -54,13 +54,15 @@ IMAGE_CONTEXT_MODE_ENV = "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_MODE"
 IMAGE_CONTEXT_KEEP_RECENT_ENV = "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_KEEP_RECENT"
 IMAGE_CONTEXT_DATA_DIR_ENV = "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_DATA_DIR"
 IMAGE_CONTEXT_MIN_BYTES_ENV = "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_MIN_BYTES"
-# How the model fetches an omitted image back.  ``stdio`` is a desktop client
-# whose configuration this app owns; ``http`` is a gateway, where the client
-# lives somewhere else and only a URL can reach the tool; ``off`` promises no
-# tool at all; ``auto`` picks per host.
+# How the model fetches an omitted image back.  ``path`` writes each image to a
+# file and lets the client's own viewer open it, so nothing in the client's
+# configuration has to change; ``stdio`` adds an MCP server to a desktop client
+# this app already configures; ``http`` is a gateway, where the client lives
+# somewhere else and only a URL can reach the tool; ``off`` promises no tool at
+# all; ``auto`` picks per host.
 IMAGE_CONTEXT_FETCH_ENV = "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_FETCH"
 IMAGE_CONTEXT_FETCH_DEFAULT = "auto"
-IMAGE_CONTEXT_FETCH_VALUES = ("auto", "stdio", "http", "off")
+IMAGE_CONTEXT_FETCH_VALUES = ("auto", "path", "stdio", "http", "off")
 IMAGE_CONTEXT_MODE_DEFAULT = "auto"
 IMAGE_CONTEXT_MODE_VALUES = ("auto", "manual")
 IMAGE_CONTEXT_KEEP_RECENT_DEFAULT = 0
@@ -115,13 +117,14 @@ _WORDS: Dict[str, Dict[str, Any]] = {
         "auto_plain": (
             lambda image_id: f"需要原图时调用 view_image_by_id，传入“{image_id}”。"
         ),
+        "file_plain": lambda name: f"需要原图时调用 view_image，传入“{name}”。",
         "duplicate": (
             lambda image_id, where: f"这张图和 {image_id}（{where}）内容完全相同，"
             "那一条在本次请求里照常提供，请直接参考那一条。"
         ),
         "fetched": "取回的原图",
         "copy": (
-            lambda image_id: f"[{image_id} 的原图：模型当时用 view_image_by_id 取回，"
+            lambda image_id: f"[{image_id} 的原图：模型当时取回，"
             "只在那一轮提供，现在已省略]"
         ),
         "auto_note": (
@@ -148,6 +151,19 @@ _WORDS: Dict[str, Dict[str, Any]] = {
             "“需要 IMG-xxx”（几张就都写上）：用户看到这一行才会把那张图重新发给你。"
             "现在看不到的画面细节，不要猜测或补充；不要让用户重新上传，也不要用其他工具"
             "去读取图片文件。"
+        ),
+        "auto_file_note": (
+            "上下文管理说明（来自用户安装的上下文素材管理工具）：这个任务开着“自动选图”。"
+            "为了节省上下文，之前各轮的图片默认不再随请求提供，它们原来的位置换成了"
+            "“[图片 IMG-xxx 已省略…]”这样的占位文字；本轮新出现的图片照常提供。\n"
+            "这些图片在它们出现的那一轮真实存在，你当时收到并看过；你之前对它们的描述，"
+            "以及据此做出的判断，都是看着原图做出的，仍然有效。不要因为现在看不到，就认为"
+            "之前的回答是猜测或错误，也不要收回或道歉。\n"
+            "回答需要看某张被省略的图片、而你之前说过的内容不够用时，调用 view_image 工具，"
+            "传入那张图占位文字里给出的文件路径（几张就一次调几次）。"
+            "之前说过的内容够用时，不要调用。现在看不到的画面细节，不要猜测或补充；"
+            "不要让用户重新上传图片。\n"
+            "取回的图片只在本轮提供，下一轮又会换回占位文字；之后还需要时，再调用一次。"
         ),
         "manual_note": (
             "上下文管理说明（来自用户安装的上下文素材管理工具）：为了节省上下文，"
@@ -191,14 +207,15 @@ _WORDS: Dict[str, Dict[str, Any]] = {
         "auto_plain": (
             lambda image_id: f'To see the original, call view_image_by_id with "{image_id}".'
         ),
+        "file_plain": lambda name: f'To see the original, call view_image with "{name}".',
         "duplicate": (
             lambda image_id, where: f"This is the same content as {image_id} ({where}); "
             "that one is provided in this request, so read it there."
         ),
         "fetched": "fetched original",
         "copy": (
-            lambda image_id: f"[original of {image_id}: fetched with view_image_by_id "
-            "for that turn only, now omitted]"
+            lambda image_id: f"[original of {image_id}: fetched for that turn only, "
+            "now omitted]"
         ),
         "auto_note": (
             "Context management note (from the context attachment tool the user "
@@ -236,6 +253,26 @@ _WORDS: Dict[str, Dict[str, Any]] = {
             "need several): that is how the user knows which one to send again. "
             "Do not guess or add detail you cannot see now; do not ask the user to "
             "upload it again, and do not read image files with another tool."
+        ),
+        "auto_file_note": (
+            "Context management note (from the context attachment tool the user "
+            "installed): automatic image selection is on for this task. To save "
+            "context, images from earlier turns are not provided by default and "
+            "their place appear as text like \"[Image IMG-xxx omitted …]\". Images "
+            "new in this turn are provided as usual.\n"
+            "Those images did exist in the turn they appeared in and you did "
+            "receive and see them; what you described, and the judgements you made "
+            "from it, were made looking at the original and still hold. Do not "
+            "treat earlier answers as guesses or mistakes because the image is not "
+            "visible now, and do not take them back or apologise for them.\n"
+            "When an answer needs an omitted image and what you already said is not "
+            "enough, call the view_image tool with the file path that image's "
+            "placeholder gives (once per image); the original appears in that tool "
+            "result. Do not call it when what you already said is enough. Do not "
+            "guess or add detail you cannot see now, and do not ask the user to "
+            "upload the image again.\n"
+            "A fetched image is provided for this turn only and becomes a "
+            "placeholder again afterwards; call again when you need it again."
         ),
         "manual_note": (
             "Context management note (from the context attachment tool the user "
@@ -321,25 +358,63 @@ def _client_config_present(environ: Optional[Mapping[str, str]] = None) -> bool:
     return os.path.isdir(home)
 
 
-def fetch_available(environ: Optional[Mapping[str, str]] = None) -> bool:
-    """Whether the model can actually fetch an omitted image on this host.
+def endpoint_served(environ: Optional[Mapping[str, str]] = None) -> bool:
+    """Whether the fetch endpoint has ever answered a client on this host.
 
-    A placeholder may only name ``view_image_by_id`` when that tool will be
-    there.  A gateway on a server has no client configuration to edit, so unless
-    it serves the HTTP endpoint the note must fall back to the wording that asks
-    the user -- promising a tool that does not exist is how a model ends up
-    retrying a call nobody answers.
+    A gateway cannot see the client's configuration, so the only evidence that
+    ``view_image_by_id`` exists out there is that someone actually called it.
+    """
+
+    from . import image_context_store as _store_module
+
+    marker = os.path.join(_store_module.cache_dir(dict(environ) if environ else None), "endpoint-served")
+    return os.path.isfile(marker)
+
+
+def mark_endpoint_served(environ: Optional[Mapping[str, str]] = None) -> None:
+    """Record that a client reached the fetch endpoint from now on."""
+
+    from . import image_context_store as _store_module
+
+    root = _store_module.cache_dir(dict(environ) if environ else None)
+    try:
+        os.makedirs(root, exist_ok=True)
+        marker = os.path.join(root, "endpoint-served")
+        with open(marker, "w", encoding="utf-8") as handle:
+            handle.write(str(int(__import__("time").time())))
+    except OSError:
+        pass
+
+
+def fetch_kind(environ: Optional[Mapping[str, str]] = None) -> str:
+    """How a placeholder may promise to bring an image back: ``file``, ``tool``, ``ask``.
+
+    ``file`` names a file the client's own image viewer can open, which needs no
+    change to the client's configuration at all; ``tool`` names
+    ``view_image_by_id``; ``ask`` tells the model to ask the user.  A placeholder
+    may only promise what will actually be there.
     """
 
     env = os.environ if environ is None else environ
     mode = fetch_mode(env)
     if mode == "off":
-        return False
+        return "ask"
+    if mode == "path":
+        return "file"
     if mode in {"stdio", "http"}:
-        return True
-    # ``auto``: the desktop client this app configured, or a gateway that was
-    # told to serve the endpoint.  Anything else promises nothing.
-    return _client_config_present(env)
+        return "tool"
+    # ``auto``: a host that owns the client's configuration can hand it a file
+    # path and change nothing; a gateway can only offer the endpoint, and may
+    # only name the tool once a client has used it.
+    if _client_config_present(env):
+        return "file"
+    return "tool" if endpoint_served(env) else "ask"
+
+
+def fetch_available(environ: Optional[Mapping[str, str]] = None) -> bool:
+    """Whether the model can actually fetch an omitted image on this host."""
+
+    return fetch_kind(environ) != "ask"
 
 
 def min_bytes(environ: Optional[Mapping[str, str]] = None) -> int:
@@ -749,21 +824,26 @@ def _heading(image: _Found, state: str, lang: str) -> str:
 def _placeholder(image: _Found, lang: str, *, state: Optional[str] = None) -> str:
     words = _WORDS[lang]
     if state is None:
-        state = words["auto_plain"] is not None and words["omitted"]
-    body = (
-        words["auto_plain"](image.image_id)
-        if _AUTOMATIC_PLACEHOLDER[lang]
-        else words["plain"](image.image_id)
-    )
+        state = words["omitted"]
+    kind = _PLACEHOLDER_KIND[lang]
+    path = _FILE_PATHS.get(image.image_id)
+    if kind == "file" and path:
+        body = words["file_plain"](path)
+    elif kind == "tool":
+        body = words["auto_plain"](image.image_id)
+    else:
+        # No tool and no file: the only way back is the user sending it again.
+        body = words["plain"](image.image_id)
     return f"{_heading(image, str(state), lang)}\n{body}"
 
 
-# Which final line a placeholder carries.  The two are not interchangeable: the
-# automatic wording tells the model to call the fetch tool, the manual one to
-# write "need IMG-xxx" for the user.  The switch is per request, so it is set
-# through this module-level flag inside the pass instead of being threaded
-# through every placeholder call.
-_AUTOMATIC_PLACEHOLDER: Dict[str, bool] = {_LANG_ZH: True, _LANG_EN: True}
+# Which final line a placeholder carries.  They are not interchangeable: one
+# tells the model to open a file with the client's own viewer, one to call the
+# fetch tool, one to write "need IMG-xxx" for the user.  The choice is per
+# request, so it is set through these module-level maps inside the pass instead
+# of being threaded through every placeholder call.
+_PLACEHOLDER_KIND: Dict[str, str] = {_LANG_ZH: "ask", _LANG_EN: "ask"}
+_FILE_PATHS: Dict[str, str] = {}
 
 
 def _duplicate_placeholder(
@@ -938,11 +1018,13 @@ def _with_codex_image_context(request_kwargs: dict) -> Optional[dict]:
     if not isinstance(input_items, list) or not input_items:
         return None
 
-    # The client's own uploaded images live inside ``input`` too, and a client
-    # only signs what the upstream produced: a signed item before the image is
-    # still part of the immovable prefix, so the boundary is the last signed
-    # item and everything after it is rewritable.
-    mutable_from = _suffix_start(input_items)
+    # Every item is rewritable, including the ones before a signed item: a
+    # client that turns off server-side storage stamps an encrypted reasoning
+    # item on *every* turn, so a boundary at the last such item would leave all
+    # of history frozen and nothing would ever be omitted.  The invariant is
+    # narrower -- the signed items themselves are never touched, because this
+    # pass only ever replaces image parts, and no signed item carries one.
+    mutable_from = 0
     images = scan(input_items)
     if not images:
         return None
@@ -1000,6 +1082,11 @@ def _with_codex_image_context(request_kwargs: dict) -> Optional[dict]:
     # away later -- and it is the same copy the placeholders are built from, so
     # it is written before the placeholder decision.
     _store_replay(thread_id, request_kwargs)
+    _FILE_PATHS.clear()
+    if thread_id:
+        from . import image_context_store as _store_module
+
+        _FILE_PATHS.update(_store_module.paths(thread_id))
 
     # Byte-identical images are one content: when a content would be omitted
     # everywhere, its newest copy stays sent and the older ones point at it.  A
@@ -1026,7 +1113,7 @@ def _with_codex_image_context(request_kwargs: dict) -> Optional[dict]:
     # The final line may only name the fetch tool when that tool exists here;
     # otherwise the model is told to ask the user, which is the one action that
     # can still bring the image back on a gateway with no tool of its own.
-    _AUTOMATIC_PLACEHOLDER[lang] = automatic and fetch_available()
+    _PLACEHOLDER_KIND[lang] = fetch_kind() if automatic else "ask"
     for image in omitted:
         if image.copy_of is not None:
             replacements.setdefault(image.item, {})[image.part or 0] = str(
@@ -1104,8 +1191,10 @@ def _with_codex_image_context(request_kwargs: dict) -> Optional[dict]:
     ):
         note_at -= 1
     words = _WORDS[lang]
-    fetchable = fetch_available()
-    if automatic and fetchable:
+    kind = _PLACEHOLDER_KIND[lang]
+    if automatic and kind == "file":
+        note = words["auto_file_note"]
+    elif automatic and kind == "tool":
         note = words["auto_note"]
     elif automatic:
         # Omitted by this pass with no tool to fetch them back: the model has to

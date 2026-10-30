@@ -279,6 +279,7 @@ ContentSize RouteInitialContentSize(std::wstring_view route) {
     return {960, 660};
   }
   if (route == L"provider-wizard") return {620, 460};
+  if (route == L"image-context") return {900, 620};
   if (route == L"file-editor") return {900, 560};
   return {320, 160};
 }
@@ -719,6 +720,23 @@ void DisableWindowTransitions(HWND window) noexcept {
 // all draw the app icon instead of the fallback.
 constexpr int kWindowIconResource = 1008;
 
+// The settings shell owns the window's top strip: its React header is the
+// app identity and the active pane title, so the native caption is removed and
+// this many 96-DPI DIPs stay draggable.  The system caption buttons are drawn
+// on top of the same strip on the right.
+constexpr int kIntegratedTitleBarHeightDip = 38;
+
+bool UsesIntegratedTitleBar(std::wstring_view route) {
+  // Keep this list in step with isSettingsShellRoute() in
+  // rn/packages/shared/src/routes.ts.  The shell's React header is the one
+  // surface that was laid out to replace the caption; every other route keeps
+  // the native title bar.
+  return route == L"general-settings" || route == L"providers-models" ||
+      route == L"runtime-settings" || route == L"codex-settings" ||
+      route == L"claude-settings" || route == L"data-management" ||
+      route == L"logs";
+}
+
 void ApplyWindowIcons(HWND window) noexcept {
   if (window == nullptr) return;
   const HINSTANCE instance = GetModuleHandleW(nullptr);
@@ -851,6 +869,10 @@ void WinUI3NativeLeaf::DispatchAction(std::string const& action) {
 }
 
 bool WinUI3NativeLeaf::HandleWindowMessage(UINT message, WPARAM wparam, LPARAM lparam) {
+  // A resized, maximized, or DPI-changed window moves the caption buttons, so
+  // the draggable strip has to be described again in the new client frame.
+  // Return false: the host still owns every one of these messages.
+  if (message == WM_SIZE || message == WM_DPICHANGED) UpdateTitleBarDragRegions();
   if (message == WM_CLOSE && !quitting_) {
     if (!active_route_.empty()) {
       DispatchAction("request-close-" + WideToUtf8(active_route_));
@@ -880,9 +902,60 @@ bool WinUI3NativeLeaf::HandleWindowMessage(UINT message, WPARAM wparam, LPARAM l
   return false;
 }
 
+void WinUI3NativeLeaf::ApplyIntegratedTitleBar(bool enabled) {
+  if (window_handle_ == nullptr) return;
+  if (integrated_title_bar_ == enabled) {
+    if (enabled) UpdateTitleBarDragRegions();
+    return;
+  }
+  try {
+    auto app_window = winrt::Microsoft::UI::Windowing::AppWindow::FromWindowId(
+        winrt::Microsoft::UI::GetWindowIdFromWindow(window_handle_));
+    auto title_bar = app_window.TitleBar();
+    title_bar.ExtendsContentIntoTitleBar(enabled);
+    if (enabled) {
+      // The React shell paints the strip behind the caption buttons; only the
+      // buttons' own hover and pressed states may draw a background.
+      title_bar.ButtonBackgroundColor(winrt::Windows::UI::Colors::Transparent());
+      title_bar.ButtonInactiveBackgroundColor(winrt::Windows::UI::Colors::Transparent());
+    }
+    integrated_title_bar_ = enabled;
+    if (enabled) UpdateTitleBarDragRegions();
+  } catch (...) {
+    // A host that cannot project an AppWindow keeps its native caption instead
+    // of losing every way to move the window.
+    integrated_title_bar_ = false;
+  }
+}
+
+void WinUI3NativeLeaf::UpdateTitleBarDragRegions() {
+  if (window_handle_ == nullptr || !integrated_title_bar_) return;
+  try {
+    auto app_window = winrt::Microsoft::UI::Windowing::AppWindow::FromWindowId(
+        winrt::Microsoft::UI::GetWindowIdFromWindow(window_handle_));
+    auto title_bar = app_window.TitleBar();
+    RECT client{};
+    if (!GetClientRect(window_handle_, &client)) return;
+    const auto dpi = static_cast<int>(GetDpiForWindow(window_handle_));
+    const auto height = std::max<LONG>(
+        1, MulDiv(kIntegratedTitleBarHeightDip, dpi, 96));
+    const auto width = std::max<LONG>(0, (client.right - client.left) - title_bar.RightInset());
+    std::vector<winrt::Windows::Graphics::RectInt32> regions;
+    if (width > 0 && client.bottom > 0) {
+      regions.push_back({0, 0, width, std::min<LONG>(height, client.bottom)});
+    }
+    title_bar.SetDragRectangles(regions);
+  } catch (...) {
+  }
+}
+
 void WinUI3NativeLeaf::OpenRoute(std::wstring_view route) {
   auto const previous_route = active_route_;
   active_route_ = route;
+  // Only the shared settings shell draws its own title-bar strip.  The
+  // provider wizard, the raw file editor, the image-context window, and the
+  // hidden home surface keep the native caption they were designed around.
+  ApplyIntegratedTitleBar(UsesIntegratedTitleBar(route));
   if (route == L"home") {
     // "home" leaves the settings shell for the tray, mirroring the macOS
     // host: hide the single window instead of showing an empty shell pane.
@@ -902,7 +975,14 @@ void WinUI3NativeLeaf::OpenRoute(std::wstring_view route) {
           SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER);
       window_sized_ = true;
     }
-    if (IsIconic(window_handle_)) ShowWindow(window_handle_, SW_RESTORE);
+    if (IsIconic(window_handle_)) {
+      ShowWindow(window_handle_, SW_RESTORE);
+    } else if (!IsWindowVisible(window_handle_)) {
+      // A tray launch can arrive after the shared window was ordered out.
+      // SW_SHOWNORMAL is required here; SetForegroundWindow alone does not
+      // make a hidden Win32 window visible or restore its taskbar presence.
+      ShowWindow(window_handle_, SW_SHOWNORMAL);
+    }
     SetForegroundWindow(window_handle_);
   }
   // Windows hosts one React root for every route: opening a window only sets
@@ -2827,7 +2907,14 @@ void WinUI3NativeLeaf::EnsureTray() {
   tray_.uID = 1;
   tray_.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
   tray_.uCallbackMessage = kTrayMessage;
-  tray_.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+  tray_.hIcon = static_cast<HICON>(LoadImageW(
+      GetModuleHandleW(nullptr),
+      MAKEINTRESOURCEW(kWindowIconResource),
+      IMAGE_ICON,
+      GetSystemMetrics(SM_CXSMICON),
+      GetSystemMetrics(SM_CYSMICON),
+      LR_SHARED));
+  if (tray_.hIcon == nullptr) tray_.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
   wcsncpy_s(tray_.szTip, status_title_.empty() ? L"Young Router" : status_title_.c_str(), _TRUNCATE);
   tray_visible_ = Shell_NotifyIconW(NIM_ADD, &tray_) == TRUE;
 }
@@ -2971,6 +3058,7 @@ std::wstring WinUI3NativeLeaf::RouteTitle(std::wstring_view route) const {
     return Localized("appTitle", L"Young Router");
   }
   if (route == L"provider-wizard") return Localized("routeProviderWizard", L"Add Provider");
+  if (route == L"image-context") return Localized("routeImageContext", L"Image Context");
   if (route == L"file-editor") return Localized("routeFileEditor", L"Edit File");
   return Localized("appTitle", L"Young Router");
 }

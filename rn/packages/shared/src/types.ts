@@ -29,6 +29,7 @@ export type AppRoute =
   | "relay-accounts"
   | "relay-add"
   | "provider-wizard"
+  | "image-context"
   | "logs";
 
 export type LogTab =
@@ -703,6 +704,7 @@ export interface NativeLocalization {
   routeGeneralSettings: string;
   routeRuntimeSettings: string;
   routeDataManagement: string;
+  routeImageContext: string;
   routeProviderWizard: string;
   routeFileEditor: string;
   routeLogs: string;

@@ -2,6 +2,7 @@ import React from "react";
 import {
   ActivityIndicator,
   FlatList,
+  Image,
   NativeModules,
   Platform,
   Pressable,
@@ -499,7 +500,8 @@ type TextFieldProps = TextInputProps & {
 };
 
 
-export function NativeTextField({ style, onChangeText, onSubmitEditing, search = false, borderless = false, ...props }: TextFieldProps): React.JSX.Element {
+export function NativeTextField({ style, onChangeText, onSubmitEditing, onBlur, onFocus, search = false, borderless = false, ...props }: TextFieldProps): React.JSX.Element {
+  const [focused, setFocused] = React.useState(false);
   if (Platform.OS === "windows") {
     // Windows text input is React Native's own Composition leaf: RichEdit
     // backed, with IME, selection, and secure entry already working inside the
@@ -519,14 +521,14 @@ export function NativeTextField({ style, onChangeText, onSubmitEditing, search =
     // and the inner input both carry an explicit height instead of inheriting
     // one. Without that, RichEdit centres its single line against the taller
     // frame and the glyphs sit on the bottom edge, clipped.
-    return <View style={[styles.windowsTextField, style, props.editable === false && styles.windowsTextFieldDisabled]}>
-      <TextInput {...props} style={inputStyle} onChangeText={onChangeText} onSubmitEditing={onSubmitEditing} onBlur={props.onBlur} />
+    return <View style={[styles.windowsTextField, focused && styles.windowsTextFieldFocused, style, props.editable === false && styles.windowsTextFieldDisabled]}>
+      <TextInput {...props} style={inputStyle} onFocus={(event) => { setFocused(true); onFocus?.(event); }} onChangeText={onChangeText} onSubmitEditing={onSubmitEditing} onBlur={(event) => { setFocused(false); onBlur?.(event); }} />
     </View>;
   }
   if (Platform.OS === "macos") {
-    return <AppKitTextField {...props} search={search} borderless={borderless} style={style} onChangeText={onChangeText} onSubmitEditing={onSubmitEditing} />;
+    return <AppKitTextField {...props} onBlur={onBlur} search={search} borderless={borderless} style={style} onChangeText={onChangeText} onSubmitEditing={onSubmitEditing} />;
   }
-  return <TextInput {...props} style={style} onChangeText={onChangeText} onSubmitEditing={onSubmitEditing} />;
+  return <TextInput {...props} onFocus={onFocus} onBlur={onBlur} style={style} onChangeText={onChangeText} onSubmitEditing={onSubmitEditing} />;
 }
 
 export function NativeToggle({ value, disabled, onValueChange, style, accessibilityLabel }: ToggleProps): React.JSX.Element {
@@ -587,6 +589,10 @@ function windowsSourceSymbol(symbol: string): string {
   return WINDOWS_SOURCE_GLYPHS[symbol] ?? "•";
 }
 
+function windowsSourceImageUri(imageName: string): string {
+  return `ms-appx:///Assets/Sidebar/${imageName}.png`;
+}
+
 // A virtualized table re-renders its mounted window on every scroll frame, so a
 // row must not re-render just because its parent did.  The key lists arrive as
 // Sets (see `WindowsTable`) so a row's lookups are O(1) rather than a scan per
@@ -604,7 +610,7 @@ function sameColumns(left: TableColumn[], right: TableColumn[]): boolean {
   return true;
 }
 
-function sameTableRow(previous: { row: TableRow; index: number; columns: TableColumn[]; compact: boolean; sourceList: boolean; stripedRows: boolean; selected: boolean; disabled: boolean; alert: boolean; rowSymbol?: string; rowSymbolColor?: string; secondaryCellKeys: Set<string>; selectableSpanning: boolean; onSelect: (row: TableRow, index: number) => void }, next: typeof previous): boolean {
+function sameTableRow(previous: { row: TableRow; index: number; columns: TableColumn[]; compact: boolean; sourceList: boolean; stripedRows: boolean; selected: boolean; disabled: boolean; alert: boolean; rowSymbol?: string; rowSymbolColor?: string; rowImageName?: string; secondaryCellKeys: Set<string>; selectableSpanning: boolean; onSelect: (row: TableRow, index: number) => void }, next: typeof previous): boolean {
   return previous.row === next.row
     && previous.index === next.index
     && previous.compact === next.compact
@@ -615,6 +621,7 @@ function sameTableRow(previous: { row: TableRow; index: number; columns: TableCo
     && previous.alert === next.alert
     && previous.rowSymbol === next.rowSymbol
     && previous.rowSymbolColor === next.rowSymbolColor
+    && previous.rowImageName === next.rowImageName
     && previous.secondaryCellKeys === next.secondaryCellKeys
     && previous.selectableSpanning === next.selectableSpanning
     && previous.onSelect === next.onSelect
@@ -633,6 +640,7 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
   alert,
   rowSymbol,
   rowSymbolColor,
+  rowImageName,
   secondaryCellKeys,
   selectableSpanning,
   onSelect,
@@ -648,6 +656,7 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
   alert: boolean;
   rowSymbol?: string;
   rowSymbolColor?: string;
+  rowImageName?: string;
   secondaryCellKeys: Set<string>;
   selectableSpanning: boolean;
   onSelect: (row: TableRow, index: number) => void;
@@ -672,15 +681,21 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
         const cell = row.cells[columnIndex] ?? "";
         const cellKey = `${row.key}\x1f${columnIndex}`;
         const secondary = secondaryCellKeys.has(cellKey);
-        return <Text key={`${row.key}:${columnIndex}`} numberOfLines={1} style={[windowsTableStyles.cell, { width: column.width, color: secondary ? "#667085" : textColor }, columnIndex === 0 && sourceList && windowsTableStyles.sourceCell]}>
-          {columnIndex === 0 && sourceList && rowSymbol ? <Text style={[windowsTableStyles.symbol, { color: disabled ? "#98a2b3" : rowSymbolColor || "#475467" }]}>{windowsSourceSymbol(rowSymbol)}</Text> : null}{cell.replace(/^\t/u, "")}
-        </Text>;
+        const cellColor = secondary ? "#667085" : textColor;
+        const visibleCell = cell.replace(/^\t/u, "");
+        if (columnIndex === 0 && sourceList) {
+          return <View key={`${row.key}:${columnIndex}`} style={[windowsTableStyles.cellView, { width: column.width }]}>
+            {rowImageName ? <Image source={{ uri: windowsSourceImageUri(rowImageName) }} style={windowsTableStyles.sourceImage} /> : rowSymbol ? <Text style={[windowsTableStyles.symbol, { color: disabled ? "#98a2b3" : rowSymbolColor || "#475467" }]}>{windowsSourceSymbol(rowSymbol)}</Text> : null}
+            <Text numberOfLines={1} style={[windowsTableStyles.cellText, { color: cellColor }]}>{visibleCell}</Text>
+          </View>;
+        }
+        return <Text key={`${row.key}:${columnIndex}`} numberOfLines={1} style={[windowsTableStyles.cell, { width: column.width, color: cellColor }]}>{visibleCell}</Text>;
       })}
     </View>}
   </Pressable>;
 }, sameTableRow);
 
-function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, followBottom, scrollToRow, framed, sourceList, rowSymbols, rowSymbolColors, disabledRowKeys, secondaryCellKeys, selectableSpanningKeys, onSelectionChange, onRowDoublePress, style, alertRowKeys }: {
+function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, followBottom, scrollToRow, framed, sourceList, rowSymbols, rowSymbolColors, rowImageNames, disabledRowKeys, secondaryCellKeys, selectableSpanningKeys, onSelectionChange, onRowDoublePress, style, alertRowKeys }: {
   columns: TableProps["columns"];
   rows: TableProps["rows"];
   selectedKey: string;
@@ -692,6 +707,7 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
   sourceList: boolean;
   rowSymbols: string[];
   rowSymbolColors: string[];
+  rowImageNames: string[];
   disabledRowKeys: string[];
   secondaryCellKeys: string[];
   selectableSpanningKeys: Set<string>;
@@ -749,10 +765,11 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
     alert={alertKeys.has(item.key)}
     rowSymbol={rowSymbols[index]}
     rowSymbolColor={rowSymbolColors[index]}
+    rowImageName={rowImageNames[index]}
     secondaryCellKeys={secondaryKeys}
     selectableSpanning={selectableSpanningKeys.has(item.key)}
     onSelect={select}
-  />, [alertKeys, columns, compact, disabledKeys, rowSymbols, rowSymbolColors, secondaryKeys, selectableSpanningKeys, select, selectedKey, sourceList, stripedRows]);
+  />, [alertKeys, columns, compact, disabledKeys, rowImageNames, rowSymbols, rowSymbolColors, secondaryKeys, selectableSpanningKeys, select, selectedKey, sourceList, stripedRows]);
   const keyExtractor = React.useCallback((row: TableRow): string => row.key, []);
   return <View style={[windowsTableStyles.root, !framed && windowsTableStyles.borderless, style]}>
     <ScrollView horizontal showsHorizontalScrollIndicator={!sourceList} style={windowsTableStyles.horizontalScroll} contentContainerStyle={windowsTableStyles.horizontalContent}>
@@ -792,15 +809,18 @@ const windowsTableStyles = StyleSheet.create({
   horizontalBody: { flex: 1, minHeight: 0 },
   verticalList: { flex: 1, minHeight: 0 },
   body: { flexGrow: 1 },
-  row: { minWidth: "100%", borderBottomWidth: 1, borderBottomColor: "#eef2f6", justifyContent: "center" },
+  row: { minWidth: "100%", borderBottomWidth: 1, borderBottomColor: "#e5e7eb", justifyContent: "center" },
   rowCompact: { minHeight: 30 },
   rowRelaxed: { minHeight: 36 },
   rowStripe: { backgroundColor: "#fafbfc" },
   rowSelected: { backgroundColor: "#eaf3ff", borderLeftWidth: 3, borderLeftColor: "#1677d2" },
   rowDisabled: { opacity: 0.72 },
   cells: { flexDirection: "row", alignItems: "center", paddingHorizontal: 8 },
+  cellView: { flexDirection: "row", alignItems: "center", paddingHorizontal: 8, minWidth: 0 },
+  cellText: { flexShrink: 1, minWidth: 0, fontSize: UI_FONT_SIZE },
   cell: { paddingHorizontal: 8, color: "#1f2937", fontSize: UI_FONT_SIZE },
   sourceCell: { flexDirection: "row", alignItems: "center" },
+  sourceImage: { width: 20, height: 20, marginRight: 8, borderRadius: 4 },
   symbol: { width: 20, height: 20, marginRight: 8, fontFamily: "Segoe MDL2 Assets", fontSize: 16, lineHeight: 20, textAlign: "center" },
   groupText: { paddingHorizontal: 12, color: "#475467", fontSize: UI_TIP_FONT_SIZE, fontWeight: "600" },
 });
@@ -856,7 +876,7 @@ export function NativeTable({ columns, rows, selectedKey = "", striped = true, c
   };
   if (Platform.OS === "windows") {
     // This React table is the only Windows table path.
-    return <WindowsTable columns={columns} rows={rows} selectedKey={selectedKey} stripedRows={stripedRows} compact={compact} followBottom={followBottom} scrollToRow={scrollToRow} framed={framed} sourceList={sourceList} rowSymbols={rowSymbols} rowSymbolColors={rowSymbolColors} disabledRowKeys={disabledRowKeys} secondaryCellKeys={secondaryCellKeys} selectableSpanningKeys={selectableSpanningKeys} onSelectionChange={onSelectionChange} onRowDoublePress={onRowDoublePress} alertRowKeys={alertRowKeys} style={[styles.table, style]} />;
+    return <WindowsTable columns={columns} rows={rows} selectedKey={selectedKey} stripedRows={stripedRows} compact={compact} followBottom={followBottom} scrollToRow={scrollToRow} framed={framed} sourceList={sourceList} rowSymbols={rowSymbols} rowSymbolColors={rowSymbolColors} rowImageNames={rowImageNames} disabledRowKeys={disabledRowKeys} secondaryCellKeys={secondaryCellKeys} selectableSpanningKeys={selectableSpanningKeys} onSelectionChange={onSelectionChange} onRowDoublePress={onRowDoublePress} alertRowKeys={alertRowKeys} style={[styles.table, style]} />;
   }
   if (Platform.OS === "macos") {
     return <AppKitTable {...nativeProps} cellHorizontalPadding={cellHorizontalPadding} firstColumnHorizontalPadding={firstColumnHorizontalPadding} preserveColumnWidths={preserveColumnWidths} scrollTrailingColumnOverflow={scrollTrailingColumnOverflow} onSelectionChange={(event) => onSelectionChange?.(event.nativeEvent.key, event.nativeEvent.index)} onRowDoublePress={(event) => onRowDoublePress?.(event.nativeEvent.key, event.nativeEvent.index)} style={[styles.table, style]} />;
@@ -973,7 +993,8 @@ const styles = StyleSheet.create({
   tableFallbackGroupText: { fontWeight: "400" },
   editor: { minHeight: 160 },
   editorFallback: { minHeight: 160, textAlignVertical: "top", fontSize: UI_FONT_SIZE },
-  windowsTextField: { minHeight: 28, justifyContent: "center", overflow: "hidden", borderWidth: 1, borderColor: "#c8c8c8", borderRadius: 4, backgroundColor: "#ffffff" },
+  windowsTextField: { minHeight: 28, justifyContent: "center", overflow: "hidden", borderWidth: 1, borderColor: "#c8c8c8", borderRadius: 3, backgroundColor: "#ffffff" },
+  windowsTextFieldFocused: { borderColor: "#0078d4" },
   windowsTextFieldDisabled: { opacity: 0.5 },
   // RNW's Windows single-line leaf ignores `textAlignVertical`, and its own
   // vertical placement is `paddingTop + (contentFrame - naturalHeight) / 2`,

@@ -2396,7 +2396,7 @@ class ProvidersModelsDomainTests(unittest.TestCase):
 class CodexSettingsDomainTests(unittest.TestCase):
 
     def test_image_context_switch_writes_and_removes_only_this_apps_mcp_entry(self) -> None:
-        """Codex's fetch tool follows the runtime switch, nothing else moves."""
+        """The switch alone never edits Codex: only an explicit MCP choice does."""
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2418,19 +2418,32 @@ class CodexSettingsDomainTests(unittest.TestCase):
             with mock.patch(
                 "young_router.core.domains.codex._default_runtime_settings_path",
                 return_value=settings,
+            ), mock.patch.dict(
+                "os.environ",
+                {"YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_FETCH": "auto"},
             ):
                 codex = CodexSettingsDomain(runtime, codex_home=home)
                 self.assertFalse(codex.snapshot()["image_context_mcp"])
-                self.assertTrue(codex.sync_image_context_mcp())
-                self.assertTrue(codex.snapshot()["image_context_mcp"])
-                written = (home / "config.toml").read_text(encoding="utf-8")
-                self.assertIn("[mcp_servers.young_router_image_context]", written)
-                self.assertIn("[mcp_servers.other]", written)
+                # The switch on its own leaves the client's file alone: the
+                # desktop client can open a file, so no server is needed.
+                self.assertFalse(codex.sync_image_context_mcp())
+                untouched = (home / "config.toml").read_text(encoding="utf-8")
+                self.assertNotIn("young_router_image_context", untouched)
+                self.assertIn("[mcp_servers.other]", untouched)
 
-                # Disabling removes this app's entry and leaves the user's own.
-                settings.write_text(
-                    "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_ENABLED=0\n", encoding="utf-8"
-                )
+                # An operator who asks for the server explicitly gets it.
+                with mock.patch.dict(
+                    "os.environ",
+                    {"YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_FETCH": "stdio"},
+                ):
+                    self.assertTrue(codex.sync_image_context_mcp())
+                    self.assertTrue(codex.snapshot()["image_context_mcp"])
+                    written = (home / "config.toml").read_text(encoding="utf-8")
+                    self.assertIn("[mcp_servers.young_router_image_context]", written)
+                    self.assertIn("[mcp_servers.other]", written)
+
+                # Going back to the file-based fetch removes it again, and
+                # leaves the user's own server where it was.
                 self.assertTrue(codex.sync_image_context_mcp())
                 self.assertFalse(codex.snapshot()["image_context_mcp"])
                 after = (home / "config.toml").read_text(encoding="utf-8")
