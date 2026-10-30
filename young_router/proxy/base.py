@@ -59,6 +59,11 @@ _RESPONSES_CHAT_BRIDGE_FALLBACK_REASON_KEY = (
     "responses_chat_bridge_fallback_reason"
 )
 _STREAM_ERROR_FALLBACK_START_BUFFER_CHUNKS = 20
+
+#: The keys a chat-completions delta may carry thinking under.  ``reasoning_content``
+#: is the deepseek-style spelling this proxy's own bridge reads, ``reasoning`` is
+#: what some relays send instead.
+_CHAT_REASONING_DELTA_KEYS = ("reasoning_content", "reasoning")
 _STALL_TIMEOUT_SECONDS_ENV = "YOUNG_ROUTER_STALL_TIMEOUT_SECONDS"
 _STALL_TIMEOUT_DEFAULT_SECONDS = 120.0
 # How long an attempt may run before its failure stops being read as the
@@ -978,6 +983,7 @@ def _responses_usage_for_codex(
     usage: Any,
     *,
     input_token_upper_bound: Optional[int] = None,
+    input_token_floor: Optional[int] = None,
 ) -> Optional[dict[str, Any]]:
     if usage is None:
         return None
@@ -999,12 +1005,24 @@ def _responses_usage_for_codex(
         output_details = _object_get(usage, "completion_tokens_details")
 
     cached_tokens = _int_or_zero(_object_get(input_details, "cached_tokens"))
+    # The relays these models are served from count their own way, and a count
+    # that is too low is not harmless: Codex shows it as context used and
+    # compacts against it, so an undercounted thread runs until the router
+    # refuses it.  The proxy already counted this exact request (the same count
+    # the pre-call check compares to the window), so the floor is the client
+    # seeing the truth rather than whatever the upstream felt like reporting.
+    floor_tokens = _int_or_none(input_token_floor)
+    if floor_tokens is not None and floor_tokens > input_tokens:
+        input_tokens = floor_tokens
+        total_tokens = input_tokens + output_tokens
     bounded_input_tokens = _int_or_none(input_token_upper_bound)
     if bounded_input_tokens is not None and bounded_input_tokens >= 0:
         if input_tokens > bounded_input_tokens:
             input_tokens = bounded_input_tokens
             cached_tokens = min(cached_tokens, input_tokens)
             total_tokens = input_tokens + output_tokens
+
+    cached_tokens = min(cached_tokens, input_tokens)
 
     return {
         "input_tokens": input_tokens,
@@ -1026,9 +1044,12 @@ def _normalize_response_completed_event_usage(
 ) -> Any:
     response = _object_get(event, "response")
     usage = _object_get(response, "usage")
+    from . import context_window as _context_window_module
+
     normalized_usage = _responses_usage_for_codex(
         usage,
         input_token_upper_bound=input_token_upper_bound,
+        input_token_floor=_context_window_module.measured_input_tokens(),
     )
     if normalized_usage is None:
         return event

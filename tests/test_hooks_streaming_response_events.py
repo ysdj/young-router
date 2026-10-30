@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from hook_test_utils import *
 
+import importlib
+
 import re
 
 
@@ -2714,3 +2716,93 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
             f"answer; delivered so far: {delivered_before_next_frame[3]}",
         )
         self.assertIn("response.reasoning_summary_text.delta", delivered)
+
+    async def test_chat_reasoning_delta_releases_the_start_buffer(self) -> None:
+        """A chat-completions thinking delta is output the reader can already see.
+
+        A ``fallback`` route answers on the chat shape, so its thinking arrives
+        as ``choices[0].delta.reasoning_content`` rather than as a Responses
+        summary event.  The start buffer only released those on its twenty-chunk
+        ceiling, so the client was handed the first twenty frames of every
+        thinking phase in one burst -- the same failure the Responses summary
+        path had, one layer lower.
+        """
+
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
+        delivered: list[str] = []
+
+        async def upstream_stream():
+            yield {"choices": [{"index": 0, "delta": {"role": "assistant"}}]}
+            yield {"choices": [{"index": 0, "delta": {"reasoning_content": "step one"}}]}
+            yield {"choices": [{"index": 0, "delta": {"reasoning_content": "step two"}}]}
+            yield {"choices": [{"index": 0, "delta": {"content": "the answer"}}]}
+            yield {
+                "id": "chatcmpl-think",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }
+
+        request_data = {
+            "model": "deepseek-v4.1-flash",
+            "messages": [{"role": "user", "content": "Think first."}],
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/chat/completions"},
+            "model_info": {"id": "order1-a", "order": 1},
+        }
+
+        async for chunk in streaming_module._yield_start_buffered_stream_with_error_fallback(
+            upstream_stream(),
+            request_data,
+        ):
+            payload = jsonable_stream_chunk(chunk)
+            delivered.append(str(payload.get("type") or ("chat" if "choices" in payload else "")))
+            if "choices" in payload:
+                delta = payload["choices"][0].get("delta") or {}
+                if delta.get("reasoning_content") == "step one":
+                    # The thinking must reach the reader while the upstream is
+                    # still producing it, not after the answer starts.
+                    delivered.append("first-thinking-frame")
+
+        self.assertIn("first-thinking-frame", delivered)
+
+    def test_the_reasoning_predicate_reads_every_protocol_shape(self) -> None:
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
+        cases = {
+            "response summary": (
+                {
+                    "type": "response.reasoning_summary_text.delta",
+                    "delta": "weighing",
+                },
+                True,
+            ),
+            "chat reasoning_content": (
+                {"choices": [{"index": 0, "delta": {"reasoning_content": "weighing"}}]},
+                True,
+            ),
+            "chat reasoning": (
+                {"choices": [{"index": 0, "delta": {"reasoning": "weighing"}}]},
+                True,
+            ),
+            "anthropic thinking": (
+                {"type": "content_block_delta", "delta": {"type": "thinking_delta", "thinking": "weighing"}},
+                True,
+            ),
+            "empty thinking": (
+                {"choices": [{"index": 0, "delta": {"reasoning_content": ""}}]},
+                False,
+            ),
+            "answer text": (
+                {"choices": [{"index": 0, "delta": {"content": "answer"}}]},
+                False,
+            ),
+            "done frame": (
+                {"type": "response.reasoning_summary_text.done", "text": "weighing"},
+                False,
+            ),
+        }
+        for name, (chunk, expected) in cases.items():
+            with self.subTest(case=name):
+                self.assertEqual(
+                    expected,
+                    streaming_module._stream_chunk_is_public_reasoning_delta(chunk),
+                )

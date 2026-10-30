@@ -27,6 +27,7 @@ from .base import (
     List,
     Optional,
     _CURRENT_EXCLUDED_DEPLOYMENT_IDS,
+    _CHAT_REASONING_DELTA_KEYS,
     _CURRENT_SELECTED_DEPLOYMENT_BOX,
     _IMAGE_GENERATION_TOOL_FALLBACK_ATTEMPTS_METADATA_KEY,
     _JSONStreamEvent,
@@ -2235,13 +2236,41 @@ def _stream_chunk_is_public_reasoning_delta(chunk: Any) -> bool:
 
     dumps = _stream_chunk_dumps(chunk)
     for visible_chunk in dumps if dumps else [chunk]:
-        if not _web_search_native_module._is_public_reasoning_summary_stream_event(
-            _stream_chunk_type(visible_chunk)
-        ):
+        if not isinstance(visible_chunk, dict):
             continue
-        delta = visible_chunk.get("delta") if isinstance(visible_chunk, dict) else None
-        if isinstance(delta, str) and delta.strip():
+        chunk_type = _stream_chunk_type(visible_chunk)
+        delta = visible_chunk.get("delta")
+        if _web_search_native_module._is_public_reasoning_summary_stream_event(
+            chunk_type
+        ):
+            if isinstance(delta, str) and delta.strip():
+                return True
+            if isinstance(delta, dict) and str(delta.get("thinking") or "").strip():
+                return True
+            continue
+        # Anthropic reports thinking as a ``content_block_delta`` whose own
+        # ``delta`` is a ``thinking_delta`` carrying ``thinking``.
+        if isinstance(delta, dict) and str(delta.get("thinking") or "").strip():
             return True
+        # A chat-completions stream carries the same thinking in its choice
+        # delta: ``reasoning_content`` (deepseek-style routes) or ``reasoning``
+        # (some relays).  It is the shape a ``fallback`` route produces, so
+        # leaving it out held the first twenty frames of every thinking phase
+        # in the start buffer and handed the client the whole block at once --
+        # the burst this predicate exists to prevent, one layer lower than the
+        # Responses bridge.
+        if chunk_type:
+            continue
+        for choice in visible_chunk.get("choices") or []:
+            if not isinstance(choice, dict):
+                continue
+            choice_delta = choice.get("delta")
+            if not isinstance(choice_delta, dict):
+                continue
+            for key in _CHAT_REASONING_DELTA_KEYS:
+                value = choice_delta.get(key)
+                if isinstance(value, str) and value.strip():
+                    return True
     return False
 
 
@@ -5964,7 +5993,15 @@ async def _yield_start_buffered_stream_with_error_fallback(
         request_data,
         saw_responses_completed=saw_responses_completed,
         stream_started_at=stream_started_at,
-        saw_visible_output=saw_visible_output or saw_delivered_output,
+        # A Responses summary is a committed item in the client's transcript, so
+        # showing one ends the replay window there.  On the native chat shape a
+        # thinking-only turn must still reach a peer route -- a replay is the
+        # lesser cost there, and the recovery branch reads this flag to decide
+        # exactly that.
+        saw_visible_output=(
+            saw_visible_output
+            or (saw_delivered_output and _request_is_responses_stream(request_data))
+        ),
         on_responses_completed=(
             lambda: _routing_module._record_deployment_success_for_cooldown(
                 request_data
