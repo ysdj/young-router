@@ -769,7 +769,7 @@ const DSH_VISION_ROUTER_QUICK_DEFAULTS: Record<string, string> = {
 // active typing would make every settings surface pay for unrelated edits.
 // Native secret inputs keep a short quiet-period commit because their values
 // intentionally never enter React state.
-const SECRET_INPUT_COMMIT_DEBOUNCE_MS = 150;
+const SECRET_INPUT_COMMIT_DEBOUNCE_MS = 500;
 const RAW_EDITOR_SYNC_INTERVAL_MS = 120;
 
 function sameDiskState(left: DiskState | undefined, right: DiskState | undefined): boolean {
@@ -3344,7 +3344,7 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
     {settingsRoute ? <AssistantSettingsWorkspace busy={busy} native={native} codexModels={codexModelRows} codexModelCatalogEnabled={codexModelCatalogEnabled} standaloneSearch={codexStandaloneSearch} onToggleStandaloneSearch={(enabled) => dispatch("codex.search.set", { enabled }, "codex")} codexFeatures={(domainState(snapshot, "codex").structured as UnknownRecord | undefined)?.features as UnknownRecord | undefined} clientProvider={codexClientProvider} clientModel={codexClientModel} localApiActive={codexUsesLocalApi} onToggleCodexModelCatalog={(enabled) => dispatch("codex.model_catalog.set", { enabled }, "codex")} onToggleCodexFeature={(feature, enabled) => dispatch("codex.feature.set", { feature, enabled }, "codex")} onUseLocalApi={(selection) => dispatch("use_local_api", selection, "codex")} onUseSavedModel={(selection) => dispatch("use_saved_model", selection, "codex")} translate={translate} ipc={ipc} filesToken={settingsRawBaselineToken} onOpenFile={openAssistantFile} /> : null}
     {route === "logs" ? <LogsWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} translate={translate} dispatch={dispatch} onStatus={setResult} onStatusBar={setStatusBarControls} requestedTab={nativeAction?.id === "open-recovery" ? "recovery" : logTabRequest} requestedTabKey={nativeAction?.sequence ?? 0} /> : null}
     {route === "general-settings" ? <GeneralWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} dispatch={dispatch} dispatchServiceAction={enqueueServiceDispatch} translate={translate} onStatus={setResult} onSnapshot={onSnapshot} /> : null}
-    {route === "runtime-settings" ? <RuntimeWorkspace snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} clearSecret={clearSecret} native={native} /> : null}
+    {route === "runtime-settings" ? <RuntimeWorkspace snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} clearSecret={clearSecret} native={native} ipc={ipc} /> : null}
     {route === "data-management" ? <DataManagementWorkspace snapshot={snapshot} tab={dataManagementTab} onTabChange={setDataManagementTab} statuses={dataManagementStatuses} busy={busy} webDavOperationBusy={webDavOperationBusy} translate={translate} dispatch={dispatchDataManagement} onSecretState={onSecretState} onFlushPendingFields={flushPendingFields} onTabSwitchError={(tab, reason) => setDataManagementStatuses((current) => ({ ...current, [tab]: errorMessage(reason, translate) }))} onInspectImport={inspectImportDataManagement} onImport={importDataManagement} onConfirmImportReplace={confirmImportDraftReplacement} onExport={exportDataManagement} onProbeWebDav={probeWebDav} onSyncWebDav={syncWebDav} onCommitWebDavSettings={commitWebDavSettings} /> : null}
     </View> : null}
     {/* One permanent status strip per settings window: the last result replaces
@@ -8910,7 +8910,20 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
   // The proxy's API key is the credential this window hands the user's own
   // clients, so its field is the one credential the pane draws in the clear:
   // the native control holds the value, Core hands it over the read-once
-  // native lease, and no snapshot ever carries it.
+  // native lease, and no snapshot ever carries it. Windows uses this embedded
+  // field too; the old native dialog remains only as an unused compatibility
+  // capability for older callers.
+  const masterKeyField = <NativeSecretInputControl
+    label={translate("general.apiKey")}
+    hint={translate("general.apiKeyPlaceholder")}
+    busy={busy || snapshot === undefined}
+    domain="runtime"
+    field="setting"
+    target="YOUNG_ROUTER_MASTER_KEY"
+    plainText
+    autoCommit
+    onSecretState={(state) => { if (state.status === "error" && state.error !== "") onStatus(state.error); }}
+  />;
   const validatePort = (next: string): string | undefined => {
     const trimmed = next.trim();
     if (!/^\d+$/.test(trimmed)) return translate("runtime.invalidInteger");
@@ -9048,12 +9061,7 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
         {/* The one plaintext credential field: the key is drawn so it can be
             copied into a client, and the value arrives over the native read
             lease rather than through a Core snapshot. */}
-        <View style={styles.generalApiKeyField}>
-          {Platform.OS === "windows"
-            ? <WindowsMasterKeyEditor native={native} busy={busy || snapshot === undefined} translate={translate} onStatus={onStatus} />
-            : <NativeSecretInputControl label={translate("general.apiKey")} hint={translate("general.apiKeyPlaceholder")} busy={busy || snapshot === undefined} domain="runtime" field="setting" target="YOUNG_ROUTER_MASTER_KEY" plainText autoCommit onSecretState={(state) => { if (state.status === "error" && state.error !== "") onStatus(state.error); }} />}
-
-        </View>
+        <View style={styles.generalApiKeyField}>{masterKeyField}</View>
       </View>
     </View>
   </PersistentScrollView>;
@@ -9062,7 +9070,7 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
 /** The runtime category whose surface is the image-context panel. */
 const IMAGE_CONTEXT_CATEGORY = "Codex Images";
 
-function RuntimeWorkspace({ snapshot, busy, translate, dispatch, onSecretState, clearSecret, native }: { snapshot?: CoreSnapshot; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; clearSecret: NativeSecretClear; native: NativeLeafAdapter }): React.JSX.Element {
+function RuntimeWorkspace({ snapshot, busy, translate, dispatch, onSecretState, clearSecret, native, ipc }: { snapshot?: CoreSnapshot; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; clearSecret: NativeSecretClear; native: NativeLeafAdapter; ipc: IpcClient }): React.JSX.Element {
   const state = domainState(snapshot, "runtime");
   const allSettings = asRecords(state.settings).length > 0 ? asRecords(state.settings) : asRecords(state.categories).flatMap((category) => asRecords(category.settings));
   // Settings owned by the General pane (for example the proxy port) stay in
@@ -9093,7 +9101,7 @@ function RuntimeWorkspace({ snapshot, busy, translate, dispatch, onSecretState, 
             the new category instead of inheriting the previous scroll offset. */}
         <PersistentScrollView key={selectedCategory} style={styles.runtimeScrollSurface} contentContainerStyle={styles.runtimeWorkspace}>
           {selectedCategory === "" ? <EmptyState translate={translate} /> : <View style={styles.runtimeFieldList}>{(groups[selectedCategory] ?? []).map((item) => <RuntimeField key={identifier(item)} item={item} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} clearSecret={clearSecret} dshSyncToken={dshSyncToken} />)}
-            {selectedCategory === IMAGE_CONTEXT_CATEGORY ? <ImageContextPanel snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} /> : null}
+            {selectedCategory === IMAGE_CONTEXT_CATEGORY ? <ImageContextPanel snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} ipc={ipc} /> : null}
           </View>}
         </PersistentScrollView>
       </View>
@@ -9110,20 +9118,24 @@ function RuntimeWorkspace({ snapshot, busy, translate, dispatch, onSecretState, 
  * and writes the same selection Context Attachment Manager writes, which is why
  * a task curated in either place behaves the same.
  */
-function ImageContextPanel({ snapshot, busy, translate, dispatch }: { snapshot?: CoreSnapshot; busy: boolean; translate: Translate; dispatch: Dispatch }): React.JSX.Element {
-  // Everything this panel shows travels in the image-context domain's snapshot:
-  // the task list, the open task's images and the preview being looked at.  The
-  // pane therefore renders from one revision, the way every other pane does.
+function ImageContextPanel({ snapshot, busy, translate, dispatch, ipc }: { snapshot?: CoreSnapshot; busy: boolean; translate: Translate; dispatch: Dispatch; ipc: IpcClient }): React.JSX.Element {
+  // Everything about a task travels in the image-context domain's snapshot; the
+  // bytes of one previewed image do not, because a snapshot redacts and bounds
+  // every string it exposes.  So the preview is the one read this panel makes
+  // for itself.
   const state = domainState(snapshot, "image_context");
   const tasks = asRecords(state.tasks);
   const environment = asRecord(state.environment);
   const task = asRecord(state.task);
   const images = asRecords(task.images);
-  const preview = asRecord(state.preview);
+  const selectedTaskId = stringValue(asRecord(task.task).id) || stringValue(tasks[0]?.id);
+  const [preview, setPreview] = useState<{ id: string; dataUrl: string | null } | undefined>(undefined);
+  useEffect(() => {
+    setPreview(undefined);
+  }, [selectedTaskId, snapshot?.revision]);
   if (tasks.length === 0) {
     return <View style={styles.runtimeField}><Text style={styles.externalSettingsHelpText}>{translate("imageContext.empty")}</Text></View>;
   }
-  const selectedTaskId = stringValue(asRecord(task.task).id) || stringValue(tasks[0].id);
   // A tick means two different things, because automatic selection does two
   // different things: with it on, earlier turns are omitted by the pass itself,
   // so a tick can only mean "send this every turn" (pinned).  With it off, the
@@ -9131,6 +9143,12 @@ function ImageContextPanel({ snapshot, busy, translate, dispatch }: { snapshot?:
   const automatic = booleanValue(task.auto);
   const setIncluded = (id: string, included: boolean): void => {
     void dispatch(automatic ? "pin" : "set", automatic ? { task: selectedTaskId, id, pinned: included } : { task: selectedTaskId, id, included }, "image_context");
+  };
+  const openPreview = (id: string): void => {
+    void ipc.imageContextImage(selectedTaskId, id).then(
+      (answer) => setPreview({ id, dataUrl: stringValue(answer.data_url) || null }),
+      () => setPreview({ id, dataUrl: null }),
+    );
   };
   return <View style={styles.runtimeField}>
     <View style={styles.runtimeImageTools}>
@@ -9144,27 +9162,26 @@ function ImageContextPanel({ snapshot, busy, translate, dispatch }: { snapshot?:
         });
         return <ActionButton key={id} title={label} titleWidth="auto" toolTip={id} disabled={busy} onPress={() => { void dispatch("open", { task: id }, "image_context"); }} />;
       })}</View>
-      <NativeToggle accessibilityLabel={translate("imageContext.auto")} value={booleanValue(task.auto)} disabled={busy} onValueChange={(enabled) => { void dispatch("auto", { task: selectedTaskId, enabled }, "image_context"); }} style={styles.runtimeBooleanControl} />
+      <NativeToggle accessibilityLabel={translate("imageContext.auto")} value={automatic} disabled={busy || !selectedTaskId} onValueChange={(enabled) => { void dispatch("auto", { task: selectedTaskId, enabled }, "image_context"); }} style={styles.runtimeBooleanControl} />
       <ActionButton title={translate("imageContext.forget")} titleWidth="auto" disabled={busy || !selectedTaskId} onPress={() => { void dispatch("forget", { task: selectedTaskId }, "image_context"); }} />
     </View>
     <Text style={styles.externalSettingsHelpText}>{translate("imageContext.autoHint")}</Text>
     <Text style={styles.externalSettingsHelpText}>{translate("imageContext.next", { sent: String(numberValue(asRecord(task.next).sent, 0)), omitted: String(numberValue(asRecord(task.next).omitted, 0)) })}</Text>
     <View style={styles.runtimeImageGrid}>{images.map((image) => {
       const id = stringValue(image.id);
-      const included = booleanValue(task.auto) ? booleanValue(image.pinned) : !booleanValue(image.unchecked);
+      const included = automatic ? booleanValue(image.pinned) : !booleanValue(image.unchecked);
       return <View key={id} style={styles.runtimeImageCell}>
-        <ActionButton title={translate("imageContext.preview")} titleWidth="auto" disabled={busy} onPress={() => { void dispatch("preview", { task: selectedTaskId, id }, "image_context"); }} />
+        <ActionButton title={translate("imageContext.preview")} titleWidth="auto" disabled={busy} onPress={() => openPreview(id)} />
         <Text numberOfLines={1} style={styles.runtimeImageCellLabel}>{id}</Text>
         <Text numberOfLines={1} style={styles.externalSettingsHelpText}>{`${numberValue(image.width, 0)}×${numberValue(image.height, 0)}`}</Text>
-        <NativeCheckbox label={translate(booleanValue(task.auto) ? "imageContext.everyTurn" : "imageContext.send")} value={included} disabled={busy} onValueChange={(next) => setIncluded(id, next)} />
+        <NativeCheckbox label={translate(automatic ? "imageContext.everyTurn" : "imageContext.send")} value={included} disabled={busy} onValueChange={(next) => setIncluded(id, next)} />
       </View>;
     })}</View>
-    {preview.data_url ? <View style={styles.runtimeImagePreviewSurface}>
-      <Text numberOfLines={1} style={styles.runtimeImageCellLabel}>{stringValue(preview.id)}</Text>
-      <Image source={{ uri: stringValue(preview.data_url) }} style={styles.runtimeImagePreview} />
-      <ActionButton title={translate("common.close")} titleWidth="auto" onPress={() => { void dispatch("close_preview", {}, "image_context"); }} />
+    {preview ? <View style={styles.runtimeImagePreviewSurface}>
+      <Text numberOfLines={1} style={styles.runtimeImageCellLabel}>{preview.id}</Text>
+      {preview.dataUrl ? <Image source={{ uri: preview.dataUrl }} style={styles.runtimeImagePreview} /> : <Text style={styles.externalSettingsHelpText}>{translate("imageContext.noPreview")}</Text>}
+      <ActionButton title={translate("status.close")} titleWidth="auto" onPress={() => setPreview(undefined)} />
     </View> : null}
-    {stringValue(preview.id) && !preview.data_url ? <Text style={styles.externalSettingsHelpText}>{translate("imageContext.noPreview")}</Text> : null}
     {stringValue(environment.mode) ? <Text style={styles.externalSettingsHelpText}>{translate("imageContext.environment", { mode: stringValue(environment.mode), fetch: stringValue(environment.fetch) })}</Text> : null}
   </View>;
 }
@@ -9408,7 +9425,7 @@ function RuntimeField({ item, busy, translate, dispatch, onSecretState, clearSec
     control = <NativeSecretInputControl label={label} hint={item.retained === true ? translate("runtime.secretRetained") : translate("runtime.jsonPlaceholder")} busy={busy} domain="runtime" field="setting" target={key} multiline plainText autoCommit resetToken={jsonResetToken} onSecretState={onSecretState} />;
     action = <ActionButton title={item.will_clear === true ? translate("common.willClear") : translate("common.clear")} disabled={busy || item.retained !== true || item.will_clear === true} onPress={() => { void clearSecret({ domain: "runtime", field: "setting", target: key }).then(() => setJsonResetToken((current) => current + 1)); }} />;
   } else if (item.secret === true) {
-    control = <NativeSecretInputControl label={label} hint={item.retained === true ? translate("runtime.secretRetained") : undefined} busy={busy} domain="runtime" field="setting" target={key} onSecretState={onSecretState} setTitle={translate("common.set")} />;
+    control = <NativeSecretInputControl label={label} hint={item.retained === true ? translate("runtime.secretRetained") : undefined} busy={busy} domain="runtime" field="setting" target={key} autoCommit onSecretState={onSecretState} />;
     action = <ActionButton title={item.will_clear === true ? translate("common.willClear") : translate("common.clear")} disabled={busy || item.retained !== true || item.will_clear === true} onPress={() => clearSecret({ domain: "runtime", field: "setting", target: key })} />;
   } else {
     control = <RuntimeValueField label={label} value={value} keyboardType={numericKind ? "numeric" : undefined} validate={validate} resetToken={resetToken} resetValue={rawDefaultValue} onCommit={(next) => dispatch("set_setting", { key, value: next })} onErrorChange={setValueError} />;
@@ -9701,56 +9718,18 @@ function WebDavWorkspace({ snapshot, busy, pendingAction, webDavBusy, actionRow,
 }
 
 function WebDavPasswordField({ configured, busy, translate, onSecretState }: { configured: boolean; busy: boolean; translate: Translate; onSecretState: (state: SecretState) => void }): React.JSX.Element {
-  const [commitRequest, setCommitRequest] = useState(0);
-  const [resetRequest, setResetRequest] = useState(0);
-  const [status, setStatus] = useState("ready");
-  const registry = useContext(PendingFieldContext);
-  const fieldId = useRef(Symbol("WebDAV Password"));
-  const dirtyRef = useRef(false);
-  const commitSequence = useRef(0);
-  const pendingCommit = useRef<{ request: number; resolve: () => void; reject: (reason: Error) => void } | undefined>(undefined);
-  const requestCommit = useCallback((): Promise<void> => {
-    const request = commitSequence.current + 1;
-    commitSequence.current = request;
-    return new Promise<void>((resolve, reject) => {
-      pendingCommit.current?.resolve();
-      pendingCommit.current = { request, resolve, reject };
-      setCommitRequest(request);
-    });
-  }, []);
-  const reset = useCallback((): void => {
-    dirtyRef.current = false;
-    registry?.setDirty(fieldId.current, false);
-    setResetRequest((current) => current + 1);
-  }, [registry]);
-  useEffect(() => {
-    registry?.register(fieldId.current, { commit: requestCommit, reset, isDirty: () => dirtyRef.current });
-    return () => {
-      pendingCommit.current?.resolve();
-      pendingCommit.current = undefined;
-      registry?.register(fieldId.current);
-    };
-  }, [registry, requestCommit, reset]);
-  return <View style={SETTINGS_FIELD_ROW_INDENTED}><Text style={SETTINGS_FIELD_LABEL}>{translate("webdav.password")}</Text><NativeSecureTextInput domain="webdav" field="password" label={translate("webdav.password")} placeholder={configured ? translate("webdav.passwordHintConfigured") : translate("webdav.passwordHintOptional")} disabled={busy || status === "saving"} commitRequest={commitRequest} resetRequest={resetRequest} onSecretState={(state) => {
-    setStatus(state.status);
-    if (state.status === "dirty") {
-      dirtyRef.current = true;
-      registry?.setDirty(fieldId.current, true);
-    } else if (state.status === "saved" || state.status === "ready" || state.status === "error") {
-      dirtyRef.current = false;
-      registry?.setDirty(fieldId.current, false);
-    }
-    const pending = pendingCommit.current;
-    if (pending && state.commitRequest >= pending.request && state.status !== "saving" && state.status !== "dirty") {
-      pendingCommit.current = undefined;
-      if (state.status === "error") pending.reject(new Error(state.error || "WebDAV password could not be staged"));
-      else pending.resolve();
-    }
-    if (state.status === "saved") {
-      setResetRequest((current) => current + 1);
-      onSecretState(state);
-    }
-  }} style={styles.webdavPasswordInput} /></View>;
+  return <View style={SETTINGS_FIELD_ROW_INDENTED}>
+    <Text style={SETTINGS_FIELD_LABEL}>{translate("webdav.password")}</Text>
+    <NativeSecretInputControl
+      label={translate("webdav.password")}
+      hint={configured ? translate("webdav.passwordHintConfigured") : translate("webdav.passwordHintOptional")}
+      busy={busy}
+      domain="webdav"
+      field="password"
+      autoCommit
+      onSecretState={onSecretState}
+    />
+  </View>;
 }
 
 type RouteTraceAttempt = {

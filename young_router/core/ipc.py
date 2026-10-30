@@ -1071,6 +1071,15 @@ class CoreIPCServer:
                     result = self.stage_editor_capability(
                         editor_token, text, session_token=session_token
                     )
+            elif request.method == "image_context_image":
+                # Image bytes never travel in a snapshot: a projection redacts
+                # and bounds every string it exposes, so a picture asked for
+                # here is its own answer, the way an editor document is.
+                task = params.get("task")
+                image_id = params.get("id")
+                if not isinstance(task, str) or not isinstance(image_id, str):
+                    raise CoreError("invalid_image", "The requested image is unavailable")
+                result = self.core.image_context_image(task, image_id)
             elif request.method == "dispatch":
                 action = params.get("action")
                 expected = params.get("revision")

@@ -4860,6 +4860,24 @@ class CoreStore:
             base_revision=self._revision + 1,
         )
 
+    def image_context_image(self, task: str, image_id: str) -> dict[str, Any]:
+        """One stored image of one task, for the panel's preview.
+
+        Read straight from the domain rather than through a snapshot: a snapshot
+        redacts and bounds every string it exposes, and a picture is neither.
+        """
+
+        adapter = self._domains.get("image_context")
+        read = getattr(adapter, "image", None)
+        if not callable(read):
+            raise CoreError("invalid_image", "The requested image is unavailable")
+        try:
+            return read(task, image_id)
+        except CoreError:
+            raise
+        except Exception:
+            raise CoreError("invalid_image", "The requested image is unavailable") from None
+
     def reload(self, domain: str | None = None, *, revision: int | None = None) -> dict[str, Any]:
         with self._lock:
             self._check_revision(revision)

@@ -148,7 +148,7 @@ class CoreProtocolTests(unittest.TestCase):
         schema = load_protocol_schema()
         self.assertEqual(1, schema["protocol_version"])
         self.assertEqual(
-            ["snapshot", "disk_state", "logs", "editor", "files", "dispatch", "subscribe", "validate", "apply", "reload", "probe", "export", "import_preview", "import"],
+            ["snapshot", "disk_state", "logs", "editor", "files", "image_context_image", "dispatch", "subscribe", "validate", "apply", "reload", "probe", "export", "import_preview", "import"],
             schema["methods"],
         )
         typescript = (
@@ -206,6 +206,7 @@ class CoreProtocolTests(unittest.TestCase):
             "logs": {"tab": "requests"},
             "editor": {"domain": "codex", "document": "config"},
             "files": {},
+            "image_context_image": {"task": "task-one", "id": "IMG-0001"},
             "dispatch": {"action": {"type": "set", "domain": "language", "payload": {}}},
             "subscribe": {"topics": ["snapshot"]},
             "validate": {"domain": "language", "revision": 0},
@@ -217,6 +218,7 @@ class CoreProtocolTests(unittest.TestCase):
             "import": {"import_plan_token": "plan", "sections": ["language"], "revision": 0},
         }
         invalid = {
+            "image_context_image": {"task": "task-one"},
             "snapshot": {"stale": True},
             "disk_state": {"domains": []},
             "logs": {"tab": "unknown"},
@@ -289,6 +291,17 @@ class CoreProtocolTests(unittest.TestCase):
                         "exists": False,
                     }
                 ],
+            },
+            "image_context_image": {
+                "task": "task-one",
+                "id": "IMG-0001",
+                "mime": "image/png",
+                "bytes": 3,
+                "width": None,
+                "height": None,
+                "turn": None,
+                "name": None,
+                "data_url": None,
             },
             "dispatch": {"revision": 0, "action_summary": {"operation": "fetch_models"}},
             "subscribe": {"subscription_id": "subscription"},

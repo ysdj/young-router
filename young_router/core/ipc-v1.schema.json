@@ -10,6 +10,7 @@
     "logs",
     "editor",
     "files",
+    "image_context_image",
     "dispatch",
     "subscribe",
     "validate",
@@ -26,6 +27,7 @@
     "logs": {"params": {"$ref": "#/$defs/logsParams"}, "result": {"$ref": "#/$defs/logsResult"}},
     "editor": {"params": {"$ref": "#/$defs/editorParams"}, "result": {"$ref": "#/$defs/editorResult"}},
     "files": {"params": {"$ref": "#/$defs/emptyParams"}, "result": {"$ref": "#/$defs/filesResult"}},
+    "image_context_image": {"params": {"$ref": "#/$defs/imageContextImageParams"}, "result": {"$ref": "#/$defs/imageContextImageResult"}},
     "dispatch": {"params": {"$ref": "#/$defs/dispatchParams"}, "result": {"$ref": "#/$defs/dispatchResult"}},
     "subscribe": {"params": {"$ref": "#/$defs/subscribeParams"}, "result": {"$ref": "#/$defs/subscribeResult"}},
     "validate": {"params": {"$ref": "#/$defs/domainRevisionParams"}, "result": {"$ref": "#/$defs/validateResult"}},
@@ -43,7 +45,7 @@
     "properties": {
       "protocol_version": {"const": 1},
       "request_id": {"type": "string", "minLength": 1, "maxLength": 256},
-      "method": {"enum": ["snapshot", "disk_state", "logs", "editor", "files", "dispatch", "subscribe", "validate", "apply", "reload", "probe", "export", "import_preview", "import"]},
+      "method": {"enum": ["snapshot", "disk_state", "logs", "editor", "files", "image_context_image", "dispatch", "subscribe", "validate", "apply", "reload", "probe", "export", "import_preview", "import"]},
       "params": {"type": "object"}
     },
     "allOf": [
@@ -52,6 +54,7 @@
       {"if": {"properties": {"method": {"const": "logs"}}}, "then": {"properties": {"params": {"$ref": "#/$defs/logsParams"}}}},
       {"if": {"properties": {"method": {"const": "editor"}}}, "then": {"properties": {"params": {"$ref": "#/$defs/editorParams"}}}},
       {"if": {"properties": {"method": {"const": "files"}}}, "then": {"properties": {"params": {"$ref": "#/$defs/emptyParams"}}}},
+      {"if": {"properties": {"method": {"const": "image_context_image"}}}, "then": {"properties": {"params": {"$ref": "#/$defs/imageContextImageParams"}}}},
       {"if": {"properties": {"method": {"const": "dispatch"}}}, "then": {"properties": {"params": {"$ref": "#/$defs/dispatchParams"}}}},
       {"if": {"properties": {"method": {"const": "subscribe"}}}, "then": {"properties": {"params": {"$ref": "#/$defs/subscribeParams"}}}},
       {"if": {"properties": {"method": {"const": "validate"}}}, "then": {"properties": {"params": {"$ref": "#/$defs/domainRevisionParams"}}}},
@@ -123,6 +126,8 @@
     "logSource": {"type": "object", "additionalProperties": false, "required": ["id", "label"], "properties": {"id": {"type": "string", "minLength": 1, "maxLength": 64}, "label": {"type": "string", "maxLength": 160}}, "x-typescript-type": "LogSource"},
     "logsResult": {"type": "object", "additionalProperties": false, "required": ["changed", "revision", "log"], "properties": {"changed": {"type": "boolean"}, "revision": {"$ref": "#/$defs/revision"}, "log": {"oneOf": [{"$ref": "#/$defs/logView"}, {"type": "null"}]}}},
     "editorResult": {"type": "object", "additionalProperties": false, "required": ["domain", "document", "editor_token", "revision", "text", "baseline"], "properties": {"domain": {"enum": ["codex", "claude", "clients"]}, "document": {"enum": ["config", "auth", "settings", "desktop", "developer", "pi_settings", "pi_models", "pi_auth", "dsh_settings", "dsh_desktop_settings", "opencode_config", "opencode_auth", "codex_agents", "codex_model_catalog"]}, "editor_token": {"type": "string", "minLength": 1, "maxLength": 256}, "revision": {"$ref": "#/$defs/revision"}, "text": {"type": "string", "maxLength": 6291456}, "baseline": {"type": "string", "maxLength": 6291456}}},
+    "imageContextImageParams": {"type": "object", "additionalProperties": false, "required": ["task", "id"], "properties": {"task": {"type": "string", "minLength": 1, "maxLength": 120}, "id": {"type": "string", "minLength": 1, "maxLength": 32}}, "x-typescript-type": "{ task: string; id: string }"},
+    "imageContextImageResult": {"type": "object", "additionalProperties": false, "required": ["task", "id", "mime", "bytes", "data_url"], "properties": {"task": {"type": "string"}, "id": {"type": "string"}, "mime": {"type": "string"}, "bytes": {"type": "integer", "minimum": 0}, "width": {"type": ["integer", "null"]}, "height": {"type": ["integer", "null"]}, "turn": {"type": ["integer", "null"]}, "name": {"type": ["string", "null"]}, "data_url": {"type": ["string", "null"], "maxLength": 8388608}}, "x-typescript-type": "IpcResults[\"image_context_image\"]"},
     "filesResult": {"type": "object", "additionalProperties": false, "required": ["revision", "files"], "properties": {"revision": {"$ref": "#/$defs/revision"}, "files": {"type": "array", "maxItems": 32, "x-typescript-type": "ClientFile[]", "items": {"type": "object", "additionalProperties": false, "required": ["id", "client", "domain", "document", "name", "path", "display_path", "language", "exists"], "properties": {"id": {"type": "string", "minLength": 1, "maxLength": 128}, "client": {"enum": ["codex", "claude", "claudeCode", "claudeDesktop", "pi", "dsh", "opencode"]}, "domain": {"enum": ["codex", "claude", "clients"]}, "document": {"type": "string", "minLength": 1, "maxLength": 128}, "name": {"type": "string", "minLength": 1, "maxLength": 256}, "path": {"type": "string", "minLength": 1, "maxLength": 4096}, "display_path": {"type": "string", "minLength": 1, "maxLength": 4096}, "language": {"enum": ["json", "jsonc", "toml", "yaml", "text"]}, "exists": {"type": "boolean"}}}}}},
     "revisionResult": {"type": "object", "additionalProperties": false, "required": ["revision"], "properties": {"revision": {"$ref": "#/$defs/revision"}}},
     "dispatchResult": {"type": "object", "additionalProperties": false, "required": ["revision"], "properties": {"revision": {"$ref": "#/$defs/revision"}, "action_summary": {"type": "object", "x-typescript-type": "Record<string, unknown>"}}},

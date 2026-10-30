@@ -6,6 +6,7 @@ export type IpcMethod =
   | "logs"
   | "editor"
   | "files"
+  | "image_context_image"
   | "dispatch"
   | "subscribe"
   | "validate"
@@ -461,6 +462,7 @@ export interface IpcParams {
     }
     | { editor_token: string; text: string };
   files: Record<string, never>;
+  image_context_image: { task: string; id: string };
   dispatch: { action: DispatchAction; revision?: number };
   subscribe: { topics?: "snapshot"[] };
   validate: { domain: ConfigDomain; revision?: number };
@@ -499,6 +501,17 @@ export interface IpcResults {
     baseline: string;
   };
   files: { revision: number; files: ClientFile[] };
+  image_context_image: {
+    task: string;
+    id: string;
+    mime: string;
+    bytes: number;
+    width: number | null;
+    height: number | null;
+    turn: number | null;
+    name: string | null;
+    data_url: string | null;
+  };
   dispatch: { revision: number; action_summary?: Record<string, unknown> };
   subscribe: { subscription_id: string };
   validate: { validate: ValidationSummary };
@@ -588,6 +601,7 @@ export interface IpcClient {
   logs(tab: LogTab, revision?: number): Promise<IpcResults["logs"]>;
   editor(domain: EditorDomain, document: EditorDocument): Promise<IpcResults["editor"]>;
   files(): Promise<IpcResults["files"]>;
+  imageContextImage(task: string, id: string): Promise<IpcResults["image_context_image"]>;
   stageEditor(editorToken: string, text: string): Promise<IpcResults["editor"]>;
   dispatch(action: DispatchAction, revision?: number): Promise<IpcResults["dispatch"]>;
   subscribe(listener: (event: IpcEvent) => void, topics?: IpcEventTopic[]): () => void;
