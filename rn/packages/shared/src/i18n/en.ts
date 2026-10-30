@@ -370,6 +370,8 @@ export const en: Record<TranslationKey, string> = {
   "general.portHint": "Default: {default} · An occupied port steps forward to the next free one.",
   "general.apiKey": "API key",
   "general.apiKeyPlaceholder": "Enter the proxy API key",
+  "imageContext.taskChip": "{{images}} imgs · {{at}}",
+  "imageContext.forget": "Forget task",
   "imageContext.empty": "No task has stored images yet. Turn on Codex image context, then open a task that used images.",
   "imageContext.auto": "Automatic selection",
   "imageContext.autoHint": "On, earlier turns are omitted and only this turn's images are sent. Off, only the images you untick are left out.",

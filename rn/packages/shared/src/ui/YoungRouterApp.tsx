@@ -9126,9 +9126,16 @@ function ImageContextPanel({ snapshot, busy, translate, dispatch }: { snapshot?:
     <View style={styles.runtimeImageTools}>
       <View style={styles.runtimeImageTasks}>{tasks.map((entry) => {
         const id = stringValue(entry.id);
-        return <ActionButton key={id} title={id.length > 14 ? `${id.slice(0, 13)}…` : id} titleWidth="auto" disabled={busy} onPress={() => { void dispatch("open", { task: id }, "image_context"); }} />;
+        // A task's id is a UUID nobody reads; what a person recognises is how
+        // many images it holds and when it last ran.
+        const label = translate("imageContext.taskChip", {
+          images: String(numberValue(entry.images, 0)),
+          at: stringValue(entry.updated_at).slice(5, 16).replace("T", " "),
+        });
+        return <ActionButton key={id} title={label} titleWidth="auto" toolTip={id} disabled={busy} onPress={() => { void dispatch("open", { task: id }, "image_context"); }} />;
       })}</View>
       <NativeToggle accessibilityLabel={translate("imageContext.auto")} value={booleanValue(task.auto)} disabled={busy} onValueChange={(enabled) => { void dispatch("auto", { task: selectedTaskId, enabled }, "image_context"); }} style={styles.runtimeBooleanControl} />
+      <ActionButton title={translate("imageContext.forget")} titleWidth="auto" disabled={busy || !selectedTaskId} onPress={() => { void dispatch("forget", { task: selectedTaskId }, "image_context"); }} />
     </View>
     <Text style={styles.externalSettingsHelpText}>{translate("imageContext.autoHint")}</Text>
     <Text style={styles.externalSettingsHelpText}>{translate("imageContext.next", { sent: String(numberValue(asRecord(task.next).sent, 0)), omitted: String(numberValue(asRecord(task.next).omitted, 0)) })}</Text>

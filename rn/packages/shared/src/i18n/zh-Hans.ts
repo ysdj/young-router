@@ -372,6 +372,8 @@ export const zhHans: Record<TranslationKey, string> = {
   "general.portHint": "默认值: {default} · 端口被占用时自动顺延到下一个可用端口。",
   "general.apiKey": "API Key",
   "general.apiKeyPlaceholder": "输入代理 API Key",
+  "imageContext.taskChip": "{{images}} 张 · {{at}}",
+  "imageContext.forget": "删除该任务",
   "imageContext.empty": "还没有任务存过图片。打开 Codex 图片上下文，再回到用过图片的任务即可。",
   "imageContext.auto": "自动选图",
   "imageContext.autoHint": "打开：之前各轮的图默认省略，只发这一轮的；关闭：只省略你取消勾选的图。",

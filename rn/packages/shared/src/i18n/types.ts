@@ -384,6 +384,8 @@ export type TranslationKey =
   | "general.portHint"
   | "general.apiKey"
   | "general.apiKeyPlaceholder"
+  | "imageContext.taskChip"
+  | "imageContext.forget"
   | "imageContext.empty"
   | "imageContext.auto"
   | "imageContext.autoHint"
