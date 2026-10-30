@@ -470,6 +470,10 @@ CONNECT_WORKBUDDY_WORK="$STAGING_CACHE/connect-workbuddy"
 VERIDROP_WORK="$STAGING_CACHE/veridrop"
 OUR_FREE_MODEL_WORK="$STAGING_CACHE/our-free-model"
 DSH_VISION_ROUTER_WORK="$STAGING_CACHE/dsh-vision-router"
+# The image-context pass copies Context Attachment Manager's placeholder wording
+# and reads its selection file, so every build re-checks that release: a release
+# that moved either one fails here instead of shipping a pass the model misreads.
+CONTEXT_ATTACHMENT_MANAGER_WORK="$STAGING_CACHE/context-attachment-manager"
 # Each job is started in this shell, not inside a command substitution: a
 # substitution runs in a subshell, so a job it launches is not a child of the
 # shell that has to wait for it and its output would corrupt the captured pid.
@@ -493,6 +497,9 @@ STAGING_PIDS+=("$!")
 OUR_FREE_MODEL_STAGE_ARGS=("$PROJECT_ROOT/scripts/update_our_free_model.py"
   --output "$OUR_FREE_MODEL_WORK")
 "${STAGE_PYTHON[@]}" "${OUR_FREE_MODEL_STAGE_ARGS[@]}" &
+STAGING_PIDS+=("$!")
+"${STAGE_PYTHON[@]}" "$PROJECT_ROOT/scripts/update_context_attachment_manager.py" \
+  --output "$CONTEXT_ATTACHMENT_MANAGER_WORK" &
 STAGING_PIDS+=("$!")
 
 pnpm install --frozen-lockfile

@@ -2395,6 +2395,49 @@ class ProvidersModelsDomainTests(unittest.TestCase):
 
 class CodexSettingsDomainTests(unittest.TestCase):
 
+    def test_image_context_switch_writes_and_removes_only_this_apps_mcp_entry(self) -> None:
+        """Codex's fetch tool follows the runtime switch, nothing else moves."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            home = root / "codex"
+            home.mkdir()
+            (home / "config.toml").write_text(
+                'model = "default-chat"\n\n'
+                '[mcp_servers.other]\ncommand = "/usr/bin/other"\n',
+                encoding="utf-8",
+            )
+            (home / "auth.json").write_text("{}\n", encoding="utf-8")
+            settings = root / "runtime-settings.env"
+            settings.write_text(
+                "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_ENABLED=1\n", encoding="utf-8"
+            )
+
+            with mock.patch(
+                "young_router.core.domains.codex._default_runtime_settings_path",
+                return_value=settings,
+            ):
+                codex = CodexSettingsDomain(runtime, codex_home=home)
+                self.assertFalse(codex.snapshot()["image_context_mcp"])
+                self.assertTrue(codex.sync_image_context_mcp())
+                self.assertTrue(codex.snapshot()["image_context_mcp"])
+                written = (home / "config.toml").read_text(encoding="utf-8")
+                self.assertIn("[mcp_servers.young_router_image_context]", written)
+                self.assertIn("[mcp_servers.other]", written)
+
+                # Disabling removes this app's entry and leaves the user's own.
+                settings.write_text(
+                    "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_ENABLED=0\n", encoding="utf-8"
+                )
+                self.assertTrue(codex.sync_image_context_mcp())
+                self.assertFalse(codex.snapshot()["image_context_mcp"])
+                after = (home / "config.toml").read_text(encoding="utf-8")
+                self.assertNotIn("young_router_image_context", after)
+                self.assertIn("[mcp_servers.other]", after)
+
+
 
     def test_use_local_api_rewrites_the_selected_provider_in_place(self) -> None:
         """The pane's Codex action adopts this app's own proxy as the backend."""

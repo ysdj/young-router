@@ -43,7 +43,7 @@ struct NativeMenuGroup {
 
 // Convert a content size expressed in 96-DPI DIPs to the physical outer-frame
 // size required by AppWindow::Resize for a particular native window.
-POINT FrameTrackSizeForContentDips(HWND window, LONG width, LONG height);
+POINT FrameTrackSizeForContentDips(HWND window, LONG width, LONG height, UINT dpi_hint = 0);
 
 // Applies the Win32 half of the immediate-presentation policy to an owned
 // window, including future route and modal windows.
@@ -194,7 +194,8 @@ class WinUI3NativeLeaf : public std::enable_shared_from_this<WinUI3NativeLeaf> {
   std::optional<NativeSecretEditResult> EditSecret(
       std::wstring_view title,
       bool allow_clear,
-      bool present);
+      bool present,
+      std::wstring_view initial);
   std::optional<GroupManagerResult> ShowGroupManager(
       std::wstring title,
       std::wstring account_label,

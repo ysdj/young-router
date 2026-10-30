@@ -1670,7 +1670,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         windows_viewer = windows.split("void WinUI3NativeLeaf::ShowReadOnlyText(", 1)[1].split(
             "std::optional<size_t> WinUI3NativeLeaf::ShowActionMenu", 1
         )[0]
-        self.assertIn("xaml::Window dialog;", windows_viewer)
+        self.assertIn("XamlDialog dialog;", windows_viewer)
         self.assertIn("controls::WebView2 viewer;", windows_viewer)
         self.assertIn("InitializeReadOnlyCodeViewer(weak_state, viewer_html, viewer_text, viewer_language);", windows_viewer)
         self.assertIn("RunOwnedModalWindow(dialog, window_handle_, {760, 520}, state->finished)", windows_viewer)
@@ -2391,7 +2391,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("RCT_EXTERN_METHOD(chooseModelsToAdd:", mac_bridge)
 
         self.assertIn("std::optional<std::vector<std::wstring>> WinUI3NativeLeaf::ChooseModelsToAdd(", windows_leaf)
-        self.assertIn("xaml::Window dialog;", windows_leaf)
+        self.assertIn("XamlDialog dialog;", windows_leaf)
         self.assertIn("RunOwnedModalWindow(dialog, window_handle_", windows_leaf)
         self.assertNotIn("XamlUIService", windows_module)
         self.assertIn('all.Content(winrt::box_value(Localized("modelChooserAll"', windows_leaf)
@@ -3328,6 +3328,101 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         ):
             self.assertNotIn(removed, controls)
 
+
+    def test_windows_general_master_key_uses_a_win32_secret_editor(self) -> None:
+        ui = (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
+        general = ui.split("function GeneralWorkspace", 1)[1].split("function RuntimeWorkspace", 1)[0]
+        leaf = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
+        module = (WIN_NATIVE / "WinUI3NativeLeafModule.cpp").read_text(encoding="utf-8")
+        editor = leaf.split("std::optional<NativeSecretEditResult> WinUI3NativeLeaf::EditSecret", 1)[1].split(
+            "std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager", 1
+        )[0]
+        edit_secret = module.split("void WinUI3NativeLeafModule::EditSecret", 1)[1].split(
+            "void WinUI3NativeLeafModule::ShowGroupManager", 1
+        )[0]
+
+        self.assertIn("function WindowsMasterKeyEditor", ui)
+        self.assertIn('native.editSecret({', ui)
+        self.assertIn('domain: "runtime"', ui)
+        self.assertIn('target: "YOUNG_ROUTER_MASTER_KEY"', ui)
+        # Core rejects an empty proxy key, so the editor must not offer Clear.
+        self.assertIn("allowClear: false", ui)
+        self.assertIn('Platform.OS === "windows"', general)
+        self.assertNotIn('target="YOUNG_ROUTER_MASTER_KEY" plainText autoCommit onSecretState={onApiKeyState}', general)
+
+        # The host is a Win32 React Native window without a XAML Application:
+        # constructing Microsoft.UI.Xaml.Window there throws RPC_E_WRONG_THREAD.
+        self.assertIn("DialogBoxIndirectParamW(", editor)
+        self.assertNotIn("xaml::Window dialog;", editor)
+        self.assertNotIn("RunOwnedModalWindow(", editor)
+
+        # ReactPromise marshals through RNW's call invoker; re-posting the
+        # resolution through the JS dispatcher dropped the callback and rejected
+        # with "Promise destroyed." instead of settling the edit.
+        self.assertIn("promise.Resolve(std::nullopt);", edit_secret)
+        self.assertNotIn("js_dispatcher", edit_secret)
+
+    def test_windows_native_sheets_host_xaml_in_an_app_window(self) -> None:
+        leaf = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
+
+        # The host is not a WinUI 3 Application, so Microsoft.UI.Xaml.Window
+        # cannot be constructed on its UI thread (RPC_E_WRONG_THREAD).  Every
+        # sheet now uses an AppWindow whose client area hosts a XamlIsland
+        # through a DesktopChildSiteBridge.
+        self.assertNotIn("xaml::Window", leaf)
+        self.assertIn("class XamlDialog", leaf)
+        self.assertIn("DesktopChildSiteBridge::Create(", leaf)
+        self.assertIn("bridge.OverrideScale(", leaf)
+        self.assertIn("bridge.Connect(state_->island.ContentIsland());", leaf)
+        self.assertIn("bool RunOwnedModalWindow(", leaf)
+        self.assertIn("XamlDialog& dialog,", leaf)
+        # The island is built in the dialog constructor: constructing it is what
+        # initializes XAML on the thread before the caller creates any control.
+        constructor = leaf.split("class XamlDialog", 1)[1].split("struct State", 1)[0]
+        self.assertIn("XamlIsland{}", constructor)
+
+    def test_windows_secret_fields_retain_the_island_they_cannot_close(self) -> None:
+        # WinUI 3.1.8 faults inside XamlIsland::Close when a XamlIsland hosted
+        # through RNW's ContentIslandComponentView is released: the component
+        # view keeps its ChildSiteLink for reuse and the island is a derived
+        # member.  The secure input therefore retains the island for the life of
+        # the process (clearing the field first) instead of closing it under the
+        # link; this is the crash that killed the window when a WebDAV password
+        # field was unmounted.
+        controls = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
+        secure = controls.split("struct SecureTextInputComponentView", 1)[1].split("template <typename TComponent>", 1)[0]
+        self.assertIn("void RetainIsland() noexcept", secure)
+        self.assertIn("RetainIsland();", secure)
+        self.assertIn("static auto* retained = new std::vector", secure)
+        self.assertIn("password_box_.Password(winrt::hstring{})", secure)
+        destructor = secure.split("~SecureTextInputComponentView()", 1)[1].split("RetainIsland", 1)[0]
+        self.assertNotIn("island_ = nullptr;", destructor)
+
+    def test_windows_host_marks_its_window_with_the_app_icon(self) -> None:
+        # The Win32 host's window class carries an icon of its own, so setting
+        # the module icon alone left the title bar on Windows' generic
+        # placeholder.  The leaf now pushes the embedded icon onto the window,
+        # and the resource script is the script that embeds it (a stale stub
+        # here produced an exe with no icon at all).
+        leaf = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
+        self.assertIn("void ApplyWindowIcons(HWND window)", leaf)
+        self.assertIn("SendMessageW(window, WM_SETICON, ICON_SMALL", leaf)
+        self.assertIn("SendMessageW(window, WM_SETICON, ICON_BIG", leaf)
+        self.assertIn("ApplyWindowIcons(window_handle_);", leaf)
+        script = (WIN_PROJECT / "YoungRouter.rc").read_text(encoding="ascii")
+        self.assertIn("IDI_ICON1               ICON                    \"small.ico\"", script)
+        self.assertNotIn("�", script)
+
+    def test_windows_source_list_uses_the_platform_glyphs_not_a_badge(self) -> None:
+        # The sidebar's icon is the Windows navigation glyph for the pane, drawn
+        # in the pane's own color: a tinted tile behind a hamburger read as an
+        # emoji, and the wrong codepoints named the wrong surfaces.
+        controls = (SHARED / "ui/NativeControls.tsx").read_text(encoding="utf-8")
+        for glyph in (r'"\uE9E9"', r'"\uE81E"', r'"\uE8FD"', r'"\uE895"'):
+            self.assertIn(glyph, controls)
+        for obsolete in (r'"\uE700"', r'"\uE7B8"', r'"\uE8A5"'):
+            self.assertNotIn(obsolete, controls)
+        self.assertNotIn("backgroundColor: rowSymbolColor", controls)
 
     def test_windows_controls_use_winui_theme_resources_for_state_colors(self) -> None:
         adapter = (SHARED / "ui/NativeControls.tsx").read_text(encoding="utf-8")

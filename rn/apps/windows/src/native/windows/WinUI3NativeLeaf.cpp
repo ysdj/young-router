@@ -27,6 +27,8 @@
 #include <winrt/Windows.UI.Text.h>
 #include <winrt/Windows.System.h>
 #include <winrt/Windows.Data.Json.h>
+#include <winrt/Microsoft.UI.Composition.h>
+#include <winrt/Microsoft.UI.Content.h>
 #include <winrt/Microsoft.UI.Interop.h>
 #include <winrt/Microsoft.UI.Windowing.h>
 #include <winrt/Microsoft.UI.Xaml.Automation.h>
@@ -85,8 +87,153 @@ std::wstring RememberedRelayKey(std::wstring const& account_id, std::wstring con
 
 namespace web = winrt::Microsoft::Web::WebView2::Core;
 
+// The host is a Win32 React Native composition window, not a WinUI 3
+// Application: `Microsoft.UI.Xaml.Window` construction fails there with
+// RPC_E_WRONG_THREAD, so every native sheet used to disappear.  A dialog is
+// instead an AppWindow whose client area hosts a XAML island through a
+// DesktopChildSiteBridge -- the same composition path RNW's own windows use.
+// The wrapper mirrors the small part of the XAML Window surface these sheets
+// call, and copies share one window like a WinRT object does.
+class XamlDialog {
+ public:
+  XamlDialog() : state_(std::make_shared<State>()) {
+    std::weak_ptr<State> weak = state_;
+    state_->destroying_token = state_->window.Destroying(
+        [weak](winrt::Microsoft::UI::Windowing::AppWindow const&, winrt::Windows::Foundation::IInspectable const&) {
+          if (auto current = weak.lock()) current->NotifyClosed();
+        });
+    state_->window.Hide();
+  }
+
+  XamlDialog(std::nullptr_t) noexcept {}
+
+  explicit operator bool() const noexcept { return state_ && state_->window; }
+
+  XamlDialog& operator=(std::nullptr_t) noexcept {
+    state_.reset();
+    return *this;
+  }
+
+  void Title(std::wstring_view title) const {
+    if (state_ && state_->window) state_->window.Title(winrt::hstring(title));
+  }
+
+  void Content(winrt::Microsoft::UI::Xaml::UIElement const& content) const {
+    if (!state_ || !state_->window) return;
+    try {
+      if (!state_->compositor) state_->compositor = winrt::Microsoft::UI::Composition::Compositor();
+      if (!state_->island) state_->island = winrt::Microsoft::UI::Xaml::XamlIsland{};
+      state_->island.Content(content);
+      if (!state_->bridge) {
+        state_->bridge = winrt::Microsoft::UI::Content::DesktopChildSiteBridge::Create(
+            state_->compositor, state_->window.Id());
+        state_->bridge.ResizePolicy(winrt::Microsoft::UI::Content::ContentSizePolicy::ResizeContentToParentWindow);
+        state_->bridge.Connect(state_->island.ContentIsland());
+        state_->bridge.Show();
+      }
+    } catch (...) {
+    }
+  }
+
+  template <typename Callback>
+  void Closed(Callback&& callback) const {
+    if (!state_) return;
+    auto handler = std::forward<Callback>(callback);
+    state_->closed = [handler = std::move(handler)]() mutable { handler(nullptr, nullptr); };
+  }
+
+  template <typename Callback>
+  winrt::event_token Activated(Callback&& callback) const {
+    if (!state_) return {};
+    auto handler = std::forward<Callback>(callback);
+    state_->activated = [handler = std::move(handler)]() mutable { handler(nullptr, nullptr); };
+    return winrt::event_token{1};
+  }
+
+  void Activated(winrt::event_token&) const {
+    if (state_) state_->activated = nullptr;
+  }
+
+  void Activated(winrt::event_token const&) const {
+    if (state_) state_->activated = nullptr;
+  }
+
+  void Activate() const {
+    if (!state_ || !state_->window) return;
+    state_->window.Show();
+    auto const hwnd = Handle();
+    ShowWindow(hwnd, SW_SHOWNORMAL);
+    SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+    // The hidden AppWindow reports the primary monitor's DPI; now that it is
+    // shown on the owner's monitor the island can be told the real scale.
+    if (state_->bridge) {
+      auto const dpi = GetDpiForWindow(hwnd);
+      if (dpi != 0) {
+        state_->bridge.OverrideScale(static_cast<float>(dpi) / static_cast<float>(USER_DEFAULT_SCREEN_DPI));
+      }
+    }
+    SetForegroundWindow(hwnd);
+    if (state_->activated) {
+      auto activated = std::move(state_->activated);
+      state_->activated = nullptr;
+      activated();
+    }
+  }
+
+  void Close() const {
+    if (!state_ || !state_->window) return;
+    try {
+      state_->window.Destroy();
+    } catch (...) {
+    }
+  }
+
+  HWND Handle() const noexcept {
+    if (!state_ || !state_->window) return nullptr;
+    return winrt::Microsoft::UI::GetWindowFromWindowId(state_->window.Id());
+  }
+
+ private:
+  struct State {
+    winrt::Microsoft::UI::Windowing::AppWindow window{nullptr};
+    winrt::Microsoft::UI::Composition::Compositor compositor{nullptr};
+    winrt::Microsoft::UI::Xaml::XamlIsland island{nullptr};
+    winrt::Microsoft::UI::Content::DesktopChildSiteBridge bridge{nullptr};
+    winrt::event_token destroying_token{};
+    std::function<void()> closed;
+    std::function<void()> activated;
+    bool closed_notified = false;
+
+    State() {
+      window = winrt::Microsoft::UI::Windowing::AppWindow::Create();
+      // Constructing the island is what establishes the XAML runtime on this
+      // thread.  Do it before the caller builds the dialog content: without it
+      // the first StackPanel/Button construction fails with RPC_E_WRONG_THREAD.
+      island = winrt::Microsoft::UI::Xaml::XamlIsland{};
+    }
+
+    ~State() {
+      try {
+        if (window) {
+          window.Destroying(destroying_token);
+          window.Destroy();
+        }
+      } catch (...) {
+      }
+    }
+
+    void NotifyClosed() {
+      if (closed_notified) return;
+      closed_notified = true;
+      if (closed) closed();
+    }
+  };
+
+  std::shared_ptr<State> state_;
+};
+
 struct ReadOnlyCodeViewerState {
-  winrt::Microsoft::UI::Xaml::Window dialog{nullptr};
+  XamlDialog dialog{nullptr};
   winrt::Microsoft::UI::Xaml::Controls::WebView2 webview{nullptr};
   web::CoreWebView2 core{nullptr};
   winrt::event_token activated_token{};
@@ -140,8 +287,10 @@ LONG DipToPhysicalPixels(LONG value, UINT dpi) {
   return MulDiv(value, static_cast<int>(dpi), USER_DEFAULT_SCREEN_DPI);
 }
 
-POINT FrameTrackSizeForContent(HWND window, ContentSize content) {
-  const UINT window_dpi = window == nullptr ? USER_DEFAULT_SCREEN_DPI : GetDpiForWindow(window);
+POINT FrameTrackSizeForContent(HWND window, ContentSize content, UINT dpi_hint = 0) {
+  const UINT window_dpi = dpi_hint != 0
+      ? dpi_hint
+      : (window == nullptr ? USER_DEFAULT_SCREEN_DPI : GetDpiForWindow(window));
   const UINT dpi = window_dpi == 0 ? USER_DEFAULT_SCREEN_DPI : window_dpi;
   RECT frame{
       0,
@@ -251,12 +400,12 @@ std::wstring FoldModelSearchText(std::wstring value) {
 }
 
 bool RunOwnedModalWindow(
-    winrt::Microsoft::UI::Xaml::Window const& dialog,
+    XamlDialog& dialog,
     HWND owner,
     winrt::Windows::Graphics::SizeInt32 content_size_dips,
     bool& finished) {
-  HWND dialog_handle = nullptr;
-  winrt::check_hresult(dialog.as<::IWindowNative>()->get_WindowHandle(&dialog_handle));
+  HWND dialog_handle = dialog.Handle();
+  if (dialog_handle == nullptr) return false;
   YoungRouter::DisableWindowTransitions(dialog_handle);
   const bool disable_owner = owner != nullptr && IsWindow(owner);
   if (disable_owner) {
@@ -265,10 +414,31 @@ bool RunOwnedModalWindow(
   }
 
   auto window_id = winrt::Microsoft::UI::GetWindowIdFromWindow(dialog_handle);
+  // A hidden AppWindow still reports the primary monitor's DPI; size the sheet
+  // with the owner's DPI so it lands at the intended DIP size on the monitor
+  // the user is looking at.
+  const auto owner_dpi = disable_owner ? GetDpiForWindow(owner) : 0;
   const auto frame = YoungRouter::FrameTrackSizeForContentDips(
-      dialog_handle, content_size_dips.Width, content_size_dips.Height);
+      dialog_handle, content_size_dips.Width, content_size_dips.Height, owner_dpi);
   winrt::Microsoft::UI::Windowing::AppWindow::GetFromWindowId(window_id).Resize({frame.x, frame.y});
+  if (disable_owner) {
+    RECT owner_rect{};
+    RECT dialog_rect{};
+    if (GetWindowRect(owner, &owner_rect) && GetWindowRect(dialog_handle, &dialog_rect)) {
+      auto const width = dialog_rect.right - dialog_rect.left;
+      auto const height = dialog_rect.bottom - dialog_rect.top;
+      SetWindowPos(
+          dialog_handle,
+          nullptr,
+          owner_rect.left + (owner_rect.right - owner_rect.left - width) / 2,
+          owner_rect.top + (owner_rect.bottom - owner_rect.top - height) / 2,
+          0,
+          0,
+          SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+  }
   dialog.Activate();
+  SetWindowPos(dialog_handle, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
 
   MSG message{};
   BOOL message_result = TRUE;
@@ -362,6 +532,172 @@ winrt::fire_and_forget InitializeReadOnlyCodeViewer(
     FailReadOnlyCodeViewer(weak_state);
   }
 }
+
+// The host is a Win32 React Native composition window, not a WinUI 3
+// Application: `Microsoft.UI.Xaml.Window` construction fails there with
+// RPC_E_WRONG_THREAD (only XAML islands are supported).  A secret therefore
+// gets a plain Win32 modal dialog whose edit control lives entirely outside
+// XAML, which also keeps the value off the React bridge.
+constexpr int kSecretEditId = 1301;
+constexpr int kSecretSetId = 1302;
+constexpr int kSecretClearId = 1303;
+constexpr WORD kDialogEditClass = 0x0081;
+constexpr WORD kDialogButtonClass = 0x0080;
+
+struct SecretDialogState {
+  std::optional<YoungRouter::NativeSecretEditResult> result;
+  std::wstring initial;
+  HWND edit = nullptr;
+  HWND set = nullptr;
+};
+
+// Builds a DLGTEMPLATE in memory: the secret title and the button labels are
+// localized at run time, so the template cannot be a resource.
+class DialogTemplateBuilder {
+ public:
+  DialogTemplateBuilder(DWORD style, std::wstring_view title, short width, short height, WORD item_count) {
+    Dword(style);
+    Dword(0);
+    Word(item_count);
+    Short(0);
+    Short(0);
+    Short(width);
+    Short(height);
+    Word(0);  // no menu
+    Word(0);  // dialog class
+    String(title);
+  }
+
+  void Font(WORD points, std::wstring_view face) {
+    Word(points);
+    String(face);
+  }
+
+  void Item(
+      DWORD style,
+      DWORD extended_style,
+      short x,
+      short y,
+      short width,
+      short height,
+      WORD id,
+      WORD builtin_class,
+      std::wstring_view text) {
+    Align4();
+    Dword(style);
+    Dword(extended_style);
+    Short(x);
+    Short(y);
+    Short(width);
+    Short(height);
+    Word(id);
+    Word(0xFFFF);
+    Word(builtin_class);
+    String(text);
+    Word(0);  // no creation data
+  }
+
+  std::vector<BYTE> const& data() const noexcept { return bytes_; }
+
+ private:
+  void Align4() {
+    while (bytes_.size() % 4 != 0) bytes_.push_back(0);
+  }
+
+  void Word(WORD value) {
+    auto const* raw = reinterpret_cast<BYTE const*>(&value);
+    bytes_.insert(bytes_.end(), raw, raw + sizeof(value));
+  }
+
+  void Short(short value) {
+    auto const* raw = reinterpret_cast<BYTE const*>(&value);
+    bytes_.insert(bytes_.end(), raw, raw + sizeof(value));
+  }
+
+  void Dword(DWORD value) {
+    auto const* raw = reinterpret_cast<BYTE const*>(&value);
+    bytes_.insert(bytes_.end(), raw, raw + sizeof(value));
+  }
+
+  void String(std::wstring_view value) {
+    auto const* raw = reinterpret_cast<BYTE const*>(value.data());
+    bytes_.insert(bytes_.end(), raw, raw + value.size() * sizeof(wchar_t));
+    Word(0);
+  }
+
+  std::vector<BYTE> bytes_;
+};
+
+INT_PTR CALLBACK SecretDialogProc(HWND dialog, UINT message, WPARAM wparam, LPARAM lparam) {
+  auto state = reinterpret_cast<SecretDialogState*>(GetWindowLongPtrW(dialog, GWLP_USERDATA));
+  switch (message) {
+    case WM_INITDIALOG: {
+      state = reinterpret_cast<SecretDialogState*>(lparam);
+      SetWindowLongPtrW(dialog, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+      if (state != nullptr) {
+        state->edit = GetDlgItem(dialog, kSecretEditId);
+        state->set = GetDlgItem(dialog, kSecretSetId);
+        if (state->edit != nullptr && !state->initial.empty()) {
+          SetWindowTextW(state->edit, state->initial.c_str());
+        }
+        if (state->set != nullptr) {
+          EnableWindow(state->set, state->edit != nullptr && GetWindowTextLengthW(state->edit) > 0);
+        }
+      }
+      RECT owner{};
+      RECT frame{};
+      GetWindowRect(dialog, &frame);
+      auto const parent = GetWindow(dialog, GW_OWNER);
+      if (parent != nullptr && GetWindowRect(parent, &owner)) {
+        auto const width = frame.right - frame.left;
+        auto const height = frame.bottom - frame.top;
+        SetWindowPos(
+            dialog,
+            nullptr,
+            owner.left + (owner.right - owner.left - width) / 2,
+            owner.top + (owner.bottom - owner.top - height) / 2,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+      }
+      if (state != nullptr && state->edit != nullptr) SetFocus(state->edit);
+      return FALSE;
+    }
+    case WM_COMMAND: {
+      auto const id = LOWORD(wparam);
+      if (id == kSecretSetId) {
+        if (state == nullptr || state->edit == nullptr) return TRUE;
+        auto const length = GetWindowTextLengthW(state->edit);
+        std::wstring value(static_cast<size_t>(length) + 1, L'\0');
+        auto const copied = GetWindowTextW(state->edit, value.data(), static_cast<int>(value.size()));
+        value.resize(static_cast<size_t>(std::max(0, copied)));
+        if (value.empty()) return TRUE;
+        state->result = YoungRouter::NativeSecretEditResult{false, std::move(value)};
+        EndDialog(dialog, IDOK);
+        return TRUE;
+      }
+      if (id == kSecretClearId) {
+        if (state != nullptr) state->result = YoungRouter::NativeSecretEditResult{true, {}};
+        EndDialog(dialog, IDOK);
+        return TRUE;
+      }
+      if (id == IDCANCEL) {
+        EndDialog(dialog, IDCANCEL);
+        return TRUE;
+      }
+      if (id == kSecretEditId && HIWORD(wparam) == EN_CHANGE && state != nullptr && state->set != nullptr) {
+        EnableWindow(state->set, state->edit != nullptr && GetWindowTextLengthW(state->edit) > 0);
+        return TRUE;
+      }
+      return FALSE;
+    }
+    case WM_CLOSE:
+      EndDialog(dialog, IDCANCEL);
+      return TRUE;
+    default:
+      return FALSE;
+  }
+}
 }  // namespace
 
 namespace YoungRouter {
@@ -376,13 +712,36 @@ void DisableWindowTransitions(HWND window) noexcept {
       static_cast<DWORD>(sizeof(disabled)));
 }
 
-POINT FrameTrackSizeForContentDips(HWND window, LONG width, LONG height) {
+// The Win32 host's window class carries an icon of its own, so the title bar
+// keeps Windows' generic placeholder even after the exe embeds the app mark.
+// Set the window's own icons from the module resource (IDI_ICON1, see
+// windows/YoungRouter/resource.h) so the title bar, Alt+Tab and the taskbar
+// all draw the app icon instead of the fallback.
+constexpr int kWindowIconResource = 1008;
+
+void ApplyWindowIcons(HWND window) noexcept {
+  if (window == nullptr) return;
+  const HINSTANCE instance = GetModuleHandleW(nullptr);
+  const auto small_size = GetSystemMetrics(SM_CXSMICON);
+  const auto small_height = GetSystemMetrics(SM_CYSMICON);
+  if (const auto icon = static_cast<HICON>(
+          LoadImageW(instance, MAKEINTRESOURCEW(kWindowIconResource), IMAGE_ICON, small_size, small_height, LR_SHARED))) {
+    SendMessageW(window, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(icon));
+  }
+  if (const auto icon = static_cast<HICON>(
+          LoadImageW(instance, MAKEINTRESOURCEW(kWindowIconResource), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE | LR_SHARED))) {
+    SendMessageW(window, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(icon));
+  }
+}
+
+POINT FrameTrackSizeForContentDips(HWND window, LONG width, LONG height, UINT dpi_hint) {
   return FrameTrackSizeForContent(
       window,
       {
           std::max<LONG>(1, width),
           std::max<LONG>(1, height),
-      });
+      },
+      dpi_hint);
 }
 
 std::shared_ptr<WinUI3NativeLeaf> WinUI3NativeLeaf::Shared() {
@@ -403,6 +762,7 @@ void WinUI3NativeLeaf::Initialize(winrt::Microsoft::UI::Xaml::Window const& wind
   window_handle_ = nullptr;
   window.as<::IWindowNative>()->get_WindowHandle(&window_handle_);
   DisableWindowTransitions(window_handle_);
+  ApplyWindowIcons(window_handle_);
   InstallWindowHook();
   EnsureTray();
 }
@@ -415,6 +775,7 @@ void WinUI3NativeLeaf::Initialize(HWND window_handle) {
   if (window_handle == nullptr && window_handle_ != nullptr) return;
   window_handle_ = window_handle;
   DisableWindowTransitions(window_handle_);
+  ApplyWindowIcons(window_handle_);
   InstallWindowHook();
   EnsureTray();
 }
@@ -603,7 +964,7 @@ std::optional<std::wstring> WinUI3NativeLeaf::ShowDecisionWindow(
   constexpr double kDialogMinWidth = 300;
   constexpr double kDialogMaxWidth = 420;
   constexpr double kDialogMargin = 20;
-  xaml::Window dialog;
+  XamlDialog dialog;
   dialog.Title(winrt::hstring(title));
 
   controls::StackPanel root;
@@ -764,7 +1125,7 @@ void WinUI3NativeLeaf::ShowReadOnlyText(
   namespace controls = winrt::Microsoft::UI::Xaml::Controls;
 
   auto state = std::make_shared<ReadOnlyCodeViewerState>();
-  xaml::Window dialog;
+  XamlDialog dialog;
   state->dialog = dialog;
   dialog.Title(winrt::hstring(title));
 
@@ -949,7 +1310,7 @@ std::optional<std::vector<std::wstring>> WinUI3NativeLeaf::ChooseModelsToAdd(
     controls::Button invert{nullptr};
     controls::Button add{nullptr};
     controls::TextBlock empty_state{nullptr};
-    xaml::Window dialog{nullptr};
+    XamlDialog dialog{nullptr};
     bool finished = false;
     bool accepted = false;
   };
@@ -957,7 +1318,7 @@ std::optional<std::vector<std::wstring>> WinUI3NativeLeaf::ChooseModelsToAdd(
   state->models = std::move(models);
   state->selected.assign(state->models.size(), false);
 
-  xaml::Window dialog;
+  XamlDialog dialog;
   state->dialog = dialog;
   dialog.Title(Localized("modelChooserTitle", L"Choose Models to Add"));
 
@@ -1172,64 +1533,59 @@ std::optional<std::vector<std::wstring>> WinUI3NativeLeaf::ChooseModelsToAdd(
 std::optional<NativeSecretEditResult> WinUI3NativeLeaf::EditSecret(
     std::wstring_view title,
     bool allow_clear,
-    bool present) {
-  namespace xaml = winrt::Microsoft::UI::Xaml;
-  namespace controls = winrt::Microsoft::UI::Xaml::Controls;
-
-  xaml::Window dialog;
-  dialog.Title(winrt::hstring(title));
-  controls::StackPanel root;
-  root.Spacing(12);
-  root.Margin(xaml::Thickness{20, 20, 20, 20});
-  controls::PasswordBox input;
-  input.FontSize(kUIFontSize);
-  input.MaxLength(16384);
-  root.Children().Append(input);
-
-  controls::StackPanel actions;
-  actions.Orientation(controls::Orientation::Horizontal);
-  actions.HorizontalAlignment(xaml::HorizontalAlignment::Right);
-  actions.Spacing(8);
-  controls::Button cancel;
-  cancel.FontSize(kUIFontSize);
-  cancel.Content(winrt::box_value(winrt::hstring(Localized("cancel", L"Cancel"))));
-  actions.Children().Append(cancel);
-  controls::Button clear;
-  clear.FontSize(kUIFontSize);
-  if (allow_clear && present) {
-    clear.Content(winrt::box_value(winrt::hstring(Localized("clear", L"Clear"))));
-    actions.Children().Append(clear);
+    bool present,
+    std::wstring_view initial) {
+  auto const show_clear = allow_clear && present;
+  DialogTemplateBuilder builder(DS_MODALFRAME | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU, title, 300, 80,
+      static_cast<WORD>(show_clear ? 4 : 3));
+  builder.Font(9, L"Segoe UI");
+  // The proxy key is the one credential this window shows in the clear so it
+  // can be copied into a client, exactly as the previous inline field did.
+  builder.Item(
+      WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+      WS_EX_CLIENTEDGE,
+      10, 10, 280, 14,
+      kSecretEditId,
+      kDialogEditClass,
+      L"");
+  auto const cancel_label = Localized("cancel", L"Cancel");
+  auto const clear_label = Localized("clear", L"Clear");
+  auto const set_label = Localized("set", L"Set");
+  builder.Item(
+      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+      0,
+      228, 34, 62, 16,
+      IDCANCEL,
+      kDialogButtonClass,
+      cancel_label);
+  if (show_clear) {
+    builder.Item(
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        0,
+        160, 34, 62, 16,
+        kSecretClearId,
+        kDialogButtonClass,
+        clear_label);
   }
-  controls::Button set;
-  set.FontSize(kUIFontSize);
-  set.Content(winrt::box_value(winrt::hstring(Localized("set", L"Set"))));
-  set.IsEnabled(false);
-  actions.Children().Append(set);
-  root.Children().Append(actions);
-  dialog.Content(root);
+  builder.Item(
+      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+      0,
+      92, 34, 62, 16,
+      kSecretSetId,
+      kDialogButtonClass,
+      set_label);
 
-  bool finished = false;
-  std::optional<NativeSecretEditResult> result;
-  input.PasswordChanged([set](auto const& sender, auto const&) {
-    set.IsEnabled(!sender.as<controls::PasswordBox>().Password().empty());
-  });
-  cancel.Click([dialog](auto const&, auto const&) { dialog.Close(); });
-  if (allow_clear && present) {
-    clear.Click([dialog, &result](auto const&, auto const&) {
-      result = NativeSecretEditResult{true, {}};
-      dialog.Close();
-    });
-  }
-  set.Click([dialog, input, &result](auto const&, auto const&) {
-    auto value = std::wstring(input.Password());
-    if (value.empty()) return;
-    result = NativeSecretEditResult{false, std::move(value)};
-    dialog.Close();
-  });
-  dialog.Closed([&finished](auto const&, auto const&) { finished = true; });
-  if (!RunOwnedModalWindow(dialog, window_handle_, {520, 190}, finished)) result.reset();
-  input.Password(L"");
-  return result;
+  auto const instance = GetModuleHandleW(nullptr);
+  SecretDialogState state;
+  state.initial = std::wstring(initial);
+  auto const shown = DialogBoxIndirectParamW(
+      instance,
+      reinterpret_cast<LPCDLGTEMPLATEW>(const_cast<BYTE*>(builder.data().data())),
+      window_handle_,
+      SecretDialogProc,
+      reinterpret_cast<LPARAM>(&state));
+  if (shown == -1 || !state.result) return std::nullopt;
+  return state.result;
 }
 
 std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
@@ -1299,7 +1655,7 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
     return -1;
   };
 
-  xaml::Window dialog;
+  XamlDialog dialog;
   dialog.Title(winrt::hstring(title));
   controls::StackPanel root;
   root.Spacing(8);

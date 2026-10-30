@@ -39,6 +39,7 @@ $VeridropWork = Join-Path $StagingCache "veridrop"
 $ConnectWorkBuddyWork = Join-Path $StagingCache "connect-workbuddy"
 $OurFreeModelWork = Join-Path $StagingCache "our-free-model"
 $DshVisionRouterWork = Join-Path $StagingCache "dsh-vision-router"
+$ContextAttachmentManagerWork = Join-Path $StagingCache "context-attachment-manager"
 
 function Copy-CoreSource {
   param([string]$Source, [string]$Destination)
@@ -87,6 +88,11 @@ try {
   $DshVisionRouterUpdater = Join-Path $ProjectRoot "scripts\update_dsh_vision_router.py"
   & uv run --no-project --python 3.12 $DshVisionRouterUpdater --output $DshVisionRouterWork
   if ($LASTEXITCODE -ne 0) { throw "Could not update the bundled dsh-vision-router package." }
+  # The image-context pass copies Context Attachment Manager's placeholder wording
+  # and reads its selection file, so every build re-checks that release.
+  $ContextAttachmentManagerUpdater = Join-Path $ProjectRoot "scripts\update_context_attachment_manager.py"
+  & uv run --no-project --python 3.12 $ContextAttachmentManagerUpdater --output $ContextAttachmentManagerWork
+  if ($LASTEXITCODE -ne 0) { throw "Could not verify the Context Attachment Manager release the image-context pass mirrors." }
   if (-not (Test-Path (Join-Path $AppRoot "windows"))) {
     throw "React Native Windows host project is missing at rn/apps/windows/windows."
   }
@@ -149,13 +155,13 @@ try {
       # Keep the large native/Python seed reusable while refreshing the small
       # fast-moving LiteLLM layer when its release lock advances.
       Write-Output "Updating LiteLLM in the prebuilt runtime seed: $($SeedCheck.Trim()) -> $LiteLLMVersion."
-      uv pip install --python (Join-Path $RuntimeBin "python.exe") --target "$RuntimeSitePackages" --upgrade "litellm[proxy]==$LiteLLMVersion" "fastapi==0.140.3" PyYAML Pillow
+      uv pip install --python (Join-Path $RuntimeBin "python.exe") --target "$RuntimeSitePackages" --upgrade "litellm[proxy]==$LiteLLMVersion" "fastapi==0.140.3" PyYAML
       if ($LASTEXITCODE -ne 0) { throw "Could not update LiteLLM in the prebuilt runtime seed." }
     }
   } else {
     uv pip install --python (Join-Path $RuntimeBin "python.exe") `
       --target "$RuntimeSitePackages" `
-      "litellm[proxy]==$LiteLLMVersion" "fastapi==0.140.3" PyYAML Pillow
+      "litellm[proxy]==$LiteLLMVersion" "fastapi==0.140.3" PyYAML
     if ($LASTEXITCODE -ne 0) { throw "Could not install the bundled Windows runtime dependencies." }
   }
   # The staged scan program is imported into the Core's own interpreter, so what

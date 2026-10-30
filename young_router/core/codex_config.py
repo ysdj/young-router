@@ -1044,6 +1044,13 @@ def structured_config(config: dict[str, Any], auth: dict[str, Any]) -> dict[str,
                 "transport": transport,
                 "command": _get_text(server.get("command")) or "",
                 "url": _get_text(server.get("url")) or "",
+                "args": [
+                    argument
+                    for argument in server.get("args", [])
+                    if isinstance(argument, str)
+                ]
+                if isinstance(server.get("args"), list)
+                else [],
             }
         )
     structured["mcp_servers"] = mcp_servers

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from . import image_generation as _image_generation_module
+from . import image_context as _image_context_module
 from . import image_inputs as _image_inputs_module
 from . import codex_contract as _codex_contract_module
 from . import responses_output as _responses_output_module
@@ -39,20 +40,12 @@ class YoungRouterHook(CustomLogger):
         data: dict,
         call_type: Any,
     ) -> Optional[dict]:
-        """Shrink a replayed Responses history before LiteLLM counts it.
+        """Record what the replay carries before LiteLLM counts it.
 
-        ``Router._pre_call_checks`` refuses a request whose token count exceeds
-        a deployment's ``model_info.max_input_tokens``, and it runs at
-        deployment selection -- before ``async_pre_call_deployment_hook``,
-        where oversized replayed tool outputs and image histories are normally
-        elided.  The limit it compares against is the same number the Core
-        publishes to the client as that model's context budget, which the
-        client has already applied to its own window: a conversation the client
-        measured as fitting was refused locally, with no upstream contacted at
-        all.
-
-        Eliding here is the only ordering in which the count describes the
-        request that is actually sent.
+        Nothing is rewritten here: the replay reaches the upstream exactly as
+        the client sent it, and the image-context pass that decides which
+        images go out runs in ``async_pre_call_deployment_hook`` together with
+        every other request adaptation.
         """
 
         if not isinstance(data, dict):
@@ -66,23 +59,7 @@ class YoungRouterHook(CustomLogger):
             data,
             _responses_execution_module._chat_bridge_reasoning_included(data),
         )
-        # Image history is reduced before deployment selection as well as in the
-        # deployment hook.  The second pass is intentionally retained because
-        # LiteLLM may rebuild request kwargs between those two callback points.
-        prepared = _responses_request_module._with_prefix_image_previews(data)
-        if prepared is None:
-            prepared = data
-        elided = _responses_request_module._with_elided_oversized_tool_outputs(
-            prepared
-        )
-        if elided is None:
-            return prepared if prepared is not data else None
-        # ``pre_call_hook`` replaces the request wholesale, so every field the
-        # elision pass did not carry over has to travel with it.
-        for key, value in data.items():
-            if key not in elided:
-                elided[key] = value
-        return elided
+        return None
 
     def _record_recent_request_started(self, kwargs: Dict[str, Any]) -> None:
         """Publish a bounded progress row before the upstream call begins."""
@@ -181,12 +158,8 @@ class YoungRouterHook(CustomLogger):
             _responses_request_module._with_dsh_messages_plaintext_content_restored,
             _responses_request_module._with_plaintext_agent_message_content_restored,
             _responses_request_module._with_codex_function_call_arguments_repaired,
-            _responses_request_module._with_neutral_attachment_paths,
-            _responses_request_module._with_prefix_image_previews,
-            _responses_request_module._with_codex_view_image_output_paths,
             _responses_request_module._with_codex_function_call_output_text,
-            _responses_request_module._with_elided_oversized_tool_outputs,
-            _image_inputs_module._with_bounded_image_inputs,
+            *(_image_context_module.CODEX_IMAGE_CONTEXT_REQUEST_STEPS),
             _responses_request_module._with_internal_litellm_metadata,
             _responses_request_module._with_mcp_auto_approval,
             _responses_request_module._with_codex_openrouter_native_web_search_tool,
@@ -203,12 +176,9 @@ class YoungRouterHook(CustomLogger):
         ):
             image_budget_before = None
             image_budget_event = None
-            if update_request is _image_inputs_module._with_bounded_image_inputs:
+            if update_request is _image_context_module._with_codex_image_context:
                 image_budget_before = _image_inputs_module._image_input_budget(modified_kwargs)
-                image_budget_event = "image_input_budget"
-            elif update_request is _responses_request_module._with_prefix_image_previews:
-                image_budget_before = _image_inputs_module._image_input_budget(modified_kwargs)
-                image_budget_event = "prefix_image_preview"
+                image_budget_event = "codex_image_context"
             updated_kwargs = update_request(modified_kwargs)
             if image_budget_before is not None:
                 _trace_module._route_trace(

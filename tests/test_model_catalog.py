@@ -151,29 +151,21 @@ class ModelCatalogTests(unittest.TestCase):
             ),
             defaults_by_key["YOUNG_ROUTER_HEAVY_REPLAY_STREAM_START_THRESHOLD_BYTES"],
         )
+        from young_router.proxy import image_context as image_context_module
+
+        # The image-context pass reads its own settings through ``os.environ``,
+        # so its defaults are the module's constants rather than ``base``'s.
         self.assertEqual(
-            "1" if base_module._PREFIX_IMAGE_PREVIEW_ENABLED_DEFAULT else "0",
-            defaults_by_key["YOUNG_ROUTER_PREFIX_IMAGE_PREVIEW_ENABLED"],
+            image_context_module.IMAGE_CONTEXT_MODE_DEFAULT,
+            defaults_by_key["YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_MODE"],
         )
         self.assertEqual(
-            str(base_module._PREFIX_IMAGE_PREVIEW_MIN_BYTES_DEFAULT),
-            defaults_by_key["YOUNG_ROUTER_PREFIX_IMAGE_PREVIEW_MIN_BYTES"],
+            str(image_context_module.IMAGE_CONTEXT_KEEP_RECENT_DEFAULT),
+            defaults_by_key["YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_KEEP_RECENT"],
         )
         self.assertEqual(
-            base_module._PREFIX_IMAGE_MODE_DEFAULT,
-            defaults_by_key["YOUNG_ROUTER_PREFIX_IMAGE_MODE"],
-        )
-        self.assertEqual(
-            str(base_module._PREFIX_IMAGE_RECENT_COUNT_DEFAULT),
-            defaults_by_key["YOUNG_ROUTER_PREFIX_IMAGE_RECENT_COUNT"],
-        )
-        self.assertEqual(
-            "1" if base_module._PREFIX_IMAGE_ORIGINAL_PATH_DEFAULT else "0",
-            defaults_by_key["YOUNG_ROUTER_PREFIX_IMAGE_ORIGINAL_PATH"],
-        )
-        self.assertEqual(
-            str(base_module._HISTORY_TOOL_OUTPUT_LATENCY_BUDGET_DEFAULT_CHARS),
-            defaults_by_key["YOUNG_ROUTER_HISTORY_TOOL_OUTPUT_LATENCY_BUDGET_CHARS"],
+            str(image_context_module.IMAGE_CONTEXT_MIN_BYTES_DEFAULT),
+            defaults_by_key["YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_MIN_BYTES"],
         )
 
     def test_selected_names_keep_explicit_models_in_order_and_dedupe(self) -> None:

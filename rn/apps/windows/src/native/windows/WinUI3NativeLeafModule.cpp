@@ -557,48 +557,55 @@ void WinUI3NativeLeafModule::EditSecret(
   }
   try {
     auto ui_dispatcher = context_.UIDispatcher();
-    auto js_dispatcher = context_.JSDispatcher();
-    std::thread([domain, field, target, title, allow_clear, promise, ui_dispatcher, js_dispatcher, leaf = leaf_] {
+    // ReactPromise marshals its own resolution onto the JS thread through the
+    // call invoker RNW built for this call (``MakeCallback``).  Posting the
+    // resolution through ``context_.JSDispatcher()`` as well made the whole
+    // callback disappear on this host, so the promise was destroyed without
+    // being settled and JS saw "Promise destroyed." instead of the edit.
+    std::thread([domain, field, target, title, allow_clear, promise, ui_dispatcher, leaf = leaf_] {
       auto capability = CoreIPCBridge::Shared().CreateSecretCapability(domain, field, target, "settings");
       if (!capability) {
-        js_dispatcher.Post([promise] { promise.Resolve(std::nullopt); });
+        promise.Resolve(std::nullopt);
         return;
       }
-      ui_dispatcher.Post([capability = std::move(*capability), title, allow_clear, promise, js_dispatcher, leaf] {
+      // Prefill the editor with the value the field already holds so "Edit"
+      // reads the key the window currently uses.  The read is the same
+      // read-once native lease the inline field used; it never crosses JS.
+      std::wstring initial;
+      if (capability->present) {
+        if (auto current = CoreIPCBridge::Shared().ReadPlainTextSecret(domain, field, target)) {
+          initial = Utf8ToWide(*current);
+        }
+      }
+      ui_dispatcher.Post([capability = std::move(*capability), title, allow_clear, promise,
+                          initial = std::move(initial), leaf] {
         try {
-          auto edited = leaf->EditSecret(title, allow_clear, capability.present);
+          auto edited = leaf->EditSecret(title, allow_clear, capability.present, initial);
           if (!edited) {
-            js_dispatcher.Post([promise] { promise.Resolve(std::nullopt); });
+            promise.Resolve(std::nullopt);
             return;
           }
-          std::thread([
-              capability,
-              value = std::move(edited->value),
-              clear = edited->clear,
-              promise,
-              js_dispatcher]() mutable {
+          std::thread([capability, value = std::move(edited->value), clear = edited->clear, promise]() mutable {
             std::optional<std::string> utf8_value;
             if (!clear) {
               utf8_value = WideToUtf8(value);
               if (!utf8_value) {
-                js_dispatcher.Post([promise] { promise.Resolve(std::nullopt); });
+                promise.Resolve(std::nullopt);
                 return;
               }
             }
             auto staged = CoreIPCBridge::Shared().StageSecret(capability.token, utf8_value, clear);
-            js_dispatcher.Post([promise, staged] {
-              if (!staged) {
-                promise.Resolve(std::nullopt);
-                return;
-              }
-              winrt::Microsoft::ReactNative::JSValueObject result;
-              result["revision"] = staged->revision;
-              result["present"] = staged->present;
-              promise.Resolve(std::move(result));
-            });
+            if (!staged) {
+              promise.Resolve(std::nullopt);
+              return;
+            }
+            winrt::Microsoft::ReactNative::JSValueObject result;
+            result["revision"] = staged->revision;
+            result["present"] = staged->present;
+            promise.Resolve(std::move(result));
           }).detach();
         } catch (...) {
-          js_dispatcher.Post([promise] { promise.Resolve(std::nullopt); });
+          promise.Resolve(std::nullopt);
         }
       });
     }).detach();
@@ -851,26 +858,23 @@ void WinUI3NativeLeafModule::ClearSecret(
     return;
   }
   try {
-    auto js_dispatcher = context_.JSDispatcher();
-    std::thread([domain, field, target, promise, js_dispatcher] {
+    std::thread([domain, field, target, promise] {
       // The capability token and clear flag remain native-only.  React never
       // sends an empty string or receives secret material for this operation.
       auto capability = CoreIPCBridge::Shared().CreateSecretCapability(domain, field, target, "settings");
       if (!capability || !capability->present) {
-        js_dispatcher.Post([promise] { promise.Resolve(std::nullopt); });
+        promise.Resolve(std::nullopt);
         return;
       }
       auto staged = CoreIPCBridge::Shared().StageSecret(capability->token, std::nullopt, true);
-      js_dispatcher.Post([promise, staged] {
-        if (!staged) {
-          promise.Resolve(std::nullopt);
-          return;
-        }
-        winrt::Microsoft::ReactNative::JSValueObject result;
-        result["revision"] = staged->revision;
-        result["present"] = staged->present;
-        promise.Resolve(std::move(result));
-      });
+      if (!staged) {
+        promise.Resolve(std::nullopt);
+        return;
+      }
+      winrt::Microsoft::ReactNative::JSValueObject result;
+      result["revision"] = staged->revision;
+      result["present"] = staged->present;
+      promise.Resolve(std::move(result));
     }).detach();
   } catch (...) {
     promise.Resolve(std::nullopt);

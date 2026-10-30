@@ -41,7 +41,6 @@ const zh: Record<string, RuntimeCopy> = {
   YOUNG_ROUTER_STREAM_START_TIMEOUT_SECONDS: { label: "首事件超时", help: "普通请求等待首个上游流事件的最长时间。设为 0 时回退到请求超时。" },
   YOUNG_ROUTER_HEAVY_REPLAY_STREAM_START_TIMEOUT_SECONDS: { label: "重前缀首事件超时", help: "重放前缀序列化后超过重前缀阈值的 Responses 请求，改用此更长的首事件预算；多 MB 的签名历史会让所有路由同时推迟首个事件。设为 0 时仅使用首事件超时。" },
   YOUNG_ROUTER_HEAVY_REPLAY_STREAM_START_THRESHOLD_BYTES: { label: "重前缀阈值", help: "重放负载（input 加 instructions）序列化后超过该字节数时启用重前缀首事件超时。设为 0 可完全关闭加长预算。" },
-  YOUNG_ROUTER_HISTORY_TOOL_OUTPUT_LATENCY_BUDGET_CHARS: { label: "重放工具输出预算", help: "每轮最多把多少字符的历史工具输出重新发给上游，超过就说明等待已经超过这些内容的证据价值。长链路上首字节能耗几乎与字节数成正比（4 并发时 150KB 约 3.8 秒、300KB 7.5 秒、500KB 12.4 秒），而大窗口允许的量是这个的几倍。先裁剪超过单条丢弃阈值的记录；若仍超过预算，再按需裁剪更旧的小记录。每个类别的最新一条尽量完整保留。设为 0 时只由路由窗口决定。" },
   YOUNG_ROUTER_WEBSOCKET_MAX_FRAME_BYTES: { label: "WebSocket 帧上限", help: "本地代理接受的单个 WebSocket 消息帧的最大字节数。Codex 会把整轮请求（含签名历史）作为单帧发送，上限过小会在进入路由前被 1009 关闭并触发重连循环。修改后需重启服务生效。" },
   YOUNG_ROUTER_CODEX_COMPACTION_START_TIMEOUT_SECONDS: { label: "压缩首事件超时", help: "结构化 Codex 压缩请求等待首个事件的最长时间。设为 0 时回退到请求超时。" },
   YOUNG_ROUTER_STALL_TIMEOUT_SECONDS: { label: "流空闲超时", help: "首个事件到达后，相邻流事件之间允许的最长间隔。设为 0 可取消本地流空闲上限。" },
@@ -82,11 +81,11 @@ const zh: Record<string, RuntimeCopy> = {
   YOUNG_ROUTER_DEPLOYMENT_COOLDOWN_ORDINARY_ENABLED: { label: "普通请求写入冷却", help: "普通请求失败时是否向共享部署冷却池累计失败。所有请求类型仍会读取已有冷却状态。" },
   YOUNG_ROUTER_DEPLOYMENT_COOLDOWN_COMPACTION_ENABLED: { label: "压缩请求写入冷却", help: "结构化 Codex 压缩失败时是否向共享部署冷却池累计失败。默认关闭，避免仅压缩时的上游失败让普通工作路由进入冷却。" },
   YOUNG_ROUTER_IMAGE_TOOL_UNSUPPORTED_TTL_SECONDS: { label: "图像工具不支持记忆", help: "某部署明确拒绝 image_generation 工具后，在此时长内跳过它。参数错误、超时、策略拒绝和其他上游错误不会写入该记忆；设为 0 可关闭跨请求记忆。" },
-  YOUNG_ROUTER_PREFIX_IMAGE_PREVIEW_ENABLED: { label: "签名前缀图片预览化", help: "重放时把签名前缀中超大的 view_image 输出替换为固定的预览图加本地路径引用，不再每轮重传原始字节；显式要求原图分辨率的输出同样按该预览重放（原图字节一律不进重放），需要细节时再调 view_image 打开路径即可。引用的文件客户端可能丢掉（剪贴板粘贴、临时目录里的中间裁剪图、已删除的文件）时，先复制到持久的重放图片缓存；连副本都写不出来时保留内联预览，绝不留一个打不开的路径。" },
-  YOUNG_ROUTER_PREFIX_IMAGE_PREVIEW_MIN_BYTES: { label: "前缀图片预览阈值", help: "签名前缀中的内联图片超过该字节数才替换为预览；更小的图片照原样转发。" },
-  YOUNG_ROUTER_PREFIX_IMAGE_MODE: { label: "前缀图片模式", help: "签名前缀 view_image 输出的重放方式：preview 对所有超大的输出保留缩略预览；path-recent 仅最近的图片输出保留预览，更老的替换为纯路径引用；off 完全关闭改写。模型始终可以再调 view_image 重开任意原图；只存在于临时存储的原图会换成缓存里的持久副本，因此系统清理临时目录后这条仍成立。" },
-  YOUNG_ROUTER_PREFIX_IMAGE_RECENT_COUNT: { label: "前缀图片保留张数", help: "path-recent 模式下，最近多少个图片输出保留内联预览；更老的输出变为纯路径引用。设为 0 时所有超大输出都退化为路径引用。" },
-  YOUNG_ROUTER_PREFIX_IMAGE_ORIGINAL_PATH: { label: "原图转路径", help: "path-recent 模式下，显式要求原图分辨率的 view_image 输出与普通输出一样参与预览 / 路径转换（保留窗口内为预览加路径，超出后为纯路径引用），重放里不再内联原图字节。关闭后，显式原图请求永远原样重放、不参与转换。" },
+  YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_ENABLED: { label: "Codex 上下文图片管理", help: "只让真正还有用的图进入请求：这一轮的图照常发送，之前各轮的图换成一行占位符（编号、轮次、尺寸），模型需要重看时用 view_image_by_id 按编号取回。占位符措辞、IMG-xxxx 编号和选图文件都沿用 Context Attachment Manager，因此在那个面板里做的勾选在这里同样生效；但不会使用它的代理，Codex 始终指向本代理。只改写重放中可变的尾部，签名历史不动，缓存不受影响。默认关闭：关闭时请求原样送达上游。" },
+  YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_MODE: { label: "Codex 图片管理方式", help: "自动：默认省略之前各轮的图，这是长图片任务保持流畅的关键。手动：只有你在 Context Attachment Manager 面板里取消勾选的图才被替换，其余照常发送。" },
+  YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_KEEP_RECENT: { label: "Codex 图片保留轮数", help: "自动模式下，最近多少轮的图仍以内联原图发送。0 表示之前各轮全部省略，这是 Context Attachment Manager 的默认做法，也是反复修改同一张图的任务想要的。" },
+  YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_MIN_BYTES: { label: "Codex 图片管理阈值", help: "之前各轮中，小于该字节数的图保持内联：占位符加之后一次取回的开销比省下的字节更大。0 表示所有历史图都参与处理。" },
+  YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_DATA_DIR: { label: "Codex 图片管理数据目录", help: "Context Attachment Manager 存放选图文件的目录。留空依次读取 CAM_DATA_DIR 和该平台下该插件的默认目录。如果你改过 CAM_DATA_DIR，把这里指到同一个目录。" },
   YOUNG_ROUTER_MCP_AUTO_APPROVE: { label: "自动同意 MCP 工具", help: "启用后将 Responses API 的 MCP 工具设置为 require_approval=never，使上游服务不再暂停等待交互式批准。默认关闭，因为这会绕过 MCP 安全审核。" },
   YOUNG_ROUTER_LOG_MAX_BYTES: { label: "本地日志文件上限", help: "本地日志单个文件的容量上限，包括最近请求、服务标准输出 / 错误和状态项操作。轮转时按设定的备份段数保留 .1..N 旧末尾内容。" },
   YOUNG_ROUTER_LOG_BACKUP_SEGMENTS: { label: "日志备份段数", help: "本地日志轮转时保留的历史末尾段数（.1..N）。设为 1 时只保留紧接着的上一段；当前文件始终保留。" },
@@ -108,20 +107,18 @@ const zh: Record<string, RuntimeCopy> = {
 };
 
 const options: Record<string, Record<string, string>> = {
-  "*": { on: "开启", auto: "自动", local: "本地", api: "API", off: "关闭", error: "直接报错", recovery: "恢复", recovery_cooldown: "恢复并冷却" },
-  YOUNG_ROUTER_PREFIX_IMAGE_MODE: { preview: "全部预览", "path-recent": "近期预览+远期路径", off: "关闭" },
+  "*": { on: "开启", auto: "自动", manual: "手动", local: "本地", api: "API", off: "关闭", error: "直接报错", recovery: "恢复", recovery_cooldown: "恢复并冷却" },
 };
 const englishOptions: Record<string, string> = {
   on: "On",
   off: "Off",
   auto: "Auto",
+  manual: "Manual",
   local: "Local",
   api: "API",
   error: "Error",
   recovery: "Recover",
   recovery_cooldown: "Recover + cooldown",
-  preview: "Preview",
-  "path-recent": "Recent previews + older paths",
 };
 
 function isChinese(translate: Translator): boolean {

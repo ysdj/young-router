@@ -120,39 +120,5 @@ class ProxyModuleIntegrityTests(unittest.TestCase):
         self.assertEqual(offenders, [], "module aliases used without an import:\n" + "\n".join(offenders))
 
 
-class RuntimeDependencyDeclarationTests(unittest.TestCase):
-    """A module the data plane imports at request time must be declared.
-
-    ``proxy/image_inputs._resize_data_url`` imports Pillow while encoding a
-    replayed image preview, and it catches every exception there so one
-    undecodable image cannot fail a turn.  That made an *undeclared* Pillow
-    indistinguishable from "nothing needed shrinking": the LV host served
-    multi-megabyte replays, answered every health check, and logged nothing.
-    LiteLLM does not depend on Pillow, so the package has to say it does and
-    nothing but a static check here keeps that line from being tidied away.
-    """
-
-    def test_pillow_is_a_declared_runtime_dependency(self) -> None:
-        pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-        project_table = pyproject.split("[project]", 1)[1].split("\n[", 1)[0]
-        self.assertIn("dependencies", project_table)
-        declared = [
-            line.strip().strip('\",\'').lower()
-            for line in project_table.splitlines()
-            if "pillow" in line.lower()
-        ]
-        self.assertTrue(
-            declared,
-            "pyproject.toml must declare Pillow: the image-preview encoder imports it "
-            "at request time and LiteLLM does not pull it in.",
-        )
-
-    def test_the_declared_dependency_is_the_one_the_encoder_imports(self) -> None:
-        encoder = (ROOT / "young_router" / "proxy" / "image_inputs.py").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn("from PIL import Image", encoder)
-
-
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

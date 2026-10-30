@@ -638,9 +638,11 @@ class ReactNativeReleaseTests(unittest.TestCase):
         # An empty array has to be initialized, and an exit must stop every
         # staged update rather than leave a child writing a cache that the
         # next installer begins to modify.
-        # Five: the four staged releases plus the Node runtime that ships beside
-        # them, which is its own stager because it is not a release.
-        self.assertEqual(5, script.count('STAGING_PIDS+=("$!")'))
+        # Six: the four staged releases, the Context Attachment Manager gate
+        # that verifies the release this app's image context mirrors, and the
+        # Node runtime that ships beside them and is its own stager because it
+        # is not a release.
+        self.assertEqual(6, script.count('STAGING_PIDS+=("$!")'))
         self.assertIn('STAGING_PIDS[@]+"${STAGING_PIDS[@]}"', script)
         self.assertIn('INSTALL_LOCK_PID=$!', script)
         self.assertIn('rm -f "$INSTALL_LOCK_OWNER"', script)

@@ -8,14 +8,11 @@ description = "Local AI gateway desktop app: Core IPC, LiteLLM data plane, and b
 readme = "README.md"
 requires-python = ">=3.11"
 dynamic = ["version"]
-# A runtime dependency, not a test extra: bounding a replayed image history
-# encodes the preview with Pillow (``proxy/image_inputs._resize_data_url``).
-# LiteLLM does not pull it, so declaring it here is what keeps any installer of
-# this package -- the desktop bundle, the LV host, a plain ``pip install`` --
-# from serving multi-megabyte replays with no error to show for it.
-dependencies = [
-  "Pillow>=10",
-]
+# No runtime dependencies of its own: the data plane runs on what LiteLLM
+# already installs.  Encoding an image here would need Pillow, and the passes
+# that did that are gone -- image context is decided by the attachment manager,
+# which ships its own encoder.
+dependencies = []
 
 [tool.setuptools.dynamic]
 version = { file = ["VERSION"] }
@@ -34,3 +31,4 @@ young-router-codex-config = "young_router.core.codex_config:main"
 young-router-provider-import = "young_router.core.external_provider_import:main"
 young-router-config-package = "young_router.core.configuration_package:main"
 young-router-usage-logs = "young_router.core.remote_usage_logs:main"
+young-router-image-context = "young_router.proxy.image_context_mcp:main"

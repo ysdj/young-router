@@ -568,22 +568,59 @@ export function NativePicker({ labels, selectedValue, disabled, compact = true, 
 }
 
 
+// The Windows sidebar draws the platform's own navigation glyphs, one per SF
+// Symbol the shared presentation names.  Each entry is the Fluent/MDL2 mark
+// that means the same thing — not the macOS tile's shape scaled down: \uE700
+// is the hamburger menu, so General read as a collapsed menu instead of
+// settings, and a document (\uE8A5) stood in for the log list.  A missing name
+// falls back to a neutral dot instead of borrowing another row's mark.
+const WINDOWS_SOURCE_GLYPHS: Record<string, string> = {
+  "slider.horizontal.3": "\uE9E9",
+  "square.stack.3d.up": "\uE81E",
+  "gearshape.2": "\uE713",
+  terminal: "\uE756",
+  "arrow.up.arrow.down": "\uE895",
+  "list.bullet.rectangle": "\uE8FD",
+};
+
 function windowsSourceSymbol(symbol: string): string {
-  const glyphs: Record<string, string> = {
-    "slider.horizontal.3": "\uE700",
-    "square.stack.3d.up": "\uE7B8",
-    "gearshape.2": "\uE713",
-    terminal: "\uE756",
-    "arrow.up.arrow.down": "\uE895",
-    "list.bullet.rectangle": "\uE8A5",
-  };
-  return glyphs[symbol] ?? "•";
+  return WINDOWS_SOURCE_GLYPHS[symbol] ?? "•";
 }
 
 // A virtualized table re-renders its mounted window on every scroll frame, so a
 // row must not re-render just because its parent did.  The key lists arrive as
 // Sets (see `WindowsTable`) so a row's lookups are O(1) rather than a scan per
 // cell, which is what made a long log list stall while rows were mounted.
+// A source list's columns are usually written inline at the call site, so a
+// parent render hands the row a fresh array of the same widths.  Comparing the
+// widths by value keeps that parent render from re-mounting every row — the
+// cost a wide log table paid on each snapshot publish.
+function sameColumns(left: TableColumn[], right: TableColumn[]): boolean {
+  if (left === right) return true;
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index].label !== right[index].label || left[index].width !== right[index].width) return false;
+  }
+  return true;
+}
+
+function sameTableRow(previous: { row: TableRow; index: number; columns: TableColumn[]; compact: boolean; sourceList: boolean; stripedRows: boolean; selected: boolean; disabled: boolean; alert: boolean; rowSymbol?: string; rowSymbolColor?: string; secondaryCellKeys: Set<string>; selectableSpanning: boolean; onSelect: (row: TableRow, index: number) => void }, next: typeof previous): boolean {
+  return previous.row === next.row
+    && previous.index === next.index
+    && previous.compact === next.compact
+    && previous.sourceList === next.sourceList
+    && previous.stripedRows === next.stripedRows
+    && previous.selected === next.selected
+    && previous.disabled === next.disabled
+    && previous.alert === next.alert
+    && previous.rowSymbol === next.rowSymbol
+    && previous.rowSymbolColor === next.rowSymbolColor
+    && previous.secondaryCellKeys === next.secondaryCellKeys
+    && previous.selectableSpanning === next.selectableSpanning
+    && previous.onSelect === next.onSelect
+    && sameColumns(previous.columns, next.columns);
+}
+
 const WindowsTableRow = React.memo(function WindowsTableRow({
   row,
   index,
@@ -636,12 +673,12 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
         const cellKey = `${row.key}\x1f${columnIndex}`;
         const secondary = secondaryCellKeys.has(cellKey);
         return <Text key={`${row.key}:${columnIndex}`} numberOfLines={1} style={[windowsTableStyles.cell, { width: column.width, color: secondary ? "#667085" : textColor }, columnIndex === 0 && sourceList && windowsTableStyles.sourceCell]}>
-          {columnIndex === 0 && sourceList && rowSymbol ? <Text style={[windowsTableStyles.symbol, { backgroundColor: rowSymbolColor || "#667085" }]}>{windowsSourceSymbol(rowSymbol)}</Text> : null}{cell.replace(/^\t/u, "")}
+          {columnIndex === 0 && sourceList && rowSymbol ? <Text style={[windowsTableStyles.symbol, { color: disabled ? "#98a2b3" : rowSymbolColor || "#475467" }]}>{windowsSourceSymbol(rowSymbol)}</Text> : null}{cell.replace(/^\t/u, "")}
         </Text>;
       })}
     </View>}
   </Pressable>;
-});
+}, sameTableRow);
 
 function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, followBottom, scrollToRow, framed, sourceList, rowSymbols, rowSymbolColors, disabledRowKeys, secondaryCellKeys, selectableSpanningKeys, onSelectionChange, onRowDoublePress, style, alertRowKeys }: {
   columns: TableProps["columns"];
@@ -688,13 +725,18 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
     if (!followBottom) return;
     verticalList.current?.scrollToEnd({ animated: false });
   }, [followBottom, rows.length]);
+  // The selectable set is read through a ref so the one stable callback keeps
+  // its identity across a table re-render: a new closure here was enough to
+  // invalidate every mounted row.
+  const selectableSpanningRef = React.useRef(selectableSpanningKeys);
+  selectableSpanningRef.current = selectableSpanningKeys;
   const select = React.useCallback((row: TableProps["rows"][number], index: number): void => {
-    if (row.spanning && !selectableSpanningKeys.has(row.key)) return;
+    if (row.spanning && !selectableSpanningRef.current.has(row.key)) return;
     const now = Date.now();
     if (lastPress.current?.key === row.key && now - lastPress.current.at < 360) onRowDoublePress?.(row.key, index);
     lastPress.current = { key: row.key, at: now };
     onSelectionChange?.(row.key, index);
-  }, [onRowDoublePress, onSelectionChange, selectableSpanningKeys]);
+  }, [onRowDoublePress, onSelectionChange]);
   const renderRow = React.useCallback(({ item, index }: { item: TableRow; index: number }): React.JSX.Element => <WindowsTableRow
     row={item}
     index={index}
@@ -759,19 +801,30 @@ const windowsTableStyles = StyleSheet.create({
   cells: { flexDirection: "row", alignItems: "center", paddingHorizontal: 8 },
   cell: { paddingHorizontal: 8, color: "#1f2937", fontSize: UI_FONT_SIZE },
   sourceCell: { flexDirection: "row", alignItems: "center" },
-  symbol: { width: 18, height: 18, marginRight: 7, borderRadius: 5, color: "#ffffff", fontFamily: "Segoe MDL2 Assets", fontSize: 12, lineHeight: 18, textAlign: "center" },
+  symbol: { width: 20, height: 20, marginRight: 8, fontFamily: "Segoe MDL2 Assets", fontSize: 16, lineHeight: 20, textAlign: "center" },
   groupText: { paddingHorizontal: 12, color: "#475467", fontSize: UI_TIP_FONT_SIZE, fontWeight: "600" },
 });
 
-export function NativeTable({ columns, rows, selectedKey = "", striped = true, compact = true, followBottom = false, scrollToRow = -1, framed = true, sourceList = false, rowSymbols = [], rowSymbolColors = [], rowImageNames = [], cellHorizontalPadding = 8, firstColumnHorizontalPadding = 8, preserveColumnWidths = false, scrollTrailingColumnOverflow = false, disabledRowKeys = [], secondaryCellKeys = [], selectableSpanningRowKeys = [], onSelectionChange, onRowDoublePress, style, alertRowKeys = [] }: TableProps): React.JSX.Element {
+// The empty lists are module constants, not fresh `[]` defaults: a new array
+// on every render invalidated the memoized lookup Sets in `WindowsTable` (and
+// with them every mounted row) even when no prop changed.
+const EMPTY_STRINGS: string[] = [];
+
+export function NativeTable({ columns, rows, selectedKey = "", striped = true, compact = true, followBottom = false, scrollToRow = -1, framed = true, sourceList = false, rowSymbols = EMPTY_STRINGS, rowSymbolColors = EMPTY_STRINGS, rowImageNames = EMPTY_STRINGS, cellHorizontalPadding = 8, firstColumnHorizontalPadding = 8, preserveColumnWidths = false, scrollTrailingColumnOverflow = false, disabledRowKeys = EMPTY_STRINGS, secondaryCellKeys = EMPTY_STRINGS, selectableSpanningRowKeys = EMPTY_STRINGS, onSelectionChange, onRowDoublePress, style, alertRowKeys = EMPTY_STRINGS }: TableProps): React.JSX.Element {
   // Striped rows belong to the list surface, not to its contents: the native
   // table paints its alternating bands across the whole viewport, so an empty
   // list shows the same stripes and reads as a list that happens to have no
   // rows. Deriving this from `rows.length` made every empty list a blank white
   // block, indistinguishable from the pane behind it.
   const stripedRows = striped && !sourceList;
-  const spanningRowKeys = rows.filter((row) => row.spanning).map((row) => row.key);
-  const selectableSpanningKeys = new Set(selectableSpanningRowKeys.filter((key) => spanningRowKeys.includes(key)));
+  // One Set per data change, not one per render: `WindowsTable` hands it to
+  // every row, so a fresh Set defeated the row memo and re-rendered the whole
+  // mounted window whenever the parent published anything.
+  const spanningRowKeys = React.useMemo(() => rows.filter((row) => row.spanning).map((row) => row.key), [rows]);
+  const selectableSpanningKeys = React.useMemo(() => {
+    const spanning = new Set(spanningRowKeys);
+    return new Set(selectableSpanningRowKeys.filter((key) => spanning.has(key)));
+  }, [spanningRowKeys, selectableSpanningRowKeys]);
   // Every key here must also appear in the macOS wrapper's own parameter list:
   // `AppKitControls.tsx` forwards props by hand, so a prop added on one host and
   // forgotten on the other arrives empty instead of failing to compile.

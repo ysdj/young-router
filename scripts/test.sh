@@ -37,7 +37,6 @@ elif command -v uv >/dev/null 2>&1; then
     --with "litellm[proxy]==$(tr -d '[:space:]' < LITELLM_VERSION)"
     --with "fastapi==0.140.3"
     --with PyYAML
-    --with Pillow
     python
   )
 else

@@ -2044,7 +2044,7 @@ function SettingsShell({ route, windowRoute, snapshot, ipc, native, translate, l
         <Text numberOfLines={1} style={styles.settingsSidebarTitle}>{translate("app.title")}</Text>
       </View>
       <NativeTable
-        columns={[{ label: "", width: 186 }]}
+        columns={SETTINGS_SIDEBAR_COLUMNS}
         rows={paneRows}
         selectedKey={pane}
         striped={false}
@@ -2097,6 +2097,12 @@ function SettingsShell({ route, windowRoute, snapshot, ipc, native, translate, l
  */
 const SETTINGS_RAIL_WIDTH = 156;
 const SETTINGS_RAIL_COLUMN_WIDTH = 148;
+// The sidebar and the rail draw one icon-plus-name column.  These arrays are
+// module constants so a settings re-render hands `NativeTable` the same column
+// list: an inline literal was a new array every time, which re-mounted every
+// row of a list the user was reading.
+const SETTINGS_SIDEBAR_COLUMNS = [{ label: "", width: 186 }];
+const SETTINGS_RAIL_COLUMNS = [{ label: "", width: SETTINGS_RAIL_COLUMN_WIDTH }];
 /**
  * The one settings-field grid every settings pane uses (general, runtime
  * settings, backup and sync, external clients): a left-aligned label column, the control
@@ -2130,7 +2136,7 @@ function SettingsRail({ rows, selectedKey, onSelectionChange }: {
   // apart; the rail's single right divider is its only rule.
   return <View style={styles.settingsRail}>
     <NativeTable
-      columns={[{ label: "", width: SETTINGS_RAIL_COLUMN_WIDTH }]}
+      columns={SETTINGS_RAIL_COLUMNS}
       rows={rows}
       selectedKey={selectedKey}
       striped={false}
@@ -8835,13 +8841,45 @@ function AssistantSettingsWorkspace({ busy, native, codexModels, codexModelCatal
   </View>;
 }
 
+function WindowsMasterKeyEditor({ native, busy, translate, onStatus }: { native: NativeLeafAdapter; busy: boolean; translate: Translate; onStatus: (message?: string) => void }): React.JSX.Element {
+  const [present, setPresent] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const edit = useCallback(async () => {
+    setEditing(true);
+    try {
+      const result = await native.editSecret({
+        domain: "runtime",
+        field: "setting",
+        target: "YOUNG_ROUTER_MASTER_KEY",
+        title: translate("general.apiKey"),
+        // Core refuses an empty proxy key (that would turn LiteLLM into
+        // unauthenticated mode), so the editor must not offer Clear for it.
+        allowClear: false,
+      });
+      if (result) {
+        setPresent(result.present);
+        onStatus(translate(result.present ? "common.saved" : "common.cleared"));
+      }
+    } catch (reason: unknown) {
+      onStatus(errorMessage(reason, translate));
+    } finally {
+      setEditing(false);
+    }
+  }, [native, onStatus, translate]);
+  return <NativeButton
+    title={present ? translate("common.edit") : translate("common.set")}
+    compact
+    busy={editing}
+    disabled={busy || editing}
+    accessibilityLabel={translate("general.apiKey")}
+    onPress={() => { void edit(); }}
+  />;
+}
+
 function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServiceAction, translate, onStatus, onSnapshot }: { snapshot?: CoreSnapshot; ipc: IpcClient; native: NativeLeafAdapter; busy: boolean; dispatch: Dispatch; dispatchServiceAction: (type: string) => Promise<unknown>; translate: Translate; onStatus: (message?: string) => void; onSnapshot: (next: CoreSnapshot) => void }): React.JSX.Element {
-  // The API-key field is native, so its result reaches this pane as a state
-  // event rather than a dispatch result; a failure belongs in the window's one
-  // status strip, beside every other result this pane reports.
-  const onApiKeyState = useCallback((state: SecretState) => {
-    if (state.status === "error" && state.error !== "") onStatus(state.error);
-  }, [onStatus]);
+  // Windows uses the native modal editor for this one field. It avoids the
+  // WinUI ContentIsland lifetime that crashes when the General pane unmounts,
+  // while the value remains entirely inside the native secret capability.
   const [autoStartBusy, setAutoStartBusy] = useState(false);
   const [serviceBusy, setServiceBusy] = useState(false);
   const [requestedAutoStart, setRequestedAutoStart] = useState<boolean>();
@@ -8984,7 +9022,6 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
         <Text style={styles.generalRowLabel}>{translate("general.autoStart")}</Text>
         <NativeToggle value={autoStartValue} disabled={autoStartBusy || busy || snapshot === undefined} accessibilityLabel={translate("general.autoStart")} onValueChange={(next) => { void setAutoStart(next); }} style={styles.generalToggle} />
       </View>
-      <View style={styles.generalHelpSlot}><Text style={styles.generalHelpText}>{translate("general.autoStartHint")}</Text></View>
       <View style={styles.generalRow}>
         <Text style={styles.generalRowLabel}>{translate("general.runInBackground")}</Text>
         <NativeToggle value={backgroundValue} disabled={backgroundBusy || busy || snapshot === undefined} accessibilityLabel={translate("general.runInBackground")} onValueChange={(next) => { void setRunInBackground(next); }} style={styles.generalToggle} />
@@ -8998,7 +9035,6 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
         <Text numberOfLines={1} style={styles.generalRowValue}>{serviceLabel}</Text>
         {serviceActionAvailable ? <NativeButton compact primary={!serviceRestart} busy={serviceBusy} disabled={snapshot === undefined || (busy && !serviceBusy)} title={serviceRestart ? translate("service.restart") : translate("service.start")} accessibilityLabel={serviceRestart ? translate("service.restart") : translate("service.start")} onPress={() => { void runServiceAction(); }} style={styles.generalServiceAction} /> : null}
       </View>
-      <View style={styles.generalHelpSlot}><Text style={styles.generalHelpText}>{translate("general.serviceHint")}</Text></View>
       <View style={styles.generalRow}>
         <Text style={styles.generalRowLabel}>{translate("general.port")}</Text>
         <RuntimeValueField label={translate("general.port")} value={portValue} keyboardType="numeric" validate={validatePort} onCommit={(next) => dispatch("set_setting", { key: "LITELLM_PORT", value: next })} />
@@ -9010,10 +9046,12 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
             copied into a client, and the value arrives over the native read
             lease rather than through a Core snapshot. */}
         <View style={styles.generalApiKeyField}>
-          <NativeSecretInputControl label={translate("general.apiKey")} hint={translate("general.apiKeyPlaceholder")} busy={busy || snapshot === undefined} domain="runtime" field="setting" target="YOUNG_ROUTER_MASTER_KEY" plainText autoCommit onSecretState={onApiKeyState} />
+          {Platform.OS === "windows"
+            ? <WindowsMasterKeyEditor native={native} busy={busy || snapshot === undefined} translate={translate} onStatus={onStatus} />
+            : <NativeSecretInputControl label={translate("general.apiKey")} hint={translate("general.apiKeyPlaceholder")} busy={busy || snapshot === undefined} domain="runtime" field="setting" target="YOUNG_ROUTER_MASTER_KEY" plainText autoCommit onSecretState={(state) => { if (state.status === "error" && state.error !== "") onStatus(state.error); }} />}
+
         </View>
       </View>
-      <View style={styles.generalHelpSlot}><Text style={styles.generalHelpText}>{translate("general.apiKeyHint")}</Text></View>
     </View>
   </PersistentScrollView>;
 }

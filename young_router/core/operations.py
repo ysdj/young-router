@@ -80,6 +80,15 @@ _RUNTIME_SETTINGS_PROCESS_AUTHORITATIVE_KEYS = frozenset(
     {
         "YOUNG_ROUTER_CODEX_DESCENDANT_CLEANUP",
         "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON",
+        # The image-context pass is the one request rewrite whose *switch* the
+        # operator changes while a task is running; a missing value must read
+        # as the schema default (off) instead of as "the host environment
+        # forgot to unset an old one".
+        "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_ENABLED",
+        "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_MODE",
+        "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_KEEP_RECENT",
+        "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_MIN_BYTES",
+        "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_DATA_DIR",
     }
 )
 

@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import stat
 import subprocess
+import sys
 import threading
 import time
 import tomllib
@@ -42,6 +43,7 @@ from ._shared import (
     _action_name,
     _default_provider_config_path,
     _default_runtime_root,
+    _default_runtime_settings_path,
     _mapping,
     _safe_problem,
 )
@@ -388,6 +390,115 @@ def _surface_sync_patch(
     if selected_override:
         patch["features"] = selected_override
     return patch
+
+
+# The MCP server Young Router registers for the model's fetch tool.  It carries
+# this app's own name and its argument list, so nothing a user configured for
+# another purpose is ever mistaken for it, and only this entry is added or
+# removed when the image-context setting changes.
+IMAGE_CONTEXT_SERVER_ID = "young_router_image_context"
+IMAGE_CONTEXT_SERVER_ARGS = [
+    "-m",
+    "young_router.proxy.image_context_mcp",
+]
+
+
+def image_context_mcp_registered(config: Mapping[str, Any]) -> bool:
+    """Whether Codex already lists this app's image-context fetch server."""
+
+    raw = (config or {}).get("mcp_servers")
+    servers = raw if isinstance(raw, Mapping) else {}
+    if not servers and isinstance(raw, Sequence):
+        # ``structured`` lists servers as ``[{id, ...}]``; the parsed TOML they
+        # come from is a table keyed by id.  Accept both so the caller never has
+        # to know which projection it is holding.
+        servers = {
+            str(item.get("id")): item
+            for item in raw
+            if isinstance(item, Mapping) and item.get("id")
+        }
+    server = servers.get(IMAGE_CONTEXT_SERVER_ID)
+    return isinstance(server, Mapping) and bool(
+        str(server.get("command") or "").strip()
+    )
+
+
+def image_context_mcp_patch(
+    config: Mapping[str, Any],
+    *,
+    enabled: bool,
+    python: str,
+) -> dict[str, Any]:
+    """The patch that adds or removes the fetch server without touching others.
+
+    The server is a stdio entry that runs this installation's interpreter, so a
+    bundled desktop app resolves its own runtime instead of a ``python`` the
+    user happens to have on ``PATH``.  It is registered with
+    ``required = false``: a session whose interpreter is missing still starts,
+    and the model simply gets no fetch tool.
+    """
+
+    # ``mcp_servers`` in a structured patch is the complete list: any server
+    # absent from it is removed.  So the patch always states every server the
+    # file already has, and only this app's own entry gains or loses anything.
+    retained = [
+        {"id": str(item.get("id"))}
+        for item in _mcp_server_entries(config)
+        if str(item.get("id")) != IMAGE_CONTEXT_SERVER_ID
+    ]
+    if enabled:
+        return {
+            "mcp_servers": [
+                {
+                    "id": IMAGE_CONTEXT_SERVER_ID,
+                    "command": python,
+                    "args": list(IMAGE_CONTEXT_SERVER_ARGS),
+                    "transport": "stdio",
+                    "required": False,
+                },
+                *retained,
+            ]
+        }
+    if not image_context_mcp_registered(config):
+        return {}
+    return {"mcp_servers": retained}
+
+
+def _mcp_server_entries(config: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """Every MCP server of a Codex document, as ``[{id, …}]``."""
+
+    raw = (config or {}).get("mcp_servers")
+    if isinstance(raw, Mapping):
+        return [
+            {**item, "id": str(server_id)}
+            for server_id, item in raw.items()
+            if isinstance(item, Mapping)
+        ]
+    if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes, bytearray)):
+        return [item for item in raw if isinstance(item, Mapping) and item.get("id")]
+    return []
+
+
+def image_context_settings() -> dict[str, Any]:
+    """Read the runtime settings that decide this pass.
+
+    Read at dispatch time rather than cached: the settings file is the
+    operator's, and a value changed there must reach the next write.
+    """
+
+    from .. import runtime_settings_io
+
+    values: Mapping[str, Any] = {}
+    try:
+        values = runtime_settings_io.read_settings_file(
+            _default_runtime_settings_path(), runtime_settings_io.load_specs()
+        )
+    except Exception:
+        values = {}
+    return {
+        "enabled": str(values.get("YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_ENABLED") or "").strip()
+        in {"1", "true", "TRUE", "True"},
+    }
 
 
 def _remove_legacy_computer_mcp(text: str) -> str:
@@ -1078,6 +1189,20 @@ class CodexSettingsDomain:
                 return item.get("supports_standalone_web_search") is True
         return False
 
+    def image_context_mcp_enabled(self) -> bool:
+        """Whether Codex lists this app's image-context fetch server.
+
+        The switch lives in the runtime settings (that is where the operator
+        turns the pass on), and the server entry follows it: a Codex session
+        with the pass on but no fetch tool would leave the model holding
+        placeholders it can never open, so the two are kept together here.
+        """
+
+        structured = self._draft.get("structured")
+        return image_context_mcp_registered(
+            structured if isinstance(structured, Mapping) else {}
+        )
+
     def _safe_snapshot(self, payload: Mapping[str, Any], revision: int) -> dict[str, Any]:
         errors = payload.get("validation_errors", [])
         warnings = payload.get("warnings", [])
@@ -1091,6 +1216,7 @@ class CodexSettingsDomain:
             "auth_file_exists": bool(payload.get("auth_exists")),
             "uses_local_api": self.uses_local_api(),
             "standalone_search": self.standalone_search_enabled(),
+            "image_context_mcp": self.image_context_mcp_enabled(),
             "structured": redact(payload.get("structured", {})),
             "models": redact(payload.get("models", [])),
             "validation_errors": redact(errors if isinstance(errors, list) else []),
@@ -1307,6 +1433,22 @@ class CodexSettingsDomain:
                     ],
                 },
             )
+        elif name in {"codex_image_context_set", "codex_image_context"}:
+            # The setting itself belongs to the runtime settings; this action
+            # only keeps Codex's own MCP list in step with it, which is the one
+            # thing the data plane cannot write by itself.
+            enabled_value = data.get("enabled")
+            if not isinstance(enabled_value, bool):
+                raise DomainError("The Codex image-context switch is invalid")
+            structured = self._draft.get("structured")
+            structured = structured if isinstance(structured, Mapping) else {}
+            patch = image_context_mcp_patch(
+                structured,
+                enabled=enabled_value,
+                python=str(data.get("python") or sys.executable or "python3"),
+            )
+            if patch:
+                self._draft = self._sync(config_text, auth_text, patch)
         elif name in {"reset", "cancel", "reload", "restore_defaults"}:
             self._draft = copy.deepcopy(self._raw)
         else:
@@ -1625,6 +1767,45 @@ class CodexSettingsDomain:
             sync_plugins=selected_features,
         )
         return patch
+
+    def sync_image_context_mcp(self) -> bool:
+        """Write Codex's fetch-server entry to match the image-context switch.
+
+        Reads the switch from the runtime settings and adds or removes this
+        app's own MCP entry, touching nothing else in the client's file.  The
+        document is written here rather than staged: the switch is already
+        committed when this runs, and a staged edit would leave Codex without
+        the tool for exactly the turns the placeholders start appearing in.
+        """
+
+        import sys as _sys
+
+        enabled_now = bool(image_context_settings().get("enabled"))
+        structured = self._draft.get("structured")
+        structured = structured if isinstance(structured, Mapping) else {}
+        if enabled_now == image_context_mcp_registered(structured):
+            return False
+        config_text = self._draft.get("config_text", "")
+        auth_text = self._draft.get("auth_text", "{}\n")
+        if not isinstance(config_text, str) or not isinstance(auth_text, str):
+            return False
+        patch = image_context_mcp_patch(
+            structured,
+            enabled=enabled_now,
+            python=str(_sys.executable or "python3"),
+        )
+        if not patch:
+            return False
+        written = self._sync(config_text, auth_text, patch)
+        self._write_documents(written)
+        self._raw = copy.deepcopy(written)
+        self._draft = copy.deepcopy(written)
+        self._baseline = (
+            str(written.get("config_text", "")),
+            str(written.get("auth_text", "{}\n")),
+        )
+        self.revision += 1
+        return True
 
     def follow_local_api_endpoint(self) -> bool:
         """Rewrite a client that uses this app's proxy onto its current endpoint.

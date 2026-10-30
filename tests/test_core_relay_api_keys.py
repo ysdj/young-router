@@ -435,6 +435,128 @@ class RelayApiKeyDomainTests(unittest.TestCase):
             self.assertEqual(applied["resources"], disabled["resources"])
             self.assertEqual(applied["groups"], disabled["groups"])
 
+    def test_auto_grouping_survives_a_refresh_after_a_new_upstream_group(self) -> None:
+        """A group the station just added is synced, not wedged by the sheet's own read.
+
+                自动分组 stages two kinds of work around a new upstream group: a
+        create for the group that owns no key yet, and a retirement for every
+        key whose group the station dropped.  The pane reads the station again
+        before it ever applies — the mount probe, 刷新, the alignment interval,
+        and 分组管理 opening all do — and that read used to erase the draft row a
+        staged create had added while hiding the retired one.  Alignment then saw
+        the group as still unowned and staged a *second* create for it on every
+        pass, and the retirement's target was gone from the account while the
+        journal still had to call the station for it, so Apply refused the whole
+        draft with ``resource_unavailable``.  Nothing about that refusal can be
+        fixed from the pane: the switch stays on, the new group's key is never
+        created, and the key of the dropped group is never retired.
+        """
+
+        class Station(RelayMutationHTTPClient):
+            def __init__(self) -> None:
+                super().__init__({})
+                self.keys = [
+                    {"id": "key-keep", "name": "Balanced", "status": "active", "key": "replace-keep", "group_id": 2, "group": {"name": "Balanced"}},
+                    {"id": "key-dead", "name": "Removed", "status": "active", "key": "replace-dead", "group_id": 99, "group": {"name": "Removed"}},
+                ]
+                self.groups = [{"id": 2, "name": "Balanced", "rate_multiplier": 1.0}]
+
+            def json(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
+                if path == "/api/v1/user/profile":
+                    return {"data": {"balance": 4.5}}
+                if path.startswith("/api/v1/keys"):
+                    return {"data": {"items": [dict(item) for item in self.keys]}}
+                if path == "/api/v1/groups/available":
+                    return {"data": [dict(item) for item in self.groups]}
+                if path == "/api/v1/groups/rates":
+                    return {"data": {}}
+                if path == "/api/v1/channels/available":
+                    return {"data": [{"platforms": [{"supported_models": ["model-test"]}]}]}
+                raise AssertionError(f"unexpected relay path: {path}")
+
+            def post(self, origin: str, path: str, *, headers: dict[str, str], body: dict[str, object] | None = None) -> object:
+                payload = super().post(origin, path, headers=headers, body=body)
+                # A real station answers a create with the row it just made, and
+                # lists it from then on; reconciliation reads that back.
+                created = {"id": "key-new", "name": str((body or {}).get("name", "")), "status": "active", "key": "replace-new", "group_id": None}
+                self.keys.append(created)
+                return {"success": True, "data": {"id": "key-new"}}
+
+            def delete(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
+                payload = super().delete(origin, path, headers=headers)
+                removed = path.rsplit("/", 1)[-1]
+                self.keys = [item for item in self.keys if str(item["id"]) != removed]
+                return payload
+
+            def put(self, origin: str, path: str, *, headers: dict[str, str], body: dict[str, object] | None = None) -> object:
+                payload = super().put(origin, path, headers=headers, body=body)
+                # The create's own metadata (its group, then its name) lands on
+                # the row the station just made, and reconciliation reads it back.
+                target = path.rsplit("/", 1)[-1]
+                for item in self.keys:
+                    if str(item["id"]) != target:
+                        continue
+                    for field in ("name", "group_id", "status"):
+                        if body and field in body:
+                            item[field] = body[field]
+                return payload
+
+        client = Station()
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RelayAccountsDomain(directory, http_client=client)
+            account = domain.dispatch(
+                "account.add",
+                {"type": "sub2api", "label": "Relay", "origin": "https://relay.example.test"},
+            )["accounts"][0]
+            domain.accept_login_result(account["id"], username="person@example.test", cookie="session=fixture")
+            domain.refresh_resources(account["id"])
+            domain.dispatch(
+                "api_key.set_auto_grouping",
+                {"account_id": account["id"], "enabled": True},
+            )
+
+            # The station adds a group.  Every read from here is the pane's own.
+            client.groups.append({"id": 9, "name": "NewGroup", "rate_multiplier": 0.5})
+
+            def align() -> list[str]:
+                domain.refresh_resources(account["id"])
+                snapshot = domain.dispatch(
+                    "api_key.auto_group_align",
+                    {"account_id": account["id"]},
+                )["accounts"][0]
+                return [resource["name"] for resource in snapshot["resources"]]
+
+            self.assertEqual(["Balanced", "NewGroup"], align())
+            # A second pass is a derivation, not an accumulation: the group owns
+            # the key the first pass staged, so no second create is filed for it.
+            self.assertEqual(["Balanced", "NewGroup"], align())
+            self.assertEqual(
+                ["NewGroup"],
+                [
+                    operation["changes"]["name"]
+                    for operation in domain._pending_operations
+                    if operation["kind"] == "api_key_create"
+                ],
+            )
+            # The retired key is hidden from the sheet, and Apply still stages,
+            # performs, and reconciles its deletion by the id the journal holds.
+            prepared = domain.prepare_apply()
+            self.assertTrue(prepared["ready"], prepared["issues"])
+            self.assertEqual(
+                ["sub2api-key-dead"],
+                [operation["resource_id"] for operation in prepared["destructive"]],
+            )
+            applied = domain.apply()
+            self.assertEqual("applied", applied["status"], applied["issues"])
+            self.assertIn(
+                ("DELETE", "/api/v1/keys/key-dead", "https://relay.example.test", {"Cookie": "session=fixture"}, None),
+                client.calls,
+            )
+            self.assertIn(
+                ("POST", "/api/v1/keys", "https://relay.example.test", {"Cookie": "session=fixture"}, {"name": "NewGroup"}),
+                client.calls,
+            )
+
     def test_auto_grouping_without_station_groups_keeps_every_key(self) -> None:
         """An unknown group list is not a layout, so nothing is staged to delete."""
 

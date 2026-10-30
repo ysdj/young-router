@@ -2194,6 +2194,18 @@ class RelayAccountsDomain:
                 ]
                 self._accounts[index] = _private_account(updated)
                 continue
+            if kind == "api_key_create":
+                # A create this Core staged has no row on the station yet, so the
+                # read that just landed cannot describe it: without this the
+                # draft row a create added disappeared at the next refresh while
+                # its journal entry lived on.  自动分组 then saw a group with no
+                # key of its own at every pass and staged a second create for the
+                # same group, and a third — the journal grew one duplicate per
+                # interval tick, and the pane could no longer say which of them
+                # the group's one key was.
+                if operation.get("state") == "staged" and not operation.get("remote_resource_id"):
+                    self._append_pending_create_preview(index, operation)
+                continue
             if kind not in {"api_key_update", "api_key_set_group", "api_key_set_enabled"}:
                 continue
             try:
@@ -2202,6 +2214,51 @@ class RelayAccountsDomain:
                 # The station stopped reporting this key; the journal keeps the
                 # operation and Apply states it rather than inventing a row.
                 continue
+
+    def _append_pending_create_preview(self, index: int, operation: Mapping[str, Any]) -> None:
+        """Put a staged create's own draft row back onto a fresh station reading.
+
+        The row is derived from the operation, never stored, so re-deriving it
+        after every read reproduces the same line instead of accumulating one
+        copy per refresh.  Its id is the operation's temporary ``pending-`` id,
+        which is what makes the alignment see the group as already carrying the
+        key it staged.
+        """
+
+        account = copy.deepcopy(self._accounts[index])
+        resource_id = str(operation.get("resource_id", ""))
+        if not resource_id:
+            return
+        resources = [
+            item for item in account.get("resources", []) if isinstance(item, Mapping)
+        ]
+        if any(item.get("id") == resource_id for item in resources):
+            return
+        changes = operation.get("changes", {})
+        group_id = str(changes.get("group_id", ""))
+        group = next(
+            (
+                item
+                for item in account.get("groups", [])
+                if isinstance(item, Mapping) and str(item.get("id", "")) == group_id
+            ),
+            None,
+        )
+        account["resources"] = [
+            *[dict(item) for item in resources],
+            _safe_resource(
+                {
+                    "id": resource_id,
+                    "name": changes.get("name"),
+                    "api_base": f"{account['origin'].rstrip('/')}/v1",
+                    "enabled": changes.get("enabled") is not False,
+                    "models": [],
+                    "group_id": group_id,
+                    "group_name": str(group.get("name", group_id)) if isinstance(group, Mapping) else group_id,
+                }
+            ),
+        ]
+        self._accounts[index] = _private_account(account)
 
     def _replace_resource_preview(self, index: int, resource_id: str, changes: Mapping[str, Any]) -> None:
         account = copy.deepcopy(self._accounts[index])
@@ -2653,7 +2710,7 @@ class RelayAccountsDomain:
             if not self._has_session_credentials(account):
                 issues.append(self._apply_issue("login_required", account_id=account_id, resource_id=resource_id))
                 continue
-            if operation.get("kind") != "api_key_create":
+            if operation.get("kind") not in {"api_key_create", "api_key_delete"}:
                 try:
                     self._selected_resource(account, resource_id)
                 except RelayAccountsError:
@@ -4958,9 +5015,36 @@ class RelayAccountsDomain:
         return payload
 
     def _api_key_remote_id(self, account: Mapping[str, Any], resource_id: object) -> str:
-        resource = self._selected_resource(account, resource_id)
         prefix = "newapi-" if account["type"] == "newapi" else "sub2api-"
-        raw_id = resource["id"]
+        selected = _resource_id(resource_id)
+        resources = account.get("resources", [])
+        resource = next(
+            (
+                item
+                for item in resources
+                if isinstance(item, Mapping) and item.get("id") == selected
+            ),
+            None,
+        ) if isinstance(resources, list) else None
+        if not isinstance(resource, Mapping):
+            # A delete this Core already staged is the one caller whose target
+            # the account no longer lists.  ``_reapply_pending_resource_changes``
+            # hides a retired row — the sheet must not show a key the layout is
+            # about to remove — so resolving the operation through the stored
+            # list refused the very deletion the journal holds.  The staged id
+            # is the station's own id with this Core's prefix, which is exactly
+            # what the delete needs to name.
+            if (
+                not selected.startswith(prefix)
+                or not any(
+                    operation.get("kind") == "api_key_delete"
+                    and operation.get("resource_id") == selected
+                    for operation in self._pending_operations
+                )
+            ):
+                raise RelayAccountsError("The selected relay API resource is unavailable")
+            resource = {"id": selected}
+        raw_id = str(resource.get("id", ""))
         if not raw_id.startswith(prefix):
             raise RelayAccountsError("The selected relay API resource is unavailable")
         remote_id = raw_id.removeprefix(prefix)

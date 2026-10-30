@@ -2143,7 +2143,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
             {value.strip() for value in re.findall(r"fontSize:\s*([^,}\n]+)", relay)},
         )
         self.assertEqual(
-            {"UI_FONT_SIZE", "UI_TIP_FONT_SIZE", "12"},
+            # 12 is the tip step, 16 the sidebar's icon glyph: the glyph is
+            # drawn from the icon font, so it is the one text run that does not
+            # use a UI step.
+            {"UI_FONT_SIZE", "UI_TIP_FONT_SIZE", "12", "16"},
             {value.strip() for value in re.findall(r"fontSize:\s*([^,}\n]+)", self.native_controls)},
         )
         self.assertIn("runtimeHelpText: { ...SETTINGS_FIELD_HELP_TEXT }", self.ui)
@@ -2343,7 +2346,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("striped = true, compact = true", self.native_controls)
         self.assertIn("const stripedRows = striped && !sourceList;", self.native_controls)
         self.assertIn("alternatingRows: stripedRows,", self.native_controls)
-        self.assertIn("const spanningRowKeys = rows.filter((row) => row.spanning).map((row) => row.key);", self.native_controls)
+        self.assertIn("const spanningRowKeys = React.useMemo(() => rows.filter((row) => row.spanning).map((row) => row.key), [rows]);", self.native_controls)
         self.assertIn("selectableSpanningRowKeys: Array.from(selectableSpanningKeys),", self.native_controls)
         # The React table forwards the same list chrome and grouping props.
         self.assertIn("secondaryCellKeys", self.native_controls)
@@ -2360,11 +2363,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
         mac_native = MACOS_CONTROLS.read_text(encoding="utf-8")
         self.assertIn("const SETTINGS_RAIL_WIDTH = 156;", self.ui)
         self.assertIn("const SETTINGS_RAIL_COLUMN_WIDTH = 148;", self.ui)
+        # The column list is a module constant: an inline literal was a new
+        # array on every settings render, which re-mounted each sidebar row.
+        self.assertIn("const SETTINGS_RAIL_COLUMNS = [{ label: \"\", width: SETTINGS_RAIL_COLUMN_WIDTH }];", self.ui)
         self.assertIn('settingsRail: { width: SETTINGS_RAIL_WIDTH, flexShrink: 0, minHeight: 0, paddingTop: 6, overflow: "hidden" }', self.ui)
         self.assertIn("settingsRailList: { flex: 1, minHeight: 0 },", self.ui)
         rail = self.ui.split("function SettingsRail(", 1)[1].split("\nfunction ", 1)[0]
         for marker in (
-            'columns={[{ label: "", width: SETTINGS_RAIL_COLUMN_WIDTH }]}',
+            "columns={SETTINGS_RAIL_COLUMNS}",
             "sourceList",
             "cellHorizontalPadding={8}",
             "firstColumnHorizontalPadding={8}",
@@ -3833,7 +3839,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         ):
             self.assertIn(marker, self.macos_leaf)
         self.assertIn("models.count <= 10_000", mac_module)
-        self.assertIn("xaml::Window dialog;", windows_leaf)
+        self.assertIn("XamlDialog dialog;", windows_leaf)
         self.assertIn("RunOwnedModalWindow(dialog, window_handle_", windows_leaf)
         self.assertIn("list.MinHeight(220);", windows_leaf)
         self.assertIn("list.Height(420);", windows_leaf)

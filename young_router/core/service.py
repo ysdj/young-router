@@ -4757,6 +4757,9 @@ class CoreStore:
                     # not stuck behind the Core lock.  Only a commit that
                     # changed the document the proxy loads needs one.
                     self._schedule_reload_for_applied_domains(applied, runtime_document_before)
+                # Codex's own MCP list follows the image-context switch: the two
+                # are written together, and the proxy restart above is unrelated.
+                self._sync_codex_image_context_mcp(applied)
                 self._revision += 1
                 self._persist_metadata()
             except Exception as exc:
@@ -4791,6 +4794,45 @@ class CoreStore:
                 "pending_operations": 0,
                 "issues": [],
             }
+
+    def _sync_codex_image_context_mcp(self, applied: Sequence[str]) -> None:
+        """Keep Codex's fetch server in step with the image-context switch.
+
+        The switch is a runtime setting (that is where an operator turns the
+        pass on) and the server entry is a Codex document, so the two live in
+        two domains and must move together: a pass that is on with no fetch tool
+        leaves the model holding placeholders it can never open, and a fetch
+        tool with the pass off is a tool that can never answer.  The caller
+        holds ``self._lock``.
+        """
+
+        if "codex" not in applied and "runtime" not in applied:
+            return
+        adapter = self._domains.get("codex")
+        sync = getattr(adapter, "sync_image_context_mcp", None)
+        if not callable(sync):
+            return
+        try:
+            changed = bool(sync())
+        except Exception:
+            # A Codex document this app cannot rewrite must not fail the commit
+            # that just succeeded: the pass itself is served by the proxy.
+            return
+        if not changed or adapter is None:
+            return
+        self._baselines["codex"] = self._adapter_draft_state("codex")
+        self._disk["codex"] = {
+            "changed": False,
+            "generation": int(self._disk.get("codex", {}).get("generation", 0)),
+            "keep_draft": False,
+        }
+        self._disk_identities["codex"] = self._external_disk_identity(adapter)
+        self._mark_domain(
+            "codex",
+            dirty=False,
+            validation={"valid": True, "issues": []},
+            base_revision=self._revision + 1,
+        )
 
     def reload(self, domain: str | None = None, *, revision: int | None = None) -> dict[str, Any]:
         with self._lock:

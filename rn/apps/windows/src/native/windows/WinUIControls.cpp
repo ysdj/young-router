@@ -499,6 +499,27 @@ struct SecureTextInputComponentView
       }
     } catch (...) {
     }
+    RetainIsland();
+  }
+
+  // Closing a XamlIsland that was connected through RNW's
+  // ContentIslandComponentView faults inside XamlIsland::Close (0x549a08 /
+  // 0x4e654) because the component view keeps its ChildSiteLink for reuse and
+  // the derived members are destroyed before that link.  There is no point at
+  // which this view can close the island safely, so it is retained for the life
+  // of the process: the app keeps running, and the retained set is bounded by
+  // the number of distinct secret fields a session mounts.  The field's text is
+  // cleared first so a retained box does not keep the secret.
+  void RetainIsland() noexcept {
+    if (!island_) return;
+    try {
+      if (password_box_) password_box_.Password(winrt::hstring{});
+      if (multiline_box_) multiline_box_.Text(winrt::hstring{});
+    } catch (...) {
+    }
+    static auto* retained = new std::vector<winrt::Microsoft::UI::Xaml::XamlIsland>();
+    retained->push_back(std::move(island_));
+    island_ = nullptr;
   }
 
   void InitializeContentIsland(ContentIslandComponentView const& island_view) noexcept {
