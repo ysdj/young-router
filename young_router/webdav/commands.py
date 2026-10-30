@@ -118,6 +118,12 @@ def command_pull(args: argparse.Namespace) -> int:
 
     print(f"Pulled Young Router config from {_redact_url(remote_bundle_url)}")
     print_manifest_summary("Remote snapshot", manifest)
+    if not (result["installed"] or result["removed"] or result["backups"]):
+        # The remote snapshot is exactly what this machine already holds.  Say
+        # that instead of reporting a pull with no files under it, so an
+        # interval pull reads the same whether it transferred or stopped at the
+        # manifest.
+        print("WebDAV pull: already up to date")
     for path in result["installed"]:
         print(f"Installed: {path}")
     for path in result["removed"]:

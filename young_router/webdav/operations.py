@@ -15,12 +15,14 @@ from .core import (
     WebDAVHTTPError,
     _validate_bundle_header,
     archived_bundle_name,
+    build_manifest,
     bundle_url,
     collection_url,
     create_bundle,
     install_bundle,
     manifest_name,
     manifest_url,
+    manifests_match,
     read_config_bundle,
     remote_sibling_url,
     save_sync_state,
@@ -176,8 +178,38 @@ def pull_bundle(
     config_path: pathlib.Path,
     state_path: pathlib.Path | None = None,
     action: str = "pull",
+    *,
+    skip_when_unchanged: bool = True,
 ) -> dict[str, Any]:
+    """Install the remote bundle, or state that there is nothing to install.
+
+    ``skip_when_unchanged`` reads the sidecar manifest (a few hundred bytes)
+    before the bundle, and stops there when its fingerprints already match the
+    files on disk.  A keep-in-sync host pulls on an interval: without this the
+    whole bundle is downloaded every tick to discover it is the one already
+    installed.  The answer is the same either way -- nothing is written -- so
+    the comparison can only save the transfer, never change the outcome, and an
+    unreadable side (a corrupt local config, a refused manifest) falls back to
+    the ordinary whole-bundle pull.
+    """
+
     remote_bundle_url = bundle_url(settings)
+    if skip_when_unchanged and config_path.exists():
+        try:
+            local_manifest = build_manifest(config_path)
+            remote_manifest = read_remote_manifest(client, settings)
+        except SyncError:
+            remote_manifest = None
+        else:
+            if remote_manifest is not None and manifests_match(local_manifest, remote_manifest):
+                if state_path is not None:
+                    save_sync_state(state_path, settings, remote_manifest, action)
+                return {
+                    "manifest": remote_manifest,
+                    "installed": [],
+                    "removed": [],
+                    "backups": [],
+                }
     bundle_data = client.get(remote_bundle_url, max_bytes=CONFIG_BUNDLE_MAX_BYTES)
     result = install_bundle(bundle_data, config_path)
     if state_path is not None:

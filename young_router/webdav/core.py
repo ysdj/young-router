@@ -1040,20 +1040,21 @@ def install_bundle(bundle_data: bytes, config_path: pathlib.Path) -> dict[str, A
             # this Mac still holds.  Nothing is lost either way: a local file
             # the sync does replace is backed up first, and the skipped
             # accounts stay exactly as they were.
-            if archive_name == RELAY_ACCOUNTS_FILE and target_path.exists():
-                local_document = target_path.read_bytes()
-                merged = _merge_relay_accounts(local_document, files[archive_name])
-                if merged is not None:
-                    backups.append(_backup(target_path))
-                    _atomic_write(target_path, merged)
-                    installed.append(str(target_path))
-                    continue
-                if merged is None and local_document == files[archive_name]:
-                    # Identical copies: nothing to install and nothing to back
-                    # up, so a converged pairing stops accumulating backups on
-                    # every run.
-                    continue
             if target_path.exists():
+                local_document = target_path.read_bytes()
+                if archive_name == RELAY_ACCOUNTS_FILE:
+                    merged = _merge_relay_accounts(local_document, files[archive_name])
+                    if merged is not None:
+                        backups.append(_backup(target_path))
+                        _atomic_write(target_path, merged)
+                        installed.append(str(target_path))
+                        continue
+                if local_document == files[archive_name]:
+                    # A pull that repeats unchanged remote content must write
+                    # nothing: an interval pull would otherwise leave a fresh
+                    # .bak beside the file on every run (one per tick, forever)
+                    # and bump the mtime of a configuration nothing changed.
+                    continue
                 backups.append(_backup(target_path))
             _atomic_write(target_path, files[archive_name])
             installed.append(str(target_path))

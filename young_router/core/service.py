@@ -2987,7 +2987,13 @@ class CoreStore:
                             webdav_operations.push_bundle(client, settings, config_path, state_path, "sync-push")
                             outcome = "push"
                         elif remote_changed and not local_changed:
-                            webdav_operations.pull_bundle(client, settings, config_path, state_path, "sync-pull")
+                            # The comparison above already read the manifest; a
+                            # second one would only restate what this branch
+                            # knows, so accept the remote bundle directly.
+                            webdav_operations.pull_bundle(
+                                client, settings, config_path, state_path, "sync-pull",
+                                skip_when_unchanged=False,
+                            )
                             pulled = True
                             outcome = "pull"
                         elif local_changed and remote_changed:

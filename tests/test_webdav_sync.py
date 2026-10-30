@@ -6,6 +6,7 @@ import json
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -300,6 +301,119 @@ class WebDAVSyncBundleTests(unittest.TestCase):
             self.assertEqual(manifest["app"], "young-router")
             self.assertTrue(target_config.exists())
             self.assertEqual(result["manifest"]["summary"]["active_models"], 1)
+
+    def test_a_repeated_pull_of_the_same_bundle_writes_nothing(self) -> None:
+        """An interval pull converges instead of accumulating backups.
+
+        ``pull`` installs the remote bundle whatever its content, and every
+        install backed the target up first.  A host that pulls on a timer
+        therefore left one ``.bak-webdav-*`` per tick beside a configuration
+        nothing had changed, and rewrote the file (and its mtime) each time.
+        """
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            source = temp / "source"
+            target = temp / "target"
+            source.mkdir()
+            target.mkdir()
+            bundle, _manifest = webdav_core.create_bundle(self.write_config(source))
+            config_path = target / "config.yaml"
+
+            first = webdav_core.install_bundle(bundle, config_path)
+            self.assertEqual([str(config_path)], first["installed"])
+            self.assertEqual([], first["backups"])
+            installed_at = config_path.stat().st_mtime_ns
+
+            # Long enough that a rewrite would be visible even on a coarse mtime.
+            time.sleep(0.02)
+            second = webdav_core.install_bundle(bundle, config_path)
+
+            self.assertEqual([], second["installed"])
+            self.assertEqual([], second["backups"])
+            self.assertEqual([], list(target.glob("*.bak-webdav-*")))
+            self.assertEqual(installed_at, config_path.stat().st_mtime_ns)
+
+    def test_a_pull_that_matches_the_remote_manifest_skips_the_bundle(self) -> None:
+        """``pull`` reads the sidecar manifest first and stops when it matches.
+
+        An unchanged remote is the ordinary case for a keep-in-sync host, and
+        downloading the whole bundle to discover that is the transfer this
+        comparison exists to avoid.  A remote that does differ still installs.
+        """
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            source = temp / "source"
+            target = temp / "target"
+            source.mkdir()
+            target.mkdir()
+            bundle, manifest = webdav_core.create_bundle(self.write_config(source))
+            config_path = target / "config.yaml"
+            webdav_core.install_bundle(bundle, config_path)
+            manifest_data = json.dumps(manifest).encode("utf-8")
+
+            class FakeClient:
+                def __init__(self) -> None:
+                    self.urls: list[str] = []
+
+                def get(self, url: str, *, max_bytes: int) -> bytes:
+                    self.urls.append(url)
+                    if url.endswith(".manifest.json"):
+                        return manifest_data
+                    return bundle
+
+            settings = webdav_core.Settings(
+                url="https://example.com/dav/resource/", remote_name="config.json"
+            )
+            client = FakeClient()
+            result = webdav_operations.pull_bundle(client, settings, config_path)
+
+            self.assertEqual([], result["installed"])
+            self.assertEqual(
+                ["https://example.com/dav/resource/config.manifest.json"], client.urls
+            )
+
+    def test_a_pull_installs_a_remote_that_differs_from_the_local_file(self) -> None:
+        """The manifest shortcut must not swallow a real change."""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            source = temp / "source"
+            target = temp / "target"
+            source.mkdir()
+            target.mkdir()
+            config_path = target / "config.yaml"
+            old_bundle, _old_manifest = webdav_core.create_bundle(self.write_config(source))
+            webdav_core.install_bundle(old_bundle, config_path)
+
+            source_config = self.write_config(source)
+            source_config.write_text(
+                source_config.read_text(encoding="utf-8").replace(
+                    "default-chat", "changed-chat"
+                ),
+                encoding="utf-8",
+            )
+            new_bundle, new_manifest = webdav_core.create_bundle(source_config)
+            manifest_data = json.dumps(new_manifest).encode("utf-8")
+
+            class FakeClient:
+                def __init__(self) -> None:
+                    self.urls: list[str] = []
+
+                def get(self, url: str, *, max_bytes: int) -> bytes:
+                    self.urls.append(url)
+                    if url.endswith(".manifest.json"):
+                        return manifest_data
+                    return new_bundle
+
+            settings = webdav_core.Settings(
+                url="https://example.com/dav/resource/", remote_name="config.json"
+            )
+            result = webdav_operations.pull_bundle(FakeClient(), settings, config_path)
+
+            self.assertEqual([str(config_path)], result["installed"])
+            self.assertIn("changed-chat", config_path.read_text(encoding="utf-8"))
 
     def test_relay_accounts_and_plaintext_password_round_trip_with_the_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
