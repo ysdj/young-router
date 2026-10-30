@@ -674,7 +674,46 @@ def _language(request_kwargs: Mapping[str, Any]) -> str:
     return _LANG_ZH if re.search(r"[\u4e00-\u9fff]", blob) else _LANG_EN
 
 
+# Codex names its task inside ``x-codex-turn-metadata`` as JSON, and that is
+# the only place a proxy sees the id: the plain ``thread_id`` keys
+# ``_trace_session_context`` looks for never appear at the top level of a real
+# request.  Without this the replay cache has no key to file anything under and
+# the fetch tool can never answer.
+_TURN_METADATA_HEADERS = (
+    "x-codex-turn-metadata",
+    "X-Codex-Turn-Metadata",
+)
+_THREAD_ID_KEYS = ("thread_id", "threadId", "session_id", "conversation_id")
+
+
 def _thread_id(request_kwargs: Mapping[str, Any]) -> Optional[str]:
+    """The task this request belongs to, from the client's own turn metadata."""
+
+    candidates: List[Any] = []
+    for container_key in ("proxy_server_request", "headers", "request_headers"):
+        container = request_kwargs.get(container_key)
+        if isinstance(container, Mapping):
+            candidates.append(container.get("headers") if container_key == "proxy_server_request" else container)
+    for metadata_key in ("metadata", "litellm_metadata", "client_metadata"):
+        container = request_kwargs.get(metadata_key)
+        if isinstance(container, Mapping):
+            candidates.append(container)
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            continue
+        for header_name in _TURN_METADATA_HEADERS:
+            value = candidate.get(header_name)
+            if not isinstance(value, str) or not value.strip():
+                continue
+            try:
+                parsed = json.loads(value)
+            except ValueError:
+                continue
+            if isinstance(parsed, Mapping):
+                for id_key in _THREAD_ID_KEYS:
+                    found = parsed.get(id_key)
+                    if isinstance(found, str) and found.strip():
+                        return found.strip()
     from . import routing as _routing_module
 
     try:
@@ -682,7 +721,7 @@ def _thread_id(request_kwargs: Mapping[str, Any]) -> Optional[str]:
     except Exception:
         return None
     if isinstance(session, Mapping):
-        for key in ("thread_id", "conversation_id", "session_id", "id"):
+        for key in ("id", "thread_id", "session_id", "conversation_id"):
             value = session.get(key)
             if isinstance(value, str) and value:
                 return value
