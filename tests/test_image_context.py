@@ -16,9 +16,11 @@ import struct
 import tempfile
 import unittest
 import zlib
+from pathlib import Path
 from unittest import mock
 
 from young_router.proxy import image_context as image_context_module
+from young_router.proxy import image_context_endpoint
 from young_router.proxy import image_context_mcp as mcp_module
 from young_router.proxy import image_context_store as store_module
 
@@ -169,8 +171,20 @@ class ImageContextRewriteTests(_ImageContextCase):
 
         result = self.rewritten(items)
 
-        # The newest turn keeps every part, tags included.
-        self.assertEqual(result["input"][-1], items[-1])
+        # The newest turn keeps its image byte-for-byte, and gains the id label
+        # that tells the model which image the placeholder named.  The label is
+        # inserted, never substituted: an upload with no Codex tag around it
+        # would otherwise be swapped for the label and the image would vanish.
+        newest = result["input"][-1]
+        images = [part for part in newest["content"] if part.get("type") == "input_image"]
+        self.assertEqual(images, [items[1]["content"][2]])
+        labels = [
+            part["text"]
+            for part in newest["content"]
+            if part.get("type") == "input_text" and "IMG-0002" in part.get("text", "")
+        ]
+        self.assertEqual(len(labels), 1)
+        self.assertIn("provided", labels[0])
 
     def test_an_aged_image_becomes_a_placeholder_that_keeps_its_identity(self) -> None:
         items = [
@@ -253,7 +267,12 @@ class ImageContextRewriteTests(_ImageContextCase):
         text = result["input"][1]["content"][1]["text"]
         self.assertIn("图片 IMG-0001 未重复提供", text)
         self.assertIn("IMG-0002", text)
-        self.assertEqual(result["input"][2], items[1])
+        # The copy that is still sent states its own id, and is still sent.
+        sent_content = result["input"][2]["content"]
+        self.assertTrue(any(part.get("type") == "input_image" for part in sent_content))
+        self.assertTrue(
+            any("IMG-0002" in part.get("text", "") for part in sent_content)
+        )
 
     def test_the_switch_off_means_the_request_is_untouched(self) -> None:
         items = [
@@ -379,6 +398,71 @@ class ImageContextRewriteTests(_ImageContextCase):
         )
 
 
+class ImageContextCopyTests(_ImageContextCase):
+    def test_a_fetched_copy_keeps_the_id_it_copies(self) -> None:
+        raw = _png(320, 240, noisy=True)
+        items = [
+            _user_turn("第一轮", _upload_parts(raw)),
+            _user_turn("第二轮", _upload_parts(_png(300, 200, noisy=True, seed=2))),
+            {
+                "type": "function_call_output",
+                "call_id": "c9",
+                "output": [
+                    {"type": "input_text", "text": "[图片 IMG-0001 取回的原图｜第 1 轮]"},
+                    {"type": "input_image", "image_url": _data_url(raw)},
+                ],
+            },
+            _user_turn("第三轮", _upload_parts(_png(280, 180, noisy=True, seed=3))),
+        ]
+
+        found = image_context_module.scan(items)
+
+        # The copy is not a new occurrence: the numbering does not move, so an id
+        # the model already knows still names the same picture after a fetch.
+        self.assertEqual(
+            [(image.image_id, image.copy_of) for image in found],
+            [
+                ("IMG-0001", None),
+                ("IMG-0002", None),
+                ("IMG-0001", "IMG-0001"),
+                ("IMG-0003", None),
+            ],
+        )
+
+    def test_a_copy_from_an_earlier_turn_is_left_out_with_its_own_note(self) -> None:
+        raw = _png(320, 240, noisy=True)
+        items = [
+            _user_turn("第一轮", _upload_parts(raw)),
+            _user_turn("第二轮", _upload_parts(_png(300, 200, noisy=True, seed=2))),
+            {
+                "type": "function_call_output",
+                "call_id": "c9",
+                "output": [
+                    {"type": "input_text", "text": "[图片 IMG-0001 取回的原图｜第 1 轮]"},
+                    {"type": "input_image", "image_url": _data_url(raw)},
+                ],
+            },
+            _user_turn("第三轮", _upload_parts(_png(280, 180, noisy=True, seed=3))),
+        ]
+
+        result = self.rewritten(items)
+
+        tool_output = [
+            item
+            for item in result["input"]
+            if item.get("type") == "function_call_output"
+        ][0]
+        self.assertEqual(
+            [part["type"] for part in tool_output["output"]], ["input_text", "input_text"]
+        )
+        self.assertIn("的原图", tool_output["output"][1]["text"])
+        # The turn that fetched it keeps its own image.
+        newest = result["input"][-1]
+        self.assertTrue(
+            any(part.get("type") == "input_image" for part in newest["content"])
+        )
+
+
 class ImageContextFetchTests(_ImageContextCase):
     def test_the_fetch_answers_from_the_request_the_proxy_stored(self) -> None:
         thread = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
@@ -437,6 +521,21 @@ class ImageContextFetchTests(_ImageContextCase):
         self.assertEqual([block["type"] for block in blocks], ["text", "image"])
         self.assertEqual(blocks[1]["mimeType"], "image/png")
 
+    def test_an_id_is_found_even_when_the_client_names_no_task(self) -> None:
+        # Codex starts an MCP server without telling it which task the model is
+        # in, so the id has to be resolvable on its own.
+        thread = "dddddddd-0000-1111-2222-333333333333"
+        image_context_module._with_codex_image_context(
+            _request(
+                [_user_turn("first", _upload_parts(_png(4, 4))), _user_turn("second")],
+                metadata={"thread_id": thread},
+            )
+        )
+
+        self.assertIsNotNone(store_module.image_data_url(None, "IMG-0001"))
+        self.assertIsNotNone(store_module.image_data_url("another-task", "IMG-0001"))
+        self.assertIsNone(store_module.image_data_url(None, "IMG-0404"))
+
     def test_the_initializer_names_the_server_and_its_instructions(self) -> None:
         answer = mcp_module.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize"})
 
@@ -459,6 +558,74 @@ class ImageContextFetchTests(_ImageContextCase):
         self.assertTrue(answer["result"]["isError"])
 
 
+class ImageContextDeploymentTests(_ImageContextCase):
+    """A gateway on a server has no client to configure, so it promises nothing."""
+
+    def test_auto_serves_http_where_no_client_configuration_exists(self) -> None:
+        environment = {"HOME": str(Path(self.directory.name) / "server-home")}
+
+        self.assertEqual(
+            image_context_module.fetch_mode(environment), "auto"
+        )
+        self.assertFalse(image_context_module.fetch_available(environment))
+        self.assertTrue(image_context_endpoint.enabled(environment))
+
+    def test_auto_registers_a_stdio_client_where_one_exists(self) -> None:
+        home = Path(self.directory.name) / "desktop-home"
+        (home / ".codex").mkdir(parents=True)
+        environment = {"HOME": str(home)}
+
+        self.assertTrue(image_context_module.fetch_available(environment))
+        self.assertFalse(image_context_endpoint.enabled(environment))
+
+    def test_off_promises_no_tool_and_opens_no_port(self) -> None:
+        environment = {"YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_FETCH": "off"}
+
+        self.assertFalse(image_context_module.fetch_available(environment))
+        self.assertFalse(image_context_endpoint.enabled(environment))
+
+    def test_a_gateway_without_a_tool_asks_the_user_instead(self) -> None:
+        items = [
+            _user_turn("第一轮", _upload_parts(_png(320, 240, noisy=True))),
+            _user_turn("第二轮"),
+        ]
+        with mock.patch.dict(
+            os.environ,
+            {
+                image_context_module.IMAGE_CONTEXT_FETCH_ENV: "off",
+            },
+        ):
+            result = self.rewritten(items)
+
+        note = [
+            item["content"][0]["text"]
+            for item in result["input"]
+            if item.get("role") == "developer"
+        ][0]
+        self.assertNotIn("view_image_by_id", note)
+        self.assertIn("需要 IMG-", note)
+        self.assertIn("需要 IMG-0001", json.dumps(result["input"], ensure_ascii=False))
+
+    def test_the_endpoint_answers_only_with_the_installations_token(self) -> None:
+        environment = {"LITELLM_MASTER_KEY": "sk-test"}
+        body = json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+        ).encode("utf-8")
+
+        self.assertTrue(
+            image_context_endpoint.authorized("Bearer sk-test", environment)
+        )
+        self.assertFalse(
+            image_context_endpoint.authorized("Bearer sk-other", environment)
+        )
+        self.assertFalse(image_context_endpoint.authorized(None, environment))
+        # No token configured is not an open door.
+        self.assertFalse(image_context_endpoint.authorized("Bearer anything", {}))
+        status, payload = image_context_endpoint.answer(body)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["result"]["tools"][0]["name"], mcp_module.TOOL_NAME)
+
+
 class ImageContextStorageTests(_ImageContextCase):
     def test_a_stored_replay_holds_images_and_never_text(self) -> None:
         thread = "dddddddd-eeee-ffff-0000-111111111111"
@@ -469,9 +636,7 @@ class ImageContextStorageTests(_ImageContextCase):
 
         store_module.store(thread, {"input": items})
 
-        path = os.path.join(
-            self.data_dir, "young-router-replays", f"{thread}.json"
-        )
+        path = os.path.join(store_module.cache_dir(), f"{thread}.json")
         with open(path, encoding="utf-8") as handle:
             written = handle.read()
         self.assertNotIn("secret sentence", written)

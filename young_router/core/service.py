@@ -3579,6 +3579,11 @@ class CoreStore:
                     # The proxy's port or key may have just changed; a Codex
                     # client that already uses the proxy has to follow it.
                     self._follow_codex_local_api()
+                    # A start or restart is also where the image-context switch
+                    # and the client's fetch-server entry are reconciled: the
+                    # pass reads its switch from the proxy's environment, which
+                    # only a replaced process has.
+                    self._sync_codex_image_context_mcp(["codex"])
                 return self._project_service_dispatch(previous_service, payload)
         except CoreError:
             self._project_service_reload_failure()
@@ -3873,6 +3878,13 @@ class CoreStore:
                     except Exception:
                         pass
                 self._follow_codex_local_api(codex)
+                # The image-context switch lives in the runtime settings and the
+                # fetch server in the client's document.  Reconciling here as
+                # well as on Apply is what makes the two agree after a start:
+                # a settings file edited while the app was closed, or a client
+                # file restored from a backup, would otherwise leave the pass on
+                # with no tool to fetch what it omitted.
+                self._sync_codex_image_context_mcp(["codex"])
             stopping = self._service_reload_stopping
             self._emit()
         if stopping:

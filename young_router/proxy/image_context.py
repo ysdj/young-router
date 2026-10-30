@@ -54,6 +54,13 @@ IMAGE_CONTEXT_MODE_ENV = "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_MODE"
 IMAGE_CONTEXT_KEEP_RECENT_ENV = "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_KEEP_RECENT"
 IMAGE_CONTEXT_DATA_DIR_ENV = "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_DATA_DIR"
 IMAGE_CONTEXT_MIN_BYTES_ENV = "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_MIN_BYTES"
+# How the model fetches an omitted image back.  ``stdio`` is a desktop client
+# whose configuration this app owns; ``http`` is a gateway, where the client
+# lives somewhere else and only a URL can reach the tool; ``off`` promises no
+# tool at all; ``auto`` picks per host.
+IMAGE_CONTEXT_FETCH_ENV = "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_FETCH"
+IMAGE_CONTEXT_FETCH_DEFAULT = "auto"
+IMAGE_CONTEXT_FETCH_VALUES = ("auto", "stdio", "http", "off")
 IMAGE_CONTEXT_MODE_DEFAULT = "auto"
 IMAGE_CONTEXT_MODE_VALUES = ("auto", "manual")
 IMAGE_CONTEXT_KEEP_RECENT_DEFAULT = 0
@@ -113,6 +120,10 @@ _WORDS: Dict[str, Dict[str, Any]] = {
             "那一条在本次请求里照常提供，请直接参考那一条。"
         ),
         "fetched": "取回的原图",
+        "copy": (
+            lambda image_id: f"[{image_id} 的原图：模型当时用 view_image_by_id 取回，"
+            "只在那一轮提供，现在已省略]"
+        ),
         "auto_note": (
             "上下文管理说明（来自用户安装的上下文素材管理工具）：这个任务开着“自动选图”。"
             "为了节省上下文，之前各轮的图片默认不再随请求提供，它们原来的位置换成了"
@@ -125,6 +136,18 @@ _WORDS: Dict[str, Dict[str, Any]] = {
             "之前说过的内容够用时，不要调用。现在看不到的画面细节，不要猜测或补充；"
             "不要让用户重新上传图片，也不要用其他工具去读取图片文件。\n"
             "取回的图片只在本轮提供，下一轮又会换回占位文字；之后还需要时，再调用一次。"
+        ),
+        "auto_ask_note": (
+            "上下文管理说明（来自用户安装的上下文素材管理工具）：这个任务开着“自动选图”。"
+            "为了节省上下文，之前各轮的图片默认不再随请求提供，它们原来的位置换成了"
+            "“[图片 IMG-xxx 已省略…]”这样的占位文字；本轮新出现的图片照常提供。\n"
+            "这些图片在它们出现的那一轮真实存在，你当时收到并看过；你之前对它们的描述，"
+            "以及据此做出的判断，都是看着原图做出的，仍然有效。不要因为现在看不到，就认为"
+            "之前的回答是猜测或错误，也不要收回或道歉。\n"
+            "回答需要看某张被省略的图片、而你之前说过的内容不够用时，在回复里单独写一行"
+            "“需要 IMG-xxx”（几张就都写上）：用户看到这一行才会把那张图重新发给你。"
+            "现在看不到的画面细节，不要猜测或补充；不要让用户重新上传，也不要用其他工具"
+            "去读取图片文件。"
         ),
         "manual_note": (
             "上下文管理说明（来自用户安装的上下文素材管理工具）：为了节省上下文，"
@@ -173,6 +196,10 @@ _WORDS: Dict[str, Dict[str, Any]] = {
             "that one is provided in this request, so read it there."
         ),
         "fetched": "fetched original",
+        "copy": (
+            lambda image_id: f"[original of {image_id}: fetched with view_image_by_id "
+            "for that turn only, now omitted]"
+        ),
         "auto_note": (
             "Context management note (from the context attachment tool the user "
             "installed): automatic image selection is on for this task. To save "
@@ -192,6 +219,23 @@ _WORDS: Dict[str, Dict[str, Any]] = {
             "again, and do not read image files with another tool.\n"
             "A fetched image is provided for this turn only and becomes a "
             "placeholder again afterwards; call again when you need it again."
+        ),
+        "auto_ask_note": (
+            "Context management note (from the context attachment tool the user "
+            "installed): automatic image selection is on for this task. To save "
+            "context, images from earlier turns are not provided by default and "
+            "their place holds text like \"[Image IMG-xxx omitted …]\"; images new "
+            "in this turn are provided as usual.\n"
+            "Those images did exist in the turn they appeared in and you did "
+            "receive and see them; what you described, and the judgements you made "
+            "from it, were made looking at the original and still hold. Do not "
+            "treat earlier answers as guesses or mistakes because the image is not "
+            "visible now, and do not take them back or apologise for them.\n"
+            "When an answer needs an omitted image and what you already said is "
+            "not enough, write \"need IMG-xxx\" on its own line (several ids if you "
+            "need several): that is how the user knows which one to send again. "
+            "Do not guess or add detail you cannot see now; do not ask the user to "
+            "upload it again, and do not read image files with another tool."
         ),
         "manual_note": (
             "Context management note (from the context attachment tool the user "
@@ -255,6 +299,49 @@ def keep_recent(environ: Optional[Mapping[str, str]] = None) -> int:
     )
 
 
+def fetch_mode(environ: Optional[Mapping[str, str]] = None) -> str:
+    env = os.environ if environ is None else environ
+    value = str(env.get(IMAGE_CONTEXT_FETCH_ENV) or "").strip().lower()
+    return value if value in IMAGE_CONTEXT_FETCH_VALUES else IMAGE_CONTEXT_FETCH_DEFAULT
+
+
+def _client_config_present(environ: Optional[Mapping[str, str]] = None) -> bool:
+    """Whether this host is the one that owns the client's configuration."""
+
+    env = os.environ if environ is None else environ
+    configured = str(env.get("CODEX_HOME") or "").strip()
+    home = (
+        os.path.expanduser(configured)
+        if configured
+        else os.path.join(
+            os.path.expanduser(str(env.get("HOME") or env.get("USERPROFILE") or "~")),
+            ".codex",
+        )
+    )
+    return os.path.isdir(home)
+
+
+def fetch_available(environ: Optional[Mapping[str, str]] = None) -> bool:
+    """Whether the model can actually fetch an omitted image on this host.
+
+    A placeholder may only name ``view_image_by_id`` when that tool will be
+    there.  A gateway on a server has no client configuration to edit, so unless
+    it serves the HTTP endpoint the note must fall back to the wording that asks
+    the user -- promising a tool that does not exist is how a model ends up
+    retrying a call nobody answers.
+    """
+
+    env = os.environ if environ is None else environ
+    mode = fetch_mode(env)
+    if mode == "off":
+        return False
+    if mode in {"stdio", "http"}:
+        return True
+    # ``auto``: the desktop client this app configured, or a gateway that was
+    # told to serve the endpoint.  Anything else promises nothing.
+    return _client_config_present(env)
+
+
 def min_bytes(environ: Optional[Mapping[str, str]] = None) -> int:
     env = os.environ if environ is None else environ
     return _as_int(
@@ -285,6 +372,24 @@ def data_dir(environ: Optional[Mapping[str, str]] = None) -> str:
 # --------------------------------------------------------------------------
 
 
+def _safe_thread_file_name(thread_id: Optional[str]) -> Optional[str]:
+    """One task id as a file name, or ``None`` when it is not one.
+
+    Codex ids are UUIDs, but a selection file is read from disk on every
+    request: an id carrying a separator or a traversal piece would name a file
+    outside the selection directory, so those are refused rather than cleaned.
+    """
+
+    if not isinstance(thread_id, str):
+        return None
+    cleaned = thread_id.strip()
+    if not cleaned or len(cleaned) > 120:
+        return None
+    if any(piece in cleaned for piece in ("/", "\\", "\0", "..")):
+        return None
+    return cleaned
+
+
 def _thread_state_path(thread_id: str, environ: Optional[Mapping[str, str]]) -> str:
     return os.path.join(data_dir(environ), "selection", f"{thread_id}.json")
 
@@ -300,7 +405,7 @@ def read_selection(
     unreadable file is not an error -- it means "let the mode decide".
     """
 
-    if not thread_id or not re.fullmatch(r"[0-9a-fA-F-]{8,64}", thread_id):
+    if not _safe_thread_file_name(thread_id):
         return {}
     path = _thread_state_path(thread_id, environ)
     try:
@@ -393,6 +498,14 @@ def _decode_data_url(value: Any) -> Optional[Tuple[str, bytes]]:
 
 
 _IMAGE_PART_TYPES = ("input_image", "image_url")
+# The line the fetch tool writes before an image it returns, in either language:
+# ``[图片 IMG-0004 取回的原图｜…]`` / ``[Image IMG-0004 fetched original | …]``.
+# An image behind it is a *copy* of an existing occurrence, not a new one, so it
+# must not take a new id -- the model and the panel both address that image by
+# the id it copies.
+_FETCHED_LINE = re.compile(
+    r"^\[(?:图片|Image) (IMG-\d{3,}) (?:取回的原图|fetched original)(?:｜| \||])"
+)
 _OPEN_TAG = re.compile(r'^<image name=(\[Image #\d+\]) path="(.*)">$', re.S)
 _CLOSE_TAG = re.compile(r"^</image>$")
 
@@ -402,6 +515,7 @@ class _Found:
 
     __slots__ = (
         "image_id",
+        "copy_of",
         "key",
         "item",
         "part",
@@ -438,9 +552,13 @@ def _text_of(part: Any) -> Optional[str]:
     return text if isinstance(text, str) else None
 
 
-def _kind_of(item_type: Optional[str], part: Any) -> str:
+def _kind_of(item_type: Optional[str], role: Any) -> str:
+    """Where an image came from, in the reference implementation's four kinds."""
+
     if item_type == "image_generation_call":
         return "generated"
+    if item_type == "message" and role == "user":
+        return "upload"
     return "tool"
 
 
@@ -475,7 +593,7 @@ def scan(
                 continue
             found.append(
                 _found_image(
-                    image_id=_numbered(len(found) + 1),
+                    image_id=_numbered(len([item for item in found if item.copy_of is None]) + 1),
                     key=f"{index}:result",
                     item=index,
                     part=None,
@@ -511,9 +629,38 @@ def scan(
             name = None
             if open_tag is not None:
                 name = _OPEN_TAG.match(_text_of(parts[open_tag]) or "").group(1)  # type: ignore[union-attr]
+            # A copy the fetch tool returned names the occurrence it copies in
+            # the line right before it.  It keeps that id and does not advance
+            # the numbering, so an id the model already knows still means the
+            # same image after a fetch.
+            copy_of = None
+            for look_back in (part_index - 1, part_index - 2):
+                if look_back < 0:
+                    continue
+                line = _FETCHED_LINE.match(_text_of(parts[look_back]) or "")
+                if line is not None:
+                    copy_of = line.group(1)
+                    break
+            if copy_of is not None:
+                found.append(
+                    _found_image(
+                        image_id=copy_of,
+                        copy_of=copy_of,
+                        key=f"{index}:{part_index}",
+                        item=index,
+                        part=part_index,
+                        open_tag=open_tag,
+                        close_tag=close_tag,
+                        data=data,
+                        turn=turn,
+                        kind="tool",
+                        name=name,
+                    )
+                )
+                continue
             found.append(
                 _found_image(
-                    image_id=_numbered(len(found) + 1),
+                    image_id=_numbered(len([item for item in found if item.copy_of is None]) + 1),
                     key=f"{index}:{part_index}",
                     item=index,
                     part=part_index,
@@ -521,7 +668,7 @@ def scan(
                     close_tag=close_tag,
                     data=data,
                     turn=turn,
-                    kind="upload" if open_tag is not None else _kind_of(item.get("type"), part),
+                    kind=_kind_of(item.get("type"), item.get("role")),
                     name=name,
                 )
             )
@@ -545,6 +692,7 @@ def _turn_count(input_items: Any) -> int:
 def _found_image(
     *,
     image_id: str,
+    copy_of: Optional[str] = None,
     key: str,
     item: int,
     part: Optional[int],
@@ -560,6 +708,7 @@ def _found_image(
     digest = hashlib.sha256(raw).hexdigest()
     return _Found(
         image_id=image_id,
+        copy_of=copy_of,
         key=key,
         item=item,
         part=part,
@@ -626,6 +775,18 @@ def _duplicate_placeholder(
         f"{_heading(image, str(words['not_repeated']), lang)}\n"
         f"{words['duplicate'](twin.image_id, where)}"
     )
+
+
+def _included_label(image: _Found, lang: str) -> str:
+    """The line put before an image that is still sent.
+
+    Codex's own ``[Image #N]`` restarts in every message, so once a placeholder
+    names an id the model has no way to tell which of the images in front of it
+    that id is.  Every sent image therefore carries its own id, which is how the
+    model asks for the right one later.
+    """
+
+    return _heading(image, str(_WORDS[lang]["included"]), lang)
 
 
 def _fetched_label(image: _Found, lang: str) -> str:
@@ -812,6 +973,16 @@ def _with_codex_image_context(request_kwargs: dict) -> Optional[dict]:
         if image_id in pinned:
             sent_content[image.content_id or ""] = image
             continue
+        if image.copy_of is not None:
+            # A copy the fetch tool returned belongs to the turn that fetched
+            # it; every later turn leaves it out again, in either mode.  Its
+            # original keeps its own place and its own state.
+            if image.turn < current_turn:
+                omitted_keys.add(image.key)
+                omitted.append(image)
+            else:
+                sent_content[image.content_id or ""] = image
+            continue
         drop = image_id in unchecked or (automatic and aged and big)
         if drop and not in_mutable:
             # A frozen image stays, but it still counts as sent: a placeholder
@@ -834,10 +1005,14 @@ def _with_codex_image_context(request_kwargs: dict) -> Optional[dict]:
     # everywhere, its newest copy stays sent and the older ones point at it.  A
     # duplicate placeholder names a copy the model can still see; when there is
     # no such copy the content is simply not in the request.
-    for content_id in {image.content_id for image in omitted}:
+    for content_id in {image.content_id for image in omitted if image.copy_of is None}:
         if content_id in sent_content:
             continue
-        copies = [image for image in omitted if image.content_id == content_id]
+        copies = [
+            image
+            for image in omitted
+            if image.content_id == content_id and image.copy_of is None
+        ]
         if len(copies) < 2:
             continue
         newest = max(copies, key=lambda image: image.item)
@@ -848,8 +1023,20 @@ def _with_codex_image_context(request_kwargs: dict) -> Optional[dict]:
 
     # A duplicate placeholder points at a copy that is still being sent, so the
     # model keeps the content without the bytes being uploaded twice.
-    _AUTOMATIC_PLACEHOLDER[lang] = automatic
+    # The final line may only name the fetch tool when that tool exists here;
+    # otherwise the model is told to ask the user, which is the one action that
+    # can still bring the image back on a gateway with no tool of its own.
+    _AUTOMATIC_PLACEHOLDER[lang] = automatic and fetch_available()
     for image in omitted:
+        if image.copy_of is not None:
+            replacements.setdefault(image.item, {})[image.part or 0] = str(
+                _WORDS[lang]["copy"](image.copy_of)
+            )
+            if image.close_tag is not None:
+                replacements[image.item][image.close_tag] = ""
+            for position in range((image.part or 0) + 1, (image.close_tag or image.part or 0) + 1):
+                replacements[image.item][position] = ""
+            continue
         twin = sent_content.get(image.content_id or "")
         text = _placeholder(image, lang)
         if twin is not None and twin.key != image.key:
@@ -863,10 +1050,26 @@ def _with_codex_image_context(request_kwargs: dict) -> Optional[dict]:
         for position in range(first + 1, last + 1):
             bucket[position] = ""
 
+    # Every image still sent states its id, so a placeholder that names one can
+    # be matched to the picture in front of the model.  This is an *insertion*
+    # before the image, never a replacement: an upload with no Codex tag around
+    # it would otherwise be swapped for the label and the image would vanish.
+    # Only the mutable suffix may change, so a frozen image stays byte-identical.
+    omitted_keys_all = {image.key for image in omitted}
+    labels: Dict[int, Dict[int, str]] = {}
+    for image in images:
+        if image.key in omitted_keys_all or image.item < mutable_from:
+            continue
+        if image.part is None:
+            continue
+        at = image.open_tag if image.open_tag is not None else image.part
+        labels.setdefault(image.item, {}).setdefault(at, _included_label(image, lang))
+
     rewritten: List[Any] = []
     for index, item in enumerate(input_items):
         bucket = replacements.get(index)
-        if not bucket or not isinstance(item, dict):
+        inserts = labels.get(index)
+        if (not bucket and not inserts) or not isinstance(item, dict):
             rewritten.append(item)
             continue
         field = "content" if item.get("type") == "message" else "output"
@@ -876,10 +1079,13 @@ def _with_codex_image_context(request_kwargs: dict) -> Optional[dict]:
             continue
         next_parts: List[Any] = []
         for position, part in enumerate(parts):
-            if position not in bucket:
+            label = (inserts or {}).get(position)
+            if label is not None:
+                next_parts.append({"type": "input_text", "text": label})
+            if position not in (bucket or {}):
                 next_parts.append(part)
                 continue
-            text = bucket[position]
+            text = (bucket or {})[position]
             if not text:
                 continue
             next_parts.append({"type": "input_text", "text": text})
@@ -898,7 +1104,15 @@ def _with_codex_image_context(request_kwargs: dict) -> Optional[dict]:
     ):
         note_at -= 1
     words = _WORDS[lang]
-    note = words["auto_note"] if automatic else words["manual_note"]
+    fetchable = fetch_available()
+    if automatic and fetchable:
+        note = words["auto_note"]
+    elif automatic:
+        # Omitted by this pass with no tool to fetch them back: the model has to
+        # ask the user, so the note must say that instead of naming a tool.
+        note = words["auto_ask_note"]
+    else:
+        note = words["manual_note"]
     rewritten.insert(
         note_at,
         {

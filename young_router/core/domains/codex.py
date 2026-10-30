@@ -428,6 +428,7 @@ def image_context_mcp_patch(
     *,
     enabled: bool,
     python: str,
+    python_path: str = "",
 ) -> dict[str, Any]:
     """The patch that adds or removes the fetch server without touching others.
 
@@ -447,18 +448,20 @@ def image_context_mcp_patch(
         if str(item.get("id")) != IMAGE_CONTEXT_SERVER_ID
     ]
     if enabled:
-        return {
-            "mcp_servers": [
-                {
-                    "id": IMAGE_CONTEXT_SERVER_ID,
-                    "command": python,
-                    "args": list(IMAGE_CONTEXT_SERVER_ARGS),
-                    "transport": "stdio",
-                    "required": False,
-                },
-                *retained,
-            ]
+        entry: dict[str, Any] = {
+            "id": IMAGE_CONTEXT_SERVER_ID,
+            "command": python,
+            "args": list(IMAGE_CONTEXT_SERVER_ARGS),
+            "transport": "stdio",
+            "required": False,
         }
+        if python_path:
+            # The client starts this server itself, without this app's launcher,
+            # so the one thing the launcher would have exported has to travel in
+            # the entry: a bare ``-m young_router…`` cannot find the package
+            # otherwise, and the tool would fail to start in every session.
+            entry["env"] = {"PYTHONPATH": python_path}
+        return {"mcp_servers": [entry, *retained]}
     if not image_context_mcp_registered(config):
         return {}
     return {"mcp_servers": retained}
@@ -477,6 +480,25 @@ def _mcp_server_entries(config: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes, bytearray)):
         return [item for item in raw if isinstance(item, Mapping) and item.get("id")]
     return []
+
+
+def _image_context_python_path() -> str:
+    """The import path the client's own process must carry for the tool.
+
+    A bundled Core runs from ``Contents/Resources/Core`` with its dependencies
+    in ``runtime/site-packages``; nothing puts either on a child's path unless
+    the launcher does, and this child is started by the client instead.
+    """
+
+    roots: list[str] = []
+    for entry in sys.path:
+        if not entry:
+            continue
+        normalised = str(entry).rstrip("/")
+        if normalised.endswith("site-packages") or normalised.endswith("Resources/Core"):
+            if normalised not in roots:
+                roots.append(normalised)
+    return os.pathsep.join(roots)
 
 
 def image_context_settings() -> dict[str, Any]:
@@ -1446,6 +1468,7 @@ class CodexSettingsDomain:
                 structured,
                 enabled=enabled_value,
                 python=str(data.get("python") or sys.executable or "python3"),
+                python_path=str(data.get("python_path") or ""),
             )
             if patch:
                 self._draft = self._sync(config_text, auth_text, patch)
@@ -1793,6 +1816,7 @@ class CodexSettingsDomain:
             structured,
             enabled=enabled_now,
             python=str(_sys.executable or "python3"),
+            python_path=_image_context_python_path(),
         )
         if not patch:
             return False

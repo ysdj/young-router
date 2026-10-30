@@ -8,6 +8,7 @@ const categories: Record<string, string> = {
   "Web Search": "网页搜索",
   "Vision Router": "视觉路由",
   "Model Context": "模型上下文",
+  "Codex Images": "Codex 图片上下文",
   "Fallback": "故障转移",
   "MCP": "MCP",
   "Logs": "日志",
@@ -84,9 +85,10 @@ const zh: Record<string, RuntimeCopy> = {
   YOUNG_ROUTER_IMAGE_TOOL_UNSUPPORTED_TTL_SECONDS: { label: "图像工具不支持记忆", help: "某部署明确拒绝 image_generation 工具后，在此时长内跳过它。参数错误、超时、策略拒绝和其他上游错误不会写入该记忆；设为 0 可关闭跨请求记忆。" },
   YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_ENABLED: { label: "Codex 图片上下文", help: "只让真正还有用的图进入请求：这一轮的图照常发送，之前各轮的图换成一行占位符（编号、轮次、尺寸），模型需要重看时用 view_image_by_id 按编号取回。占位符措辞、IMG-xxxx 编号和选图文件都沿用 Context Attachment Manager，因此在那个面板里做的勾选在这里同样生效；但不会使用它的代理，Codex 始终指向本代理。只改写重放中可变的尾部，签名历史不动，缓存不受影响。默认关闭：关闭时请求原样送达上游。" },
   YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_MODE: { label: "图片上下文模式", help: "自动：默认省略之前各轮的图，这是长图片任务保持流畅的关键。手动：只有你在 Context Attachment Manager 面板里取消勾选的图才被替换，其余照常发送。" },
+  YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_FETCH: { label: "取图方式", help: "模型怎么取回被省略的图。自动：在本应用配置的客户端里登记工具；在没有客户端配置的机器上（服务器上的网关）改为自己提供 HTTP 端点。本地：只登记客户端条目。HTTP：只在 POST /mcp 提供端点，用代理密钥认证。关闭：不承诺任何工具，占位符改为请用户重发。占位符绝不能提到一个不存在的工具。" },
   YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_KEEP_RECENT: { label: "保留最近轮数", help: "自动模式下，最近多少轮的图仍以内联原图发送。0 表示之前各轮全部省略，这是 Context Attachment Manager 的默认做法，也是反复修改同一张图的任务想要的。" },
-  YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_MIN_BYTES: { label: "图片上下文阈值", help: "之前各轮中，小于该字节数的图保持内联：占位符加之后一次取回的开销比省下的字节更大。0 表示所有历史图都参与处理。" },
-  YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_DATA_DIR: { label: "图片上下文目录", help: "Context Attachment Manager 存放选图文件的目录。留空依次读取 CAM_DATA_DIR 和该平台下该插件的默认目录。如果你改过 CAM_DATA_DIR，把这里指到同一个目录。" },
+  YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_MIN_BYTES: { label: "忽略小于", help: "之前各轮中，小于该字节数的图保持内联：占位符加之后一次取回的开销比省下的字节更大。0 表示所有历史图都参与处理。" },
+  YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_DATA_DIR: { label: "选图目录", help: "Context Attachment Manager 存放选图文件的目录。留空依次读取 CAM_DATA_DIR 和该平台下该插件的默认目录。如果你改过 CAM_DATA_DIR，把这里指到同一个目录。" },
   YOUNG_ROUTER_MCP_AUTO_APPROVE: { label: "自动同意 MCP 工具", help: "启用后将 Responses API 的 MCP 工具设置为 require_approval=never，使上游服务不再暂停等待交互式批准。默认关闭，因为这会绕过 MCP 安全审核。" },
   YOUNG_ROUTER_LOG_MAX_BYTES: { label: "本地日志文件上限", help: "本地日志单个文件的容量上限，包括最近请求、服务标准输出 / 错误和状态项操作。轮转时按设定的备份段数保留 .1..N 旧末尾内容。" },
   YOUNG_ROUTER_LOG_BACKUP_SEGMENTS: { label: "日志备份段数", help: "本地日志轮转时保留的历史末尾段数（.1..N）。设为 1 时只保留紧接着的上一段；当前文件始终保留。" },
@@ -108,13 +110,15 @@ const zh: Record<string, RuntimeCopy> = {
 };
 
 const options: Record<string, Record<string, string>> = {
-  "*": { on: "开启", auto: "自动", manual: "手动", local: "本地", api: "API", off: "关闭", error: "直接报错", recovery: "恢复", recovery_cooldown: "恢复并冷却" },
+  "*": { on: "开启", auto: "自动", manual: "手动", stdio: "本地客户端", http: "HTTP 端点", local: "本地", api: "API", off: "关闭", error: "直接报错", recovery: "恢复", recovery_cooldown: "恢复并冷却" },
 };
 const englishOptions: Record<string, string> = {
   on: "On",
   off: "Off",
   auto: "Auto",
   manual: "Manual",
+  stdio: "Local client",
+  http: "HTTP endpoint",
   local: "Local",
   api: "API",
   error: "Error",

@@ -26,6 +26,10 @@ import time
 from typing import Any, Dict, List, Optional
 
 REPLAY_CACHE_DIR_ENV = "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_CACHE_DIR"
+# This app's own state, never the plugin's: a gateway deployed on a server has
+# no attachment manager installed and no business writing into one's folders.
+RUNTIME_ROOT_ENV = "LITELLM_RUNTIME_ROOT"
+RUNTIME_ROOT_FALLBACK_ENV = "YOUNG_ROUTER_HOME"
 # A task the user has not touched for a day cannot produce a turn that asks for
 # one of its images, and Codex's own session list keeps nothing alive that long.
 REPLAY_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
@@ -33,13 +37,26 @@ REPLAY_CACHE_MAX_TASKS = 32
 
 
 def cache_dir(environ: Optional[Dict[str, str]] = None) -> str:
-    from . import image_context as _image_context_module
+    """Where this app keeps the replays the fetch tool answers from.
+
+    Its own directory, under this installation's runtime root: the attachment
+    manager's data folder is a desktop plugin's, and a gateway on a server has
+    neither the plugin nor a reason to write there.
+    """
 
     env = os.environ if environ is None else environ
     configured = str(env.get(REPLAY_CACHE_DIR_ENV) or "").strip()
     if configured:
         return os.path.expanduser(configured)
-    return os.path.join(_image_context_module.data_dir(env), "young-router-replays")
+    root = (
+        str(env.get(RUNTIME_ROOT_ENV) or "").strip()
+        or str(env.get(RUNTIME_ROOT_FALLBACK_ENV) or "").strip()
+    )
+    base = os.path.expanduser(root) if root else os.path.join(
+        os.path.expanduser(str(env.get("HOME") or env.get("USERPROFILE") or "~")),
+        ".young-router",
+    )
+    return os.path.join(base, "image-context", "replays")
 
 
 def _path_for(thread_id: str, environ: Optional[Dict[str, str]] = None) -> str:
@@ -156,12 +173,33 @@ def image_data_url(
     image_id: str,
     environ: Optional[Dict[str, str]] = None,
 ) -> Optional[tuple]:
-    """``(mime, data_url)`` for one stored id, or ``None`` when it is gone."""
+    """``(mime, data_url)`` for one stored id, or ``None`` when it is gone.
+
+    The task is one lookup key, not a requirement: a client starts this tool
+    without telling it which task the model is in (Codex passes a task id to its
+    own tools, not to an MCP server's), so an id that the named task cannot
+    answer is looked for in the most recent replays.  ``IMG-0004`` names one
+    image of one task, and a hit in the newest replay that carries it is the
+    task the model is asking about.
+    """
 
     wanted = str(image_id or "").strip().upper()
     if not wanted:
         return None
-    for image in load(thread_id, environ):
+    answer = _lookup(load(thread_id, environ), wanted)
+    if answer is not None:
+        return answer
+    for candidate in _recent_threads(environ):
+        if candidate == _safe_thread_id(thread_id):
+            continue
+        answer = _lookup(load(candidate, environ), wanted)
+        if answer is not None:
+            return answer
+    return None
+
+
+def _lookup(images: List[Dict[str, Any]], wanted: str) -> Optional[tuple]:
+    for image in images:
         if str(image.get("id") or "").upper() != wanted:
             continue
         mime = image.get("mime")
@@ -170,6 +208,25 @@ def image_data_url(
             return None
         return mime, f"data:{mime};base64,{encoded}"
     return None
+
+
+def _recent_threads(environ: Optional[Dict[str, str]] = None) -> List[str]:
+    """Stored task ids, newest first."""
+
+    root = cache_dir(environ)
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return []
+    entries: List[tuple] = []
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        try:
+            entries.append((os.path.getmtime(os.path.join(root, name)), name[: -len(".json")]))
+        except OSError:
+            continue
+    return [name for _, name in sorted(entries, reverse=True)[:REPLAY_CACHE_MAX_TASKS]]
 
 
 def known_ids(thread_id: Any, environ: Optional[Dict[str, str]] = None) -> List[str]:

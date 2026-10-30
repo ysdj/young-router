@@ -1051,6 +1051,13 @@ def structured_config(config: dict[str, Any], auth: dict[str, Any]) -> dict[str,
                 ]
                 if isinstance(server.get("args"), list)
                 else [],
+                "env": {
+                    str(name): str(value)
+                    for name, value in (server.get("env") or {}).items()
+                    if isinstance(name, str) and isinstance(value, str)
+                }
+                if isinstance(server.get("env"), dict)
+                else {},
             }
         )
     structured["mcp_servers"] = mcp_servers
@@ -1380,6 +1387,17 @@ def _apply_mcp_patch(text: str, value: object) -> str:
         for key in ("command", "url", "bearer_token_env_var"):
             if key in item:
                 text = _patch_optional_string(text, path, key, item[key])
+        if "env" in item:
+            env = item["env"]
+            if env is None:
+                text = remove_table_value(text, path, "env")
+            elif isinstance(env, dict) and all(
+                isinstance(name, str) and isinstance(value, str)
+                for name, value in env.items()
+            ):
+                text = set_table_value(text, path, "env", env)
+            else:
+                raise EditorError("mcp server env must be a table of strings or null")
         if "args" in item:
             args = item["args"]
             if args is None:
