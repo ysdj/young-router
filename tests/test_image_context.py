@@ -341,6 +341,25 @@ class ImageContextRewriteTests(_ImageContextCase):
         ][0]
         self.assertIn("IMG-0001", replaced["content"][1]["text"])
 
+    def test_the_task_id_is_read_from_the_clients_turn_metadata(self) -> None:
+        # Codex carries the task id only inside this JSON header; without it the
+        # pass has nowhere to file the replay the fetch tool answers from.
+        metadata = json.dumps({"thread_id": "aaaa", "turn_id": "t1"})
+
+        self.assertEqual(
+            image_context_module._thread_id(
+                {"proxy_server_request": {"headers": {"x-codex-turn-metadata": metadata}}}
+            ),
+            "aaaa",
+        )
+        self.assertEqual(
+            image_context_module._thread_id(
+                {"litellm_metadata": {"X-Codex-Turn-Metadata": metadata}}
+            ),
+            "aaaa",
+        )
+        self.assertIsNone(image_context_module._thread_id({}))
+
     def test_a_pinned_id_is_sent_in_auto_mode(self) -> None:
         thread = "11111111-2222-3333-4444-777777777777"
         self.selection(
