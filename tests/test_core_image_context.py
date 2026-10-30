@@ -78,9 +78,12 @@ class ImageContextDomainTests(unittest.TestCase):
         self.assertEqual([image["id"] for image in snapshot["task"]["images"]], ["IMG-0002", "IMG-0001"])
 
     def test_unticking_an_image_writes_the_selection_the_pass_reads(self) -> None:
+        # Manual selection: here a tick is the plain send/don't-send.
+        self.domain.dispatch("auto", {"task": "task-one", "enabled": False})
         self.domain.dispatch("set", {"task": "task-one", "id": "IMG-0001", "included": False})
 
         state = self.domain.snapshot()["task"]
+        # Manual mode, because the unticked image is what decides sending here.
         self.assertEqual(state["next"], {"sent": 1, "omitted": 1})
         written = json.loads(
             (Path(self.environment["YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_DATA_DIR"]) / "selection" / "task-one.json").read_text()
@@ -91,6 +94,22 @@ class ImageContextDomainTests(unittest.TestCase):
         # Ticking it again clears the entry rather than leaving a second state.
         self.domain.dispatch("set", {"task": "task-one", "id": "IMG-0001", "included": True})
         self.assertEqual(self.domain.snapshot()["task"]["next"], {"sent": 2, "omitted": 0})
+
+    def test_in_auto_mode_a_tick_pins_the_image_instead(self) -> None:
+        # Automatic selection omits earlier turns by itself, so the checkbox has
+        # to mean "every turn" there -- clearing an unchecked entry would change
+        # nothing that a person could see.
+        self.domain.dispatch("auto", {"task": "task-one", "enabled": True})
+        self.domain.dispatch("pin", {"task": "task-one", "id": "IMG-0002", "pinned": True})
+
+        state = self.domain.snapshot()["task"]
+        self.assertEqual(state["next"], {"sent": 1, "omitted": 1})
+        self.assertEqual([row["id"] for row in state["images"] if row["pinned"]], ["IMG-0002"])
+        written = json.loads(
+            (Path(self.environment["YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_DATA_DIR"]) / "selection" / "task-one.json").read_text()
+        )
+        self.assertIn("IMG-0002", written["pinned"])
+        self.assertTrue(written["auto"])
 
     def test_automatic_selection_is_per_task_and_survives_a_reload(self) -> None:
         self.domain.dispatch("auto", {"task": "task-one", "enabled": False})

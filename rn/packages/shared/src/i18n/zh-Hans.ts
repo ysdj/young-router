@@ -380,6 +380,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "imageContext.next": "下一轮：发送 {sent} 张，省略 {omitted} 张",
   "imageContext.preview": "预览",
   "imageContext.send": "发送",
+  "imageContext.everyTurn": "每轮都发",
   "imageContext.noPreview": "这张图太大，这里不预览；仍可按编号取回。",
   "imageContext.environment": "模式 {mode} · 取图 {fetch}",
   "runtime.invalidNumber": "请输入数字",

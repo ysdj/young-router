@@ -143,10 +143,20 @@ class ImageContextDomain:
             "images": rows,
             # What the next turn will actually do, stated as a number so the
             # panel never has to re-implement the pass's own rule.
-            "next": {
-                "sent": sum(1 for row in rows if row["pinned"] or not row["unchecked"]),
-                "omitted": sum(1 for row in rows if row["unchecked"] and not row["pinned"]),
-            },
+            "next": (
+                {
+                    # Automatic selection omits every earlier turn: only a
+                    # pinned image is guaranteed a place in the next request,
+                    # and this turn's own images are not in the replay yet.
+                    "sent": sum(1 for row in rows if row["pinned"]),
+                    "omitted": sum(1 for row in rows if not row["pinned"]),
+                }
+                if (auto if isinstance(auto, bool) else _image_context.mode(self._env()) == "auto")
+                else {
+                    "sent": sum(1 for row in rows if not row["unchecked"]),
+                    "omitted": sum(1 for row in rows if row["unchecked"]),
+                }
+            ),
             "environment": self.environment(),
         }
 
@@ -191,6 +201,13 @@ class ImageContextDomain:
             if not isinstance(included, bool):
                 raise DomainError("An image selection must be on or off")
             self._write_selection(task_id, image_id, included=included)
+        elif name in {"pin", "set_pinned"}:
+            task_id = str(data.get("task") or "").strip()
+            image_id = str(data.get("id") or "").strip()
+            pinned = data.get("pinned")
+            if not isinstance(pinned, bool):
+                raise DomainError("An image pin must be on or off")
+            self._write_pin(task_id, image_id, pinned=pinned)
         elif name in {"auto", "set_auto"}:
             task_id = str(data.get("task") or "").strip()
             enabled = data.get("enabled")
@@ -264,6 +281,26 @@ class ImageContextDomain:
         if not included:
             selection["unchecked"][image_id] = {"id": image_id, "at": _now()}
             selection["pinned"].pop(image_id, None)
+        self._write(task_id, selection)
+
+    def _write_pin(self, task_id: str, image_id: str, *, pinned: bool) -> None:
+        """Pin an image: with automatic selection on, this is what "send" means.
+
+        Automatic selection omits everything from earlier turns by itself, so a
+        checkbox that only cleared an "unchecked" entry would have no visible
+        effect.  Pinning is the same word the attachment manager's panel uses for
+        "every turn", and it is the one the pass reads for that purpose.
+        """
+
+        task_id = self._require_task(task_id)
+        known = {str(image.get("id")) for image in _store.load(task_id, self._env())}
+        if image_id not in known:
+            raise DomainError(f"{image_id} is not an image of this task")
+        selection = self._selection(task_id)
+        selection["pinned"].pop(image_id, None)
+        if pinned:
+            selection["pinned"][image_id] = {"id": image_id, "at": _now()}
+            selection["unchecked"].pop(image_id, None)
         self._write(task_id, selection)
 
     def _write_auto(self, task_id: str, enabled: bool) -> None:

@@ -392,6 +392,7 @@ export type TranslationKey =
   | "imageContext.next"
   | "imageContext.preview"
   | "imageContext.send"
+  | "imageContext.everyTurn"
   | "imageContext.noPreview"
   | "imageContext.environment"
   | "runtime.invalidNumber"

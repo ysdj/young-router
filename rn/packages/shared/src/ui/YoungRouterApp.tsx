@@ -660,6 +660,9 @@ const SETTINGS_DISK_POLL_MS = 5_000;
 // last edit so the runtime picks it up without an explicit Apply button. The
 // short debounce coalesces rapid toggles into one Core apply.
 const IMMEDIATE_APPLY_DEBOUNCE_MS = 500;
+// Text fields use the same quiet-period behavior as VS Code's autosave: the
+// field stays responsive locally, then one settled value is staged and applied.
+const TEXT_INPUT_COMMIT_DEBOUNCE_MS = 500;
 const LOG_VIEW_POLL_MS = 5_000;
 const REQUEST_LOG_POLL_MS = 1_000;
 const RECOVERY_LOG_POLL_MS = 1_000;
@@ -9121,7 +9124,14 @@ function ImageContextPanel({ snapshot, busy, translate, dispatch }: { snapshot?:
     return <View style={styles.runtimeField}><Text style={styles.externalSettingsHelpText}>{translate("imageContext.empty")}</Text></View>;
   }
   const selectedTaskId = stringValue(asRecord(task.task).id) || stringValue(tasks[0].id);
-  const setIncluded = (id: string, included: boolean): void => { void dispatch("set", { task: selectedTaskId, id, included }, "image_context"); };
+  // A tick means two different things, because automatic selection does two
+  // different things: with it on, earlier turns are omitted by the pass itself,
+  // so a tick can only mean "send this every turn" (pinned).  With it off, the
+  // tick is the plain send/don't-send the attachment manager's panel uses.
+  const automatic = booleanValue(task.auto);
+  const setIncluded = (id: string, included: boolean): void => {
+    void dispatch(automatic ? "pin" : "set", automatic ? { task: selectedTaskId, id, pinned: included } : { task: selectedTaskId, id, included }, "image_context");
+  };
   return <View style={styles.runtimeField}>
     <View style={styles.runtimeImageTools}>
       <View style={styles.runtimeImageTasks}>{tasks.map((entry) => {
@@ -9141,12 +9151,12 @@ function ImageContextPanel({ snapshot, busy, translate, dispatch }: { snapshot?:
     <Text style={styles.externalSettingsHelpText}>{translate("imageContext.next", { sent: String(numberValue(asRecord(task.next).sent, 0)), omitted: String(numberValue(asRecord(task.next).omitted, 0)) })}</Text>
     <View style={styles.runtimeImageGrid}>{images.map((image) => {
       const id = stringValue(image.id);
-      const included = !booleanValue(image.unchecked) || booleanValue(image.pinned);
+      const included = booleanValue(task.auto) ? booleanValue(image.pinned) : !booleanValue(image.unchecked);
       return <View key={id} style={styles.runtimeImageCell}>
         <ActionButton title={translate("imageContext.preview")} titleWidth="auto" disabled={busy} onPress={() => { void dispatch("preview", { task: selectedTaskId, id }, "image_context"); }} />
         <Text numberOfLines={1} style={styles.runtimeImageCellLabel}>{id}</Text>
         <Text numberOfLines={1} style={styles.externalSettingsHelpText}>{`${numberValue(image.width, 0)}×${numberValue(image.height, 0)}`}</Text>
-        <NativeCheckbox label={translate("imageContext.send")} value={included} disabled={busy} onValueChange={(next) => setIncluded(id, next)} />
+        <NativeCheckbox label={translate(booleanValue(task.auto) ? "imageContext.everyTurn" : "imageContext.send")} value={included} disabled={busy} onValueChange={(next) => setIncluded(id, next)} />
       </View>;
     })}</View>
     {preview.data_url ? <View style={styles.runtimeImagePreviewSurface}>
@@ -9469,11 +9479,9 @@ type PendingTextFieldState = {
   hasError: () => boolean;
 };
 
-// Keep ordinary text local across every settings surface while typing. Blur,
-// submit, and Apply are the only commit points, so active typing never waits
-// for a Core dispatch or a full snapshot publication. A validator runs at the
-// commit point only: an invalid draft stays local, keeps the row dirty, and
-// surfaces an inline error instead of being written to Core.
+// Ordinary text keeps its draft local for the short autosave quiet period,
+// then commits without requiring a blur or an explicit Apply. Blur, submit and
+// the shell's close/navigation flush remain immediate fallback commit points.
 function usePendingTextField(value: string, onCommit: (next: string) => void | Promise<void>, label: string, onDraftChange?: (next: string) => void, validate?: (next: string) => string | undefined): PendingTextFieldState {
   const [draft, setDraft] = useState(value);
   const [error, setError] = useState<string>();
@@ -9485,6 +9493,7 @@ function usePendingTextField(value: string, onCommit: (next: string) => void | P
   const dirtyRef = useRef(false);
   const errorRef = useRef<string | undefined>(undefined);
   const commitInFlight = useRef<Promise<void> | undefined>(undefined);
+  const commitTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const onCommitRef = useRef(onCommit);
   const onDraftChangeRef = useRef(onDraftChange);
   const validateRef = useRef(validate);
@@ -9513,6 +9522,10 @@ function usePendingTextField(value: string, onCommit: (next: string) => void | P
   }, [registry]);
 
   const commit = useCallback(async (): Promise<void> => {
+    if (commitTimer.current !== undefined) {
+      clearTimeout(commitTimer.current);
+      commitTimer.current = undefined;
+    }
     while (dirtyRef.current) {
       const existing = commitInFlight.current;
       if (existing) {
@@ -9550,10 +9563,22 @@ function usePendingTextField(value: string, onCommit: (next: string) => void | P
     if (errorRef.current !== undefined) setFieldError(undefined);
     // If an earlier staged value is still in flight, returning to the last
     // known draft still needs one more stage after that write finishes.
-    setDirty(next !== committedRef.current || commitInFlight.current !== undefined);
-  }, [setDirty, setFieldError]);
+    const dirty = next !== committedRef.current || commitInFlight.current !== undefined;
+    setDirty(dirty);
+    if (commitTimer.current !== undefined) clearTimeout(commitTimer.current);
+    if (dirty) {
+      commitTimer.current = setTimeout(() => {
+        commitTimer.current = undefined;
+        void commit().catch(() => undefined);
+      }, TEXT_INPUT_COMMIT_DEBOUNCE_MS);
+    }
+  }, [commit, setDirty, setFieldError]);
 
   const reset = useCallback((): void => {
+    if (commitTimer.current !== undefined) {
+      clearTimeout(commitTimer.current);
+      commitTimer.current = undefined;
+    }
     const next = valueRef.current;
     committedRef.current = next;
     draftRef.current = next;
@@ -9566,6 +9591,10 @@ function usePendingTextField(value: string, onCommit: (next: string) => void | P
   // Reset-to-default must clear an uncommitted local draft too, otherwise the
   // field keeps showing the old value after the Core value returns to default.
   const resetTo = useCallback((next: string): void => {
+    if (commitTimer.current !== undefined) {
+      clearTimeout(commitTimer.current);
+      commitTimer.current = undefined;
+    }
     committedRef.current = next;
     draftRef.current = next;
     setDraft(next);
@@ -9573,6 +9602,12 @@ function usePendingTextField(value: string, onCommit: (next: string) => void | P
     setFieldError(undefined);
     setDirty(false);
   }, [setDirty, setFieldError]);
+
+  useEffect(() => {
+    return () => {
+      if (commitTimer.current !== undefined) clearTimeout(commitTimer.current);
+    };
+  }, []);
 
   useEffect(() => {
     registry?.register(fieldId.current, { commit, reset, isDirty: () => dirtyRef.current, hasError: () => errorRef.current !== undefined, flushBeforeAssistantEditor: true });

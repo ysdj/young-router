@@ -378,6 +378,7 @@ export const en: Record<TranslationKey, string> = {
   "imageContext.next": "Next turn: {sent} sent, {omitted} omitted",
   "imageContext.preview": "Preview",
   "imageContext.send": "Send",
+  "imageContext.everyTurn": "Every turn",
   "imageContext.noPreview": "This image is too large to preview here; it can still be fetched by its id.",
   "imageContext.environment": "Mode {mode} · fetch {fetch}",
   "runtime.invalidNumber": "Enter a number",
