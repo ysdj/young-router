@@ -47,7 +47,8 @@ export type ConfigDomain =
   | "webdav"
   | "logs"
   | "language"
-  | "relay_accounts";
+  | "relay_accounts"
+  | "image_context";
 
 export type LanguagePreference = "system" | "en" | "zh-Hans";
 

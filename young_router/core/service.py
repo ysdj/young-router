@@ -113,6 +113,8 @@ _DOMAIN_ALIASES = {
     "relay_accounts": "relay_accounts",
     "language": "language",
     "logs": "logs",
+    "image-context": "image_context",
+    "image_context": "image_context",
 }
 
 SERVICE_STATES = frozenset({"starting", "running", "unhealthy", "stopped", "unknown"})
@@ -153,6 +155,8 @@ def _default_domain_state(name: str) -> dict[str, Any]:
         return {"tabs": list(LOG_TABS), "revision": 0}
     if name == "codex":
         return {"config_exists": False, "auth_file_exists": False, "revision": 0}
+    if name == "image_context":
+        return {"tasks": [], "environment": {}, "revision": 0}
     return {"revision": 0}
 
 
@@ -1060,6 +1064,7 @@ class CoreStore:
         from .domains.clients import ClientSettingsDomain
         from .domains.codex import CodexSettingsDomain
         from .domains.language import LanguageSettingsDomain
+        from .domains.image_context import ImageContextDomain
         from .domains.logs import LogsDomain
         from .domains.providers_models import ProvidersModelsDomain
         from .domains.relay_accounts import RelayAccountsDomain
@@ -1201,6 +1206,15 @@ class CoreStore:
             adapters.append(clients_factory())
         except Exception:
             adapters.append(RecoverableDomain("clients", clients_factory))
+        # The image-context panel reads this app's own replay cache and writes
+        # one task's selection file; it owns no document a user edits.
+        image_context_factory: Callable[[], DomainAdapter] = lambda: ImageContextDomain()
+        adapter_factories = [image_context_factory]
+        for factory in adapter_factories:
+            try:
+                adapters.append(factory())
+            except Exception:
+                adapters.append(RecoverableDomain("image_context", factory))
         language_factory: Callable[[], DomainAdapter] = lambda: LanguageSettingsDomain(language_path)
         try:
             adapters.append(language_factory())

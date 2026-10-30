@@ -3341,7 +3341,7 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
     {settingsRoute ? <AssistantSettingsWorkspace busy={busy} native={native} codexModels={codexModelRows} codexModelCatalogEnabled={codexModelCatalogEnabled} standaloneSearch={codexStandaloneSearch} onToggleStandaloneSearch={(enabled) => dispatch("codex.search.set", { enabled }, "codex")} codexFeatures={(domainState(snapshot, "codex").structured as UnknownRecord | undefined)?.features as UnknownRecord | undefined} clientProvider={codexClientProvider} clientModel={codexClientModel} localApiActive={codexUsesLocalApi} onToggleCodexModelCatalog={(enabled) => dispatch("codex.model_catalog.set", { enabled }, "codex")} onToggleCodexFeature={(feature, enabled) => dispatch("codex.feature.set", { feature, enabled }, "codex")} onUseLocalApi={(selection) => dispatch("use_local_api", selection, "codex")} onUseSavedModel={(selection) => dispatch("use_saved_model", selection, "codex")} translate={translate} ipc={ipc} filesToken={settingsRawBaselineToken} onOpenFile={openAssistantFile} /> : null}
     {route === "logs" ? <LogsWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} translate={translate} dispatch={dispatch} onStatus={setResult} onStatusBar={setStatusBarControls} requestedTab={nativeAction?.id === "open-recovery" ? "recovery" : logTabRequest} requestedTabKey={nativeAction?.sequence ?? 0} /> : null}
     {route === "general-settings" ? <GeneralWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} dispatch={dispatch} dispatchServiceAction={enqueueServiceDispatch} translate={translate} onStatus={setResult} onSnapshot={onSnapshot} /> : null}
-    {route === "runtime-settings" ? <RuntimeWorkspace snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} clearSecret={clearSecret} /> : null}
+    {route === "runtime-settings" ? <RuntimeWorkspace snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} clearSecret={clearSecret} native={native} /> : null}
     {route === "data-management" ? <DataManagementWorkspace snapshot={snapshot} tab={dataManagementTab} onTabChange={setDataManagementTab} statuses={dataManagementStatuses} busy={busy} webDavOperationBusy={webDavOperationBusy} translate={translate} dispatch={dispatchDataManagement} onSecretState={onSecretState} onFlushPendingFields={flushPendingFields} onTabSwitchError={(tab, reason) => setDataManagementStatuses((current) => ({ ...current, [tab]: errorMessage(reason, translate) }))} onInspectImport={inspectImportDataManagement} onImport={importDataManagement} onConfirmImportReplace={confirmImportDraftReplacement} onExport={exportDataManagement} onProbeWebDav={probeWebDav} onSyncWebDav={syncWebDav} onCommitWebDavSettings={commitWebDavSettings} /> : null}
     </View> : null}
     {/* One permanent status strip per settings window: the last result replaces
@@ -9056,7 +9056,10 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
   </PersistentScrollView>;
 }
 
-function RuntimeWorkspace({ snapshot, busy, translate, dispatch, onSecretState, clearSecret }: { snapshot?: CoreSnapshot; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; clearSecret: NativeSecretClear }): React.JSX.Element {
+/** The runtime category whose surface is the image-context panel. */
+const IMAGE_CONTEXT_CATEGORY = "Codex Images";
+
+function RuntimeWorkspace({ snapshot, busy, translate, dispatch, onSecretState, clearSecret, native }: { snapshot?: CoreSnapshot; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; clearSecret: NativeSecretClear; native: NativeLeafAdapter }): React.JSX.Element {
   const state = domainState(snapshot, "runtime");
   const allSettings = asRecords(state.settings).length > 0 ? asRecords(state.settings) : asRecords(state.categories).flatMap((category) => asRecords(category.settings));
   // Settings owned by the General pane (for example the proxy port) stay in
@@ -9086,10 +9089,66 @@ function RuntimeWorkspace({ snapshot, busy, translate, dispatch, onSecretState, 
         {/* The surface is keyed by its category, so a switch starts at the top of
             the new category instead of inheriting the previous scroll offset. */}
         <PersistentScrollView key={selectedCategory} style={styles.runtimeScrollSurface} contentContainerStyle={styles.runtimeWorkspace}>
-          {selectedCategory === "" ? <EmptyState translate={translate} /> : <View style={styles.runtimeFieldList}>{(groups[selectedCategory] ?? []).map((item) => <RuntimeField key={identifier(item)} item={item} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} clearSecret={clearSecret} dshSyncToken={dshSyncToken} />)}</View>}
+          {selectedCategory === "" ? <EmptyState translate={translate} /> : <View style={styles.runtimeFieldList}>{(groups[selectedCategory] ?? []).map((item) => <RuntimeField key={identifier(item)} item={item} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} clearSecret={clearSecret} dshSyncToken={dshSyncToken} />)}
+            {selectedCategory === IMAGE_CONTEXT_CATEGORY ? <ImageContextPanel snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} /> : null}
+          </View>}
         </PersistentScrollView>
       </View>
     </View>
+  </View>;
+}
+
+/**
+ * A task's images, and which of them go out with its next turn.
+ *
+ * The pass decides that from one file per task; this panel is how a person sees
+ * and changes that file without leaving the app. It reads the replay the fetch
+ * tool answers from -- so every thumbnail is the image the model would receive --
+ * and writes the same selection Context Attachment Manager writes, which is why
+ * a task curated in either place behaves the same.
+ */
+function ImageContextPanel({ snapshot, busy, translate, dispatch }: { snapshot?: CoreSnapshot; busy: boolean; translate: Translate; dispatch: Dispatch }): React.JSX.Element {
+  // Everything this panel shows travels in the image-context domain's snapshot:
+  // the task list, the open task's images and the preview being looked at.  The
+  // pane therefore renders from one revision, the way every other pane does.
+  const state = domainState(snapshot, "image_context");
+  const tasks = asRecords(state.tasks);
+  const environment = asRecord(state.environment);
+  const task = asRecord(state.task);
+  const images = asRecords(task.images);
+  const preview = asRecord(state.preview);
+  if (tasks.length === 0) {
+    return <View style={styles.runtimeField}><Text style={styles.externalSettingsHelpText}>{translate("imageContext.empty")}</Text></View>;
+  }
+  const selectedTaskId = stringValue(asRecord(task.task).id) || stringValue(tasks[0].id);
+  const setIncluded = (id: string, included: boolean): void => { void dispatch("set", { task: selectedTaskId, id, included }, "image_context"); };
+  return <View style={styles.runtimeField}>
+    <View style={styles.runtimeImageTools}>
+      <View style={styles.runtimeImageTasks}>{tasks.map((entry) => {
+        const id = stringValue(entry.id);
+        return <ActionButton key={id} title={id.length > 14 ? `${id.slice(0, 13)}…` : id} titleWidth="auto" disabled={busy} onPress={() => { void dispatch("open", { task: id }, "image_context"); }} />;
+      })}</View>
+      <NativeToggle accessibilityLabel={translate("imageContext.auto")} value={booleanValue(task.auto)} disabled={busy} onValueChange={(enabled) => { void dispatch("auto", { task: selectedTaskId, enabled }, "image_context"); }} style={styles.runtimeBooleanControl} />
+    </View>
+    <Text style={styles.externalSettingsHelpText}>{translate("imageContext.autoHint")}</Text>
+    <Text style={styles.externalSettingsHelpText}>{translate("imageContext.next", { sent: String(numberValue(asRecord(task.next).sent, 0)), omitted: String(numberValue(asRecord(task.next).omitted, 0)) })}</Text>
+    <View style={styles.runtimeImageGrid}>{images.map((image) => {
+      const id = stringValue(image.id);
+      const included = !booleanValue(image.unchecked) || booleanValue(image.pinned);
+      return <View key={id} style={styles.runtimeImageCell}>
+        <ActionButton title={translate("imageContext.preview")} titleWidth="auto" disabled={busy} onPress={() => { void dispatch("preview", { task: selectedTaskId, id }, "image_context"); }} />
+        <Text numberOfLines={1} style={styles.runtimeImageCellLabel}>{id}</Text>
+        <Text numberOfLines={1} style={styles.externalSettingsHelpText}>{`${numberValue(image.width, 0)}×${numberValue(image.height, 0)}`}</Text>
+        <NativeCheckbox label={translate("imageContext.send")} value={included} disabled={busy} onValueChange={(next) => setIncluded(id, next)} />
+      </View>;
+    })}</View>
+    {preview.data_url ? <View style={styles.runtimeImagePreviewSurface}>
+      <Text numberOfLines={1} style={styles.runtimeImageCellLabel}>{stringValue(preview.id)}</Text>
+      <Image source={{ uri: stringValue(preview.data_url) }} style={styles.runtimeImagePreview} />
+      <ActionButton title={translate("common.close")} titleWidth="auto" onPress={() => { void dispatch("close_preview", {}, "image_context"); }} />
+    </View> : null}
+    {stringValue(preview.id) && !preview.data_url ? <Text style={styles.externalSettingsHelpText}>{translate("imageContext.noPreview")}</Text> : null}
+    {stringValue(environment.mode) ? <Text style={styles.externalSettingsHelpText}>{translate("imageContext.environment", { mode: stringValue(environment.mode), fetch: stringValue(environment.fetch) })}</Text> : null}
   </View>;
 }
 
@@ -12465,6 +12524,13 @@ const assistantFileSurfaceStyles = StyleSheet.create({
 });
 
 const styles = StyleSheet.create({
+  runtimeImageTools: { flexDirection: "row", alignItems: "center", gap: 6, flexWrap: "wrap" },
+  runtimeImageTasks: { flex: 1, minWidth: 0, flexDirection: "row", gap: 4, flexWrap: "wrap" },
+  runtimeImageGrid: { flexDirection: "row", gap: 6, flexWrap: "wrap" },
+  runtimeImageCell: { width: 132, gap: 2, paddingVertical: 4 },
+  runtimeImageCellLabel: { color: systemColors.label, fontSize: UI_TIP_FONT_SIZE, fontWeight: "600" },
+  runtimeImagePreviewSurface: { gap: 4, paddingVertical: 6, alignItems: "flex-start" },
+  runtimeImagePreview: { width: 320, height: 240, resizeMode: "contain", backgroundColor: systemColors.textBackground },
   routeTraceWorkspace: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 6 },
   routeTraceRequestPane: { width: "31%", minWidth: 252, maxWidth: 360, minHeight: 0, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground },
   routeTraceRequestScroll: { flex: 1, minHeight: 0 },
