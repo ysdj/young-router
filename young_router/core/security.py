@@ -131,12 +131,28 @@ def _key_text(key: object) -> str:
         cached = _key_text_cache.get(key)
         if cached is not None:
             return cached
-        text = key.strip().lower().replace("-", "_")
+        text = _camel_case_to_underscores(key.strip()).lower().replace("-", "_")
         if len(_key_text_cache) >= _KEY_TEXT_CACHE_LIMIT:
             _key_text_cache.clear()
         _key_text_cache[key] = text
         return text
-    return str(key).strip().lower().replace("-", "_")
+    return _camel_case_to_underscores(str(key).strip()).lower().replace("-", "_")
+
+
+def _camel_case_to_underscores(value: str) -> str:
+    """Spell a camelCase name the way its snake_case sibling is spelled.
+
+    One key name reaches a snapshot in either spelling: a settings key is
+    ``YOUNG_ROUTER_..._MAX_TOKENS`` while the JSON document that carries the
+    same number uses ``maxTokens``.  Classifying those two differently made
+    ``maxTokens`` a credential and rewrote the whole stored document to
+    ``"maxTokens":configured`` in every snapshot.  Only a real camel boundary
+    is split, so an already-snake name is returned unchanged.
+    """
+
+    if "_" in value or not any(character.isupper() for character in value):
+        return value
+    return re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", value)
 
 
 # Key classification answers the same question for the same key name on every
@@ -197,9 +213,18 @@ def _token_quantity_key(text: str) -> bool:
     safe direction.
     """
 
-    if "token" not in text:
+    # The name may be written in either spelling: a platform setting uses
+    # snake case (``max_input_tokens``) while a JSON document this app stores
+    # uses camel case (``maxTokens``, ``tokenBudget``).  Splitting only on the
+    # underscore classified ``maxTokens`` as a credential, so the whole JSON
+    # document was rewritten to `"maxTokens":configured` inside every snapshot
+    # -- the document's own editor then opened on text that was not JSON.
+    if "token" not in text.lower():
         return False
-    parts = text.split("_")
+    # Split both spellings into words: underscores, and the boundaries a camel
+    # case name has.  `text` arrives lower-cased, so the boundary has to be read
+    # from the original string before this point.
+    parts = [part for part in re.split(r"[^a-z0-9]+", text.lower()) if part]
     if any(part in NON_SECRET_TOKEN_QUANTITY_SEGMENTS for part in parts):
         return True
     return (

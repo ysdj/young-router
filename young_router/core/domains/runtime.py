@@ -590,6 +590,14 @@ class RuntimeSettingsDomain:
             raise DomainError("The requested secret field is unavailable")
         if not self._is_secret_setting(target):
             raise DomainError("The requested secret field is unavailable")
+        # A snapshot states a secret's stored text as REDACTED.  A staged value
+        # that carries that marker is the redacted projection, never the
+        # document: writing it back would replace the real setting with the
+        # placeholder -- for the JSON document that means the quick controls
+        # project `configured` instead of a token limit, and the document itself
+        # is then no longer editable, because the editor reads what is stored.
+        if value.strip() == REDACTED:
+            raise DomainError("The requested secret field is unavailable")
         self._set_values({"values": {target: value}})
         self.revision += 1
 

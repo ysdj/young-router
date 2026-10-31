@@ -63,6 +63,10 @@ ALPHA_SEARCH_UNSUPPORTED_TTL_ENV = "YOUNG_ROUTER_ALPHA_SEARCH_UNSUPPORTED_TTL_SE
 DEFAULT_UNSUPPORTED_TTL_SECONDS = 300.0
 MAX_QUERIES = 4
 MAX_RESULTS = 20
+# DeepSeek's ``/tools/search`` refuses a longer ``query`` with HTTP 400 (and
+# the same bound covers ``ori_question``), so every query is cut to it here
+# rather than letting one long paste fail the whole call.
+MAX_QUERY_CHARS = 128
 MAX_FIND_MATCHES = 20
 # OpenAI's own answer separates result entries with this rule and nothing else
 # -- no blank lines, no per-query headings.  Reproducing it exactly keeps the
@@ -325,7 +329,15 @@ def _commands(body: Mapping[str, Any]) -> Mapping[str, Any]:
 
 
 def search_queries(body: Mapping[str, Any]) -> list[str]:
-    """The queries Codex asked for, bounded the way the tool documents them."""
+    """The queries Codex asked for, bounded the way the tool documents them.
+
+    The 128-character bound is the backend's own limit, not a preference:
+    DeepSeek answers a longer ``query`` with HTTP 400, and one refused query
+    used to fail the whole call -- so a model that pasted a paragraph into
+    ``q`` lost the search entirely and fell back to driving a browser.  Cutting
+    at the limit keeps the call answerable; the alternative is not a longer
+    query but no search at all.
+    """
 
     raw = _commands(body).get("search_query")
     queries: list[str] = []
@@ -335,7 +347,7 @@ def search_queries(body: Mapping[str, Any]) -> list[str]:
                 continue
             text = item.get("q")
             if isinstance(text, str) and text.strip():
-                queries.append(text.strip())
+                queries.append(text.strip()[:MAX_QUERY_CHARS])
             if len(queries) >= MAX_QUERIES:
                 break
     if queries:
@@ -348,7 +360,7 @@ def search_queries(body: Mapping[str, Any]) -> list[str]:
     # A turn may carry the query only as the request input.
     question = body.get("input")
     if isinstance(question, str) and question.strip():
-        return [question.strip()[:128]]
+        return [question.strip()[:MAX_QUERY_CHARS]]
     return []
 
 

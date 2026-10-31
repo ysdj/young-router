@@ -432,6 +432,23 @@ class CoreProtocolTests(unittest.TestCase):
             "token_count": 12,
         }
         self.assertEqual(limits, redact(limits))
+        # A camelCase name is the same key as its snake_case sibling, and the
+        # JSON document this app stores spells its budget `maxTokens`.  Reading
+        # only the underscore form left that key classified as a credential, so
+        # the stored document reached every snapshot rewritten to
+        # `"maxTokens":configured` — text that is no longer JSON, which the
+        # document's own editor then opened on.
+        camel = {
+            "maxTokens": 4096,
+            "timeoutSeconds": 45,
+            "tokenBudget": 1000,
+            "localLmStudio": {"enabled": False},
+        }
+        self.assertEqual(camel, redact(camel))
+        document = '{"enabled":true,"maxTokens":4096,"timeoutSeconds":45}'
+        self.assertEqual(document, redact(document))
+        for key in ("apiKey", "accessToken", "providerAuthToken"):
+            self.assertEqual({key: "configured"}, redact({key: "synthetic-credential"}), key)
         for key in (
             "input_tokens",
             "output_tokens",

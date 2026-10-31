@@ -108,6 +108,24 @@ class SearchEndpointShapeTests(unittest.TestCase):
             ["甪直有什么特产"], search_endpoint.search_queries(_body(commands={}))
         )
 
+    def test_a_query_longer_than_the_backend_accepts_is_cut_not_refused(self) -> None:
+        """DeepSeek answers a longer ``query`` with HTTP 400, and one refused
+        query used to fail the whole call -- so a model that pasted a paragraph
+        lost the search and fell back to driving a browser.  The bound applies
+        to every spelling of the query, including the request ``input``."""
+
+        pasted = "甪直古镇特产推荐 " * 20
+        self.assertGreater(len(pasted), search_endpoint.MAX_QUERY_CHARS)
+        body = _body(commands={"search_query": [{"q": pasted}]})
+        self.assertEqual(
+            [pasted[: search_endpoint.MAX_QUERY_CHARS]],
+            search_endpoint.search_queries(body),
+        )
+        self.assertEqual(
+            [pasted[: search_endpoint.MAX_QUERY_CHARS]],
+            search_endpoint.search_queries(_body(input=pasted, commands={})),
+        )
+
     def test_response_length_selects_the_result_count(self) -> None:
         body = _body(commands={"search_query": [{"q": "x"}], "response_length": "long"})
         self.assertEqual(20, search_endpoint.result_count(body))
@@ -437,6 +455,29 @@ class SearchEndpointDeepSeekTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(["a", "b", "c", "d"], sorted(searched))
         # The duplicate URL is kept once across all four answers.
         self.assertEqual(5, len(payload["results"]))
+
+    async def test_a_query_the_backend_refuses_is_sent_within_its_own_bound(self) -> None:
+        """The bound is what the backend accepts, proven against ``/tools/search``."""
+
+        sent: list[int] = []
+
+        async def fake(url, key, payload, client):
+            sent.append(len(payload["query"]))
+            return 200, {
+                "results": [
+                    {"title": "t", "url": "https://example.test/a", "summary": "s"}
+                ]
+            }
+
+        body = _body(commands={"search_query": [{"q": "长" * 400}]})
+        with mock.patch.object(search_endpoint, "_post_json", fake):
+            payload, reason = await search_endpoint._deepseek_search(
+                {"api_base": "https://api.deepseek.com/v1", "api_key": "k"}, body, None
+            )
+
+        self.assertEqual("", reason)
+        self.assertEqual([search_endpoint.MAX_QUERY_CHARS], sent)
+        self.assertIn("https://example.test/a", payload["output"])
 
     async def test_open_by_reference_fetches_the_page_it_names(self) -> None:
         session = search_endpoint._session_for("probe")
