@@ -623,7 +623,14 @@ def apply(data: Any) -> Optional[Dict[str, Any]]:
             count = next_count
             _MEASURED_INPUT_TOKENS.set(count)
     if pessimistic_tokens(data, count) <= limit:
-        _trace(original, data, count=original_count, window=limit, router=router)
+        _trace(
+            original,
+            data,
+            count=original_count,
+            window=limit,
+            router=router,
+            image_pass=True,
+        )
         return dict(data)
     # The estimate the first pass uses is bytes-per-token, which is close but
     # not exact; the count after it is the router's own.  Repeat until the
@@ -655,6 +662,24 @@ def apply(data: Any) -> Optional[Dict[str, Any]]:
     return dict(final)
 
 
+def _turn_facts(items: Any) -> Dict[str, Any]:
+    """What the pass judged: which turns the images sit in, and what it protects."""
+
+    from . import image_context as _image_context_module
+
+    try:
+        images = _image_context_module.scan(items)
+    except Exception:
+        return {}
+    list_items = items if isinstance(items, list) else []
+    return {
+        "current_turn": _image_context_module._turn_count(list_items),
+        "protected_index": _protected_index(list_items),
+        "image_turns": sorted({image.turn for image in images})[:16],
+        "image_count": len(images),
+    }
+
+
 def _trace(
     before: Mapping[str, Any],
     after: Mapping[str, Any],
@@ -662,6 +687,7 @@ def _trace(
     count: int,
     window: int,
     router: Any,
+    image_pass: bool = False,
 ) -> None:
     from . import routing as _routing_module
     from . import trace as _trace_module
@@ -680,6 +706,9 @@ def _trace(
             # be accepted", and only the pair shows which one the elision moved.
             image_bytes_before=_inline_image_bytes(before.get("input")),
             image_bytes_after=_inline_image_bytes(after.get("input")),
+            image_pass=image_pass,
+            before_facts=_turn_facts(before.get("input")),
+            after_facts=_turn_facts(after.get("input")),
             items_before=len(before.get("input") or []),
             items_after=len(after.get("input") or []),
         )
