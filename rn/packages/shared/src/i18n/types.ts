@@ -305,6 +305,7 @@ export type TranslationKey =
   | "common.notAvailable"
   | "common.saving"
   | "common.saved"
+  | "common.savedServiceStopped"
   | "common.reloaded"
   | "common.ready"
   | "common.notApplied"

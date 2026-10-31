@@ -73,7 +73,7 @@
     // shell, so an explicit whitelist here silently gives a missed pane
     // (General) a plain titled window while the shell still reserves its
     // title-bar inset.
-    NSSet<NSString *> *standaloneRoutes = [NSSet setWithArray:@[@"home", @"provider-wizard", @"file-editor", @"image-context"]];
+    NSSet<NSString *> *standaloneRoutes = [NSSet setWithArray:@[@"home", @"provider-wizard", @"file-editor"]];
     const BOOL settingsShell = ![standaloneRoutes containsObject:route];
     NSView *rootView = (NSView *)[rootViewFactory viewWithModuleName:@"YoungRouter" initialProperties:props];
     // RCTSurfaceHostingView defaults to an opaque white background on macOS.

@@ -79,6 +79,16 @@ Procedures a reader needs while investigating, whose subject is a log or a recor
 - Prefer Codex task tools over filesystem inspection; resolve a rollout path by exact task ID from the read-only state database, never by scanning all of `~/.codex/sessions`. Query logs by exact task/request ID, event, and timestamp, printing only timestamp, event, request id, deployment, status, and a sanitized exception.
 - Read source only after the exact error text or trace event names the owning branch, then stop once the causal chain is closed and make the smallest fix with its focused regression test.
 
+## Windows Development Environment
+
+- A checkout can be the Mac home share as seen from Windows: `C:\Mac\Home` is a symlink to the Parallels share `\\psf\Home`. Git Bash's `//Mac/Home/...` reaches Node as `\\Mac\Home\...`, and pnpm 11 then aborts with `current dir is an absolute path with drive letter`. Spell the same directory `C:\...` (or enter it through `cmd /c pushd`) for every pnpm command.
+- Never install `rn/node_modules` on that share from Windows. Parallels cannot create pnpm's symlinks there: they become `.lnk` files, and `.bin` keeps an unlinkable reparse point, after which neither host resolves `react`/`react-native`. A Windows build belongs in a copy on the VM's local disk with its own `pnpm install --node-linker=hoisted`; the shared tree carries source, not a Windows module tree.
+- A `tsc` run reporting hundreds of `Cannot find module 'react'` and implicit-`any` errors is the unresolved module tree above, not the source. The same commit typechecks clean in the local copy, so do not "fix" those errors in shared code.
+- The `python.exe` on PATH is the Windows Store alias, not an interpreter. Run the Python suites with `uv run --no-project --with pyyaml --python 3.12 python -m unittest ...`.
+- This host is ARM64: `react-native run-windows` defaults to `--arch ARM64`, and an x64 build is emulated. The WinAppSDK C++/WinRT factory is `AppWindow::GetFromWindowId`; `FromWindowId` is the C# spelling and does not exist in this projection.
+- The Windows secure text input is a XAML island. In this composition host its `PasswordBox` does not composite into the React surface (a debug `TextBlock` placed in the same island did not draw either). The General master key is therefore a plaintext `NativeTextField` on Windows, backed by the host's native `readSecret`/`stageSecret` capability; macOS keeps the inline secure control. That one credential is the deliberate exception to the no-secret-in-React-state rule: do not put any other secret into React state or restore the XAML leaf to the General pane.
+  The same island can fault in `Microsoft.UI.Xaml.dll` when its view is unmounted; the retained-island workaround in `WinUIControls.cpp` keeps the process alive only while the view is not destroyed. A pane switch after the inline field had been mounted produced one such crash in this session, so do not put the inline secret control back on Windows without replacing the leaf.
+
 ## Development And Verification
 
 - Keep all project-owned test sources directly under `tests/`, and keep the working tree free of `work/`, `tmp/`, and preview bundles: ephemeral probes belong in a system temporary directory that is removed when the run ends.

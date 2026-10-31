@@ -13,14 +13,11 @@ export const ROUTES: readonly RouteDefinition[] = [
   { id: "claude-settings", titleKey: "status.claude" },
   { id: "data-management", titleKey: "status.dataManagement" },
   { id: "provider-wizard", titleKey: "providers.wizard.title" },
-  // Its own window, like the provider wizard: a task list grows with use and
-  // must not lengthen a settings pane.
-  { id: "image-context", titleKey: "status.imageContext" },
   { id: "logs", titleKey: "status.logs" },
 ];
 
 export const MENU_ROUTES: readonly RouteDefinition[] = ROUTES.filter(
-  ({ id }) => id !== "claude-settings" && id !== "provider-wizard" && id !== "image-context",
+  ({ id }) => id !== "claude-settings" && id !== "provider-wizard",
 );
 
 /**
@@ -53,7 +50,7 @@ export function isSettingsPaneRoute(route: AppRoute | undefined): boolean {
 
 /** Every non-home, non-sheet route renders inside the settings shell. */
 export function isSettingsShellRoute(route: AppRoute | undefined): boolean {
-  return route !== undefined && route !== "home" && route !== "provider-wizard" && route !== "file-editor" && route !== "image-context";
+  return route !== undefined && route !== "home" && route !== "provider-wizard" && route !== "file-editor";
 }
 
 export function routeMenuActions(

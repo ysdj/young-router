@@ -10,6 +10,7 @@
 #include <cmath>
 #include <set>
 #include <shobjidl_core.h>
+#include <winrt/Microsoft.ReactNative.h>
 #include <winrt/Windows.Globalization.h>
 #include <winrt/Windows.ApplicationModel.DataTransfer.h>
 
@@ -33,10 +34,12 @@ std::optional<std::string> WideToUtf8(std::wstring const& value) {
 }
 
 HWND HostWindow(winrt::Microsoft::ReactNative::ReactContext const& context) {
-  // RNW's ARM64 prebuilt composition library does not export the internal
-  // ReactCoreInjection helper; use the active WinUI host as the owner for
-  // native pickers instead.
-  (void)context;
+  const auto window_id = winrt::Microsoft::ReactNative::ReactCoreInjection::GetTopLevelWindowId(context.Properties().Handle());
+  if (window_id != 0) {
+    auto window = winrt::Microsoft::UI::WindowId{window_id};
+    if (auto handle = winrt::Microsoft::UI::GetWindowFromWindowId(window); handle != nullptr) return handle;
+  }
+  if (const auto child = YoungRouter::CurrentReactChildHostWindow(); child != nullptr) return child;
   return GetActiveWindow();
 }
 
@@ -127,12 +130,11 @@ namespace YoungRouter {
 void WinUI3NativeLeafModule::Initialize(winrt::Microsoft::ReactNative::ReactContext const& context) noexcept {
   try {
     context_ = context;
-    auto leaf = leaf_;
     // REACT_EVENT fills the field with a lambda that calls EmitJSEvent,
     // so it is safe to call from the UI thread and no JS dispatcher is
     // needed.  Reading the field at dispatch time is what makes it
     // non-empty: at REACT_INIT the field has not been filled yet.
-    leaf->SetActionHandler([this](std::string const& action) {
+    leaf_->SetActionHandler([this](std::string const& action) {
       // The field holds the lambda REACT_EVENT installed (it calls
       // EmitJSEvent), so it is read here rather than captured: at
       // REACT_INIT it has not been filled yet, and a copy taken then
@@ -150,13 +152,33 @@ void WinUI3NativeLeafModule::Initialize(winrt::Microsoft::ReactNative::ReactCont
       }).detach();
     });
     auto owner = HostWindow(context_);
-    context_.UIDispatcher().Post([leaf, owner] { leaf->Initialize(owner); });
+    if (leaf_->WindowHandle() != nullptr && leaf_->WindowHandle() != owner) {
+      leaf_ = WinUI3NativeLeaf::Create();
+      leaf_->SetChildHost(true);
+    }
+    auto leaf = leaf_;
+    if (leaf->IsChildHost()) {
+      leaf->SetActionHandler([this](std::string const& action) {
+        std::thread([this, action] {
+          try { if (MenuAction) MenuAction(action); } catch (...) {}
+        }).detach();
+      });
+    }
+    context_.UIDispatcher().Post([leaf, owner] {
+      leaf->Initialize(owner);
+      auto route = InitialChildRoute(owner);
+      if (!route.empty()) leaf->OpenRoute(route);
+    });
   } catch (...) {
   }
 }
 
 void WinUI3NativeLeafModule::OpenWindow(std::wstring const& route) noexcept {
   try {
+    if ((route == L"provider-wizard" || route == L"file-editor") && !leaf_->IsChildHost()) {
+      OpenReactChildWindow(route);
+      return;
+    }
     auto leaf = leaf_;
     context_.UIDispatcher().Post([leaf, route] { leaf->OpenRoute(route); });
   } catch (...) {
@@ -165,6 +187,10 @@ void WinUI3NativeLeafModule::OpenWindow(std::wstring const& route) noexcept {
 
 void WinUI3NativeLeafModule::CloseWindow(std::optional<std::wstring> const& route) noexcept {
   try {
+    if (route && (*route == L"provider-wizard" || *route == L"file-editor") && leaf_->IsChildHost()) {
+      CloseReactChildWindow();
+      return;
+    }
     auto leaf = leaf_;
     context_.UIDispatcher().Post([leaf, route] {
       if (route && !route->empty()) leaf->CloseRoute(*route);
@@ -175,6 +201,10 @@ void WinUI3NativeLeafModule::CloseWindow(std::optional<std::wstring> const& rout
 
 void WinUI3NativeLeafModule::FocusWindow(std::wstring const& route) noexcept {
   try {
+    if ((route == L"provider-wizard" || route == L"file-editor") && !leaf_->IsChildHost()) {
+      OpenReactChildWindow(route);
+      return;
+    }
     auto leaf = leaf_;
     context_.UIDispatcher().Post([leaf, route] { leaf->OpenRoute(route); });
   } catch (...) {
@@ -232,6 +262,19 @@ void WinUI3NativeLeafModule::SetTrayActions(winrt::Microsoft::ReactNative::JSVal
     });
   } catch (...) {
   }
+}
+
+void WinUI3NativeLeafModule::OpenFileEditor(std::wstring const& target) noexcept {
+  try {
+    OpenReactChildWindow(L"file-editor", target);
+  } catch (...) {
+  }
+}
+
+void WinUI3NativeLeafModule::PrepareFileEditor() noexcept {
+  // The child root is cheap to create and is opened on demand; keep this
+  // capability for the shared bridge but avoid creating an invisible second
+  // RNW host that would own a stale document.
 }
 
 void WinUI3NativeLeafModule::OpenFilePicker(
@@ -608,6 +651,62 @@ void WinUI3NativeLeafModule::EditSecret(
           promise.Resolve(std::nullopt);
         }
       });
+    }).detach();
+  } catch (...) {
+    promise.Resolve(std::nullopt);
+  }
+}
+
+void WinUI3NativeLeafModule::ReadSecret(
+    std::string const& domain,
+    std::string const& field,
+    std::optional<std::string> const& target,
+    winrt::Microsoft::ReactNative::ReactPromise<std::optional<winrt::Microsoft::ReactNative::JSValueObject>> const& promise) noexcept {
+  if (domain.empty() || domain.size() > 64 || field.empty() || field.size() > 64 ||
+      (target && target->size() > 256)) {
+    promise.Resolve(std::nullopt);
+    return;
+  }
+  try {
+    std::thread([domain, field, target, promise]() {
+      auto value = CoreIPCBridge::Shared().ReadPlainTextSecret(domain, field, target);
+      winrt::Microsoft::ReactNative::JSValueObject result;
+      result["present"] = value.has_value();
+      if (value) result["value"] = *value;
+      promise.Resolve(std::move(result));
+    }).detach();
+  } catch (...) {
+    promise.Resolve(std::nullopt);
+  }
+}
+
+void WinUI3NativeLeafModule::StageSecret(
+    std::string const& domain,
+    std::string const& field,
+    std::optional<std::string> const& target,
+    std::string const& value,
+    winrt::Microsoft::ReactNative::ReactPromise<std::optional<winrt::Microsoft::ReactNative::JSValueObject>> const& promise) noexcept {
+  if (domain.empty() || domain.size() > 64 || field.empty() || field.size() > 64 ||
+      (target && target->size() > 256) || value.size() > 64 * 1024) {
+    promise.Resolve(std::nullopt);
+    return;
+  }
+  try {
+    std::thread([domain, field, target, value, promise]() {
+      auto capability = CoreIPCBridge::Shared().CreateSecretCapability(domain, field, target, "settings");
+      if (!capability) {
+        promise.Resolve(std::nullopt);
+        return;
+      }
+      auto staged = CoreIPCBridge::Shared().StageSecret(capability->token, std::optional<std::string>(value), false);
+      if (!staged) {
+        promise.Resolve(std::nullopt);
+        return;
+      }
+      winrt::Microsoft::ReactNative::JSValueObject result;
+      result["revision"] = staged->revision;
+      result["present"] = staged->present;
+      promise.Resolve(std::move(result));
     }).detach();
   } catch (...) {
     promise.Resolve(std::nullopt);

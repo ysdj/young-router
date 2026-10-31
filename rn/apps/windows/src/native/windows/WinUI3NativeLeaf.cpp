@@ -39,6 +39,8 @@
 namespace {
 constexpr UINT kTrayMessage = WM_APP + 31;
 constexpr UINT kQuitMessage = WM_APP + 32;
+constexpr UINT kReactChildCloseMessage = WM_APP + 33;
+constexpr UINT kReactChildRestoreParentMessage = WM_APP + 34;
 constexpr UINT kTrayMenuFirstCommand = 41000;
 constexpr double kUIFontSize = 13.0;
 // A hint's own step, mirroring the shared UI's `UI_TIP_FONT_SIZE` (12): an
@@ -279,7 +281,6 @@ ContentSize RouteInitialContentSize(std::wstring_view route) {
     return {960, 660};
   }
   if (route == L"provider-wizard") return {620, 460};
-  if (route == L"image-context") return {900, 620};
   if (route == L"file-editor") return {900, 560};
   return {320, 160};
 }
@@ -326,7 +327,7 @@ LRESULT CALLBACK TrayWindowProc(HWND window, UINT message, WPARAM wparam, LPARAM
       }
       return result;
     }
-    if (leaf->HandleWindowMessage(message, wparam, lparam)) return 0;
+    if (auto result = leaf->HandleWindowMessage(message, wparam, lparam)) return *result;
   }
   return previous ? CallWindowProcW(previous, window, message, wparam, lparam) : DefWindowProcW(window, message, wparam, lparam);
 }
@@ -752,6 +753,24 @@ void ApplyWindowIcons(HWND window) noexcept {
   }
 }
 
+void ApplyWindowFrameBackground(HWND window) noexcept {
+  if (window == nullptr) return;
+  // Extending into the title bar leaves the resize border to the window
+  // class background.  The RNW host class ships no brush, so the 13 px frame
+  // of a 200% DPI window showed the desktop through it (visible as a strip of
+  // whatever window was behind).  COLOR_WINDOW follows light/dark mode.
+  SetClassLongPtrW(
+      window,
+      GCLP_HBRBACKGROUND,
+      reinterpret_cast<LONG_PTR>(GetSysColorBrush(COLOR_WINDOW)));
+  // The class brush covers the client background, but the frame outside the
+  // client is composited by DWM.  Painting the border and caption in the same
+  // window color keeps the desktop from showing through the resize margin.
+  const COLORREF frame = GetSysColor(COLOR_WINDOW);
+  DwmSetWindowAttribute(window, DWMWA_BORDER_COLOR, &frame, sizeof(frame));
+  DwmSetWindowAttribute(window, DWMWA_CAPTION_COLOR, &frame, sizeof(frame));
+}
+
 POINT FrameTrackSizeForContentDips(HWND window, LONG width, LONG height, UINT dpi_hint) {
   return FrameTrackSizeForContent(
       window,
@@ -765,6 +784,10 @@ POINT FrameTrackSizeForContentDips(HWND window, LONG width, LONG height, UINT dp
 std::shared_ptr<WinUI3NativeLeaf> WinUI3NativeLeaf::Shared() {
   static auto instance = std::make_shared<WinUI3NativeLeaf>();
   return instance;
+}
+
+std::shared_ptr<WinUI3NativeLeaf> WinUI3NativeLeaf::Create() {
+  return std::make_shared<WinUI3NativeLeaf>();
 }
 
 WinUI3NativeLeaf::~WinUI3NativeLeaf() {
@@ -781,6 +804,7 @@ void WinUI3NativeLeaf::Initialize(winrt::Microsoft::UI::Xaml::Window const& wind
   window.as<::IWindowNative>()->get_WindowHandle(&window_handle_);
   DisableWindowTransitions(window_handle_);
   ApplyWindowIcons(window_handle_);
+  ApplyWindowFrameBackground(window_handle_);
   InstallWindowHook();
   EnsureTray();
 }
@@ -794,6 +818,7 @@ void WinUI3NativeLeaf::Initialize(HWND window_handle) {
   window_handle_ = window_handle;
   DisableWindowTransitions(window_handle_);
   ApplyWindowIcons(window_handle_);
+  ApplyWindowFrameBackground(window_handle_);
   InstallWindowHook();
   EnsureTray();
 }
@@ -868,16 +893,56 @@ void WinUI3NativeLeaf::DispatchAction(std::string const& action) {
   handler(action);
 }
 
-bool WinUI3NativeLeaf::HandleWindowMessage(UINT message, WPARAM wparam, LPARAM lparam) {
+std::optional<LRESULT> WinUI3NativeLeaf::HandleWindowMessage(UINT message, WPARAM wparam, LPARAM lparam) {
+  if (integrated_title_bar_ && message == WM_NCCALCSIZE && wparam == TRUE) {
+    // The React title strip is the client surface.  Leaving the default
+    // non-client calculation in place exposes the desktop through the resize
+    // frame when the AppWindow title bar is extended into the content area.
+    return 0;
+  }
+  if (integrated_title_bar_ && message == WM_NCHITTEST && window_handle_ != nullptr && !IsZoomed(window_handle_)) {
+    RECT frame{};
+    if (GetWindowRect(window_handle_, &frame)) {
+      const auto dpi = static_cast<UINT>(GetDpiForWindow(window_handle_));
+      const LONG resize_border = std::max<LONG>(4, MulDiv(6, dpi == 0 ? USER_DEFAULT_SCREEN_DPI : dpi, 96));
+      const LONG x = static_cast<LONG>(static_cast<short>(LOWORD(lparam)));
+      const LONG y = static_cast<LONG>(static_cast<short>(HIWORD(lparam)));
+      const bool left = x < frame.left + resize_border;
+      const bool right = x >= frame.right - resize_border;
+      const bool top = y < frame.top + resize_border;
+      const bool bottom = y >= frame.bottom - resize_border;
+      if (left || right || top || bottom) {
+        if (top && left) return HTTOPLEFT;
+        if (top && right) return HTTOPRIGHT;
+        if (bottom && left) return HTBOTTOMLEFT;
+        if (bottom && right) return HTBOTTOMRIGHT;
+        if (left) return HTLEFT;
+        if (right) return HTRIGHT;
+        if (top) return HTTOP;
+        return HTBOTTOM;
+      }
+    }
+  }
   // A resized, maximized, or DPI-changed window moves the caption buttons, so
   // the draggable strip has to be described again in the new client frame.
-  // Return false: the host still owns every one of these messages.
+  // Return nullopt for messages the host still owns.
   if (message == WM_SIZE || message == WM_DPICHANGED) UpdateTitleBarDragRegions();
+  if (message == kReactChildCloseMessage && child_host_) {
+    quitting_ = true;
+    PostQuitMessage(0);
+    return 0;
+  }
+  if (message == kReactChildRestoreParentMessage && !child_host_) {
+    EnableWindow(window_handle_, TRUE);
+    SetForegroundWindow(window_handle_);
+    SetFocus(window_handle_);
+    return 0;
+  }
   if (message == WM_CLOSE && !quitting_) {
     if (!active_route_.empty()) {
       DispatchAction("request-close-" + WideToUtf8(active_route_));
     }
-    return true;
+    return 0;
   }
   if (message == kQuitMessage) {
     quitting_ = true;
@@ -885,7 +950,7 @@ bool WinUI3NativeLeaf::HandleWindowMessage(UINT message, WPARAM wparam, LPARAM l
     // The window may be hidden; end the thread's message loop explicitly so
     // Exit never depends on a hidden window's close path.
     PostQuitMessage(0);
-    return true;
+    return 0;
   }
   if (message == kTrayMessage && wparam == tray_.uID) {
     if (lparam == WM_LBUTTONUP || lparam == WM_LBUTTONDBLCLK) {
@@ -893,13 +958,13 @@ bool WinUI3NativeLeaf::HandleWindowMessage(UINT message, WPARAM wparam, LPARAM l
     } else if (lparam == WM_RBUTTONUP || lparam == WM_CONTEXTMENU) {
       ShowTrayMenu();
     }
-    return true;
+    return 0;
   } else if (message == WM_COMMAND && LOWORD(wparam) >= kTrayMenuFirstCommand &&
              LOWORD(wparam) < kTrayMenuFirstCommand + actions_.size()) {
     DispatchTrayAction(static_cast<size_t>(LOWORD(wparam) - kTrayMenuFirstCommand));
-    return true;
+    return 0;
   }
-  return false;
+  return std::nullopt;
 }
 
 void WinUI3NativeLeaf::ApplyIntegratedTitleBar(bool enabled) {
@@ -909,7 +974,7 @@ void WinUI3NativeLeaf::ApplyIntegratedTitleBar(bool enabled) {
     return;
   }
   try {
-    auto app_window = winrt::Microsoft::UI::Windowing::AppWindow::FromWindowId(
+    auto app_window = winrt::Microsoft::UI::Windowing::AppWindow::GetFromWindowId(
         winrt::Microsoft::UI::GetWindowIdFromWindow(window_handle_));
     auto title_bar = app_window.TitleBar();
     title_bar.ExtendsContentIntoTitleBar(enabled);
@@ -931,7 +996,7 @@ void WinUI3NativeLeaf::ApplyIntegratedTitleBar(bool enabled) {
 void WinUI3NativeLeaf::UpdateTitleBarDragRegions() {
   if (window_handle_ == nullptr || !integrated_title_bar_) return;
   try {
-    auto app_window = winrt::Microsoft::UI::Windowing::AppWindow::FromWindowId(
+    auto app_window = winrt::Microsoft::UI::Windowing::AppWindow::GetFromWindowId(
         winrt::Microsoft::UI::GetWindowIdFromWindow(window_handle_));
     auto title_bar = app_window.TitleBar();
     RECT client{};
@@ -953,7 +1018,7 @@ void WinUI3NativeLeaf::OpenRoute(std::wstring_view route) {
   auto const previous_route = active_route_;
   active_route_ = route;
   // Only the shared settings shell draws its own title-bar strip.  The
-  // provider wizard, the raw file editor, the image-context window, and the
+  // provider wizard, the raw file editor, and the
   // hidden home surface keep the native caption they were designed around.
   ApplyIntegratedTitleBar(UsesIntegratedTitleBar(route));
   if (route == L"home") {
@@ -998,6 +1063,7 @@ void WinUI3NativeLeaf::CloseRoute(std::wstring_view route) {
   if (active_route_ == route) {
     active_route_.clear();
     if (window_handle_ != nullptr) ShowWindow(window_handle_, SW_HIDE);
+    if (child_host_) CloseReactChildWindow();
   }
 }
 
@@ -3058,7 +3124,6 @@ std::wstring WinUI3NativeLeaf::RouteTitle(std::wstring_view route) const {
     return Localized("appTitle", L"Young Router");
   }
   if (route == L"provider-wizard") return Localized("routeProviderWizard", L"Add Provider");
-  if (route == L"image-context") return Localized("routeImageContext", L"Image Context");
   if (route == L"file-editor") return Localized("routeFileEditor", L"Edit File");
   return Localized("appTitle", L"Young Router");
 }

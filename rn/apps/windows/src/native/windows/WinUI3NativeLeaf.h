@@ -16,6 +16,14 @@
 
 namespace YoungRouter {
 
+// The Windows host can own a second RNW root for child surfaces. These are
+// implemented by the app entry point because only it owns the package
+// providers and ReactNativeAppBuilder configuration.
+void OpenReactChildWindow(std::wstring_view route, std::wstring_view initial_file_target = {});
+void CloseReactChildWindow();
+std::wstring InitialChildRoute(HWND window);
+HWND CurrentReactChildHostWindow() noexcept;
+
 struct NativeMenuAction {
   std::wstring id;
   std::wstring title;
@@ -120,6 +128,7 @@ struct GroupManagerResult {
 class WinUI3NativeLeaf : public std::enable_shared_from_this<WinUI3NativeLeaf> {
  public:
   static std::shared_ptr<WinUI3NativeLeaf> Shared();
+  static std::shared_ptr<WinUI3NativeLeaf> Create();
   ~WinUI3NativeLeaf();
 
   void Initialize(winrt::Microsoft::UI::Xaml::Window const& window);
@@ -130,13 +139,16 @@ class WinUI3NativeLeaf : public std::enable_shared_from_this<WinUI3NativeLeaf> {
   std::wstring Localized(std::string const& key, std::wstring_view fallback) const;
   void SetActionHandler(std::function<void(std::string const&)> handler);
   void DispatchAction(std::string const& action);
-  bool HandleWindowMessage(UINT message, WPARAM wparam, LPARAM lparam);
+  std::optional<LRESULT> HandleWindowMessage(UINT message, WPARAM wparam, LPARAM lparam);
   void OpenRoute(std::wstring_view route);
   void CloseRoute(std::wstring_view route);
   // WM_GETMINMAXINFO uses physical frame pixels.  Keep the route specifications
   // in 96-DPI content DIPs and convert them at the native window boundary.
   POINT MinimumTrackSizeForActiveRoute() const;
   bool SetWindowContentSize(std::wstring_view route, double width, double height);
+  HWND WindowHandle() const noexcept { return window_handle_; }
+  void SetChildHost(bool child) noexcept { child_host_ = child; }
+  bool IsChildHost() const noexcept { return child_host_; }
   // One answer on the app's decision window: its label, the id the caller hears
   // back, whether Return carries it, whether Escape and the title-bar close
   // button carry it, and whether it destroys what it names.  Mirrors the macOS
@@ -222,6 +234,10 @@ class WinUI3NativeLeaf : public std::enable_shared_from_this<WinUI3NativeLeaf> {
   void DispatchTrayAction(size_t index);
   void ShowTrayMenu();
   void InstallWindowHook();
+  // The shared settings shell draws its own title strip; extending the client
+  // area into the caption is what lets that strip be the window's title bar.
+  void ApplyIntegratedTitleBar(bool enabled);
+  void UpdateTitleBarDragRegions();
   std::wstring RouteTitle(std::wstring_view route) const;
   std::wstring VersionText() const;
 
@@ -232,6 +248,8 @@ class WinUI3NativeLeaf : public std::enable_shared_from_this<WinUI3NativeLeaf> {
   // The one window takes its initial size on the first route it opens; every
   // later open keeps the geometry the user chose.
   bool window_sized_ = false;
+  bool integrated_title_bar_ = false;
+  bool child_host_ = false;
   NOTIFYICONDATAW tray_{};
   bool tray_visible_ = false;
   bool service_running_ = false;

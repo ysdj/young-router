@@ -48,6 +48,17 @@ type NativeModule = {
   awaitGroupManagerApply?: () => Promise<RelayGroupManagerResult | undefined>;
   finishGroupManagerApply?: (options: { status: string; close: boolean }) => Promise<void>;
   updateGroupManager?: (options: RelayGroupManagerSnapshot) => Promise<boolean>;
+  readSecret?: (
+    domain: string,
+    field: string,
+    target: string | undefined,
+  ) => Promise<{ present: boolean; value?: string } | undefined>;
+  stageSecret?: (
+    domain: string,
+    field: string,
+    target: string | undefined,
+    value: string,
+  ) => Promise<{ revision: number; present: boolean } | undefined>;
   editSecret?: (
     domain: "providers_models" | "codex" | "claude" | "runtime" | "webdav",
     field: string,
@@ -180,6 +191,12 @@ const nativeBridge: NativeLeafBridge = {
     : undefined,
   editSecret: async (domain, field, target, title, allowClear) => leaf.editSecret?.(domain, field, target, title, allowClear),
   clearSecret: async (domain, field, target) => leaf.clearSecret?.(domain, field, target),
+  readSecret: leaf.readSecret
+    ? async (options) => leaf.readSecret!(options.domain, options.field, options.target)
+    : undefined,
+  stageSecret: leaf.stageSecret
+    ? async (options) => leaf.stageSecret!(options.domain, options.field, options.target, options.value)
+    : undefined,
   copySecret: async (domain, field, target) => leaf.copySecret?.(domain, field, target) ?? false,
   relayLogin: async (options) => leaf.relayLogin?.(options),
   cancelRelayLogin: () => leaf.cancelRelayLogin?.(),

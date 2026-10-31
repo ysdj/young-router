@@ -88,6 +88,17 @@ export interface NativeLeafBridge {
     field: string,
     target: string | undefined,
   ): Promise<{ revision: number; present: boolean } | undefined>;
+  readSecret?(options: {
+    domain: "providers_models" | "codex" | "claude" | "runtime" | "webdav";
+    field: string;
+    target?: string;
+  }): Promise<{ present: boolean; value?: string } | undefined>;
+  stageSecret?(options: {
+    domain: "providers_models" | "codex" | "claude" | "runtime" | "webdav";
+    field: string;
+    target?: string;
+    value: string;
+  }): Promise<{ revision: number; present: boolean } | undefined>;
   copySecret(domain: "providers_models" | "relay_accounts", field: "api_key", target: string): Promise<boolean>;
   relayLogin(options: {
     accountId: string;
@@ -208,6 +219,8 @@ export function createNativeLeafBridgeAdapter(bridge: NativeLeafBridge): NativeL
       : undefined,
     editSecret: ({ domain, field, target, title, allowClear }) => bridge.editSecret(domain, field, target, title, allowClear),
     clearSecret: ({ domain, field, target }) => bridge.clearSecret(domain, field, target),
+    readSecret: bridge.readSecret ? (options) => bridge.readSecret!(options) : undefined,
+    stageSecret: bridge.stageSecret ? (options) => bridge.stageSecret!(options) : undefined,
     copySecret: ({ domain, field, target }) => bridge.copySecret(domain, field, target),
     relayLogin: (options) => bridge.relayLogin(options),
     cancelRelayLogin: () => bridge.cancelRelayLogin?.(),

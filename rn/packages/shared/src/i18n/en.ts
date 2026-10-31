@@ -304,6 +304,7 @@ export const en: Record<TranslationKey, string> = {
   "common.notAvailable": "N/A",
   "common.saving": "Saving…",
   "common.saved": "Saved",
+  "common.savedServiceStopped": "Saved; it will take effect when the service starts",
   "common.reloaded": "Reloaded",
   "common.ready": "Ready",
   "common.notApplied": "Changes not applied",

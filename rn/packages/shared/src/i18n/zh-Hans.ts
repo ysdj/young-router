@@ -304,6 +304,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "common.notAvailable": "不适用",
   "common.saving": "正在保存…",
   "common.saved": "已保存",
+  "common.savedServiceStopped": "已保存，服务启动后生效",
   "common.reloaded": "已重新加载",
   "common.ready": "就绪",
   "common.notApplied": "更改未生效",

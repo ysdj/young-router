@@ -547,7 +547,7 @@ static BOOL HandleLiteLLMTabCommand(NSView *source, SEL commandSelector)
     self.accessibilityElement = NO;
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
-    self.layer.cornerRadius = 6.0;
+    self.layer.cornerRadius = 4.0;
     self.layer.borderColor = NSColor.keyboardFocusIndicatorColor.CGColor;
     self.layer.borderWidth = 0.0;
     [CATransaction commit];
@@ -566,7 +566,7 @@ static BOOL HandleLiteLLMTabCommand(NSView *source, SEL commandSelector)
   _borderVisible = borderVisible;
   [CATransaction begin];
   [CATransaction setDisableActions:YES];
-  self.layer.borderWidth = borderVisible ? 3.0 : 0.0;
+  self.layer.borderWidth = borderVisible ? 2.0 : 0.0;
   [CATransaction commit];
 }
 

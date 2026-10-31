@@ -1,6 +1,6 @@
 import type { TranslationKey } from "../i18n/types";
 import React, { createContext, useCallback, useEffect, useMemo, useRef, useState, useContext } from "react";
-import { AppState, FlatList, Image, Platform, PlatformColor, Pressable, ScrollView, StyleSheet, Text, View, type HostInstance, type ScrollViewProps, type StyleProp, type TextStyle, type ViewStyle } from "react-native";
+import { Animated, AppState, FlatList, Image, Platform, PlatformColor, Pressable, ScrollView, StyleSheet, Text, View, type HostInstance, type ScrollViewProps, type StyleProp, type TextStyle, type ViewStyle } from "react-native";
 import { createTranslator } from "../i18n";
 import { assistantSettingOptions, type AssistantSettingOption } from "../i18n/assistantSettingsI18n";
 import { runtimeCategoryLabel, runtimeFieldHelp, runtimeFieldLabel, runtimeOptionLabel, runtimeUnitLabel } from "../i18n/runtimeSettingsI18n";
@@ -102,6 +102,7 @@ const SERVICE_STARTUP_RETRY_DELAYS_MS = [0, 5_000, 20_000, 60_000];
 // pane stating "启动中" forever. It costs one loopback read every interval and
 // only while the state is transitional.
 const SERVICE_STATE_RECONCILE_MS = 1_000;
+const CORE_SNAPSHOT_RETRY_DELAYS_MS = [250, 500, 1_000, 2_000, 4_000, 8_000, 15_000] as const;
 type EditableDiskDomain = "codex" | "claude" | "clients" | "providers_models" | "runtime" | "webdav";
 type RawEditorConflictResolution = "reload" | "keep";
 type AssistantSettingsDomain = "codex" | "claude" | "clients";
@@ -658,8 +659,10 @@ const compactStyles = StyleSheet.create({
 const SETTINGS_DISK_POLL_MS = 5_000;
 // Immediate settings commit: a staged control change applies shortly after the
 // last edit so the runtime picks it up without an explicit Apply button. The
-// short debounce coalesces rapid toggles into one Core apply.
-const IMMEDIATE_APPLY_DEBOUNCE_MS = 500;
+// short debounce coalesces rapid toggles into one Core apply; it sits *after*
+// the text/secret field's own quiet period, so a typed value lands in about
+// 700 ms rather than a full second.
+const IMMEDIATE_APPLY_DEBOUNCE_MS = 200;
 // Text fields use the same quiet-period behavior as VS Code's autosave: the
 // field stays responsive locally, then one settled value is staged and applied.
 const TEXT_INPUT_COMMIT_DEBOUNCE_MS = 500;
@@ -1231,13 +1234,14 @@ function isApplyResult(value: unknown): value is IpcResults["apply"] {
     && Array.isArray(result.issues);
 }
 
-function applyResultMessage(result: IpcResults["apply"], translate: Translate, appliedKey?: string | null): string {
+function applyResultMessage(result: IpcResults["apply"], translate: Translate, appliedKey?: string | null, serviceState?: ServiceStatus["state"]): string {
   // A write that did not finish is reported for what the user can see: the
   // change is not in effect.  Core's own operation accounting (the completed
   // and pending relay steps) stays internal, and no pane renders an issue card
   // over its content — the permanent status strip states the outcome.
   if (result.status === "partial") return translate("common.notAppliedPartial");
   if (result.status === "failed") return translate("common.notApplied");
+  if (serviceState === "stopped") return translate("common.savedServiceStopped");
   return translate(appliedKey ?? "common.saved");
 }
 
@@ -1655,7 +1659,7 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
       routeGeneralSettings: translate("status.general"),
       routeCodexSettings: translate("status.codex"), routeClaudeSettings: translate("card.claudeSettings"),
       routeRuntimeSettings: translate("card.runtimeSettings"),
-      routeDataManagement: translate("card.dataManagement"), routeImageContext: translate("status.imageContext"), routeProviderWizard: translate("providers.wizard.title"), routeFileEditor: translate("settings.editFile"), routeLogs: translate("card.logs"),
+      routeDataManagement: translate("card.dataManagement"), routeProviderWizard: translate("providers.wizard.title"), routeFileEditor: translate("settings.editFile"), routeLogs: translate("card.logs"),
       providerAuthInstruction: translate("relay.officialProviderWebViewHint"),
       providerAuthBlocked: translate("relay.officialProviderAuthBlocked"),
       logOriginal: translate("logs.originalRecord"),
@@ -1690,17 +1694,28 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
     const unsubscribe = ipc.subscribe((event) => receive(event.snapshot));
     const latest = ipc.latestSnapshot();
     if (latest && latest !== initialSnapshot) receive(latest);
-    if (!latest) {
-      void refreshSnapshot().catch(() => {
-        if (mounted) {
-          native.menuBar.setStatus({ state: "unknown" });
-          setError(hostTranslate("error.coreUnavailable"));
-        }
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    let retryAttempt = 0;
+    const refreshUntilReady = (): void => {
+      void refreshSnapshot().then(() => {
+        retryAttempt = 0;
+      }).catch(() => {
+        if (!mounted) return;
+        // Core starts alongside the native window and can take several seconds
+        // to publish its endpoint. Keep the Windows loading surface alive and
+        // retry with a capped backoff instead of turning one startup race into
+        // a permanent "local core unavailable" page.
+        native.menuBar.setStatus({ state: "unknown" });
+        const delay = CORE_SNAPSHOT_RETRY_DELAYS_MS[Math.min(retryAttempt, CORE_SNAPSHOT_RETRY_DELAYS_MS.length - 1)];
+        retryAttempt += 1;
+        retryTimer = setTimeout(refreshUntilReady, delay);
       });
-    }
+    };
+    if (!latest) refreshUntilReady();
     if (isPrimaryHost) native.setShortcuts({ openMenu: "Cmd+, / Ctrl+,", closeWindow: "Esc", reload: "Cmd+R / Ctrl+R" });
     return () => {
       mounted = false;
+      if (retryTimer !== undefined) clearTimeout(retryTimer);
       unsubscribe();
     };
   }, [hostTranslate, initialSnapshot, ipc, isPrimaryHost, native, receiveSnapshot, refreshSnapshot]);
@@ -1720,6 +1735,10 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
       native.window.focus("home");
       return;
     }
+    // Put the pane in the tree before the native host makes the window
+    // visible: opening first showed one empty frame while the
+    // `open-providers-models` action travelled back through IPC.
+    setRoute("providers-models");
     native.window.open("providers-models");
     native.window.focus("providers-models");
   }, [isPrimaryHost, native, routeRequest, snapshot]);
@@ -2042,7 +2061,7 @@ function SettingsShell({ route, windowRoute, snapshot, ipc, native, translate, l
   };
   return <View style={styles.settingsShellFrame}>
     <View style={styles.settingsShellHeader}>
-      <View style={[styles.settingsSidebarHeader, styles.settingsSidebarHeaderIntegrated]}>
+      <View style={[styles.settingsSidebarHeader, styles.settingsSidebarHeaderIntegrated, Platform.OS === "windows" && styles.settingsSidebarHeaderWindows]}>
         {appInfo?.icon ? <Image source={{ uri: appInfo.icon }} style={styles.settingsSidebarAppIcon} /> : null}
         <Text numberOfLines={1} style={styles.settingsSidebarTitle}>{translate("app.title")}</Text>
       </View>
@@ -2051,7 +2070,7 @@ function SettingsShell({ route, windowRoute, snapshot, ipc, native, translate, l
       </View>
     </View>
     <View style={styles.settingsShell}>
-      <View style={styles.settingsSidebar}>
+      <View style={[styles.settingsSidebar, Platform.OS === "windows" && styles.settingsSidebarWindows]}>
         <NativeTable
           columns={SETTINGS_SIDEBAR_COLUMNS}
           rows={paneRows}
@@ -2400,7 +2419,7 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
       } else if (isApplyResult(value)) {
         // An explicit caller message wins for the applied case so instant
         // applies can say "Saved" instead of the generic "Applied".
-        publishResult(applyResultMessage(value, translate, typeof message === "string" ? message : null));
+        publishResult(applyResultMessage(value, translate, typeof message === "string" ? message : null, latestSnapshot.current?.service.state));
       } else if (typeof message === "function") {
         const key = message(value);
         publishResult(key === null ? undefined : translate(key));
@@ -2606,7 +2625,11 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
     // already includes every staged change for that document.
     void flushAssistantEditorFields()
       .then(() => {
-        if (Platform.OS === "windows" || native.openFileEditor === undefined) {
+        if (Platform.OS === "windows" && native.openFileEditor) {
+          native.openFileEditor(JSON.stringify(editorTargetPayload(file, true)));
+          return;
+        }
+        if (native.openFileEditor === undefined) {
           setInlineEditorFile(file);
           onNavigate("file-editor");
           return;
@@ -3116,17 +3139,18 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
     if (route === "provider-wizard") dropProviderWizardStagedKey();
     if (route === "data-management") importPlanToken.current = undefined;
     if (route === "file-editor") {
+      if (Platform.OS === "windows") {
+        native.window.close("file-editor");
+        return;
+      }
       // The editor owns one document of the settings pane; closing it returns
       // to that pane instead of closing the settings shell.
-      if (Platform.OS === "windows") native.window.open("codex-settings");
       onClose();
       return;
     }
     if (route === "provider-wizard" && Platform.OS === "windows") {
-      // Windows currently owns one React host window. Restore the parent
-      // route in that host instead of hiding it as a second native window.
-      native.window.open("providers-models");
-      onClose();
+      dropProviderWizardStagedKey();
+      native.window.close("provider-wizard");
       return;
     }
     try {
@@ -3136,8 +3160,8 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
     }
   };
   const requestClose = async (): Promise<void> => {
-    // The provider wizard is a native modal child window. Its Cancel button
-    // and title-bar close both dismiss that child directly.
+    // The provider wizard is a native child window. Its Cancel button and
+    // title-bar close both dismiss that child directly.
     if (route === "provider-wizard") {
       closeRoute();
       return;
@@ -3354,15 +3378,14 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
 
   return <TranslationContext.Provider value={settingsRoute ? translate : undefined}><PendingFieldContext.Provider value={fieldRegistry}><View style={styles.windowSurface}>
     {!shell && route !== "providers-models" && route !== "logs" && route !== "provider-wizard" && route !== "data-management" ? <WindowTitle title={windowTitle} /> : null}
-    {route === "providers-models" || route === "provider-wizard" || route === "file-editor" || settingsRoute || route === "logs" || route === "runtime-settings" || route === "data-management" || route === "general-settings" || route === "image-context" ? <View style={[styles.windowContent, compactStyles.windowContent, styles.windowContentFixed, route === "file-editor" && styles.fileEditorRouteContent, route === "providers-models" && styles.providersContent, route === "provider-wizard" && styles.providerWizardRouteContent, settingsRoute && styles.assistantSettingsContent, route === "logs" && styles.logsContent, route === "runtime-settings" && styles.runtimeContent, route === "data-management" && styles.dataManagementContent]}>
-    {route === "providers-models" ? <ProviderWorkspace snapshot={snapshot} ipc={ipc} onSnapshot={onSnapshot} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onStatus={setResult} onSecretState={onSecretState} applyProbedSurface={applyProbedSurface} onOpenWizard={() => { if (Platform.OS === "windows") onNavigate("provider-wizard"); native.window.open("provider-wizard"); }} relay={relayBridge} addOfficialAccount={addOfficialAccount} /> : null}
+    {route === "providers-models" || route === "provider-wizard" || route === "file-editor" || settingsRoute || route === "logs" || route === "runtime-settings" || route === "data-management" || route === "general-settings" ? <View style={[styles.windowContent, compactStyles.windowContent, styles.windowContentFixed, route === "file-editor" && styles.fileEditorRouteContent, route === "providers-models" && styles.providersContent, route === "provider-wizard" && styles.providerWizardRouteContent, settingsRoute && styles.assistantSettingsContent, route === "logs" && styles.logsContent, route === "runtime-settings" && styles.runtimeContent, route === "data-management" && styles.dataManagementContent]}>
+    {route === "providers-models" ? <ProviderWorkspace snapshot={snapshot} ipc={ipc} onSnapshot={onSnapshot} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onStatus={setResult} onSecretState={onSecretState} applyProbedSurface={applyProbedSurface} onOpenWizard={() => { if (Platform.OS === "windows") { native.window.open("provider-wizard"); } else { onNavigate("provider-wizard"); native.window.open("provider-wizard"); } }} relay={relayBridge} addOfficialAccount={addOfficialAccount} /> : null}
     {route === "file-editor" ? <FileEditorWorkspace file={inlineEditorFile} fileId={fileIdRequest} nativeAction={nativeAction} ipc={ipc} native={native} translate={translate} busy={busy} onEditorConflict={resolveRawEditorConflict} reloadToken={settingsRawReloadToken} baselineToken={settingsRawBaselineToken} syncRevision={snapshot?.revision} onFlushPendingFields={flushPendingFields} onClose={closeRoute} /> : null}
     {route === "provider-wizard" ? <ProviderSetupWizard snapshot={snapshot} native={native} providers={providerWizardProviders} relaySources={providerWizardRelaySources} relayStations={providerWizardRelayStations} busy={busy} translate={translate} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onStatus={setResult} onClose={closeRoute} onKeyToken={registerProviderWizardKeyToken} relay={relayBridge} addOfficialAccount={addOfficialAccount} status={result} /> : null}
     {settingsRoute ? <AssistantSettingsWorkspace busy={busy} native={native} codexModels={codexModelRows} codexModelCatalogEnabled={codexModelCatalogEnabled} standaloneSearch={codexStandaloneSearch} onToggleStandaloneSearch={(enabled) => dispatch("codex.search.set", { enabled }, "codex")} codexFeatures={(domainState(snapshot, "codex").structured as UnknownRecord | undefined)?.features as UnknownRecord | undefined} clientProvider={codexClientProvider} clientModel={codexClientModel} localApiActive={codexUsesLocalApi} onToggleCodexModelCatalog={(enabled) => dispatch("codex.model_catalog.set", { enabled }, "codex")} onToggleCodexFeature={(feature, enabled) => dispatch("codex.feature.set", { feature, enabled }, "codex")} onUseLocalApi={(selection) => dispatch("use_local_api", selection, "codex")} onUseSavedModel={(selection) => dispatch("use_saved_model", selection, "codex")} translate={translate} ipc={ipc} filesToken={settingsRawBaselineToken} onOpenFile={openAssistantFile} /> : null}
     {route === "logs" ? <LogsWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} translate={translate} dispatch={dispatch} onStatus={setResult} onStatusBar={setStatusBarControls} requestedTab={nativeAction?.id === "open-recovery" ? "recovery" : logTabRequest} requestedTabKey={nativeAction?.sequence ?? 0} /> : null}
     {route === "general-settings" ? <GeneralWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} dispatch={dispatch} dispatchServiceAction={enqueueServiceDispatch} translate={translate} onStatus={setResult} onSnapshot={onSnapshot} /> : null}
     {route === "runtime-settings" ? <RuntimeWorkspace snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} clearSecret={clearSecret} native={native} ipc={ipc} /> : null}
-    {route === "image-context" ? <ImageContextWorkspace snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} ipc={ipc} native={native} /> : null}
     {route === "data-management" ? <DataManagementWorkspace snapshot={snapshot} tab={dataManagementTab} onTabChange={setDataManagementTab} statuses={dataManagementStatuses} busy={busy} webDavOperationBusy={webDavOperationBusy} translate={translate} dispatch={dispatchDataManagement} onSecretState={onSecretState} onFlushPendingFields={flushPendingFields} onTabSwitchError={(tab, reason) => setDataManagementStatuses((current) => ({ ...current, [tab]: errorMessage(reason, translate) }))} onInspectImport={inspectImportDataManagement} onImport={importDataManagement} onConfirmImportReplace={confirmImportDraftReplacement} onExport={exportDataManagement} onProbeWebDav={probeWebDav} onSyncWebDav={syncWebDav} onCommitWebDavSettings={commitWebDavSettings} /> : null}
     </View> : null}
     {/* One permanent status strip per settings window: the last result replaces
@@ -3815,6 +3838,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
 
   // Keep window geometry aligned with the embedded sign-in step.
   useEffect(() => {
+    if (Platform.OS === "windows") return;
     const showingSignIn = loginPhase === "sign-in";
     void native.window.setContentSize?.("provider-wizard", showingSignIn ? 900 : 620, showingSignIn ? 620 : 460);
   }, [loginPhase, native.window]);
@@ -6849,24 +6873,71 @@ function TablePane({ title, actions, wide, style, children }: { title: string; a
  * fades out after a scroll, and horizontal scrolling is left to scroll views
  * that own their own horizontal affordance.
  */
-const PersistentScrollView = React.forwardRef<ScrollView, ScrollViewProps & { onViewportHeightChange?: (height: number) => void; onContentHeightChange?: (height: number) => void }>(function PersistentScrollView({ style, contentContainerStyle, children, onViewportHeightChange, onContentHeightChange, onLayout, onContentSizeChange, ...props }, ref): React.JSX.Element {
-  // The indicator stays inside the scroll view: the native leaf resolves the
-  // scroll view by walking its ancestors (`nearestScrollView`), so lifting it
-  // out of the tree leaves it managing nothing.  It rides the content container
-  // instead, which is why its own frame must not depend on the content's
-  // height — see `persistentScrollIndicator`.
-  return <ScrollView
-    {...props}
-    ref={ref}
-    style={style}
-    contentContainerStyle={contentContainerStyle}
-    showsHorizontalScrollIndicator={false}
-    onLayout={(event) => { onViewportHeightChange?.(event.nativeEvent.layout.height); onLayout?.(event); }}
-    onContentSizeChange={(width, height) => { onContentHeightChange?.(height); onContentSizeChange?.(width, height); }}
-  >
-    {children}
-    <NativePersistentScrollIndicator style={styles.persistentScrollIndicator} />
-  </ScrollView>;
+const PersistentScrollView = React.forwardRef<ScrollView, ScrollViewProps & { onViewportHeightChange?: (height: number) => void; onContentHeightChange?: (height: number) => void }>(function PersistentScrollView({ style, contentContainerStyle, children, onViewportHeightChange, onContentHeightChange, onLayout, onContentSizeChange, onScroll, scrollEventThrottle, ...props }, ref): React.JSX.Element {
+  // macOS keeps the AppKit leaf: it resolves the scroll view by walking its
+  // ancestors, so the indicator has to stay inside the ScrollView's content.
+  // Windows' native WinUI scrollbar draws through the platform theme, which
+  // this composition host leaves empty (every platform brush is null), so the
+  // bar was invisible even while the view scrolled.  The Windows branch draws
+  // the same quiet 4 pt overlay thumb itself and hides the unused native one.
+  const contentHeight = useRef(0);
+  const viewportHeight = useRef(0);
+  const thumbOffset = useRef(new Animated.Value(0)).current;
+  const [thumbHeight, setThumbHeight] = useState(0);
+  const [overflowing, setOverflowing] = useState(false);
+  const updateMetrics = (nextContent?: number, nextViewport?: number): void => {
+    if (nextContent !== undefined) contentHeight.current = nextContent;
+    if (nextViewport !== undefined) viewportHeight.current = nextViewport;
+    const content = contentHeight.current;
+    const viewport = viewportHeight.current;
+    const nextOverflowing = content > viewport + 1;
+    setOverflowing(nextOverflowing);
+    if (nextOverflowing) setThumbHeight(Math.max(24, (viewport * viewport) / content));
+  };
+  const handleScroll = (event: Parameters<NonNullable<ScrollViewProps["onScroll"]>>[0]): void => {
+    const content = contentHeight.current;
+    const viewport = viewportHeight.current;
+    if (content > viewport + 1) {
+      const thumb = Math.max(24, (viewport * viewport) / content);
+      const maxThumb = Math.max(0, viewport - thumb - 4);
+      const maxScroll = Math.max(1, content - viewport);
+      thumbOffset.setValue(Math.max(0, Math.min(maxThumb, (event.nativeEvent.contentOffset.y / maxScroll) * maxThumb)));
+    }
+    onScroll?.(event);
+  };
+  if (Platform.OS === "macos") {
+    return <ScrollView
+      {...props}
+      ref={ref}
+      style={style}
+      contentContainerStyle={contentContainerStyle}
+      showsHorizontalScrollIndicator={false}
+      scrollEventThrottle={scrollEventThrottle}
+      onScroll={onScroll}
+      onLayout={(event) => { onViewportHeightChange?.(event.nativeEvent.layout.height); onLayout?.(event); }}
+      onContentSizeChange={(width, height) => { onContentHeightChange?.(height); onContentSizeChange?.(width, height); }}
+    >
+      {children}
+      <NativePersistentScrollIndicator style={styles.persistentScrollIndicator} />
+    </ScrollView>;
+  }
+  return <View style={[styles.persistentScrollHost, style]}>
+    <ScrollView
+      {...props}
+      ref={ref}
+      style={styles.persistentScrollFill}
+      contentContainerStyle={contentContainerStyle}
+      showsHorizontalScrollIndicator={false}
+      showsVerticalScrollIndicator={false}
+      scrollEventThrottle={scrollEventThrottle ?? 16}
+      onScroll={handleScroll}
+      onLayout={(event) => { updateMetrics(undefined, event.nativeEvent.layout.height); onViewportHeightChange?.(event.nativeEvent.layout.height); onLayout?.(event); }}
+      onContentSizeChange={(width, height) => { updateMetrics(height); onContentHeightChange?.(height); onContentSizeChange?.(width, height); }}
+    >
+      {children}
+    </ScrollView>
+    {overflowing && thumbHeight > 0 ? <Animated.View pointerEvents="none" style={[styles.persistentScrollThumb, { height: thumbHeight, transform: [{ translateY: thumbOffset }] }]} /> : null}
+  </View>;
 });
 
 // One public model's own settings: the client-facing name, the limits its
@@ -8863,9 +8934,38 @@ function AssistantSettingsWorkspace({ busy, native, codexModels, codexModelCatal
 }
 
 function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServiceAction, translate, onStatus, onSnapshot }: { snapshot?: CoreSnapshot; ipc: IpcClient; native: NativeLeafAdapter; busy: boolean; dispatch: Dispatch; dispatchServiceAction: (type: string) => Promise<unknown>; translate: Translate; onStatus: (message?: string) => void; onSnapshot: (next: CoreSnapshot) => void }): React.JSX.Element {
-  // The proxy API key is edited in the form itself. The value never enters
-  // React state: the native secret control reads it over Core's read-once
-  // lease and commits it back through the same capability.
+  // The proxy API key is the one credential the pane draws in the clear.  On
+  // Windows it is a plain text field over Core's native read/stage capability
+  // (the XAML-island secret leaf does not composite into this host); macOS
+  // keeps the inline native secure field.
+  const [masterKey, setMasterKey] = useState("");
+  useEffect(() => {
+    if (Platform.OS !== "windows" || !native.readSecret) return undefined;
+    let active = true;
+    void native.readSecret({ domain: "runtime", field: "setting", target: "YOUNG_ROUTER_MASTER_KEY" })
+      .then((result) => { if (active && result) setMasterKey(result.value ?? ""); })
+      .catch(() => undefined);
+    return () => { active = false; };
+  }, [native]);
+  const commitMasterKey = async (next: string): Promise<void> => {
+    const value = next.trim();
+    if (!value) {
+      onStatus(translate("providers.wizard.required"));
+      return;
+    }
+    try {
+      const staged = await native.stageSecret?.({
+        domain: "runtime",
+        field: "setting",
+        target: "YOUNG_ROUTER_MASTER_KEY",
+        value,
+      });
+      if (!staged) throw new Error(translate("error.coreUnavailable"));
+      onStatus(translate("common.saved"));
+    } catch (reason: unknown) {
+      onStatus(errorMessage(reason, translate));
+    }
+  };
   const [autoStartBusy, setAutoStartBusy] = useState(false);
   const [serviceBusy, setServiceBusy] = useState(false);
   const [requestedAutoStart, setRequestedAutoStart] = useState<boolean>();
@@ -8896,17 +8996,28 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
   // native lease, and no snapshot ever carries it. Both hosts use this
   // embedded field; the old native dialog remains only as an unused
   // compatibility capability for older callers.
-  const masterKeyField = <NativeSecretInputControl
-    label={translate("general.apiKey")}
-    hint={translate("general.apiKeyPlaceholder")}
-    busy={busy || snapshot === undefined}
-    domain="runtime"
-    field="setting"
-    target="YOUNG_ROUTER_MASTER_KEY"
-    plainText
-    autoCommit
-    onSecretState={(state) => { if (state.status === "error" && state.error !== "") onStatus(state.error); }}
-  />;
+  // The Windows composition host cannot draw the XAML-island secret input
+  // (the island's PasswordBox is not composited into the React surface), so
+  // this pane keeps the host's native secret editor until that leaf is
+  // replaced. macOS draws the same field inline in the shared form.
+  const masterKeyField = Platform.OS === "windows"
+    ? <RuntimeValueField
+      label={translate("general.apiKey")}
+      value={masterKey}
+      onCommit={commitMasterKey}
+      validate={(next) => next.trim() ? undefined : translate("providers.wizard.required")}
+    />
+    : <NativeSecretInputControl
+      label={translate("general.apiKey")}
+      hint={translate("general.apiKeyPlaceholder")}
+      busy={busy || snapshot === undefined}
+      domain="runtime"
+      field="setting"
+      target="YOUNG_ROUTER_MASTER_KEY"
+      plainText
+      autoCommit
+      onSecretState={(state) => { if (state.status === "error" && state.error !== "") onStatus(state.error); }}
+    />;
   const validatePort = (next: string): string | undefined => {
     const trimmed = next.trim();
     if (!/^\d+$/.test(trimmed)) return translate("runtime.invalidInteger");
@@ -9036,7 +9147,7 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
       </View>
       <View style={styles.generalRow}>
         <Text style={styles.generalRowLabel}>{translate("general.port")}</Text>
-        <RuntimeValueField label={translate("general.port")} value={portValue} keyboardType="numeric" validate={validatePort} onCommit={(next) => dispatch("set_setting", { key: "LITELLM_PORT", value: next })} />
+        <RuntimeValueField label={translate("general.port")} value={portValue} keyboardType="numeric" validate={validatePort} onCommit={(next) => dispatch("set_setting", { key: "LITELLM_PORT", value: next }, "runtime")} />
       </View>
       <View style={styles.generalHelpSlot}><Text style={styles.generalHelpText}>{translate("general.portHint", { default: portDefault })}</Text></View>
       <View style={styles.generalRow}>
@@ -9073,6 +9184,7 @@ function RuntimeWorkspace({ snapshot, busy, translate, dispatch, onSecretState, 
   const [activeCategory, setActiveCategory] = useState("");
   // The task list is a surface of its own: it grows with the conversations the
   // pass has seen, so it opens over the pane instead of lengthening it.
+  const [imageContextOpen, setImageContextOpen] = useState(false);
   const selectedCategory = categories.includes(activeCategory) ? activeCategory : (categories[0] ?? "");
   const tocRows = useMemo(() => categories.map((name) => ({ key: name, cells: [runtimeCategoryLabel(name, translate)] })), [categories, translate]);
   const dshSyncToken = DSH_VISION_ROUTER_QUICK_KEYS.map((key) => `${key}:${stringValue(settings.find((item) => identifier(item) === key)?.value)}`).join("|");
@@ -9091,11 +9203,12 @@ function RuntimeWorkspace({ snapshot, busy, translate, dispatch, onSecretState, 
             the new category instead of inheriting the previous scroll offset. */}
         <PersistentScrollView key={selectedCategory} style={styles.runtimeScrollSurface} contentContainerStyle={styles.runtimeWorkspace}>
           {selectedCategory === "" ? <EmptyState translate={translate} /> : <View style={styles.runtimeFieldList}>{(groups[selectedCategory] ?? []).map((item) => <RuntimeField key={identifier(item)} item={item} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} clearSecret={clearSecret} dshSyncToken={dshSyncToken} />)}
-            {selectedCategory === IMAGE_CONTEXT_CATEGORY ? <ImageContextWindowLink snapshot={snapshot} busy={busy} translate={translate} native={native} /> : null}
+            {selectedCategory === IMAGE_CONTEXT_CATEGORY ? <ImageContextWindowLink snapshot={snapshot} busy={busy} translate={translate} onOpen={() => setImageContextOpen(true)} /> : null}
           </View>}
         </PersistentScrollView>
       </View>
     </View>
+    {imageContextOpen ? <ImageContextPanel snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} ipc={ipc} onClose={() => setImageContextOpen(false)} /> : null}
   </View>;
 }
 
@@ -9116,13 +9229,13 @@ function RuntimeWorkspace({ snapshot, busy, translate, dispatch, onSecretState, 
  * person override any single image.
  */
 /** The line the runtime pane keeps: what the pass is doing, and a way in. */
-function ImageContextWindowLink({ snapshot, busy, translate, native }: { snapshot?: CoreSnapshot; busy: boolean; translate: Translate; native: NativeLeafAdapter }): React.JSX.Element {
+function ImageContextWindowLink({ snapshot, busy, translate, onOpen }: { snapshot?: CoreSnapshot; busy: boolean; translate: Translate; onOpen: () => void }): React.JSX.Element {
   const state = domainState(snapshot, "image_context");
   const tasks = asRecords(state.tasks);
   const environment = asRecord(state.environment);
   return <View style={styles.runtimeField}>
     <View style={styles.runtimeImageRow}>
-      <ActionButton title={translate("imageContext.open")} titleWidth="auto" disabled={busy} onPress={() => { native.window.open("image-context"); native.window.focus("image-context"); }} />
+      <ActionButton title={translate("imageContext.open")} titleWidth="auto" disabled={busy} onPress={onOpen} />
       <Text style={styles.externalSettingsHelpText}>{translate("imageContext.openHint", { tasks: String(tasks.length) })}</Text>
     </View>
     <View style={styles.runtimeImageRow}>
@@ -9132,7 +9245,7 @@ function ImageContextWindowLink({ snapshot, busy, translate, native }: { snapsho
   </View>;
 }
 
-function ImageContextWorkspace({ snapshot, busy, translate, dispatch, ipc, native }: { snapshot?: CoreSnapshot; busy: boolean; translate: Translate; dispatch: Dispatch; ipc: IpcClient; native: NativeLeafAdapter }): React.JSX.Element {
+function ImageContextPanel({ snapshot, busy, translate, dispatch, ipc, onClose }: { snapshot?: CoreSnapshot; busy: boolean; translate: Translate; dispatch: Dispatch; ipc: IpcClient; onClose: () => void }): React.JSX.Element {
   const state = domainState(snapshot, "image_context");
   const tasks = asRecords(state.tasks);
   const environment = asRecord(state.environment);
@@ -9181,13 +9294,12 @@ function ImageContextWorkspace({ snapshot, busy, translate, dispatch, ipc, nativ
     // itself, so a tick can only mean "send this every turn" (pinned).
     void dispatch(automatic ? "pin" : "set", automatic ? { task: selectedTaskId, id, pinned: included } : { task: selectedTaskId, id, included }, "image_context");
   };
-  return <View style={styles.imageContextWindow}>
+  return <View style={styles.imageContextBackdrop}>
+    <View style={styles.imageContextWindow}>
     <View style={styles.imageContextHeader}>
-      <View style={styles.imageContextHeaderTitle}>
-        <Text style={styles.imageContextTitle}>{translate("status.imageContext")}</Text>
-        <Text numberOfLines={2} style={styles.imageContextLead}>{translate("imageContext.lead")}</Text>
-      </View>
-      <ActionButton title={translate("status.close")} titleWidth="auto" onPress={() => native.window.close("image-context")} />
+      {/* The title bar already names this surface, so the body opens straight
+          into what the reader needs to know. */}
+      <Text style={styles.imageContextLead}>{translate("imageContext.lead")}</Text>
     </View>
     <View style={styles.imageContextBody}>
       <View style={styles.imageContextList}>
@@ -9206,7 +9318,10 @@ function ImageContextWorkspace({ snapshot, busy, translate, dispatch, ipc, nativ
               style={[styles.imageContextTaskRow, id === selectedTaskId && styles.imageContextTaskRowSelected]}
             >
               <Text numberOfLines={1} style={[styles.imageContextTaskCount, id === selectedTaskId && styles.imageContextSelectedText]}>{translate("imageContext.taskChip", { images: String(numberValue(item.images, 0)), at: stringValue(item.updated_at).slice(5, 16).replace("T", " ") })}</Text>
-              <Text numberOfLines={1} style={styles.imageContextTaskId}>{id}</Text>
+              {/* Both lines of a selected row sit on the selection ink, so both
+                  take its text colour; a secondary grey on blue reads as a
+                  disabled row. */}
+              <Text numberOfLines={1} style={[styles.imageContextTaskId, id === selectedTaskId && styles.imageContextSelectedText]}>{id}</Text>
             </Pressable>;
           }}
         />}
@@ -9255,6 +9370,12 @@ function ImageContextWorkspace({ snapshot, busy, translate, dispatch, ipc, nativ
         {preview.dataUrl ? null : <Text style={styles.imageContextHelp}>{translate("imageContext.noPreview")}</Text>}
         <ActionButton title={translate("status.close")} titleWidth="auto" onPress={() => setPreview(undefined)} />
       </View> : null}
+    </View>
+    {/* The way out sits at the end of the window, under the content it closes,
+        the way the app's other child surfaces put theirs. */}
+    <View style={styles.imageContextFooter}>
+      <ActionButton title={translate("status.close")} titleWidth="auto" onPress={onClose} />
+    </View>
     </View>
   </View>;
 }
@@ -12629,10 +12750,10 @@ const styles = StyleSheet.create({
   runtimeImageThumbPicture: { width: 148, height: 96, resizeMode: "contain" },
   runtimeImageThumbFallback: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE },
   runtimeImageCellLabel: { color: systemColors.label, fontSize: UI_TIP_FONT_SIZE, fontWeight: "600" },
-  imageContextWindow: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window },
-  imageContextHeader: { flexShrink: 0, flexDirection: "row", alignItems: "flex-start", gap: 12, paddingHorizontal: 18, paddingTop: SETTINGS_TITLEBAR_INSET + 12, paddingBottom: 10, borderBottomWidth: 1, borderBottomColor: systemColors.separator },
-  imageContextHeaderTitle: { flex: 1, minWidth: 0, gap: 3 },
-  imageContextTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600" },
+  imageContextBackdrop: { position: "absolute", top: 0, left: 0, right: 0, bottom: 0, alignItems: "center", justifyContent: "center", padding: 12, backgroundColor: "rgba(0, 0, 0, 0.16)" },
+  imageContextWindow: { width: "100%", maxWidth: 900, maxHeight: "100%", minHeight: 0, flex: 1, borderRadius: 10, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.window, overflow: "hidden" },
+  imageContextHeader: { flexShrink: 0, paddingHorizontal: 18, paddingTop: 12, paddingBottom: 10, borderBottomWidth: 1, borderBottomColor: systemColors.separator },
+  imageContextFooter: { flexShrink: 0, flexDirection: "row", alignItems: "center", justifyContent: "flex-end", gap: 10, paddingHorizontal: 18, paddingVertical: 10, borderTopWidth: 1, borderTopColor: systemColors.separator },
   imageContextLead: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16 },
   imageContextBody: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row" },
   imageContextList: { width: 232, flexShrink: 0, minHeight: 0, borderRightWidth: 1, borderRightColor: systemColors.separator },
@@ -12733,15 +12854,15 @@ const styles = StyleSheet.create({
   root: { flex: 1, minWidth: 420 },
   menuBarHost: { flex: 1 }, error: { margin: 20, color: systemColors.red, fontSize: UI_FONT_SIZE },
   startupLoading: { flex: 1, alignItems: "center", justifyContent: "center" }, startupLoadingText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
-  windowSurface: { flex: 1, position: "relative", backgroundColor: systemColors.window }, windowContent: { flexGrow: 1, paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, gap: 8 }, windowContentFixed: { flex: 1, minHeight: 0 }, fileEditorRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providersContent: { paddingBottom: 6, gap: 6 }, providerWizardRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providerWizardSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, logsContent: { paddingHorizontal: 12, paddingTop: 12, paddingBottom: 0 }, runtimeContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, dataManagementContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, assistantSettingsContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, windowTitleBlock: { paddingHorizontal: 20, paddingTop: 12, paddingBottom: 3, gap: 3 }, windowTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
+  windowSurface: { flex: 1, position: "relative", backgroundColor: systemColors.window }, windowsChildModalSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, windowContent: { flexGrow: 1, paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, gap: 8 }, windowContentFixed: { flex: 1, minHeight: 0 }, fileEditorRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providersContent: { paddingBottom: 6, gap: 6 }, providerWizardRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providerWizardSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, logsContent: { paddingHorizontal: 12, paddingTop: 12, paddingBottom: 0 }, runtimeContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, dataManagementContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, assistantSettingsContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, windowTitleBlock: { paddingHorizontal: 20, paddingTop: 12, paddingBottom: 3, gap: 3 }, windowTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
   // Settings window: a native source-list sidebar next to the active pane.
-  settingsShellFrame: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, settingsShellHeader: { flexShrink: 0, flexDirection: "row", minWidth: 0, backgroundColor: systemColors.window, borderBottomWidth: 1, borderBottomColor: systemColors.separator }, settingsShell: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row" }, settingsSidebar: { width: 200, minWidth: 0, flexShrink: 0, minHeight: 0 }, settingsSidebarHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 16, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarHeaderIntegrated: { width: 200, height: SETTINGS_TITLEBAR_INSET + 38, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarAppIcon: { width: SETTINGS_HEADER_CONTENT_HEIGHT, height: SETTINGS_HEADER_CONTENT_HEIGHT, borderRadius: 4 }, settingsSidebarTitle: { color: systemColors.label, fontSize: SOURCE_LIST_FONT_SIZE, fontWeight: "600" }, settingsSidebarSpacer: { height: 8, flexShrink: 0 }, settingsSidebarList: { flex: 1, minWidth: 0, minHeight: 0 }, settingsPaneHeader: { flexShrink: 0, paddingHorizontal: 20, paddingTop: 10, paddingBottom: 8 }, settingsPaneHeaderIntegrated: { flex: 1, minWidth: 0, height: SETTINGS_TITLEBAR_INSET + 38, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsDetail: { minWidth: 0, flex: 1, paddingTop: SETTINGS_TITLEBAR_INSET }, settingsDetailIntegrated: { paddingTop: 0 }, settingsDetailBody: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsDetailBodyBare: { backgroundColor: "transparent" }, settingsDetailPane: { flex: 1, minWidth: 0 }, settingsPaneTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600", lineHeight: SETTINGS_HEADER_CONTENT_HEIGHT }, settingsRail: { width: SETTINGS_RAIL_WIDTH, flexShrink: 0, minHeight: 0, paddingTop: 6, overflow: "hidden" }, settingsRailList: { flex: 1, minHeight: 0 }, settingsRailDivider: { position: "absolute", top: 0, bottom: 0, right: 0, width: 1, backgroundColor: systemColors.separator }, settingsRailDetail: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsRailDetailHeader: { minHeight: 50, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 14, paddingVertical: 8, backgroundColor: systemColors.window }, settingsRailDetailTitleBlock: { flex: 1, minWidth: 0, gap: 2 }, settingsRailDetailActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, settingsRailDetailTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, settingsRailDetailHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16 },
+  settingsShellFrame: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, settingsShellHeader: { flexShrink: 0, flexDirection: "row", minWidth: 0, backgroundColor: systemColors.window, borderBottomWidth: 1, borderBottomColor: systemColors.separator }, settingsShell: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row" }, settingsSidebar: { width: 200, minWidth: 0, flexShrink: 0, minHeight: 0 }, settingsSidebarHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 16, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarHeaderIntegrated: { width: 200, height: SETTINGS_TITLEBAR_INSET + 38, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarHeaderWindows: { backgroundColor: "#f3f3f3" }, settingsSidebarWindows: { backgroundColor: "#f3f3f3", borderRightWidth: 1, borderRightColor: "#e5e5e5" }, settingsSidebarAppIcon: { width: SETTINGS_HEADER_CONTENT_HEIGHT, height: SETTINGS_HEADER_CONTENT_HEIGHT, borderRadius: 4 }, settingsSidebarTitle: { color: systemColors.label, fontSize: SOURCE_LIST_FONT_SIZE, fontWeight: "600" }, settingsSidebarSpacer: { height: 8, flexShrink: 0 }, settingsSidebarList: { flex: 1, minWidth: 0, minHeight: 0 }, settingsPaneHeader: { flexShrink: 0, paddingHorizontal: 20, paddingTop: 10, paddingBottom: 8 }, settingsPaneHeaderIntegrated: { flex: 1, minWidth: 0, height: SETTINGS_TITLEBAR_INSET + 38, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsDetail: { minWidth: 0, flex: 1, paddingTop: SETTINGS_TITLEBAR_INSET }, settingsDetailIntegrated: { paddingTop: 0 }, settingsDetailBody: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsDetailBodyBare: { backgroundColor: "transparent" }, settingsDetailPane: { flex: 1, minWidth: 0 }, settingsPaneTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600", lineHeight: SETTINGS_HEADER_CONTENT_HEIGHT }, settingsRail: { width: SETTINGS_RAIL_WIDTH, flexShrink: 0, minHeight: 0, paddingTop: 6, overflow: "hidden" }, settingsRailList: { flex: 1, minHeight: 0 }, settingsRailDivider: { position: "absolute", top: 0, bottom: 0, right: 0, width: 1, backgroundColor: systemColors.separator }, settingsRailDetail: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsRailDetailHeader: { minHeight: 50, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 14, paddingVertical: 8, backgroundColor: systemColors.window }, settingsRailDetailTitleBlock: { flex: 1, minWidth: 0, gap: 2 }, settingsRailDetailActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, settingsRailDetailTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, settingsRailDetailHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16 },
   routeStatusBar: { minHeight: 24, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, justifyContent: "space-between", paddingHorizontal: 16, paddingVertical: 2, borderTopWidth: 1, borderTopColor: systemColors.separator },
   // The usage pager is the window's status bar on this tab: the row count stays
   // on the left where every other route states its status, and the page controls
   // sit on the right of that same row rather than in a strip above the table.
   usageStatusBar: { minHeight: 24, flexShrink: 0, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8, paddingHorizontal: 16, paddingVertical: 2, borderTopWidth: 1, borderTopColor: systemColors.separator }, routeStatusText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE },
-  generalScroll: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, generalContent: { paddingTop: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, paddingBottom: 16, gap: 18 }, generalSection: { gap: 4 }, generalSectionTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, generalRow: { ...SETTINGS_FIELD_ROW_INDENTED }, generalRowLabel: { ...SETTINGS_FIELD_LABEL }, generalRowValue: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, generalToggle: { ...SETTINGS_FIELD_SWITCH_SLOT }, generalHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }, generalHelpText: { ...SETTINGS_FIELD_HELP_TEXT }, generalServiceAction: { minWidth: 96 }, generalApiKeyField: { flex: 1, minWidth: 0, maxWidth: 320 }, providerToolbar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardToolbarButton: { minWidth: 104 }, toolbarSpacer: { flex: 1 }, windowTabsRow: { flex: 1, minWidth: 0, height: 28, flexDirection: "row", alignItems: "center", gap: 8 }, windowTabsToolbarRow: { flex: 1, minWidth: 0, width: "100%", height: 24, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 6, overflow: "hidden" }, windowTabs: { width: 224, height: 24 }, windowTabsWithActions: { flexShrink: 1 }, windowTabsActions: { flex: 1, minWidth: 0, maxWidth: 400, marginLeft: "auto", flexShrink: 0 },
+  generalScroll: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, generalContent: { paddingTop: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, paddingBottom: 16, gap: 18 }, generalSection: { gap: 4 }, generalSectionTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, generalRow: { ...SETTINGS_FIELD_ROW_INDENTED }, generalRowLabel: { ...SETTINGS_FIELD_LABEL }, generalRowValue: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, generalToggle: { ...SETTINGS_FIELD_SWITCH_SLOT }, generalHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }, generalHelpText: { ...SETTINGS_FIELD_HELP_TEXT }, generalServiceAction: { minWidth: 96 }, generalApiKeyField: { flex: 1, minWidth: 0, maxWidth: 320 }, generalApiKeyButton: { minWidth: 96, alignSelf: "flex-start" }, providerToolbar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardToolbarButton: { minWidth: 104 }, toolbarSpacer: { flex: 1 }, windowTabsRow: { flex: 1, minWidth: 0, height: 28, flexDirection: "row", alignItems: "center", gap: 8 }, windowTabsToolbarRow: { flex: 1, minWidth: 0, width: "100%", height: 24, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 6, overflow: "hidden" }, windowTabs: { width: 224, height: 24 }, windowTabsWithActions: { flexShrink: 1 }, windowTabsActions: { flex: 1, minWidth: 0, maxWidth: 400, marginLeft: "auto", flexShrink: 0 },
   providerWizardSetupContent: { flex: 1, minHeight: 0, justifyContent: "flex-start", alignItems: "center", paddingHorizontal: 24, paddingTop: 18, paddingBottom: 12 }, providerWizardSetupSurface: { width: "100%", maxWidth: 520, minWidth: 0, gap: 12 }, providerWizardSetupSurfaceModel: { flex: 1, minHeight: 0 }, providerWizardSignInPanel: { width: "100%", minHeight: 160, justifyContent: "center", gap: 8, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 7, backgroundColor: systemColors.control, paddingHorizontal: 16, paddingVertical: 18 }, providerWizardAuthRow: { minHeight: 30, flexDirection: "row", alignItems: "center", gap: 8 }, providerWizardAuthStatus: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
   providerMiddlePane: { flex: 1, minWidth: 0, gap: 6 }, // The empty pane reads as the top of a list that has no rows yet, not as a
   // poster centred in a large window: it keeps the column's width and the
@@ -12799,7 +12920,7 @@ const styles = StyleSheet.create({
   // row is the same 24 pt row and starts at the pane's top with no extra inset,
   // so 供应商: <name> reads on one line with that button instead of sitting a few
   // points below it, and the sections under it keep the left column's row pitch.
-  providersLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 12 }, providerWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, providerLeftColumn: { flex: 1, minWidth: 0, minHeight: 0, gap: 6 }, providerModelColumns: { flex: 1, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }, routeWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, fetchKeyPicker: { width: 170, height: 24, marginRight: 6, flexShrink: 0 }, providerListPane: { width: 180, minWidth: 180, maxWidth: 180, flexGrow: 0, flexShrink: 0 }, modelListPane: { flex: 1, minWidth: 0 }, tablePane: { flex: 1, minWidth: 0, gap: 6 }, tablePaneWide: { flex: 1, minWidth: 0 }, tableTitleRow: { height: 24, flexDirection: "row", alignItems: "center" }, tableTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, tableActions: { marginLeft: "auto", flexDirection: "row", gap: 6 }, iconButton: { minWidth: 22, width: 22, minHeight: 22, height: 22, alignItems: "center", justifyContent: "center" }, tableBottomRow: { minHeight: 26, flexDirection: "row", alignItems: "center" }, nativeProviderTable: { flex: 1, minHeight: 0 }, nativeModelTable: { flex: 1, minHeight: 0 }, modelTable: { flex: 1, minHeight: 0 }, nativeRouteTable: { flex: 1, minHeight: 0 }, providerInspector: { width: 320, minWidth: 260, maxWidth: 360, flexGrow: 0, flexShrink: 1 }, providerEditorContent: { flex: 1, minHeight: 0 }, providerEditorScrollContent: { paddingLeft: 0, paddingRight: 16, paddingBottom: 12, gap: 6 }, persistentScrollIndicator: { position: "absolute", width: 0, height: 0 }, providerEditorHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerEditorHeading: { flex: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerReturnToModel: { flexShrink: 1 }, providerEditorSection: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 3, gap: 4 }, providerEnabledRow: { minHeight: 22, flexDirection: "row", alignItems: "center" }, providerSourceFields: { minWidth: 0, gap: 4 }, inspectorContent: { paddingLeft: 0, paddingRight: 6, paddingBottom: 12, gap: 6 }, inspectorBody: { gap: 4 }, modelBreadcrumb: { minHeight: 24, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 4 }, breadcrumbProvider: { flexShrink: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, breadcrumbSeparator: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorHeading: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorDivider: { height: 1, backgroundColor: systemColors.separator }, inspectorEnabledRow: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, // A link is also a cursor: the row shows the pointing hand over the whole
+  providersLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 12 }, providerWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, providerLeftColumn: { flex: 1, minWidth: 0, minHeight: 0, gap: 6 }, providerModelColumns: { flex: 1, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }, routeWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, fetchKeyPicker: { width: 170, height: 24, marginRight: 6, flexShrink: 0 }, providerListPane: { width: 180, minWidth: 180, maxWidth: 180, flexGrow: 0, flexShrink: 0 }, modelListPane: { flex: 1, minWidth: 0 }, tablePane: { flex: 1, minWidth: 0, gap: 6 }, tablePaneWide: { flex: 1, minWidth: 0 }, tableTitleRow: { height: 24, flexDirection: "row", alignItems: "center" }, tableTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, tableActions: { marginLeft: "auto", flexDirection: "row", gap: 6 }, iconButton: { minWidth: 22, width: 22, minHeight: 22, height: 22, alignItems: "center", justifyContent: "center" }, tableBottomRow: { minHeight: 26, flexDirection: "row", alignItems: "center" }, nativeProviderTable: { flex: 1, minHeight: 0 }, nativeModelTable: { flex: 1, minHeight: 0 }, modelTable: { flex: 1, minHeight: 0 }, nativeRouteTable: { flex: 1, minHeight: 0 }, providerInspector: { width: 320, minWidth: 260, maxWidth: 360, flexGrow: 0, flexShrink: 1 }, providerEditorContent: { flex: 1, minHeight: 0 }, providerEditorScrollContent: { paddingLeft: 0, paddingRight: 16, paddingBottom: 12, gap: 6 }, persistentScrollIndicator: { position: "absolute", width: 0, height: 0 }, persistentScrollHost: { position: "relative", flex: 1, minHeight: 0 }, persistentScrollFill: { flex: 1, minHeight: 0 }, persistentScrollThumb: { position: "absolute", top: 2, right: 2, width: 4, borderRadius: 2, backgroundColor: "rgba(96,96,96,0.55)" }, providerEditorHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerEditorHeading: { flex: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerReturnToModel: { flexShrink: 1 }, providerEditorSection: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 3, gap: 4 }, providerEnabledRow: { minHeight: 22, flexDirection: "row", alignItems: "center" }, providerSourceFields: { minWidth: 0, gap: 4 }, inspectorContent: { paddingLeft: 0, paddingRight: 6, paddingBottom: 12, gap: 6 }, inspectorBody: { gap: 4 }, modelBreadcrumb: { minHeight: 24, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 4 }, breadcrumbProvider: { flexShrink: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, breadcrumbSeparator: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorHeading: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorDivider: { height: 1, backgroundColor: systemColors.separator }, inspectorEnabledRow: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, // A link is also a cursor: the row shows the pointing hand over the whole
 // finding, label included, exactly like every native link in the app.
 inspectorProbeFinding: { flexShrink: 1, minWidth: 0, cursor: "pointer" }, inspectorProbeFindingText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textDecorationLine: "underline" }, inspectorEnableControl: { flexShrink: 0 }, orderEditorRow: { width: "100%", minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, orderEditorField: { flex: 1, width: undefined }, orderFollowControl: { flexShrink: 0 }, modelWindowValue: { flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 6 }, modelWindowText: { flexShrink: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE }, modelWindowLink: { flexShrink: 0 }, protocolSettings: { gap: 4 }, helpTipAnchor: { position: "relative", zIndex: 2 }, helpTipDismiss: { position: "absolute", left: -2400, right: -2400, top: -2400, bottom: -2400 }, helpTipButton: { width: 16, height: 16, minWidth: 16, minHeight: 16 }, helpTipPopupLeft: { position: "absolute", left: 0, bottom: 22, width: 208, zIndex: 4, paddingHorizontal: 8, paddingVertical: 6, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.control, shadowColor: "#000000", shadowOpacity: 0.18, shadowRadius: 8, shadowOffset: { width: 0, height: 2 } }, helpTipPopup: { position: "absolute", right: 0, bottom: 22, width: 208, zIndex: 4, paddingHorizontal: 8, paddingVertical: 6, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.control, shadowColor: "#000000", shadowOpacity: 0.18, shadowRadius: 8, shadowOffset: { width: 0, height: 2 } }, helpTipText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
   externalSettingsWorkspace: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }, externalSettingsFieldList: { ...SETTINGS_FIELD_LIST }, externalSettingsField: { ...SETTINGS_FIELD }, externalSettingsInputRow: { ...SETTINGS_FIELD_ROW_INDENTED }, externalSettingsFieldLabel: { ...SETTINGS_FIELD_LABEL }, externalSettingsValueSlot: { ...SETTINGS_FIELD_ROUTE_SLOT }, externalSettingsBooleanControl: { ...SETTINGS_FIELD_SWITCH_SLOT }, externalSettingsHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }, externalSettingsHelpText: { ...SETTINGS_FIELD_HELP_TEXT }, externalSettingsPane: { flex: 1, minHeight: 0 }, externalSettingsPaneContent: { paddingVertical: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, gap: 14 }, codexRawEditorBase: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, minHeight: 0, gap: 5 }, codexRawEditorHeader: { minHeight: 18 }, codexRawEditorLabel: { fontFamily: Platform.select({ macos: "Menlo", windows: "Cascadia Mono", default: "monospace" }), fontWeight: "600" }, codexRawNativeEditor: { minHeight: 0 }, codexRawEditorLoading: { minHeight: 0 },

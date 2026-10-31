@@ -380,7 +380,7 @@ private enum NativeRelayOriginPolicy {
             // the screen only when the user opens the document it edits.
             configureImmediatePresentation(window)
             withoutAnimations { window.orderOut(nil) }
-        } else if windowRoute == "provider-wizard" || windowRoute == "file-editor" || windowRoute == "image-context" {
+        } else if windowRoute == "provider-wizard" || windowRoute == "file-editor" {
             // The wizard and the file editor are children of the workspace they
             // open from: each is its own movable window with the rest of the
             // app locked until it closes, exactly like the model chooser. A
@@ -2780,13 +2780,6 @@ private enum NativeRelayOriginPolicy {
                 minSize: NSSize(width: 720, height: 420),
                 maxSize: nil
             )
-        case "image-context":
-            // A task list beside a grid of pictures: room for four cards.
-            return RouteWindowLayout(
-                contentSize: NSSize(width: 900, height: 620),
-                minSize: NSSize(width: 720, height: 480),
-                maxSize: nil
-            )
         default:
             return RouteWindowLayout(
                 contentSize: NSSize(width: 1052, height: 600),
@@ -2819,7 +2812,6 @@ private enum NativeRelayOriginPolicy {
         case "codex-settings", "claude-settings": return localized("routeCodexSettings", fallback: "External")
         case "runtime-settings": return localized("routeRuntimeSettings", fallback: "Runtime")
         case "data-management": return localized("routeDataManagement", fallback: "Data Management")
-        case "image-context": return localized("routeImageContext", fallback: "Image Context")
         case "logs": return localized("routeLogs", fallback: "Logs")
         default: return nil
         }
@@ -2837,10 +2829,6 @@ private enum NativeRelayOriginPolicy {
         case "home": return localized("routeHome", fallback: "Young Router")
         case "provider-wizard": return localized("routeProviderWizard", fallback: "Add Provider")
         case "file-editor": return localized("routeFileEditor", fallback: "Edit File")
-        // A route missing here cannot be opened at all: ``open(route:)`` bails
-        // out when the title is nil, which is how this window stayed invisible
-        // even though its layout, its surface, and its button all existed.
-        case "image-context": return localized("routeImageContext", fallback: "Image Context")
         default: return nil
         }
     }

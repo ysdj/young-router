@@ -128,26 +128,66 @@ try {
   }
   Remove-Item -LiteralPath $PythonInstalls -Recurse -Force -ErrorAction SilentlyContinue
 
+  $RuntimePython = Join-Path $RuntimeBin "python.exe"
   $LiteLLMVersion = (Get-Content -Raw (Join-Path $ProjectRoot "LITELLM_VERSION")).Trim()
   # ``uv`` marks the standalone interpreter it installs as externally managed
   # (``EXTERNALLY-MANAGED`` in its ``lib/python3.12``), so installing *into* it
   # is refused:
   #
-  #   error: The interpreter at ... is externally managed, and indicates the
-  #   following: This Python installation is managed by uv and should not be
-  #   modified.
+  #   The interpreter at ... is externally managed
   #
   # ``--target`` writes the packages into that interpreter's own site-packages
-  # instead of asking it to accept an install, so the runtime keeps the layout
-  # its wrappers and the staged Veridrop dependencies already use. The macOS
-  # build has always installed this way, which is why the same refusal never
-  # appeared there.
-  $RuntimeSitePackages = & (Join-Path $RuntimeBin "python.exe") -c "import sysconfig; print(sysconfig.get_paths()['purelib'])"
+  # instead of asking it to accept an install. ARM64 needs one extra platform
+  # split: LiteLLM's normal ``proxy`` extra is installable, but its optional
+  # ``litellm-proxy-extras`` package pulls psycopg wheels that PyPI does not
+  # publish for Windows ARM64. Install the proxy extra's metadata without its
+  # dependencies, then install every base/proxy requirement except that one
+  # optional database package. The package itself is not imported by this app.
+  $RuntimeSitePackages = & $RuntimePython -c "import sysconfig; print(sysconfig.get_paths()['purelib'])"
   if ($LASTEXITCODE -ne 0 -or -not $RuntimeSitePackages) {
     throw "Could not resolve the bundled Windows runtime's site-packages path."
   }
+  function Install-LiteLLM {
+    if ($WindowsArch -eq "ARM64") {
+      & uv pip install --python $RuntimePython --target "$RuntimeSitePackages" --upgrade --no-deps "litellm[proxy]==$LiteLLMVersion"
+      if ($LASTEXITCODE -ne 0) { throw "Could not install the LiteLLM package for Windows ARM64." }
+      $metadataFile = Get-ChildItem -LiteralPath $RuntimeBin -Recurse -File -Filter "METADATA" -ErrorAction SilentlyContinue |
+        Where-Object { $_.Directory.Name -eq "litellm-$LiteLLMVersion.dist-info" } |
+        Select-Object -First 1
+      if ($null -eq $metadataFile) {
+        throw "Could not read LiteLLM's Windows ARM64 dependency metadata."
+      }
+      $LiteLLMRequirements = @(
+        $proxySingle = "extra == '" + "proxy" + "'"
+        $proxyDouble = 'extra == "' + "proxy" + '"'
+        foreach ($line in Get-Content -LiteralPath $metadataFile.FullName) {
+          if (-not $line.StartsWith("Requires-Dist:")) { continue }
+          $raw = $line.Substring("Requires-Dist:".Length).Trim()
+          $parts = $raw.Split(";", 2)
+          $head = $parts[0].Trim()
+          $marker = if ($parts.Count -eq 2) { $parts[1].Trim() } else { "" }
+          if ($head.StartsWith("litellm-proxy-extras", [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+          if ($marker.Contains($proxySingle) -or $marker.Contains($proxyDouble)) {
+            $marker = $marker.Replace(" and " + $proxySingle, "").Replace($proxySingle + " and ", "")
+            $marker = $marker.Replace(" and " + $proxyDouble, "").Replace($proxyDouble + " and ", "").Trim()
+            if ($marker -eq "") { $head } else { "$head; $marker" }
+          } elseif ($marker -notmatch "extra\s*==") {
+            $raw
+          }
+        }
+      )
+      if ($LiteLLMRequirements.Count -eq 0) {
+        throw "Could not read LiteLLM's Windows ARM64 dependency set."
+      }
+      & uv pip install --python $RuntimePython --target "$RuntimeSitePackages" --upgrade @LiteLLMRequirements "fastapi==0.140.3" PyYAML
+      if ($LASTEXITCODE -ne 0) { throw "Could not install the bundled Windows ARM64 runtime dependencies." }
+      return
+    }
+    & uv pip install --python $RuntimePython --target "$RuntimeSitePackages" --upgrade "litellm[proxy]==$LiteLLMVersion" "fastapi==0.140.3" PyYAML
+    if ($LASTEXITCODE -ne 0) { throw "Could not install the bundled Windows runtime dependencies." }
+  }
   if ($RuntimeSeed) {
-    $SeedCheck = & (Join-Path $RuntimeBin "python.exe") -c "from importlib.metadata import version; print(version('litellm'))"
+    $SeedCheck = & $RuntimePython -c "from importlib.metadata import version; print(version('litellm'))"
     if ($LASTEXITCODE -ne 0) {
       throw "The prebuilt runtime seed does not carry LiteLLM metadata."
     }
@@ -155,14 +195,10 @@ try {
       # Keep the large native/Python seed reusable while refreshing the small
       # fast-moving LiteLLM layer when its release lock advances.
       Write-Output "Updating LiteLLM in the prebuilt runtime seed: $($SeedCheck.Trim()) -> $LiteLLMVersion."
-      uv pip install --python (Join-Path $RuntimeBin "python.exe") --target "$RuntimeSitePackages" --upgrade "litellm[proxy]==$LiteLLMVersion" "fastapi==0.140.3" PyYAML
-      if ($LASTEXITCODE -ne 0) { throw "Could not update LiteLLM in the prebuilt runtime seed." }
+      Install-LiteLLM
     }
   } else {
-    uv pip install --python (Join-Path $RuntimeBin "python.exe") `
-      --target "$RuntimeSitePackages" `
-      "litellm[proxy]==$LiteLLMVersion" "fastapi==0.140.3" PyYAML
-    if ($LASTEXITCODE -ne 0) { throw "Could not install the bundled Windows runtime dependencies." }
+    Install-LiteLLM
   }
   # The staged scan program is imported into the Core's own interpreter, so what
   # it imports and the bundled runtime does not already carry is added to that

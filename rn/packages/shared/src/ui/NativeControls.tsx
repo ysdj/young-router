@@ -589,9 +589,22 @@ function windowsSourceSymbol(symbol: string): string {
   return WINDOWS_SOURCE_GLYPHS[symbol] ?? "•";
 }
 
-function windowsSourceImageUri(imageName: string): string {
-  return `ms-appx:///Assets/Sidebar/${imageName}.png`;
+function windowsSourceImage(imageName: string): number | undefined {
+  // The sidebar tiles ship with the shared UI, so Metro bundles the bytes and
+  // `Image` resolves them without a package-relative `ms-appx` URI.  The old
+  // URI pointed at the package root, while the app payload lives under
+  // `YoungRouter\`, so every tile silently rendered as an empty box.
+  return WINDOWS_SOURCE_IMAGES[imageName];
 }
+
+const WINDOWS_SOURCE_IMAGES: Record<string, number> = {
+  SidebarGeneral: require("./assets/sidebar/SidebarGeneral.png"),
+  SidebarProviders: require("./assets/sidebar/SidebarProviders.png"),
+  SidebarRuntime: require("./assets/sidebar/SidebarRuntime.png"),
+  SidebarCodex: require("./assets/sidebar/SidebarCodex.png"),
+  SidebarData: require("./assets/sidebar/SidebarData.png"),
+  SidebarLogs: require("./assets/sidebar/SidebarLogs.png"),
+};
 
 // A virtualized table re-renders its mounted window on every scroll frame, so a
 // row must not re-render just because its parent did.  The key lists arrive as
@@ -662,20 +675,30 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
   onSelect: (row: TableRow, index: number) => void;
 }): React.JSX.Element {
   const spanning = row.spanning === true;
+  const [hovered, setHovered] = React.useState(false);
   const stripe = stripedRows && !selected && !disabled && index % 2 === 1;
   const textColor = alert ? "#8a5a00" : (disabled ? "#98a2b3" : "#1f2937");
   const rowStyle = [
     windowsTableStyles.row,
     { height: compact ? 30 : 36 },
+    sourceList && windowsTableStyles.sourceRow,
     stripe && windowsTableStyles.rowStripe,
-    selected && windowsTableStyles.rowSelected,
+    // A NavigationView-style source list selects with a quiet fill and a short
+    // accent pill, not the full-height blue bar a data table uses.  The
+    // sidebar and the settings rail both go through this branch.
+    sourceList && selected && windowsTableStyles.sourceRowSelected,
+    sourceList && hovered && !selected && windowsTableStyles.sourceRowHover,
+    !sourceList && selected && windowsTableStyles.rowSelected,
     disabled && windowsTableStyles.rowDisabled,
   ];
   return <Pressable
     disabled={disabled || (spanning && !selectableSpanning)}
     onPress={() => onSelect(row, index)}
+    onHoverIn={sourceList ? () => setHovered(true) : undefined}
+    onHoverOut={sourceList ? () => setHovered(false) : undefined}
     style={rowStyle}
   >
+    {sourceList && selected ? <View style={[windowsTableStyles.sourceSelectionIndicator, { top: (compact ? 30 : 36) / 2 - 8 }]} /> : null}
     {spanning ? <Text numberOfLines={1} style={[windowsTableStyles.groupText, { color: textColor }]}>{row.cells[0] ?? ""}</Text> : <View style={windowsTableStyles.cells}>
       {columns.map((column, columnIndex) => {
         const cell = row.cells[columnIndex] ?? "";
@@ -683,9 +706,10 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
         const secondary = secondaryCellKeys.has(cellKey);
         const cellColor = secondary ? "#667085" : textColor;
         const visibleCell = cell.replace(/^\t/u, "");
+        const sourceImage = rowImageName ? windowsSourceImage(rowImageName) : undefined;
         if (columnIndex === 0 && sourceList) {
           return <View key={`${row.key}:${columnIndex}`} style={[windowsTableStyles.cellView, { width: column.width }]}>
-            {rowImageName ? <Image source={{ uri: windowsSourceImageUri(rowImageName) }} style={windowsTableStyles.sourceImage} /> : rowSymbol ? <Text style={[windowsTableStyles.symbol, { color: disabled ? "#98a2b3" : rowSymbolColor || "#475467" }]}>{windowsSourceSymbol(rowSymbol)}</Text> : null}
+            {rowSymbol ? <Text style={[windowsTableStyles.symbol, { color: disabled ? "#98a2b3" : selected ? "#1f1f1f" : "#5f6368" }]}>{windowsSourceSymbol(rowSymbol)}</Text> : sourceImage !== undefined ? <Image source={sourceImage} style={windowsTableStyles.sourceImage} /> : null}
             <Text numberOfLines={1} style={[windowsTableStyles.cellText, { color: cellColor }]}>{visibleCell}</Text>
           </View>;
         }
@@ -810,6 +834,13 @@ const windowsTableStyles = StyleSheet.create({
   verticalList: { flex: 1, minHeight: 0 },
   body: { flexGrow: 1 },
   row: { minWidth: "100%", borderBottomWidth: 1, borderBottomColor: "#e5e7eb", justifyContent: "center" },
+  // A source list is a navigation surface, not a data table: no row rules,
+  // a small inset, and a rounded quiet fill.  It is what Windows Settings,
+  // Explorer's navigation pane, and NavigationView draw.
+  sourceRow: { minWidth: 0, marginHorizontal: 4, borderRadius: 4, borderBottomWidth: 0 },
+  sourceRowSelected: { backgroundColor: "#e9e9e9" },
+  sourceRowHover: { backgroundColor: "#ececec" },
+  sourceSelectionIndicator: { position: "absolute", left: 0, width: 3, height: 16, borderRadius: 1.5, backgroundColor: "#0067c0" },
   rowCompact: { minHeight: 30 },
   rowRelaxed: { minHeight: 36 },
   rowStripe: { backgroundColor: "#fafbfc" },
@@ -821,7 +852,7 @@ const windowsTableStyles = StyleSheet.create({
   cell: { paddingHorizontal: 8, color: "#1f2937", fontSize: UI_FONT_SIZE },
   sourceCell: { flexDirection: "row", alignItems: "center" },
   sourceImage: { width: 20, height: 20, marginRight: 8, borderRadius: 4 },
-  symbol: { width: 20, height: 20, marginRight: 8, fontFamily: "Segoe MDL2 Assets", fontSize: 16, lineHeight: 20, textAlign: "center" },
+  symbol: { width: 20, height: 20, marginRight: 8, fontFamily: "Segoe MDL2 Assets", fontSize: 16, lineHeight: 20, textAlign: "center", transform: [{ translateY: 1 }] },
   groupText: { paddingHorizontal: 12, color: "#475467", fontSize: UI_TIP_FONT_SIZE, fontWeight: "600" },
 });
 

@@ -127,7 +127,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
     def test_menu_bar_home_is_not_a_dashboard_or_sidebar_shell(self) -> None:
         """The menu-bar host stays hidden; the status icon opens the settings shell."""
-        self.assert_ui_has('route === "home" ? <View style={styles.menuBarHost} />')
+        self.assert_ui_has(': <View style={styles.menuBarHost} />) : null}')
         self.assert_ui_has("function SettingsShell(")
         self.assert_ui_has('isSettingsShellRoute(route)')
         for removed_shell in (
@@ -328,7 +328,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # first issues instead of a sentence that says only that something is wrong.
         self.assertIn('publishResult(value.valid ? translate("common.saved") : (validationSummaryMessage(value, translate) ?? translate("error.validationFailed")));', self.ui)
         self.assertIn("function validationSummaryMessage(summary: unknown, translate: Translate): string | undefined {", self.ui)
-        self.assertIn('publishResult(applyResultMessage(value, translate, typeof message === "string" ? message : null));', self.ui)
+        self.assertIn('publishResult(applyResultMessage(value, translate, typeof message === "string" ? message : null, latestSnapshot.current?.service.state));', self.ui)
         self.assertIn('if (result.status === "partial") return translate("common.notAppliedPartial");', self.ui)
         self.assertIn('if (result.status === "failed") return translate("common.notApplied");', self.ui)
         self.assertIn('apply_failed: "common.notApplied",', self.ui)
@@ -1173,7 +1173,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('return <PersistentScrollView style={styles.providerEditorContent} contentContainerStyle={styles.providerEditorScrollContent} showsVerticalScrollIndicator nestedScrollEnabled>')
         self.assert_ui_has('<ProviderIdentityFields')
         self.assert_ui_has("<NativePersistentScrollIndicator style={styles.persistentScrollIndicator} />")
-        self.assert_ui_has('showsHorizontalScrollIndicator={false}\n    onLayout=')
+        self.assert_ui_has('showsHorizontalScrollIndicator={false}')
+        # Windows draws its own overlay thumb: the composition host leaves the
+        # RNW platform theme empty, so the native WinUI scrollbar painted no
+        # brushes at all.
+        self.assert_ui_has('showsVerticalScrollIndicator={false}\n      scrollEventThrottle={scrollEventThrottle ?? 16}')
+        self.assert_ui_has('persistentScrollThumb:')
+        self.assert_ui_has('Animated.View')
         # The model step scrolls in exactly one place, and it is the roster box:
         # the step body is a plain column, so the pane cannot grow a second
         # scroller beside the list, and the box's own frame carries the border
@@ -2080,6 +2086,15 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('settingsSidebarAppIcon: { width: SETTINGS_HEADER_CONTENT_HEIGHT, height: SETTINGS_HEADER_CONTENT_HEIGHT, borderRadius: 4 }', self.ui)
         self.assertIn('settingsPaneTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600", lineHeight: SETTINGS_HEADER_CONTENT_HEIGHT }', self.ui)
         self.assertIn('settingsSidebarList: { flex: 1, minWidth: 0, minHeight: 0 }', self.ui)
+        # A Windows NavigationView source list: no row rules, a rounded quiet
+        # selection fill, a short accent pill, and a hover fill.  The old
+        # bright-blue bar and the row separators were the macOS source list
+        # drawn over a data-table frame.
+        self.assertIn('settingsSidebarWindows: { backgroundColor: "#f3f3f3"', self.ui)
+        self.assertIn('sourceRow: { minWidth: 0, marginHorizontal: 4, borderRadius: 4, borderBottomWidth: 0 }', self.native_controls)
+        self.assertIn('sourceRowSelected: { backgroundColor: "#e9e9e9" }', self.native_controls)
+        self.assertIn('sourceSelectionIndicator:', self.native_controls)
+        self.assertIn('onHoverIn={sourceList ? () => setHovered(true) : undefined}', self.native_controls)
         shell = self.ui.split("function SettingsShell(", 1)[1].split("function RouteSurface(", 1)[0]
         self.assertIn('sourceList', shell)
         self.assertIn('framed={false}', shell)
@@ -2089,13 +2104,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('const next = SETTINGS_PANES.find(({ id }) => id === key)?.id;', shell)
         self.assertIn('native.window.open(next);', shell)
         self.assertIn('native.window.close(Platform.OS === "windows" ? pane : windowRoute);', shell)
-        self.assertIn('<RouteSurface key={pane} route={pane} shell', shell)
+        self.assertIn('<RouteSurface route={pane} shell', shell)
         # Beta Display's native settings layout: an app identity header with a
         # hairline, a pane source list, and a flexible spacer. About lives in
         # the native application/tray menu instead of the sidebar.
         self.assertIn('<Text numberOfLines={1} style={styles.settingsSidebarTitle}>{translate("app.title")}</Text>', shell)
         self.assertIn('<View style={styles.settingsSidebarSpacer} />', shell)
-        self.assertIn('<View style={styles.settingsPaneHeader}><Text numberOfLines={1} style={styles.settingsPaneTitle}>{translate(paneTitleKey)}</Text></View>', shell)
+        self.assertIn('<View style={[styles.settingsPaneHeader, styles.settingsPaneHeaderIntegrated]}>', shell)
+        self.assertIn('<View style={styles.settingsShellHeader}>', shell)
         self.assertIn('void native.versionInfo().then((next) => { if (active) setAppInfo(next); })', shell)
         self.assertNotIn("lastSelection", shell)
         self.assertNotIn('AboutPane', shell)
@@ -3080,9 +3096,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
     def test_sensitive_settings_use_inline_native_password_controls(self) -> None:
         for marker in (
             "function NativeSecretInputControl(",
-            "<NativeSecureTextInput domain={domain}",
+            "<NativeSecureTextInput",
+            "style={[styles.nativeSecretInput",
+            "nativeSecretInput: { flex: 1, minWidth: 86, minHeight: 26 },",
             'domain="runtime" field="setting"',
-            'domain="webdav" field="password"',
+            'domain="webdav"',
+            'field="password"',
             'domain="providers_models" field="api_key"',
             'placeholder={hint ?? ""}',
         ):
@@ -6189,7 +6208,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '{canFollowMultiplier ? <NativeCheckbox',
             'result.status === "partial"',
             'result.status === "failed"',
-            'publishResult(applyResultMessage(value, translate, typeof message === "string" ? message : null));',
+            'publishResult(applyResultMessage(value, translate, typeof message === "string" ? message : null, latestSnapshot.current?.service.state));',
             '// Core restarts the managed proxy for providers_models and runtime',
         ):
             self.assertIn(marker, self.ui)
@@ -6754,7 +6773,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'label={translate("webdav.syncEvery")}',
             'label={translate("webdav.httpTimeout")}',
             "function WebDavPasswordField(",
-            'placeholder={configured ? translate("webdav.passwordHintConfigured") : translate("webdav.passwordHintOptional")}',
+            'hint={configured ? translate("webdav.passwordHintConfigured") : translate("webdav.passwordHintOptional")}',
             'webdavPasswordInput: { width: SETTINGS_FIELD_VALUE_WIDTH, minHeight: 26 }',
             'labelWidth={SETTINGS_FIELD_LABEL_WIDTH}',
             'controlWidth={SETTINGS_FIELD_VALUE_WIDTH}',
@@ -6839,12 +6858,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
     def test_text_fields_keep_active_typing_local_and_project_dependent_views(self) -> None:
         for marker in (
             "function usePendingTextField(",
-            "setDirty(next !== committedRef.current || commitInFlight.current !== undefined);",
+            "setDirty(dirty);",
             "void commit().catch(() => undefined);",
             "void field.commit().catch(() => undefined);",
             "hasPendingFieldEdits())",
             "registry?.setDirty(fieldId.current, true);",
-            "const SECRET_INPUT_COMMIT_DEBOUNCE_MS = 150;",
+            "const SECRET_INPUT_COMMIT_DEBOUNCE_MS = 500;",
+            "const TEXT_INPUT_COMMIT_DEBOUNCE_MS = 500;",
             "const secretDebounceTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);",
             "if (autoCommit) {",
             "}, SECRET_INPUT_COMMIT_DEBOUNCE_MS);",
@@ -6865,8 +6885,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("if (!dirtyRef.current) {\n      committedRef.current = value;", pending_hook)
         self.assertIn("onDraftChangeRef.current?.(next);", pending_hook)
         self.assertIn("if (dirtyRef.current) void commit().catch(() => undefined);", pending_hook)
-        self.assertNotIn("debounceTimer", pending_hook)
-        self.assertNotIn("setTimeout(", pending_hook)
+        self.assertIn("if (commitTimer.current !== undefined) clearTimeout(commitTimer.current);", pending_hook)
+        self.assertIn("}, TEXT_INPUT_COMMIT_DEBOUNCE_MS);", pending_hook)
+        self.assertIn("if (dirtyRef.current) void commit().catch(() => undefined);", pending_hook)
         self.assertIn("onDraftChange={onNameDraftChange}", self.ui)
         self.assertIn("drafts?.providerDisplayName(provider)", self.ui)
         self.assertIn("setProviderNameDraft", self.ui)

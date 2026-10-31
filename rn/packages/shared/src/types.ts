@@ -29,7 +29,6 @@ export type AppRoute =
   | "relay-accounts"
   | "relay-add"
   | "provider-wizard"
-  | "image-context"
   | "logs";
 
 export type LogTab =
@@ -704,7 +703,6 @@ export interface NativeLocalization {
   routeGeneralSettings: string;
   routeRuntimeSettings: string;
   routeDataManagement: string;
-  routeImageContext: string;
   routeProviderWizard: string;
   routeFileEditor: string;
   routeLogs: string;
@@ -917,6 +915,18 @@ export interface NativeLeafAdapter {
     domain: "providers_models" | "codex" | "claude" | "runtime" | "webdav";
     field: string;
     target?: string;
+  }): Promise<{ revision: number; present: boolean } | undefined>;
+  /** Plaintext read/stage for the one credential the UI draws in the clear. */
+  readSecret?(options: {
+    domain: "providers_models" | "codex" | "claude" | "runtime" | "webdav";
+    field: string;
+    target?: string;
+  }): Promise<{ present: boolean; value?: string } | undefined>;
+  stageSecret?(options: {
+    domain: "providers_models" | "codex" | "claude" | "runtime" | "webdav";
+    field: string;
+    target?: string;
+    value: string;
   }): Promise<{ revision: number; present: boolean } | undefined>;
   copySecret(options: {
     // A key the workspace can copy without ever receiving it: the relay

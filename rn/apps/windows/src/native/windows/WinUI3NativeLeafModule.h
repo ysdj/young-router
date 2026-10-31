@@ -17,7 +17,8 @@ struct WinUI3NativeLeafModule {
   REACT_METHOD(SetMenuBarActions, L"setMenuBarActions");
   REACT_METHOD(SetTrayStatus, L"setTrayStatus");
   REACT_METHOD(SetTrayActions, L"setTrayActions");
-  REACT_METHOD(OpenFilePicker, L"openFilePicker");
+  REACT_METHOD(OpenFileEditor, L"openFileEditor");
+  REACT_METHOD(PrepareFileEditor, L"prepareFileEditor");
   REACT_METHOD(SaveFilePicker, L"saveFilePicker");
   REACT_METHOD(ShowConfirmation, L"showConfirmation");
   REACT_METHOD(ShowReadOnlyText, L"showReadOnlyText");
@@ -26,6 +27,8 @@ struct WinUI3NativeLeafModule {
   REACT_METHOD(ChooseModelsToAdd, L"chooseModelsToAdd");
   REACT_METHOD(SetLocalization, L"setLocalization");
   REACT_METHOD(EditSecret, L"editSecret");
+  REACT_METHOD(ReadSecret, L"readSecret");
+  REACT_METHOD(StageSecret, L"stageSecret");
   REACT_METHOD(ShowGroupManager, L"showGroupManager");
   REACT_METHOD(ClearSecret, L"clearSecret");
   REACT_METHOD(CopySecret, L"copySecret");
@@ -58,6 +61,8 @@ struct WinUI3NativeLeafModule {
   void SetMenuBarActions(winrt::Microsoft::ReactNative::JSValueArray const& actions) noexcept;
   void SetTrayStatus(std::wstring const& title, bool running) noexcept;
   void SetTrayActions(winrt::Microsoft::ReactNative::JSValueArray const& actions) noexcept;
+  void OpenFileEditor(std::wstring const& target) noexcept;
+  void PrepareFileEditor() noexcept;
   void OpenFilePicker(std::string const& purpose, winrt::Microsoft::ReactNative::ReactPromise<std::optional<std::string>> const& promise) noexcept;
   void SaveFilePicker(std::wstring const& suggested_name, winrt::Microsoft::ReactNative::ReactPromise<std::optional<std::string>> const& promise) noexcept;
   void ShowConfirmation(
@@ -96,6 +101,17 @@ struct WinUI3NativeLeafModule {
       std::optional<std::string> const& target,
       std::wstring const& title,
       bool allow_clear,
+      winrt::Microsoft::ReactNative::ReactPromise<std::optional<winrt::Microsoft::ReactNative::JSValueObject>> const& promise) noexcept;
+  void ReadSecret(
+      std::string const& domain,
+      std::string const& field,
+      std::optional<std::string> const& target,
+      winrt::Microsoft::ReactNative::ReactPromise<std::optional<winrt::Microsoft::ReactNative::JSValueObject>> const& promise) noexcept;
+  void StageSecret(
+      std::string const& domain,
+      std::string const& field,
+      std::optional<std::string> const& target,
+      std::string const& value,
       winrt::Microsoft::ReactNative::ReactPromise<std::optional<winrt::Microsoft::ReactNative::JSValueObject>> const& promise) noexcept;
   void ShowGroupManager(
       winrt::Microsoft::ReactNative::JSValueObject const& options,
