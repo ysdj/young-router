@@ -2806,3 +2806,45 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
                     expected,
                     streaming_module._stream_chunk_is_public_reasoning_delta(chunk),
                 )
+
+
+class DeliveredTextFastPathTests(unittest.TestCase):
+    """The fast path may only ever say yes; a no belongs to the full predicates."""
+
+    SHAPES = [
+        ({"choices": [{"delta": {"content": "abc"}}]}, True),
+        ({"choices": [{"delta": {"reasoning_content": "think"}}]}, True),
+        ({"choices": [{"delta": {"reasoning": "think"}}]}, True),
+        ({"choices": [{"delta": {"content": ""}}]}, None),
+        ({"choices": [{"delta": {}}]}, None),
+        ({"choices": [{"delta": {"role": "assistant"}}]}, None),
+        ({"choices": [{"delta": {"content": [{"type": "text", "text": "x"}]}}]}, True),
+        ({"choices": [{"delta": {"content": [{"type": "image_url"}]}}]}, True),
+        ({"type": "content_block_delta", "delta": {"type": "thinking_delta", "thinking": "x"}}, True),
+        ({"type": "content_block_delta", "delta": {"type": "text_delta", "text": "x"}}, True),
+        ({"type": "response.reasoning_summary_text.delta", "delta": "x"}, True),
+        ({"type": "response.output_item.added", "item": {"type": "message"}}, None),
+    ]
+
+    def test_the_fast_path_only_answers_yes(self) -> None:
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
+        for chunk, expected in self.SHAPES:
+            fast = streaming_module._stream_chunk_delivered_text_delta(chunk)
+            if expected is True:
+                self.assertTrue(fast, f"fast path missed {chunk!r}")
+            elif fast:
+                self.assertTrue(
+                    streaming_module._stream_chunk_has_delivered_output(chunk),
+                    f"fast path said yes where the predicate disagrees: {chunk!r}",
+                )
+
+    def test_the_fast_path_agrees_with_the_predicate_on_the_chat_shape(self) -> None:
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
+        for chunk, expected in self.SHAPES[:7]:
+            if chunk.get("choices") is None:
+                continue
+            self.assertEqual(
+                streaming_module._stream_chunk_has_delivered_output(chunk),
+                expected is True,
+                f"predicate disagrees on {chunk!r}",
+            )

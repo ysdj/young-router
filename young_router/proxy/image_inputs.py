@@ -142,19 +142,37 @@ def _sanitize_response_echoed_request_images(response: Any, request_kwargs: Opti
     return sanitized
 
 
+def _sanitize_with_image_references(value: Any, references: set[str]) -> Any:
+    """``_sanitize_response_echoed_request_images`` with the references in hand.
+
+    The references are a pure function of the request, and the streaming form of
+    the sanitizer ran them again for every frame: a text-only turn paid a full
+    walk of its own payload once per chunk.  Callers that already hold the set
+    come through here instead.
+    """
+
+    sanitized, changed = _strip_echoed_request_images(value, references)
+    if not changed:
+        return value
+    if sanitized is _OMIT_RESPONSE_VALUE:
+        return {}
+    return sanitized
+
+
 def _sanitize_response_echoed_request_images_for_delivery(
     response: Any,
     request_kwargs: Optional[dict],
 ) -> Any:
-    if not _request_image_references(request_kwargs):
+    references = _request_image_references(request_kwargs)
+    if not references:
         return response
     if _responses_output_module._response_is_async_iterable(response):
         async def _sanitize_stream() -> AsyncIterator[Any]:
             async for chunk in response:
-                yield _sanitize_response_echoed_request_images(chunk, request_kwargs)
+                yield _sanitize_with_image_references(chunk, references)
 
         return _sanitize_stream()
-    return _sanitize_response_echoed_request_images(response, request_kwargs)
+    return _sanitize_with_image_references(response, references)
 
 
 def _split_image_data_url(value: Any) -> Optional[tuple[str, str]]:
