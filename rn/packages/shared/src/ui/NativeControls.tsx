@@ -1132,7 +1132,7 @@ const styles = StyleSheet.create({
   windowsTextFieldInput: { flex: 1, minWidth: 0, paddingHorizontal: 8, paddingTop: 0, paddingBottom: 21, fontSize: UI_FONT_SIZE, color: WINDOWS_CONTROL.text, backgroundColor: "transparent" },
   // A multiline leaf aligns to the top instead (the host returns early for it),
   // so it only needs even padding around the block of text.
-  windowsTextFieldInputMultiline: { paddingTop: 4, paddingBottom: 4, textAlignVertical: "top" },
+  windowsTextFieldInputMultiline: { paddingTop: 4, paddingBottom: 4, paddingRight: 12, textAlignVertical: "top" },
   splitView: { minHeight: 120, flexDirection: "row" },
   splitFallback: { minHeight: 120, flexDirection: "row" },
   splitLeading: { minWidth: 0, flexShrink: 0 },

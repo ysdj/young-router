@@ -948,6 +948,12 @@ std::optional<LRESULT> WinUI3NativeLeaf::HandleWindowMessage(UINT message, WPARA
   }
   if (message == WM_CLOSE && !quitting_) {
     if (!active_route_.empty()) {
+      // A settings window's close is a hide, and a hide has nothing to wait
+      // for: the window goes away now, and the pane finishes committing the
+      // field it had focused behind it.  Ordering the window out first and then
+      // asking React meant a large field (the runtime pane's JSON document) held
+      // the caption button for as long as its commit took.
+      if (!child_host_) ShowWindow(window_handle_, SW_HIDE);
       DispatchAction("request-close-" + WideToUtf8(active_route_));
     }
     return 0;
@@ -1088,6 +1094,8 @@ void WinUI3NativeLeaf::OpenRoute(std::wstring_view route) {
 void WinUI3NativeLeaf::CloseRoute(std::wstring_view route) {
   if (active_route_ == route) {
     active_route_.clear();
+    // Idempotent: WM_CLOSE already hid the parent window, and a child window
+    // still needs its own process to end.
     if (window_handle_ != nullptr) ShowWindow(window_handle_, SW_HIDE);
     if (child_host_) CloseReactChildWindow();
   }

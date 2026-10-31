@@ -3385,7 +3385,7 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
     {settingsRoute ? <AssistantSettingsWorkspace busy={busy} native={native} codexModels={codexModelRows} codexModelCatalogEnabled={codexModelCatalogEnabled} standaloneSearch={codexStandaloneSearch} onToggleStandaloneSearch={(enabled) => dispatch("codex.search.set", { enabled }, "codex")} codexFeatures={(domainState(snapshot, "codex").structured as UnknownRecord | undefined)?.features as UnknownRecord | undefined} clientProvider={codexClientProvider} clientModel={codexClientModel} localApiActive={codexUsesLocalApi} onToggleCodexModelCatalog={(enabled) => dispatch("codex.model_catalog.set", { enabled }, "codex")} onToggleCodexFeature={(feature, enabled) => dispatch("codex.feature.set", { feature, enabled }, "codex")} onUseLocalApi={(selection) => dispatch("use_local_api", selection, "codex")} onUseSavedModel={(selection) => dispatch("use_saved_model", selection, "codex")} translate={translate} ipc={ipc} filesToken={settingsRawBaselineToken} onOpenFile={openAssistantFile} /> : null}
     {route === "logs" ? <LogsWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} translate={translate} dispatch={dispatch} onStatus={setResult} onStatusBar={setStatusBarControls} requestedTab={nativeAction?.id === "open-recovery" ? "recovery" : logTabRequest} requestedTabKey={nativeAction?.sequence ?? 0} /> : null}
     {route === "general-settings" ? <GeneralWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} dispatch={dispatch} dispatchServiceAction={enqueueServiceDispatch} translate={translate} onStatus={setResult} onSnapshot={onSnapshot} /> : null}
-    {route === "runtime-settings" ? <RuntimeWorkspace snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} clearSecret={clearSecret} native={native} ipc={ipc} /> : null}
+    {route === "runtime-settings" ? <RuntimeWorkspace snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} clearSecret={clearSecret} native={native} ipc={ipc} onStatus={setResult} /> : null}
     {route === "data-management" ? <DataManagementWorkspace snapshot={snapshot} tab={dataManagementTab} onTabChange={setDataManagementTab} statuses={dataManagementStatuses} busy={busy} webDavOperationBusy={webDavOperationBusy} translate={translate} dispatch={dispatchDataManagement} onSecretState={onSecretState} onFlushPendingFields={flushPendingFields} onTabSwitchError={(tab, reason) => setDataManagementStatuses((current) => ({ ...current, [tab]: errorMessage(reason, translate) }))} onInspectImport={inspectImportDataManagement} onImport={importDataManagement} onConfirmImportReplace={confirmImportDraftReplacement} onExport={exportDataManagement} onProbeWebDav={probeWebDav} onSyncWebDav={syncWebDav} onCommitWebDavSettings={commitWebDavSettings} /> : null}
     </View> : null}
     {/* One permanent status strip per settings window: the last result replaces
@@ -6888,14 +6888,22 @@ const PersistentScrollView = React.forwardRef<ScrollView, ScrollViewProps & { on
   const thumbOffset = useRef(new Animated.Value(0)).current;
   const [thumbHeight, setThumbHeight] = useState(0);
   const [overflowing, setOverflowing] = useState(false);
+  const metricsState = useRef({ overflowing: false, thumbHeight: 0 });
   const updateMetrics = (nextContent?: number, nextViewport?: number): void => {
     if (nextContent !== undefined) contentHeight.current = nextContent;
     if (nextViewport !== undefined) viewportHeight.current = nextViewport;
     const content = contentHeight.current;
     const viewport = viewportHeight.current;
     const nextOverflowing = content > viewport + 1;
+    // The thumb is a 1-DIP-scaled bar: a sub-pixel change to its height is not
+    // visible, and setting state for one re-rendered the whole pane mid-scroll,
+    // which is what made a long settings page scroll in steps.
+    const nextThumb = nextOverflowing ? Math.round(Math.max(24, (viewport * viewport) / content)) : 0;
+    const previous = metricsState.current;
+    if (previous.overflowing === nextOverflowing && previous.thumbHeight === nextThumb) return;
+    metricsState.current = { overflowing: nextOverflowing, thumbHeight: nextThumb };
     setOverflowing(nextOverflowing);
-    if (nextOverflowing) setThumbHeight(Math.max(24, (viewport * viewport) / content));
+    setThumbHeight(nextThumb);
   };
   const handleScroll = (event: Parameters<NonNullable<ScrollViewProps["onScroll"]>>[0]): void => {
     const content = contentHeight.current;
@@ -9172,7 +9180,7 @@ const IMAGE_CONTEXT_CATEGORY = "Codex Images";
 const THUMBNAIL_LIMIT = 6;
 const THUMBNAIL_MAX_BYTES = 1_500_000;
 
-function RuntimeWorkspace({ snapshot, busy, translate, dispatch, onSecretState, clearSecret, native, ipc }: { snapshot?: CoreSnapshot; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; clearSecret: NativeSecretClear; native: NativeLeafAdapter; ipc: IpcClient }): React.JSX.Element {
+function RuntimeWorkspace({ snapshot, busy, translate, dispatch, onSecretState, clearSecret, native, ipc, onStatus }: { snapshot?: CoreSnapshot; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; clearSecret: NativeSecretClear; native: NativeLeafAdapter; ipc: IpcClient; onStatus: (status?: string) => void }): React.JSX.Element {
   const state = domainState(snapshot, "runtime");
   const allSettings = asRecords(state.settings).length > 0 ? asRecords(state.settings) : asRecords(state.categories).flatMap((category) => asRecords(category.settings));
   // Settings owned by the General pane (for example the proxy port) stay in
@@ -9205,7 +9213,7 @@ function RuntimeWorkspace({ snapshot, busy, translate, dispatch, onSecretState, 
         {/* The surface is keyed by its category, so a switch starts at the top of
             the new category instead of inheriting the previous scroll offset. */}
         <PersistentScrollView key={selectedCategory} style={styles.runtimeScrollSurface} contentContainerStyle={styles.runtimeWorkspace}>
-          {selectedCategory === "" ? <EmptyState translate={translate} /> : <View style={styles.runtimeFieldList}>{(groups[selectedCategory] ?? []).map((item) => <RuntimeField key={identifier(item)} item={item} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} clearSecret={clearSecret} dshSyncToken={dshSyncToken} />)}
+          {selectedCategory === "" ? <EmptyState translate={translate} /> : <View style={styles.runtimeFieldList}>{(groups[selectedCategory] ?? []).map((item) => <RuntimeField key={identifier(item)} item={item} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} clearSecret={clearSecret} dshSyncToken={dshSyncToken} native={native} onStatus={onStatus} />)}
             {selectedCategory === IMAGE_CONTEXT_CATEGORY ? <ImageContextWindowLink snapshot={snapshot} busy={busy} translate={translate} onOpen={() => setImageContextOpen(true)} /> : null}
           </View>}
         </PersistentScrollView>
@@ -9558,7 +9566,7 @@ function DataManagementWorkspace({ snapshot, tab, onTabChange, statuses, busy, w
   </View>;
 }
 
-function RuntimeField({ item, busy, translate, dispatch, onSecretState, clearSecret, dshSyncToken }: { item: UnknownRecord; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; clearSecret: NativeSecretClear; dshSyncToken: string }): React.JSX.Element {
+function RuntimeField({ item, busy, translate, dispatch, onSecretState, clearSecret, dshSyncToken, native, onStatus }: { item: UnknownRecord; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; clearSecret: NativeSecretClear; dshSyncToken: string; native: NativeLeafAdapter; onStatus: (status?: string) => void }): React.JSX.Element {
   const [jsonResetToken, setJsonResetToken] = useState(0);
   const [valueError, setValueError] = useState<string>();
   const [resetToken, setResetToken] = useState(0);
@@ -9616,10 +9624,15 @@ function RuntimeField({ item, busy, translate, dispatch, onSecretState, clearSec
     const selectedIndex = visibleOptionValues.indexOf(value);
     control = <NativePicker labels={optionLabels} selectedValue={optionLabels[selectedIndex] ?? optionLabels[0] ?? ""} disabled={busy} onChange={({ nativeEvent }) => { const next = optionValues[nativeEvent.index]; const visibleNext = visibleOptionValues[nativeEvent.index] ?? next; if (visibleNext !== undefined) void dispatch("set_setting", { key, value: visibleNext }); }} style={styles.runtimeValueControl} />;
   } else if (isMultiline) {
-    // JSON may contain provider credentials. Keep the document in the native
-    // editor and stage it through the one-time Core secret capability while
-    // still giving the user a real multiline textarea.
-    control = <NativeSecretInputControl label={label} hint={item.retained === true ? translate("runtime.secretRetained") : translate("runtime.jsonPlaceholder")} busy={busy} domain="runtime" field="setting" target={key} multiline plainText autoCommit resetToken={jsonResetToken} onSecretState={onSecretState} />;
+    // JSON may contain provider credentials, so it is still written through
+    // Core's one-time secret capability and never as a plain setting.  It is
+    // edited in the shared multiline field rather than the native secret leaf:
+    // that leaf owns a XAML island, and RNW recycles its child-site link, so
+    // reopening this pane mounted a second island on a connected link and
+    // faulted inside Microsoft.UI.Xaml.dll (c0000005).  The island is the
+    // crash; a text field has none, and it also keeps the document readable,
+    // which is the point of an advanced field.
+    control = <RuntimeJsonField label={label} value={value} hint={item.retained === true ? translate("runtime.secretRetained") : translate("runtime.jsonPlaceholder")} busy={busy} resetToken={jsonResetToken} resetValue={rawDefaultValue} target={key} native={native} translate={translate} onStatus={onStatus} onCommitted={() => setJsonResetToken((current) => current + 1)} />;
     action = <ActionButton title={item.will_clear === true ? translate("common.willClear") : translate("common.clear")} disabled={busy || item.retained !== true || item.will_clear === true} onPress={() => { void clearSecret({ domain: "runtime", field: "setting", target: key }).then(() => setJsonResetToken((current) => current + 1)); }} />;
   } else if (item.secret === true) {
     control = <NativeSecretInputControl label={label} hint={item.retained === true ? translate("runtime.secretRetained") : undefined} busy={busy} domain="runtime" field="setting" target={key} autoCommit onSecretState={onSecretState} />;
@@ -9653,6 +9666,99 @@ function RuntimeField({ item, busy, translate, dispatch, onSecretState, clearSec
     </View>
     {valueError ? <Text style={styles.runtimeFieldError}>{valueError}</Text> : null}
     <RuntimeFieldMeta item={item} translate={translate} />
+  </View>;
+}
+
+/**
+ * One advanced JSON document: edited as text, written through Core's secret
+ * capability.
+ *
+ * Two things rule the shape. The snapshot redacts a secret's stored text to
+ * `configured`, so the document has to be read through the one-shot plaintext
+ * capability before it can be edited; and the native secret leaf cannot be used
+ * here at all, because it owns a XAML island that RNW's recycled child-site link
+ * can only take once (reopening the pane faulted in Microsoft.UI.Xaml.dll).
+ */
+/** A stored JSON document, or the field's default when the text is not JSON. */
+function jsonDocumentOrFallback(text: string, fallback: string): string {
+  const trimmed = text.trim();
+  if (!trimmed) return fallback;
+  try {
+    JSON.parse(trimmed);
+    return text;
+  } catch {
+    return fallback;
+  }
+}
+
+function RuntimeJsonField({ label, value, hint, busy, resetToken, resetValue, target, native, translate, onStatus, onCommitted }: { label: string; value: string; hint: string; busy: boolean; resetToken: number; resetValue: string; target: string; native: NativeLeafAdapter; translate: Translate; onStatus: (status?: string) => void; onCommitted: () => void }): React.JSX.Element {
+  const redacted = value === "configured";
+  const [document, setDocument] = useState(redacted ? "" : value);
+  const [draft, setDraft] = useState(redacted ? "" : value);
+  const [error, setError] = useState<string>();
+  const [saving, setSaving] = useState(false);
+  const [loaded, setLoaded] = useState(!redacted);
+  useEffect(() => {
+    if (!redacted || !native.readSecret) { setLoaded(true); return undefined; }
+    let active = true;
+    void native.readSecret({ domain: "runtime", field: "setting", target })
+      .then((result) => {
+        if (!active) return;
+        // Core hands back the stored document.  A stored text that is not JSON
+        // cannot be edited meaningfully and cannot be saved either, so the
+        // field opens on the default document instead of on text that only
+        // looks like a document.
+        const text = jsonDocumentOrFallback(result?.value ?? "", resetValue);
+        setDocument(text);
+        setDraft(text);
+        setLoaded(true);
+      })
+      .catch(() => { if (active) { setLoaded(true); setError(translate("runtime.jsonUnavailable")); } });
+    return () => { active = false; };
+  }, [native, redacted, resetValue, target, translate]);
+  // Core's stored document is the truth, and a reset replaces the draft with
+  // the field's default.
+  useEffect(() => { if (loaded) setDraft(document); }, [document, loaded]);
+  useEffect(() => { setDraft(resetValue); }, [resetToken]);
+  const commit = async (): Promise<void> => {
+    const next = draft.trim();
+    if (next === document.trim()) return;
+    if (next !== "") {
+      try {
+        JSON.parse(next);
+      } catch {
+        setError(translate("runtime.invalidJson"));
+        return;
+      }
+    }
+    setError(undefined);
+    setSaving(true);
+    try {
+      const staged = await native.stageSecret?.({ domain: "runtime", field: "setting", target, value: next });
+      if (!staged) throw new Error(translate("error.coreUnavailable"));
+      setDocument(next);
+      onStatus(translate("common.saved"));
+      onCommitted();
+    } catch (reason: unknown) {
+      setError(errorMessage(reason, translate));
+    } finally {
+      setSaving(false);
+    }
+  };
+  return <View style={styles.runtimeJsonColumn}>
+    <NativeTextField
+      style={[styles.input, styles.textArea, styles.runtimeJsonField, error !== undefined && styles.inputInvalid]}
+      value={draft}
+      placeholder={loaded ? hint : translate("runtime.jsonLoading")}
+      editable={!busy && !saving && loaded}
+      multiline
+      onChangeText={setDraft}
+      onBlur={() => { void commit(); }}
+      autoCapitalize="none"
+      autoCorrect={false}
+      accessibilityLabel={label}
+    />
+    {error !== undefined ? <Text style={styles.fieldError} accessibilityLiveRegion="polite">{error}</Text> : null}
   </View>;
 }
 
@@ -12988,7 +13094,7 @@ inspectorProbeFinding: { flexShrink: 1, minWidth: 0, cursor: "pointer" }, inspec
   secretFieldButtons: { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 4 },
   secretFieldButton: { flex: 1, minWidth: 0, height: 26 },
   nativeSecretControl: { flex: 1, minWidth: 0, minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 },
-  nativeSecretInput: { flex: 1, minWidth: 86, minHeight: 26 },
+  nativeSecretInput: { flex: 1, minWidth: 86, minHeight: 26 }, runtimeJsonColumn: { flex: 1, minWidth: 0, gap: 4 }, runtimeJsonField: { height: 132, alignSelf: "stretch" },
   rawEditor: { flex: 1, minHeight: 180, gap: 4 },
   rawEditorHeader: { minHeight: 28, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 },
   rawNativeEditorFrame: { flex: 1, minHeight: 160, position: "relative" },

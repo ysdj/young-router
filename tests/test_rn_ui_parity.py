@@ -3762,8 +3762,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "runtimeMultilineEditor:",
             "runtimeMultilineHelpSlot:",
             'kind === "json"',
-            "multiline plainText autoCommit",
-            "nativeSecretTextArea:",
+            # The JSON document is edited in the shared multiline field; the
+            # native secret leaf's island could not be remounted when the pane
+            # was reopened.
+            "<RuntimeJsonField label={label}",
+            "runtimeJsonField:",
             "runtimeUnit:",
             "runtimeActionSlot:",
             "runtimeHelpSlot:",

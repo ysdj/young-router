@@ -2504,8 +2504,32 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertNotIn("onChangeText", windows_codegen)
         self.assertIn("OnSecretState", windows_codegen)
         self.assertIn("NativeSecretInputControl", ui)
-        self.assertIn("multiline plainText autoCommit", ui)
         self.assertNotIn('onEdit={() => stageSecret({ domain: "runtime"', ui)
+        # The advanced JSON document is the one secret-shaped field drawn without
+        # the native leaf: that leaf owns a XAML island, and RNW recycles the
+        # child-site link the island is connected through, so reopening the pane
+        # mounted a second island on a connected link and faulted inside
+        # Microsoft.UI.Xaml.dll.  It is edited as text, read through the one-shot
+        # plaintext capability (the snapshot redacts the document), and still
+        # written through the secret staging call, never as a plain setting.
+        self.assertIn("function RuntimeJsonField(", ui)
+        self.assertIn('void native.readSecret({ domain: "runtime", field: "setting", target })', ui)
+        self.assertIn('await native.stageSecret?.({ domain: "runtime", field: "setting", target, value: next })', ui)
+        self.assertIn('translate("runtime.invalidJson")', ui)
+        self.assertNotIn('domain="runtime" field="setting" target={key} multiline plainText autoCommit', ui)
+        # The advanced JSON document is the one secret-shaped field that does not
+        # use the native leaf: that leaf owns a XAML island, and remounting one on
+        # a recycled child-site link faulted inside Microsoft.UI.Xaml.dll when the
+        # pane was reopened.  It is edited as text and still staged through the
+        # secret capability, so the JSON never reaches Core as a plain setting.
+        self.assertIn("function RuntimeJsonField(", ui)
+        self.assertIn('await native.stageSecret?.({ domain: "runtime", field: "setting", target, value: next })', ui)
+        self.assertIn('translate("runtime.invalidJson")', ui)
+        zh = (SHARED / "i18n/zh-Hans.ts").read_text(encoding="utf-8")
+        en = (SHARED / "i18n/en.ts").read_text(encoding="utf-8")
+        self.assertIn('"runtime.invalidJson": "这不是有效的 JSON，改动未保存。"', zh)
+        self.assertIn('"runtime.invalidJson": "This is not valid JSON, so the change was not saved."', en)
+        self.assertNotIn('domain="runtime" field="setting" target={key} multiline plainText autoCommit', ui)
 
     def test_provider_api_key_plaintext_readback_is_narrow_and_native_only(self) -> None:
         ipc = (ROOT / "young_router" / "core" / "ipc.py").read_text(encoding="utf-8")
