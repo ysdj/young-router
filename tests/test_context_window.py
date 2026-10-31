@@ -217,6 +217,64 @@ class WindowTests(unittest.TestCase):
         self.assertLessEqual(usage["input_tokens_details"]["cached_tokens"], usage["input_tokens"])
 
 
+def _tool_image_item(chars: int = 5000) -> dict:
+    """A ``view_image`` result: one text part and the picture itself."""
+
+    from test_image_context import _data_url, _png
+
+    return {
+        "type": "function_call_output",
+        "call_id": "call_view",
+        "output": [
+            {"type": "input_text", "text": "x" * chars},
+            {"type": "input_image", "image_url": _data_url(_png(64, 64, noisy=True))},
+        ],
+    }
+
+
+class CurrentTurnTests(unittest.TestCase):
+    """The turn being answered arrives intact, images included.
+
+    Real thread with a single user message: 24 ``view_image`` results all belong
+    to that one turn.  Replacing them (they are the same turn as the question)
+    handed the model a placeholder for the picture it had just asked to see.
+    """
+
+    def test_a_tool_result_with_an_image_is_never_elided(self) -> None:
+        item = _tool_image_item()
+        self.assertIsNone(cw._elide_item(item))
+
+    def test_the_whole_current_turn_is_protected(self) -> None:
+        items = [
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "be brief"}]},
+            {"type": "function_call", "call_id": "old", "name": "shell", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "old", "output": "y" * 9000},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "look"}]},
+            {"type": "function_call", "call_id": "call_view", "name": "view_image", "arguments": "{}"},
+            _tool_image_item(),
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "I see it."}]},
+        ]
+        data = {"model": "m", "input": items}
+        router = _Router(300)
+        with mock.patch.object(cw, "_router", return_value=router):
+            fitted = cw.apply(data)
+        self.assertIsNotNone(fitted)
+        assert fitted is not None
+        after = fitted["input"]
+        # The current turn's own items are untouched, in order.
+        self.assertEqual(after[-3:], items[-3:])
+        # The earlier tool call paid for it: elided, or dropped as a call and
+        # its output together -- never one half of the pair.
+        old = [item for item in after if item.get("call_id") == "old"]
+        self.assertTrue(
+            not old or all("elided" in cw._item_text(item) for item in old)
+        )
+        # And the current turn's picture is still in the request.
+        self.assertEqual(
+            cw._inline_image_bytes(after), cw._inline_image_bytes(items)
+        )
+
+
 class ImageWeightTests(unittest.TestCase):
     """The token counter and the relay's byte counter must not disagree.
 

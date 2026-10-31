@@ -210,9 +210,25 @@ def _replace_text(container: Any, text: str) -> Tuple[Any, bool]:
     return container, False
 
 
+def _carries_image(item: Mapping[str, Any]) -> bool:
+    for field in ("content", "output"):
+        parts = item.get(field)
+        if not isinstance(parts, list):
+            continue
+        for part in parts:
+            if isinstance(part, Mapping) and "image" in str(part.get("type") or ""):
+                return True
+    return False
+
+
 def _elide_item(item: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     """Return a copy of ``item`` with its body replaced, or ``None``."""
 
+    # A body that includes a picture cannot be replaced by a text marker: the
+    # picture is not what "earlier characters elided" describes.  Images leave
+    # the replay only through the placeholder pass, which can name their file.
+    if _carries_image(item):
+        return None
     chars = len(_item_text(item))
     if chars < _MIN_ELIDABLE_CHARS:
         return None
@@ -248,8 +264,23 @@ def _elidable(items: List[Any]) -> List[int]:
 
 
 def _protected_index(items: List[Any]) -> int:
-    """Everything from the last message on stays exactly as the client sent it."""
+    """Everything from the current turn's opening message on stays verbatim.
 
+    The turn being answered is the unit that must arrive intact: its tool calls
+    and their outputs are what the model is in the middle of using.  A thread
+    with a single user message puts every ``view_image`` result of that turn
+    here, and shortening one of them hands the model a placeholder for the
+    picture it just asked to see.
+    """
+
+    for index in range(len(items) - 1, -1, -1):
+        item = items[index]
+        if (
+            isinstance(item, Mapping)
+            and item.get("type") == "message"
+            and item.get("role") == "user"
+        ):
+            return index
     for index in range(len(items) - 1, -1, -1):
         item = items[index]
         if isinstance(item, Mapping) and item.get("type") == "message":
