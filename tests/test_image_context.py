@@ -733,5 +733,53 @@ class ImageContextStorageTests(_ImageContextCase):
         self.assertIn("IMG-0001", written)
 
 
+class ImageContextDeclineTests(_ImageContextCase):
+    """A pass that declines silently is indistinguishable from one that is off."""
+
+    def decline_reasons(self) -> list:
+        from young_router.proxy import trace as trace_module
+
+        calls = []
+        original = trace_module._route_trace
+
+        def capture(event, **fields):
+            if event == "codex_image_context_declined":
+                calls.append(fields.get("reason"))
+            return original(event, **fields)
+
+        self.enterContext(mock.patch.object(trace_module, "_route_trace", capture))
+        return calls
+
+    def test_a_disabled_setting_says_so(self) -> None:
+        reasons = self.decline_reasons()
+        items = [_user_turn("first", _upload_parts(_png(120, 90, noisy=True))), _user_turn("second")]
+        with mock.patch.dict(
+            os.environ, {image_context_module.IMAGE_CONTEXT_ENABLED_ENV: "0"}
+        ):
+            self.assertIsNone(
+                image_context_module._with_codex_image_context(_request(items))
+            )
+        self.assertEqual(reasons, ["setting_disabled"])
+
+    def test_images_only_in_the_current_turn_say_so(self) -> None:
+        # The case that produced the bug report: every image belonged to the
+        # turn being answered, so no rewrite was legal -- and nothing said that.
+        reasons = self.decline_reasons()
+        items = [
+            _user_turn("earlier"),
+            _user_turn("look", _upload_parts(_png(120, 90, noisy=True))),
+        ]
+        with mock.patch.dict(
+            os.environ,
+            {
+                image_context_module.IMAGE_CONTEXT_ENABLED_ENV: "1",
+                image_context_module.IMAGE_CONTEXT_FETCH_ENV: "path",
+            },
+        ):
+            self.assertIsNone(
+                image_context_module._with_codex_image_context(_request(items))
+            )
+        self.assertEqual(reasons, ["no_image_old_enough"])
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

@@ -1016,6 +1016,40 @@ def _with_codex_image_context(request_kwargs: dict) -> Optional[dict]:
     return _rewrite(request_kwargs)
 
 
+def _declined(request_kwargs: Any, reason: str) -> None:
+    """Say why this request was left alone, once per decision.
+
+    A pass that silently declines is indistinguishable from a pass that is off,
+    and that ambiguity already cost a debugging session: the log said the
+    rewrite did not change the request, and nothing said which of these six
+    conditions had been true.
+    """
+
+    if not isinstance(request_kwargs, dict):
+        return
+    from . import trace as _trace_module
+
+    try:
+        _trace_module._route_trace(
+            "codex_image_context_declined",
+            reason=reason,
+            images=_image_count_of(request_kwargs),
+            enabled=enabled(),
+            mode=mode(),
+            keep_recent=keep_recent(),
+            min_bytes=min_bytes(),
+        )
+    except Exception:
+        return
+
+
+def _image_count_of(request_kwargs: Mapping[str, Any]) -> Optional[int]:
+    try:
+        return len(scan(request_kwargs.get("input")))
+    except Exception:
+        return None
+
+
 def _rewrite(
     request_kwargs: dict,
     *,
@@ -1023,15 +1057,19 @@ def _rewrite(
     keep: Optional[int] = None,
 ) -> Optional[dict]:
     if not forced and not enabled():
+        _declined(request_kwargs, "setting_disabled")
         return None
     request_kwargs = request_kwargs if isinstance(request_kwargs, dict) else {}
     if not _deployment_allows_images(request_kwargs):
+        _declined(request_kwargs, "route_refuses_images")
         return None
     from . import responses_request as _responses_request_module
 
     if not _responses_request_module._request_has_responses_shape(request_kwargs):
+        _declined(request_kwargs, "not_a_responses_request")
         return None
     if not _has_codex_client_evidence(request_kwargs):
+        _declined(request_kwargs, "no_codex_client_evidence")
         return None
     if _responses_request_module._request_has_structured_codex_compaction(
         request_kwargs
@@ -1039,9 +1077,11 @@ def _rewrite(
         # A compaction request replays its signed history byte-exact: the
         # upstream compacts exactly what it receives, and a placeholder baked
         # into the compacted history would be permanent.
+        _declined(request_kwargs, "structured_compaction")
         return None
     input_items = request_kwargs.get("input")
     if not isinstance(input_items, list) or not input_items:
+        _declined(request_kwargs, "empty_input")
         return None
 
     # Every item is rewritable, including the ones before a signed item: a
@@ -1053,6 +1093,7 @@ def _rewrite(
     mutable_from = 0
     images = scan(input_items)
     if not images:
+        _declined(request_kwargs, "no_images")
         return None
     # The turn being answered is the last one in the replay, whether or not it
     # carried an image: an image from an earlier turn is older than it even
@@ -1132,6 +1173,18 @@ def _rewrite(
         omitted = [image for image in omitted if image is not newest]
         sent_content[content_id or ""] = newest
     if not omitted:
+        # Every image was either in the turn being answered, pinned, or below
+        # the byte floor.  This is the one decline that depends on the replay's
+        # own shape, so it states what it saw.
+        _declined(
+            request_kwargs,
+            "no_image_old_enough"
+            if not any(
+                image.turn < current_turn and len(image.raw) >= minimum
+                for image in images
+            )
+            else "nothing_omitted",
+        )
         return None
 
     # A duplicate placeholder points at a copy that is still being sent, so the
