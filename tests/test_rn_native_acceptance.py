@@ -2951,7 +2951,16 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         adapter = (SHARED / "ui/NativeControls.tsx").read_text(encoding="utf-8")
         self.assertIn("function WindowsCheckbox(", adapter)
         self.assertIn("accessibilityState={{ checked: value, disabled: disabled === true }}", adapter)
-        self.assertIn("return <Switch value={value} disabled={disabled} onValueChange={onValueChange}", adapter)
+        # The Windows switch is drawn by the adapter too: RNW's <Switch> paints
+        # its own UIKit-shaped control, so the one surface outside the Windows
+        # palette was a grey track with a dark knob in both states.  Its knob
+        # travels by the track's own alignment, so a recycled row cannot leave
+        # an absolutely-positioned knob behind in the previous state.
+        self.assertIn("function WindowsToggle(", adapter)
+        self.assertIn("return <WindowsToggle value={value} disabled={disabled} onValueChange={onValueChange}", adapter)
+        self.assertIn("accessibilityRole=\"switch\"", adapter)
+        self.assertIn("windowsToggleTrackOn: { justifyContent: \"flex-end\", borderColor: WINDOWS_CONTROL.accent, backgroundColor: WINDOWS_CONTROL.accent }", adapter)
+        self.assertNotIn("  Switch,", adapter)
 
     def test_a_windows_pane_switch_keeps_the_users_window_geometry(self) -> None:
         """The initial size belongs to the first presentation, not every open.
@@ -2994,6 +3003,24 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("ApplyIntegratedTitleBar(UsesIntegratedTitleBar(route));", windows)
         self.assertIn("if (message == WM_SIZE || message == WM_DPICHANGED) UpdateTitleBarDragRegions();", windows)
         self.assertIn("bool integrated_title_bar_ = false;", header)
+        # The caption change moves the client inside an unchanged window, and RNW
+        # only re-arranges its root on an AppWindow size change: without this the
+        # root kept the captioned client's height and the window ended in a blank
+        # band with the status bar floating above it.
+        self.assertIn("void RelayoutRootView();", header)
+        self.assertIn("SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE", windows)
+        self.assertIn("void WinUI3NativeLeaf::RelayoutRootView() {", windows)
+        self.assertIn("  RelayoutRootView();", windows)
+        # Deferred by one message: arranging the root from inside the window-proc
+        # dispatch the frame change starts is what the XAML layer faulted on.
+        self.assertIn("PostMessageW(window_handle_, kRelayoutRootMessage, 0, 0);", windows)
+        self.assertIn("if (message == kRelayoutRootMessage) {", windows)
+        # A settings window has no caption band, so its frame is the content plus
+        # the three resize borders only.
+        self.assertIn("UINT dpi_hint = 0, bool integrated_title_bar = false) {", windows)
+        self.assertIn("if (integrated_title_bar) frame.top = 0;", windows)
+        self.assertIn("0, integrated_title_bar_);", windows)
+        self.assertIn("SetRootRelayout", header)
         for route in (
             "general-settings",
             "providers-models",
@@ -3025,6 +3052,10 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # 1120x680 client and painted the rest of the window as empty.
         self.assertIn("YoungRouter::FrameTrackSizeForContentDips(windowHandle, 960, 660)", app)
         self.assertIn("appWindow.Resize({initialFrame.x, initialFrame.y});", app)
+        # The host hands the leaf the one call that re-arranges the root at the
+        # client size, so the caption change lands in the layout.
+        self.assertIn("YoungRouter::WinUI3NativeLeaf::Shared()->SetRootRelayout(", app)
+        self.assertIn("rnWindow.LayoutConstraints(constraints);", app)
 
     def test_windows_launch_paints_the_pane_before_presenting_the_window(self) -> None:
         ui = (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
@@ -3059,6 +3090,48 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         project = WIN_PROJECT
         self.assertIn("#define IDI_ICON1 1008", (project / "resource.h").read_text(encoding="utf-8"))
         self.assertIn('IDI_ICON1               ICON                    "small.ico"', (project / "YoungRouter.rc").read_text(encoding="utf-8"))
+
+    def test_windows_packages_share_one_identity(self) -> None:
+        """One app on the machine, not one per publisher.
+
+        Windows keys an installed app by Name + Publisher, so a development
+        manifest that declared `CN=YoungRouterDevelopment` installed *beside*
+        the shipped `CN=YoungRouter Test` package instead of replacing it: two
+        Start entries, two registrations, and a tray hand-off that launched the
+        other copy.  Both manifests state the shipped identity, the version
+        script owns their Version, and the package family name the app hands
+        off to is the one that identity produces.
+        """
+
+        package = ROOT / "rn/apps/windows/windows/YoungRouter.Package"
+        manifests = {
+            "package": (package / "Package.appxmanifest").read_text(encoding="utf-8"),
+            "host": (WIN_PROJECT / "Package.appxmanifest").read_text(encoding="utf-8"),
+        }
+        identities = {}
+        for name, manifest in manifests.items():
+            identity = manifest.split("<Identity", 1)[1].split("/>", 1)[0]
+            identities[name] = (
+                identity.split('Name="', 1)[1].split('"', 1)[0],
+                identity.split('Publisher="', 1)[1].split('"', 1)[0],
+                identity.split('Version="', 1)[1].split('"', 1)[0],
+            )
+            self.assertIn('Publisher="CN=YoungRouter Test"', identity)
+            # The version script stamps VERSION.BUILD_NUMBER; a hand-written
+            # version here is what let the manifest fall five releases behind.
+            self.assertEqual(
+                (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+                + "."
+                + (ROOT / "BUILD_NUMBER").read_text(encoding="utf-8").strip(),
+                identities[name][2],
+            )
+        self.assertEqual(identities["package"], identities["host"])
+
+        # The family name the tray and the launcher open must be the identity's:
+        # Name_PublisherId, i.e. the hash of the publisher above.
+        for source in ("YoungRouter.cpp", "YoungRouterLauncher.cpp"):
+            text = (WIN_PROJECT / source).read_text(encoding="utf-8")
+            self.assertIn("YoungRouter_vephk5vwyzj3j!App", text)
 
     def test_windows_package_manifest_names_the_logos_the_build_ships(self) -> None:
         package = ROOT / "rn/apps/windows/windows/YoungRouter.Package"
@@ -3314,9 +3387,14 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
 
     def test_table_scrollbars_only_appear_when_they_are_needed(self) -> None:
         native_controls = (SHARED / "ui" / "NativeControls.tsx").read_text(encoding="utf-8")
-        self.assertIn('tableFallback: { minHeight: 120, borderWidth: 1, borderColor: "#d4d4d8", overflow: "hidden" }', native_controls)
+        self.assertIn('tableFallback: { minHeight: 120, borderWidth: 1, borderColor: WINDOWS_CONTROL.stroke, overflow: "hidden" }', native_controls)
         self.assertNotIn('tableFallback: { minHeight: 120, overflow: "scroll" }', native_controls)
-        self.assertIn("<ScrollView horizontal showsHorizontalScrollIndicator={!sourceList}", native_controls)
+        self.assertIn("<ScrollView horizontal showsHorizontalScrollIndicator style={windowsTableStyles.horizontalScroll}", native_controls)
+        # A source list draws its rows at the pane's own width instead: the
+        # horizontal scroller around it was scrollable by the few points a row
+        # overflowed, which is what made the sidebar slide between panes.
+        self.assertIn("{sourceList ? body : <ScrollView horizontal showsHorizontalScrollIndicator", native_controls)
+        self.assertIn("sourceCellViewFlex: { flex: 1, minWidth: 0 }", native_controls)
         self.assertIn("<FlatList", native_controls)
         self.assertIn("style={windowsTableStyles.verticalList}", native_controls)
         self.assertIn("nestedScrollEnabled", native_controls)
@@ -3555,8 +3633,16 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
 
     def test_windows_controls_use_winui_theme_resources_for_state_colors(self) -> None:
         adapter = (SHARED / "ui/NativeControls.tsx").read_text(encoding="utf-8")
-        for color in ("#005fb8", "#c42b1c", "#98a2b3", "#eaf3ff"):
-            self.assertIn(color, adapter)
+        # One palette for every Windows control: the accent, the critical fill,
+        # the disabled ink and the selected wash are declared once, so a button,
+        # a field and a table frame cannot drift apart again.
+        self.assertIn("export const WINDOWS_CONTROL = {", adapter)
+        for token in ("accent: \"#005fb8\"", "danger: \"#c42b1c\"", "textDisabled: \"#98a2b3\"", "accentSubtle: \"#eaf3ff\"", "stroke: \"#d1d1d1\"", "text: \"#1b1b1b\""):
+            self.assertIn(token, adapter)
+        # No Windows style re-states a raw hex value.
+        style_block = adapter.split("const windowsTableStyles", 1)[1].split("const EMPTY_STRINGS", 1)[0]
+        for raw in ("#c8c8c8", "#d0d5dd", "#d4d4d8", "#e4e7ec", "#f8fafc", "#1f2937", "#475467"):
+            self.assertNotIn(raw, style_block)
         controls = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
         self.assertNotIn("ThemeBrush", controls)
         self.assertNotIn("AccentFillColorDefaultBrush", controls)

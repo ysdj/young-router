@@ -465,6 +465,18 @@ _Use_decl_annotations_ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, PSTR 
   auto windowHandle = winrt::Microsoft::UI::GetWindowFromWindowId(appWindow.Id());
   YoungRouter::WinUI3NativeLeaf::Shared()->SetChildHost(childMode);
   YoungRouter::WinUI3NativeLeaf::Shared()->Initialize(windowHandle);
+  YoungRouter::WinUI3NativeLeaf::Shared()->SetRootRelayout([reactNativeWin32App, windowHandle]() {
+    auto rnWindow = reactNativeWin32App.ReactNativeWindow();
+    RECT client{};
+    if (!rnWindow || !GetClientRect(windowHandle, &client) || client.right <= 0 || client.bottom <= 0) return;
+    const auto dpi = GetDpiForWindow(windowHandle);
+    const float scale = static_cast<float>(dpi == 0 ? USER_DEFAULT_SCREEN_DPI : dpi) / USER_DEFAULT_SCREEN_DPI;
+    winrt::Microsoft::ReactNative::LayoutConstraints constraints;
+    constraints.LayoutDirection = winrt::Microsoft::ReactNative::LayoutDirection::Undefined;
+    constraints.MinimumSize = constraints.MaximumSize = {
+        static_cast<float>(client.right) / scale, static_cast<float>(client.bottom) / scale};
+    rnWindow.LayoutConstraints(constraints);
+  });
   // Start at the settings shell's content size, in physical pixels for this
   // monitor's DPI.  The root is sized from the client rect when Start()
   // creates it; resizing the still-hidden window afterwards (the old

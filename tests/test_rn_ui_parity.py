@@ -145,7 +145,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # mid-action.  A child window keeps no strip of its own.
         # The strip keeps its permanent strip and, since the usage pager lives
         # at its right end, it may also carry that route's own controls.
-        self.assert_ui_has('{shell ? <View style={styles.routeStatusBar}><Text numberOfLines={2} style={styles.routeStatusText}>{routeStatus ?? translate("common.ready")}</Text>{statusBarControls}</View> : null}')
+        self.assert_ui_has('{shell ? <View style={[styles.routeStatusBar, Platform.OS === "windows" && styles.routeStatusBarWindows]}><Text numberOfLines={2} style={[styles.routeStatusText, Platform.OS === "windows" && styles.routeStatusTextWindows]}>{routeStatus ?? translate("common.ready")}</Text>{statusBarControls}</View> : null}')
+        # The strip reads from the same Windows palette as the pane above it.
+        self.assert_ui_has('routeStatusBarWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid, borderTopColor: WINDOWS_CONTROL.strokeSubtle }')
         self.assertNotIn("{shell && routeStatus ? <View style={styles.routeStatusBar}>", self.ui)
         self.assertIn('"common.ready": "Ready"', self.en)
         self.assertIn('"common.ready": "就绪"', self.zh)
@@ -1593,7 +1595,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # names the active tab and carries that pane's commands, so the pane
             # body opens on its content instead of repeating the tab name as a
             # heading and no pane draws an action bar of its own.
-            '<View style={styles.settingsRailDetail}>',
+            '<View style={[styles.settingsRailDetail, Platform.OS === "windows" && styles.settingsRailDetailWindows]}>',
             '<SettingsDetailHeader title={dataManagementTabRows.find((row) => row.key === tab)?.cells[0] ?? ""} />',
             '{tab === "import" ? <PersistentScrollView style={styles.dataManagementPane} contentContainerStyle={[styles.dataManagementPaneScrollContent, dataManagementPolishStyles.paneScrollContent]}>',
             '{tab === "export" ? <PersistentScrollView style={styles.dataManagementPane} contentContainerStyle={[styles.dataManagementPaneScrollContent, dataManagementPolishStyles.paneScrollContent]}>',
@@ -2090,10 +2092,33 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # selection fill, a short accent pill, and a hover fill.  The old
         # bright-blue bar and the row separators were the macOS source list
         # drawn over a data-table frame.
-        self.assertIn('settingsSidebarWindows: { backgroundColor: "#f3f3f3"', self.ui)
+        self.assertIn('settingsSidebarWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid', self.ui)
+        # One content surface on Windows: the panes used to paint their own
+        # white card inside a grey body, so the toolbar row above it met the
+        # content across a rule-less seam and the card's inset changed from pane
+        # to pane.  The body, the rail's detail and that detail's header now draw
+        # the same surface, and only the shell rules and list frames remain.
+        self.assertIn('settingsDetailBodyWindows: { backgroundColor: WINDOWS_CONTROL.fill }', self.ui)
+        self.assertIn('settingsRailDetailWindows: { backgroundColor: WINDOWS_CONTROL.fill }', self.ui)
+        self.assertIn('settingsRailDetailHeaderWindows: { backgroundColor: WINDOWS_CONTROL.fill }', self.ui)
+        self.assertIn('Platform.OS === "windows" && styles.settingsDetailBodyWindows', self.ui)
+        # The rail column keeps the shell colour like the sidebar, and the pane
+        # behind it is the content surface: RouteSurface used to paint the window
+        # colour behind every pane, so the shell's surface showed only as a
+        # gutter around a white card.
+        self.assertIn('settingsRailWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid }', self.ui)
+        self.assertIn('windowSurfaceShellWindows: { backgroundColor: WINDOWS_CONTROL.fill }', self.ui)
+        self.assertIn('shell && Platform.OS === "windows" && styles.windowSurfaceShellWindows', self.ui)
         self.assertIn('sourceRow: { minWidth: 0, marginHorizontal: 4, borderRadius: 4, borderBottomWidth: 0 }', self.native_controls)
-        self.assertIn('sourceRowSelected: { backgroundColor: "#e9e9e9" }', self.native_controls)
+        self.assertIn('sourceRowSelected: { backgroundColor: WINDOWS_CONTROL.fillSelected }', self.native_controls)
         self.assertIn('sourceSelectionIndicator:', self.native_controls)
+        # The sidebar is exactly as wide as its rows: the row's first cell fills
+        # the pane instead of taking a fixed column width, and the source list is
+        # not wrapped in the data table's horizontal scroller.  Before that, a
+        # row was 11 pt wider than the 199 pt sidebar and the column scrolled, so
+        # every pane switch shifted it horizontally by a different amount.
+        self.assertIn('sourceCellViewFlex: { flex: 1, minWidth: 0 }', self.native_controls)
+        self.assertIn('{sourceList ? body : <ScrollView horizontal showsHorizontalScrollIndicator', self.native_controls)
         self.assertIn('onHoverIn={sourceList ? () => setHovered(true) : undefined}', self.native_controls)
         shell = self.ui.split("function SettingsShell(", 1)[1].split("function RouteSurface(", 1)[0]
         self.assertIn('sourceList', shell)
@@ -2475,7 +2500,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # scrolls its trailing overflow horizontally.
         self.assertIn("cell: { paddingHorizontal: 8", self.native_controls)
         self.assertIn("windowsTableStyles.horizontalContent", self.native_controls)
-        self.assertIn("<ScrollView horizontal showsHorizontalScrollIndicator={!sourceList}", self.native_controls)
+        self.assertIn("<ScrollView horizontal showsHorizontalScrollIndicator style={windowsTableStyles.horizontalScroll}", self.native_controls)
+        # A source list lays its rows out at the pane's own width: wrapping the
+        # sidebar in this scroller let a row that was a few points too wide
+        # scroll, so the column slid sideways by a per-selection amount.
+        self.assertIn("{sourceList ? body : <ScrollView horizontal showsHorizontalScrollIndicator", self.native_controls)
+        self.assertIn("sourceCellViewFlex: { flex: 1, minWidth: 0 }", self.native_controls)
 
 
     def test_windows_codegen_declares_every_prop_its_spec_does(self) -> None:
@@ -2965,7 +2995,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # The detail column is the same rail detail external clients render:
             # one shared header band naming the selected category above the
             # keyed surface.
-            '<View style={styles.settingsRailDetail}>',
+            '<View style={[styles.settingsRailDetail, Platform.OS === "windows" && styles.settingsRailDetailWindows]}>',
             '<SettingsDetailHeader title={runtimeCategoryLabel(selectedCategory, translate)} />',
             '{(groups[selectedCategory] ?? []).map((item) => <RuntimeField',
             'translate("common.willClear")',
@@ -7174,9 +7204,18 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('runMutationOnce("provider.add", () => dispatch("provider.add", { provider: { name, models: [], enabled: true } }));', self.ui)
         self.assertIn('const pendingProviderIds = useRef<Set<string> | undefined>(undefined);', self.ui)
         self.assertIn(
-            '<ActionButton title={translate("providers.addWizard")} titleWidth="tight" disabled={busy} style={styles.providerWizardToolbarButton} onPress={onOpenWizard} />',
+            '<ActionButton title={translate("providers.addWizard")} titleWidth="tight" disabled={busy} onPress={onOpenWizard} />',
             self.ui,
         )
+        # The toolbar action carries no pane-specific width: NativeButton applies
+        # its own title-width style after the caller's, so an override here only
+        # read as a width that was never used.
+        self.assertNotIn("providerWizardToolbarButton", self.ui)
+        # A command that opens another surface ends in a real ellipsis, not three
+        # full stops, so Windows draws one glyph instead of three spaced periods.
+        self.assertIn('"providers.addWizard": "添加向导…"', self.zh)
+        self.assertIn('"providers.addWizard": "Add with wizard…"', self.en)
+        self.assertNotIn('"providers.addWizard": "添加向导..."', self.zh)
 
     def test_first_base_url_commit_names_a_custom_provider_from_the_host(self) -> None:
         # A provider created without a URL takes its name from the first

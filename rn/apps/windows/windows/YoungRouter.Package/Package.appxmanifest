@@ -6,9 +6,18 @@
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
   IgnorableNamespaces="uap rescap">
 
+  <!-- One package identity, and this is its only source.
+       Windows keys a package by Name + Publisher, so a development build that
+       declares a different publisher installs *beside* the shipped one instead
+       of replacing it: the machine ended up with two Start entries, two
+       registrations and two copies of the same app.  The publisher below is
+       the shipped identity, and the package family name it produces
+       (YoungRouter_vephk5vwyzj3j) is what the tray's "open the app" path and
+       YoungRouterLauncher.cpp hand off to.  Bump Version for every build that
+       lands on a machine: it is the version Windows uses to order upgrades. -->
   <Identity
     Name="YoungRouter"
-    Publisher="CN=YoungRouterDevelopment"
+    Publisher="CN=YoungRouter Test"
     Version="1.0.1.5" />
 
   <Properties>

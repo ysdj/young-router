@@ -8,7 +8,6 @@ import {
   Pressable,
   ScrollView,
   StyleSheet,
-  Switch,
   Text,
   TextInput,
   View,
@@ -308,7 +307,7 @@ const WINDOWS_BUTTON_GLYPHS: Record<NonNullable<ButtonProps["symbol"]>, string> 
 function WindowsButton({ title, symbol, symbolWithTitle, symbolTrailing, toolTip, accessibilityLabel, disabled, busy, primary, destructive, compact, link, plainLink, titleWidth: _titleWidth, onPress, style, ref }: ButtonProps & { ref?: React.Ref<any> }): React.JSX.Element {
   const showsTitle = symbolWithTitle === true || !symbol;
   const glyph = symbol ? WINDOWS_BUTTON_GLYPHS[symbol] ?? "\uE74D" : undefined;
-  const ink = disabled ? "#98a2b3" : destructive ? "#c42b1c" : primary ? "#ffffff" : link ? "#005fb8" : "#1a1a1a";
+  const ink = disabled ? WINDOWS_CONTROL.textDisabled : destructive ? WINDOWS_CONTROL.danger : primary ? WINDOWS_CONTROL.fill : link ? WINDOWS_CONTROL.accent : WINDOWS_CONTROL.text;
   return <Pressable
     ref={ref as never}
     disabled={disabled}
@@ -351,6 +350,23 @@ const WindowsSegmentedControl = React.forwardRef<any, SegmentedProps>(function W
     })}
   </View>;
 });
+
+function WindowsToggle({ value, disabled, onValueChange, style, accessibilityLabel }: ToggleProps): React.JSX.Element {
+  const toggle = (): void => onValueChange?.(!value);
+  return <Pressable
+    style={[styles.windowsToggle, disabled && styles.windowsDisabled, style]}
+    disabled={disabled}
+    onPress={toggle}
+    onAccessibilityTap={toggle}
+    accessibilityRole="switch"
+    accessibilityLabel={accessibilityLabel}
+    accessibilityState={{ checked: value, disabled: disabled === true }}
+  >
+    <View style={[styles.windowsToggleTrack, value && styles.windowsToggleTrackOn]}>
+      <View style={[styles.windowsToggleKnob, value && styles.windowsToggleKnobOn]} />
+    </View>
+  </Pressable>;
+}
 
 function WindowsCheckbox({ label, value, disabled, compact = true, labelVisible = true, onValueChange, style }: CheckboxProps): React.JSX.Element {
   const sizedStyle = [{ minWidth: labelVisible ? nativeCheckboxMinimumWidth(label) : 24 }, style];
@@ -533,7 +549,7 @@ export function NativeTextField({ style, onChangeText, onSubmitEditing, onBlur, 
 
 export function NativeToggle({ value, disabled, onValueChange, style, accessibilityLabel }: ToggleProps): React.JSX.Element {
   if (Platform.OS === "windows") {
-    return <Switch value={value} disabled={disabled} onValueChange={onValueChange} style={style} accessibilityLabel={accessibilityLabel} />;
+    return <WindowsToggle value={value} disabled={disabled} onValueChange={onValueChange} style={style} accessibilityLabel={accessibilityLabel} />;
   }
   if (Platform.OS === "macos") {
     return <AppKitToggle value={value} disabled={disabled} onValueChange={onValueChange} style={style} accessibilityLabel={accessibilityLabel} />;
@@ -641,6 +657,12 @@ function sameTableRow(previous: { row: TableRow; index: number; columns: TableCo
     && sameColumns(previous.columns, next.columns);
 }
 
+// One row height for the row itself, the accent pill beside it, and the
+// virtualised offsets: three copies of `compact ? 30 : 36` were free to drift.
+function windowsRowHeight(compact: boolean): number {
+  return compact ? 30 : WINDOWS_CONTROL.sourceRowHeight;
+}
+
 const WindowsTableRow = React.memo(function WindowsTableRow({
   row,
   index,
@@ -677,10 +699,10 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
   const spanning = row.spanning === true;
   const [hovered, setHovered] = React.useState(false);
   const stripe = stripedRows && !selected && !disabled && index % 2 === 1;
-  const textColor = alert ? "#8a5a00" : (disabled ? "#98a2b3" : "#1f2937");
+  const textColor = alert ? WINDOWS_CONTROL.warning : (disabled ? WINDOWS_CONTROL.textDisabled : WINDOWS_CONTROL.text);
   const rowStyle = [
     windowsTableStyles.row,
-    { height: compact ? 30 : 36 },
+    { height: windowsRowHeight(compact) },
     sourceList && windowsTableStyles.sourceRow,
     stripe && windowsTableStyles.rowStripe,
     // A NavigationView-style source list selects with a quiet fill and a short
@@ -698,18 +720,22 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
     onHoverOut={sourceList ? () => setHovered(false) : undefined}
     style={rowStyle}
   >
-    {sourceList && selected ? <View style={[windowsTableStyles.sourceSelectionIndicator, { top: (compact ? 30 : 36) / 2 - 8 }]} /> : null}
+    {sourceList && selected ? <View style={[windowsTableStyles.sourceSelectionIndicator, { top: windowsRowHeight(compact) / 2 - 8 }]} /> : null}
     {spanning ? <Text numberOfLines={1} style={[windowsTableStyles.groupText, { color: textColor }]}>{row.cells[0] ?? ""}</Text> : <View style={windowsTableStyles.cells}>
       {columns.map((column, columnIndex) => {
         const cell = row.cells[columnIndex] ?? "";
         const cellKey = `${row.key}\x1f${columnIndex}`;
         const secondary = secondaryCellKeys.has(cellKey);
-        const cellColor = secondary ? "#667085" : textColor;
+        const cellColor = secondary ? WINDOWS_CONTROL.textSecondary : textColor;
         const visibleCell = cell.replace(/^\t/u, "");
         const sourceImage = rowImageName ? windowsSourceImage(rowImageName) : undefined;
         if (columnIndex === 0 && sourceList) {
-          return <View key={`${row.key}:${columnIndex}`} style={[windowsTableStyles.cellView, { width: column.width }]}>
-            {rowSymbol ? <Text style={[windowsTableStyles.symbol, { color: disabled ? "#98a2b3" : selected ? "#1f1f1f" : "#5f6368" }]}>{windowsSourceSymbol(rowSymbol)}</Text> : sourceImage !== undefined ? <Image source={sourceImage} style={windowsTableStyles.sourceImage} /> : null}
+          // A source list never scrolls sideways: the row has to fit the pane it
+          // navigates.  A fixed column width here (plus the cell and row insets)
+          // overflowed the sidebar, and that overflow was scrollable, so the
+          // whole column slid by a different amount on every selection.
+          return <View key={`${row.key}:${columnIndex}`} style={[windowsTableStyles.cellView, sourceList ? windowsTableStyles.sourceCellViewFlex : { width: column.width }]}>
+            {rowSymbol ? <Text style={[windowsTableStyles.symbol, { color: disabled ? WINDOWS_CONTROL.textDisabled : selected ? WINDOWS_CONTROL.text : WINDOWS_CONTROL.textSecondary }]}>{windowsSourceSymbol(rowSymbol)}</Text> : sourceImage !== undefined ? <Image source={sourceImage} style={windowsTableStyles.sourceImage} /> : null}
             <Text numberOfLines={1} style={[windowsTableStyles.cellText, { color: cellColor }]}>{visibleCell}</Text>
           </View>;
         }
@@ -742,7 +768,7 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
 }): React.JSX.Element {
   const lastPress = React.useRef<{ key: string; at: number } | undefined>(undefined);
   const verticalList = React.useRef<FlatList<TableRow>>(null);
-  const rowHeight = compact ? 30 : 36;
+  const rowHeight = windowsRowHeight(compact);
   const totalWidth = columns.reduce((sum, column) => sum + column.width, 0);
   // Built once per prop change instead of once per mounted row per cell: a
   // log that appends 20 entries a second otherwise rebuilt the same lookups
@@ -795,65 +821,119 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
     onSelect={select}
   />, [alertKeys, columns, compact, disabledKeys, rowImageNames, rowSymbols, rowSymbolColors, secondaryKeys, selectableSpanningKeys, select, selectedKey, sourceList, stripedRows]);
   const keyExtractor = React.useCallback((row: TableRow): string => row.key, []);
+  const body = <View style={[windowsTableStyles.horizontalBody, !sourceList && { minWidth: totalWidth }]}>
+    {!sourceList ? <View style={[windowsTableStyles.header, { minWidth: totalWidth }]}>
+      {columns.map((column) => <Text key={column.label} numberOfLines={1} style={[windowsTableStyles.headerText, { width: column.width }]}>{column.label}</Text>)}
+    </View> : null}
+    <FlatList
+      ref={verticalList}
+      data={rows}
+      renderItem={renderRow}
+      keyExtractor={keyExtractor}
+      style={windowsTableStyles.verticalList}
+      contentContainerStyle={windowsTableStyles.body}
+      nestedScrollEnabled
+      initialNumToRender={24}
+      maxToRenderPerBatch={24}
+      windowSize={7}
+      getItemLayout={(_data, index) => ({ length: rowHeight, offset: rowHeight * index, index })}
+      // A target that scrolls out of range while the list is still laying
+      // out is dropped instead of thrown: `scrollToIndex` fails loudly by
+      // design, and a thrown error here escapes into the host process.
+      onScrollToIndexFailed={() => undefined}
+    />
+  </View>;
   return <View style={[windowsTableStyles.root, !framed && windowsTableStyles.borderless, style]}>
-    <ScrollView horizontal showsHorizontalScrollIndicator={!sourceList} style={windowsTableStyles.horizontalScroll} contentContainerStyle={windowsTableStyles.horizontalContent}>
-      <View style={[windowsTableStyles.horizontalBody, { minWidth: totalWidth }]}>
-        {!sourceList ? <View style={[windowsTableStyles.header, { minWidth: totalWidth }]}>
-          {columns.map((column) => <Text key={column.label} numberOfLines={1} style={[windowsTableStyles.headerText, { width: column.width }]}>{column.label}</Text>)}
-        </View> : null}
-        <FlatList
-          ref={verticalList}
-          data={rows}
-          renderItem={renderRow}
-          keyExtractor={keyExtractor}
-          style={windowsTableStyles.verticalList}
-          contentContainerStyle={windowsTableStyles.body}
-          nestedScrollEnabled
-          initialNumToRender={24}
-          maxToRenderPerBatch={24}
-          windowSize={7}
-          getItemLayout={(_data, index) => ({ length: rowHeight, offset: rowHeight * index, index })}
-          // A target that scrolls out of range while the list is still laying
-          // out is dropped instead of thrown: `scrollToIndex` fails loudly by
-          // design, and a thrown error here escapes into the host process.
-          onScrollToIndexFailed={() => undefined}
-        />
-      </View>
-    </ScrollView>
+    {/* A source list is a navigation pane, so it lays its rows out at the pane's
+        own width and never scrolls horizontally.  Wrapping it in the data
+        table's horizontal scroller made the sidebar slide sideways by a
+        per-selection amount once a row was a few points too wide. */}
+    {sourceList ? body : <ScrollView horizontal showsHorizontalScrollIndicator style={windowsTableStyles.horizontalScroll} contentContainerStyle={windowsTableStyles.horizontalContent}>{body}</ScrollView>}
   </View>;
 }
 
+// The Windows control layer's one palette and metric set (Fluent 2, light).
+//
+// Every Windows-only style below reads these instead of repeating a hex value:
+// the surface had drifted into four border greys (#c8c8c8, #d0d5dd, #d4d4d8,
+// #e4e7ec), three body inks (#1a1a1a, #1f2937, #111827), three corner radii
+// (3, 4, 6) and two focus colours (#0078d4 beside the accent #005fb8), so a
+// button, a field and a table frame from the same pane never quite matched.
+// The values are Fluent 2's own solid fills and strokes, flattened because the
+// composition host paints over a solid window rather than a themed brush.
+export const WINDOWS_CONTROL = {
+  /** ControlStrokeColorDefault: the 1 pt bezel of a button, field or picker. */
+  stroke: "#d1d1d1",
+  /** ControlStrokeColorSecondary: dividers, row rules, the pane's right edge. */
+  strokeSubtle: "#e5e5e5",
+  /** ControlStrongStrokeColorDefault: a checkbox or radio box outline. */
+  strokeStrong: "#8a8a8a",
+  /** ControlFillColorDefault. */
+  fill: "#ffffff",
+  /** The quiet header band above a table. */
+  fillSubtle: "#fafafa",
+  /** SolidBackgroundFillColorBase: the shell, its sidebar and its status bar. */
+  fillSolid: "#f3f3f3",
+  /** SubtleFillColorSecondary: the selected row of a source list. */
+  fillSelected: "#e9e9e9",
+  /** One step lighter, so hover trails selection instead of matching it. */
+  fillHover: "#ececec",
+  /** TextFillColorPrimary. */
+  text: "#1b1b1b",
+  /** TextFillColorSecondary. */
+  textSecondary: "#5d5d5d",
+  /** TextFillColorTertiary: glyphs beside a label. */
+  textTertiary: "#8a8a8a",
+  /** TextFillColorDisabled. */
+  textDisabled: "#98a2b3",
+  /** AccentFillColorDefault. */
+  accent: "#005fb8",
+  /** A selected segment's wash behind accent ink. */
+  accentSubtle: "#eaf3ff",
+  /** SystemFillColorCritical. */
+  danger: "#c42b1c",
+  /** SystemFillColorCaution, for a row that needs attention. */
+  warning: "#8a5a00",
+  /** ControlCornerRadius. */
+  radius: 4,
+  /** The compact control height every Windows button, field and picker shares. */
+  controlHeight: 24,
+  /** A row of a source list, matching the shell's own 36 pt navigation row. */
+  sourceRowHeight: 36,
+} as const;
+
 const windowsTableStyles = StyleSheet.create({
-  root: { minHeight: 120, overflow: "hidden", borderWidth: 1, borderColor: "#d0d5dd", borderRadius: 6, backgroundColor: "#ffffff" },
+  root: { minHeight: 120, overflow: "hidden", borderWidth: 1, borderColor: WINDOWS_CONTROL.stroke, borderRadius: WINDOWS_CONTROL.radius, backgroundColor: WINDOWS_CONTROL.fill },
   borderless: { borderWidth: 0, borderRadius: 0, backgroundColor: "transparent" },
-  header: { flexDirection: "row", alignItems: "center", minHeight: 30, paddingHorizontal: 8, backgroundColor: "#f8fafc", borderBottomWidth: 1, borderBottomColor: "#e4e7ec" },
-  headerText: { paddingHorizontal: 8, color: "#667085", fontSize: UI_TIP_FONT_SIZE, fontWeight: "600" },
+  header: { flexDirection: "row", alignItems: "center", minHeight: 30, paddingHorizontal: 8, backgroundColor: WINDOWS_CONTROL.fillSubtle, borderBottomWidth: 1, borderBottomColor: WINDOWS_CONTROL.strokeSubtle },
+  headerText: { paddingHorizontal: 8, color: WINDOWS_CONTROL.textSecondary, fontSize: UI_TIP_FONT_SIZE, fontWeight: "600" },
   horizontalScroll: { flex: 1, minHeight: 0 },
   horizontalContent: { flexGrow: 1, minHeight: 0 },
   horizontalBody: { flex: 1, minHeight: 0 },
   verticalList: { flex: 1, minHeight: 0 },
   body: { flexGrow: 1 },
-  row: { minWidth: "100%", borderBottomWidth: 1, borderBottomColor: "#e5e7eb", justifyContent: "center" },
+  row: { minWidth: "100%", borderBottomWidth: 1, borderBottomColor: WINDOWS_CONTROL.strokeSubtle, justifyContent: "center" },
   // A source list is a navigation surface, not a data table: no row rules,
   // a small inset, and a rounded quiet fill.  It is what Windows Settings,
   // Explorer's navigation pane, and NavigationView draw.
   sourceRow: { minWidth: 0, marginHorizontal: 4, borderRadius: 4, borderBottomWidth: 0 },
-  sourceRowSelected: { backgroundColor: "#e9e9e9" },
-  sourceRowHover: { backgroundColor: "#ececec" },
-  sourceSelectionIndicator: { position: "absolute", left: 0, width: 3, height: 16, borderRadius: 1.5, backgroundColor: "#0067c0" },
+  sourceRowSelected: { backgroundColor: WINDOWS_CONTROL.fillSelected },
+  sourceRowHover: { backgroundColor: WINDOWS_CONTROL.fillHover },
+  sourceSelectionIndicator: { position: "absolute", left: 0, width: 3, height: 16, borderRadius: 1.5, backgroundColor: WINDOWS_CONTROL.accent },
   rowCompact: { minHeight: 30 },
   rowRelaxed: { minHeight: 36 },
-  rowStripe: { backgroundColor: "#fafbfc" },
-  rowSelected: { backgroundColor: "#eaf3ff", borderLeftWidth: 3, borderLeftColor: "#1677d2" },
+  rowStripe: { backgroundColor: WINDOWS_CONTROL.fillSubtle },
+  rowSelected: { backgroundColor: WINDOWS_CONTROL.accentSubtle, borderLeftWidth: 3, borderLeftColor: WINDOWS_CONTROL.accent },
   rowDisabled: { opacity: 0.72 },
   cells: { flexDirection: "row", alignItems: "center", paddingHorizontal: 8 },
   cellView: { flexDirection: "row", alignItems: "center", paddingHorizontal: 8, minWidth: 0 },
+  sourceCellViewFlex: { flex: 1, minWidth: 0 },
   cellText: { flexShrink: 1, minWidth: 0, fontSize: UI_FONT_SIZE },
-  cell: { paddingHorizontal: 8, color: "#1f2937", fontSize: UI_FONT_SIZE },
+  cell: { paddingHorizontal: 8, color: WINDOWS_CONTROL.text, fontSize: UI_FONT_SIZE },
   sourceCell: { flexDirection: "row", alignItems: "center" },
   sourceImage: { width: 20, height: 20, marginRight: 8, borderRadius: 4 },
   symbol: { width: 20, height: 20, marginRight: 8, fontFamily: "Segoe MDL2 Assets", fontSize: 16, lineHeight: 20, textAlign: "center", transform: [{ translateY: 1 }] },
-  groupText: { paddingHorizontal: 12, color: "#475467", fontSize: UI_TIP_FONT_SIZE, fontWeight: "600" },
+  groupText: { paddingHorizontal: 12, color: WINDOWS_CONTROL.textSecondary, fontSize: UI_TIP_FONT_SIZE, fontWeight: "600" },
 });
 
 // The empty lists are module constants, not fresh `[]` defaults: a new array
@@ -970,46 +1050,60 @@ const styles = StyleSheet.create({
   buttonBusyIndicator: { width: BUSY_SPINNER_SIZE, height: BUSY_SPINNER_SIZE },
   busySpinner: { width: BUSY_SPINNER_SIZE, height: BUSY_SPINNER_SIZE },
   controlText: { fontSize: UI_FONT_SIZE },
-  windowsButton: { minHeight: 24, minWidth: 28, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 4, paddingHorizontal: 8, borderRadius: 4, borderWidth: 1, borderColor: "#c8c8c8", backgroundColor: "#ffffff" },
-  windowsButtonCompact: { minHeight: 24, paddingHorizontal: 6 },
+  windowsButton: { minHeight: WINDOWS_CONTROL.controlHeight, minWidth: 28, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 4, paddingHorizontal: 8, borderRadius: WINDOWS_CONTROL.radius, borderWidth: 1, borderColor: WINDOWS_CONTROL.stroke, backgroundColor: WINDOWS_CONTROL.fill },
+  windowsButtonCompact: { minHeight: WINDOWS_CONTROL.controlHeight, paddingHorizontal: 6 },
   windowsButtonLink: { borderWidth: 0, backgroundColor: "transparent", paddingHorizontal: 0 },
   windowsButtonPlainLink: { borderWidth: 0, backgroundColor: "transparent", paddingHorizontal: 0, justifyContent: "flex-start" },
-  windowsButtonPrimary: { borderColor: "#005fb8", backgroundColor: "#005fb8" },
-  windowsButtonDestructive: { borderColor: "#c42b1c", backgroundColor: "#c42b1c" },
+  windowsButtonPrimary: { borderColor: WINDOWS_CONTROL.accent, backgroundColor: WINDOWS_CONTROL.accent },
+  windowsButtonDestructive: { borderColor: WINDOWS_CONTROL.danger, backgroundColor: WINDOWS_CONTROL.danger },
   windowsButtonDisabled: { opacity: 0.55 },
   windowsButtonGlyph: { fontFamily: "Segoe MDL2 Assets", fontSize: UI_FONT_SIZE, lineHeight: 16 },
   windowsButtonTitle: { fontSize: UI_FONT_SIZE, flexShrink: 1 },
   windowsButtonLinkTitle: { textDecorationLine: "underline" },
   windowsButtonPlainLinkTitle: { textDecorationLine: "underline", fontWeight: "400" },
-  windowsSegmented: { flexDirection: "row", alignItems: "stretch", minHeight: 24, borderRadius: 4, borderWidth: 1, borderColor: "#c8c8c8", overflow: "hidden", backgroundColor: "#ffffff" },
-  windowsSegmentedCompact: { minHeight: 24 },
-  windowsSegment: { flex: 1, minWidth: 0, alignItems: "center", justifyContent: "center", paddingHorizontal: 6, borderRightWidth: 1, borderRightColor: "#e4e7ec" },
-  windowsSegmentFirst: { borderTopLeftRadius: 3, borderBottomLeftRadius: 3 },
-  windowsSegmentLast: { borderRightWidth: 0, borderTopRightRadius: 3, borderBottomRightRadius: 3 },
-  windowsSegmentSelected: { backgroundColor: "#eaf3ff" },
-  windowsSegmentText: { color: "#475467", fontSize: UI_TIP_FONT_SIZE },
-  windowsSegmentTextSelected: { color: "#005fb8", fontWeight: "600" },
-  windowsCheckboxCompact: { minHeight: 24 },
-  windowsCheckboxBox: { width: 16, height: 16, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: "#71717a", borderRadius: 3, backgroundColor: "#ffffff" },
-  windowsCheckboxBoxChecked: { borderColor: "#005fb8", backgroundColor: "#005fb8" },
-  windowsCheckboxMark: { color: "#ffffff", fontSize: 12, lineHeight: 14, fontWeight: "700" },
-  windowsCheckboxLabel: { color: "#1a1a1a", fontSize: UI_FONT_SIZE, flexShrink: 1 },
+  windowsSegmented: { flexDirection: "row", alignItems: "stretch", minHeight: WINDOWS_CONTROL.controlHeight, borderRadius: WINDOWS_CONTROL.radius, borderWidth: 1, borderColor: WINDOWS_CONTROL.stroke, overflow: "hidden", backgroundColor: WINDOWS_CONTROL.fill },
+  windowsSegmentedCompact: { minHeight: WINDOWS_CONTROL.controlHeight },
+  windowsSegment: { flex: 1, minWidth: 0, alignItems: "center", justifyContent: "center", paddingHorizontal: 6, borderRightWidth: 1, borderRightColor: WINDOWS_CONTROL.strokeSubtle },
+  windowsSegmentFirst: { borderTopLeftRadius: WINDOWS_CONTROL.radius - 1, borderBottomLeftRadius: WINDOWS_CONTROL.radius - 1 },
+  windowsSegmentLast: { borderRightWidth: 0, borderTopRightRadius: WINDOWS_CONTROL.radius - 1, borderBottomRightRadius: WINDOWS_CONTROL.radius - 1 },
+  // One ink for both the tab labels and the toolbar buttons beside them: the
+  // 12 pt secondary grey read as a different control family next to a 13 pt
+  // button label on the same row.
+  windowsSegmentSelected: { backgroundColor: WINDOWS_CONTROL.accentSubtle },
+  windowsSegmentText: { color: WINDOWS_CONTROL.textSecondary, fontSize: UI_FONT_SIZE },
+  windowsSegmentTextSelected: { color: WINDOWS_CONTROL.accent, fontWeight: "600" },
+  windowsCheckboxCompact: { minHeight: WINDOWS_CONTROL.controlHeight },
+  // Fluent 2's ToggleSwitch: a 40 x 20 track with a 12 pt knob.  RNW's
+  // <Switch> draws its own UIKit-shaped control, so the one surface outside
+  // this palette was a grey track with a dark knob in both states, beside
+  // Fluent buttons that had just been unified.
+  windowsToggle: { minWidth: 40, minHeight: WINDOWS_CONTROL.controlHeight, justifyContent: "center" },
+  windowsToggleTrack: { width: 40, height: 20, flexDirection: "row", alignItems: "center", justifyContent: "flex-start", paddingHorizontal: 3, borderWidth: 1, borderRadius: 10, borderColor: WINDOWS_CONTROL.strokeStrong, backgroundColor: "transparent" },
+  // The knob's travel comes from the track's own alignment, so no
+  // absolutely-positioned child can be left behind by a re-render.
+  windowsToggleTrackOn: { justifyContent: "flex-end", borderColor: WINDOWS_CONTROL.accent, backgroundColor: WINDOWS_CONTROL.accent },
+  windowsToggleKnob: { width: 12, height: 12, borderRadius: 6, backgroundColor: WINDOWS_CONTROL.textSecondary },
+  windowsToggleKnobOn: { backgroundColor: WINDOWS_CONTROL.fill },
+  windowsCheckboxBox: { width: 16, height: 16, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: WINDOWS_CONTROL.strokeStrong, borderRadius: WINDOWS_CONTROL.radius - 2, backgroundColor: WINDOWS_CONTROL.fill },
+  windowsCheckboxBoxChecked: { borderColor: WINDOWS_CONTROL.accent, backgroundColor: WINDOWS_CONTROL.accent },
+  windowsCheckboxMark: { color: WINDOWS_CONTROL.fill, fontSize: 12, lineHeight: 14, fontWeight: "700" },
+  windowsCheckboxLabel: { color: WINDOWS_CONTROL.text, fontSize: UI_FONT_SIZE, flexShrink: 1 },
   windowsDisabled: { opacity: 0.55 },
-  windowsDisabledText: { color: "#98a2b3" },
-  windowsPicker: { minHeight: 24, flexDirection: "row", alignItems: "center", paddingHorizontal: 6, borderWidth: 1, borderColor: "#c8c8c8", borderRadius: 4, backgroundColor: "#ffffff" },
-  windowsPickerCompact: { minHeight: 24 },
+  windowsDisabledText: { color: WINDOWS_CONTROL.textDisabled },
+  windowsPicker: { minHeight: WINDOWS_CONTROL.controlHeight, flexDirection: "row", alignItems: "center", paddingHorizontal: 6, borderWidth: 1, borderColor: WINDOWS_CONTROL.stroke, borderRadius: WINDOWS_CONTROL.radius, backgroundColor: WINDOWS_CONTROL.fill },
+  windowsPickerCompact: { minHeight: WINDOWS_CONTROL.controlHeight },
   windowsPickerDisabled: { opacity: 0.55 },
-  windowsPickerText: { flex: 1, minWidth: 0, color: "#1a1a1a", fontSize: UI_FONT_SIZE },
-  windowsPickerChevron: { color: "#667085", fontSize: UI_TIP_FONT_SIZE, marginLeft: 4 },
+  windowsPickerText: { flex: 1, minWidth: 0, color: WINDOWS_CONTROL.text, fontSize: UI_FONT_SIZE },
+  windowsPickerChevron: { color: WINDOWS_CONTROL.textSecondary, fontSize: UI_TIP_FONT_SIZE, marginLeft: 4 },
   linkButton: { minWidth: 72, minHeight: 22 },
   segmented: { minHeight: 24 },
   toggleFallback: { minWidth: 24, minHeight: 24, justifyContent: "center" },
   checkboxFallback: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 },
-  staticBooleanIndicator: { width: 16, height: 16, borderWidth: 1, borderColor: "#71717a", alignItems: "center", justifyContent: "center", backgroundColor: "#ffffff" },
-  staticBooleanIndicatorChecked: { backgroundColor: "#dbeafe", borderColor: "#1d4ed8" },
-  staticBooleanIndicatorText: { fontSize: UI_TIP_FONT_SIZE, lineHeight: 14, color: "#111827", fontWeight: "700" },
+  staticBooleanIndicator: { width: 16, height: 16, borderWidth: 1, borderColor: WINDOWS_CONTROL.strokeStrong, alignItems: "center", justifyContent: "center", backgroundColor: WINDOWS_CONTROL.fill },
+  staticBooleanIndicatorChecked: { backgroundColor: WINDOWS_CONTROL.accentSubtle, borderColor: WINDOWS_CONTROL.accent },
+  staticBooleanIndicatorText: { fontSize: UI_TIP_FONT_SIZE, lineHeight: 14, color: WINDOWS_CONTROL.text, fontWeight: "700" },
   selectableRow: { minHeight: 28, justifyContent: "center", paddingHorizontal: 8 },
-  selectableRowSelected: { backgroundColor: "#dbeafe" },
+  selectableRowSelected: { backgroundColor: WINDOWS_CONTROL.accentSubtle },
   selectableText: { gap: 2 },
   selectableTitle: { fontSize: UI_FONT_SIZE },
   selectableDetail: { fontSize: UI_FONT_SIZE, opacity: 0.65 },
@@ -1017,15 +1111,15 @@ const styles = StyleSheet.create({
   // Let the surrounding window provide scrolling when a fallback host needs
   // it; `overflow: scroll` would force an empty scrollbar gutter on every
   // table, even when all rows fit.
-  tableFallback: { minHeight: 120, borderWidth: 1, borderColor: "#d4d4d8", overflow: "hidden" },
+  tableFallback: { minHeight: 120, borderWidth: 1, borderColor: WINDOWS_CONTROL.stroke, overflow: "hidden" },
   tableFallbackUnframed: { borderWidth: 0 },
-  tableFallbackStripe: { backgroundColor: "#f1f1f3" },
+  tableFallbackStripe: { backgroundColor: WINDOWS_CONTROL.fillSubtle },
   tableFallbackGroupRow: { minHeight: 26, justifyContent: "center", paddingHorizontal: 8 },
   tableFallbackGroupText: { fontWeight: "400" },
   editor: { minHeight: 160 },
   editorFallback: { minHeight: 160, textAlignVertical: "top", fontSize: UI_FONT_SIZE },
-  windowsTextField: { minHeight: 28, justifyContent: "center", overflow: "hidden", borderWidth: 1, borderColor: "#c8c8c8", borderRadius: 3, backgroundColor: "#ffffff" },
-  windowsTextFieldFocused: { borderColor: "#0078d4" },
+  windowsTextField: { minHeight: WINDOWS_CONTROL.controlHeight, justifyContent: "center", overflow: "hidden", borderWidth: 1, borderColor: WINDOWS_CONTROL.stroke, borderRadius: WINDOWS_CONTROL.radius, backgroundColor: WINDOWS_CONTROL.fill },
+  windowsTextFieldFocused: { borderColor: WINDOWS_CONTROL.accent },
   windowsTextFieldDisabled: { opacity: 0.5 },
   // RNW's Windows single-line leaf ignores `textAlignVertical`, and its own
   // vertical placement is `paddingTop + (contentFrame - naturalHeight) / 2`,
@@ -1035,7 +1129,7 @@ const styles = StyleSheet.create({
   // paddings: 21 DIP, i.e. one line plus its leading. Measured on the installed
   // build at 192 DPI, this puts a 24 DIP field's ink on the optical centre of
   // its bezel instead of against the bottom edge.
-  windowsTextFieldInput: { flex: 1, minWidth: 0, paddingHorizontal: 8, paddingTop: 0, paddingBottom: 21, fontSize: UI_FONT_SIZE, color: "#1a1a1a", backgroundColor: "transparent" },
+  windowsTextFieldInput: { flex: 1, minWidth: 0, paddingHorizontal: 8, paddingTop: 0, paddingBottom: 21, fontSize: UI_FONT_SIZE, color: WINDOWS_CONTROL.text, backgroundColor: "transparent" },
   // A multiline leaf aligns to the top instead (the host returns early for it),
   // so it only needs even padding around the block of text.
   windowsTextFieldInputMultiline: { paddingTop: 4, paddingBottom: 4, textAlignVertical: "top" },

@@ -675,7 +675,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "providers.upstreamContextWindowHelpTitle": "上游上下文",
   "providers.upstreamContextWindowHelp": "该上游在自己的模型目录里公布了这个窗口，本应用只读取它，不能修改。",
   "providers.followMultiplier": "跟随倍率",
-  "providers.addWizard": "添加向导...",
+  "providers.addWizard": "添加向导…",
   "providers.wizard.title": "配置供应商",
   "providers.wizard.stepProvider": "供应商",
   "providers.wizard.stepKeys": "密钥",

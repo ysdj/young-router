@@ -669,7 +669,7 @@ export const en: Record<TranslationKey, string> = {
   "providers.upstreamContextWindowHelpTitle": "Upstream context",
   "providers.upstreamContextWindowHelp": "This upstream publishes this window in its own model catalog. The app only reads it; it cannot be changed here.",
   "providers.followMultiplier": "Follow multiplier",
-  "providers.addWizard": "Add with wizard",
+  "providers.addWizard": "Add with wizard…",
   "providers.wizard.title": "Configure provider",
   "providers.wizard.stepProvider": "Provider",
   "providers.wizard.stepKeys": "Keys",

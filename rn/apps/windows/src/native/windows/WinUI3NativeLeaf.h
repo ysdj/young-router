@@ -149,6 +149,10 @@ class WinUI3NativeLeaf : public std::enable_shared_from_this<WinUI3NativeLeaf> {
   HWND WindowHandle() const noexcept { return window_handle_; }
   void SetChildHost(bool child) noexcept { child_host_ = child; }
   bool IsChildHost() const noexcept { return child_host_; }
+  // Re-arranges the React root at the current client size.  RNW follows
+  // AppWindow size changes only, so a caption change that resizes the client
+  // inside an unchanged window must ask for the layout itself.
+  void SetRootRelayout(std::function<void()> relayout) { root_relayout_ = std::move(relayout); }
   // One answer on the app's decision window: its label, the id the caller hears
   // back, whether Return carries it, whether Escape and the title-bar close
   // button carry it, and whether it destroys what it names.  Mirrors the macOS
@@ -238,6 +242,7 @@ class WinUI3NativeLeaf : public std::enable_shared_from_this<WinUI3NativeLeaf> {
   // area into the caption is what lets that strip be the window's title bar.
   void ApplyIntegratedTitleBar(bool enabled);
   void UpdateTitleBarDragRegions();
+  void RelayoutRootView();
   std::wstring RouteTitle(std::wstring_view route) const;
   std::wstring VersionText() const;
 
@@ -249,6 +254,7 @@ class WinUI3NativeLeaf : public std::enable_shared_from_this<WinUI3NativeLeaf> {
   // later open keeps the geometry the user chose.
   bool window_sized_ = false;
   bool integrated_title_bar_ = false;
+  std::function<void()> root_relayout_;
   bool child_host_ = false;
   NOTIFYICONDATAW tray_{};
   bool tray_visible_ = false;

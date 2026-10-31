@@ -41,6 +41,11 @@ constexpr UINT kTrayMessage = WM_APP + 31;
 constexpr UINT kQuitMessage = WM_APP + 32;
 constexpr UINT kReactChildCloseMessage = WM_APP + 33;
 constexpr UINT kReactChildRestoreParentMessage = WM_APP + 34;
+// The root is re-arranged one message later than the change that moved the
+// client: a caption change fires WM_NCCALCSIZE and WM_SIZE synchronously
+// inside SetWindowPos, and arranging the composition root from inside that
+// dispatch is what the XAML layer faulted on.
+constexpr UINT kRelayoutRootMessage = WM_APP + 35;
 constexpr UINT kTrayMenuFirstCommand = 41000;
 constexpr double kUIFontSize = 13.0;
 // A hint's own step, mirroring the shared UI's `UI_TIP_FONT_SIZE` (12): an
@@ -289,7 +294,11 @@ LONG DipToPhysicalPixels(LONG value, UINT dpi) {
   return MulDiv(value, static_cast<int>(dpi), USER_DEFAULT_SCREEN_DPI);
 }
 
-POINT FrameTrackSizeForContent(HWND window, ContentSize content, UINT dpi_hint = 0) {
+// An integrated title bar has no caption band above the client: the AppWindow
+// keeps only the left, right and bottom resize frame.  Content sizes must
+// convert with that frame, or every settings window opens and clamps one
+// native caption taller than its content.
+POINT FrameTrackSizeForContent(HWND window, ContentSize content, UINT dpi_hint = 0, bool integrated_title_bar = false) {
   const UINT window_dpi = dpi_hint != 0
       ? dpi_hint
       : (window == nullptr ? USER_DEFAULT_SCREEN_DPI : GetDpiForWindow(window));
@@ -308,6 +317,7 @@ POINT FrameTrackSizeForContent(HWND window, ContentSize content, UINT dpi_hint =
   if (!AdjustWindowRectExForDpi(&frame, style, has_menu, extended_style, dpi)) {
     return {frame.right - frame.left, frame.bottom - frame.top};
   }
+  if (integrated_title_bar) frame.top = 0;
   return {frame.right - frame.left, frame.bottom - frame.top};
 }
 
@@ -894,12 +904,6 @@ void WinUI3NativeLeaf::DispatchAction(std::string const& action) {
 }
 
 std::optional<LRESULT> WinUI3NativeLeaf::HandleWindowMessage(UINT message, WPARAM wparam, LPARAM lparam) {
-  if (integrated_title_bar_ && message == WM_NCCALCSIZE && wparam == TRUE) {
-    // The React title strip is the client surface.  Leaving the default
-    // non-client calculation in place exposes the desktop through the resize
-    // frame when the AppWindow title bar is extended into the content area.
-    return 0;
-  }
   if (integrated_title_bar_ && message == WM_NCHITTEST && window_handle_ != nullptr && !IsZoomed(window_handle_)) {
     RECT frame{};
     if (GetWindowRect(window_handle_, &frame)) {
@@ -927,6 +931,10 @@ std::optional<LRESULT> WinUI3NativeLeaf::HandleWindowMessage(UINT message, WPARA
   // the draggable strip has to be described again in the new client frame.
   // Return nullopt for messages the host still owns.
   if (message == WM_SIZE || message == WM_DPICHANGED) UpdateTitleBarDragRegions();
+  if (message == kRelayoutRootMessage) {
+    if (root_relayout_) root_relayout_();
+    return 0;
+  }
   if (message == kReactChildCloseMessage && child_host_) {
     quitting_ = true;
     PostQuitMessage(0);
@@ -977,6 +985,10 @@ void WinUI3NativeLeaf::ApplyIntegratedTitleBar(bool enabled) {
     auto app_window = winrt::Microsoft::UI::Windowing::AppWindow::GetFromWindowId(
         winrt::Microsoft::UI::GetWindowIdFromWindow(window_handle_));
     auto title_bar = app_window.TitleBar();
+    // The AppWindow owns the client calculation: extending into the title bar
+    // drops only the caption band and keeps the left, right and bottom resize
+    // frame outside the client, so no content sits under the invisible border.
+    integrated_title_bar_ = enabled;
     title_bar.ExtendsContentIntoTitleBar(enabled);
     if (enabled) {
       // The React shell paints the strip behind the caption buttons; only the
@@ -984,13 +996,26 @@ void WinUI3NativeLeaf::ApplyIntegratedTitleBar(bool enabled) {
       title_bar.ButtonBackgroundColor(winrt::Windows::UI::Colors::Transparent());
       title_bar.ButtonInactiveBackgroundColor(winrt::Windows::UI::Colors::Transparent());
     }
-    integrated_title_bar_ = enabled;
+    SetWindowPos(
+        window_handle_, nullptr, 0, 0, 0, 0,
+        SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
     if (enabled) UpdateTitleBarDragRegions();
   } catch (...) {
     // A host that cannot project an AppWindow keeps its native caption instead
     // of losing every way to move the window.
     integrated_title_bar_ = false;
   }
+  // Changing the caption changes the client size without changing the window
+  // size, and RNW only re-arranges its root on an AppWindow size change: the
+  // root kept the captioned client's height, leaving an empty band below the
+  // status bar until the user resized the window.  Queue it instead of arranging
+  // here, so the layout never runs inside the window-proc dispatch that the
+  // frame change just started.
+  RelayoutRootView();
+}
+
+void WinUI3NativeLeaf::RelayoutRootView() {
+  if (window_handle_ != nullptr) PostMessageW(window_handle_, kRelayoutRootMessage, 0, 0);
 }
 
 void WinUI3NativeLeaf::UpdateTitleBarDragRegions() {
@@ -1034,7 +1059,8 @@ void WinUI3NativeLeaf::OpenRoute(std::wstring_view route) {
       // it, and only then: the geometry after that belongs to the user, so a
       // pane switch or a menu action must not snap a resized or maximized
       // window back (macOS only applies geometry when it creates a window).
-      const auto frame = FrameTrackSizeForContent(window_handle_, RouteInitialContentSize(route));
+      const auto frame = FrameTrackSizeForContent(
+          window_handle_, RouteInitialContentSize(route), 0, integrated_title_bar_);
       SetWindowPos(
           window_handle_, nullptr, 0, 0, frame.x, frame.y,
           SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER);
@@ -1068,7 +1094,8 @@ void WinUI3NativeLeaf::CloseRoute(std::wstring_view route) {
 }
 
 POINT WinUI3NativeLeaf::MinimumTrackSizeForActiveRoute() const {
-  return FrameTrackSizeForContent(window_handle_, RouteMinimumContentSize(active_route_));
+  return FrameTrackSizeForContent(
+      window_handle_, RouteMinimumContentSize(active_route_), 0, integrated_title_bar_);
 }
 
 bool WinUI3NativeLeaf::SetWindowContentSize(std::wstring_view route, double width, double height) {
@@ -1081,7 +1108,10 @@ bool WinUI3NativeLeaf::SetWindowContentSize(std::wstring_view route, double widt
   }
 
   const auto frame = FrameTrackSizeForContent(
-      window_handle_, {static_cast<LONG>(std::lround(width)), static_cast<LONG>(std::lround(height))});
+      window_handle_,
+      {static_cast<LONG>(std::lround(width)), static_cast<LONG>(std::lround(height))},
+      0,
+      integrated_title_bar_);
   return SetWindowPos(
       window_handle_,
       nullptr,
