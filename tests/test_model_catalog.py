@@ -29,6 +29,49 @@ def _number_text_for_schema(value: float) -> str:
 
 
 class ModelCatalogTests(unittest.TestCase):
+    def test_a_custom_route_asks_for_a_visible_thinking_summary(self) -> None:
+        """A route's thinking is summary frames the proxy only forwards on request.
+
+        The client reads an absent or ``none`` summary as "hide the thinking",
+        and the proxy then drops every ``response.reasoning_summary_*`` frame.
+        A custom route inherits the base profile's ``none``, so without this the
+        block stayed empty until the user edited the client's own TOML.
+        """
+
+        native_models = [
+            {
+                "slug": "gpt-base",
+                "priority": 1,
+                "visibility": "list",
+                "default_reasoning_summary": "none",
+                "model_messages": {"instructions_template": "Base agent"},
+            }
+        ]
+        with mock.patch(
+            "young_router.core.model_catalog.load_native_catalog",
+            return_value=native_models,
+        ):
+            route = catalog_payload(["kimi-k3.1-pro"])["models"][0]
+            native = catalog_payload(["gpt-base"])["models"][0]
+        self.assertEqual("auto", route["default_reasoning_summary"])
+        # The client's own model keeps what it declares: its thinking does not
+        # travel through this proxy.
+        self.assertEqual("none", native["default_reasoning_summary"])
+
+    def test_a_catalog_written_before_the_summary_default_is_rebuilt(self) -> None:
+        """An existing catalog that hides the thinking must not stay current."""
+
+        names = ["kimi-k3.1-pro"]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "model-catalog.json"
+            write_catalog(path, names)
+            self.assertTrue(catalog_is_current(path, names))
+            stale = json.loads(path.read_text(encoding="utf-8"))
+            for model in stale["models"]:
+                model["default_reasoning_summary"] = "none"
+            path.write_text(json.dumps(stale), encoding="utf-8")
+            self.assertFalse(catalog_is_current(path, names))
+
     def test_fallback_catalog_repairs_the_native_base_profile(self) -> None:
         native_models = [
             {

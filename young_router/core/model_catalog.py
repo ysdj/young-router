@@ -35,6 +35,15 @@ _REASONING_LEVELS = (
     {"effort": "high", "description": "Greater reasoning depth for complex tasks"},
     {"effort": "xhigh", "description": "Extra reasoning depth for complex tasks"},
 )
+#: The summary the client asks for when a model's catalog entry names one.
+#: A route answers thinking as ``response.reasoning_summary_*`` frames and the
+#: proxy delivers them only to a request that named a visible summary, so a
+#: catalog entry left on the native default (``none``) hides every route's
+#: thinking behind a manual ``model_reasoning_summary`` edit in the client's own
+#: TOML.  ``auto`` is the value both clients treat as "show the thinking", while
+#: ``detailed``/``concise``/``raw`` stay the user's own choice.
+DEFAULT_REASONING_SUMMARY = "auto"
+
 _REASONING_DESCRIPTIONS = {
     "none": "No reasoning",
     "minimal": "Minimal reasoning for faster responses",
@@ -375,6 +384,16 @@ def _catalog_model(
     model["max_context_window"] = context.max_context_window
     model["effective_context_window_percent"] = context.effective_context_window_percent
     _apply_search_tool_capability(model, registry, name)
+    # A custom route's thinking arrives as ``response.reasoning_summary_*``
+    # frames, and the proxy delivers them only to a request that named a visible
+    # summary.  Such a route inherits the base profile's ``none``, which the
+    # client reads as "hide the thinking" -- so every route's block stayed empty
+    # until the user found ``model_reasoning_summary`` in the client's own TOML
+    # by hand.  The catalog is the only place this app can state the default, so
+    # a route states one.  An exact native profile is the client's own model and
+    # keeps whatever it declares: its thinking does not depend on this proxy.
+    if not exact_native_match:
+        model["default_reasoning_summary"] = DEFAULT_REASONING_SUMMARY
     # An exact native profile may contain Codex-only modes such as ``ultra``
     # that activate task delegation rather than map directly to a provider
     # reasoning effort.  The route capability registry intentionally knows
