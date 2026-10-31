@@ -26,6 +26,7 @@ elided tool result is still the result of the call that produced it.
 
 from __future__ import annotations
 
+import json
 from contextvars import ContextVar
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
@@ -65,6 +66,12 @@ _RETRY_FRACTIONS = (0.55, 0.3)
 #: relay that refused a prompt teaches the next turn where the real ceiling is,
 #: so the same thread pays for the discovery once and not on every message.
 _ACCEPTED_SIZE: Dict[str, int] = {}
+
+#: A shrink has to remove at least this share of the payload to be worth a
+#: resend.  A rewrite that leaves the body within a rounding error of what was
+#: just refused is the same bytes going back up, and the answer to those bytes
+#: is already known.
+_MIN_SHRINK_FRACTION = 0.9
 
 #: The exact size of the request this task is serving, as the router counts it.
 #: ``apply`` measures it anyway -- the count decides whether the request can be
@@ -435,6 +442,28 @@ def retry_for_refusal(
         return False
     group = model if isinstance(model, str) and model else data.get("model")
     measured = measured_input_tokens()
+    # A refused prompt is usually refused for its bytes, not its tokens: the
+    # images a thread keeps re-sending are the whole difference between what a
+    # counter reports and what the relay receives.  Replacing them needs no
+    # count at all -- the refusal itself proved there were too many -- so it runs
+    # before the measurement gate.  Behind that gate a counter that could not
+    # answer ended a turn whose cause was 50 MB of replayed pictures.
+    before_bytes = _payload_bytes(data)
+    rewritten_images = _image_shrunk(data, 0)
+    if rewritten_images is not None and _shrank_enough(
+        {"input": rewritten_images["input"]}, before_bytes
+    ):
+        data["input"] = rewritten_images["input"]
+        _SHRUNK.set(True)
+        _trace_retry(
+            data,
+            attempt=attempt,
+            count=measured or 0,
+            target=measured or 0,
+            model=group,
+            image_bytes=_inline_image_bytes(data.get("input")),
+        )
+        return True
     if not measured or measured <= 0:
         # The pre-call pass skips counting a request far below the declared
         # window, so there may be no measurement to scale from; the refusal is
@@ -443,32 +472,36 @@ def retry_for_refusal(
         measured = count_tokens(data, _router())
     if not measured or measured <= 0:
         return False
-    # A refused prompt is usually refused for its bytes, not its tokens: the
-    # images a thread keeps re-sending are the whole difference between what a
-    # counter reports and what the relay receives.  Replacing them costs nothing
-    # a token check would have saved, so it comes before eliding text.
-    rewritten_images = _image_shrunk(data, 0)
-    if rewritten_images is not None:
-        data["input"] = rewritten_images["input"]
-        _SHRUNK.set(True)
-        _trace_retry(
-            data,
-            attempt=attempt,
-            count=measured,
-            target=measured,
-            model=group,
-            image_bytes=_inline_image_bytes(data.get("input")),
-        )
-        return True
     target = int(measured * _RETRY_FRACTIONS[attempt])
     rewritten = _fitted_items(data["input"], count=measured, target=target)
     if rewritten is None:
+        return False
+    if not _shrank_enough({"input": rewritten}, before_bytes):
+        # Eliding freed nothing a relay would notice (everything that fits this
+        # target already sits inside the turn being answered).  Resending the
+        # same bytes invites the same refusal, so the turn ends on the
+        # classified error instead of on a second attempt that cannot succeed.
         return False
     data["input"] = rewritten
     _MEASURED_INPUT_TOKENS.set(target)
     _SHRUNK.set(True)
     _trace_retry(data, attempt=attempt, count=measured, target=target, model=group)
     return True
+
+def _payload_bytes(data: Mapping[str, Any]) -> int:
+    """The wire size of the replay, which is what a relay refuses."""
+
+    try:
+        return len(json.dumps(data.get("input") or []))
+    except Exception:
+        return 0
+
+def _shrank_enough(data: Mapping[str, Any], before_bytes: int) -> bool:
+    """Whether this rewrite removed something worth resending the request for."""
+
+    if before_bytes <= 0:
+        return True
+    return _payload_bytes(data) <= int(before_bytes * _MIN_SHRINK_FRACTION)
 
 
 def record_accepted_size(data: Any, *, model: Optional[str] = None) -> None:
@@ -563,8 +596,6 @@ def _count_is_worth_running(data: Mapping[str, Any], window: int) -> bool:
     """
 
     try:
-        import json
-
         serialized = len(json.dumps(data.get("input") or []))
     except Exception:
         return True

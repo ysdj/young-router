@@ -19,6 +19,7 @@ import zlib
 from pathlib import Path
 from unittest import mock
 
+from young_router.proxy import context_window as cw
 from young_router.proxy import image_context as image_context_module
 from young_router.proxy import image_context_endpoint
 from young_router.proxy import image_context_mcp as mcp_module
@@ -780,6 +781,67 @@ class ImageContextDeclineTests(_ImageContextCase):
                 image_context_module._with_codex_image_context(_request(items))
             )
         self.assertEqual(reasons, ["no_image_old_enough"])
+
+class ImageContextSizeModeTests(_ImageContextCase):
+    """A turn-only pass cannot shorten a task, and a Codex task is one turn.
+
+    Real thread ``01a19000``: one user message, then ~800 items of work, every
+    ``view_image`` result of it staying inside that same turn.  The replay
+    reached 50.4 MB of base64 pictures, WorkBuddy refused it with its own
+    ``prompt is too long`` after 29 s, and both size repairs declined for the
+    same reason -- the pictures were not old enough, because the only turn was
+    the current one.  The turn ended as "Codex ran out of room".
+    """
+
+    def one_turn_task(self, pictures: int) -> list:
+        items: list = [_user_turn("look at these and report")]
+        for index in range(pictures):
+            items.append(
+                {
+                    "type": "function_call",
+                    "call_id": f"call_{index}",
+                    "name": "view_image",
+                    "arguments": "{}",
+                }
+            )
+            items.append(
+                _tool_image(
+                    _png(120, 90, noisy=True, seed=index + 1), call_id=f"call_{index}"
+                )
+            )
+            items.append(_assistant(f"page {index} looks fine"))
+        return items
+
+    def test_size_mode_omits_pictures_older_than_the_newest_result(self) -> None:
+        items = self.one_turn_task(4)
+        before = cw._inline_image_bytes(items)
+
+        result = image_context_module.rewrite_for_size(_request(items), keep=0)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        after = cw._inline_image_bytes(result["input"])
+        self.assertLess(after, before / 2)
+        # The newest result's picture is the one the model just asked to see.
+        self.assertEqual(after, cw._inline_image_bytes([items[-2]]))
+        # Every omitted picture is still named, so it can be fetched back.
+        self.assertIn("IMG-0001", json.dumps(result["input"], ensure_ascii=False))
+
+    def test_the_setting_still_leaves_the_turn_being_answered_alone(self) -> None:
+        # Size mode is forced for a different reason than the setting: the
+        # setting must not start rewriting a turn the model is working in.
+        items = self.one_turn_task(4)
+
+        self.assertIsNone(
+            image_context_module._with_codex_image_context(_request(items))
+        )
+
+    def test_size_mode_frees_nothing_from_a_single_picture(self) -> None:
+        items = [_user_turn("look")] + self.one_turn_task(1)[1:]
+
+        self.assertIsNone(
+            image_context_module.rewrite_for_size(_request(items), keep=0)
+        )
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

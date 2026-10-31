@@ -999,6 +999,11 @@ def rewrite_for_size(
     ``view_image`` carries every image it ever looked at, and an upstream that
     prices those bytes refuses the prompt long before any token counter says
     the window is full -- so the choice is a placeholder or a dead turn.
+
+    Unlike the setting, this pass also reaches the images of the turn being
+    answered, all but the newest result's, because a task with one user message
+    keeps every picture it ever viewed in that one turn (see
+    ``newest_picture_item`` in ``_rewrite``).
     """
 
     return _rewrite(request_kwargs, forced=True, keep=keep)
@@ -1101,6 +1106,17 @@ def _rewrite(
     current_turn = _turn_count(input_items)
     keep = keep_recent() if keep is None else keep
     minimum = min_bytes()
+    # Size mode also reaches the images inside the turn being answered, because
+    # a Codex task *is* one turn: a single user message followed by hundreds of
+    # steps, and every ``view_image`` result of it stays in that one turn for
+    # ever.  A pass that only omitted earlier turns' images was therefore inert
+    # on exactly the thread that needed it -- one real task replayed 74 pictures
+    # (50.4 MB of base64) on every step until the upstream refused the prompt as
+    # too long, and the router had no rewrite left to answer with.  What is
+    # never omitted is the newest result that carries a picture: that is the one
+    # the model just asked to look at, and every older copy is still reachable
+    # through the id its placeholder names (``image_for_turn``) or that file.
+    newest_picture_item = max(image.item for image in images) if forced else None
 
     thread_id = _thread_id(request_kwargs)
     selection = read_selection(thread_id)
@@ -1118,6 +1134,8 @@ def _rewrite(
         image_id = image.image_id or ""
         in_mutable = image.item >= mutable_from
         aged = image.turn < current_turn and (current_turn - image.turn) > keep
+        if newest_picture_item is not None and image.item < newest_picture_item:
+            aged = True
         big = len(image.raw) >= minimum
         if image_id in pinned:
             sent_content[image.content_id or ""] = image

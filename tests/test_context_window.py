@@ -386,6 +386,129 @@ class ImageWeightTests(unittest.TestCase):
         self.assertTrue(cw.retry_for_refusal(data, exc, attempt=0))
         self.assertLess(cw._inline_image_bytes(data["input"]), before)
 
+    def test_a_one_turn_task_is_shortened_too(self) -> None:
+        # Real thread 01a19000: one user message and ~800 items of work, every
+        # picture inside that same turn.  The image pass declined every time
+        # because no picture was old enough, so the turn died on a 50 MB
+        # refusal that no resend could change.
+        items: list = [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "look"}]}
+        ]
+        for index in range(4):
+            items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": f"call_{index}",
+                    "output": [{"type": "input_image", "image_url": self._image(index + 1)["image_url"]}],
+                }
+            )
+            items.append(
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "ok"}]}
+            )
+        data = {
+            "call_type": "aresponses",
+            "model": "m",
+            "input": items,
+            "headers": {"Originator": "codex_cli_rs"},
+            "metadata": {"thread_id": "11111111-2222-3333-4444-999999999999"},
+        }
+        cw._MEASURED_INPUT_TOKENS.set(None)
+        before = cw._inline_image_bytes(data["input"])
+
+        exc = RuntimeError("prompt is too long (upstream code 11115)")
+
+        self.assertTrue(cw.retry_for_refusal(data, exc, attempt=0))
+        self.assertLess(cw._inline_image_bytes(data["input"]), before / 2)
+
+    def test_a_shrink_that_frees_nothing_is_not_a_repair(self) -> None:
+        # Eliding cannot reach inside the turn being answered, so a replay whose
+        # size sits there is resendable only in name.  Reporting it as repaired
+        # sent the identical bytes back up, which ends the same way.
+        items: list = [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "first"}]},
+            {"type": "function_call_output", "call_id": "old", "output": "z" * 400},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "now"}]},
+        ]
+        items.extend(
+            {"type": "function_call_output", "call_id": f"big_{index}", "output": "z" * 200000}
+            for index in range(3)
+        )
+        data = {"model": "m", "input": items}
+        cw._MEASURED_INPUT_TOKENS.set(1_000_000)
+        before = cw._payload_bytes(data)
+
+        self.assertFalse(
+            cw.retry_for_refusal(data, RuntimeError("prompt is too long"), attempt=0)
+        )
+        self.assertEqual(cw._payload_bytes(data), before)
+
+    def test_an_image_shrink_that_frees_nothing_is_not_a_repair(self) -> None:
+        # One earlier picture beside the huge one the model just asked to see:
+        # the rewrite is real and the relay's answer would be identical.
+        items: list = [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "look"}]},
+        ]
+        for index in range(2):
+            items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": f"call_{index}",
+                    "output": [
+                        {
+                            "type": "input_image",
+                            "image_url": self._image(index + 1)["image_url"],
+                        }
+                    ],
+                }
+            )
+        items.append(
+            {
+                "type": "function_call_output",
+                "call_id": "big",
+                "output": "z" * 400000,
+            }
+        )
+        data = {
+            "call_type": "aresponses",
+            "model": "m",
+            "input": items,
+            "headers": {"Originator": "codex_cli_rs"},
+            "metadata": {"thread_id": "11111111-2222-3333-4444-888888888888"},
+        }
+        cw._MEASURED_INPUT_TOKENS.set(1_000_000)
+        before = cw._payload_bytes(data)
+
+        self.assertFalse(
+            cw.retry_for_refusal(data, RuntimeError("prompt is too long"), attempt=0)
+        )
+        self.assertEqual(cw._payload_bytes(data), before)
+
+    def test_a_refusal_is_answered_even_without_a_token_count(self) -> None:
+        # The count was never the evidence: the refusal itself proved the prompt
+        # was too big.  Gating the image pass on a measurement a relay-shaped
+        # request cannot produce ended the turn with the rewrite still available.
+        data = self._replay(6)
+        cw._MEASURED_INPUT_TOKENS.set(None)
+        before = cw._inline_image_bytes(data["input"])
+
+        class _Uncountable:
+            def get_model_list(self, model_name=None):
+                return [{"model_info": {"max_input_tokens": 10**9}}]
+
+            def _count_pre_call_check_tokens(self, messages=None, input=None, request_kwargs=None):
+                raise RuntimeError("no counter for this shape")
+
+        with mock.patch.object(cw, "_router", return_value=_Uncountable()):
+            self.assertTrue(
+                cw.retry_for_refusal(
+                    data,
+                    RuntimeError("prompt is too long"),
+                    attempt=0,
+                    model="m",
+                )
+            )
+        self.assertLess(cw._inline_image_bytes(data["input"]), before)
+
 
 if __name__ == "__main__":
     unittest.main()
