@@ -1009,10 +1009,17 @@ def structured_config(config: dict[str, Any], auth: dict[str, Any]) -> dict[str,
                 "requires_openai_auth": provider.get("requires_openai_auth")
                 if isinstance(provider.get("requires_openai_auth"), bool)
                 else False,
+                # Tri-state, and absence has to stay absence: this row is what
+                # the editor sends back, so collapsing a missing opt-in to
+                # ``false`` makes one unrelated provider edit write
+                # ``supports_standalone_web_search = false`` and retire Codex's
+                # only web tool on a Responses Lite route.  ``null`` removes the
+                # key, which for a file that never had it is no change.
                 "supports_standalone_web_search": provider.get(
                     "supports_standalone_web_search"
                 )
-                is True,
+                if isinstance(provider.get("supports_standalone_web_search"), bool)
+                else None,
                 "auth_mode": _provider_auth_mode(provider),
                 # ``null`` distinguishes no command field from an explicitly
                 # configured empty string.  It lets a structured list update

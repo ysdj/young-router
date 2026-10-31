@@ -1450,7 +1450,13 @@ class CodexSettingsDomain:
                     "providers": [
                         {
                             "id": provider_id,
-                            "supports_standalone_web_search": True if enabled_value else None,
+                            # An explicit ``false``, never an absent key: a
+                            # restart reconciles a *missing* opt-in onto a
+                            # client that points at this proxy (that is the
+                            # healing path for a file written before the
+                            # opt-in existed), so recording "off" as absence
+                            # would turn this switch back on at the next start.
+                            "supports_standalone_web_search": enabled_value,
                         }
                     ],
                 },
@@ -1682,7 +1688,14 @@ class CodexSettingsDomain:
         self.revision += 1
         return self.snapshot()
 
-    def _active_provider_patch(self, *, base_url: str, key: str, wire_api: str | None = None) -> dict[str, Any]:
+    def _active_provider_patch(
+        self,
+        *,
+        base_url: str,
+        key: str,
+        wire_api: str | None = None,
+        standalone_web_search: bool | None = None,
+    ) -> dict[str, Any]:
         """Point the client's *current* provider at one endpoint.
 
         Codex names its gateway in ``model_provider``, so both client actions
@@ -1693,6 +1706,12 @@ class CodexSettingsDomain:
         ``openai_base_url``; a selection with no editable endpoint at all (an
         empty or Bedrock-style built-in) falls back to the one provider row
         this app owns, because there is nothing to follow.
+
+        ``standalone_web_search`` is for the local-proxy route only.  The flag
+        makes Codex call ``{this provider's base_url}/alpha/search``, which only
+        a gateway this app fronts can answer; a direct route's ``base_url`` is
+        the provider itself, so setting it there would aim Codex at an endpoint
+        that provider does not serve.
         """
 
         structured = self._draft.get("structured")
@@ -1717,6 +1736,8 @@ class CodexSettingsDomain:
             entry["base_url"] = base_url
             if wire_api is not None:
                 entry["wire_api"] = wire_api
+            if standalone_web_search is not None:
+                entry["supports_standalone_web_search"] = standalone_web_search
             entry["auth_mode"] = "openai_auth"
             return {"api_key": key, "providers": providers}
         entry = next(
@@ -1733,6 +1754,8 @@ class CodexSettingsDomain:
                 "auth_mode": "openai_auth",
             }
         )
+        if standalone_web_search is not None:
+            entry["supports_standalone_web_search"] = standalone_web_search
         return {"api_key": key, "model_provider": LOCAL_API_PROVIDER_ID, "providers": providers}
 
     @staticmethod
@@ -1747,13 +1770,46 @@ class CodexSettingsDomain:
         return ""
 
     def _local_api_patch(self) -> dict[str, Any]:
-        """The patch that moves the client's current provider onto this proxy."""
+        """The patch that moves the client's current provider onto this proxy.
+
+        The search opt-in travels with it: Codex's Responses Lite lane declares
+        no hosted ``web_search`` tool, so ``supports_standalone_web_search`` on
+        this row is the whole reason the client ever calls this proxy's
+        ``/alpha/search`` -- which is the route that reaches DeepSeek's own
+        ``/tools/search``.  Without it the client registers no web tool at all
+        and the agent falls back to driving a browser.
+
+        Adoption states the opt-in unless the operator already did: an explicit
+        ``false`` in the row is ``codex_search_set``'s own decision and moving
+        the endpoint does not reopen it.
+        """
 
         from ._shared import local_proxy_endpoint
 
         base_url, key = local_proxy_endpoint()
         self._local_api_base_url = base_url
-        return self._active_provider_patch(base_url=base_url, key=key, wire_api="responses")
+        structured = self._draft.get("structured")
+        structured = structured if isinstance(structured, Mapping) else {}
+        active = str(structured.get("model_provider") or "").strip()
+        already_decided = any(
+            isinstance(item, Mapping)
+            and str(item.get("id") or "").strip() == active
+            and item.get("supports_standalone_web_search") is False
+            for item in structured.get("providers") or []
+        )
+        patch = self._active_provider_patch(
+            base_url=base_url,
+            key=key,
+            wire_api="responses",
+            standalone_web_search=None if already_decided else True,
+        )
+        if not already_decided:
+            # The standalone executor inherits Codex's default ``cached`` mode,
+            # which registers it with live web access off.  The opt-in and the
+            # mode are one decision, exactly as ``codex_search_set`` treats
+            # them.
+            patch["web_search"] = "live"
+        return patch
 
     def _surface_sync_patch(
         self,
@@ -1871,9 +1927,43 @@ class CodexSettingsDomain:
         if not current or not previous_base_url or current.rstrip("/") != previous_base_url.rstrip("/"):
             return False
         current_key = str(structured.get("api_key") or "").strip()
-        if current.rstrip("/") == base_url.rstrip("/") and current_key == key:
+        endpoint_current = current.rstrip("/") == base_url.rstrip("/") and current_key == key
+        # The search opt-in is transcribed from the same row, and this route is
+        # the only thing that can answer it: Codex calls
+        # ``{base_url}/alpha/search`` here, which is how a search reaches
+        # DeepSeek's own ``/tools/search``.  A client adopted before the
+        # opt-in was written carries none, registers no web tool at all, and
+        # the agent drives a browser instead.  Only a *missing* key is healed:
+        # an explicit ``false`` is the operator's own decision
+        # (``codex_search_set``), and reviving it on every restart would undo
+        # that.
+        search_missing = not isinstance(
+            next(
+                (
+                    item.get("supports_standalone_web_search")
+                    for item in structured.get("providers") or []
+                    if isinstance(item, Mapping)
+                    and str(item.get("id") or "").strip() == active
+                ),
+                None,
+            ),
+            bool,
+        )
+        # ``web_search`` is the switch Codex actually reads, so an operator who
+        # turned search off at the top level is just as decided as one who
+        # wrote ``false`` on the row: leaving the opt-in absent cannot turn that
+        # back on, and writing it would register an executor with the mode off.
+        if str(structured.get("web_search") or "").strip().lower() == "disabled":
+            search_missing = False
+        if endpoint_current and not search_missing:
             return False
-        patch = self._active_provider_patch(base_url=base_url, key=key)
+        patch = self._active_provider_patch(
+            base_url=base_url,
+            key=key,
+            standalone_web_search=True if search_missing else None,
+        )
+        if search_missing:
+            patch["web_search"] = structured.get("web_search") or "live"
         config_text, auth_text, _, _ = self._editor_documents_from_disk()
         written = self._sync(config_text, auth_text, patch)
         if isinstance(self._draft.get("config_text"), str) and isinstance(self._draft.get("auth_text"), str):

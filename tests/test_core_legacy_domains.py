@@ -2627,6 +2627,114 @@ class CodexSettingsDomainTests(unittest.TestCase):
                 self.assertIn("http://127.0.0.1:11434/v1", documents["config_text"])
                 self.assertNotIn("sk-second", documents["auth_text"])
 
+    def test_adopting_the_local_api_registers_the_search_tool(self) -> None:
+        """The proxy route is the only one that can answer Codex's search.
+
+        Codex's Responses Lite lane declares no hosted ``web_search`` tool; it
+        calls ``{base_url}/alpha/search`` on the provider it was given, and
+        ``supports_standalone_web_search`` is the switch that registers that
+        executor at all.  A client moved onto this proxy without it runs with
+        no web tool, and the agent answers by driving a browser instead of
+        searching -- which is exactly what the DeepSeek route must not do,
+        since this proxy reaches DeepSeek's own ``/tools/search`` for it.
+        """
+
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch("young_router.core.domains.codex._ensure_browser_plugins"):
+            from young_router.core.domains import _shared
+
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            home = root / "codex"
+            home.mkdir()
+            (home / "config.toml").write_text(
+                'model = "default-chat"\n'
+                'model_provider = "relay"\n'
+                '\n'
+                '[model_providers.relay]\n'
+                'name = "relay"\n'
+                'base_url = "https://relay.example.test/v1"\n'
+                'wire_api = "responses"\n'
+                'requires_openai_auth = true\n',
+                encoding="utf-8",
+            )
+            (home / "auth.json").write_text('{"OPENAI_API_KEY": "retired-key"}\n', encoding="utf-8")
+            with mock.patch.object(
+                _shared, "local_proxy_endpoint", return_value=("http://127.0.0.1:19999/v1", "sk-first")
+            ):
+                domain = CodexSettingsDomain(runtime, codex_home=home)
+                self.assertFalse(domain.snapshot()["standalone_search"])
+                domain.dispatch("use_local_api", {"model": "default-chat"})
+
+            snapshot = domain.snapshot()
+            self.assertTrue(snapshot["standalone_search"])
+            # The executor inherits ``cached``, which registers it with live
+            # web access off; the opt-in and the mode are one decision.
+            self.assertEqual("live", snapshot["structured"]["web_search"])
+
+    def test_a_restart_heals_a_client_adopted_before_the_search_opt_in(self) -> None:
+        """A missing opt-in is repaired; an explicit off is left alone.
+
+        ``follow_local_api_endpoint`` runs on every proxy restart.  A client
+        adopted by a build that did not write the opt-in has to be healed, or
+        it keeps running with no web tool for as long as the file exists.  An
+        operator's own ``false`` (``codex_search_set``) and Codex's own
+        ``web_search = "disabled"`` are decisions, not absences, and reviving
+        either would be the router overriding the user on every start.
+        """
+
+        def config_text(*, opt_in: str, mode: str = "") -> str:
+            return (
+                'model = "default-chat"\n'
+                'model_provider = "relay"\n'
+                f'{mode}'
+                '\n'
+                '[model_providers.relay]\n'
+                'name = "relay"\n'
+                'base_url = "http://127.0.0.1:21000/v1"\n'
+                'wire_api = "responses"\n'
+                'requires_openai_auth = true\n'
+                f'{opt_in}'
+            )
+
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch("young_router.core.domains.codex._ensure_browser_plugins"):
+            from young_router.core.domains import _shared
+
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+
+            def open_domain(name: str, text: str):
+                home = root / name
+                home.mkdir()
+                (home / "config.toml").write_text(text, encoding="utf-8")
+                (home / "auth.json").write_text('{"OPENAI_API_KEY": "sk-first"}\n', encoding="utf-8")
+                return CodexSettingsDomain(runtime, codex_home=home)
+
+            with mock.patch.object(
+                _shared, "local_proxy_endpoint", return_value=("http://127.0.0.1:21000/v1", "sk-first")
+            ):
+                healed = open_domain("missing", config_text(opt_in=""))
+                self.assertFalse(healed.snapshot()["standalone_search"])
+                self.assertTrue(healed.follow_local_api_endpoint())
+                self.assertTrue(healed.snapshot()["standalone_search"])
+                # The reconcile is idempotent: a second start writes nothing.
+                self.assertFalse(healed.follow_local_api_endpoint())
+
+                kept_off = open_domain(
+                    "explicit-off", config_text(opt_in="supports_standalone_web_search = false\n")
+                )
+                self.assertFalse(kept_off.follow_local_api_endpoint())
+                self.assertFalse(kept_off.snapshot()["standalone_search"])
+
+                disabled = open_domain(
+                    "mode-disabled", config_text(opt_in="", mode='web_search = "disabled"\n')
+                )
+                self.assertFalse(disabled.follow_local_api_endpoint())
+                self.assertFalse(disabled.snapshot()["standalone_search"])
+
     def test_use_saved_model_restores_the_provider_endpoint_key_and_default_model(self) -> None:
         """The designate action points the client straight at one saved route."""
 

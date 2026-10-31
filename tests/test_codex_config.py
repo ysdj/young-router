@@ -201,6 +201,72 @@ class CodexConfigTests(unittest.TestCase):
 
                 self.assertTrue(tomllib.loads(second)["features"]["token_budget"])
 
+    def test_an_unset_search_opt_in_survives_a_provider_row_round_trip(self) -> None:
+        """A missing ``supports_standalone_web_search`` must stay missing.
+
+        The structured row is what the editor sends back on every provider edit.
+        Reporting a missing opt-in as ``false`` made one unrelated edit write
+        ``supports_standalone_web_search = false``, which retires the only web
+        tool a Responses Lite route can have -- Codex then registers no
+        ``web.run`` and the agent drives a browser instead of searching.  The
+        reported value is therefore tri-state, and only an explicit ``false``
+        may write ``false``.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            runtime_config = Path(directory) / "config.yaml"
+            self.write_runtime_config(runtime_config)
+            config_text = textwrap.dedent(
+                """
+                model = "active-chat"
+                model_provider = "newapi"
+
+                [model_providers.newapi]
+                name = "newapi"
+                base_url = "http://127.0.0.1:12390/v1"
+                wire_api = "responses"
+                requires_openai_auth = true
+                """
+            ).lstrip()
+            parsed = codex_config.parse_toml_text(config_text)
+            reported = codex_config.structured_config(parsed, {})["providers"]
+            self.assertIsNone(reported[0]["supports_standalone_web_search"])
+
+            # The edit that used to erase the opt-in: anything about the row.
+            untouched, _auth, _config, _parsed_auth = codex_config.apply_structured_patch(
+                config_text, "{}\n", {"providers": reported}, runtime_config
+            )
+            self.assertNotIn(
+                "supports_standalone_web_search",
+                tomllib.loads(untouched)["model_providers"]["newapi"],
+            )
+
+            # Present stays present, and an explicit off still writes off.
+            enabled_text = config_text + "supports_standalone_web_search = true\n"
+            enabled_parsed = codex_config.parse_toml_text(enabled_text)
+            enabled_rows = codex_config.structured_config(enabled_parsed, {})["providers"]
+            self.assertIs(True, enabled_rows[0]["supports_standalone_web_search"])
+            kept, _auth, _config, _parsed_auth = codex_config.apply_structured_patch(
+                enabled_text, "{}\n", {"providers": enabled_rows}, runtime_config
+            )
+            self.assertIs(
+                True,
+                tomllib.loads(kept)["model_providers"]["newapi"][
+                    "supports_standalone_web_search"
+                ],
+            )
+
+            off_rows = [dict(enabled_rows[0], supports_standalone_web_search=False)]
+            switched_off, _auth, _config, _parsed_auth = codex_config.apply_structured_patch(
+                enabled_text, "{}\n", {"providers": off_rows}, runtime_config
+            )
+            self.assertIs(
+                False,
+                tomllib.loads(switched_off)["model_providers"]["newapi"][
+                    "supports_standalone_web_search"
+                ],
+            )
+
     def test_litellm_model_selection_uses_non_openai_provider_for_local_compaction(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             runtime_config = Path(directory) / "config.yaml"
