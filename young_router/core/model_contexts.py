@@ -149,11 +149,10 @@ def _reasoning_fields_from_payload(value: Mapping[str, Any]) -> dict[str, Any]:
 def _image_model_metadata_from_payload(value: Mapping[str, Any]) -> dict[str, Any]:
     """Extract the bounded public image-model contract from a catalog record.
 
-    A cache entry has already been through the normalizer and carries its answer
-    as ``image_model_metadata``.  Reading such an entry back must keep that
-    answer: the fields it was derived from (``modalities``, ``architecture``)
-    are not part of the stored contract, so re-deriving would drop the metadata
-    every time the cache was reloaded.
+    A cache entry carries the contract the normalizer wrote, and the fields it
+    was derived from (``modalities``, ``architecture``) are not part of it, so
+    a reload returns that stored contract rather than deriving it again from
+    fields the cache no longer holds.
     """
 
     stored = value.get("image_model_metadata")
@@ -178,14 +177,19 @@ def _image_model_metadata_from_payload(value: Mapping[str, Any]) -> dict[str, An
 
 
 def _image_metadata_contract(value: Mapping[str, Any]) -> dict[str, Any]:
-    """Normalize one image-model contract, whether derived or already stored."""
+    """Normalize one image-model contract, whether derived or already stored.
+
+    A derived contract reads its modalities from ``architecture``/``modalities``;
+    a stored one states ``input_modalities``/``output_modalities`` itself, and
+    that statement is the one a reload must return.
+    """
 
     architecture = value.get("architecture")
     architecture = architecture if isinstance(architecture, Mapping) else {}
     modalities = value.get("modalities")
     modalities = modalities if isinstance(modalities, Mapping) else {}
-    input_modalities = architecture.get("input_modalities", modalities.get("input"))
-    output_modalities = architecture.get("output_modalities", modalities.get("output"))
+    input_modalities = value.get("input_modalities", architecture.get("input_modalities", modalities.get("input")))
+    output_modalities = value.get("output_modalities", architecture.get("output_modalities", modalities.get("output")))
     if not isinstance(input_modalities, list):
         input_modalities = []
     if not isinstance(output_modalities, list):
@@ -932,6 +936,9 @@ class ModelContextRegistry:
         A cache that has disappeared keeps the records already in hand: the
         file going away is not evidence that a resolved window became unknown,
         and the bundled fallback may not stand in for it.
+
+        This instance's own ``_write_cache`` refreshes the recorded identity, so
+        the file it just wrote is never adopted as someone else's.
         """
 
         if not self._cache_loaded:
@@ -939,8 +946,19 @@ class ModelContextRegistry:
         identity = self._cache_file_state()
         if identity is None or identity == self._cache_file_identity:
             return
+        # Drop the copy this instance holds; ``_sync_cache`` reads the new one.
         self._cache_loaded = False
         self._provider_lookups = {}
+
+    def _sync_cache(self) -> None:
+        """Answer from the cache file as it stands, adopting another's write.
+
+        Every read path needs both halves.  The adopt only invalidates the copy
+        in hand, so the read beside it is the one that reloads; neither step
+        can be dropped, and neither repeats the other's work.
+        """
+
+        self._adopt_external_cache_write()
         self._load_cache()
 
     def _load_cache(self) -> None:
@@ -1141,8 +1159,7 @@ class ModelContextRegistry:
         return result
 
     def refresh_if_due(self, *, force: bool = False) -> bool:
-        self._adopt_external_cache_write()
-        self._load_cache()
+        self._sync_cache()
         if not self.refresh_enabled:
             return False
         _, refresh_hours = self._runtime_values()
@@ -1172,7 +1189,6 @@ class ModelContextRegistry:
         self._write_cache()
         return True
 
-    @staticmethod
     @staticmethod
     def _deployment_context(deployment: Mapping[str, Any]) -> int | None:
         """The window the *user* declared for one route, if they declared one."""
@@ -1257,8 +1273,7 @@ class ModelContextRegistry:
         the effective policy the managed catalog writes.
         """
 
-        self._adopt_external_cache_write()
-        self._load_cache()
+        self._sync_cache()
         unknown, _ = self._runtime_values()
         return self._context_record_from_records(
             self._resolved_route_records(public_name),
@@ -1276,7 +1291,6 @@ class ModelContextRegistry:
         inferred lookup already takes.
         """
 
-        self._load_cache()
         resolved = self.default_record_for(public_name)
         contexts = self._custom_contexts(public_name)
         if not contexts:
@@ -1309,8 +1323,7 @@ class ModelContextRegistry:
     ) -> dict[str, Any] | None:
         """Return public image metadata, optionally refreshing public catalogs."""
 
-        self._adopt_external_cache_write()
-        self._load_cache()
+        self._sync_cache()
         if refresh:
             self.refresh_if_due()
         candidates = _candidate_ids(model_id)
@@ -1337,8 +1350,7 @@ class ModelContextRegistry:
     ) -> dict[str, dict[str, Any]]:
         """Resolve image metadata for concrete route model ids."""
 
-        self._adopt_external_cache_write()
-        self._load_cache()
+        self._sync_cache()
         if refresh:
             self.refresh_if_due()
         resolved: dict[str, dict[str, Any]] = {}
@@ -1351,8 +1363,7 @@ class ModelContextRegistry:
     def reasoning_for_model_id(self, model_id: str) -> ReasoningCapability | None:
         """Return Pi/Codex reasoning policy for one concrete deployment model."""
 
-        self._adopt_external_cache_write()
-        self._load_cache()
+        self._sync_cache()
         normalized_id = model_id.strip().casefold()
         if "@" in normalized_id:
             normalized_id = normalized_id.split("@", 1)[0]
