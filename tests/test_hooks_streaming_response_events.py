@@ -615,6 +615,83 @@ class HookStreamingResponseEventTests(HookTestCase):
         self.assertEqual(usage["output_tokens"], 7)
         self.assertEqual(usage["total_tokens"], upper_bound + 7)
 
+    async def test_provider_cache_hit_tokens_reach_the_client(self) -> None:
+        # A relay that answers a bridged chat request reports the same fact
+        # under its own name and leaves ``prompt_tokens_details.cached_tokens``
+        # at zero.  DeepSeek is the one this app routes: it answers
+        # ``prompt_cache_hit_tokens`` and ``cache_read_input_tokens``.  Reading
+        # only the OpenAI-shaped field told Codex ``cached_tokens: 0`` on a
+        # thread whose prefix the upstream had in fact reused -- and Codex's
+        # turn meter and its compaction both read this number, so a zero there
+        # is not a harmless zero.
+        hooks, _proxy_server = load_hook_module()
+
+        for provider_usage, expected in (
+            (
+                {
+                    "prompt_tokens": 15_007,
+                    "completion_tokens": 4,
+                    "prompt_cache_hit_tokens": 14_848,
+                    "prompt_cache_miss_tokens": 159,
+                    "prompt_tokens_details": {"cached_tokens": 0},
+                },
+                14_848,
+            ),
+            (
+                {
+                    "input_tokens": 15_007,
+                    "output_tokens": 4,
+                    "input_tokens_details": {"cached_tokens": 0},
+                    "cache_read_input_tokens": 14_848,
+                },
+                14_848,
+            ),
+            (
+                {
+                    "prompt_tokens": 15_007,
+                    "completion_tokens": 4,
+                    "prompt_tokens_details": {"cached_tokens": 14_848},
+                },
+                14_848,
+            ),
+            (
+                # What the DeepSeek route actually answers: the real count in
+                # the OpenAI-shaped field *and* a zero in the Anthropic-shaped
+                # one.  LiteLLM's own mapping lets that zero win, so the reader
+                # here must not.
+                {
+                    "prompt_tokens": 15_007,
+                    "completion_tokens": 4,
+                    "prompt_tokens_details": {"cached_tokens": 14_848},
+                    "prompt_cache_hit_tokens": 14_848,
+                    "cache_read_input_tokens": 0,
+                },
+                14_848,
+            ),
+            (
+                {
+                    "prompt_tokens": 15_007,
+                    "completion_tokens": 4,
+                },
+                0,
+            ),
+        ):
+            event = {
+                "type": "response.completed",
+                "response": {"id": "resp-provider-cache", "usage": provider_usage},
+            }
+
+            normalized = hooks._responses_stream_chunk_for_delivery(
+                event,
+                {"call_type": "aresponses", "input": "short request"},
+            )
+
+            self.assertEqual(
+                normalized["response"]["usage"]["input_tokens_details"]["cached_tokens"],
+                expected,
+                provider_usage,
+            )
+
     async def test_non_codex_completed_usage_remains_unchanged(self) -> None:
         hooks, _proxy_server = load_hook_module()
         event = {

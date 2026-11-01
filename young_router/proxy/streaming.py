@@ -4797,6 +4797,16 @@ async def _yield_guarded_original_stream(
 
     event_tail: List[Any] = []
     visible_output_seen = saw_visible_output
+    # Whether this answer has *begun*, which is a different question from
+    # whether the client was shown anything: thinking is delivered the moment
+    # it arrives but it never answers the turn.  A bridged chat route that is
+    # cut while it is still thinking reports itself as ``response.completed``
+    # with a reasoning item and nothing else (LiteLLM's completion bridge
+    # fabricates that terminal from whatever it collected when the chat stream
+    # simply stops).  Handing that to the client is a finished turn that
+    # states no outcome at all, so the empty-completion check below reads this
+    # flag rather than the delivered-output one, whose thinking would waive it.
+    answer_output_seen = False
     seen_output_item_ids: set[str] = set()
     pending_tool_items: dict[str, tuple[int, dict[str, Any]]] = {}
     completed_output_items: dict[int, dict[str, Any]] = {}
@@ -5111,6 +5121,7 @@ async def _yield_guarded_original_stream(
             continue
         remember(chunk)
         visible_output_seen = visible_output_seen or _stream_chunk_has_delivered_output(chunk)
+        answer_output_seen = answer_output_seen or _stream_chunk_has_visible_output(chunk)
         completed_compat_chunk = _responses_output_limit_incomplete_as_completed_chunk(
             chunk,
             request_data,
@@ -5119,7 +5130,7 @@ async def _yield_guarded_original_stream(
             chunk = completed_compat_chunk
             remember(chunk)
         if _responses_stream_chunk_is_completed(chunk):
-            if _responses_completed_chunk_is_empty(chunk, request_data) and not visible_output_seen:
+            if _responses_completed_chunk_is_empty(chunk, request_data) and not answer_output_seen:
                 break
             saw_responses_completed = True
             record_responses_stream_success()
@@ -5264,6 +5275,7 @@ async def _yield_guarded_original_stream(
                 raise chunk_exception
             remember(chunk)
             visible_output_seen = visible_output_seen or _stream_chunk_has_delivered_output(chunk)
+            answer_output_seen = answer_output_seen or _stream_chunk_has_visible_output(chunk)
             completed_compat_chunk = _responses_output_limit_incomplete_as_completed_chunk(
                 chunk,
                 request_data,
@@ -5272,7 +5284,7 @@ async def _yield_guarded_original_stream(
                 chunk = completed_compat_chunk
                 remember(chunk)
             if _responses_stream_chunk_is_completed(chunk):
-                if _responses_completed_chunk_is_empty(chunk, request_data) and not visible_output_seen:
+                if _responses_completed_chunk_is_empty(chunk, request_data) and not answer_output_seen:
                     break
                 saw_responses_completed = True
                 record_responses_stream_success()

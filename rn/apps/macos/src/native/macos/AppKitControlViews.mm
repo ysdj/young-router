@@ -218,6 +218,9 @@ NSFont *TableCellFont()
 // The settings sidebar follows the native reference: a 13.5pt medium label, a
 // half step above the 13pt body text.
 constexpr CGFloat LiteLLMSourceListFontSize = 13.5;
+// A source-list row's second line: the app's one tip step, one point under the
+// rail's name rather than a size of its own.
+constexpr CGFloat LiteLLMSourceListDetailFontSize = 12.0;
 
 NSFont *SourceListFont()
 {
@@ -1197,6 +1200,26 @@ void WidenTableHeaderOverVisibleWidth(NSScrollView *scrollView);
   self.textField.textColor = emphasized
       ? NSColor.alternateSelectedControlTextColor
       : SourceListTitleColor(self.effectiveAppearance);
+}
+
+@end
+
+// The same rail row, when it carries a second line: the entry's name on the
+// first line and its own small print under it, which is how the system's own
+// source lists date their entries.  Both lines swap ink together on selection.
+@interface LiteLLMSourceListDetailCellView : LiteLLMSourceListTextCellView
+@property(nonatomic, strong) NSTextField *detailField;
+@end
+
+@implementation LiteLLMSourceListDetailCellView
+
+- (void)setBackgroundStyle:(NSBackgroundStyle)backgroundStyle
+{
+  [super setBackgroundStyle:backgroundStyle];
+  const BOOL emphasized = backgroundStyle == NSBackgroundStyleEmphasized;
+  self.detailField.textColor = emphasized
+      ? NSColor.alternateSelectedControlTextColor
+      : NSColor.secondaryLabelColor;
 }
 
 @end
@@ -2935,6 +2958,9 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   const bool overflowBehaviorChanged = oldViewProps.preserveColumnWidths != newViewProps.preserveColumnWidths ||
       oldViewProps.scrollTrailingColumnOverflow != newViewProps.scrollTrailingColumnOverflow;
   const bool sourceListChanged = oldViewProps.sourceList != newViewProps.sourceList;
+  // Whether a row has a second line is a fact about the table's height, so a
+  // change there has to re-tile the rows exactly like a density change does.
+  const bool rowDetailsChanged = oldViewProps.rowDetails.empty() != newViewProps.rowDetails.empty();
   const bool rowsChanged = oldViewProps.rowKeys != newViewProps.rowKeys ||
       oldViewProps.cells != newViewProps.cells ||
       oldViewProps.rowSymbols != newViewProps.rowSymbols ||
@@ -2944,7 +2970,8 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
       oldViewProps.secondaryCellKeys != newViewProps.secondaryCellKeys ||
       oldViewProps.alertRowKeys != newViewProps.alertRowKeys ||
       oldViewProps.spanningRowKeys != newViewProps.spanningRowKeys ||
-      oldViewProps.selectableSpanningRowKeys != newViewProps.selectableSpanningRowKeys;
+      oldViewProps.selectableSpanningRowKeys != newViewProps.selectableSpanningRowKeys ||
+      oldViewProps.rowDetails != newViewProps.rowDetails;
   const bool dataChanged = columnsChanged || compactChanged || paddingChanged || firstColumnPaddingChanged ||
       overflowBehaviorChanged || sourceListChanged || rowsChanged;
   const BOOL initialDataLoad = !_hasLoadedData;
@@ -2963,12 +2990,15 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
     // beside the table's trailing edge.
     [self applySourceListChrome:newViewProps.sourceList];
   }
-  if (compactChanged || sourceListChanged) {
+  if (compactChanged || sourceListChanged || rowDetailsChanged) {
     // Sidebar rows use the native source-list rhythm; a compact source list is
     // the pane's own rail one level down, so it takes one density step below the
     // sidebar's 30 pt without losing the badge tile's optical centering.
+    // A source list whose rows carry their own second line needs the height of
+    // two text lines; every other list keeps its rhythm exactly as before.
+    const bool twoLine = newViewProps.sourceList && !newViewProps.rowDetails.empty();
     _tableView.rowHeight = newViewProps.sourceList
-        ? (newViewProps.compact ? 26 : 30)
+        ? (twoLine ? 40 : (newViewProps.compact ? 26 : 30))
         : (newViewProps.compact ? 22 : 28);
     _tableView.intercellSpacing = newViewProps.sourceList ? NSMakeSize(0, 2) : NSZeroSize;
     if (_tableView.headerView != nil) {
@@ -3674,10 +3704,25 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   // sidebar, so it carries the sidebar's own type step and ink instead of
   // falling through to an ordinary body cell.
   const bool railRow = viewProps.sourceList;
-  NSUserInterfaceItemIdentifier identifier = railRow ? @"LiteLLMAppKitSourceListTextCell" : @"LiteLLMAppKitTableCell";
+  // A rail row with a second line is its own cell class and identifier: the
+  // rows of one table agree, and reusing a one-line cell for a two-line row
+  // would leave the subtitle with nowhere to go.
+  NSString *detail = @"";
+  if (railRow && static_cast<size_t>(row) < viewProps.rowDetails.size()) {
+    detail = StringFromStdString(viewProps.rowDetails[static_cast<size_t>(row)]);
+  }
+  // One class for the whole table, not per row: a table whose rows can carry a
+  // second line draws every rail row in the same cell, so a row without one
+  // keeps the same height and the same leading edge as its neighbours.
+  const bool detailRow = railRow && !viewProps.rowDetails.empty();
+  NSUserInterfaceItemIdentifier identifier = detailRow
+      ? @"LiteLLMAppKitSourceListDetailCell"
+      : (railRow ? @"LiteLLMAppKitSourceListTextCell" : @"LiteLLMAppKitTableCell");
   NSTableCellView *cell = [tableView makeViewWithIdentifier:identifier owner:self];
   if (cell == nil) {
-    Class cellClass = railRow ? [LiteLLMSourceListTextCellView class] : [NSTableCellView class];
+    Class cellClass = detailRow
+        ? [LiteLLMSourceListDetailCellView class]
+        : (railRow ? [LiteLLMSourceListTextCellView class] : [NSTableCellView class]);
     cell = [[cellClass alloc] initWithFrame:NSZeroRect];
     cell.identifier = identifier;
     NSTextField *label = [NSTextField labelWithString:@""];
@@ -3687,11 +3732,34 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
     label.maximumNumberOfLines = 1;
     [cell addSubview:label];
     cell.textField = label;
-    [NSLayoutConstraint activateConstraints:@[
-      [label.leadingAnchor constraintEqualToAnchor:cell.leadingAnchor constant:8],
-      [label.trailingAnchor constraintEqualToAnchor:cell.trailingAnchor constant:-8],
-      [label.centerYAnchor constraintEqualToAnchor:cell.centerYAnchor],
-    ]];
+    if (detailRow) {
+      // The name sits on the row's first line, the small print under it: the
+      // pair is a stack, so both lines share the leading edge and the second
+      // one never claims the row's height.
+      LiteLLMSourceListDetailCellView *detailCell = (LiteLLMSourceListDetailCellView *)cell;
+      NSTextField *secondary = [NSTextField labelWithString:@""];
+      secondary.translatesAutoresizingMaskIntoConstraints = NO;
+      secondary.font = [NSFont systemFontOfSize:LiteLLMSourceListDetailFontSize weight:NSFontWeightRegular];
+      secondary.lineBreakMode = NSLineBreakByTruncatingTail;
+      secondary.maximumNumberOfLines = 1;
+      secondary.textColor = NSColor.secondaryLabelColor;
+      [cell addSubview:secondary];
+      detailCell.detailField = secondary;
+      [NSLayoutConstraint activateConstraints:@[
+        [label.leadingAnchor constraintEqualToAnchor:cell.leadingAnchor constant:8],
+        [label.trailingAnchor constraintEqualToAnchor:cell.trailingAnchor constant:-8],
+        [label.topAnchor constraintEqualToAnchor:cell.topAnchor constant:5],
+        [secondary.leadingAnchor constraintEqualToAnchor:label.leadingAnchor],
+        [secondary.trailingAnchor constraintEqualToAnchor:cell.trailingAnchor constant:-8],
+        [secondary.topAnchor constraintEqualToAnchor:label.bottomAnchor constant:1],
+      ]];
+    } else {
+      [NSLayoutConstraint activateConstraints:@[
+        [label.leadingAnchor constraintEqualToAnchor:cell.leadingAnchor constant:8],
+        [label.trailingAnchor constraintEqualToAnchor:cell.trailingAnchor constant:-8],
+        [label.centerYAnchor constraintEqualToAnchor:cell.centerYAnchor],
+      ]];
+    }
   }
   const CGFloat horizontalPadding = MAX(
       LiteLLMTableMinimumHorizontalPadding,
@@ -3700,12 +3768,27 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
       LiteLLMTableMinimumHorizontalPadding,
       static_cast<CGFloat>(viewProps.firstColumnHorizontalPadding));
   const CGFloat columnPadding = columnIndex == 0 ? firstColumnHorizontalPadding : horizontalPadding;
+  // A detail cell's second label shares the same edge, so both of its
+  // constraints move with the column padding; any other cell only has the one.
+  NSTextField *detailLabel = [cell isKindOfClass:[LiteLLMSourceListDetailCellView class]]
+      ? ((LiteLLMSourceListDetailCellView *)cell).detailField
+      : nil;
   for (NSLayoutConstraint *constraint in cell.constraints) {
-    if (constraint.firstItem != cell.textField || constraint.secondItem != cell) continue;
+    if (constraint.secondItem != cell) continue;
+    if (constraint.firstItem != cell.textField &&
+        (detailLabel == nil || constraint.firstItem != detailLabel)) {
+      continue;
+    }
     if (constraint.firstAttribute == NSLayoutAttributeLeading) constraint.constant = columnPadding;
     else if (constraint.firstAttribute == NSLayoutAttributeTrailing) constraint.constant = -columnPadding;
   }
   NSTextField *label = cell.textField;
+  if (detailRow) {
+    LiteLLMSourceListDetailCellView *detailCell = (LiteLLMSourceListDetailCellView *)cell;
+    detailCell.detailField.stringValue = detail;
+    detailCell.detailField.toolTip = detail;
+    detailCell.detailField.accessibilityLabel = detail;
+  }
   const std::string &rowKey = viewProps.rowKeys[static_cast<size_t>(row)];
   if (railRow) {
     label.stringValue = value;

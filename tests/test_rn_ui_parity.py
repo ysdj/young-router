@@ -195,7 +195,21 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('setFooterStatus(translate("common.saving"));')
         self.assert_ui_has('setFooterStatus(translate("common.saved"));')
         self.assert_ui_has('setFooterStatus(errorMessage(reason, translate));')
-        self.assert_ui_has('<Text numberOfLines={1} style={assistantFileSurfaceStyles.editorFooterStatus}>{footerStatus ?? ""}</Text>')
+        # Windows asks "discard?" in this footer because a native confirmation
+        # owned by the editor's own process window never appeared above it;
+        # macOS keeps its sheet. The result still rides beside the buttons.
+        self.assert_ui_has('<Text numberOfLines={1} style={assistantFileSurfaceStyles.editorFooterStatus}>{confirmingDiscard ? translate("settings.discardDraftTitle") : footerStatus ?? ""}</Text>')
+        # The Windows field reports its own line breaks; a draft that kept them
+        # staged a TOML file Core rejected as invalid, so the edited text is
+        # normalized (and keeps the document's final line break) before staging.
+        self.assert_ui_has('const normalized = withDocumentEnding(normalizeEditorText(text));')
+        self.assert_ui_has('draftRef.current = normalized;')
+        self.assert_ui_has('const withDocumentEnding = (value: string): string => (')
+        self.assert_ui_has('setConfirmingDiscard(true);')
+        self.assert_ui_has('<ActionButton primary danger title={translate("common.discard")} disabled={saving} onPress={discardConfirmed} />')
+        # Its own actions are the only thing that may block this window: a stuck
+        # host-wide busy flag used to make Close return immediately.
+        self.assert_ui_has('    if (saving) return;')
         self.assert_ui_has('editorFooterStatus: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },')
         # 分组管理 hands its staged edits over and stays up while they are
         # written and applied: a failed save keeps its rows and its
@@ -1065,7 +1079,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '{modelFetchState === "loading" ? <NativeBusySpinner label={translate("providers.wizard.fetchingModels")} /> : <NativeButton title={translate("providers.wizard.refreshModels")}',
             'busy={fetchModelsBusy} disabled={(busy && !fetchModelsBusy)',
             'busy={probing}',
-            'busy={saving} disabled={(busy && !saving)',
+            'busy={saving} disabled={saving || target === undefined}',
             'busy={designateBusy}',
             'busy={serviceBusy} disabled={snapshot === undefined || (busy && !serviceBusy)}',
             'busy={cooldownClearPending}',
@@ -2402,8 +2416,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
     def test_subordinate_rails_share_one_source_list_style(self) -> None:
         mac_native = MACOS_CONTROLS.read_text(encoding="utf-8")
-        self.assertIn("const SETTINGS_RAIL_WIDTH = 156;", self.ui)
-        self.assertIn("const SETTINGS_RAIL_COLUMN_WIDTH = 148;", self.ui)
+        self.assertIn("const SETTINGS_RAIL_WIDTH = 200;", self.ui)
+        self.assertIn("const SETTINGS_RAIL_COLUMN_WIDTH = 192;", self.ui)
         # The column list is a module constant: an inline literal was a new
         # array on every settings render, which re-mounted each sidebar row.
         self.assertIn("const SETTINGS_RAIL_COLUMNS = [{ label: \"\", width: SETTINGS_RAIL_COLUMN_WIDTH }];", self.ui)
@@ -2422,10 +2436,16 @@ class ReactNativeUiParityTests(unittest.TestCase):
         shell = self.ui.split("function SettingsShell(", 1)[1].split("\nfunction ", 1)[0]
         self.assertIn("compact={false}", shell)
         self.assertIn("sourceList", shell)
-        self.assertEqual(self.ui.count("<SettingsRail"), 3)
+        # Runtime, external clients, backup, and the image-context window: every
+        # surface that splits into a list and a detail renders the same pair.
+        self.assertEqual(self.ui.count("<SettingsRail"), 4)
         rail_row = mac_native.split("const bool railRow = viewProps.sourceList;", 1)[1].split("label.toolTip = value;", 1)[0]
-        self.assertIn('identifier = railRow ? @"LiteLLMAppKitSourceListTextCell" : @"LiteLLMAppKitTableCell";', rail_row)
-        self.assertIn("Class cellClass = railRow ? [LiteLLMSourceListTextCellView class] : [NSTableCellView class];", rail_row)
+        # A rail row is the rail's own cell, and a row with a second line is
+        # that same cell with the tip step under its name.
+        self.assertIn('@"LiteLLMAppKitSourceListTextCell"', rail_row)
+        self.assertIn('@"LiteLLMAppKitSourceListDetailCell"', rail_row)
+        self.assertIn("[LiteLLMSourceListTextCellView class]", rail_row)
+        self.assertIn("[LiteLLMSourceListDetailCellView class]", rail_row)
         self.assertIn("label.font = SourceListFont();", rail_row)
         self.assertIn("label.textColor = SourceListTitleColor(self.effectiveAppearance);", rail_row)
         # Windows draws the same rail with the shared React table.
@@ -2472,8 +2492,17 @@ class ReactNativeUiParityTests(unittest.TestCase):
             ROOT / "rn/apps/macos/src/native/macos/AppKitControlViews.mm"
         ).read_text(encoding="utf-8")
         self.assertIn("compact?: WithDefault<boolean, false>;", mac_table_spec)
+        # Two densities, and one step taller while a rail row carries a second
+        # line: the row a list draws is the list's own decision, never a
+        # per-row height that would desynchronise `scrollToRow`.
         self.assertIn(
-            "_tableView.rowHeight = newViewProps.sourceList ? (newViewProps.compact ? 26 : 30) : (newViewProps.compact ? 22 : 28);",
+            "_tableView.rowHeight = newViewProps.sourceList "
+            "? (twoLine ? 40 : (newViewProps.compact ? 26 : 30)) "
+            ": (newViewProps.compact ? 22 : 28);",
+            re.sub(r"\s+", " ", mac_native),
+        )
+        self.assertIn(
+            "const bool twoLine = newViewProps.sourceList && !newViewProps.rowDetails.empty();",
             re.sub(r"\s+", " ", mac_native),
         )
         # Windows is a React table with the same two densities.
@@ -3022,7 +3051,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.assertNotIn(removed, runtime_workspace)
         # The band above the surface is the one shared detail header, so the
         # runtime, external, and backup panes never drift apart.
-        self.assertEqual(self.ui.count("<SettingsDetailHeader"), 3)
+        self.assertEqual(self.ui.count("<SettingsDetailHeader"), 4)
 
     def test_dsh_router_keeps_advanced_json_below_native_quick_controls(self) -> None:
         schema = (ROOT / "young_router/core/runtime_settings_schema.py").read_text(encoding="utf-8")
@@ -3174,6 +3203,74 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("return await refreshSnapshot();", self.ui)
         self.assertNotIn("refreshSnapshot(!background)", self.ui)
         self.assertNotIn("runServiceOperation(\"health\", true)", self.ui)
+
+    def test_image_context_opens_as_a_child_window_not_a_pane_overlay(self) -> None:
+        # The image-context task list is a child surface, the way 添加向导, the
+        # raw file editor, and 分组管理 are: a movable titled window over the
+        # window that opened it.  A React backdrop drawn inside the runtime
+        # pane is not that surface -- it cannot be dragged, it is clipped by the
+        # pane it sits in, and the window behind it stays live.
+        routes = (ROOT / "rn/packages/shared/src/routes.ts").read_text(encoding="utf-8")
+        self.assertIn('{ id: "image-context", titleKey: "status.imageContext" },', routes)
+        self.assertIn('({ id }) => id !== "claude-settings" && id !== "provider-wizard" && id !== "image-context",', routes)
+        self.assertIn('route !== "file-editor" && route !== "image-context";', routes)
+        self.assertIn('| "image-context"', (ROOT / "rn/packages/shared/src/types.ts").read_text(encoding="utf-8"))
+
+        self.assertIn("function openImageContextWindow(native: NativeLeafAdapter): void {", self.ui)
+        self.assertIn('native.window.open("image-context");', self.ui)
+        self.assertIn('native.window.focus("image-context");', self.ui)
+        self.assertIn('onOpen={() => openImageContextWindow(native)}', self.ui)
+        self.assertIn('{route === "image-context" ? <ImageContextWorkspace snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} ipc={ipc} native={native} /> : null}', self.ui)
+        self.assertIn('onPress={() => native.window.close("image-context")}', self.ui)
+        # No pane draws the list itself: the backdrop, the inline close handler,
+        # and the pane-owned open flag are what made it an invented modal.
+        self.assertNotIn("imageContextBackdrop", self.ui)
+        self.assertNotIn("setImageContextOpen", self.ui)
+        # 查看大图 is the same window's detail column, not a card floating over
+        # it: the overlay was clipped by the pane, covered the rows it belongs
+        # to, and read as a dialog the window could not lock.
+        self.assertNotIn("imageContextPreview", self.ui)
+        self.assertIn('{fullSize ? <View style={styles.imageContextViewer}>', self.ui)
+        self.assertIn('title={translate("imageContext.back")}', self.ui)
+        # A picture the window cannot draw is stated as a fact, never as the
+        # old refusal that told the reader to click the card for the original.
+        self.assertIn('"imageContext.noPreview": "This image has no stored bytes this app can draw."', self.en)
+        self.assertIn('setFullSize({ id, dataUrl: stringValue(answer.data_url) || null, downscaled: booleanValue(answer.downscaled) })', self.ui)
+
+        macos_leaf = MACOS_LEAF.read_text(encoding="utf-8")
+        self.assertIn('case "image-context": return localized("routeImageContext", fallback: "Image Context")', macos_leaf)
+        self.assertIn('if windowRoute == "provider-wizard" || windowRoute == "file-editor" || windowRoute == "image-context" {', macos_leaf)
+        self.assertIn(
+            'if windowRoute == "image-context", settingsWindowKey() == nil,\n           let parentTitle = routeWindowTitle("runtime-settings") {',
+            macos_leaf,
+        )
+        app_delegate = (ROOT / "rn/apps/macos/macos/YoungRouter-macOS/AppDelegate.mm").read_text(encoding="utf-8")
+        self.assertIn('@"provider-wizard", @"file-editor", @"image-context"', app_delegate)
+
+        windows_leaf = WINDOWS_LEAF.read_text(encoding="utf-8")
+        self.assertIn('if (route == L"image-context") return Localized("routeImageContext", L"Image Context");', windows_leaf)
+        self.assertIn('if (route == L"image-context") return {720, 480};', windows_leaf)
+        self.assertIn('if (route == L"image-context") return {900, 620};', windows_leaf)
+        windows_module = (ROOT / "rn/apps/windows/src/native/windows/WinUI3NativeLeafModule.cpp").read_text(encoding="utf-8")
+        self.assertIn('route == L"image-context") && !leaf_->IsChildHost()', windows_module)
+        windows_host = (ROOT / "rn/apps/windows/windows/YoungRouter/YoungRouter.cpp").read_text(encoding="utf-8")
+        self.assertIn('if (route != L"provider-wizard" && route != L"file-editor" && route != L"image-context") return;', windows_host)
+        self.assertIn('return route == L"provider-wizard" || route == L"file-editor" || route == L"image-context"', windows_host)
+
+    def test_image_context_does_not_offer_a_per_task_switch_here(self) -> None:
+        # The automatic-selection switch belongs to Context Attachment Manager's
+        # own panel.  The window reads it -- a tick must still mean "every
+        # turn" where the pass omits -- but turning it here was a second owner
+        # for the same file, and this app no longer writes it.
+        self.assertNotIn('dispatch("auto"', self.ui)
+        self.assertNotIn('translate("imageContext.auto")', self.ui)
+        self.assertNotIn('"imageContext.auto":', self.en)
+        self.assertNotIn('"imageContext.auto":', self.zh)
+        self.assertNotIn('| "imageContext.auto"', (ROOT / "rn/packages/shared/src/i18n/types.ts").read_text(encoding="utf-8"))
+        # The rest of that document is still that panel's: a write here keeps
+        # it intact, which is what the comment at the writer states.
+        self.assertIn("const automatic = booleanValue(task.auto);", self.ui)
+        self.assertIn('dispatch(automatic ? "pin" : "set"', self.ui)
 
     def test_online_usage_is_a_select_driven_log_view_not_a_child_browser(self) -> None:
         # The 在线用量 tab is a log view: a dropdown chooses which configured
@@ -3544,7 +3641,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
             raw_editor.index("const resolution = await onConflict(domain, document);"),
         )
         self.assertIn("void ipc.editor(domain, document).then((descriptor) => {", raw_editor)
-        self.assertIn('<View style={styles.rawNativeEditorFrame}>\n        <CodeEditorWebView', raw_editor)
+        self.assertIn("<View style={styles.rawNativeEditorFrame}>", raw_editor)
+        # Windows edits the shared draft in the native multiline field: a
+        # WebView2 inside the child editor window's XAML island renders blank.
+        self.assertIn('Platform.OS === "windows"', raw_editor)
+        self.assertIn("<NativeTextField", raw_editor)
+        self.assertIn("<CodeEditorWebView", raw_editor)
         self.assertIn('documentKey={`${documentKey}:${editorRenderRevision}`}', raw_editor)
         self.assertIn("value={draft}", raw_editor)
         self.assertIn("baseline={baseline}", raw_editor)
@@ -4901,6 +5003,23 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("startupAttempts.current = attempt + 1;", self.ui)
         self.assertIn('const timer = setTimeout(() => { void runServiceOperation("start"); }, delay);', self.ui)
         self.assertNotIn("startupAttempted", self.ui)
+        # The retry budget is spent by *attempts*, not by renders.  The effect
+        # below keys on the service state and on this callback, so a callback
+        # that took ``snapshot`` as a dependency changed identity on every
+        # poll: each snapshot re-ran the effect, walked the whole backoff in a
+        # second, and left a stopped router with no attempt left -- the window
+        # then sat on 已停止 until the app was relaunched.  The optimistic
+        # "starting" copy comes from a ref instead, so the callback is stable.
+        self.assertIn("const current = latestSnapshot.current;", self.ui)
+        self.assertIn(
+            "receiveSnapshot({ ...current, service: { ...current.service, state: \"starting\" } });",
+            self.ui,
+        )
+        self.assertNotIn("receiveSnapshot({ ...snapshot, service: { ...snapshot.service, state: \"starting\" } });", self.ui)
+        self.assertIn(
+            "}, [hostTranslate, ipc, native, receiveSnapshot, refreshSnapshot]);",
+            self.ui,
+        )
         self.assertIn('const serviceRestart = serviceState === "unhealthy" || serviceState === "starting";', general)
         self.assertIn('const serviceActionAvailable = serviceState === "stopped" || serviceRestart;', general)
         # A transitional state is a claim about Core, and Core is the authority
@@ -4917,6 +5036,17 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # the one surface that could never correct it.
         self.assertIn("  }, [refreshSnapshot, snapshot?.revision, snapshot?.service.state]);", self.ui)
         self.assertNotIn('if (!isPrimaryHost || !snapshot) return;\n    // A transitional state is a claim about a proxy replacement', self.ui)
+        # 运行中 is the other claim no window can verify: a Core replaced under
+        # an idle app leaves the last snapshot standing, and the 服务 row then
+        # states 运行中 (端口 12390) over a port nothing answers on.  It re-reads
+        # slowly, and it accepts an unchanged revision because a replacement
+        # restores that revision from the same record.
+        self.assertIn("const SERVICE_RUNNING_RECONCILE_MS = 15_000;", self.ui)
+        self.assertIn('if (snapshot?.service.state !== "running") return;', self.ui)
+        self.assertIn(
+            "if (next.revision === acceptedSnapshotRevision.current && next.service.state === observed) return;",
+            self.ui,
+        )
         self.assertIn('await dispatchServiceAction(serviceRestart ? "service.restart" : "service.start");', general)
         # The strip names the action that landed; the 服务 row already states the
         # state, so the same word is never printed twice on one screen.
@@ -7573,7 +7703,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
     def test_service_lifecycle_stays_in_the_shared_menu_surface(self) -> None:
         """Lifecycle labels and state-specific enablement are shared by AppKit and WinUI."""
         for marker in (
-            'receiveSnapshot({ ...snapshot, service: { ...snapshot.service, state: "starting" } });',
+            # The callback reads the latest snapshot through a ref rather than a
+            # closure dependency, so its identity stays stable across polls.
+            'receiveSnapshot({ ...current, service: { ...current.service, state: "starting" } });',
             'const serviceState = snapshot.service.state;',
             'const serviceStartAvailable = !serviceOperationPending && serviceState === "stopped";',
             'const serviceRestartAvailable = !serviceOperationPending && serviceState !== "unknown";',

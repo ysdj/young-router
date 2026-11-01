@@ -116,6 +116,28 @@ struct CodeWebViewComponentView
     try {
       island_ = winrt::Microsoft::UI::Xaml::XamlIsland{};
       webview_ = WebView2{};
+      // The island this browser lives in does not always report the window DPI
+      // when it is first arranged, and the WebView then draws its logical page
+      // straight into the physical client: at 200% the editor filled exactly the
+      // top-left quarter.  The element's own rasterization scale is what decides
+      // that, so set it to the ratio between the window and the island once,
+      // here, where both values are known.
+      try {
+        double island_scale = 1.0;
+        try {
+          island_scale = island_.ContentIsland().RasterizationScale();
+        } catch (...) {
+          island_scale = 1.0;
+        }
+        if (!(island_scale > 0.0)) island_scale = 1.0;
+        const auto dpi = GetDpiForSystem();
+        const double window_scale = static_cast<double>(dpi == 0 ? USER_DEFAULT_SCREEN_DPI : dpi) / USER_DEFAULT_SCREEN_DPI;
+        const double element_scale = window_scale / island_scale;
+        if (element_scale > 0.0 && std::abs(element_scale - 1.0) > 0.01) {
+          webview_.RasterizationScale(element_scale);
+        }
+      } catch (...) {
+      }
       auto weak = get_weak();
       navigation_completed_token_ = webview_.NavigationCompleted(
           [weak](auto const&, auto const& args) {
@@ -127,10 +149,59 @@ struct CodeWebViewComponentView
           });
       island_.Content(webview_);
       island_view.Connect(island_.ContentIsland());
-      InitializeBrowser();
+      // A XamlIsland created in this process starts at a rasterization scale of
+      // 1.0 and only adopts the host window's DPI with its first arrange pass.
+      // EnsureCoreWebView2Async builds the browser site against the island as
+      // it is right now, so starting it immediately drew the whole page at 1x
+      // into a client measured in physical pixels: on a 200% monitor the
+      // editor filled exactly the top-left quarter.  The island's content
+      // never changes from here on -- only the moment the browser backend is
+      // allowed to come up moves.
+      StartBrowserWhenScaled(island_view);
     } catch (...) {
       EmitEditorError("initialize_failed");
     }
+  }
+
+  // Poll the island scale across a few dispatcher turns; it leaves 1.0 when
+  // the site adopted the window DPI.  After a bounded wait it starts anyway:
+  // a 1x browser still renders a usable editor, a missing one renders none.
+  void StartBrowserWhenScaled(ContentIslandComponentView const& island_view) noexcept {
+    auto queue = winrt::Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread();
+    if (!queue) {
+      InitializeBrowser();
+      return;
+    }
+    struct Wait {
+      winrt::weak_ref<CodeWebViewComponentView> owner{nullptr};
+      winrt::Microsoft::UI::Dispatching::DispatcherQueue queue{nullptr};
+      ContentIslandComponentView island_view{nullptr};
+      int attempts = 0;
+    };
+    auto wait = std::make_shared<Wait>();
+    wait->owner = get_weak();
+    wait->queue = queue;
+    wait->island_view = island_view;
+    auto step = std::make_shared<std::function<void()>>();
+    *step = [wait, step]() {
+      auto self = wait->owner.get();
+      if (!self || self->disposed_) return;
+      auto scale = 1.0;
+      try {
+        scale = self->island_.ContentIsland().RasterizationScale();
+      } catch (...) {
+        // The island is gone or not connected yet; stop waiting and start the
+        // browser so the surface still initializes.
+        self->InitializeBrowser();
+        return;
+      }
+      if (scale == 1.0 && ++wait->attempts < 8) {
+        wait->queue.TryEnqueue(winrt::Microsoft::UI::Dispatching::DispatcherQueuePriority::Low, *step);
+        return;
+      }
+      self->InitializeBrowser();
+    };
+    queue.TryEnqueue(winrt::Microsoft::UI::Dispatching::DispatcherQueuePriority::Low, *step);
   }
 
   void UpdateProps(
@@ -175,7 +246,12 @@ struct CodeWebViewComponentView
 
   void InitializeBrowser() noexcept {
     auto weak = get_weak();
-    [weak]() -> winrt::fire_and_forget {
+    // Hold this component across every await: the browser backend takes long
+    // enough that React can release its only reference while it is still
+    // starting, and the coroutine then resumed on a destroyed object -- the
+    // editor stayed permanently blank with no error the surface could show.
+    auto strong = get_strong();
+    [weak, strong]() -> winrt::fire_and_forget {
       auto self = weak.get();
       if (!self || self->disposed_) co_return;
       try {
@@ -196,6 +272,9 @@ struct CodeWebViewComponentView
               if (auto current = weak.get()) current->HandleWebMessage(args);
             });
         self->browser_ready_ = true;
+        // The props may have arrived while the backend was still starting; that
+        // pass could not navigate. Re-apply them now that a page can load.
+        self->ApplyProps(nullptr);
         self->NavigateToCurrentHtml();
       } catch (...) {
         if (auto current = weak.get(); current && !current->disposed_) {

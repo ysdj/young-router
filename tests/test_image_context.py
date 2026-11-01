@@ -14,6 +14,7 @@ import os
 import random
 import struct
 import tempfile
+import time
 import unittest
 import zlib
 from pathlib import Path
@@ -116,6 +117,10 @@ class _ImageContextCase(unittest.TestCase):
                 image_context_module.IMAGE_CONTEXT_ENABLED_ENV: "1",
                 image_context_module.IMAGE_CONTEXT_DATA_DIR_ENV: self.data_dir,
                 image_context_module.IMAGE_CONTEXT_MIN_BYTES_ENV: "1024",
+                # These cases are about what retirement does at all, so the
+                # window is off here; the window's own size has its own case.
+                image_context_module._VISIBLE_PICTURES_ENV: "0",
+                image_context_module._VISIBLE_TOKENS_ENV: "0",
                 # Which promise a placeholder may make depends on the host, so
                 # every test states it instead of inheriting the developer's.
                 image_context_module.IMAGE_CONTEXT_FETCH_ENV: "off",
@@ -278,16 +283,16 @@ class ImageContextRewriteTests(_ImageContextCase):
         result = self.rewritten(items)
 
         # One copy stays sent, so the other becomes the duplicate placeholder
-        # naming it -- the content is never lost, only the bytes.
-        text = result["input"][1]["content"][1]["text"]
-        self.assertIn("图片 IMG-0001 未重复提供", text)
-        self.assertIn("IMG-0002", text)
-        # The copy that is still sent states its own id, and is still sent.
-        sent_content = result["input"][2]["content"]
-        self.assertTrue(any(part.get("type") == "input_image" for part in sent_content))
-        self.assertTrue(
-            any("IMG-0002" in part.get("text", "") for part in sent_content)
-        )
+        # naming it -- the content is never lost, only the bytes.  The copy that
+        # stays is the oldest, because the newest one moves forward with every
+        # step and every placeholder naming it would have to be rewritten, which
+        # is exactly the prefix the upstream would then re-read.
+        opening = result["input"][0]["content"]
+        self.assertTrue(any(part.get("type") == "input_image" for part in opening))
+        self.assertTrue(any("IMG-0001" in part.get("text", "") for part in opening))
+        duplicate = result["input"][2]["content"][1]["text"]
+        self.assertIn("图片 IMG-0002 未重复提供", duplicate)
+        self.assertIn("IMG-0001", duplicate)
 
     def test_the_switch_off_means_the_request_is_untouched(self) -> None:
         items = [
@@ -554,6 +559,79 @@ class ImageContextFileFetchTests(_ImageContextCase):
         self.assertEqual({}, store_module.paths(self.thread))
 
 
+class ImageContextStoreRetentionTests(_ImageContextCase):
+    """The store's own day: pictures do not outlive the replay they answer from."""
+
+    def store_task(self, thread: str, seed: int = 1) -> None:
+        items = [_user_turn("first", _upload_parts(_png(40, 30, noisy=True, seed=seed)))]
+        self.assertEqual(store_module.store(thread, {"input": items}), 1)
+
+    def backdate(self, path: str, seconds: float) -> None:
+        moment = time.time() - seconds
+        os.utime(path, (moment, moment))
+
+    def test_a_replay_and_its_file_copies_expire_after_a_day(self) -> None:
+        self.store_task("old-thread", 1)
+        self.store_task("new-thread", 2)
+        old_replay = os.path.join(store_module.cache_dir(), "old-thread.json")
+        old_folder = os.path.join(store_module.files_dir(), "old-thread")
+        self.backdate(old_replay, 25 * 60 * 60)
+        self.backdate(old_folder, 25 * 60 * 60)
+
+        removed = store_module.sweep(now=time.time())
+
+        self.assertEqual(removed, 1)
+        self.assertFalse(os.path.exists(old_replay))
+        self.assertFalse(os.path.isdir(old_folder))
+        # The fresh task is untouched: its pictures can still answer a fetch.
+        self.assertTrue(os.path.isfile(os.path.join(store_module.cache_dir(), "new-thread.json")))
+        self.assertTrue(os.path.isdir(os.path.join(store_module.files_dir(), "new-thread")))
+
+    def test_the_task_cap_takes_the_file_copies_with_it(self) -> None:
+        # Creating the tasks through the store would sweep the cap after every
+        # write, so the oldest would be gone before it could be aged in order.
+        with mock.patch.object(store_module, "sweep", return_value=0):
+            for index in range(store_module.REPLAY_CACHE_MAX_TASKS + 1):
+                self.store_task(f"thread-{index:02d}", index + 1)
+        oldest_replay = os.path.join(store_module.cache_dir(), "thread-00.json")
+        oldest_folder = os.path.join(store_module.files_dir(), "thread-00")
+        self.backdate(oldest_replay, 60 * 60)
+        self.backdate(oldest_folder, 60 * 60)
+
+        store_module.sweep(now=time.time())
+
+        self.assertFalse(os.path.exists(oldest_replay))
+        self.assertFalse(os.path.isdir(oldest_folder))
+        self.assertEqual(
+            len([name for name in os.listdir(store_module.cache_dir()) if name.endswith(".json")]),
+            store_module.REPLAY_CACHE_MAX_TASKS,
+        )
+
+    def test_file_copies_without_a_replay_are_dropped(self) -> None:
+        orphan = os.path.join(store_module.files_dir(), "orphan-thread")
+        os.makedirs(orphan)
+        with open(os.path.join(orphan, "IMG-0001.png"), "wb") as handle:
+            handle.write(b"png")
+
+        store_module.sweep(now=time.time())
+
+        self.assertFalse(os.path.isdir(orphan))
+
+    def test_reading_a_stale_replay_refuses_to_answer(self) -> None:
+        self.store_task("old-thread", 1)
+        replay = os.path.join(store_module.cache_dir(), "old-thread.json")
+        with open(replay, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        payload["at"] = time.time() - 25 * 60 * 60
+        with open(replay, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+
+        self.assertEqual([], store_module.load("old-thread"))
+        # Refusing is not deleting: the sweeper owns the file, and a concurrent
+        # write at the same path may have just replaced it.
+        self.assertTrue(os.path.exists(replay))
+
+
 class ImageContextFetchTests(_ImageContextCase):
     def test_the_fetch_answers_from_the_request_the_proxy_stored(self) -> None:
         thread = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
@@ -812,6 +890,137 @@ class ImageContextSizeModeTests(_ImageContextCase):
             items.append(_assistant(f"page {index} looks fine"))
         return items
 
+    def test_the_kept_picture_is_the_same_one_on_every_step(self) -> None:
+        # The cache is the reason this is not "the newest picture": keeping the
+        # newest moves the kept item forward on every step, which rewrites an
+        # item already on the wire and makes the upstream re-read everything
+        # after it.  Measured on a real 20-image replay, that cost 14% of the
+        # prefix on every step that added a result.
+        kept = []
+        for pictures in (2, 3, 4, 5):
+            items = self.one_turn_task(pictures)
+            result = self.rewritten(items)
+            kept.append([image.image_id for image in image_context_module.scan(result["input"])])
+        self.assertEqual(kept[0], kept[-1])
+        # One result of the turn is still sent, so the model is never left with
+        # nothing but placeholders for the pages it just walked.
+        self.assertEqual(len(kept[-1]), 1)
+
+    def test_a_new_result_never_rewrites_the_ones_already_sent(self) -> None:
+        # Every item a previous step already put on the wire must come back
+        # byte-identical, or the prefix after it is read again.
+        def wire(pictures: int) -> list:
+            return self.rewritten(self.one_turn_task(pictures))["input"]
+
+        previous = wire(3)
+        current = wire(4)
+        for index, item in enumerate(previous):
+            self.assertEqual(item, current[index], f"item {index} drifted")
+
+    def batch_of_views(self, pictures: int) -> list:
+        """One step of a task that renders a dozen pages and looks at them all.
+
+        A step that asks for many pictures puts every ``function_call`` first and
+        the results after them, all of them after the last thing the assistant
+        said -- so no earlier request of this turn can have carried their bytes,
+        and the model is looking at every one of them for the first time.
+        """
+        items: list = [_user_turn("look at these and report")]
+        for index in range(pictures):
+            items.append(
+                {
+                    "type": "function_call",
+                    "call_id": f"call_{index}",
+                    "name": "view_image",
+                    "arguments": "{}",
+                }
+            )
+        for index in range(pictures):
+            items.append(
+                _tool_image(
+                    _png(120, 90, noisy=True, seed=index + 1), call_id=f"call_{index}"
+                )
+            )
+        return items
+
+    def test_the_turn_keeps_its_last_pictures_in_front_of_the_model(self) -> None:
+        # Retiring a picture on the next request made the model work from
+        # placeholders: real thread ``01a19633`` said "we have many images as
+        # placeholders", stitched contact sheets of its own and asked for one
+        # page per step.  A window keeps the last pictures of the turn visible.
+        items = self.batch_of_views(14)
+        items.append(_assistant("page 1 is a cover"))
+        items.append(
+            {
+                "type": "function_call",
+                "call_id": "next",
+                "name": "exec_command",
+                "arguments": "{}",
+            }
+        )
+        items.append(_tool_image(_png(120, 90, noisy=True, seed=999), call_id="next"))
+        with mock.patch.dict(
+            os.environ,
+            {
+                image_context_module._VISIBLE_PICTURES_ENV: "24",
+                image_context_module._VISIBLE_TOKENS_ENV: "1000",
+            },
+        ):
+            result = self.rewritten(items)
+        visible = len(image_context_module.scan(result["input"]))
+        # Ten newest of the turn, plus the turn's first picture as the anchor.
+        self.assertEqual(visible, 11)
+        # The oldest picture stays as well: it is the anchor every later request
+        # shares a prefix with, so retiring it would rewrite the whole request.
+        wire = json.dumps(result["input"], ensure_ascii=False)
+        self.assertIn("IMG-0001 provided", wire)
+        self.assertIn("IMG-0015 provided", wire)
+        self.assertIn("IMG-0002 omitted", wire)
+
+    def test_a_batch_of_views_reaches_the_model_whole(self) -> None:
+        # Real thread ``01a195f0``: a step that asked for several pages at once
+        # had all but one replaced by placeholders on the very request that
+        # carried them, so the model - which had never seen any of them -
+        # fetched them again one at a time.  A many-picture step became many
+        # single-picture steps, and the task dribbled through the work.
+        for pictures in (3, 12):
+            items = self.batch_of_views(pictures)
+            result = image_context_module._with_codex_image_context(
+                _request(items)
+            )
+            # A pass with nothing to say leaves the request untouched, which is
+            # the outcome this case wants: every picture of the batch still
+            # travels as its own bytes.
+            carried = (result or {}).get("input", items)
+            self.assertEqual(len(image_context_module.scan(carried)), pictures)
+
+    def test_a_view_the_model_has_already_seen_may_become_a_placeholder(self) -> None:
+        # The point of the pass survives the rule above: once the assistant has
+        # answered after those pictures, they are ones the model has seen, and
+        # the next request may name them instead of re-sending them.
+        items = self.batch_of_views(4)
+        items.append(_assistant("page 1 is a cover"))
+        items.append(
+            {
+                "type": "function_call",
+                "call_id": "next",
+                "name": "view_image",
+                "arguments": "{}",
+            }
+        )
+        items.append(_tool_image(_png(120, 90, noisy=True, seed=99), call_id="next"))
+        result = self.rewritten(items)
+        carried = image_context_module.scan(result["input"])
+        # The turn's first picture (the cache anchor) and the one it just asked
+        # for; the four it has already read are named instead.  Scanning the
+        # result renumbers what survived, so the count is what can be asserted.
+        self.assertEqual(len(carried), 2)
+        self.assertEqual(carried[-1].raw, image_context_module.scan(items)[-1].raw)
+        wire = json.dumps(result["input"], ensure_ascii=False)
+        for named in ("IMG-0002", "IMG-0003", "IMG-0004"):
+            self.assertIn(f"{named} omitted", wire)
+        self.assertIn("IMG-0005 provided", wire)
+
     def test_size_mode_omits_pictures_older_than_the_newest_result(self) -> None:
         items = self.one_turn_task(4)
         before = cw._inline_image_bytes(items)
@@ -827,14 +1036,80 @@ class ImageContextSizeModeTests(_ImageContextCase):
         # Every omitted picture is still named, so it can be fetched back.
         self.assertIn("IMG-0001", json.dumps(result["input"], ensure_ascii=False))
 
-    def test_the_setting_still_leaves_the_turn_being_answered_alone(self) -> None:
-        # Size mode is forced for a different reason than the setting: the
-        # setting must not start rewriting a turn the model is working in.
+    def test_the_setting_reaches_the_turn_being_answered(self) -> None:
+        # The task that produced this pass's own bug report is one user message
+        # followed by hundreds of steps: with the pass stopping at the turn
+        # boundary it never ran on that thread at all, and every step of the
+        # task re-uploaded the same pictures.
         items = self.one_turn_task(4)
+        before = cw._inline_image_bytes(items)
+
+        result = self.rewritten(items)
+
+        after = cw._inline_image_bytes(result["input"])
+        self.assertLess(after, before / 2)
+        # The newest result's picture is the one the model just asked to see.
+        self.assertEqual(after, cw._inline_image_bytes([items[-2]]))
+        self.assertIn("IMG-0001", json.dumps(result["input"], ensure_ascii=False))
+
+    def test_the_turns_own_upload_is_never_touched(self) -> None:
+        # The picture the user attached is what the task is about, and the note
+        # says it is provided as usual; a placeholder for it on the first
+        # request would be an answer about an image the model never saw.
+        upload = _png(120, 90, noisy=True, seed=9)
+        items = [_user_turn("look at this and at the pages", _upload_parts(upload))]
+        for index in range(3):
+            items.append(
+                {
+                    "type": "function_call",
+                    "call_id": f"call_{index}",
+                    "name": "view_image",
+                    "arguments": "{}",
+                }
+            )
+            items.append(
+                _tool_image(
+                    _png(120, 90, noisy=True, seed=index + 1), call_id=f"call_{index}"
+                )
+            )
+
+        result = self.rewritten(items)
+
+        # The developer note precedes the turn, so the upload's own message is
+        # the first user item after it.
+        opening = next(
+            item
+            for item in result["input"]
+            if item.get("type") == "message" and item.get("role") == "user"
+        )
+        uploads = [
+            part for part in opening["content"] if part.get("type") == "input_image"
+        ]
+        self.assertEqual(uploads, [items[0]["content"][2]])
+        # Its own id label is inserted before it, so a placeholder elsewhere can
+        # be matched to the picture in front of the model.
+        self.assertTrue(
+            any("IMG-0001" in part.get("text", "") for part in opening["content"])
+        )
+        # The older tool results are what was left out.
+        self.assertIn("IMG-0002", json.dumps(result["input"], ensure_ascii=False))
+
+    def test_a_lone_tool_picture_is_kept_because_nothing_is_newer(self) -> None:
+        items = self.one_turn_task(1)
 
         self.assertIsNone(
             image_context_module._with_codex_image_context(_request(items))
         )
+
+    def test_history_mode_keeps_the_turn_being_answered_whole(self) -> None:
+        items = self.one_turn_task(4)
+        with mock.patch.dict(
+            os.environ,
+            {image_context_module.IMAGE_CONTEXT_INSIDE_TURN_ENV: "history"},
+        ):
+            self.assertIsNone(
+                image_context_module._with_codex_image_context(_request(items))
+            )
 
     def test_size_mode_frees_nothing_from_a_single_picture(self) -> None:
         items = [_user_turn("look")] + self.one_turn_task(1)[1:]

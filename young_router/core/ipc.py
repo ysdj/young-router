@@ -257,7 +257,7 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
             try:
                 if self._read_body().strip() not in {b"", b"{}"}:
                     raise ProtocolError("invalid_request", "Host shutdown request is invalid")
-                self._owner.core.shutdown()
+                self._owner.core.shutdown(stopped_by="app_exit")
             except (CoreError, ProtocolError) as exc:
                 self._send_error(400, code=exc.code, message=exc.message, retryable=exc.code == "service_error")
                 return
@@ -1079,7 +1079,9 @@ class CoreIPCServer:
                 image_id = params.get("id")
                 if not isinstance(task, str) or not isinstance(image_id, str):
                     raise CoreError("invalid_image", "The requested image is unavailable")
-                result = self.core.image_context_image(task, image_id)
+                # A grid asks for a thumbnail, the enlarged view for the
+                # preview: one method, two sizes, chosen by the caller.
+                result = self.core.image_context_image(task, image_id, thumb=params.get("thumb") is True)
             elif request.method == "dispatch":
                 action = params.get("action")
                 expected = params.get("revision")

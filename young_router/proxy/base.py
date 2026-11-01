@@ -1004,7 +1004,22 @@ def _responses_usage_for_codex(
     if output_details is None:
         output_details = _object_get(usage, "completion_tokens_details")
 
-    cached_tokens = _int_or_zero(_object_get(input_details, "cached_tokens"))
+    # Every shape of "the prefix was reused" this app forwards, largest first.
+    # A relay reports the same fact several ways at once and zeroes the ones it
+    # does not mean: the DeepSeek route answers ``prompt_tokens_details
+    # .cached_tokens: 29824`` *together with* ``cache_read_input_tokens: 0``,
+    # and LiteLLM's own Anthropic mapping lets that zero overwrite the real
+    # count, so the number Codex reads was 0 on a thread the upstream had
+    # reused.  That zero is not harmless: Codex's turn meter and its compaction
+    # both read it.  Taking the maximum is safe because every one of these keys
+    # counts the same thing -- input tokens served from cache -- so a larger
+    # value can only be a more complete report, never a different quantity.
+    cached_tokens = max(
+        _int_or_zero(_object_get(input_details, "cached_tokens")),
+        _int_or_zero(_object_get(usage, "cached_tokens")),
+        _int_or_zero(_object_get(usage, "prompt_cache_hit_tokens")),
+        _int_or_zero(_object_get(usage, "cache_read_input_tokens")),
+    )
     # The relays these models are served from count their own way, and a count
     # that is too low is not harmless: Codex shows it as context used and
     # compacts against it, so an undercounted thread runs until the router

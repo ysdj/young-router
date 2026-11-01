@@ -270,6 +270,7 @@ ContentSize RouteMinimumContentSize(std::wstring_view route) {
   }
   if (route == L"provider-wizard") return {540, 420};
   if (route == L"file-editor") return {900, 560};
+  if (route == L"image-context") return {720, 480};
   // The hidden menu-bar host has no route surface. Keep its fallback small so
   // it never inherits a settings window's minimum size before a route opens.
   return {320, 160};
@@ -287,6 +288,7 @@ ContentSize RouteInitialContentSize(std::wstring_view route) {
   }
   if (route == L"provider-wizard") return {620, 460};
   if (route == L"file-editor") return {900, 560};
+  if (route == L"image-context") return {900, 620};
   return {320, 160};
 }
 
@@ -872,6 +874,13 @@ void WinUI3NativeLeaf::SetLocalization(std::map<std::string, std::wstring> strin
   }
   if (window_handle_ != nullptr && !active_route_.empty()) {
     SetWindowTextW(window_handle_, RouteTitle(active_route_).c_str());
+  } else if (window_handle_ != nullptr) {
+    // A child host is titled by its route before any React view exists, so the
+    // AppWindow carries the English fallback until the strings arrive.  Re-title
+    // it from the route the child was started with.
+    if (child_host_) {
+      SetWindowTextW(window_handle_, RouteTitle(active_route_).c_str());
+    }
   }
   if (tray_visible_) {
     auto tooltip = status_title_.empty() ? Localized("appTitle", L"Young Router") : status_title_;
@@ -3153,16 +3162,21 @@ std::wstring WinUI3NativeLeaf::Localized(std::string const& key, std::wstring_vi
   return found == strings_.end() || found->second.empty() ? std::wstring(fallback) : found->second;
 }
 
+std::wstring WinUI3NativeLeaf::RouteTitleFor(std::wstring_view route) const {
+  return RouteTitle(route);
+}
+
+std::wstring WinUI3NativeLeaf::LocalizedFor(std::string const& key, std::wstring_view fallback) const {
+  return Localized(key, fallback);
+}
+
 std::wstring WinUI3NativeLeaf::RouteTitle(std::wstring_view route) const {
-  // Settings panes share one window, so its title is the app name while the
-  // sidebar selection names the active pane (System Settings style).
-  if (route == L"home" || route == L"general-settings" || route == L"providers-models" ||
-      route == L"codex-settings" || route == L"claude-settings" || route == L"runtime-settings" ||
-      route == L"data-management" || route == L"logs") {
-    return Localized("appTitle", L"Young Router");
-  }
+  // A child window has no sidebar to name it, so its own route is its title.
   if (route == L"provider-wizard") return Localized("routeProviderWizard", L"Add Provider");
   if (route == L"file-editor") return Localized("routeFileEditor", L"Edit File");
+  if (route == L"image-context") return Localized("routeImageContext", L"Image Context");
+  // Settings panes share one window, so its title is the app name while the
+  // sidebar selection names the active pane (System Settings style).
   return Localized("appTitle", L"Young Router");
 }
 

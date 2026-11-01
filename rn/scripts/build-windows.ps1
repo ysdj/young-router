@@ -357,6 +357,27 @@ print('young-router-veridrop-import-ok')
   Copy-Item -Path (Join-Path $WindowsRelease "*") -Destination $PackagePayload -Recurse -Force
   Remove-Item -LiteralPath (Join-Path $PackagePayload "Bundle\Bundle") -Recurse -Force -ErrorAction SilentlyContinue
 
+  # The host project links Core from ``windows\<arch>\Release\Core`` as
+  # deployment content, and MSBuild only rewrites a deployment item whose source
+  # is newer.  That directory outlives a build -- a copy of it is the only thing
+  # a packaged run loads -- so a Core edit made after the last full solution
+  # build never reached the package: the app kept executing the previous
+  # ``young_router`` while the tests ran against the current one.  The staged
+  # source tree is copied over it here, before the payload is used, so one build
+  # always ships exactly the Core that was just tested.
+  $ReleaseCore = Join-Path $WindowsRelease "Core"
+  if (Test-Path $ReleaseCore) {
+    Copy-CoreSource $CoreRoot $ReleaseCore
+    $ReleaseCoreSource = Join-Path $ReleaseCore "young_router"
+    if (Test-Path $ReleaseCoreSource) {
+      Get-ChildItem -LiteralPath $ReleaseCoreSource -Recurse -Directory -Filter "__pycache__" |
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+      Get-ChildItem -LiteralPath $ReleaseCoreSource -Recurse -File -Include "*.pyc", "*.pyo" |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+    }
+    Copy-Item -Path (Join-Path $ReleaseCore "*") -Destination (Join-Path $PackagePayload "Core") -Recurse -Force
+  }
+
   # The WinUI host links Windows App SDK and can fail before WinMain when a
   # user double-clicks the unpackaged build-output EXE on ARM64. Keep the
   # packaged host produced above, then replace only that convenient raw-output

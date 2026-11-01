@@ -94,21 +94,31 @@ class CoreProtocolTests(unittest.TestCase):
 
     def test_core_parent_watchdog_runs_ordered_shutdown(self) -> None:
         events: list[str] = []
+        record_states: list[str] = []
         server_started = threading.Event()
 
         class FakeCore:
             def webdav_scheduler(self) -> "FakeScheduler":
-                return FakeScheduler()
+                return FakeScheduler("scheduler")
 
-            def shutdown(self) -> None:
+            def image_context_sweeper(self) -> "FakeScheduler":
+                return FakeScheduler("cleanup")
+
+            def shutdown(self, *, stopped_by: str = "app_exit") -> None:
+                # SIGTERM is how a host or a script *replaces* Core; the record
+                # must say so rather than read as the user's own Stop.
+                record_states.append(stopped_by)
                 events.append("core.shutdown")
 
         class FakeScheduler:
+            def __init__(self, name: str) -> None:
+                self._name = name
+
             def start(self) -> None:
-                events.append("scheduler.start")
+                events.append(f"{self._name}.start")
 
             def stop(self) -> None:
-                events.append("scheduler.stop")
+                events.append(f"{self._name}.stop")
 
         class FakeServer:
             def __init__(self, _core: object, *, address: str, port: int) -> None:
@@ -136,12 +146,13 @@ class CoreProtocolTests(unittest.TestCase):
         ):
             self.assertEqual(0, core_main.run(["--parent-pid", "4321"]))
 
-        # The interval loop starts with the IPC endpoint and stops before the
-        # store it dispatches into is shut down.
+        # Both loops start with the IPC endpoint and stop before the store they
+        # work on is shut down.
         self.assertEqual(
-            ["server.start", "scheduler.start", "scheduler.stop", "core.shutdown", "server.stop"],
+            ["server.start", "scheduler.start", "cleanup.start", "scheduler.stop", "cleanup.stop", "core.shutdown", "server.stop"],
             events,
         )
+        self.assertEqual(["core_replaced"], record_states)
         self.assertTrue(create_core.call_args.kwargs["reset_transient_routing_state"])
 
     def test_shared_schema_matches_python_and_typescript_method_contract(self) -> None:
@@ -302,6 +313,7 @@ class CoreProtocolTests(unittest.TestCase):
                 "turn": None,
                 "name": None,
                 "data_url": None,
+                "downscaled": False,
             },
             "dispatch": {"revision": 0, "action_summary": {"operation": "fetch_models"}},
             "subscribe": {"subscription_id": "subscription"},
@@ -2083,6 +2095,60 @@ class CoreIPCTests(unittest.TestCase):
             self.assertTrue(core.wait_for_service_reload(5.0))
             self.assertEqual(["reload"], reloads)
             self.assertIn("renamed", config_path.read_text(encoding="utf-8"))
+
+    def test_the_record_names_who_stopped_the_service(self) -> None:
+        """``stopped`` alone does not say who stopped it, and that was the bug.
+
+        A host replaces Core with SIGTERM (a failed session renewal, a request
+        that outlived its budget).  That stop is identical to the app quitting
+        or to the user pressing 停止服务, so a record holding only ``stopped``
+        was a decision nobody made: the replacement came up reading it, and the
+        window it handed over said 已停止 over a router that was serving a
+        second earlier.  The record now names the actor beside the state, and an
+        ordinary write drops that key so a stale reason cannot outlive the stop
+        it described.
+        """
+
+        def service_handler(operation: str) -> dict[str, str]:
+            return {"state": "stopped" if operation == "stop" else "running", "port": 49173}
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "core-state.json"
+            AtomicJSONStore(state_file).write(
+                {"version": 1, "revision": 7, "service": {"state": "running", "port": 49173}}
+            )
+            replacement = CoreStore(
+                metadata_path=state_file,
+                domains=[MemoryDomain("language", {"choice": "system"})],
+                service_handlers={"stop": service_handler},
+            )
+            replacement.shutdown(stopped_by="core_replaced")
+            recorded = json.loads(state_file.read_text(encoding="utf-8"))
+            self.assertEqual("stopped", recorded["service"]["state"])
+            self.assertEqual("core_replaced", recorded["stopped_by"])
+            self.assertEqual(7, recorded["revision"])
+
+            app_exit = CoreStore(
+                metadata_path=state_file,
+                domains=[MemoryDomain("language", {"choice": "system"})],
+                service_handlers={"stop": service_handler},
+            )
+            app_exit.shutdown(stopped_by="app_exit")
+            recorded = json.loads(state_file.read_text(encoding="utf-8"))
+            self.assertEqual("stopped", recorded["service"]["state"])
+            self.assertEqual("app_exit", recorded["stopped_by"])
+
+            # A record written by a running Core carries no actor: the key can
+            # never survive into a later stop and be read as that stop's cause.
+            running = CoreStore(
+                metadata_path=state_file,
+                domains=[MemoryDomain("language", {"choice": "system"})],
+                service_handlers={"stop": service_handler, "status": lambda _op: {"state": "running", "pid": 1, "port": 49173}},
+            )
+            running.snapshot()
+            running._persist_metadata()
+            recorded = json.loads(state_file.read_text(encoding="utf-8"))
+            self.assertNotIn("stopped_by", recorded)
 
     def test_authenticated_host_shutdown_stops_the_owned_service(self) -> None:
         calls: list[str] = []

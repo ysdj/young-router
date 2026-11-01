@@ -73,7 +73,7 @@ Editable config: `~/.young-router/config.yaml` (sanitized example: [`config.exam
 
 - **Import/export:** bring providers in from Codex / Claude settings, files, or New API / CC Switch links; export configuration sections as JSON. Confirming the detected sections writes them right away. Optional WebDAV smart sync (push / pull / merge) is available under **Backup & Sync**.
 - **Deep links:** open any screen directly — `open "young-router://open/<route>"` with `home`, `providers-models`, `provider-wizard`, `codex-settings`, `claude-settings`, `runtime-settings`, `relay-accounts`, `data-management`, or `logs?tab=…` (`requests`, `service`, `route-trace`, `recovery`, `online-usage`). Links cannot carry values or trigger a configuration write.
-- **Development:** contributor guide in [`AGENTS.md`](./AGENTS.md); focused Python tests live in `tests/`; run `pnpm exec tsc --noEmit` inside `rn/`. `scripts/version.py` keeps `VERSION`, manifests, and the Cask in sync; builds advance `LITELLM_VERSION` to the latest stable release and bundle a matching Node.js 22 runtime.
+- **Development:** contributor guide in [`AGENTS.md`](./AGENTS.md); focused Python tests live in `tests/`; run `pnpm exec tsc --noEmit` inside `rn/`. `scripts/dev-loop-macos.sh --help` covers iterating on a change in the running app without a deploy; `scripts/build-and-install-macos.sh` is the one that signs and installs. `scripts/version.py` keeps `VERSION`, manifests, and the Cask in sync; builds advance `LITELLM_VERSION` to the latest stable release and bundle a matching Node.js 22 runtime.
 
 </details>
 

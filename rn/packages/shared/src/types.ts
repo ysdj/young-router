@@ -29,6 +29,7 @@ export type AppRoute =
   | "relay-accounts"
   | "relay-add"
   | "provider-wizard"
+  | "image-context"
   | "logs";
 
 export type LogTab =
@@ -462,7 +463,7 @@ export interface IpcParams {
     }
     | { editor_token: string; text: string };
   files: Record<string, never>;
-  image_context_image: { task: string; id: string };
+  image_context_image: { task: string; id: string; thumb?: boolean };
   dispatch: { action: DispatchAction; revision?: number };
   subscribe: { topics?: "snapshot"[] };
   validate: { domain: ConfigDomain; revision?: number };
@@ -485,6 +486,8 @@ export interface ImageContextImage {
   turn: number | null;
   name: string | null;
   data_url: string | null;
+  /** True when `data_url` is a scaled copy instead of the stored bytes. */
+  downscaled: boolean;
 }
 
 export interface IpcResults {
@@ -604,7 +607,7 @@ export interface IpcClient {
   logs(tab: LogTab, revision?: number): Promise<IpcResults["logs"]>;
   editor(domain: EditorDomain, document: EditorDocument): Promise<IpcResults["editor"]>;
   files(): Promise<IpcResults["files"]>;
-  imageContextImage(task: string, id: string): Promise<IpcResults["image_context_image"]>;
+  imageContextImage(task: string, id: string, thumb?: boolean): Promise<IpcResults["image_context_image"]>;
   stageEditor(editorToken: string, text: string): Promise<IpcResults["editor"]>;
   dispatch(action: DispatchAction, revision?: number): Promise<IpcResults["dispatch"]>;
   subscribe(listener: (event: IpcEvent) => void, topics?: IpcEventTopic[]): () => void;
@@ -658,6 +661,10 @@ export interface NativeSegmentedControl {
 
 export interface NativeLocalization {
   appTitle: string;
+  /** Title of the host's own startup-failure dialog. */
+  startupFailure: string;
+  /** Body of that dialog when the failure carried no message. */
+  startupUnknownFailure: string;
   /** Application-menu About item. */
   about: string;
   autoStart: string;
@@ -705,6 +712,7 @@ export interface NativeLocalization {
   routeDataManagement: string;
   routeProviderWizard: string;
   routeFileEditor: string;
+  routeImageContext: string;
   routeLogs: string;
   /**
    * The words a child surface states beside its own footer buttons while a save

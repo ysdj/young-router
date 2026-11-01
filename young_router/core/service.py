@@ -1011,10 +1011,21 @@ class CoreStore:
         # non-zero ``snapshot`` keeps projecting the state the dispatch already
         # published instead of a controller reading taken mid-replacement.
         self._service_proxy_operations = 0
+        # How many of those are *starts*.  A start has no earlier proxy to be
+        # mid-replacement, so once the controller answers running there is no
+        # other reading it could be hiding: the start's own follow-up work (a
+        # Codex file rewrite under this lock) can outlast a window's patience,
+        # and a proxy that is serving while every snapshot still says 启动中 is
+        # the same lie in the other direction.
+        self._service_start_operations = 0
         self._last_actions: dict[str, dict[str, Any]] = {}
         # The WebDAV interval loop is created on request, started by the Core
         # entry point, and stopped with the store.
         self._webdav_scheduler: Any | None = None
+        # The image-context cache's own day, applied from outside the request
+        # path: the store sweeps on writes, which is what stops when the pass
+        # is off.  Also created on request and started by the entry point.
+        self._image_context_sweeper: Any | None = None
         # When a user action last reached this store.  An automatic WebDAV sync
         # holds the store for its whole round trip, so it waits for quiet.
         self._last_activity = time.monotonic()
@@ -1277,10 +1288,24 @@ class CoreStore:
             store._set_service_from_result(initial_service, increment=False)
         return store
 
-    def shutdown(self) -> dict[str, Any]:
-        """Stop only the proxy owned by this Core before the native host exits."""
+    def shutdown(self, *, stopped_by: str = "app_exit") -> dict[str, Any]:
+        """Stop only the proxy owned by this Core before the native host exits.
+
+        ``stopped_by`` is written beside the stop, because "stopped" on its own
+        does not say who stopped it and the two answers are worlds apart.  A
+        host replaces Core with SIGTERM -- a failed session renewal, a request
+        that outlived its budget -- and the stop it leaves behind used to be
+        indistinguishable from the user pressing 停止服务: the replacement came
+        up reading a record that claimed a decision nobody made, and the window
+        it handed over said 已停止 over a router that was serving a second
+        earlier.  ``core_replaced`` publishes that reason with the state; the
+        app's own quit keeps ``app_exit``.  The state itself is the truth about
+        the child and stays ``stopped`` either way -- what the record no longer
+        does is imply that a person asked for it.
+        """
 
         self._stop_webdav_scheduler()
+        self._stop_image_context_sweeper()
         with self._service_reload_guard:
             self._service_reload_stopping = True
             reload_thread = self._service_reload_thread
@@ -1302,7 +1327,7 @@ class CoreStore:
             if not isinstance(result, Mapping):
                 raise CoreError("service_error", "LiteLLM service returned invalid status")
             self._set_service_from_result(result, increment=False)
-            self._persist_metadata()
+            self._persist_metadata(stopped_by=stopped_by)
             self._stop_managed_workers()
             return dict(self._service)
 
@@ -1439,17 +1464,26 @@ class CoreStore:
             base_revision=self._revision,
         )
 
-    def _persist_metadata(self) -> None:
+    def _persist_metadata(self, *, stopped_by: str | None = None) -> None:
+        """Write the Core record the next Core reads.
+
+        ``stopped_by`` names who ended the service and is written only by a
+        shutdown; an ordinary write leaves the key out, so a stale reason can
+        never outlive the stop it described.  Its absence then means exactly
+        one thing: this record was written by a running Core, not by a teardown.
+        """
+
         if self._metadata_store is None:
             return
+        document: dict[str, Any] = {
+            "version": CORE_METADATA_VERSION,
+            "revision": self._revision,
+            "service": _safe_public(self._service),
+        }
+        if stopped_by is not None:
+            document["stopped_by"] = stopped_by
         try:
-            self._metadata_store.write(
-                {
-                    "version": CORE_METADATA_VERSION,
-                    "revision": self._revision,
-                    "service": _safe_public(self._service),
-                }
-            )
+            self._metadata_store.write(document)
         except PersistenceError as exc:
             raise CoreError("state_unavailable", safe_exception_message(exc)) from None
 
@@ -1498,19 +1532,27 @@ class CoreStore:
             # synthetic Core state transition.
             reload_thread = self._service_reload_thread
             planned_restart = reload_thread is not None and reload_thread.is_alive()
-            if (planned_restart or self._service_proxy_operations > 0) and self._service.get("state") == "starting":
+            transitional = self._service.get("state") == "starting"
+            owns_transition = (planned_restart or self._service_proxy_operations > 0) and transitional
+            status_handler = self._service_handlers.get("status")
+            if status_handler is not None:
                 # A planned restart owns the transitional state: the controller
                 # reports stopped/unhealthy -- or nothing at all, while its own
                 # replacement is in flight -- and a cached status must not hide
                 # the planned restart from the menu or the settings panes.
-                pass
-            else:
-                status_handler = self._service_handlers.get("status")
-                if status_handler is not None:
+                #
+                # A start is the exception, and only in one direction: it
+                # never has an earlier proxy to report, so a running answer is
+                # the truth and the window must see it even while the start's
+                # own follow-up work is still under this lock.  Anything else
+                # (the child died, or the listener was taken) leaves the
+                # announcement standing until the operation answers.
+                if not owns_transition or self._service_start_operations > 0:
                     result = status_handler("status")
                     if not isinstance(result, Mapping):
                         raise CoreError("service_error", "LiteLLM service returned invalid status")
-                    self._set_service_from_result(result, increment=False)
+                    if not owns_transition or str(result.get("state")) == "running":
+                        self._set_service_from_result(result, increment=False)
             self._refresh_external_disk_state()
             # Relay snapshots display reverse dependency counts, while the
             # provider/model domain remains the sole source of binding truth.
@@ -2831,6 +2873,28 @@ class CoreStore:
         if scheduler is not None:
             scheduler.stop()
 
+    # -- image-context cleanup --------------------------------------------
+    def image_context_sweeper(self) -> Any:
+        """The loop that enforces the replay cache's own day.
+
+        The store already sweeps after every write, but a write is the thing
+        that stops arriving once the pass is switched off or a task is left
+        behind.  Core owns the clock, so an installation nobody is looking at
+        still drops yesterday's pictures.
+        """
+
+        if self._image_context_sweeper is None:
+            from .image_context_cleanup import ImageContextSweeper
+            from ..proxy import image_context_store
+
+            self._image_context_sweeper = ImageContextSweeper(sweep=image_context_store.sweep)
+        return self._image_context_sweeper
+
+    def _stop_image_context_sweeper(self) -> None:
+        sweeper = self._image_context_sweeper
+        if sweeper is not None:
+            sweeper.stop()
+
     @staticmethod
     def _webdav_sync_sections(payload: object) -> tuple[str, str]:
         data = _as_mapping(payload)
@@ -3560,6 +3624,8 @@ class CoreStore:
         with self._lock:
             previous_service = copy.deepcopy(self._service)
             self._service_proxy_operations += 1
+            if operation in {"start", "start_async"}:
+                self._service_start_operations += 1
             try:
                 if operation in SERVICE_TRANSITION_OPERATIONS and self._service.get("state") != "starting":
                     # Publish the transition now so every window sees the proxy
@@ -3573,7 +3639,9 @@ class CoreStore:
                     self._persist_metadata()
                     self._emit()
             except BaseException:
-                self._service_proxy_operations -= 1
+                self._service_proxy_operations = max(0, self._service_proxy_operations - 1)
+                if operation in {"start", "start_async"}:
+                    self._service_start_operations = max(0, self._service_start_operations - 1)
                 raise
         try:
             # A manual restart and a background post-apply restart must never
@@ -3619,6 +3687,8 @@ class CoreStore:
             # projecting a real service state again.
             with self._lock:
                 self._service_proxy_operations = max(0, self._service_proxy_operations - 1)
+                if operation in {"start", "start_async"}:
+                    self._service_start_operations = max(0, self._service_start_operations - 1)
 
     def _publish_service_transition(self) -> None:
         """Publish the proxy leaving its state, without erasing its record.
@@ -4866,7 +4936,7 @@ class CoreStore:
             base_revision=self._revision + 1,
         )
 
-    def image_context_image(self, task: str, image_id: str) -> dict[str, Any]:
+    def image_context_image(self, task: str, image_id: str, thumb: bool = False) -> dict[str, Any]:
         """One stored image of one task, for the panel's preview.
 
         Read straight from the domain rather than through a snapshot: a snapshot
@@ -4878,7 +4948,7 @@ class CoreStore:
         if not callable(read):
             raise CoreError("invalid_image", "The requested image is unavailable")
         try:
-            return read(task, image_id)
+            return read(task, image_id, thumb=thumb) if thumb else read(task, image_id)
         except CoreError:
             raise
         except Exception:

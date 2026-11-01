@@ -12,6 +12,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+from young_router import adapters as managed_adapters
 from young_router.adapters import our_free_model
 from young_router.config.schema import PUBLIC_MODEL_CONTEXT_KEY
 from young_router.core.domains import DomainError
@@ -845,6 +846,77 @@ class OurFreeModelStoreTests(unittest.TestCase):
         self.assertEqual(
             merged[our_free_model.API_BASE_ENV[our_free_model.OUR_FREE_MODEL_PROVIDER]], "http://x"
         )
+
+    def test_both_managed_workers_are_awaited_at_the_same_time(self) -> None:
+        """The proxy's start pays the slower worker, not both.
+
+        Under ``autostart`` each fragment waits for its own worker to report
+        readiness, and the two waits are independent.  Asking for them one
+        after the other put their sum in front of the proxy spawn; running
+        them together puts the slower one there.  The assertion is on the
+        intervals overlapping, not only on elapsed time: two waits that
+        happen to be short can still be serial and pass a stopwatch.
+        """
+
+        import time as time_module
+
+        from young_router.core.operations import CoreServiceController
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        controller = CoreServiceController(Path(directory.name))
+        # Both fragments only take their waiting branch when the staged document
+        # names the reference that worker publishes.
+        controller.paths.runtime_config.parent.mkdir(parents=True, exist_ok=True)
+        controller.paths.runtime_config.write_text(
+            "\n".join(sorted(managed_adapters.managed_base_references())),
+            encoding="utf-8",
+        )
+
+        delay = 0.25
+        intervals: list[tuple[str, float, float]] = []
+
+        class SlowRuntime:
+            def __init__(self, name: str, fragment: dict[str, str]) -> None:
+                self._name = name
+                self._fragment = fragment
+
+            def environment(self, *, autostart: bool = False) -> dict[str, str]:
+                started = time_module.monotonic()
+                time_module.sleep(delay)
+                intervals.append((self._name, started, time_module.monotonic()))
+                return dict(self._fragment)
+
+            def environment_values(self) -> dict[str, str]:
+                return dict(self._fragment)
+
+            def stop(self) -> None:
+                pass
+
+        workbuddy_key = our_free_model.API_KEY_ENV[our_free_model.OUR_FREE_MODEL_PROVIDER]
+        free_model_base = our_free_model.API_BASE_ENV[our_free_model.OUR_FREE_MODEL_PROVIDER]
+        controller.attach_workbuddy(SlowRuntime("workbuddy", {workbuddy_key: "wb"}))
+        controller.attach_our_free_model(SlowRuntime("our-free-model", {free_model_base: "http://x"}))
+
+        started = time_module.monotonic()
+        merged = controller._managed_worker_environment(autostart=True)
+        elapsed = time_module.monotonic() - started
+
+        # Both fragments still reach the proxy child.
+        self.assertEqual(merged[workbuddy_key], "wb")
+        self.assertEqual(merged[free_model_base], "http://x")
+
+        self.assertEqual(len(intervals), 2, "both workers must be awaited")
+        (first_name, first_start, first_end), (second_name, second_start, second_end) = sorted(
+            intervals, key=lambda item: item[1]
+        )
+        self.assertLess(
+            second_start,
+            first_end,
+            f"{second_name} began only after {first_name} finished, so the waits were serial",
+        )
+        # The sum would be two full delays; the slower one is the budget.
+        self.assertLess(elapsed, delay * 1.8, "the two readiness waits were not overlapped")
 
 
 class OurFreeModelAdapterTests(unittest.TestCase):

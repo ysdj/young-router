@@ -85,7 +85,7 @@ export function createIpcClient(transport: IpcTransport, endpoint?: IpcEndpoint)
     logs: async (tab, revision) => call("logs", revision === undefined ? { tab } : { tab, revision }),
     editor: async (domain, document): Promise<IpcResults["editor"]> => call("editor", { domain, document }),
     files: async (): Promise<IpcResults["files"]> => call("files", {}),
-    imageContextImage: async (task, id): Promise<IpcResults["image_context_image"]> => call("image_context_image", { task, id }),
+    imageContextImage: async (task, id, thumb): Promise<IpcResults["image_context_image"]> => call("image_context_image", thumb ? { task, id, thumb: true } : { task, id }),
     stageEditor: async (editorToken, text): Promise<IpcResults["editor"]> => call("editor", { editor_token: editorToken, text }),
     dispatch: async (action: DispatchAction, revision?: number): Promise<IpcResults["dispatch"]> => call("dispatch", revision === undefined ? { action } : { action, revision }),
     subscribe: (listener: (event: IpcEvent) => void, topics?: IpcEventTopic[]): (() => void) => {

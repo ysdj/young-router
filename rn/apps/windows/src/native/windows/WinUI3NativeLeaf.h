@@ -148,6 +148,17 @@ class WinUI3NativeLeaf : public std::enable_shared_from_this<WinUI3NativeLeaf> {
   bool SetWindowContentSize(std::wstring_view route, double width, double height);
   HWND WindowHandle() const noexcept { return window_handle_; }
   void SetChildHost(bool child) noexcept { child_host_ = child; }
+  // A route's window title in the user's language, and the same lookup for a
+  // plain key.  Public because the child host titles its own window with them:
+  // a child window and the parent's own dialogs must name a surface the way the
+  // shared UI does, so a Chinese install never shows an English fallback beside
+  // a localized pane.
+  std::wstring RouteTitleFor(std::wstring_view route) const;
+  // The route-to-title table itself, private to the leaf and reached through
+  // RouteTitleFor from the host.
+  std::wstring RouteTitle(std::wstring_view route) const;
+  std::wstring LocalizedFor(std::string const& key, std::wstring_view fallback) const;
+
   bool IsChildHost() const noexcept { return child_host_; }
   // Re-arranges the React root at the current client size.  RNW follows
   // AppWindow size changes only, so a caption change that resizes the client
@@ -243,7 +254,6 @@ class WinUI3NativeLeaf : public std::enable_shared_from_this<WinUI3NativeLeaf> {
   void ApplyIntegratedTitleBar(bool enabled);
   void UpdateTitleBarDragRegions();
   void RelayoutRootView();
-  std::wstring RouteTitle(std::wstring_view route) const;
   std::wstring VersionText() const;
 
   std::wstring status_title_ = L"Status: Starting";

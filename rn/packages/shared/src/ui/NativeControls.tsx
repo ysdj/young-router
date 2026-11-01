@@ -222,6 +222,12 @@ type TableProps = {
   scrollTrailingColumnOverflow?: boolean;
   disabledRowKeys?: string[];
   secondaryCellKeys?: string[];
+  /**
+   * One optional second line per row, printed small under the row's own text.
+   * A source list that names its entries by title and dates them underneath
+   * asks for this; a row with an empty entry keeps the one-line rhythm.
+   */
+  rowDetails?: string[];
   /** Rows whose text renders in the warning (brown) color. */
   alertRowKeys?: string[];
   /**
@@ -666,6 +672,7 @@ function windowsRowHeight(compact: boolean): number {
 const WindowsTableRow = React.memo(function WindowsTableRow({
   row,
   index,
+  rowHeight,
   columns,
   compact,
   sourceList,
@@ -677,11 +684,13 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
   rowSymbolColor,
   rowImageName,
   secondaryCellKeys,
+  detail,
   selectableSpanning,
   onSelect,
 }: {
   row: TableRow;
   index: number;
+  rowHeight: number;
   columns: TableColumn[];
   compact: boolean;
   sourceList: boolean;
@@ -693,6 +702,8 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
   rowSymbolColor?: string;
   rowImageName?: string;
   secondaryCellKeys: Set<string>;
+  /** The row's own second line, printed small under its text. */
+  detail?: string;
   selectableSpanning: boolean;
   onSelect: (row: TableRow, index: number) => void;
 }): React.JSX.Element {
@@ -702,7 +713,7 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
   const textColor = alert ? WINDOWS_CONTROL.warning : (disabled ? WINDOWS_CONTROL.textDisabled : WINDOWS_CONTROL.text);
   const rowStyle = [
     windowsTableStyles.row,
-    { height: windowsRowHeight(compact) },
+    { height: rowHeight },
     sourceList && windowsTableStyles.sourceRow,
     stripe && windowsTableStyles.rowStripe,
     // A NavigationView-style source list selects with a quiet fill and a short
@@ -720,7 +731,7 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
     onHoverOut={sourceList ? () => setHovered(false) : undefined}
     style={rowStyle}
   >
-    {sourceList && selected ? <View style={[windowsTableStyles.sourceSelectionIndicator, { top: windowsRowHeight(compact) / 2 - 8 }]} /> : null}
+    {sourceList && selected ? <View style={[windowsTableStyles.sourceSelectionIndicator, { top: rowHeight / 2 - 8 }]} /> : null}
     {spanning ? <Text numberOfLines={1} style={[windowsTableStyles.groupText, { color: textColor }]}>{row.cells[0] ?? ""}</Text> : <View style={windowsTableStyles.cells}>
       {columns.map((column, columnIndex) => {
         const cell = row.cells[columnIndex] ?? "";
@@ -736,7 +747,10 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
           // whole column slid by a different amount on every selection.
           return <View key={`${row.key}:${columnIndex}`} style={[windowsTableStyles.cellView, sourceList ? windowsTableStyles.sourceCellViewFlex : { width: column.width }]}>
             {rowSymbol ? <Text style={[windowsTableStyles.symbol, { color: disabled ? WINDOWS_CONTROL.textDisabled : selected ? WINDOWS_CONTROL.text : WINDOWS_CONTROL.textSecondary }]}>{windowsSourceSymbol(rowSymbol)}</Text> : sourceImage !== undefined ? <Image source={sourceImage} style={windowsTableStyles.sourceImage} /> : null}
-            <Text numberOfLines={1} style={[windowsTableStyles.cellText, { color: cellColor }]}>{visibleCell}</Text>
+            <View style={windowsTableStyles.sourceCellTextColumn}>
+              <Text numberOfLines={1} style={[windowsTableStyles.cellText, { color: cellColor }]}>{visibleCell}</Text>
+              {detail ? <Text numberOfLines={1} style={windowsTableStyles.sourceCellDetail}>{detail}</Text> : null}
+            </View>
           </View>;
         }
         return <Text key={`${row.key}:${columnIndex}`} numberOfLines={1} style={[windowsTableStyles.cell, { width: column.width, color: cellColor }]}>{visibleCell}</Text>;
@@ -745,7 +759,7 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
   </Pressable>;
 }, sameTableRow);
 
-function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, followBottom, scrollToRow, framed, sourceList, rowSymbols, rowSymbolColors, rowImageNames, disabledRowKeys, secondaryCellKeys, selectableSpanningKeys, onSelectionChange, onRowDoublePress, style, alertRowKeys }: {
+function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, followBottom, scrollToRow, framed, sourceList, rowSymbols, rowSymbolColors, rowImageNames, disabledRowKeys, secondaryCellKeys, rowDetails, selectableSpanningKeys, onSelectionChange, onRowDoublePress, style, alertRowKeys }: {
   columns: TableProps["columns"];
   rows: TableProps["rows"];
   selectedKey: string;
@@ -760,6 +774,7 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
   rowImageNames: string[];
   disabledRowKeys: string[];
   secondaryCellKeys: string[];
+  rowDetails: string[];
   selectableSpanningKeys: Set<string>;
   onSelectionChange?: (key: string, index: number) => void;
   onRowDoublePress?: (key: string, index: number) => void;
@@ -768,7 +783,11 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
 }): React.JSX.Element {
   const lastPress = React.useRef<{ key: string; at: number } | undefined>(undefined);
   const verticalList = React.useRef<FlatList<TableRow>>(null);
-  const rowHeight = windowsRowHeight(compact);
+  // One height for the whole list: `getItemLayout` is an arithmetic promise to
+  // the list, so a row that grew taller than its neighbours can only exist if
+  // every row grew with it.
+  const twoLine = rowDetails.some((detail) => detail.length > 0);
+  const rowHeight = windowsRowHeight(compact) + (twoLine ? 14 : 0);
   const totalWidth = columns.reduce((sum, column) => sum + column.width, 0);
   // Built once per prop change instead of once per mounted row per cell: a
   // log that appends 20 entries a second otherwise rebuilt the same lookups
@@ -806,6 +825,7 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
   const renderRow = React.useCallback(({ item, index }: { item: TableRow; index: number }): React.JSX.Element => <WindowsTableRow
     row={item}
     index={index}
+    rowHeight={rowHeight}
     columns={columns}
     compact={compact}
     sourceList={sourceList}
@@ -817,9 +837,10 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
     rowSymbolColor={rowSymbolColors[index]}
     rowImageName={rowImageNames[index]}
     secondaryCellKeys={secondaryKeys}
+    detail={rowDetails[index] || undefined}
     selectableSpanning={selectableSpanningKeys.has(item.key)}
     onSelect={select}
-  />, [alertKeys, columns, compact, disabledKeys, rowImageNames, rowSymbols, rowSymbolColors, secondaryKeys, selectableSpanningKeys, select, selectedKey, sourceList, stripedRows]);
+  />, [alertKeys, columns, compact, disabledKeys, rowDetails, rowImageNames, rowSymbols, rowSymbolColors, secondaryKeys, selectableSpanningKeys, select, selectedKey, sourceList, stripedRows]);
   const keyExtractor = React.useCallback((row: TableRow): string => row.key, []);
   const body = <View style={[windowsTableStyles.horizontalBody, !sourceList && { minWidth: totalWidth }]}>
     {!sourceList ? <View style={[windowsTableStyles.header, { minWidth: totalWidth }]}>
@@ -926,6 +947,8 @@ const windowsTableStyles = StyleSheet.create({
   rowSelected: { backgroundColor: WINDOWS_CONTROL.accentSubtle, borderLeftWidth: 3, borderLeftColor: WINDOWS_CONTROL.accent },
   rowDisabled: { opacity: 0.72 },
   cells: { flexDirection: "row", alignItems: "center", paddingHorizontal: 8 },
+  sourceCellTextColumn: { flex: 1, minWidth: 0, justifyContent: "center" },
+  sourceCellDetail: { color: WINDOWS_CONTROL.textSecondary, fontSize: UI_TIP_FONT_SIZE, lineHeight: 14 },
   cellView: { flexDirection: "row", alignItems: "center", paddingHorizontal: 8, minWidth: 0 },
   sourceCellViewFlex: { flex: 1, minWidth: 0 },
   cellText: { flexShrink: 1, minWidth: 0, fontSize: UI_FONT_SIZE },
@@ -941,7 +964,7 @@ const windowsTableStyles = StyleSheet.create({
 // with them every mounted row) even when no prop changed.
 const EMPTY_STRINGS: string[] = [];
 
-export function NativeTable({ columns, rows, selectedKey = "", striped = true, compact = true, followBottom = false, scrollToRow = -1, framed = true, sourceList = false, rowSymbols = EMPTY_STRINGS, rowSymbolColors = EMPTY_STRINGS, rowImageNames = EMPTY_STRINGS, cellHorizontalPadding = 8, firstColumnHorizontalPadding = 8, preserveColumnWidths = false, scrollTrailingColumnOverflow = false, disabledRowKeys = EMPTY_STRINGS, secondaryCellKeys = EMPTY_STRINGS, selectableSpanningRowKeys = EMPTY_STRINGS, onSelectionChange, onRowDoublePress, style, alertRowKeys = EMPTY_STRINGS }: TableProps): React.JSX.Element {
+export function NativeTable({ columns, rows, selectedKey = "", striped = true, compact = true, followBottom = false, scrollToRow = -1, framed = true, sourceList = false, rowSymbols = EMPTY_STRINGS, rowSymbolColors = EMPTY_STRINGS, rowImageNames = EMPTY_STRINGS, cellHorizontalPadding = 8, firstColumnHorizontalPadding = 8, preserveColumnWidths = false, scrollTrailingColumnOverflow = false, disabledRowKeys = EMPTY_STRINGS, secondaryCellKeys = EMPTY_STRINGS, rowDetails = EMPTY_STRINGS, selectableSpanningRowKeys = EMPTY_STRINGS, onSelectionChange, onRowDoublePress, style, alertRowKeys = EMPTY_STRINGS }: TableProps): React.JSX.Element {
   // Striped rows belong to the list surface, not to its contents: the native
   // table paints its alternating bands across the whole viewport, so an empty
   // list shows the same stripes and reads as a list that happens to have no
@@ -981,13 +1004,19 @@ export function NativeTable({ columns, rows, selectedKey = "", striped = true, c
     rowImageNames,
     disabledRowKeys,
     secondaryCellKeys,
+    // An all-empty list is the same as none: the native table reads a non-empty
+    // list as "these rows are two lines tall", so the padding below never has to
+    // invent a second line the UI did not ask for.
+    rowDetails: rows.some((_, index) => (rowDetails[index] ?? "").length > 0)
+      ? rows.map((_, index) => rowDetails[index] ?? "")
+      : EMPTY_STRINGS,
     alertRowKeys,
     spanningRowKeys,
     selectableSpanningRowKeys: Array.from(selectableSpanningKeys),
   };
   if (Platform.OS === "windows") {
     // This React table is the only Windows table path.
-    return <WindowsTable columns={columns} rows={rows} selectedKey={selectedKey} stripedRows={stripedRows} compact={compact} followBottom={followBottom} scrollToRow={scrollToRow} framed={framed} sourceList={sourceList} rowSymbols={rowSymbols} rowSymbolColors={rowSymbolColors} rowImageNames={rowImageNames} disabledRowKeys={disabledRowKeys} secondaryCellKeys={secondaryCellKeys} selectableSpanningKeys={selectableSpanningKeys} onSelectionChange={onSelectionChange} onRowDoublePress={onRowDoublePress} alertRowKeys={alertRowKeys} style={[styles.table, style]} />;
+    return <WindowsTable columns={columns} rows={rows} selectedKey={selectedKey} stripedRows={stripedRows} compact={compact} followBottom={followBottom} scrollToRow={scrollToRow} framed={framed} sourceList={sourceList} rowSymbols={rowSymbols} rowSymbolColors={rowSymbolColors} rowImageNames={rowImageNames} disabledRowKeys={disabledRowKeys} secondaryCellKeys={secondaryCellKeys} rowDetails={rowDetails} selectableSpanningKeys={selectableSpanningKeys} onSelectionChange={onSelectionChange} onRowDoublePress={onRowDoublePress} alertRowKeys={alertRowKeys} style={[styles.table, style]} />;
   }
   if (Platform.OS === "macos") {
     return <AppKitTable {...nativeProps} cellHorizontalPadding={cellHorizontalPadding} firstColumnHorizontalPadding={firstColumnHorizontalPadding} preserveColumnWidths={preserveColumnWidths} scrollTrailingColumnOverflow={scrollTrailingColumnOverflow} onSelectionChange={(event) => onSelectionChange?.(event.nativeEvent.key, event.nativeEvent.index)} onRowDoublePress={(event) => onRowDoublePress?.(event.nativeEvent.key, event.nativeEvent.index)} style={[styles.table, style]} />;

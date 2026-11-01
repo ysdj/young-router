@@ -338,6 +338,13 @@ private enum NativeRelayOriginPolicy {
             // the wizard closes.
             open(route: "providers-models", title: parentTitle)
         }
+        if windowRoute == "image-context", settingsWindowKey() == nil,
+           let parentTitle = routeWindowTitle("runtime-settings") {
+            // The image-context window is opened from a runtime category, so a
+            // deep link or a menu action that arrives with no settings window
+            // open still has the workspace it belongs over.
+            open(route: "runtime-settings", title: parentTitle)
+        }
         if Self.settingsPaneRoutes.contains(windowRoute),
            let existingKey = settingsWindowKey(), existingKey != windowRoute,
            let existing = routeWindows[existingKey] {
@@ -380,12 +387,12 @@ private enum NativeRelayOriginPolicy {
             // the screen only when the user opens the document it edits.
             configureImmediatePresentation(window)
             withoutAnimations { window.orderOut(nil) }
-        } else if windowRoute == "provider-wizard" || windowRoute == "file-editor" {
-            // The wizard and the file editor are children of the workspace they
-            // open from: each is its own movable window with the rest of the
-            // app locked until it closes, exactly like the model chooser. A
-            // window that is already up is only brought forward, never given a
-            // second modal session.
+        } else if windowRoute == "provider-wizard" || windowRoute == "file-editor" || windowRoute == "image-context" {
+            // The wizard, the file editor, and the image-context window are
+            // children of the workspace they open from: each is its own movable
+            // window with the rest of the app locked until it closes, exactly
+            // like the model chooser. A window that is already up is only
+            // brought forward, never given a second modal session.
             if isChildPanel(window) {
                 NSApp.activate(ignoringOtherApps: true)
                 configureImmediatePresentation(window)
@@ -2780,6 +2787,14 @@ private enum NativeRelayOriginPolicy {
                 minSize: NSSize(width: 720, height: 420),
                 maxSize: nil
             )
+        case "image-context":
+            // A task list beside a grid of pictures: room for four cards, and
+            // wide enough for the longest explainer line at its own size.
+            return RouteWindowLayout(
+                contentSize: NSSize(width: 900, height: 620),
+                minSize: NSSize(width: 720, height: 480),
+                maxSize: nil
+            )
         default:
             return RouteWindowLayout(
                 contentSize: NSSize(width: 1052, height: 600),
@@ -2812,6 +2827,7 @@ private enum NativeRelayOriginPolicy {
         case "codex-settings", "claude-settings": return localized("routeCodexSettings", fallback: "External")
         case "runtime-settings": return localized("routeRuntimeSettings", fallback: "Runtime")
         case "data-management": return localized("routeDataManagement", fallback: "Data Management")
+        case "image-context": return localized("routeImageContext", fallback: "Image Context")
         case "logs": return localized("routeLogs", fallback: "Logs")
         default: return nil
         }
@@ -2829,6 +2845,10 @@ private enum NativeRelayOriginPolicy {
         case "home": return localized("routeHome", fallback: "Young Router")
         case "provider-wizard": return localized("routeProviderWizard", fallback: "Add Provider")
         case "file-editor": return localized("routeFileEditor", fallback: "Edit File")
+        // A route missing here cannot be opened at all: ``open(route:)`` bails
+        // out when the title is nil, which is why the image-context window was
+        // once invisible while its button, its layout, and its surface existed.
+        case "image-context": return localized("routeImageContext", fallback: "Image Context")
         default: return nil
         }
     }

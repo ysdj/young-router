@@ -32,7 +32,7 @@ std::wstring AllowedRoute(std::wstring route) {
   static constexpr std::wstring_view allowed[] = {
       L"home", L"providers-models", L"codex-settings", L"claude-settings",
       L"runtime-settings", L"data-management", L"provider-wizard",
-      L"logs"};
+      L"file-editor", L"image-context", L"logs"};
   return std::find(std::begin(allowed), std::end(allowed), route) == std::end(allowed)
       ? std::wstring{} : route;
 }
@@ -116,12 +116,19 @@ std::wstring RequestedChildRouteFromCommandLine() {
   for (int index = 1; index < count; ++index) {
     std::wstring value(arguments[index]);
     if (value.rfind(prefix, 0) == 0) {
-      route = RouteWithAllowedTab(value.substr(prefix.size()), {});
+      // Use the raw value and validate against the child routes below.  Running
+      // it through RouteWithAllowedTab first meant the settings-route whitelist
+      // also had to list "file-editor"; it did not, so the editor launch parsed
+      // as an empty route, fell into the primary-host branch, and started a
+      // second "main" process that blocked forever in
+      // AppInstance::FindOrRegisterForKey without ever creating a window.
+      route = value.substr(prefix.size());
       break;
     }
   }
   LocalFree(arguments);
-  return route == L"provider-wizard" || route == L"file-editor" ? route : std::wstring{};
+  return route == L"provider-wizard" || route == L"file-editor" || route == L"image-context"
+      ? route : std::wstring{};
 }
 
 std::wstring RequestedChildFileTargetFromCommandLine() {
@@ -194,6 +201,12 @@ struct CompReactPackageProvider
 namespace YoungRouter {
 
 std::wstring InitialChildRoute(HWND window) {
+  // A child runs in its own process, so the route table the in-process host
+  // filled is empty here: the route it must show came in on the command line and
+  // is the only answer.  Without it OpenRoute never ran, the leaf kept no active
+  // route, and the window fell back to the app name instead of naming the
+  // surface it holds.
+  if (g_child_process_mode && !g_child_process_route.empty()) return g_child_process_route;
   std::lock_guard<std::mutex> guard(g_child_lock);
   auto found = g_child_routes.find(window);
   return found == g_child_routes.end() ? std::wstring{} : found->second;
@@ -267,10 +280,10 @@ void RunReactChildHost(std::shared_ptr<ReactChildHostState> state) {
     }));
 
     auto app_window = child.AppWindow();
-    app_window.Title(state->route == L"provider-wizard" ? L"Add Provider" : L"Edit File");
+    app_window.Title(YoungRouter::WinUI3NativeLeaf::Shared()->RouteTitleFor(state->route));
     child_handle = winrt::Microsoft::UI::GetWindowFromWindowId(app_window.Id());
     const LONG content_width = state->route == L"provider-wizard" ? 620 : 900;
-    const LONG content_height = state->route == L"provider-wizard" ? 460 : 560;
+    const LONG content_height = state->route == L"provider-wizard" ? 460 : state->route == L"image-context" ? 620 : 560;
     const auto frame = FrameTrackSizeForContentDips(child_handle, content_width, content_height);
     app_window.Resize({frame.x, frame.y});
     {
@@ -306,7 +319,7 @@ void RunReactChildHost(std::shared_ptr<ReactChildHostState> state) {
 
 void OpenReactChildWindow(std::wstring_view route, std::wstring_view initial_file_target) {
   if (g_child_process_mode) return;
-  if (route != L"provider-wizard" && route != L"file-editor") return;
+  if (route != L"provider-wizard" && route != L"file-editor" && route != L"image-context") return;
   const auto parent = WinUI3NativeLeaf::Shared()->WindowHandle();
   if (parent == nullptr) return;
   {
@@ -360,6 +373,12 @@ _Use_decl_annotations_ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, PSTR 
   UINT32 packagePathLength = 0;
   const bool hasPackageIdentity =
       GetCurrentPackagePath(&packagePathLength, nullptr) == ERROR_INSUFFICIENT_BUFFER;
+  // A child host is started by the packaged app with the route it must show,
+  // and it always has package identity because the parent launches this same
+  // packaged executable.  Reading the route before the identity check keeps the
+  // hand-off below from swallowing a child launch: that path returns 0 without
+  // ever opening a window, so the editor and the wizard silently never appeared.
+  const auto requestedChildRoute = RequestedChildRouteFromCommandLine();
   if (!hasPackageIdentity) {
     // WinUI 3's packaged host requires Package Identity. A user may still
     // double-click the build-output EXE, so hand that launch to the installed
@@ -371,6 +390,8 @@ _Use_decl_annotations_ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, PSTR 
     auto result = reinterpret_cast<intptr_t>(ShellExecuteW(
         nullptr, L"open", L"explorer.exe", packaged_app, nullptr, SW_SHOWNORMAL));
     if (result <= 32) {
+      // This path has no package identity, so the leaf has no localized strings
+      // yet; the message names the app the way Windows does.
       MessageBoxW(nullptr, L"Install the Young Router MSIX package before launching this file.",
           L"Young Router", MB_ICONERROR | MB_OK);
     }
@@ -379,19 +400,27 @@ _Use_decl_annotations_ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, PSTR 
 
   // Initialize WinRT
   winrt::init_apartment(winrt::apartment_type::single_threaded);
-  const auto childRoute = RequestedChildRouteFromCommandLine();
+  const auto childRoute = requestedChildRoute;
   const bool childMode = !childRoute.empty();
   if (childMode) {
     g_child_process_mode = true;
     g_child_process_route = childRoute;
   }
 
+  // AppLifecycle is the desktop single-instance and activation router.  A child
+  // window is created by CreateProcessW from the primary host and must not join
+  // that router: AppInstance::GetCurrent() looks for the activation registration
+  // of the launching package and, called from a process the host spawned with a
+  // non-activation command line, it blocks forever inside the Windows App SDK.
+  // That hang happened before the window existed, so the editor child never
+  // appeared while the wizard child (launched the same way) did.  Only the
+  // primary host owns activation; a child reads its route from its command line.
   using winrt::Microsoft::Windows::AppLifecycle::AppInstance;
   winrt::Microsoft::Windows::AppLifecycle::AppActivationArguments activation{nullptr};
   AppInstance mainInstance{nullptr};
   winrt::event_token activationToken{};
-  activation = AppInstance::GetCurrent().GetActivatedEventArgs();
   if (!childMode) {
+    activation = AppInstance::GetCurrent().GetActivatedEventArgs();
     mainInstance = AppInstance::FindOrRegisterForKey(L"YoungRouter.Main");
     if (!mainInstance.IsCurrent()) {
       try {
@@ -406,7 +435,6 @@ _Use_decl_annotations_ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, PSTR 
       YoungRouter::WinUI3NativeLeaf::Shared()->DispatchAction("open-" + winrt::to_string(route));
     });
   }
-
   // Enable per monitor DPI scaling
   SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
@@ -456,8 +484,11 @@ _Use_decl_annotations_ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, PSTR 
 
   // Get the AppWindow so we can configure its initial title and size
   auto appWindow{reactNativeWin32App.AppWindow()};
-  appWindow.Title(childMode && childRoute == L"provider-wizard" ? L"Add Provider"
-      : childMode && childRoute == L"file-editor" ? L"Edit File" : L"Young Router");
+  // A child window is titled by its route, in the user's language: the same
+  // strings that title the parent's tray menu name these two surfaces.
+  appWindow.Title(childMode
+      ? YoungRouter::WinUI3NativeLeaf::Shared()->RouteTitleFor(childRoute)
+      : YoungRouter::WinUI3NativeLeaf::Shared()->LocalizedFor("appTitle", L"Young Router"));
   // The React root is created by this host, so the leaf's window handle is
   // known here: ``GetActiveWindow`` answers nothing during module
   // initialization, which left every OpenRoute call with a null HWND and the
@@ -483,7 +514,7 @@ _Use_decl_annotations_ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, PSTR 
   // 1120x680 start, then OpenRoute's 960x660 DIP) left the composition root
   // at the smaller size and the window painted the rest as empty background.
   const auto initialContentWidth = childMode && childRoute == L"provider-wizard" ? 620 : childMode ? 900 : 960;
-  const auto initialContentHeight = childMode && childRoute == L"provider-wizard" ? 460 : childMode ? 560 : 660;
+  const auto initialContentHeight = childMode && childRoute == L"provider-wizard" ? 460 : childMode && childRoute == L"image-context" ? 620 : childMode ? 560 : 660;
   // Keep the parent settings-shell geometry explicit; child windows use their
   // own content dimensions below.
   const auto initialFrame = childMode
@@ -532,13 +563,20 @@ _Use_decl_annotations_ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, PSTR 
   reactNativeWin32App.Start();
   if (!childMode) mainInstance.Activated(activationToken);
   } catch (winrt::hresult_error const& error) {
-    MessageBoxW(nullptr, error.message().c_str(), L"Young Router startup failure", MB_ICONERROR | MB_OK);
+    auto const& leaf = *YoungRouter::WinUI3NativeLeaf::Shared();
+    MessageBoxW(nullptr, error.message().c_str(),
+        leaf.LocalizedFor("startupFailure", L"Young Router startup failure").c_str(), MB_ICONERROR | MB_OK);
     return static_cast<int>(error.code().value);
   } catch (std::exception const& error) {
-    MessageBoxA(nullptr, error.what(), "Young Router startup failure", MB_ICONERROR | MB_OK);
+    auto const& leaf = *YoungRouter::WinUI3NativeLeaf::Shared();
+    auto const message = winrt::to_hstring(error.what());
+    MessageBoxW(nullptr, message.c_str(),
+        leaf.LocalizedFor("startupFailure", L"Young Router startup failure").c_str(), MB_ICONERROR | MB_OK);
     return -1;
   } catch (...) {
-    MessageBoxW(nullptr, L"Unknown startup failure", L"Young Router startup failure", MB_ICONERROR | MB_OK);
+    auto const& leaf = *YoungRouter::WinUI3NativeLeaf::Shared();
+    MessageBoxW(nullptr, leaf.LocalizedFor("startupUnknownFailure", L"Unknown startup failure").c_str(),
+        leaf.LocalizedFor("startupFailure", L"Young Router startup failure").c_str(), MB_ICONERROR | MB_OK);
     return -1;
   }
   return 0;

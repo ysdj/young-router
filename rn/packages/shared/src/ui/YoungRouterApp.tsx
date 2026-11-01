@@ -102,6 +102,14 @@ const SERVICE_STARTUP_RETRY_DELAYS_MS = [0, 5_000, 20_000, 60_000];
 // pane stating "启动中" forever. It costs one loopback read every interval and
 // only while the state is transitional.
 const SERVICE_STATE_RECONCILE_MS = 1_000;
+// How often a window re-reads Core while it is drawing a *settled* service
+// state.  A running answer is the one claim nothing local can check: a Core can
+// be replaced -- or die -- with no request in flight, and a window that only
+// re-reads while it draws a transition then keeps stating 运行中 with the port
+// beside it while nothing is listening, until the user happens to act.  It is
+// the slow interval because this is the quiet case; the transitional one is
+// above.
+const SERVICE_RUNNING_RECONCILE_MS = 15_000;
 const CORE_SNAPSHOT_RETRY_DELAYS_MS = [250, 500, 1_000, 2_000, 4_000, 8_000, 15_000] as const;
 type EditableDiskDomain = "codex" | "claude" | "clients" | "providers_models" | "runtime" | "webdav";
 type RawEditorConflictResolution = "reload" | "keep";
@@ -1541,6 +1549,23 @@ function formatMenuTimestamp(value: string): string {
  * carries its date, because a sync that last landed weeks ago must not read
  * like one that just ran.
  */
+/**
+ * A rail row's date and time.  Always both: a rail is a history, and "15:38"
+ * alone cannot say whether that was this afternoon or last Tuesday, which is
+ * exactly the question a list of turns has to answer.
+ */
+function formatRailStamp(value: string): string {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return value;
+  return new Intl.DateTimeFormat(undefined, {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(parsed);
+}
+
 function formatActionTimestamp(value: string): string {
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime())) return value;
@@ -1579,6 +1604,9 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
   // never re-runs it.
   const launchPresented = useRef(false);
   const acceptedSnapshotRevision = useRef<number>(initialSnapshot?.revision ?? -1);
+  // The newest snapshot this host accepted, readable from a callback that must
+  // keep its identity: see ``runServiceOperation``.
+  const latestSnapshot = useRef<CoreSnapshot | undefined>(initialSnapshot);
 
   const recordMenuAction = useCallback(async (action: string): Promise<void> => {
     try {
@@ -1595,6 +1623,7 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
     // useful for live log projections, so only discard stale responses.
     if (next.revision < acceptedSnapshotRevision.current) return;
     acceptedSnapshotRevision.current = next.revision;
+    latestSnapshot.current = next;
     setSnapshot(next);
     setError(undefined);
     if (isPrimaryHost) {
@@ -1611,8 +1640,15 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
   const runServiceOperation = useCallback((operation: ServiceOperation): Promise<CoreSnapshot | undefined> => {
     if (operation === "stop") serviceShouldBeRunning.current = false;
     if (operation === "start" || operation === "restart") serviceShouldBeRunning.current = true;
-    if (snapshot && (operation === "start" || operation === "restart" || operation === "reload")) {
-      receiveSnapshot({ ...snapshot, service: { ...snapshot.service, state: "starting" } });
+    // The latest snapshot, read through a ref instead of the closure: this
+    // callback's identity is what the launch-start effect below keys on, and
+    // taking ``snapshot`` as a dependency gave it a new identity on every
+    // snapshot.  That effect then re-ran on each poll instead of on each
+    // *state change*, spending its whole retry budget (0/5/20/60 s) in the
+    // first second and leaving a stopped router with no attempt left.
+    const current = latestSnapshot.current;
+    if (current && (operation === "start" || operation === "restart" || operation === "reload")) {
+      receiveSnapshot({ ...current, service: { ...current.service, state: "starting" } });
     }
     setServiceOperationPendingCount((count) => count + 1);
     const queued = serviceOperationQueue.current.catch(() => undefined).then(async () => {
@@ -1636,12 +1672,15 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
     serviceOperationQueue.current = queued.then(() => undefined, () => undefined);
     void queued.finally(() => setServiceOperationPendingCount((count) => Math.max(0, count - 1)));
     return queued;
-  }, [hostTranslate, ipc, native, receiveSnapshot, refreshSnapshot, snapshot]);
+  }, [hostTranslate, ipc, native, receiveSnapshot, refreshSnapshot]);
 
   useEffect(() => {
-    if (!isPrimaryHost) return;
+    // A child window draws its own localized chrome -- its title and its own
+    // dialogs -- so it needs the same table the primary host sends.  Sending it
+    // only from the primary host left every child window titled in English
+    // ("Add Provider", "Edit File") beside a fully translated pane.
     native.setLocalization({
-      appTitle: translate("app.title"), about: translate("status.about"), autoStart: translate("status.autoStart"), codexModelCatalog: translate("status.codexModelCatalog"), serviceUnavailable: translate("error.coreUnavailable"),
+      appTitle: translate("app.title"), startupFailure: translate("error.startupFailure"), startupUnknownFailure: translate("error.startupUnknownFailure"), about: translate("status.about"), autoStart: translate("status.autoStart"), codexModelCatalog: translate("status.codexModelCatalog"), serviceUnavailable: translate("error.coreUnavailable"),
       serviceStatus: translate("service.status", { status: "{status}" }),
       serviceStarting: translate("service.starting"), serviceRunning: translate("service.running"),
       serviceRunningOnPort: translate("service.runningOnPort", { port: "{port}" }),
@@ -1659,7 +1698,7 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
       routeGeneralSettings: translate("status.general"),
       routeCodexSettings: translate("status.codex"), routeClaudeSettings: translate("card.claudeSettings"),
       routeRuntimeSettings: translate("card.runtimeSettings"),
-      routeDataManagement: translate("card.dataManagement"), routeProviderWizard: translate("providers.wizard.title"), routeFileEditor: translate("settings.editFile"), routeLogs: translate("card.logs"),
+      routeDataManagement: translate("card.dataManagement"), routeProviderWizard: translate("providers.wizard.title"), routeFileEditor: translate("settings.editFile"), routeImageContext: translate("status.imageContext"), routeLogs: translate("card.logs"),
       providerAuthInstruction: translate("relay.officialProviderWebViewHint"),
       providerAuthBlocked: translate("relay.officialProviderAuthBlocked"),
       logOriginal: translate("logs.originalRecord"),
@@ -1767,6 +1806,25 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
     const timer = setInterval(() => { void refreshSnapshot().catch(() => undefined); }, SERVICE_STATE_RECONCILE_MS);
     return () => clearInterval(timer);
   }, [refreshSnapshot, snapshot?.revision, snapshot?.service.state]);
+
+  useEffect(() => {
+    // The mirror of the effect above: 运行中 is a claim about a process nobody
+    // in this window can see either.  A Core replaced under an idle app -- or
+    // one that died -- leaves the last snapshot standing, and every surface
+    // that draws the 服务 row then states 运行中 (端口 12390) over a port
+    // nothing answers on.  Re-read slowly, and accept an unchanged revision:
+    // a replacement Core restores its revision from the same record, so the
+    // state is exactly the part of the answer that can move without it.
+    if (snapshot?.service.state !== "running") return;
+    const observed = snapshot.service.state;
+    const timer = setInterval(() => {
+      void ipc.snapshot().then((next) => {
+        if (next.revision === acceptedSnapshotRevision.current && next.service.state === observed) return;
+        receiveSnapshot(next);
+      }).catch(() => undefined);
+    }, SERVICE_RUNNING_RECONCILE_MS);
+    return () => clearInterval(timer);
+  }, [ipc, receiveSnapshot, snapshot?.service.state]);
 
   useEffect(() => {
     if (!isPrimaryHost || !snapshot || !serviceShouldBeRunning.current) return;
@@ -2123,8 +2181,12 @@ function SettingsShell({ route, windowRoute, snapshot, ipc, native, translate, l
  * selection capsule keeps the platform's inset on both ends — the same rhythm
  * the sidebar's own rows are drawn with.
  */
-const SETTINGS_RAIL_WIDTH = 156;
-const SETTINGS_RAIL_COLUMN_WIDTH = 148;
+// The rail is a real column of the pane, and its rows now name a task and date
+// it on a second line: 156 pt held a timestamp but cut the name of every thread
+// in half.  It matches the settings sidebar's own width, so the window reads as
+// two columns of one size rather than as a sidebar and a strip beside it.
+const SETTINGS_RAIL_WIDTH = 200;
+const SETTINGS_RAIL_COLUMN_WIDTH = 192;
 // The sidebar and the rail draw one icon-plus-name column.  These arrays are
 // module constants so a settings re-render hands `NativeTable` the same column
 // list: an inline literal was a new array every time, which re-mounted every
@@ -2151,10 +2213,18 @@ const SETTINGS_FIELD_HELP_INDENT = SETTINGS_FIELD_LEAD + SETTINGS_FIELD_LABEL_WI
 /** The one content inset every settings pane body starts from. */
 const SETTINGS_PANE_INSET = 14;
 
-function SettingsRail({ rows, selectedKey, onSelectionChange }: {
+function SettingsRail({ rows, selectedKey, onSelectionChange, details, style }: {
   rows: { key: string; cells: string[] }[];
   selectedKey: string;
   onSelectionChange: (key: string) => void;
+  /**
+   * One optional second line per row, printed small under the row's name.  The
+   * rail is one line tall unless the caller has something to put there, which
+   * is why the list, not the pane, decides the row height.
+   */
+  details?: string[];
+  /** The caller's own column slot: a rail under a search field fills what is left. */
+  style?: StyleProp<ViewStyle>;
 }): React.JSX.Element {
   // The rail draws its one divider and the list inside it draws no box: the
   // rail is a column of the pane, not a list floating in content, so a frame's
@@ -2162,7 +2232,7 @@ function SettingsRail({ rows, selectedKey, onSelectionChange }: {
   // divider that already states where the column ends.  A source list carries
   // its own selection capsule and row rhythm, which is what tells the rows
   // apart; the rail's single right divider is its only rule.
-  return <View style={[styles.settingsRail, Platform.OS === "windows" && styles.settingsRailWindows]}>
+  return <View style={[styles.settingsRail, Platform.OS === "windows" && styles.settingsRailWindows, style]}>
     <NativeTable
       columns={SETTINGS_RAIL_COLUMNS}
       rows={rows}
@@ -2170,6 +2240,7 @@ function SettingsRail({ rows, selectedKey, onSelectionChange }: {
       striped={false}
       compact
       sourceList
+      rowDetails={details}
       framed={false}
       cellHorizontalPadding={8}
       firstColumnHorizontalPadding={8}
@@ -3166,6 +3237,13 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
       closeRoute();
       return;
     }
+    // The image-context window is a native child window too, but it keeps no
+    // staged draft: the shared pane applies every tick as it changes, so its
+    // window closes without a discard question.
+    if (route === "image-context") {
+      closeRoute();
+      return;
+    }
     const restoreWindow = (): void => {
       const windowRoute = canonicalWindowRoute(route);
       native.window.open(windowRoute);
@@ -3377,11 +3455,12 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
   }, [route]);
 
   return <TranslationContext.Provider value={settingsRoute ? translate : undefined}><PendingFieldContext.Provider value={fieldRegistry}><View style={[styles.windowSurface, shell && Platform.OS === "windows" && styles.windowSurfaceShellWindows]}>
-    {!shell && route !== "providers-models" && route !== "logs" && route !== "provider-wizard" && route !== "data-management" ? <WindowTitle title={windowTitle} /> : null}
-    {route === "providers-models" || route === "provider-wizard" || route === "file-editor" || settingsRoute || route === "logs" || route === "runtime-settings" || route === "data-management" || route === "general-settings" ? <View style={[styles.windowContent, compactStyles.windowContent, styles.windowContentFixed, route === "file-editor" && styles.fileEditorRouteContent, route === "providers-models" && styles.providersContent, route === "provider-wizard" && styles.providerWizardRouteContent, settingsRoute && styles.assistantSettingsContent, route === "logs" && styles.logsContent, route === "runtime-settings" && styles.runtimeContent, route === "data-management" && styles.dataManagementContent]}>
+    {!shell && route !== "providers-models" && route !== "logs" && route !== "provider-wizard" && route !== "file-editor" && route !== "image-context" && route !== "data-management" ? <WindowTitle title={windowTitle} /> : null}
+    {route === "providers-models" || route === "provider-wizard" || route === "image-context" || route === "file-editor" || settingsRoute || route === "logs" || route === "runtime-settings" || route === "data-management" || route === "general-settings" ? <View style={[styles.windowContent, compactStyles.windowContent, styles.windowContentFixed, route === "file-editor" && styles.fileEditorRouteContent, route === "providers-models" && styles.providersContent, route === "provider-wizard" && styles.providerWizardRouteContent, route === "image-context" && styles.imageContextRouteContent, settingsRoute && styles.assistantSettingsContent, route === "logs" && styles.logsContent, route === "runtime-settings" && styles.runtimeContent, route === "data-management" && styles.dataManagementContent]}>
     {route === "providers-models" ? <ProviderWorkspace snapshot={snapshot} ipc={ipc} onSnapshot={onSnapshot} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onStatus={setResult} onSecretState={onSecretState} applyProbedSurface={applyProbedSurface} onOpenWizard={() => { if (Platform.OS === "windows") { native.window.open("provider-wizard"); } else { onNavigate("provider-wizard"); native.window.open("provider-wizard"); } }} relay={relayBridge} addOfficialAccount={addOfficialAccount} /> : null}
     {route === "file-editor" ? <FileEditorWorkspace file={inlineEditorFile} fileId={fileIdRequest} nativeAction={nativeAction} ipc={ipc} native={native} translate={translate} busy={busy} onEditorConflict={resolveRawEditorConflict} reloadToken={settingsRawReloadToken} baselineToken={settingsRawBaselineToken} syncRevision={snapshot?.revision} onFlushPendingFields={flushPendingFields} onClose={closeRoute} /> : null}
     {route === "provider-wizard" ? <ProviderSetupWizard snapshot={snapshot} native={native} providers={providerWizardProviders} relaySources={providerWizardRelaySources} relayStations={providerWizardRelayStations} busy={busy} translate={translate} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onStatus={setResult} onClose={closeRoute} onKeyToken={registerProviderWizardKeyToken} relay={relayBridge} addOfficialAccount={addOfficialAccount} status={result} /> : null}
+    {route === "image-context" ? <ImageContextWorkspace snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} ipc={ipc} native={native} /> : null}
     {settingsRoute ? <AssistantSettingsWorkspace busy={busy} native={native} codexModels={codexModelRows} codexModelCatalogEnabled={codexModelCatalogEnabled} standaloneSearch={codexStandaloneSearch} onToggleStandaloneSearch={(enabled) => dispatch("codex.search.set", { enabled }, "codex")} codexFeatures={(domainState(snapshot, "codex").structured as UnknownRecord | undefined)?.features as UnknownRecord | undefined} clientProvider={codexClientProvider} clientModel={codexClientModel} localApiActive={codexUsesLocalApi} onToggleCodexModelCatalog={(enabled) => dispatch("codex.model_catalog.set", { enabled }, "codex")} onToggleCodexFeature={(feature, enabled) => dispatch("codex.feature.set", { feature, enabled }, "codex")} onUseLocalApi={(selection) => dispatch("use_local_api", selection, "codex")} onUseSavedModel={(selection) => dispatch("use_saved_model", selection, "codex")} translate={translate} ipc={ipc} filesToken={settingsRawBaselineToken} onOpenFile={openAssistantFile} /> : null}
     {route === "logs" ? <LogsWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} translate={translate} dispatch={dispatch} onStatus={setResult} onStatusBar={setStatusBarControls} requestedTab={nativeAction?.id === "open-recovery" ? "recovery" : logTabRequest} requestedTabKey={nativeAction?.sequence ?? 0} /> : null}
     {route === "general-settings" ? <GeneralWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} dispatch={dispatch} dispatchServiceAction={enqueueServiceDispatch} translate={translate} onStatus={setResult} onSnapshot={onSnapshot} /> : null}
@@ -8448,6 +8527,11 @@ function FileEditorWorkspace({ file, fileId, nativeAction, ipc, native, translat
   const [saving, setSaving] = useState(false);
   // This child window states its own save result beside its footer buttons.
   const [footerStatus, setFooterStatus] = useState<string>();
+  // A Windows editor window is its own process, and a native confirmation owned
+  // by it never appeared above it: the request stayed pending and the window
+  // could not be closed at all. Windows asks in this surface's own footer
+  // instead; macOS keeps its sheet, which is modal to the window by design.
+  const [confirmingDiscard, setConfirmingDiscard] = useState(false);
   const readHostTarget = useCallback((): ClientFile | undefined => (
     editorTargetFromPayload(native.pendingFileEditorTarget?.())
     ?? editorTargetFromPayload(fileId)
@@ -8499,7 +8583,12 @@ function FileEditorWorkspace({ file, fileId, nativeAction, ipc, native, translat
   };
   // Close owns the last word on an unsaved draft: warn once, then discard it.
   const close = (): void => {
-    if (saving || busy) return;
+    // This window's own actions are the only thing that may block its exit. A
+    // host-wide busy flag describes Core work elsewhere -- a service apply, a
+    // provider probe -- and gating here left the editor window with a live
+    // looking Close button that returned immediately, so it could not be closed
+    // at all while that flag was stuck.
+    if (saving) return;
     if (target === undefined) {
       closeWindow();
       return;
@@ -8518,6 +8607,10 @@ function FileEditorWorkspace({ file, fileId, nativeAction, ipc, native, translat
         return;
       }
       if (current !== undefined) {
+        if (Platform.OS === "windows") {
+          setConfirmingDiscard(true);
+          return;
+        }
         const confirmed = await native.showConfirmation({
           title: translate("settings.discardDraftTitle"),
           message: translate("settings.discardDraftBody"),
@@ -8526,16 +8619,32 @@ function FileEditorWorkspace({ file, fileId, nativeAction, ipc, native, translat
         });
         if (!confirmed) return;
       }
-      // Core owns the staged document, so an explicit cancel is what makes
-      // Close mean "throw the edits away" instead of leaving them staged for
-      // the next open.
+      await discardDraft(current);
+    })();
+  };
+  // Core owns the staged document, so an explicit cancel is what makes Close
+  // mean "throw the edits away" instead of leaving them staged for the next
+  // open.
+  const discardDraft = async (current: CoreSnapshot | undefined): Promise<void> => {
+    if (!target) return;
+    setConfirmingDiscard(false);
+    try {
+      await ipc.dispatch({ domain: target.domain, type: "cancel", payload: {} }, current?.revision);
+    } catch {
+      // The user already chose to discard and the window is going away; Core
+      // reconciles the draft on the next open instead of blocking the close.
+    }
+    closeWindow();
+  };
+  const discardConfirmed = (): void => {
+    void (async () => {
+      let current: CoreSnapshot | undefined;
       try {
-        await ipc.dispatch({ domain: target.domain, type: "cancel", payload: {} }, current?.revision);
+        current = await ipc.snapshot();
       } catch {
-        // The user already chose to discard and the window is going away; Core
-        // reconciles the draft on the next open instead of blocking the close.
+        current = undefined;
       }
-      closeWindow();
+      await discardDraft(current);
     })();
   };
   const save = (): void => {
@@ -8560,8 +8669,7 @@ function FileEditorWorkspace({ file, fileId, nativeAction, ipc, native, translat
       setFooterStatus(translate("common.saved"));
     })().then(closeWindow).catch((reason: unknown) => {
       setFooterStatus(errorMessage(reason, translate));
-      setSaving(false);
-    });
+    }).finally(() => setSaving(false));
   };
   return <View style={assistantFileSurfaceStyles.editorRoute}>
     <View style={assistantFileSurfaceStyles.editorHeader}>
@@ -8577,10 +8685,17 @@ function FileEditorWorkspace({ file, fileId, nativeAction, ipc, native, translat
     <View style={assistantFileSurfaceStyles.editorFooter}>
       {/* The child states its own result beside its buttons; the buttons keep
           their trailing edge, so a message never moves them. */}
-      <Text numberOfLines={1} style={assistantFileSurfaceStyles.editorFooterStatus}>{footerStatus ?? ""}</Text>
+      <Text numberOfLines={1} style={assistantFileSurfaceStyles.editorFooterStatus}>{confirmingDiscard ? translate("settings.discardDraftTitle") : footerStatus ?? ""}</Text>
       <View style={assistantFileSurfaceStyles.editorFooterActions}>
-        <ActionButton title={translate("status.close")} disabled={busy || saving} onPress={close} />
-        <ActionButton primary title={translate("status.saveAndClose")} busy={saving} disabled={(busy && !saving) || target === undefined} onPress={save} />
+        {confirmingDiscard
+          ? <>
+            <ActionButton title={translate("status.cancel")} disabled={saving} onPress={() => setConfirmingDiscard(false)} />
+            <ActionButton primary danger title={translate("common.discard")} disabled={saving} onPress={discardConfirmed} />
+          </>
+          : <>
+            <ActionButton title={translate("status.close")} disabled={saving} onPress={close} />
+            <ActionButton primary title={translate("status.saveAndClose")} busy={saving} disabled={saving || target === undefined} onPress={save} />
+          </>}
       </View>
     </View>
   </View>;
@@ -9172,13 +9287,15 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
   </PersistentScrollView>;
 }
 
-/** The runtime category whose surface is the image-context panel. */
+/** The runtime category whose line opens the image-context window. */
 const IMAGE_CONTEXT_CATEGORY = "Codex Images";
 // Cards load their own picture, so only a handful are worth fetching: enough to
-// recognise a conversation by, and small enough that opening the pane stays
+// recognise a conversation by, and small enough that opening the window stays
 // instant.  Anything bigger than a card can show opens in the preview.
-const THUMBNAIL_LIMIT = 6;
-const THUMBNAIL_MAX_BYTES = 1_500_000;
+// How many thumbnails the panel asks for at once.  A task can hold seventy
+// images, and asking for all of them in one burst made Core refuse a share of
+// the answers, which the grid then reported as unreadable pictures.
+const THUMBNAIL_CONCURRENCY = 3;
 
 function RuntimeWorkspace({ snapshot, busy, translate, dispatch, onSecretState, clearSecret, native, ipc, onStatus }: { snapshot?: CoreSnapshot; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; clearSecret: NativeSecretClear; native: NativeLeafAdapter; ipc: IpcClient; onStatus: (status?: string) => void }): React.JSX.Element {
   const state = domainState(snapshot, "runtime");
@@ -9193,9 +9310,6 @@ function RuntimeWorkspace({ snapshot, busy, translate, dispatch, onSecretState, 
   // category's settings, so the whole domain stays navigable without one
   // continuous scroll whose position has to drive the selection back.
   const [activeCategory, setActiveCategory] = useState("");
-  // The task list is a surface of its own: it grows with the conversations the
-  // pass has seen, so it opens over the pane instead of lengthening it.
-  const [imageContextOpen, setImageContextOpen] = useState(false);
   const selectedCategory = categories.includes(activeCategory) ? activeCategory : (categories[0] ?? "");
   const tocRows = useMemo(() => categories.map((name) => ({ key: name, cells: [runtimeCategoryLabel(name, translate)] })), [categories, translate]);
   const dshSyncToken = DSH_VISION_ROUTER_QUICK_KEYS.map((key) => `${key}:${stringValue(settings.find((item) => identifier(item) === key)?.value)}`).join("|");
@@ -9214,30 +9328,40 @@ function RuntimeWorkspace({ snapshot, busy, translate, dispatch, onSecretState, 
             the new category instead of inheriting the previous scroll offset. */}
         <PersistentScrollView key={selectedCategory} style={styles.runtimeScrollSurface} contentContainerStyle={styles.runtimeWorkspace}>
           {selectedCategory === "" ? <EmptyState translate={translate} /> : <View style={styles.runtimeFieldList}>{(groups[selectedCategory] ?? []).map((item) => <RuntimeField key={identifier(item)} item={item} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} clearSecret={clearSecret} dshSyncToken={dshSyncToken} native={native} onStatus={onStatus} />)}
-            {selectedCategory === IMAGE_CONTEXT_CATEGORY ? <ImageContextWindowLink snapshot={snapshot} busy={busy} translate={translate} onOpen={() => setImageContextOpen(true)} /> : null}
+            {selectedCategory === IMAGE_CONTEXT_CATEGORY ? <ImageContextWindowLink snapshot={snapshot} busy={busy} translate={translate} onOpen={() => openImageContextWindow(native)} /> : null}
           </View>}
         </PersistentScrollView>
       </View>
     </View>
-    {imageContextOpen ? <ImageContextPanel snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} ipc={ipc} onClose={() => setImageContextOpen(false)} /> : null}
   </View>;
+}
+
+/**
+ * The task list is a child window, the way 添加向导 and the raw file editor are:
+ * its own movable titled window over the settings window, which stays locked
+ * until it closes.  Every host suspends drawing here and resumes in that
+ * window, so no pane ever draws the list itself — an in-pane overlay is not a
+ * child surface and is not an option for one.
+ */
+function openImageContextWindow(native: NativeLeafAdapter): void {
+  native.window.open("image-context");
+  native.window.focus("image-context");
 }
 
 /**
  * A task's images, and which of them go out with its next turn.
  *
- * The pass decides that from one file per task; this panel is how a person sees
- * and changes that file without leaving the app. It reads the replay the fetch
- * tool answers from -- so every thumbnail is the image the model would receive --
- * and writes the same selection Context Attachment Manager writes, which is why
- * a task curated in either place behaves the same.
- */
-/**
- * The image-context window: one task at a time, chosen from a list that can be
- * searched, because a task per conversation grows without bound and a settings
- * pane is the wrong shape for that.  The window keeps the pass's own bookkeeping
- * visible — what is sent next turn, and which images are held back — and lets a
- * person override any single image.
+ * The pass decides that from one file per task; this window is how a person
+ * sees and changes that file without leaving the app.  It reads the replay the
+ * fetch tool answers from -- so every thumbnail is the image the model would
+ * receive -- and writes the same selection Context Attachment Manager writes,
+ * which is why a task curated in either place behaves the same.
+ *
+ * One task at a time, chosen from a list that can be searched, because a task
+ * per conversation grows without bound and a settings pane is the wrong shape
+ * for that.  The window keeps the pass's own bookkeeping visible — what is sent
+ * next turn, and which images are held back — and lets a person override any
+ * single image.
  */
 /** The line the runtime pane keeps: what the pass is doing, and a way in. */
 function ImageContextWindowLink({ snapshot, busy, translate, onOpen }: { snapshot?: CoreSnapshot; busy: boolean; translate: Translate; onOpen: () => void }): React.JSX.Element {
@@ -9256,7 +9380,7 @@ function ImageContextWindowLink({ snapshot, busy, translate, onOpen }: { snapsho
   </View>;
 }
 
-function ImageContextPanel({ snapshot, busy, translate, dispatch, ipc, onClose }: { snapshot?: CoreSnapshot; busy: boolean; translate: Translate; dispatch: Dispatch; ipc: IpcClient; onClose: () => void }): React.JSX.Element {
+function ImageContextWorkspace({ snapshot, busy, translate, dispatch, ipc, native }: { snapshot?: CoreSnapshot; busy: boolean; translate: Translate; dispatch: Dispatch; ipc: IpcClient; native: NativeLeafAdapter }): React.JSX.Element {
   const state = domainState(snapshot, "image_context");
   const tasks = asRecords(state.tasks);
   const environment = asRecord(state.environment);
@@ -9265,38 +9389,94 @@ function ImageContextPanel({ snapshot, busy, translate, dispatch, ipc, onClose }
   const selectedTaskId = stringValue(asRecord(task.task).id);
   const [query, setQuery] = useState("");
   const [pictures, setPictures] = useState<Record<string, string | null>>({});
-  const [preview, setPreview] = useState<{ id: string; dataUrl: string | null } | undefined>(undefined);
+  const [helpOpen, setHelpOpen] = useState(false);
+  // 查看大图 shows the picture in this window's own detail column rather than
+  // in a floating card over it: the column is what the window is about, and an
+  // overlay here was a self-made dialog that the window behind it could not
+  // lock, could not be dragged, and covered the rows it belonged to.
+  const [fullSize, setFullSize] = useState<{ id: string; dataUrl: string | null; downscaled: boolean } | undefined>(undefined);
+  // Keyed by the task, never by the snapshot's revision: every Core change
+  // publishes a new revision, and resetting here closed the enlarged image (and
+  // re-fetched every thumbnail) on each one.
   useEffect(() => {
     setPictures({});
-    setPreview(undefined);
-  }, [selectedTaskId, snapshot?.revision]);
+    setFullSize(undefined);
+  }, [selectedTaskId]);
+  // The search covers what the rows show: the thread's name as Codex states
+  // it, the id for a task the index does not name, and the clock.
   const visibleTasks = query.trim()
-    ? tasks.filter((entry) => stringValue(entry.id).toLowerCase().includes(query.trim().toLowerCase()) || stringValue(entry.updated_at).includes(query.trim()))
+    ? tasks.filter((entry) => [stringValue(entry.title), stringValue(entry.id), formatRailStamp(stringValue(entry.updated_at))]
+      .some((value) => value.toLowerCase().includes(query.trim().toLowerCase())))
     : tasks;
   // A card shows the picture itself: a list of ids asked the reader to imagine
-  // what the window is about.  Only the newest few are loaded, and anything
-  // larger than a card can show opens in the preview instead.
+  // what the window is about.  Every card is asked for, because a card that
+  // waits for a click is a card that says "loading" until then -- but each one
+  // asks for a thumbnail (Core scales it to a card's size), so a task of seventy
+  // images costs a couple of megabytes rather than a hundred.
+  // The dependency is the set of ids, not the array: `asRecords` answers a new
+  // array on every render, and an effect keyed on that cancelled itself before
+  // any picture arrived.  The pictures map is read through a ref for the same
+  // reason -- as a dependency it re-ran the effect on every arrival and threw
+  // away the answers still in flight.
+  const asked = useRef<Record<string, true>>({});
+  const picturesRef = useRef(pictures);
+  picturesRef.current = pictures;
+  // A live task appends images while the grid is filling, so this effect runs
+  // again every few seconds.  An answer that arrives after it re-ran is still
+  // the answer for this task, so the only thing worth cancelling is a task the
+  // reader left -- cancelling per run threw away reads that had already been
+  // paid for and left half the cards blank.
+  const openTaskRef = useRef(selectedTaskId);
+  openTaskRef.current = selectedTaskId;
+  const imageIds = images.map((image) => stringValue(image.id)).filter(Boolean).join(",");
   useEffect(() => {
-    if (!selectedTaskId) return;
-    let cancelled = false;
-    for (const image of images.slice(0, THUMBNAIL_LIMIT)) {
-      const id = stringValue(image.id);
-      if (!id || pictures[id] !== undefined) continue;
-      void ipc.imageContextImage(selectedTaskId, id).then(
-        (answer) => { if (!cancelled) setPictures((current) => ({ ...current, [id]: stringValue(answer.data_url) || null })); },
-        () => { if (!cancelled) setPictures((current) => ({ ...current, [id]: null })); },
-      );
-    }
-    return () => { cancelled = true; };
-  }, [ipc, selectedTaskId, images, pictures]);
+    if (!selectedTaskId || !imageIds) return;
+    const task = selectedTaskId;
+    const pending = imageIds.split(",").filter((id) => picturesRef.current[id] === undefined && !asked.current[`${task}:${id}`]);
+    if (pending.length === 0) return;
+    const load = async (id: string): Promise<void> => {
+      const key = `${task}:${id}`;
+      if (asked.current[key]) return;
+      asked.current[key] = true;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          const answer = await ipc.imageContextImage(task, id, true);
+          if (openTaskRef.current !== task) return;
+          setPictures((current) => ({ ...current, [id]: stringValue(answer.data_url) || null }));
+          return;
+        } catch {
+          if (attempt === 0) continue;
+          // A read that failed twice is stated as failed, and the id is left
+          // unasked so the next render retries it instead of keeping the
+          // verdict forever.
+          delete asked.current[key];
+          if (openTaskRef.current !== task) return;
+          setPictures((current) => ({ ...current, [id]: null }));
+        }
+      }
+    };
+    void (async () => {
+      // Three at a time, in order: the newest pictures arrive first, and Core
+      // never sees a burst it answers by refusing.
+      for (let index = 0; index < pending.length; index += THUMBNAIL_CONCURRENCY) {
+        if (openTaskRef.current !== task) return;
+        await Promise.all(pending.slice(index, index + THUMBNAIL_CONCURRENCY).map(load));
+      }
+    })();
+  }, [ipc, selectedTaskId, imageIds]);
+  // The task's own switch lives in Context Attachment Manager's panel, not
+  // here: this window reads it, because it is what a tick means for its images.
   const automatic = booleanValue(task.auto);
   const sent = numberValue(asRecord(task.next).sent, 0);
   const omitted = numberValue(asRecord(task.next).omitted, 0);
   const fetchKind = stringValue(environment.fetch_kind);
   const openPreview = (id: string): void => {
+    // Core answers a picture for every stored image: an original while it fits
+    // a message, and a scaled copy of it otherwise, which `downscaled` states
+    // so the caption never calls a smaller copy the original.
     void ipc.imageContextImage(selectedTaskId, id).then(
-      (answer) => setPreview({ id, dataUrl: stringValue(answer.data_url) || null }),
-      () => setPreview({ id, dataUrl: null }),
+      (answer) => setFullSize({ id, dataUrl: stringValue(answer.data_url) || null, downscaled: booleanValue(answer.downscaled) }),
+      () => setFullSize({ id, dataUrl: null, downscaled: false }),
     );
   };
   const setIncluded = (id: string, included: boolean): void => {
@@ -9305,88 +9485,128 @@ function ImageContextPanel({ snapshot, busy, translate, dispatch, ipc, onClose }
     // itself, so a tick can only mean "send this every turn" (pinned).
     void dispatch(automatic ? "pin" : "set", automatic ? { task: selectedTaskId, id, pinned: included } : { task: selectedTaskId, id, included }, "image_context");
   };
-  return <View style={styles.imageContextBackdrop}>
-    <View style={styles.imageContextWindow}>
-    <View style={styles.imageContextHeader}>
-      {/* The title bar already names this surface, so the body opens straight
-          into what the reader needs to know. */}
-      <Text style={styles.imageContextLead}>{translate("imageContext.lead")}</Text>
-    </View>
+  // The rail is the shared one, so this window keeps the app's one rail width,
+  // row rhythm, and selection capsule instead of a list of its own.  A row is
+  // one line: what the reader chooses by is how many pictures a task holds and
+  // when it last changed; its id is the detail header's hint.  Core stamps
+  // ``updated_at`` in UTC (ISO-8601, trailing Z), so it is formatted here —
+  // slicing the string printed UTC and read as a clock eight hours behind.
+  // Each row is the thread's name with its own clock under it, the way a source
+  // list states an entry and its date: the name is what the reader picks by,
+  // and the time stays legible at the rail's one width instead of being cut off
+  // beside it.  A task Codex has not named shows the clock alone.
+  const railRows = useMemo(() => visibleTasks.map((entry) => ({
+    key: stringValue(entry.id),
+    cells: [stringValue(entry.title) || formatRailStamp(stringValue(entry.updated_at))],
+  })), [visibleTasks]);
+  const railDetails = useMemo(() => visibleTasks.map((entry) => (stringValue(entry.title)
+    ? formatRailStamp(stringValue(entry.updated_at))
+    // A thread Codex has not named leads with its clock, so its second line
+    // states the one fact left that tells it apart from the next one.
+    : translate("imageContext.railCount", { images: String(numberValue(entry.images, 0)) }))), [visibleTasks, translate]);
+  const selectedTask = tasks.find((entry) => stringValue(entry.id) === selectedTaskId);
+  // The thread's name leads, because that is what both Codex and this window
+  // call the task; the id stays only for a task the index cannot name, where
+  // it is still more useful than nothing.
+  const headerHint = selectedTask
+    ? `${stringValue(selectedTask.title) || selectedTaskId} · ${translate("imageContext.taskChip", { images: String(numberValue(selectedTask.images, 0)), at: formatRailStamp(stringValue(selectedTask.updated_at)) })}`
+    : translate("imageContext.leadTitle");
+  return <View style={styles.imageContextWindow}>
     <View style={styles.imageContextBody}>
-      <View style={styles.imageContextList}>
+      <View style={styles.imageContextRailColumn}>
         <View style={styles.imageContextSearch}>
           <NativeTextField value={query} onChangeText={setQuery} placeholder={translate("imageContext.search")} accessibilityLabel={translate("imageContext.search")} search />
         </View>
-        {visibleTasks.length === 0 ? <Text style={styles.imageContextEmpty}>{translate(tasks.length === 0 ? "imageContext.empty" : "imageContext.noMatch")}</Text> : <FlatList
-          data={visibleTasks}
-          keyExtractor={(entry) => stringValue(entry.id)}
-          renderItem={({ item }) => {
-            const id = stringValue(item.id);
-            return <Pressable
-              accessibilityRole="button"
-              accessibilityLabel={translate("imageContext.taskChip", { images: String(numberValue(item.images, 0)), at: stringValue(item.updated_at).slice(5, 16).replace("T", " ") })}
-              onPress={() => { void dispatch("open", { task: id }, "image_context"); }}
-              style={[styles.imageContextTaskRow, id === selectedTaskId && styles.imageContextTaskRowSelected]}
-            >
-              <Text numberOfLines={1} style={[styles.imageContextTaskCount, id === selectedTaskId && styles.imageContextSelectedText]}>{translate("imageContext.taskChip", { images: String(numberValue(item.images, 0)), at: stringValue(item.updated_at).slice(5, 16).replace("T", " ") })}</Text>
-              {/* Both lines of a selected row sit on the selection ink, so both
-                  take its text colour; a secondary grey on blue reads as a
-                  disabled row. */}
-              <Text numberOfLines={1} style={[styles.imageContextTaskId, id === selectedTaskId && styles.imageContextSelectedText]}>{id}</Text>
-            </Pressable>;
-          }}
-        />}
+        {/* The shared rail fills the column under the search field: a rail with
+            no height is a rail with no rows. */}
+        <SettingsRail rows={railRows} details={railDetails} selectedKey={selectedTaskId} style={styles.imageContextRailFill} onSelectionChange={(taskId) => { if (taskId) void dispatch("open", { task: taskId }, "image_context"); }} />
       </View>
-      <View style={styles.imageContextDetail}>
-        {tasks.length === 0 ? <Text style={styles.imageContextEmpty}>{translate("imageContext.empty")}</Text> : <>
-          <View style={styles.imageContextRow}>
-            <Text style={styles.imageContextRowLabel}>{translate("imageContext.auto")}</Text>
-            <NativeToggle accessibilityLabel={translate("imageContext.auto")} value={automatic} disabled={busy || !selectedTaskId} onValueChange={(enabled) => { void dispatch("auto", { task: selectedTaskId, enabled }, "image_context"); }} style={styles.runtimeBooleanControl} />
-            <Text style={styles.imageContextRowValue}>{translate(automatic ? "imageContext.autoOn" : "imageContext.autoOff")}</Text>
+      <View style={[styles.settingsRailDetail, Platform.OS === "windows" && styles.settingsRailDetailWindows]}>
+        <SettingsDetailHeader
+          title={fullSize ? translate("imageContext.viewerTitle", { id: fullSize.id }) : translate("imageContext.leadTitle")}
+          hint={headerHint}
+          actions={<>
+            {/* The explainer rides a help mark beside the surface it explains,
+                instead of a paragraph band over every task the window shows. */}
+            <HelpTip open={helpOpen} text={translate("imageContext.lead")} title={translate("imageContext.leadTitle")} onToggle={() => setHelpOpen((current) => !current)} />
+            {fullSize ? <ActionButton title={translate("imageContext.back")} titleWidth="auto" onPress={() => setFullSize(undefined)} /> : null}
+          </>}
+        />
+        {fullSize ? <View style={styles.imageContextViewer}>
+          <View style={styles.imageContextViewerFrame}>
+            {fullSize.dataUrl
+              ? <Image source={{ uri: fullSize.dataUrl }} style={styles.imageContextViewerPicture} />
+              : <Text style={styles.imageContextEmpty}>{translate("imageContext.noPreview")}</Text>}
           </View>
-          <Text style={styles.imageContextHelp}>{translate("imageContext.autoHint")}</Text>
-          <Text style={styles.imageContextStandfirst}>{translate("imageContext.next", { sent: String(sent), omitted: String(omitted) })}</Text>
-          <FlatList
-            data={images}
-            keyExtractor={(image) => stringValue(image.id)}
-            numColumns={4}
-            columnWrapperStyle={styles.imageContextGridRow}
-            style={styles.imageContextGrid}
-            renderItem={({ item }) => {
-              const id = stringValue(item.id);
-              const included = automatic ? booleanValue(item.pinned) : !booleanValue(item.unchecked);
-              const picture = pictures[id];
-              return <View style={styles.imageContextCard}>
-                <Pressable accessibilityRole="button" accessibilityLabel={translate("imageContext.preview")} disabled={busy} style={styles.imageContextThumb} onPress={() => openPreview(id)}>
-                  {picture ? <Image source={{ uri: picture }} style={styles.imageContextThumbPicture} /> : <Text style={styles.imageContextThumbFallback}>{translate("imageContext.preview")}</Text>}
-                </Pressable>
-                <Text numberOfLines={1} style={styles.imageContextCardLabel}>{translate("imageContext.imageLine", { id, size: `${numberValue(item.width, 0)}×${numberValue(item.height, 0)}` })}</Text>
-                <NativeCheckbox label={translate(automatic ? "imageContext.everyTurn" : "imageContext.send")} value={included} disabled={busy} onValueChange={(next) => setIncluded(id, next)} />
-              </View>;
-            }}
-          />
-          <Text style={styles.imageContextHelp}>{translate(automatic ? "imageContext.everyTurnHint" : "imageContext.sendHint")}</Text>
-          <View style={styles.imageContextRow}>
-            <Text style={styles.imageContextRowLabel}>{translate("imageContext.modelFetch")}</Text>
-            <Text style={styles.imageContextRowValue}>{translate(fetchKind === "file" ? "imageContext.fetchFile" : fetchKind === "tool" ? "imageContext.fetchTool" : "imageContext.fetchAsk")}</Text>
-          </View>
-          <View style={styles.imageContextRow}>
-            <ActionButton title={translate("imageContext.forget")} titleWidth="auto" disabled={busy || !selectedTaskId} onPress={() => { void dispatch("forget", { task: selectedTaskId }, "image_context"); }} />
-            <Text style={styles.imageContextHelp}>{translate("imageContext.forgetHint")}</Text>
-          </View>
-        </>}
+          {/* A scaled copy is stated as one: the pass still sends the stored
+              bytes, and a caption calling this "the image" would be false. */}
+          {fullSize.downscaled ? <Text style={styles.runtimeHelpText}>{translate("imageContext.scaledPreview")}</Text> : null}
+        </View> : <PersistentScrollView style={styles.runtimeScrollSurface} contentContainerStyle={styles.runtimeWorkspace}>
+          {tasks.length === 0 ? <Text style={styles.imageContextEmpty}>{translate("imageContext.empty")}</Text> : <View style={styles.runtimeFieldList}>
+            <View style={styles.runtimeField}>
+              <View style={styles.runtimeInputRow}>
+                <Text style={styles.imageContextStandfirst}>{translate("imageContext.next", { sent: String(sent), omitted: String(omitted) })}</Text>
+              </View>
+            </View>
+            {/* The pictures keep a list's own frame: it is what tells the reader
+                where the grid ends, and the cells inside it are its rows. */}
+            <View style={styles.imageContextGridFrame}>
+              <View style={styles.imageContextGrid}>
+                {images.map((item) => {
+                  const id = stringValue(item.id);
+                  const included = automatic ? booleanValue(item.pinned) : !booleanValue(item.unchecked);
+                  const picture = pictures[id];
+                  return <Pressable
+                    key={id}
+                    accessibilityRole="button"
+                    accessibilityLabel={translate("imageContext.preview")}
+                    disabled={busy}
+                    style={styles.imageContextCard}
+                    onPress={() => openPreview(id)}
+                  >
+                    <View style={styles.imageContextThumb}>
+                      {/* Three states, three answers: a picture, a read still
+                          running, and a read that failed.  One "click to
+                          enlarge" label for all of them left a blank card
+                          saying nothing about what it was waiting for. */}
+                      {picture
+                        ? <Image source={{ uri: picture }} style={styles.imageContextThumbPicture} />
+                        // Three states again, and the middle one is silent: a
+                        // read in flight is an empty card, not a word.  A card
+                        // that said "loading" for every picture stayed a wall of
+                        // the same sentence, and one that called a read in
+                        // flight "unreadable" was simply wrong.
+                        : picture === null
+                          ? <Text style={styles.imageContextThumbFallback}>{translate("imageContext.thumbFailed")}</Text>
+                          : null}
+                    </View>
+                    <Text numberOfLines={1} style={styles.imageContextCardLabel}>{translate("imageContext.imageLine", { id, size: `${numberValue(item.width, 0)}×${numberValue(item.height, 0)}` })}</Text>
+                    <NativeCheckbox label={translate(automatic ? "imageContext.everyTurn" : "imageContext.send")} value={included} disabled={busy} onValueChange={(next) => setIncluded(id, next)} />
+                  </Pressable>;
+                })}
+              </View>
+            </View>
+            <View style={styles.runtimeHelpSlot}><Text style={styles.runtimeHelpText}>{translate(automatic ? "imageContext.everyTurnHint" : "imageContext.sendHint")}</Text></View>
+            <View style={styles.runtimeField}>
+              <View style={styles.runtimeInputRow}>
+                <Text style={styles.runtimeFieldLabel}>{translate("imageContext.modelFetch")}</Text>
+                <Text style={styles.imageContextRowValue}>{translate(fetchKind === "file" ? "imageContext.fetchFile" : fetchKind === "tool" ? "imageContext.fetchTool" : "imageContext.fetchAsk")}</Text>
+              </View>
+            </View>
+            <View style={styles.runtimeField}>
+              <View style={styles.runtimeInputRow}>
+                <ActionButton title={translate("imageContext.forget")} titleWidth="auto" disabled={busy || !selectedTaskId} onPress={() => { void dispatch("forget", { task: selectedTaskId }, "image_context"); }} />
+              </View>
+              <View style={styles.runtimeHelpSlot}><Text style={styles.runtimeHelpText}>{translate("imageContext.forgetHint")}</Text></View>
+            </View>
+          </View>}
+        </PersistentScrollView>}
       </View>
-      {preview ? <View style={styles.imageContextPreview}>
-        <Image source={preview.dataUrl ? { uri: preview.dataUrl } : undefined} style={styles.imageContextPreviewPicture} />
-        {preview.dataUrl ? null : <Text style={styles.imageContextHelp}>{translate("imageContext.noPreview")}</Text>}
-        <ActionButton title={translate("status.close")} titleWidth="auto" onPress={() => setPreview(undefined)} />
-      </View> : null}
     </View>
     {/* The way out sits at the end of the window, under the content it closes,
         the way the app's other child surfaces put theirs. */}
     <View style={styles.imageContextFooter}>
-      <ActionButton title={translate("status.close")} titleWidth="auto" onPress={onClose} />
-    </View>
+      <ActionButton title={translate("status.close")} titleWidth="auto" onPress={() => native.window.close("image-context")} />
     </View>
   </View>;
 }
@@ -12210,6 +12430,12 @@ function RawEditor({ label, domain, document, language, ipc, translate, showLabe
   const appliedBaselineTokenRef = useRef(baselineToken);
 
   const normalizeEditorText = (value: string): string => value.replace(/\r\n?/g, "\n");
+  // The native field drops the document's final line break, so a file that
+  // ended with one would be saved without it. A draft keeps the ending its
+  // document had.
+  const withDocumentEnding = (value: string): string => (
+    baselineRef.current.endsWith("\n") && !value.endsWith("\n") ? `${value}\n` : value
+  );
 
   const setPending = useCallback((pending: boolean): void => {
     registry?.setDirty(fieldId.current, pending);
@@ -12480,27 +12706,57 @@ function RawEditor({ label, domain, document, language, ipc, translate, showLabe
     {showLabel ? <View style={[styles.rawEditorHeader, codexPane && styles.codexRawEditorHeader]}><Text style={[styles.fieldLabel, codexPane && styles.codexRawEditorLabel]}>{label}</Text></View> : null}
     {documentKey
       ? <View style={styles.rawNativeEditorFrame}>
-        <CodeEditorWebView
-          documentKey={`${documentKey}:${editorRenderRevision}`}
-          value={draft}
-          baseline={baseline}
-          language={language}
-          readOnly={false}
-          showDiff={showDiff}
-          menuLabels={editorMenuLabels(translate)}
-          style={[styles.rawNativeEditor, codexPane && styles.codexRawNativeEditor]}
-          onChange={(text) => {
-            if (!initializedRef.current || normalizeEditorText(text) === normalizeEditorText(draftRef.current)) return;
-            draftRef.current = text;
-            const pending = text !== stagedTextRef.current;
-            setPending(pending);
-            if (pending) scheduleStage();
-          }}
-          onError={() => {
-            setStatus("error");
-            setError(translate("common.secureEditorReadFailed"));
-          }}
-        />
+        {Platform.OS === "windows"
+          // The child editor window hosts this surface in its own XAML island.
+          // A WebView2 inside that island renders blank there (the island does
+          // not hand it the window DPI, and the browser site is arranged before
+          // the scale settles), so Windows edits the same draft in the native
+          // multiline field the runtime JSON editor already uses.  Every stage
+          // and conflict path below is shared with the rich editor.
+          ? <NativeTextField
+            // Uncontrolled on purpose: the native field owns its own text so a
+            // keystroke never re-renders this pane. Remounting on a new
+            // document or revision rebases it onto that text.
+            key={`${documentKey}:${editorRenderRevision}`}
+            multiline
+            defaultValue={draft}
+            accessibilityLabel={label}
+            style={styles.rawNativeTextField}
+            onChangeText={(text) => {
+              // The field hands back Windows line breaks (a lone carriage return
+              // per paragraph). Storing those bytes staged a document whose
+              // every line ended without a newline, so Core rejected an
+              // untouched TOML file as invalid; the draft keeps the same line
+              // endings the file and the rich editor use.
+              const normalized = withDocumentEnding(normalizeEditorText(text));
+              if (!initializedRef.current || normalized === normalizeEditorText(draftRef.current)) return;
+              draftRef.current = normalized;
+              const pending = normalized !== stagedTextRef.current;
+              setPending(pending);
+              if (pending) scheduleStage();
+            }}
+          />
+          : <CodeEditorWebView
+            documentKey={`${documentKey}:${editorRenderRevision}`}
+            value={draft}
+            baseline={baseline}
+            language={language}
+            readOnly={false}
+            showDiff={showDiff}
+            menuLabels={editorMenuLabels(translate)}
+            style={[styles.rawNativeEditor, codexPane && styles.codexRawNativeEditor]}
+            onChange={(text) => {
+              if (!initializedRef.current || normalizeEditorText(text) === normalizeEditorText(draftRef.current)) return;
+              draftRef.current = text;
+              const pending = text !== stagedTextRef.current;
+              setPending(pending);
+              if (pending) scheduleStage();
+            }}
+            onError={() => {
+              setStatus("error");
+              setError(translate("common.secureEditorReadFailed"));
+            }}
+          />}
         {loading ? <View pointerEvents="none" style={styles.rawEditorOverlay}><Text style={styles.cardHint}>{translate("common.secureEditorLoading")}</Text></View> : null}
       </View>
       : <View style={[styles.rawEditorLoading, codexPane && styles.codexRawEditorLoading]}><Text style={styles.cardHint}>{loading ? translate("common.loading") : translate("error.coreUnavailable")}</Text></View>}
@@ -12859,35 +13115,36 @@ const styles = StyleSheet.create({
   runtimeImageThumbPicture: { width: 148, height: 96, resizeMode: "contain" },
   runtimeImageThumbFallback: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE },
   runtimeImageCellLabel: { color: systemColors.label, fontSize: UI_TIP_FONT_SIZE, fontWeight: "600" },
-  imageContextBackdrop: { position: "absolute", top: 0, left: 0, right: 0, bottom: 0, alignItems: "center", justifyContent: "center", padding: 12, backgroundColor: "rgba(0, 0, 0, 0.16)" },
-  imageContextWindow: { width: "100%", maxWidth: 900, maxHeight: "100%", minHeight: 0, flex: 1, borderRadius: 10, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.window, overflow: "hidden" },
-  imageContextHeader: { flexShrink: 0, paddingHorizontal: 18, paddingTop: 12, paddingBottom: 10, borderBottomWidth: 1, borderBottomColor: systemColors.separator },
-  imageContextFooter: { flexShrink: 0, flexDirection: "row", alignItems: "center", justifyContent: "flex-end", gap: 10, paddingHorizontal: 18, paddingVertical: 10, borderTopWidth: 1, borderTopColor: systemColors.separator },
-  imageContextLead: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16 },
+  imageContextWindow: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window, overflow: "hidden" },
   imageContextBody: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row" },
-  imageContextList: { width: 232, flexShrink: 0, minHeight: 0, borderRightWidth: 1, borderRightColor: systemColors.separator },
-  imageContextSearch: { paddingHorizontal: 10, paddingVertical: 8 },
-  imageContextTaskRow: { paddingHorizontal: 12, paddingVertical: 7, gap: 1 },
-  imageContextTaskRowSelected: { backgroundColor: systemColors.selectedContent },
-  imageContextTaskCount: { color: systemColors.label, fontSize: UI_FONT_SIZE },
-  imageContextSelectedText: { color: systemColors.selectedControlText },
-  imageContextTaskId: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, fontFamily: Platform.select({ macos: "Menlo", windows: "Cascadia Mono", default: "monospace" }) },
-  imageContextDetail: { flex: 1, minWidth: 0, minHeight: 0, paddingHorizontal: 18, paddingVertical: 14, gap: 6 },
-  imageContextRow: { flexDirection: "row", alignItems: "center", gap: 8, flexWrap: "wrap" },
-  imageContextRowLabel: { width: 84, flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
+  // The search field sits above the shared rail, inside the same column, so the
+  // rail's one right divider is still the only rule between the two sides.
+  imageContextRailColumn: { width: SETTINGS_RAIL_WIDTH, flexShrink: 0, minHeight: 0 },
+  imageContextRailFill: { flex: 1, minHeight: 0, paddingTop: 0 },
+  imageContextSearch: { paddingHorizontal: 8, paddingTop: 8, paddingBottom: 4 },
+  imageContextFooter: { flexShrink: 0, flexDirection: "row", alignItems: "center", justifyContent: "flex-end", gap: 10, paddingHorizontal: SETTINGS_PANE_INSET, paddingVertical: 8, borderTopWidth: 1, borderTopColor: systemColors.separator },
   imageContextRowValue: { flex: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE },
-  imageContextHelp: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16 },
-  imageContextEmpty: { padding: 16, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 18 },
-  imageContextStandfirst: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
-  imageContextGrid: { flexGrow: 0, minHeight: 0 },
-  imageContextGridRow: { gap: 12 },
-  imageContextCard: { width: 152, gap: 3, paddingBottom: 10 },
-  imageContextThumb: { width: 152, height: 104, borderRadius: 6, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground, alignItems: "center", justifyContent: "center", overflow: "hidden" },
-  imageContextThumbPicture: { width: 152, height: 104, resizeMode: "contain" },
+  imageContextEmpty: { padding: SETTINGS_PANE_INSET, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 18 },
+  imageContextStandfirst: { flexShrink: 1, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
+  // The grid keeps a list's own frame: the cards are its rows, and the frame is
+  // how the reader sees where the list ends.
+  imageContextGridFrame: { width: "100%", borderWidth: 1, borderColor: systemColors.separator, borderRadius: 4, backgroundColor: systemColors.textBackground, overflow: "hidden" },
+  // Cells wrap, the way the runtime pane's image cells do, so a narrow window
+  // drops to three or two per row instead of clipping the last column.
+  imageContextGrid: { flexDirection: "row", flexWrap: "wrap", gap: 12, padding: 10 },
+  imageContextCard: { width: 148, gap: 3 },
+  imageContextThumb: { width: 148, height: 96, borderRadius: 4, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.window, alignItems: "center", justifyContent: "center", overflow: "hidden" },
+  imageContextThumbPicture: { width: 148, height: 96, resizeMode: "contain" },
   imageContextThumbFallback: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE },
   imageContextCardLabel: { color: systemColors.label, fontSize: UI_TIP_FONT_SIZE, fontWeight: "600" },
-  imageContextPreview: { position: "absolute", right: 18, bottom: 18, width: 392, gap: 6, padding: 12, borderRadius: 8, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.window, alignItems: "flex-start" },
-  imageContextPreviewPicture: { width: 368, height: 276, resizeMode: "contain", backgroundColor: systemColors.textBackground },
+  // 查看大图 fills the detail column and never floats over it: the picture, its
+  // id in the header, and one way back beside it.
+  imageContextViewer: { flex: 1, minWidth: 0, minHeight: 0, gap: 8, padding: SETTINGS_PANE_INSET },
+  imageContextViewerFrame: { flex: 1, minWidth: 0, minHeight: 0, borderRadius: 6, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground, alignItems: "center", justifyContent: "center", overflow: "hidden" },
+  // A flexible box, not a percentage one: the frame's height is only known after
+  // layout, and an Image sized "100%" of it was measured against the picture's
+  // own aspect and drew taller than the frame, so a tall page was cut off.
+  imageContextViewerPicture: { flex: 1, alignSelf: "stretch", minHeight: 0, resizeMode: "contain" },
   routeTraceWorkspace: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 6 },
   routeTraceRequestPane: { width: "31%", minWidth: 252, maxWidth: 360, minHeight: 0, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground },
   routeTraceRequestScroll: { flex: 1, minHeight: 0 },
@@ -12963,7 +13220,7 @@ const styles = StyleSheet.create({
   root: { flex: 1, minWidth: 420 },
   menuBarHost: { flex: 1 }, error: { margin: 20, color: systemColors.red, fontSize: UI_FONT_SIZE },
   startupLoading: { flex: 1, alignItems: "center", justifyContent: "center" }, startupLoadingText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
-  windowSurface: { flex: 1, position: "relative", backgroundColor: systemColors.window }, windowSurfaceShellWindows: { backgroundColor: WINDOWS_CONTROL.fill }, windowsChildModalSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, windowContent: { flexGrow: 1, paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, gap: 8 }, windowContentFixed: { flex: 1, minHeight: 0 }, fileEditorRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providersContent: { paddingBottom: 6, gap: 6 }, providerWizardRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providerWizardSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, logsContent: { paddingHorizontal: 12, paddingTop: 12, paddingBottom: 0 }, runtimeContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, dataManagementContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, assistantSettingsContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, windowTitleBlock: { paddingHorizontal: 20, paddingTop: 12, paddingBottom: 3, gap: 3 }, windowTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
+  windowSurface: { flex: 1, position: "relative", backgroundColor: systemColors.window }, windowSurfaceShellWindows: { backgroundColor: WINDOWS_CONTROL.fill }, windowsChildModalSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, windowContent: { flexGrow: 1, paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, gap: 8 }, rawNativeTextField: { flex: 1, alignSelf: "stretch", fontFamily: Platform.select({ windows: "Cascadia Mono", default: "monospace" }), fontSize: UI_TIP_FONT_SIZE, paddingTop: 8, paddingBottom: 8, paddingHorizontal: 10 }, windowContentFixed: { flex: 1, minHeight: 0 }, fileEditorRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providersContent: { paddingBottom: 6, gap: 6 }, providerWizardRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providerWizardSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, imageContextRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, logsContent: { paddingHorizontal: 12, paddingTop: 12, paddingBottom: 0 }, runtimeContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, dataManagementContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, assistantSettingsContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, windowTitleBlock: { paddingHorizontal: 20, paddingTop: 12, paddingBottom: 3, gap: 3 }, windowTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
   // Settings window: a native source-list sidebar next to the active pane.
   settingsShellFrame: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, settingsShellHeader: { flexShrink: 0, flexDirection: "row", minWidth: 0, backgroundColor: systemColors.window, borderBottomWidth: 1, borderBottomColor: systemColors.separator }, settingsShell: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row" }, settingsSidebar: { width: 200, minWidth: 0, flexShrink: 0, minHeight: 0 }, settingsSidebarHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 16, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarHeaderIntegrated: { width: 200, height: SETTINGS_TITLEBAR_INSET + 38, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarHeaderWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid }, settingsSidebarWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid, borderRightWidth: 1, borderRightColor: WINDOWS_CONTROL.strokeSubtle }, settingsSidebarAppIcon: { width: SETTINGS_HEADER_CONTENT_HEIGHT, height: SETTINGS_HEADER_CONTENT_HEIGHT, borderRadius: 4 }, settingsSidebarTitle: { color: systemColors.label, fontSize: SOURCE_LIST_FONT_SIZE, fontWeight: "600" }, settingsSidebarSpacer: { height: 8, flexShrink: 0 }, settingsSidebarList: { flex: 1, minWidth: 0, minHeight: 0 }, settingsPaneHeader: { flexShrink: 0, paddingHorizontal: 20, paddingTop: 10, paddingBottom: 8 }, settingsPaneHeaderIntegrated: { flex: 1, minWidth: 0, height: SETTINGS_TITLEBAR_INSET + 38, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsDetail: { minWidth: 0, flex: 1, paddingTop: SETTINGS_TITLEBAR_INSET }, settingsDetailIntegrated: { paddingTop: 0 }, settingsDetailBody: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsDetailBodyWindows: { backgroundColor: WINDOWS_CONTROL.fill }, settingsDetailBodyBare: { backgroundColor: "transparent" }, settingsDetailPane: { flex: 1, minWidth: 0 }, settingsPaneTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600", lineHeight: SETTINGS_HEADER_CONTENT_HEIGHT }, settingsRail: { width: SETTINGS_RAIL_WIDTH, flexShrink: 0, minHeight: 0, paddingTop: 6, overflow: "hidden" }, settingsRailWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid }, settingsRailList: { flex: 1, minHeight: 0 }, settingsRailDivider: { position: "absolute", top: 0, bottom: 0, right: 0, width: 1, backgroundColor: systemColors.separator }, settingsRailDetail: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsRailDetailWindows: { backgroundColor: WINDOWS_CONTROL.fill }, settingsRailDetailHeader: { minHeight: 50, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 14, paddingVertical: 8, backgroundColor: systemColors.window }, settingsRailDetailHeaderWindows: { backgroundColor: WINDOWS_CONTROL.fill }, settingsRailDetailTitleBlock: { flex: 1, minWidth: 0, gap: 2 }, settingsRailDetailActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, settingsRailDetailTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, settingsRailDetailHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16 },
   routeStatusBar: { minHeight: 24, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, justifyContent: "space-between", paddingHorizontal: 16, paddingVertical: 2, borderTopWidth: 1, borderTopColor: systemColors.separator }, routeStatusBarWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid, borderTopColor: WINDOWS_CONTROL.strokeSubtle }, routeStatusTextWindows: { color: WINDOWS_CONTROL.textSecondary },
@@ -13146,3 +13403,4 @@ const ROUTE_TRACE_ATTEMPT_TONES: Record<
     text: styles.routeTraceStepStateAttempted,
   },
 };
+

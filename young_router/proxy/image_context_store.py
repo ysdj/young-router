@@ -14,7 +14,10 @@ Storage is deliberately small and self-limiting:
 * only the images are written, never the text, so the file is a picture store
   and not a transcript;
 * a file older than a session is dropped by its own age, and the directory is
-  swept on every write so nothing accumulates.
+  swept on every write and by Core's own hourly loop, so nothing accumulates
+  even while the pass is switched off;
+* the file copies written for the path fetch go with their replay, whether the
+  replay expired or the task cap dropped it.
 """
 
 from __future__ import annotations
@@ -137,7 +140,7 @@ def store(thread_id: Any, request_kwargs: Dict[str, Any]) -> int:
         except OSError:
             pass
         return 0
-    _sweep(root)
+    sweep()
     return len(images)
 
 
@@ -206,13 +209,28 @@ def forget(thread_id: Any, environ: Optional[Dict[str, str]] = None) -> bool:
     return removed
 
 
-def _sweep(root: str) -> None:
-    now = time.time()
-    entries: List[tuple] = []
+def sweep(environ: Optional[Dict[str, str]] = None, *, now: Optional[float] = None) -> int:
+    """Delete the replays and file copies past their retention window.
+
+    Runs after every write, and from Core's own loop: a write is exactly what
+    stops happening when the pass is switched off or a task is abandoned, which
+    is when yesterday's pictures would otherwise stay on disk forever.  Every
+    step tolerates another worker sweeping the same files first.
+
+    Returns how many replays were removed.
+    """
+
+    env = os.environ if environ is None else environ
+    moment = time.time() if now is None else float(now)
+    cutoff = moment - REPLAY_CACHE_MAX_AGE_SECONDS
+    root = cache_dir(env)
+    removed = 0
     try:
         names = os.listdir(root)
     except OSError:
-        return
+        names = []
+    kept: set = set()
+    fresh: List[tuple] = []
     for name in names:
         if not name.endswith(".json"):
             continue
@@ -221,23 +239,39 @@ def _sweep(root: str) -> None:
             modified = os.path.getmtime(path)
         except OSError:
             continue
-        if now - modified > REPLAY_CACHE_MAX_AGE_SECONDS:
+        if modified < cutoff:
             try:
                 os.unlink(path)
+                removed += 1
             except OSError:
                 pass
             continue
-        entries.append((modified, path))
-    for _, path in sorted(entries, reverse=True)[REPLAY_CACHE_MAX_TASKS:]:
+        fresh.append((modified, name[: -len(".json")]))
+    fresh.sort(reverse=True)
+    for _, thread_id in fresh[:REPLAY_CACHE_MAX_TASKS]:
+        kept.add(thread_id)
+    for _, thread_id in fresh[REPLAY_CACHE_MAX_TASKS:]:
         try:
-            os.unlink(path)
-        except OSError:
+            os.unlink(os.path.join(root, f"{thread_id}.json"))
+            removed += 1
+        except FileNotFoundError:
             pass
-    _sweep_files(now)
+        except OSError:
+            # Another worker may still hold it; the copy is the answer to a
+            # replay that is still there, so leave both alone.
+            kept.add(thread_id)
+    _sweep_files(files_dir(env), kept, cutoff)
+    return removed
 
 
-def _sweep_files(now: float) -> None:
-    root = files_dir()
+def _sweep_files(root: str, kept: set, cutoff: float) -> None:
+    """Drop the file copies a retained replay no longer needs.
+
+    A copy is worth keeping only while its replay is, within the same day.  The
+    folder's own mtime was not enough: a replay dropped by the task cap left its
+    copies behind for another day.
+    """
+
     try:
         names = os.listdir(root)
     except OSError:
@@ -248,14 +282,21 @@ def _sweep_files(now: float) -> None:
             modified = os.path.getmtime(folder)
         except OSError:
             continue
-        if now - modified <= REPLAY_CACHE_MAX_AGE_SECONDS:
+        if name in kept and modified >= cutoff:
             continue
-        try:
-            for entry in os.listdir(folder):
-                os.unlink(os.path.join(folder, entry))
-            os.rmdir(folder)
-        except OSError:
-            pass
+        _remove_tree(folder)
+
+
+def _remove_tree(folder: str) -> None:
+    try:
+        for name in os.listdir(folder):
+            try:
+                os.unlink(os.path.join(folder, name))
+            except OSError:
+                pass
+        os.rmdir(folder)
+    except OSError:
+        pass
 
 
 def load(thread_id: Any, environ: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
@@ -274,6 +315,9 @@ def load(thread_id: Any, environ: Optional[Dict[str, str]] = None) -> List[Dict[
         return []
     at = payload.get("at")
     if isinstance(at, (int, float)) and time.time() - at > REPLAY_CACHE_MAX_AGE_SECONDS:
+        # A stale record never answers a fetch.  It is not unlinked here: a
+        # worker may `os.replace` a fresh replay at this path between the read
+        # and the unlink, and the sweeper owns the deletion from its own clock.
         return []
     return [image for image in images if isinstance(image, dict)]
 

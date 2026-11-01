@@ -144,6 +144,9 @@ def run(argv: list[str] | None = None) -> int:
     # The interval loop lives beside the IPC server: it reads the saved switch
     # and interval, so a machine nobody is looking at still syncs.
     webdav_scheduler = core.webdav_scheduler()
+    # The image-context cache is swept after every write; this loop is the
+    # path that still runs when the pass is off and no write arrives.
+    image_context_sweeper = core.image_context_sweeper()
 
     def request_stop(_signum: int, _frame: Any) -> None:
         stop.set()
@@ -155,6 +158,7 @@ def run(argv: list[str] | None = None) -> int:
             return 0
         server.start()
         webdav_scheduler.start()
+        image_context_sweeper.start()
         if args.endpoint_file is not None:
             _write_endpoint(args.endpoint_file, server)
         if args.print_endpoint:
@@ -177,7 +181,15 @@ def run(argv: list[str] | None = None) -> int:
         except Exception:
             pass
         try:
-            core.shutdown()
+            image_context_sweeper.stop()
+        except Exception:
+            pass
+        try:
+            # SIGTERM is how a host or a script *replaces* Core; the app
+            # quitting on its own goes through ``/v1/host/shutdown``.  The stop
+            # is the same one, so the record says which it was: a reader that
+            # finds ``stopped`` needs to know whether a person asked for it.
+            core.shutdown(stopped_by="core_replaced")
         except Exception:
             # The owner-aware controller refuses unrelated processes. A failed
             # best-effort signal cleanup must not expose local diagnostics.

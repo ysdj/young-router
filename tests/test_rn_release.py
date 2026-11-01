@@ -647,6 +647,34 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn('INSTALL_LOCK_PID=$!', script)
         self.assertIn('rm -f "$INSTALL_LOCK_OWNER"', script)
 
+    def test_windows_payload_ships_the_core_that_was_just_built(self) -> None:
+        """One build ships the Core it just tested, not the previous one.
+
+        The host project links Core from ``windows\<arch>\Release\Core`` as
+        deployment content, and MSBuild only rewrites a deployment item whose
+        source is newer.  That directory outlives a build, and the packaged
+        payload is a copy of it, so a Core edit made after the last full solution
+        build stayed invisible: the app kept running the previous
+        ``young_router`` while every test ran against the current one.  The
+        script therefore refreshes that directory from the staged source tree and
+        copies it into the payload after the payload copy.
+        """
+
+        script = (ROOT / "rn/scripts/build-windows.ps1").read_text(encoding="utf-8")
+        payload = script.index(
+            'Copy-Item -Path (Join-Path $WindowsRelease "*") -Destination $PackagePayload -Recurse -Force'
+        )
+        refresh = script.index("Copy-CoreSource $CoreRoot $ReleaseCore")
+        self.assertLess(payload, refresh)
+        self.assertIn('$ReleaseCore = Join-Path $WindowsRelease "Core"', script)
+        # The refreshed tree replaces the payload's copy, and no stale bytecode
+        # travels with it: a ``.pyc`` written against the previous source wins
+        # over the new file on import.
+        self.assertIn('Copy-Item -Path (Join-Path $ReleaseCore "*") -Destination (Join-Path $PackagePayload "Core") -Recurse -Force', script)
+        refresh_block = script[refresh : script.index("# The WinUI host links Windows App SDK")]
+        self.assertIn('-Filter "__pycache__"', refresh_block)
+        self.assertIn('-Include "*.pyc", "*.pyo"', refresh_block)
+
     def test_staging_caches_are_persistent_and_gated_by_the_staging_scripts(self) -> None:
 
         # Staging and the native build are disjoint, so a build may overlap them
@@ -978,6 +1006,96 @@ class ReactNativeReleaseTests(unittest.TestCase):
         # The stamp records the commit the header came from, which is what makes
         # a vendor refresh regenerate instead of reusing a stale header.
         self.assertIn("writeFileSync(stamp, `${pinnedCommit}\\n`, 'utf8')", bootstrap)
+
+    def test_the_dev_loop_never_carries_a_change_the_deploy_owns(self) -> None:
+        # The fast loop exists because a repeat deploy costs ~104 s and almost
+        # none of it is about the change under test.  Three things keep it from
+        # becoming a way to ship an unverified bundle:
+        #
+        #   * a native source compiles into the host executable, so it cannot be
+        #     carried by copying files -- it is refused rather than half-applied;
+        #   * the deploy stays the only thing that builds, signs, installs, and
+        #     re-checks upstream releases, and the shared stop policy stays the
+        #     only thing that signals a process; and
+        #   * both halves sync before the one restart, so a window never runs
+        #     against a Core from a different revision of the same change.
+        script = (ROOT / "scripts" / "dev-loop-macos.sh").read_text(encoding="utf-8")
+
+        # A message that names the deploy is not an invocation, so only
+        # executable lines count; the tips all say "run the deploy next".
+        for deploy_only in (
+            "build-and-install-macos.sh",
+            "codesign",
+            "xcodebuild",
+            "update-litellm.sh",
+            "pkill",
+            "kill",
+        ):
+            for number, line in enumerate(script.splitlines(), start=1):
+                body = line.strip()
+                if not body or body.startswith("#") or body.startswith("echo "):
+                    continue
+                self.assertNotIn(
+                    deploy_only,
+                    body,
+                    f"scripts/dev-loop-macos.sh:{number} does the deploy's work: {body}",
+                )
+
+        # A native change is refused, and only after naming what needs a build.
+        self.assertLess(
+            script.index("native sources are newer than the installed host"),
+            script.index("refusing to sync the rest"),
+        )
+        self.assertIn('find "$native_root" -newer "$host_executable"', script)
+        # Only this host's native sources gate a macOS sync: an unrelated
+        # Windows edit cannot change what a macOS window shows.
+        self.assertNotIn("apps/windows/windows", script)
+        self.assertNotIn("apps/windows/src/native", script)
+
+        # One exclusion list, read by both the staleness comparison and the
+        # sync.  Two lists that must agree would drift into a tree that reads as
+        # permanently stale, or -- with `--delete` -- into deleting a staged
+        # adapter mid-sync.
+        self.assertIn("CORE_SYNC_EXCLUDES=(", script)
+        self.assertEqual(script.count("CORE_SYNC_EXCLUDES[@]"), 2)
+        for staged in ("veridrop", "connect-workbuddy", "dsh-vision-router", "our-free-model"):
+            self.assertIn(f"--exclude '{staged}'", script)
+
+        # One restart, after both halves, through the shared stop policy.
+        restart_line = '"$RESTART_APP" >/dev/null 2>&1'
+        self.assertEqual(script.count(restart_line), 1)
+        auto_branch_start = script.index("  auto)")
+        auto_branch_end = script.index("esac", auto_branch_start)
+        self.assertIn("sync_python", script[auto_branch_start:auto_branch_end])
+        self.assertIn("sync_js", script[auto_branch_start:auto_branch_end])
+        self.assertGreater(script.index(restart_line), auto_branch_end)
+
+    def test_the_isolated_proxy_loop_runs_the_checkout_not_the_bundle(self) -> None:
+        # The data-plane loop starts a second proxy from the checkout's
+        # `young_router/` on a scratch port and a scratch runtime root.  Three
+        # properties make it useful rather than merely fast: the checkout's tree
+        # wins `sys.path`, or an edit would be invisible; nothing it writes lands
+        # in the user's `~/.young-router`, or a probe would rewrite real routing
+        # state; and it never reaches the installed tree, so the app beside it
+        # keeps serving whatever it was serving.
+        script = (ROOT / "scripts" / "dev-loop-macos.sh").read_text(encoding="utf-8")
+
+        self.assertIn('export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"', script)
+        self.assertIn('export YOUNG_ROUTER_HOME="$RUN_ROOT"', script)
+        self.assertIn('export LITELLM_RUNTIME_ROOT="$RUN_ROOT"', script)
+        # The scratch document is the publishable example, never the real one:
+        # a user's configuration holds provider keys, and a temporary directory
+        # is not where those belong.
+        self.assertIn('cp "$ROOT/config.example.yaml" "$RUN_ROOT/runtime/config.yaml"', script)
+
+        proxy_start = script.index('if [[ "$MODE" == "proxy" ]]; then')
+        proxy_end = script.index("exec \"$CORE_ROOT/runtime/bin/python\" -m young_router.proxy.macos_proxy", proxy_start)
+        proxy_block = script[proxy_start:proxy_end]
+        # The branch ends in `exec`, so the sync and restart below it are
+        # unreachable from here -- the app is never disturbed.
+        self.assertNotIn("$CORE/young_router", proxy_block)
+        self.assertNotIn("rsync", proxy_block)
+        self.assertIn("\nfi", script[proxy_end:])
 
     def test_the_macos_native_build_passes_the_architecture_as_an_argument(self) -> None:
         # The Pods project pins ``ARCHS = "$(ARCHS_STANDARD_64_BIT)"`` in its own

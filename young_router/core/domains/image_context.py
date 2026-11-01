@@ -5,6 +5,10 @@ changes that decision.  It reads the same replay cache the fetch tool answers
 from and writes the same selection file Context Attachment Manager's panel
 writes, so a task curated here behaves identically to one curated there.
 
+This app owns only the two image maps of that document.  A task's
+``auto`` switch is Context Attachment Manager's own -- set in its panel -- and
+is read, never written, here; every write keeps the rest of the file intact.
+
 Nothing here decides a request: a change takes effect on that task's next turn,
 because the pass reads this state fresh for every request.
 """
@@ -12,6 +16,7 @@ because the pass reads this state fresh for every request.
 from __future__ import annotations
 
 import base64
+import io
 import json
 import os
 import time
@@ -24,13 +29,71 @@ from ...proxy import image_context as _image_context
 from ...proxy import image_context_store as _store
 
 DOMAIN_NAME = "image_context"
-# One message may carry 16 MiB; a preview that needs more than this is sent as
-# metadata only, because a panel thumbnail is not worth a stalled window.
+# One message may carry 16 MiB.  An image at or below this travels as its own
+# stored bytes, unchanged: re-encoding it would show a picture the model never
+# received.
 MAX_PREVIEW_BYTES = 6 * 1024 * 1024
+# Anything larger is scaled to this long edge before it is sent.  The stored
+# original stays what the pass and the fetch tool use; a window only needs a
+# picture, and a full-size PNG can be 28 MB of base64 -- past the IPC frame
+# budget, where the old answer was a refusal instead of an image.
+PREVIEW_LONG_EDGE = 1600
+PREVIEW_BUDGET_BYTES = 1_500_000
+# A card in the grid is 148 pt wide.  Its picture is a thumbnail, not a preview:
+# sending a 1600 px copy for every image of a 70-image task was megabytes of
+# frames for a wall of postage stamps, and the cards that had not been asked for
+# yet sat on "loading" while the queue drained.
+THUMB_LONG_EDGE = 400
+THUMB_BUDGET_BYTES = 160_000
 
 
 def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _codex_home(environ: Mapping[str, str]) -> Path:
+    """Where Codex keeps its own files: ``CODEX_HOME``, else ``~/.codex``."""
+
+    configured = str(environ.get("CODEX_HOME") or "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".codex"
+
+
+def _read_thread_titles(environ: Mapping[str, str]) -> dict[str, str]:
+    """Thread id -> the title Codex itself shows for that thread.
+
+    A task id here is a Codex thread id, and Codex writes one line per thread
+    to ``session_index.jsonl`` with the name the user sees in its own window.
+    A panel that named its rows by timestamp alone made two threads of the same
+    minute indistinguishable, so this is the name every other surface of the
+    product already uses.  A missing or unreadable index is not an error: the
+    titles are decoration, and the pane falls back to the clock.
+    """
+
+    try:
+        with open(_codex_home(environ) / "session_index.jsonl", "r", encoding="utf-8") as handle:
+            lines = handle.readlines()
+    except OSError:
+        return {}
+    titles: dict[str, str] = {}
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        thread_id = str(entry.get("id") or "").strip()
+        title = str(entry.get("thread_name") or "").strip()
+        # Later lines win: the index is append-only and a thread that was
+        # renamed appears again with its newest name.
+        if thread_id and title:
+            titles[thread_id] = title
+    return titles
 
 
 class ImageContextDomain:
@@ -46,6 +109,15 @@ class ImageContextDomain:
         # and previewing an image are actions like any other.
         self._task: str = ""
         self._preview: dict[str, Any] | None = None
+        # Per-replay summaries, keyed by the task and stamped with the file's
+        # own identity.  A stored replay carries every image's bytes, so parsing
+        # one costs seconds on a long task; reading all of them for a snapshot
+        # (and again for every image a window asks for) is what made the window
+        # sit on "loading" forever.
+        self._summaries: dict[str, tuple[tuple[int, int], dict[str, Any]]] = {}
+        # Codex's own title index, re-read only when that file changes.
+        self._titles: dict[str, str] = {}
+        self._titles_identity: tuple[int, int] | None = None
 
     # -- environment -------------------------------------------------------
     def _env(self) -> dict[str, str]:
@@ -56,6 +128,19 @@ class ImageContextDomain:
 
     def selection_dir(self) -> Path:
         return Path(_image_context.data_dir(self._env())) / "selection"
+
+    def thread_titles(self) -> dict[str, str]:
+        path = _codex_home(self._env()) / "session_index.jsonl"
+        try:
+            details = path.stat()
+        except OSError:
+            self._titles, self._titles_identity = {}, None
+            return {}
+        identity = (details.st_mtime_ns, details.st_size)
+        if identity != self._titles_identity:
+            self._titles = _read_thread_titles(self._env())
+            self._titles_identity = identity
+        return self._titles
 
     def environment(self) -> dict[str, Any]:
         env = self._env()
@@ -80,30 +165,54 @@ class ImageContextDomain:
         except OSError:
             return []
         tasks: list[dict[str, Any]] = []
+        titles = self.thread_titles()
+        seen: set[str] = set()
         for path in names[:_store.REPLAY_CACHE_MAX_TASKS]:
             task_id = path.stem
-            images = _store.load(task_id, self._env())
-            if not images:
+            try:
+                details = path.stat()
+            except OSError:
                 continue
+            # A replay is immutable in meaning but rewritten in place, so its own
+            # size and mtime are the identity of what was parsed from it.
+            identity = (details.st_mtime_ns, details.st_size)
+            cached = self._summaries.get(task_id)
+            if cached is None or cached[0] != identity:
+                images = _store.load(task_id, self._env())
+                if not images:
+                    self._summaries.pop(task_id, None)
+                    continue
+                cached = (
+                    identity,
+                    {
+                        "images": len(images),
+                        "bytes": sum(len(image.get("base64") or "") for image in images) * 3 // 4,
+                    },
+                )
+                self._summaries[task_id] = cached
+            seen.add(task_id)
+            summary = cached[1]
             selection = _image_context.read_selection(task_id, self._env())
             unchecked = selection.get("unchecked") or set()
             pinned = selection.get("pinned") or set()
             auto = selection.get("auto")
-            try:
-                updated = path.stat().st_mtime
-            except OSError:
-                updated = 0.0
             tasks.append(
                 {
                     "id": task_id,
-                    "images": len(images),
+                    # The name Codex shows for this thread; empty when the
+                    # index has no line for it, which the pane reads as
+                    # "name unknown" rather than inventing one.
+                    "title": titles.get(task_id, ""),
+                    "images": summary["images"],
                     "unchecked": len(unchecked),
                     "pinned": len(pinned),
                     "auto": auto if isinstance(auto, bool) else _image_context.mode(self._env()) == "auto",
-                    "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(updated)),
-                    "bytes": sum(len(image.get("base64") or "") for image in images) * 3 // 4,
+                    "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(details.st_mtime)),
+                    "bytes": summary["bytes"],
                 }
             )
+        for stale in [key for key in self._summaries if key not in seen]:
+            self._summaries.pop(stale, None)
         return tasks
 
     def state(self, task_id: str) -> dict[str, Any]:
@@ -164,8 +273,15 @@ class ImageContextDomain:
             "environment": self.environment(),
         }
 
-    def image(self, task_id: str, image_id: str) -> dict[str, Any]:
-        """One image's bytes, or its metadata when it is too large to send."""
+    def image(self, task_id: str, image_id: str, *, thumb: bool = False) -> dict[str, Any]:
+        """One image's bytes, ready to be drawn.
+
+        ``data_url`` is what a window shows: the stored bytes themselves while
+        they fit, and otherwise a scaled re-encoding (see ``_scaled``), so a
+        large original is never a refusal.  ``downscaled`` tells the caller the
+        picture it receives is not the stored one, which is the difference
+        between "this is the image" and "this is a smaller copy of it".
+        """
 
         task_id = self._require_task(task_id)
         for image in _store.load(task_id, self._env()):
@@ -176,22 +292,39 @@ class ImageContextDomain:
             if not isinstance(mime, str) or not isinstance(encoded, str) or not encoded:
                 raise DomainError("That image has no stored bytes")
             size = len(encoded) * 3 // 4
-            entry = {
+            data_url: str | None = None
+            width = image.get("width")
+            height = image.get("height")
+            downscaled = False
+            # A thumbnail is scaled whenever it is bigger than a card, even
+            # while the stored bytes would fit a message: what the caller asked
+            # for is a small picture, not the stored one.
+            if thumb and (size > THUMB_BUDGET_BYTES or max(int(width or 0), int(height or 0)) > THUMB_LONG_EDGE):
+                scaled = _scaled(encoded, THUMB_LONG_EDGE, THUMB_BUDGET_BYTES)
+                if scaled is not None:
+                    data_url, width, height = scaled
+                    downscaled = True
+                else:
+                    data_url = f"data:{mime};base64,{encoded}" if size <= MAX_PREVIEW_BYTES else None
+            elif size <= MAX_PREVIEW_BYTES:
+                data_url = f"data:{mime};base64,{encoded}"
+            else:
+                scaled = _scaled(encoded)
+                if scaled is not None:
+                    data_url, width, height = scaled
+                    downscaled = True
+            return {
                 "task": task_id,
                 "id": image_id,
                 "mime": mime,
                 "bytes": size,
-                "width": image.get("width"),
-                "height": image.get("height"),
+                "width": width,
+                "height": height,
                 "turn": image.get("turn"),
                 "name": image.get("name"),
-                "data_url": (
-                    f"data:{mime};base64,{encoded}"
-                    if size <= MAX_PREVIEW_BYTES
-                    else None
-                ),
+                "data_url": data_url,
+                "downscaled": downscaled,
             }
-            return entry
         raise DomainError(f"{image_id} is not an image of this task")
 
     # -- writes ------------------------------------------------------------
@@ -212,12 +345,6 @@ class ImageContextDomain:
             if not isinstance(pinned, bool):
                 raise DomainError("An image pin must be on or off")
             self._write_pin(task_id, image_id, pinned=pinned)
-        elif name in {"auto", "set_auto"}:
-            task_id = str(data.get("task") or "").strip()
-            enabled = data.get("enabled")
-            if not isinstance(enabled, bool):
-                raise DomainError("Automatic selection must be on or off")
-            self._write_auto(task_id, enabled)
         elif name in {"open", "select_task"}:
             task_id = str(data.get("task") or "").strip()
             self._require_task(task_id)
@@ -227,16 +354,23 @@ class ImageContextDomain:
             task_id = str(data.get("task") or "").strip() or self._task
             image_id = str(data.get("id") or "").strip()
             self._task = task_id
-            self._preview = self.image(task_id, image_id)
+            # The snapshot says *which* image is open and how big it is; the
+            # bytes are asked for by id on their own read.  A snapshot is
+            # broadcast to every window and redacted field by field, so a
+            # picture inside one would be re-encoded as a string on every
+            # revision and every window would pay for it.
+            entry = self.image(task_id, image_id)
+            entry.pop("data_url", None)
+            self._preview = entry
         elif name in {"close_preview", "hide"}:
             self._preview = None
         elif name in {"forget", "delete"}:
             task_id = str(data.get("task") or "").strip()
             self._require_task(task_id)
-            try:
-                (self.cache_dir() / f"{task_id}.json").unlink()
-            except OSError as error:
-                raise DomainError("That task's replay could not be removed") from error
+            # The file copies are part of the record: leaving them for the next
+            # sweep kept a forgotten task's pictures readable for up to a day.
+            if not _store.forget(task_id, self._env()):
+                raise DomainError("That task's replay could not be removed")
         elif name in {"reload", "refresh"}:
             pass
         else:
@@ -245,20 +379,50 @@ class ImageContextDomain:
         return self.snapshot()
 
     def _selection(self, task_id: str) -> dict[str, Any]:
-        selection = _image_context.read_selection(task_id, self._env())
-        return {
-            "threadId": task_id,
-            "unchecked": {
-                image_id: {"id": image_id, "at": _now()}
-                for image_id in sorted(selection.get("unchecked") or set())
-            },
-            "pinned": {
-                image_id: {"id": image_id, "at": _now()}
-                for image_id in sorted(selection.get("pinned") or set())
-            },
-            **({"auto": True} if selection.get("auto") is True else {}),
-            **({"auto": False} if selection.get("auto") is False else {}),
-        }
+        """The selection document to write back, with Context Attachment Manager's
+        own keys left where they are.
+
+        This app owns only the two image maps.  ``auto``, ``autoAt``,
+        ``autoSince`` and anything a newer release adds belong to that panel,
+        and a rewrite that rebuilt the file dropped them: the switch shown in
+        its panel, the fork rule that reads ``autoAt``, and the copy rule that
+        reads ``autoSince`` all changed under the user.  A mark that is already
+        there keeps its own timestamp for the same reason -- a fork compares
+        those stamps against the moment it was made.
+        """
+
+        document: dict[str, Any] = {}
+        try:
+            with open(
+                _image_context._thread_state_path(task_id, self._env()),
+                "r",
+                encoding="utf-8",
+            ) as handle:
+                loaded = json.load(handle)
+            if isinstance(loaded, dict):
+                document = dict(loaded)
+        except (OSError, ValueError):
+            document = {}
+
+        def marks(key: str) -> dict[str, Any]:
+            raw = document.get(key)
+            if not isinstance(raw, dict):
+                return {}
+            found: dict[str, Any] = {}
+            for image_id, entry in raw.items():
+                if not isinstance(image_id, str):
+                    continue
+                found[image_id] = (
+                    entry
+                    if isinstance(entry, dict)
+                    else {"id": image_id, "at": _now()}
+                )
+            return found
+
+        document["threadId"] = task_id
+        document["unchecked"] = marks("unchecked")
+        document["pinned"] = marks("pinned")
+        return document
 
     def _write(self, task_id: str, selection: dict[str, Any]) -> None:
         directory = self.selection_dir()
@@ -307,22 +471,17 @@ class ImageContextDomain:
             selection["unchecked"].pop(image_id, None)
         self._write(task_id, selection)
 
-    def _write_auto(self, task_id: str, enabled: bool) -> None:
-        task = self._require_task(task_id)
-        selection = self._selection(task_id)
-        selection["auto"] = enabled
-        selection["autoAt"] = _now()
-        self._write(task_id, selection)
-
     # -- helpers -----------------------------------------------------------
     def _require_task(self, task_id: str) -> str:
         safe = _image_context._safe_thread_file_name(task_id)
         if not safe:
             raise DomainError("That task cannot be named")
-        for entry in self.tasks():
-            if entry["id"] == safe:
-                return safe
-        raise DomainError("That task has no stored images")
+        # The name is checked against the cache itself, not against a listing:
+        # listing loads every replay, which is the whole cost this guard must
+        # never pay on the path that serves one picture.
+        if not (self.cache_dir() / f"{safe}.json").is_file():
+            raise DomainError("That task has no stored images")
+        return safe
 
     def snapshot(self) -> dict[str, Any]:
         tasks = self.tasks()
@@ -359,6 +518,42 @@ class ImageContextDomain:
     def apply(self, payload: object | None = None) -> dict[str, Any]:
         del payload
         return {}
+
+
+def _scaled(
+    encoded: str,
+    long_edge: int = PREVIEW_LONG_EDGE,
+    budget: int = PREVIEW_BUDGET_BYTES,
+) -> tuple[str, int, int] | None:
+    """A drawable copy of one oversized image, or None when it cannot be made.
+
+    Pillow ships with the runtime the app installs (LiteLLM pulls it in), so a
+    full-size picture is scaled here rather than refused.  A source checkout
+    may not have it, and a decode can fail on bytes the pass stored anyway:
+    both answer None, and the caller states plainly that the image is on disk
+    instead of pretending a window failed.
+    """
+
+    try:
+        from PIL import Image
+    except Exception:
+        return None
+    try:
+        raw = base64.b64decode(encoded, validate=False)
+        with Image.open(io.BytesIO(raw)) as source:
+            picture = source.convert("RGB") if source.mode not in {"RGB", "L"} else source
+            picture.thumbnail((long_edge, long_edge))
+            width, height = picture.size
+            payload = b""
+            for quality in (86, 78, 70):
+                buffer = io.BytesIO()
+                picture.save(buffer, format="JPEG", quality=quality, optimize=True)
+                payload = buffer.getvalue()
+                if len(payload) <= budget:
+                    break
+        return "data:image/jpeg;base64," + base64.b64encode(payload).decode("ascii"), width, height
+    except Exception:
+        return None
 
 
 def build(environ: Mapping[str, str] | None = None) -> ImageContextDomain:

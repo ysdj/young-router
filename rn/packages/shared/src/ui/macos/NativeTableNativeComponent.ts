@@ -33,6 +33,10 @@ export interface NativeTableProps extends ViewProps {
   preserveColumnWidths?: WithDefault<boolean, false>;
   scrollTrailingColumnOverflow?: WithDefault<boolean, true>;
   disabledRowKeys?: ReadonlyArray<string>;
+  // A row's own second line: a source list that names its entries by title and
+  // dates them underneath asks for a two-line row, and an empty entry keeps the
+  // single-line rhythm for the rows that have nothing to add.
+  rowDetails?: ReadonlyArray<string>;
   secondaryCellKeys?: ReadonlyArray<string>;
   alertRowKeys?: ReadonlyArray<string>;
   spanningRowKeys?: ReadonlyArray<string>;

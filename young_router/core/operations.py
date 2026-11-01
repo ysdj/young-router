@@ -27,6 +27,7 @@ import tempfile
 import urllib.error
 import urllib.request
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from ..browser_identity import browser_request_headers
@@ -86,6 +87,7 @@ _RUNTIME_SETTINGS_PROCESS_AUTHORITATIVE_KEYS = frozenset(
         # forgot to unset an old one".
         "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_ENABLED",
         "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_MODE",
+        "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_INSIDE_TURN",
         "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_KEEP_RECENT",
         "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_MIN_BYTES",
         "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_DATA_DIR",
@@ -446,10 +448,35 @@ class CoreServiceController:
         Both workers publish their own loopback address under distinct variable
         names, so the fragments never collide and the proxy child can resolve
         whichever route's ``os.environ/`` reference a config names.
+
+        Under ``autostart`` each fragment has to wait for its own worker to
+        report readiness before it can answer, and those two waits are
+        independent -- a different worker, a different lock, different
+        variables.  Asking for them one after the other put their *sum* on the
+        proxy's start, which is the longest serial stretch this side adds to
+        it.  They are asked together instead, so the start pays the slower
+        worker rather than both.
         """
 
-        environment = self._workbuddy_environment(autostart=autostart)
-        environment.update(self._our_free_model_environment(autostart=autostart))
+        workers = (self._workbuddy_environment, self._our_free_model_environment)
+        if not autostart:
+            # Nothing waits on this path: each fragment is a recorded value or
+            # empty, so the threads would only add overhead to a status read.
+            environment = self._workbuddy_environment(autostart=False)
+            environment.update(self._our_free_model_environment(autostart=False))
+            return environment
+
+        # Each fragment reports its own failure by answering empty, so there is
+        # nothing to re-raise here: a worker that cannot start costs its own
+        # routes and never the other lane's.  The results are merged in the
+        # submitted order, the same one the sequential form used.
+        with ThreadPoolExecutor(
+            max_workers=len(workers), thread_name_prefix="managed-worker"
+        ) as pool:
+            futures = [pool.submit(worker, autostart=True) for worker in workers]
+        environment: dict[str, str] = {}
+        for future in futures:
+            environment.update(future.result())
         return environment
 
     def _invalidate_status_cache(self) -> None:

@@ -52,6 +52,10 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 IMAGE_CONTEXT_ENABLED_ENV = "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_ENABLED"
 IMAGE_CONTEXT_MODE_ENV = "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_MODE"
 IMAGE_CONTEXT_KEEP_RECENT_ENV = "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_KEEP_RECENT"
+# How much of the turn being answered this pass may take: ``turn`` (the default)
+# reaches the tool results inside it, ``history`` keeps the older rule that a
+# turn is one unit.
+IMAGE_CONTEXT_INSIDE_TURN_ENV = "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_INSIDE_TURN"
 IMAGE_CONTEXT_DATA_DIR_ENV = "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_DATA_DIR"
 IMAGE_CONTEXT_MIN_BYTES_ENV = "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_MIN_BYTES"
 # How the model fetches an omitted image back.  ``path`` writes each image to a
@@ -65,6 +69,11 @@ IMAGE_CONTEXT_FETCH_DEFAULT = "auto"
 IMAGE_CONTEXT_FETCH_VALUES = ("auto", "path", "stdio", "http", "off")
 IMAGE_CONTEXT_MODE_DEFAULT = "auto"
 IMAGE_CONTEXT_MODE_VALUES = ("auto", "manual")
+IMAGE_CONTEXT_INSIDE_TURN_DEFAULT = "turn"
+IMAGE_CONTEXT_INSIDE_TURN_VALUES = ("turn", "history")
+# A tool result that names the picture the model is working from.  Lengths are
+# not a guard here: a turn whose newest picture is its only one is left alone by
+# the loop's own floor, not by refusing to look at the newest result at all.
 IMAGE_CONTEXT_KEEP_RECENT_DEFAULT = 0
 # Images below this size are cheaper inline than as a placeholder plus a later
 # fetch, so they are left alone even when they age out.
@@ -130,7 +139,10 @@ _WORDS: Dict[str, Dict[str, Any]] = {
         "auto_note": (
             "上下文管理说明（来自用户安装的上下文素材管理工具）：这个任务开着“自动选图”。"
             "为了节省上下文，之前各轮的图片默认不再随请求提供，它们原来的位置换成了"
-            "“[图片 IMG-xxx 已省略…]”这样的占位文字；本轮新出现的图片照常提供。\n"
+            "“[图片 IMG-xxx 已省略…]”这样的占位文字。这个任务只有一轮时，"
+            "本轮里的工具结果图片也按同样的规则省略，只留其中一张；"
+            "用户在本轮附上的图从不动，照常提供。被省略的那张要看时，"
+            "按占位文字里的编号取回即可。\n"
             "这些图片在它们出现的那一轮真实存在，你当时收到并看过；你之前对它们的描述，"
             "以及据此做出的判断，都是看着原图做出的，仍然有效。不要因为现在看不到，就认为"
             "之前的回答是猜测或错误，也不要收回或道歉。\n"
@@ -143,7 +155,10 @@ _WORDS: Dict[str, Dict[str, Any]] = {
         "auto_ask_note": (
             "上下文管理说明（来自用户安装的上下文素材管理工具）：这个任务开着“自动选图”。"
             "为了节省上下文，之前各轮的图片默认不再随请求提供，它们原来的位置换成了"
-            "“[图片 IMG-xxx 已省略…]”这样的占位文字；本轮新出现的图片照常提供。\n"
+            "“[图片 IMG-xxx 已省略…]”这样的占位文字。这个任务只有一轮时，"
+            "本轮里的工具结果图片也按同样的规则省略，只留其中一张；"
+            "用户在本轮附上的图从不动，照常提供。被省略的那张要看时，"
+            "按占位文字里的编号取回即可。\n"
             "这些图片在它们出现的那一轮真实存在，你当时收到并看过；你之前对它们的描述，"
             "以及据此做出的判断，都是看着原图做出的，仍然有效。不要因为现在看不到，就认为"
             "之前的回答是猜测或错误，也不要收回或道歉。\n"
@@ -155,7 +170,10 @@ _WORDS: Dict[str, Dict[str, Any]] = {
         "auto_file_note": (
             "上下文管理说明（来自用户安装的上下文素材管理工具）：这个任务开着“自动选图”。"
             "为了节省上下文，之前各轮的图片默认不再随请求提供，它们原来的位置换成了"
-            "“[图片 IMG-xxx 已省略…]”这样的占位文字；本轮新出现的图片照常提供。\n"
+            "“[图片 IMG-xxx 已省略…]”这样的占位文字。这个任务只有一轮时，"
+            "本轮里的工具结果图片也按同样的规则省略，只留其中一张；"
+            "用户在本轮附上的图从不动，照常提供。被省略的那张要看时，"
+            "按占位文字里的编号取回即可。\n"
             "这些图片在它们出现的那一轮真实存在，你当时收到并看过；你之前对它们的描述，"
             "以及据此做出的判断，都是看着原图做出的，仍然有效。不要因为现在看不到，就认为"
             "之前的回答是猜测或错误，也不要收回或道歉。\n"
@@ -221,8 +239,11 @@ _WORDS: Dict[str, Dict[str, Any]] = {
             "Context management note (from the context attachment tool the user "
             "installed): automatic image selection is on for this task. To save "
             "context, images from earlier turns are not provided by default and "
-            "their place appear as text like \"[Image IMG-xxx omitted …]\". Images "
-            "new in this turn are provided as usual.\n"
+            "their place appear as text like \"[Image IMG-xxx omitted …]\". When "
+            "this task has a single turn, the tool results inside that turn are "
+            "omitted by the same rule and one of them is kept; an image the user "
+            "attached to this turn is never touched and is provided as usual. "
+            "Fetch an omitted one by the id its placeholder names.\n"
             "Those images did exist in the turn they appeared in and you did "
             "receive and see them; what you described, and the judgements you made "
             "from it, were made looking at the original and still hold. Do not treat "
@@ -241,8 +262,11 @@ _WORDS: Dict[str, Dict[str, Any]] = {
             "Context management note (from the context attachment tool the user "
             "installed): automatic image selection is on for this task. To save "
             "context, images from earlier turns are not provided by default and "
-            "their place holds text like \"[Image IMG-xxx omitted …]\"; images new "
-            "in this turn are provided as usual.\n"
+            "their place holds text like \"[Image IMG-xxx omitted …]\". When "
+            "this task has a single turn, the tool results inside that turn are "
+            "omitted by the same rule and one of them is kept; an image the user "
+            "attached to this turn is never touched and is provided as usual. "
+            "Fetch an omitted one by the id its placeholder names.\n"
             "Those images did exist in the turn they appeared in and you did "
             "receive and see them; what you described, and the judgements you made "
             "from it, were made looking at the original and still hold. Do not "
@@ -258,8 +282,11 @@ _WORDS: Dict[str, Dict[str, Any]] = {
             "Context management note (from the context attachment tool the user "
             "installed): automatic image selection is on for this task. To save "
             "context, images from earlier turns are not provided by default and "
-            "their place appear as text like \"[Image IMG-xxx omitted …]\". Images "
-            "new in this turn are provided as usual.\n"
+            "their place appear as text like \"[Image IMG-xxx omitted …]\". When "
+            "this task has a single turn, the tool results inside that turn are "
+            "omitted by the same rule and one of them is kept; an image the user "
+            "attached to this turn is never touched and is provided as usual. "
+            "Fetch an omitted one by the id its placeholder names.\n"
             "Those images did exist in the turn they appeared in and you did "
             "receive and see them; what you described, and the judgements you made "
             "from it, were made looking at the original and still hold. Do not "
@@ -333,6 +360,18 @@ def keep_recent(environ: Optional[Mapping[str, str]] = None) -> int:
     env = os.environ if environ is None else environ
     return _as_int(
         env.get(IMAGE_CONTEXT_KEEP_RECENT_ENV), IMAGE_CONTEXT_KEEP_RECENT_DEFAULT
+    )
+
+
+def inside_turn(environ: Optional[Mapping[str, str]] = None) -> str:
+    """Whether a task's own turn is reachable, or only the turns before it."""
+
+    env = os.environ if environ is None else environ
+    value = str(env.get(IMAGE_CONTEXT_INSIDE_TURN_ENV) or "").strip().lower()
+    return (
+        value
+        if value in IMAGE_CONTEXT_INSIDE_TURN_VALUES
+        else IMAGE_CONTEXT_INSIDE_TURN_DEFAULT
     )
 
 
@@ -476,8 +515,10 @@ def read_selection(
     """Read Context Attachment Manager's selection for one task.
 
     Only the keys this pass understands are read: ``unchecked`` (ids the user
-    turned off) and ``pinned`` (ids the user wants every turn).  A missing or
-    unreadable file is not an error -- it means "let the mode decide".
+    turned off), ``pinned`` (ids the user wants every turn), and ``auto`` (the
+    task's own automatic-selection switch, set in that project's panel).  A
+    missing or unreadable file is not an error -- it means "let the mode
+decide".
     """
 
     if not _safe_thread_file_name(thread_id):
@@ -585,6 +626,13 @@ _OPEN_TAG = re.compile(r'^<image name=(\[Image #\d+\]) path="(.*)">$', re.S)
 _CLOSE_TAG = re.compile(r"^</image>$")
 
 
+# Items the assistant produces.  A picture that comes after the last of these
+# has not been in front of the model yet, in any request of this turn.
+_ASSISTANT_ITEMS = frozenset(
+    {"function_call", "custom_tool_call", "local_shell_call", "computer_call"}
+)
+
+
 class _Found:
     """One image occurrence in a replay."""
 
@@ -604,6 +652,7 @@ class _Found:
         "kind",
         "name",
         "turn",
+        "unseen",
     )
 
     def __init__(self, **fields: Any) -> None:
@@ -637,6 +686,48 @@ def _kind_of(item_type: Optional[str], role: Any) -> str:
     return "tool"
 
 
+_VISIBLE_PICTURES_ENV = "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_VISIBLE_PICTURES"
+_VISIBLE_PICTURES_DEFAULT = 24
+_VISIBLE_TOKENS_ENV = "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_VISIBLE_TOKENS"
+_VISIBLE_TOKENS_DEFAULT = 30_000
+# The same pricing ``context_window`` uses to decide whether a request fits, so
+# the two passes agree on what a picture costs instead of one trusting bytes and
+# the other trusting pixels.
+_PICTURE_PIXELS_PER_TOKEN = 750
+_PICTURE_TILE_OVERHEAD_TOKENS = 85
+
+
+def _picture_tokens(image: Any) -> int:
+    """What one picture is expected to cost the route, in tokens."""
+
+    width = getattr(image, "width", None)
+    height = getattr(image, "height", None)
+    if isinstance(width, int) and isinstance(height, int) and width > 0 and height > 0:
+        return width * height // _PICTURE_PIXELS_PER_TOKEN + _PICTURE_TILE_OVERHEAD_TOKENS
+    raw = getattr(image, "raw", b"") or b""
+    return int(len(raw) / 2.5)
+
+
+def _visible_tokens() -> int:
+    """How many picture tokens of the turn stay visible at once."""
+
+    try:
+        value = int(os.environ.get(_VISIBLE_TOKENS_ENV, ""))
+    except (TypeError, ValueError):
+        return _VISIBLE_TOKENS_DEFAULT
+    return value if value >= 0 else _VISIBLE_TOKENS_DEFAULT
+
+
+def _visible_pictures() -> int:
+    """How many pictures of the turn being answered stay visible at once."""
+
+    try:
+        value = int(os.environ.get(_VISIBLE_PICTURES_ENV, ""))
+    except (TypeError, ValueError):
+        return _VISIBLE_PICTURES_DEFAULT
+    return value if value >= 0 else _VISIBLE_PICTURES_DEFAULT
+
+
 def scan(
     input_items: Any,
     *,
@@ -652,6 +743,21 @@ def scan(
     if not isinstance(input_items, list):
         return []
     found: List[_Found] = []
+    # A picture is *unseen* when it sits after the last item the assistant
+    # produced.  The assistant has not answered since, so no earlier request of
+    # this turn can have carried those bytes to it: replacing such a picture
+    # with a placeholder takes away the only view the model would ever get of
+    # it, and the client then fetches the same picture again and again (a batch
+    # of twelve views turned into twelve steps of one).  The flag is derived
+    # from the request itself, so it stays a pure function of the replay.
+    last_answer = -1
+    for index, item in enumerate(input_items):
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "message" and item.get("role") == "assistant":
+            last_answer = index
+        elif item.get("type") in _ASSISTANT_ITEMS:
+            last_answer = index
     turn = 0
     for index, item in enumerate(input_items):
         if not isinstance(item, dict):
@@ -677,6 +783,7 @@ def scan(
                     data=data,
                     turn=turn,
                     kind="generated",
+                    unseen=index > last_answer,
                 )
             )
             continue
@@ -730,6 +837,7 @@ def scan(
                         turn=turn,
                         kind="tool",
                         name=name,
+                        unseen=index > last_answer,
                     )
                 )
                 continue
@@ -745,6 +853,7 @@ def scan(
                     turn=turn,
                     kind=_kind_of(item.get("type"), item.get("role")),
                     name=name,
+                    unseen=index > last_answer,
                 )
             )
     return found
@@ -777,6 +886,7 @@ def _found_image(
     turn: int,
     kind: str,
     name: Optional[str] = None,
+    unseen: bool = False,
 ) -> _Found:
     mime, raw = data
     width, height = _image_size(raw)
@@ -797,6 +907,7 @@ def _found_image(
         kind=kind,
         name=name,
         turn=turn,
+        unseen=unseen,
     )
 
 
@@ -1003,7 +1114,7 @@ def rewrite_for_size(
     Unlike the setting, this pass also reaches the images of the turn being
     answered, all but the newest result's, because a task with one user message
     keeps every picture it ever viewed in that one turn (see
-    ``newest_picture_item`` in ``_rewrite``).
+    ``newest_picture_item`` / ``keep_picture_item`` in ``_rewrite``).
     """
 
     return _rewrite(request_kwargs, forced=True, keep=keep)
@@ -1106,18 +1217,102 @@ def _rewrite(
     current_turn = _turn_count(input_items)
     keep = keep_recent() if keep is None else keep
     minimum = min_bytes()
-    # Size mode also reaches the images inside the turn being answered, because
-    # a Codex task *is* one turn: a single user message followed by hundreds of
-    # steps, and every ``view_image`` result of it stays in that one turn for
-    # ever.  A pass that only omitted earlier turns' images was therefore inert
-    # on exactly the thread that needed it -- one real task replayed 74 pictures
+    # A Codex task *is* one turn: a single user message followed by hundreds of
+    # steps, and every ``view_image`` result of it stays inside that one turn for
+    # ever.  A pass that only reached earlier turns was therefore inert on
+    # exactly the thread that needed it -- one real task replayed 74 pictures
     # (50.4 MB of base64) on every step until the upstream refused the prompt as
-    # too long, and the router had no rewrite left to answer with.  What is
-    # never omitted is the newest result that carries a picture: that is the one
-    # the model just asked to look at, and every older copy is still reachable
-    # through the id its placeholder names (``image_for_turn``) or that file.
-    newest_picture_item = max(image.item for image in images) if forced else None
-
+    # too long.  Size mode always reached that far; the setting now does too, so
+    # a turn that keeps calling ``view_image`` stops paying for the same
+    # pictures on the request that follows.
+    #
+    # What the turn's own upload is exempt from, and why: it is the picture the
+    # user just attached and the one the task is about, the note below promises
+    # it is provided as usual, and a model shown a placeholder for it on the very
+    # first request would answer about an image it never saw.
+    #
+    # Which tool result stays is decided by the *cache*, not by recency.  Keeping
+    # "the newest picture" moves the kept picture forward on every step, so the
+    # step that adds a result rewrites an item that was already on the wire and
+    # the upstream re-reads everything after it: measured on a real 20-image
+    # replay, a request shared only 85.8% of its bytes with the one before it.
+    # Keeping the *oldest* result that is still inside the turn instead means an
+    # item is written once and never touched again, so every later step shares a
+    # prefix back to that item.  What the model still needs is never more than
+    # one fetch away: a placeholder names its id and the fetch tool answers it,
+    # and the newest picture is delivered as the result of the call that just
+    # returned it, which no later request can take away.
+    inside = inside_turn() == "turn"
+    # Which picture inside the turn being answered survives.  It is the *oldest*
+    # tool result of that turn, deliberately, and both passes use it:
+    #
+    # * The setting's own pass needs it because a kept picture that moves forward
+    #   with every step rewrites an item already on the wire, and the upstream
+    #   then re-reads every byte after it.  Measured on a real 20-image replay, a
+    #   request shared only 85.8% of its prefix with the one before it.
+    # * Size mode needs the same anchor for a sharper reason: the two passes run
+    #   on the same request (this one fixes what it can, ``context_window`` then
+    #   shrinks again if the route still refuses), and an anchor chosen
+    #   differently by each means the second pass rewrites what the first just
+    #   stabilised.  Measured on a live thread, that kept the hit rate at 89-96%
+    #   when the image pass alone held it at 100%.
+    #
+    # ``None`` means every tool result of the turn is still sent (nothing to
+    # anchor on); size mode then falls back to the newest picture overall, which
+    # is what it did before and is still the best single survivor there.
+    in_turn_tool_pictures = [
+        image.item
+        for image in images
+        if image.copy_of is None
+        and image.kind != "upload"
+        and image.turn >= current_turn
+    ]
+    keep_picture_item = min(in_turn_tool_pictures) if in_turn_tool_pictures else None
+    # Pictures of the turn being answered stay visible for a while, not for a
+    # single step.  Retiring one as soon as the next request carries it makes the
+    # model work from placeholders: a design task that had just looked at a dozen
+    # pages found "many images as placeholders", started stitching contact sheets
+    # of its own and asked for one page per step.  The window keeps the newest
+    # ``_VISIBLE_PICTURES`` of the turn visible and retires the rest, which still
+    # bounds the request: what a step adds is one picture, what it drops is the
+    # one that fell out of the window.
+    # A count is the wrong unit: ten thumbnails and ten 2240x3040 scans differ by
+    # an order of magnitude in bytes and in the tokens the route charges for
+    # them.  The window is therefore a budget of estimated picture tokens, taken
+    # newest first, capped by a count so a step that renders fifty tiny icons
+    # cannot fill the request either.
+    visible_window = set()
+    if in_turn_tool_pictures:
+        by_item = {
+            image.item: image
+            for image in images
+            if image.copy_of is None
+            and image.kind != "upload"
+            and image.turn >= current_turn
+        }
+        budget = _visible_tokens()
+        spent = 0
+        # A budget of zero is the setting with no window at all: every picture of
+        # the turn but its first is retired, which is what the size repair wants.
+        candidates = sorted(in_turn_tool_pictures, reverse=True) if budget > 0 else []
+        for item in candidates:
+            picture = by_item.get(item)
+            cost = _picture_tokens(picture)
+            if visible_window and spent + cost > budget:
+                break
+            visible_window.add(item)
+            spent += cost
+            if len(visible_window) >= _visible_pictures():
+                break
+    if not forced and keep_picture_item is not None and len(in_turn_tool_pictures) < 2:
+        # Leaving the only picture of the turn alone is the setting's rule; size
+        # mode has no such choice to make.
+        keep_picture_item = None
+    newest_picture_item = (
+        max(image.item for image in images)
+        if forced and images and keep_picture_item is None
+        else None
+    )
     thread_id = _thread_id(request_kwargs)
     selection = read_selection(thread_id)
     auto = selection.get("auto")
@@ -1134,7 +1329,39 @@ def _rewrite(
         image_id = image.image_id or ""
         in_mutable = image.item >= mutable_from
         aged = image.turn < current_turn and (current_turn - image.turn) > keep
-        if newest_picture_item is not None and image.item < newest_picture_item:
+        if (
+            forced
+            and newest_picture_item is not None
+            and image.item < newest_picture_item
+            # Size mode has the same duty as the setting: a picture no request
+            # has carried yet must reach the model at least once, or "fetch by
+            # id" becomes the only way to see the page it just rendered.
+            and not image.unseen
+        ):
+            aged = True
+        # The turn being answered: its tool results are omitted inside it, its
+        # upload is not.  ``in_current_turn`` also decides which placeholder
+        # wording is honest -- a picture this same turn produced was seen in this
+        # turn, not an earlier one.
+        in_current_turn = image.turn >= current_turn and current_turn > 0
+        # A picture the model has not been shown yet is never replaced by a
+        # placeholder -- unless a byte-identical copy earlier in this same
+        # request already carries the same content, in which case the model is
+        # looking straight at it.
+        twin_already_sent = (image.content_id or "") in sent_content
+        blindable = not image.unseen or twin_already_sent
+        if (
+            image.copy_of is None
+            and image.kind != "upload"
+            and keep_picture_item is not None
+            and image.item != keep_picture_item
+            # Size mode is the repair for a route that already refused, so it
+            # retires freely; the window belongs to the setting's own pass, whose
+            # job is to keep the model looking at what it just worked on.
+            and (forced or image.item not in visible_window)
+            and (forced or (inside and in_current_turn))
+            and blindable
+        ):
             aged = True
         big = len(image.raw) >= minimum
         if image_id in pinned:
@@ -1174,9 +1401,11 @@ def _rewrite(
         _FILE_PATHS.update(_store_module.paths(thread_id))
 
     # Byte-identical images are one content: when a content would be omitted
-    # everywhere, its newest copy stays sent and the older ones point at it.  A
-    # duplicate placeholder names a copy the model can still see; when there is
-    # no such copy the content is simply not in the request.
+    # everywhere, one copy stays sent and the others point at it.  Which copy is
+    # ``min`` and not ``max`` for the same reason the turn keeps its first
+    # picture: the newest copy moves forward on every step, so its placeholder
+    # elsewhere in the replay has to be rewritten to name it, and each rewrite
+    # is a prefix the upstream re-reads.  The *oldest* copy never moves.
     for content_id in {image.content_id for image in omitted if image.copy_of is None}:
         if content_id in sent_content:
             continue
@@ -1187,9 +1416,9 @@ def _rewrite(
         ]
         if len(copies) < 2:
             continue
-        newest = max(copies, key=lambda image: image.item)
-        omitted = [image for image in omitted if image is not newest]
-        sent_content[content_id or ""] = newest
+        anchor = min(copies, key=lambda image: image.item)
+        omitted = [image for image in omitted if image is not anchor]
+        sent_content[content_id or ""] = anchor
     if not omitted:
         # Every image was either in the turn being answered, pinned, or below
         # the byte floor.  This is the one decline that depends on the replay's
@@ -1198,7 +1427,14 @@ def _rewrite(
             request_kwargs,
             "no_image_old_enough"
             if not any(
-                image.turn < current_turn and len(image.raw) >= minimum
+                (image.turn < current_turn and len(image.raw) >= minimum)
+                or (
+                    image.turn >= current_turn
+                    and image.kind != "upload"
+                    and keep_picture_item is not None
+                    and image.item != keep_picture_item
+                    and len(image.raw) >= minimum
+                )
                 for image in images
             )
             else "nothing_omitted",

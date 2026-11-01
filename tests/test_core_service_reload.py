@@ -330,6 +330,61 @@ class CoreServiceReloadTests(unittest.TestCase):
             self.assertFalse(snapshot["drafts"]["codex"]["dirty"])
             self.assertTrue(snapshot["domains"]["codex"]["uses_local_api"])
 
+    def test_a_start_that_is_already_serving_stops_saying_starting(self) -> None:
+        """A start has no earlier proxy, so its own running answer is the truth.
+
+        A start's dispatch keeps the store busy until its follow-up work (the
+        Codex endpoint rewrite, under the same lock) returns, and a window asks
+        for snapshots the whole time.  While that count is held the projection
+        deliberately keeps a planned *replacement*'s announcement standing; a
+        start has no earlier proxy a running reading could be hiding, so the
+        same rule left a proxy that already answered ``/health/liveliness``
+        described as 启动中, with no pid, for as long as the follow-up ran --
+        and a window whose re-read outlived the host's request budget had the
+        Core replaced under it.  The start's own running answer is projected;
+        a failing or foreign reading still leaves the announcement standing.
+        """
+
+        started = threading.Event()
+        release = threading.Event()
+        readings = {"state": "stopped"}
+
+        def start_service(_operation: str) -> dict[str, object]:
+            started.set()
+            self.assertTrue(release.wait(5.0))
+            readings["state"] = "running"
+            return {"state": "running", "pid": 4242, "port": 49173}
+
+        core = CoreStore(
+            domains=[ProvidersModelsDomain(Path(tempfile.mkdtemp()) / "config.yaml")],
+            service_handlers={
+                "start": start_service,
+                "status": lambda _operation: dict(readings, pid=4242, port=49173),
+            },
+        )
+        worker = threading.Thread(
+            target=lambda: core.dispatch({"type": "service.start"}),
+            daemon=True,
+        )
+        worker.start()
+        self.assertTrue(started.wait(5.0))
+
+        # The child is not up yet: the announcement stays exactly as published.
+        self.assertEqual("stopped", readings["state"])
+        self.assertEqual("starting", core.snapshot()["service"]["state"])
+
+        # It came up, and the start is still finishing its own work.
+        readings["state"] = "running"
+        serving = core.snapshot()["service"]
+        self.assertEqual("running", serving["state"])
+        self.assertEqual(4242, serving["pid"])
+        self.assertEqual(49173, serving["port"])
+
+        release.set()
+        worker.join(5.0)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual("running", core.snapshot()["service"]["state"])
+
     def test_a_planned_restart_keeps_the_rest_of_the_service_record(self) -> None:
         """A replacement is a claim about the process, not about the record.
 

@@ -33,13 +33,21 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 TRACE_EVENT = "codex_context_window_elided"
 RETRY_TRACE_EVENT = "codex_context_window_shrink_retry"
 
-#: What one inline image byte costs in the worst accounting a relay can use.
-#: A token counter prices an image at a few tokens; a relay that measures the
-#: prompt it receives prices the base64 it is actually sent.  Both are real --
-#: a thread with 93 images was reported as 298k of a 950k window by the token
-#: counter and refused by the upstream for the 37.5 MB body.  Charging images
-#: at the pessimists' rate is what keeps the two verdicts from diverging.
+#: What one inline image byte costs when its own dimensions cannot be read.
+#: A token counter prices an image from its size in pixels; a relay that
+#: measures the prompt it receives prices the base64 it is actually sent.  Both
+#: are real -- a thread with 93 images was reported as 298k of a 950k window by
+#: the token counter and refused by the upstream for the 37.5 MB body.  This
+#: rate is the fallback for the second case, and it is deliberately the
+#: pessimist's: it is used to decide whether a *token* window could be exceeded,
+#: so overestimating costs a rewrite that was not needed (see
+#: ``_image_token_estimate``).
 _IMAGE_BYTES_PER_TOKEN = 2.5
+
+#: Pixels one token buys in a vision model's own accounting, and the per-image
+#: overhead of the tiles an image is cut into.
+_IMAGE_PIXELS_PER_TOKEN = 750
+_IMAGE_TILE_OVERHEAD_TOKENS = 85
 
 #: Base64 costs a third more than the bytes it encodes.
 _BASE64_OVERHEAD = 4 / 3
@@ -462,6 +470,7 @@ def retry_for_refusal(
             target=measured or 0,
             model=group,
             image_bytes=_inline_image_bytes(data.get("input")),
+            exception=exception,
         )
         return True
     if not measured or measured <= 0:
@@ -485,7 +494,14 @@ def retry_for_refusal(
     data["input"] = rewritten
     _MEASURED_INPUT_TOKENS.set(target)
     _SHRUNK.set(True)
-    _trace_retry(data, attempt=attempt, count=measured, target=target, model=group)
+    _trace_retry(
+        data,
+        attempt=attempt,
+        count=measured,
+        target=target,
+        model=group,
+        exception=exception,
+    )
     return True
 
 def _payload_bytes(data: Mapping[str, Any]) -> int:
@@ -530,9 +546,21 @@ def _trace_retry(
     target: int,
     model: Optional[str] = None,
     image_bytes: Optional[int] = None,
+    exception: Optional[BaseException] = None,
 ) -> None:
     from . import trace as _trace_module
 
+    # The cause is part of the record: this pass only runs after a route refused
+    # a request, and "which refusal" is the one fact a reader cannot recover
+    # afterwards.  A live thread was shrinking a 32k-token request on every step
+    # against a 1,000,000-token window, and nothing in the log said what the
+    # route had objected to -- so the honest answer stayed unknown.
+    refusal = None
+    if exception is not None:
+        refusal = str(exception)
+        reason = getattr(exception, "reason", None)
+        if reason:
+            refusal = f"{reason}: {refusal}"
     try:
         _trace_module._route_trace(
             RETRY_TRACE_EVENT,
@@ -541,6 +569,8 @@ def _trace_retry(
             before=count,
             target=target,
             image_bytes=image_bytes,
+            refusal=(refusal or "")[:400] or None,
+            payload_bytes=_payload_bytes(data),
         )
     except Exception:
         return
@@ -563,13 +593,48 @@ def _inline_image_bytes(items: Any) -> int:
     return int(raw * _BASE64_OVERHEAD)
 
 
-def pessimistic_tokens(data: Mapping[str, Any], count: int) -> int:
-    """``count`` plus what the images would cost a byte-counting relay."""
+def _image_token_estimate(items: Any) -> int:
+    """Tokens the replay's images could cost the *window*, overestimated.
 
-    images = _inline_image_bytes(data.get("input"))
-    if images <= 0:
-        return count
-    return count + int(images / _IMAGE_BYTES_PER_TOKEN)
+    An image's price in a vision model is its pixels, not its bytes: a 1.06 MB
+    screenshot is 2240x3040 and about 9,000 tokens, while charging its base64 at
+    ``_IMAGE_BYTES_PER_TOKEN`` made it 423,000.  That factor of fifty is not
+    conservative, it is a unit mismatch -- the number this feeds is compared
+    against a *token* window, and on a live thread it declared a 32,000-token
+    request with five screenshots to be 1,050,000 tokens of a 1,000,000-token
+    window on every single step.  The pass then shortened a request that fit,
+    removing the pictures the image pass had deliberately kept.
+
+    Dimensions come from the image headers the scanner already reads, so this
+    costs no decode.  An image whose size cannot be read keeps the byte rate,
+    where the only thing known about it is how many bytes it occupies.
+    """
+
+    from . import image_context as _image_context_module
+
+    try:
+        images = _image_context_module.scan(items)
+    except Exception:
+        return 0
+    total = 0
+    for image in images:
+        width = getattr(image, "width", None)
+        height = getattr(image, "height", None)
+        raw = getattr(image, "raw", None)
+        if isinstance(width, int) and isinstance(height, int) and width > 0 and height > 0:
+            pixels = width * height
+            total += (
+                -(-pixels // _IMAGE_PIXELS_PER_TOKEN) + _IMAGE_TILE_OVERHEAD_TOKENS
+            )
+        elif isinstance(raw, (bytes, bytearray)) and raw:
+            total += int(len(raw) * _BASE64_OVERHEAD / _IMAGE_BYTES_PER_TOKEN)
+    return total
+
+
+def pessimistic_tokens(data: Mapping[str, Any], count: int) -> int:
+    """``count`` plus what the images could add in the window's own unit."""
+
+    return count + _image_token_estimate(data.get("input"))
 
 
 def _image_shrunk(data: Any, keep: int) -> Optional[Dict[str, Any]]:

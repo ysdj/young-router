@@ -237,7 +237,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         )[0]
         self.assertIn("for child in childPanels.filter({ $0.parent === window }).map({ $0.window }) {", close_path)
         self.assertIn("endChildPanel(child)", close_path)
-        self.assertIn('if windowRoute == "provider-wizard" || windowRoute == "file-editor" {', open_route)
+        self.assertIn('if windowRoute == "provider-wizard" || windowRoute == "file-editor" || windowRoute == "image-context" {', open_route)
         self.assertIn("presentChildPanel(window, in: settingsWindow())", open_route)
         self.assertIn("endChildPanel(window)", close_route)
         self.assertIn('let restoreProviderModels = selectedRoute == "provider-wizard"', close_route)
@@ -1202,7 +1202,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # an explicit route whitelist; a whitelist silently dropped General
         # onto a plain titled window while the shared shell still reserved its
         # title-bar inset.
-        self.assertIn('NSSet<NSString *> *standaloneRoutes = [NSSet setWithArray:@[@"home", @"provider-wizard", @"file-editor"]];', app_delegate)
+        self.assertIn('NSSet<NSString *> *standaloneRoutes = [NSSet setWithArray:@[@"home", @"provider-wizard", @"file-editor", @"image-context"]];', app_delegate)
         self.assertIn("const BOOL settingsShell = ![standaloneRoutes containsObject:route];", app_delegate)
         # The material belongs to the window; a per-table backdrop would stack
         # a second vibrancy layer over only the table's own rows.
@@ -1369,7 +1369,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # A warm editor window boots its React root off screen; the shared
         # child-surface presentation is what puts it in front of the app.
         self.assertIn("if warmOnly {", mac_leaf)
-        self.assertIn('if windowRoute == "provider-wizard" || windowRoute == "file-editor" {', mac_leaf)
+        self.assertIn('if windowRoute == "provider-wizard" || windowRoute == "file-editor" || windowRoute == "image-context" {', mac_leaf)
         self.assertIn("presentChildPanel(window, in: settingsWindow())", mac_leaf)
         # The editor sheet exists for exactly one document: a bare deep link or
         # an AppKit-restored window must not present an empty editor.
@@ -1383,7 +1383,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("RCT_EXTERN_METHOD(prepareFileEditor)", mac_bridge)
         self.assertIn("RCT_EXTERN__BLOCKING_SYNCHRONOUS_METHOD(pendingFileEditorTarget)", mac_bridge)
         app_delegate = (MAC_PROJECT / "YoungRouter-macOS/AppDelegate.mm").read_text(encoding="utf-8")
-        self.assertIn('standaloneRoutes = [NSSet setWithArray:@[@"home", @"provider-wizard", @"file-editor"]];', app_delegate)
+        self.assertIn('standaloneRoutes = [NSSet setWithArray:@[@"home", @"provider-wizard", @"file-editor", @"image-context"]];', app_delegate)
         self.assertIn('props[@"initialFileTarget"] = fileId;', app_delegate)
         self.assertIn("NSString *fileId, NSWindow *existingWindow", app_delegate)
         self.assertIn('if (route == L"file-editor") return {900, 560};', win_leaf)

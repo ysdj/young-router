@@ -2067,6 +2067,207 @@ def _install_responses_chat_bridge_reasoning_replay_patch() -> None:
     )
 
 
+_RESPONSES_BRIDGE_CACHE_USAGE_PATCH_ATTR = "_young_router_bridge_cache_usage_patch"
+
+
+def _bridge_usage_with_provider_cache_hits(usage: Any) -> Any:
+    """Carry a provider's own cache-hit count across the chat bridge.
+
+    LiteLLM builds ``input_tokens_details.cached_tokens`` from
+    ``prompt_tokens_details.cached_tokens``, and a DeepSeek-shaped response
+    leaves that field at zero while reporting the same fact as
+    ``prompt_cache_hit_tokens`` / ``cache_read_input_tokens``.  A bridged
+    ``/v1/responses`` request therefore told Codex the cache was cold on every
+    step of a thread whose prefix the upstream had in fact reused -- and Codex
+    reads that number for both its turn meter and its compaction decision, so a
+    false zero is not harmless.  Measured on a real replay: the upstream
+    answered ``prompt_cache_hit_tokens: 16000`` of 16224 and the client was told
+    ``cached_tokens: 0``.
+
+    Only a missing number is filled in: an OpenAI-shaped usage is already
+    correct and is passed through untouched.
+    """
+
+    details = getattr(usage, "prompt_tokens_details", None)
+    if isinstance(usage, dict):
+        details = usage.get("prompt_tokens_details")
+    reported = 0
+    if isinstance(details, dict):
+        reported = int(details.get("cached_tokens") or 0)
+    else:
+        reported = int(getattr(details, "cached_tokens", 0) or 0)
+    if reported:
+        return usage
+
+    hit = 0
+    for key in ("prompt_cache_hit_tokens", "cache_read_input_tokens"):
+        if isinstance(usage, dict):
+            hit = int(usage.get(key) or 0)
+        else:
+            hit = int(getattr(usage, key, 0) or 0)
+        if hit:
+            break
+    if not hit:
+        return usage
+
+    input_tokens = 0
+    if isinstance(usage, dict):
+        input_tokens = int(usage.get("prompt_tokens") or 0)
+    else:
+        input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+    if input_tokens:
+        hit = min(hit, input_tokens)
+
+    try:
+        from litellm.types.utils import PromptTokensDetailsWrapper
+
+        details = PromptTokensDetailsWrapper(cached_tokens=hit)
+        if isinstance(usage, dict):
+            usage["prompt_tokens_details"] = details
+        else:
+            usage.prompt_tokens_details = details
+    except Exception:
+        return usage
+    return usage
+
+
+_USAGE_CACHE_READ_NO_OVERWRITE_ATTR = "_young_router_usage_cache_read_no_overwrite"
+
+
+def _install_usage_cache_read_no_overwrite_patch() -> None:
+    """Stop a relay's zero from erasing a real cache count.
+
+    LiteLLM's ``Usage`` builds ``prompt_tokens_details.cached_tokens`` from the
+    OpenAI-shaped field and then applies its Anthropic mapping, which assigns
+    ``cache_read_input_tokens`` on top.  This app's DeepSeek route answers both
+    keys on the same frame -- the real count in ``prompt_tokens_details`` and a
+    literal ``0`` in ``cache_read_input_tokens`` -- so that assignment overwrote
+    a correct 29,824 with a zero before anything downstream could read it.
+
+    Measured, same body each time: straight to the upstream ``cached=29824``;
+    through the proxy it reached Codex as ``cached_tokens: 0``; and
+    ``_responses_usage_for_codex`` saw only zeroes, so no later repair could
+    recover the count.  That zero is not harmless -- Codex's turn meter and its
+    compaction both read this number.
+
+    The two keys count the same quantity (input tokens served from cache), so a
+    larger value can only be a more complete report.  This rewrites the last
+    assignment to keep the larger one, and does nothing when the OpenAI-shaped
+    field is absent or smaller.
+    """
+
+    try:
+        from litellm.types.utils import PromptTokensDetailsWrapper, Usage
+    except Exception:
+        return
+    original_init = getattr(Usage, "__init__", None)
+    if original_init is None or getattr(original_init, _USAGE_CACHE_READ_NO_OVERWRITE_ATTR, False):
+        return
+
+    # Read the OpenAI-shaped count the base model already validated, before the
+    # Anthropic assignment in ``Usage.__init__`` runs.
+    class _KeepingPromptTokensDetails(PromptTokensDetailsWrapper):
+        pass
+
+    def patched_init(self: Any, *args: Any, **kwargs: Any) -> None:
+        details = kwargs.get("prompt_tokens_details")
+        read = kwargs.get("cache_read_input_tokens")
+        keep = None
+        if isinstance(details, dict):
+            keep = details.get("cached_tokens")
+        elif details is not None:
+            keep = getattr(details, "cached_tokens", None)
+        original_init(self, *args, **kwargs)
+        if (
+            isinstance(keep, int)
+            and not isinstance(keep, bool)
+            and isinstance(read, int)
+            and not isinstance(read, bool)
+            and keep > read
+        ):
+            current = getattr(self, "prompt_tokens_details", None)
+            if current is not None:
+                try:
+                    current.cached_tokens = keep
+                except Exception:
+                    pass
+            try:
+                self.cache_read_input_tokens = keep
+            except Exception:
+                pass
+
+    setattr(patched_init, _USAGE_CACHE_READ_NO_OVERWRITE_ATTR, True)
+    setattr(patched_init, "_original_usage_init", original_init)
+    Usage.__init__ = patched_init
+
+
+def _install_responses_bridge_cache_usage_patch() -> None:
+    """Give the bridged Responses shape the cache count the upstream sent.
+
+    The repair runs on the chat response *before* LiteLLM reads its usage, so the
+    number it copies into ``input_tokens_details`` is the one the provider
+    reported.  Both the non-streaming transform and the streaming iterator reach
+    LiteLLM's conversion through this one method.
+    """
+
+    try:
+        from litellm.responses.litellm_completion_transformation.transformation import (
+            LiteLLMCompletionResponsesConfig,
+        )
+    except Exception:
+        return
+
+    original = getattr(
+        LiteLLMCompletionResponsesConfig,
+        "transform_chat_completion_response_to_responses_api_response",
+        None,
+    )
+    if original is None or getattr(original, _RESPONSES_BRIDGE_CACHE_USAGE_PATCH_ATTR, False):
+        return
+
+    def patched_transform_chat_completion_response_to_responses_api_response(
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        chat_response = (
+            args[0]
+            if args
+            else kwargs.get("chat_completion_response")
+        )
+        usage = getattr(chat_response, "usage", None) if chat_response is not None else None
+        repaired = _bridge_usage_with_provider_cache_hits(usage)
+        if repaired is not usage:
+            try:
+                chat_response.usage = repaired
+            except Exception:
+                pass
+        try:
+            details = getattr(usage, "prompt_tokens_details", None)
+            _trace_module._route_trace(
+                "responses_bridge_cache_usage",
+                provider_cache_hit=getattr(usage, "prompt_cache_hit_tokens", None),
+                cached_tokens_before=(getattr(details, "cached_tokens", None) if details else None),
+                repaired=repaired is not usage,
+            )
+        except Exception:
+            pass
+        return original(*args, **kwargs)
+
+    setattr(
+        patched_transform_chat_completion_response_to_responses_api_response,
+        _RESPONSES_BRIDGE_CACHE_USAGE_PATCH_ATTR,
+        True,
+    )
+    setattr(
+        patched_transform_chat_completion_response_to_responses_api_response,
+        "_original_transform_response",
+        original,
+    )
+    LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response = staticmethod(
+        patched_transform_chat_completion_response_to_responses_api_response
+    )
+
+
 def _install_responses_tool_search_bridge_patch() -> None:
     try:
         from litellm.responses.litellm_completion_transformation.transformation import (
@@ -2450,6 +2651,8 @@ def install_all() -> None:
     # The bridged replay is repaired here, before a thinking upstream judges it:
     # the client's reasoning item does not survive the Responses-to-Chat
     # transformation when its payload is only ``encrypted_content``.
+    _install_usage_cache_read_no_overwrite_patch()
+    _install_responses_bridge_cache_usage_patch()
     _install_responses_chat_bridge_reasoning_replay_patch()
     # The managed proxy's idle loops are not part of request handling, but every
     # worker and the supervisor run them, so they are installed with the rest.

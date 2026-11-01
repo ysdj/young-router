@@ -17,6 +17,43 @@ from unittest import mock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from young_router.proxy import context_window as cw  # noqa: E402
+from young_router.proxy import trace as trace_module  # noqa: E402
+
+
+class RefusalTraceTests(unittest.TestCase):
+    """The refusal that triggered a shrink has to be on the record.
+
+    This pass only runs after a route refused a request, and a live thread was
+    shrinking a 32k-token request on every step against a 1,000,000-token
+    window. Nothing in the log said what the route had objected to, so the one
+    fact a reader needed was the one thing not recorded.
+    """
+
+    def test_the_refusal_is_recorded_with_the_shrink(self) -> None:
+        events = []
+
+        def capture(event, **fields):
+            events.append((event, fields))
+
+        with mock.patch.object(trace_module, "_route_trace", capture):
+            error = Exception("workbuddy 上游失败：请求被上游拒绝（http 400）（code 11135）")
+            error.reason = "other"
+            cw._trace_retry(
+                {"model": "deepseek-v4.1-flash", "input": [{"type": "message"}]},
+                attempt=0,
+                count=32_000,
+                target=32_000,
+                image_bytes=1_400_000,
+                exception=error,
+            )
+
+        self.assertEqual(len(events), 1)
+        _name, fields = events[0]
+        self.assertEqual(fields["attempt"], 0)
+        self.assertEqual(fields["image_bytes"], 1_400_000)
+        self.assertIn("code 11135", fields["refusal"])
+        self.assertTrue(fields["refusal"].startswith("other:"))
+        self.assertGreater(fields["payload_bytes"], 0)
 
 
 class _Router:
@@ -309,15 +346,15 @@ class ImageWeightTests(unittest.TestCase):
         environment.start()
         self.addCleanup(environment.stop)
 
-    def _image(self, seed: int) -> dict:
+    def _image(self, seed: int, size: tuple = (64, 64)) -> dict:
         from test_image_context import _data_url, _png
 
         return {
             "type": "input_image",
-            "image_url": _data_url(_png(64, 64, noisy=True, seed=seed)),
+            "image_url": _data_url(_png(*size, noisy=True, seed=seed)),
         }
 
-    def _replay(self, images: int) -> dict:
+    def _replay(self, images: int, size: tuple = (64, 64)) -> dict:
         items: list = [
             {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "be brief"}]}
         ]
@@ -328,7 +365,7 @@ class ImageWeightTests(unittest.TestCase):
                     "role": "user",
                     "content": [
                         {"type": "input_text", "text": f"look at this {index}"},
-                        self._image(index + 1),
+                        self._image(index + 1, size),
                     ],
                 }
             )
@@ -357,8 +394,35 @@ class ImageWeightTests(unittest.TestCase):
         count = cw.count_tokens(data, router)
         self.assertGreater(cw.pessimistic_tokens(data, count), count)
 
+    def test_a_screenshot_is_not_charged_at_its_byte_rate(self) -> None:
+        # A 2240x3040 screenshot is about 9,000 tokens; charging its base64 at
+        # ``_IMAGE_BYTES_PER_TOKEN`` made it 423,000, which declared a 32,000
+        # token request with five screenshots to be over a 1,000,000 token window
+        # on every step of a live thread -- and the pass then removed pictures
+        # the image pass had deliberately kept.
+        data = self._replay(1, size=(2240, 3040))
+        count = 32_000
+        estimate = cw.pessimistic_tokens(data, count) - count
+        self.assertLess(estimate, 20_000)
+        self.assertGreater(estimate, 5_000)
+
+    def test_an_image_of_unknown_size_keeps_the_byte_rate(self) -> None:
+        # Only when the header cannot be read is the wire size the only thing
+        # known about an image, and that is the case the byte rate is for.
+        from young_router.proxy import image_context as image_context_module
+
+        class Unreadable:
+            width = None
+            height = None
+            raw = b"\x00" * 25_000
+
+        with mock.patch.object(
+            image_context_module, "scan", return_value=[Unreadable()]
+        ):
+            self.assertEqual(cw._image_token_estimate([]), int(25_000 * (4 / 3) / 2.5))
+
     def test_images_are_replaced_when_the_bytes_do_not_fit(self) -> None:
-        data = self._replay(8)
+        data = self._replay(8, size=(1200, 900))
         router = _Router(10**9)
         image_bytes_before = cw._inline_image_bytes(data["input"])
         # A window the text alone fits and the images do not.

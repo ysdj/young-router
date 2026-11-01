@@ -175,7 +175,7 @@ void WinUI3NativeLeafModule::Initialize(winrt::Microsoft::ReactNative::ReactCont
 
 void WinUI3NativeLeafModule::OpenWindow(std::wstring const& route) noexcept {
   try {
-    if ((route == L"provider-wizard" || route == L"file-editor") && !leaf_->IsChildHost()) {
+    if ((route == L"provider-wizard" || route == L"file-editor" || route == L"image-context") && !leaf_->IsChildHost()) {
       OpenReactChildWindow(route);
       return;
     }
@@ -187,7 +187,7 @@ void WinUI3NativeLeafModule::OpenWindow(std::wstring const& route) noexcept {
 
 void WinUI3NativeLeafModule::CloseWindow(std::optional<std::wstring> const& route) noexcept {
   try {
-    if (route && (*route == L"provider-wizard" || *route == L"file-editor") && leaf_->IsChildHost()) {
+    if (route && (*route == L"provider-wizard" || *route == L"file-editor" || *route == L"image-context") && leaf_->IsChildHost()) {
       CloseReactChildWindow();
       return;
     }
@@ -201,7 +201,7 @@ void WinUI3NativeLeafModule::CloseWindow(std::optional<std::wstring> const& rout
 
 void WinUI3NativeLeafModule::FocusWindow(std::wstring const& route) noexcept {
   try {
-    if ((route == L"provider-wizard" || route == L"file-editor") && !leaf_->IsChildHost()) {
+    if ((route == L"provider-wizard" || route == L"file-editor" || route == L"image-context") && !leaf_->IsChildHost()) {
       OpenReactChildWindow(route);
       return;
     }

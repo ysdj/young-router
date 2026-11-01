@@ -757,6 +757,185 @@ class HookStreamingFailoverTests(HookTestCase):
         self.assertEqual(len(calls), 1)
         self.assertIn("id:reasoning-eof-route", hooks._DEPLOYMENT_COOLDOWNS)
 
+    async def test_reasoning_only_completion_after_delivered_thinking_fails_the_turn(self) -> None:
+        """A bridged chat route cut mid-thinking must not finish the turn.
+
+        LiteLLM's completion bridge fabricates ``response.completed`` from
+        whatever it collected the moment the upstream chat stream stops, so a
+        route that died after 108 reasoning tokens arrives here as a *finished*
+        response whose only item is the thinking.  Codex records no answer and
+        no call from it and ends the turn with ``last_agent_message: null``:
+        observed as a 414s turn that stopped mid-task at 01:17 with no error at
+        all.  The empty-completion check used to be waived because thinking had
+        already reached the client, so this exact frame order was delivered as
+        a completed turn.
+        """
+
+        hooks, proxy_server = load_hook_module()
+        hooks._DEPLOYMENT_COOLDOWNS.clear()
+        self.addCleanup(hooks._DEPLOYMENT_COOLDOWNS.clear)
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, None)
+        reasoning = "We need continue. Need create document."
+
+        async def thinking_only_stream():
+            yield {
+                "type": "response.created",
+                "response": {"id": "resp-thinking", "status": "in_progress"},
+            }
+            yield {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "id": "reasoning-cut",
+                    "type": "reasoning",
+                    "status": "in_progress",
+                    "summary": [],
+                },
+            }
+            yield {
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": "reasoning-cut",
+                "output_index": 0,
+                "summary_index": 0,
+                "delta": reasoning,
+            }
+            yield {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "id": "reasoning-cut",
+                    "type": "reasoning",
+                    "status": "completed",
+                    "summary": [{"type": "summary_text", "text": reasoning}],
+                },
+            }
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-thinking",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "id": "reasoning-cut",
+                            "type": "reasoning",
+                            "summary": [{"type": "summary_text", "text": reasoning}],
+                        }
+                    ],
+                },
+            }
+
+        class FakeRouter:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return []
+
+            async def aresponses(self, **payload):
+                raise AssertionError("a turn that already showed thinking is pinned")
+
+        proxy_server.llm_router = FakeRouter()
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            # Codex asks for thinking on screen; without it this router hides
+            # the summary frames and the empty completion fails over instead.
+            "reasoning": {"effort": "medium", "summary": "auto"},
+            "model_info": {
+                "id": "thinking-only-route",
+                "route_key": "provider / openai/default-chat / key=primary / order=1",
+                "order": 1,
+            },
+        }
+
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=thinking_only_stream(),
+                request_data=request_data,
+            )
+        ]
+
+        types = [chunk.get("type") for chunk in chunks]
+        # The thinking the reader already has stays delivered; the fabricated
+        # ``response.completed`` must not, or the turn ends with no outcome.
+        self.assertIn("response.reasoning_summary_text.delta", types)
+        self.assertNotIn("response.completed", types)
+        self.assertEqual(types[-1], "response.failed")
+        self.assertEqual(chunks[-1]["response"]["status"], "failed")
+        error = chunks[-1]["response"]["error"]
+        self.assertEqual(error["type"], "server_error")
+        self.assertEqual(error["code"], "upstream_stream_interrupted")
+        self.assertIn("ended without", error["message"])
+        self.assertNotIn("could not classify the stop", error["message"])
+
+    async def test_reasoning_only_completed_chunk_in_replayed_buffer_fails_the_turn(self) -> None:
+        """The same cut, read from an already-buffered start."""
+
+        hooks, _proxy_server = load_hook_module()
+        reasoning = "We need continue."
+        buffered = [
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "id": "reasoning-cut",
+                    "type": "reasoning",
+                    "status": "in_progress",
+                    "summary": [],
+                },
+            },
+            {
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": "reasoning-cut",
+                "output_index": 0,
+                "summary_index": 0,
+                "delta": reasoning,
+            },
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-thinking",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "id": "reasoning-cut",
+                            "type": "reasoning",
+                            "summary": [{"type": "summary_text", "text": reasoning}],
+                        }
+                    ],
+                },
+            },
+        ]
+
+        async def empty_stream():
+            return
+            yield  # pragma: no cover - an exhausted stream has no frames
+
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "reasoning": {"effort": "medium", "summary": "auto"},
+        }
+
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks._yield_guarded_original_stream(
+                buffered,
+                empty_stream(),
+                request_data,
+            )
+        ]
+
+        types = [chunk.get("type") for chunk in chunks]
+        self.assertIn("response.reasoning_summary_text.delta", types)
+        self.assertNotIn("response.completed", types)
+        self.assertEqual(types[-1], "response.failed")
+        self.assertEqual(
+            chunks[-1]["response"]["error"]["code"],
+            "upstream_stream_interrupted",
+        )
+
     async def test_whitespace_only_completed_text_fails_over_instead_of_completing(self) -> None:
         hooks, proxy_server = load_hook_module()
         hooks._DEPLOYMENT_COOLDOWNS.clear()
